@@ -19,6 +19,16 @@ print_status() {
     echo -e "${GREEN}✅ $1${NC}"
 }
 
+# Check for superuser privileges
+check_sudo() {
+    if [[ "$EUID" -ne 0 ]]; then
+        print_error "This script must be run with sudo privileges"
+        echo "Please run as: sudo ./install.sh"
+        exit 1
+    fi
+    print_status "Sudo privileges confirmed"
+}
+
 print_warning() {
     echo -e "${YELLOW}⚠️  $1${NC}"
 }
@@ -165,12 +175,35 @@ EOF
     fi
 }
 
+# Create symbolic link
+create_symlink() {
+    print_info "Creating symbolic link for prism command..."
+
+    INSTALL_DIR="/usr/local/bin"
+    PRISM_EXECUTABLE="$(pwd)/prism"
+
+    if [[ -L "${INSTALL_DIR}/prism" ]]; then
+        print_warning "Symbolic link already exists. Removing and recreating."
+        sudo rm "${INSTALL_DIR}/prism"
+    fi
+
+    sudo ln -s "$PRISM_EXECUTABLE" "${INSTALL_DIR}/prism"
+
+    if [[ -L "${INSTALL_DIR}/prism" ]] && [[ -x "${INSTALL_DIR}/prism" ]]; then
+        print_status "Symbolic link created successfully in ${INSTALL_DIR}"
+    else
+        print_error "Failed to create symbolic link"
+        print_warning "You may need to run this script with sudo"
+        exit 1
+    fi
+}
+
 # Test installation
 test_installation() {
     print_info "Testing PRISM installation..."
     
     # Test the CLI
-    if ./prism --help &> /dev/null; then
+    if prism --help &> /dev/null; then
         print_status "PRISM CLI is working correctly"
     else
         print_error "PRISM CLI test failed"
@@ -192,11 +225,13 @@ main() {
     print_info "Starting PRISM installation process..."
     echo
     
+    check_sudo
     check_python
     setup_venv
     install_dependencies
     install_prism
     setup_executables
+    create_symlink
     setup_config
     test_installation
     
