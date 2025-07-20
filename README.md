@@ -24,7 +24,7 @@ A comprehensive materials science platform providing unified access to **2M+ mat
 ## ⚡ Quick Start
 
 ```bash
-# Clone and install (PyPI release coming soon)
+# One-command installation (PyPI release coming soon)
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
 python quick_install.py
@@ -50,20 +50,29 @@ python -m app.cli search --database oqmd --elements Li,O --limit 10
 
 > **Note**: PRISM is currently in internal testing phase. PyPI release coming soon!
 
-### Development Install
+### One-Command Setup
+
 ```bash
 # Clone repository
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
 
-# Quick setup
+# One command handles everything!
 python quick_install.py
+```
 
-# Or manual install
+### Alternative Methods
+
+```bash
+# Manual installation
 pip install -e .
+
+# Or minimal CLI-only
+pip install click rich
 ```
 
 ### Platform-Specific
+
 ```bash
 # Linux/macOS
 ./install.sh

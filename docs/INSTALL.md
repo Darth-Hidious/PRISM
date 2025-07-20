@@ -2,20 +2,37 @@
 
 > **Note**: PRISM is currently in internal testing phase. PyPI release coming soon!
 
-## 🚀 Quick Installation
+## ⚡ One-Command Installation
 
-### Development Installation (Current)
+### Quick Setup (Recommended)
+
+```bash
+# Clone and run one command - handles everything automatically
+git clone https://github.com/Darth-Hidious/PRISM.git
+cd PRISM
+python quick_install.py
+```
+
+That's it! The installer will:
+- ✅ Install all required dependencies (with fallback for compilation issues)
+- ✅ Set up the CLI interface
+- ✅ Verify everything works
+- ✅ Show you next steps
+
+## 🚀 Alternative Installation Methods
+
+### Development Installation
 
 ```bash
 # Clone repository
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
 
-# Quick setup
-python quick_install.py
-
-# Or manual installation
+# Manual installation
 pip install -e .
+
+# Or minimal CLI-only install
+pip install click rich
 ```
 
 ## 🖥️ Platform-Specific Installation
@@ -169,4 +186,4 @@ pip install -e .
 
 - **Issues**: https://github.com/Darth-Hidious/PRISM/issues
 - **Email**: team@marc27.com
-- **Documentation**: Built-in via `prism getting-started`
+- **Documentation**: Built-in via `python -m app.cli getting-started`
