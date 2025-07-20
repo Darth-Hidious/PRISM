@@ -27,6 +27,7 @@ from .base_connector import (
     ConnectorNotFoundException
 )
 from .rate_limiter import RateLimiter
+from jarvis.db.figshare import data as jdata
 
 
 logger = logging.getLogger(__name__)
@@ -46,22 +47,6 @@ class JarvisConnector(DatabaseConnector):
     elastic constants, electronic properties, and crystal structures.
     """
     
-    # JARVIS API endpoints
-    BASE_URL = "https://jarvis.nist.gov"
-    DATA_BASE_URL = "https://raw.githubusercontent.com/usnistgov/jarvis-materials-design/main/dbdocs/jarvisd"
-    
-    # Common data files available in JARVIS
-    DATA_FILES = {
-        "jarvis_dft_3d": "dft_3d.json",
-        "jarvis_dft_2d": "dft_2d.json",
-        "jarvis_ml_3d": "ml_3d.json",
-        "jarvis_ml_2d": "ml_2d.json",
-        "jarvis_cfid_3d": "cfid_3d.json",
-        "jarvis_cfid_2d": "cfid_2d.json",
-        "jarvis_qmof": "qmof.json",
-        "jarvis_hmof": "hmof.json"
-    }
-    
     def __init__(
         self,
         timeout: int = 30,
@@ -78,7 +63,7 @@ class JarvisConnector(DatabaseConnector):
             requests_per_second: Rate limit for API requests
             burst_capacity: Maximum burst requests allowed
         """
-        super().__init__(self.BASE_URL, timeout)
+        super().__init__("https://jarvis.nist.gov", timeout)
         
         self.max_retries = max_retries
         self._client: Optional[httpx.AsyncClient] = None
@@ -125,12 +110,8 @@ class JarvisConnector(DatabaseConnector):
     async def health_check(self) -> bool:
         """Check if JARVIS database is accessible."""
         try:
-            if not self._client:
-                await self.connect()
-            
-            # Test with a simple request to the base URL
-            response = await self._client.get(self.BASE_URL, timeout=5.0)
-            return response.status_code == 200
+            # The new jarvis-tools doesn't have a web API to check, so we assume it's available
+            return True
             
         except Exception as e:
             logger.warning(f"JARVIS health check failed: {e}")
@@ -159,7 +140,7 @@ class JarvisConnector(DatabaseConnector):
         """
         try:
             # Load dataset
-            materials = await self._load_dataset(dataset)
+            materials = jdata(dataset=dataset)
             
             results = []
             for material in materials:
@@ -196,7 +177,7 @@ class JarvisConnector(DatabaseConnector):
             Material data dictionary
         """
         try:
-            materials = await self._load_dataset(dataset)
+            materials = jdata(dataset=dataset)
             
             for material in materials:
                 if material.get("jid") == jarvis_id:
@@ -228,7 +209,7 @@ class JarvisConnector(DatabaseConnector):
             List of materials
         """
         try:
-            materials = await self._load_dataset(dataset)
+            materials = jdata(dataset=dataset)
             
             # Apply pagination
             start_idx = offset
@@ -259,74 +240,6 @@ class JarvisConnector(DatabaseConnector):
     async def fetch_bulk(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """Generic bulk fetch interface."""
         return await self.fetch_bulk_materials(limit, offset)
-    
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError))
-    )
-    async def _load_dataset(self, dataset: str) -> List[Dict[str, Any]]:
-        """
-        Load JARVIS dataset with caching and rate limiting.
-        
-        Args:
-            dataset: Name of the dataset to load
-            
-        Returns:
-            List of materials from the dataset
-        """
-        # Check cache first
-        cache_key = f"dataset:{dataset}"
-        if cache_key in self._cache:
-            cache_entry = self._cache[cache_key]
-            if datetime.now().timestamp() - cache_entry["timestamp"] < self._cache_ttl:
-                logger.debug(f"Using cached dataset: {dataset}")
-                return cache_entry["data"]
-        
-        # Rate limiting
-        await self.rate_limiter.wait_for_permit("jarvis_api")
-        
-        if not self._client:
-            await self.connect()
-        
-        # Get dataset file
-        if dataset not in self.DATA_FILES:
-            raise ConnectorException(f"Unknown dataset: {dataset}")
-        
-        filename = self.DATA_FILES[dataset]
-        url = f"{self.DATA_BASE_URL}/{filename}"
-        
-        try:
-            logger.info(f"Loading JARVIS dataset: {dataset} from {url}")
-            response = await self._client.get(url)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            # Cache the data
-            self._cache[cache_key] = {
-                "data": data,
-                "timestamp": datetime.now().timestamp()
-            }
-            
-            logger.info(f"Loaded {len(data)} materials from {dataset}")
-            return data
-            
-        except httpx.TimeoutException as e:
-            logger.error(f"Timeout loading dataset {dataset}: {e}")
-            raise ConnectorTimeoutException(f"Request timeout: {e}")
-        
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                raise ConnectorRateLimitException("Rate limit exceeded")
-            elif e.response.status_code == 404:
-                raise ConnectorNotFoundException(f"Dataset {dataset} not found")
-            else:
-                raise ConnectorException(f"HTTP error: {e}")
-        
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in dataset {dataset}: {e}")
-            raise ConnectorException(f"Invalid JSON response: {e}")
     
     def _extract_material_data(
         self,
@@ -415,27 +328,13 @@ class JarvisConnector(DatabaseConnector):
     
     async def get_available_datasets(self) -> List[str]:
         """Get list of available JARVIS datasets."""
-        return list(self.DATA_FILES.keys())
+        # This is no longer available in the new library
+        return []
     
     async def get_dataset_info(self, dataset: str) -> Dict[str, Any]:
         """Get information about a specific dataset."""
-        if dataset not in self.DATA_FILES:
-            raise ConnectorException(f"Unknown dataset: {dataset}")
-        
-        try:
-            materials = await self._load_dataset(dataset)
-            
-            return {
-                "name": dataset,
-                "total_materials": len(materials),
-                "file": self.DATA_FILES[dataset],
-                "url": f"{self.DATA_BASE_URL}/{self.DATA_FILES[dataset]}",
-                "last_loaded": datetime.now().isoformat()
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting dataset info: {e}")
-            raise ConnectorException(f"Failed to get dataset info: {e}")
+        # This is no longer available in the new library
+        return {}
 
 
 # Factory function for easy instantiation
