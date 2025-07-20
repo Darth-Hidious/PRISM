@@ -28,8 +28,22 @@ from rich.layout import Layout
 from rich.columns import Columns
 from rich import print as rprint
 
-# ASCII Art for PRISM
-PRISM_ASCII_ART = """
+# Import branding configuration
+try:
+    from app.config.branding import (
+        COMPANY_LOGO, COMPANY_NAME, COMPANY_TAGLINE, COMPANY_DESCRIPTION,
+        PRIMARY_COLOR, SECONDARY_COLOR, ACCENT_COLOR, FEATURE_LIST
+    )
+    PRISM_ASCII_ART = COMPANY_LOGO
+    COMPANY_BRANDING = {
+        'name': COMPANY_NAME,
+        'tagline': COMPANY_TAGLINE,
+        'description': COMPANY_DESCRIPTION,
+        'features': FEATURE_LIST
+    }
+except ImportError:
+    # Fallback to default PRISM branding
+    PRISM_ASCII_ART = """
 ██████╗ ██████╗ ██╗███████╗███╗   ███╗
 ██╔══██╗██╔══██╗██║██╔════╝████╗ ████║
 ██████╔╝██████╔╝██║███████╗██╔████╔██║
@@ -37,15 +51,25 @@ PRISM_ASCII_ART = """
 ██║     ██║  ██║██║███████║██║ ╚═╝ ██║
 ╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚═╝
 """
+    COMPANY_BRANDING = {
+        'name': 'PRISM',
+        'tagline': 'Platform for Research in Smart Materials',
+        'description': 'Advanced Materials Discovery & Database Integration Platform',
+        'features': [
+            "✨ Access 2M+ materials across NOMAD, JARVIS, OQMD & COD",
+            "🔬 Advanced filtering, visualization & export capabilities",
+            "🚀 Interactive search modes & comprehensive examples"
+        ]
+    }
+    PRIMARY_COLOR = "cyan"
+    SECONDARY_COLOR = "blue"
+    ACCENT_COLOR = "green"
 
-WELCOME_TEXT = """
-[bold cyan]Platform for Research in Smart Materials[/bold cyan]
-[dim]Advanced Materials Discovery & Database Integration Platform[/dim]
+WELCOME_TEXT = f"""
+[bold {PRIMARY_COLOR}]{COMPANY_BRANDING['tagline']}[/bold {PRIMARY_COLOR}]
+[dim]{COMPANY_BRANDING['description']}[/dim]
 
-[green]✨ Access 2M+ materials across NOMAD, JARVIS, OQMD & COD[/green]
-[green]🔬 Advanced filtering, visualization & export capabilities[/green]
-[green]🚀 Interactive search modes & comprehensive examples[/green]
-"""
+""" + "\n".join([f"[{ACCENT_COLOR}]{feature}[/{ACCENT_COLOR}]" for feature in COMPANY_BRANDING['features']])
 
 # Initialize Rich console
 console = Console()
@@ -59,7 +83,7 @@ def show_launch_screen():
     layout.split_column(
         Layout(name="header", size=12),
         Layout(name="content", size=8),
-        Layout(name="footer", size=4)
+        Layout(name="footer", size=12)
     )
     
     # ASCII Art in header
@@ -80,10 +104,25 @@ def show_launch_screen():
     layout["content"].update(welcome_panel)
     
     # Quick tips in footer
-    tips_text = """
-[bold yellow]💡 Quick Start Tips:[/bold yellow]
-• Type [cyan]prism --help[/cyan] for all commands  • Use [cyan]prism examples[/cyan] for usage examples
-• Try [cyan]prism search --interactive[/cyan] for guided search  • Run [cyan]prism getting-started[/cyan] for setup guide
+    tips_text = f"""
+[bold {PRIMARY_COLOR}]PRISM Platform CLI - Advanced Materials Discovery & Database Integration[/bold {PRIMARY_COLOR}]
+
+A comprehensive command-line interface for materials research with support for
+NOMAD, JARVIS, OQMD, COD databases and custom database integration.
+
+[bold yellow]Features:[/bold yellow]
+• Multi-database material search with advanced filtering
+• Formation energy, band gap, and stability screening  
+• High Entropy Alloy (HEA) discovery tools
+• Data visualization and export (CSV, JSON, plots)
+• Interactive search modes with guided prompts
+• Custom database integration support
+
+[bold yellow]💡 Quick Start:[/bold yellow]
+• [cyan]prism search --interactive[/cyan]        (Interactive guided search)
+• [cyan]prism examples[/cyan]                    (See usage examples)
+• [cyan]prism getting-started[/cyan]             (Setup guide)
+• [cyan]prism --help[/cyan]                      (All commands)
 """
     tips_panel = Panel(
         tips_text,
@@ -210,23 +249,10 @@ def get_database_configs():
 @click.pass_context
 def cli(ctx, debug, config_file, no_banner):
     """
-    PRISM Platform CLI - Advanced Materials Discovery & Database Integration
+    MARC27's PRISM - Platform for Research in Smart Materials
     
-    A comprehensive command-line interface for materials research with support for
-    NOMAD, JARVIS, OQMD, COD databases and custom database integration.
-    
-    Features:
-    • Multi-database material search with advanced filtering
-    • Formation energy, band gap, and stability screening
-    • High Entropy Alloy (HEA) discovery tools
-    • Data visualization and export (CSV, JSON, plots)
-    • Interactive search modes with guided prompts
-    • Custom database integration support
-    
-    Quick Start:
-    • prism search --interactive        (Interactive guided search)
-    • prism examples                    (See usage examples)
-    • prism getting-started             (Setup guide)
+    Advanced materials discovery and database integration platform.
+    Run without arguments to see the interactive launch screen.
     """
     ctx.ensure_object(dict)
     ctx.obj['debug'] = debug
