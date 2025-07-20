@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import uuid4
 
-from sqlalchemy import Column, String, DateTime, Text, Boolean, Integer, JSON, Float, ForeignKey
+from sqlalchemy import Column, String, DateTime, Text, Boolean, Integer, JSON, Float, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -47,6 +47,83 @@ class Job(Base):
     # Metadata
     created_by = Column(String(100), nullable=True)
     job_metadata = Column(JSON, nullable=True)
+
+
+class MaterialEntry(Base):
+    """Standardized materials database table."""
+    
+    __tablename__ = "materials"
+    
+    # Primary identification
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4, index=True)
+    material_id = Column(String(100), nullable=False, unique=True, index=True)  # Unique across all sources
+    origin = Column(String(50), nullable=False, index=True)  # Source database (NOMAD, JARVIS, etc.)
+    source_id = Column(String(100), nullable=False, index=True)  # Original ID from source database
+    
+    # Composition and structure
+    composition = Column(String(500), nullable=False, index=True)  # Alphabetically-ordered composition
+    reduced_formula = Column(String(200), nullable=False, index=True)  # Reduced chemical formula
+    elements = Column(JSON, nullable=False)  # List of chemical elements
+    nsites = Column(Integer, nullable=True, index=True)  # Number of atoms
+    
+    # Physical properties
+    volume = Column(Float, nullable=True)  # Volume in Å³
+    density = Column(Float, nullable=True)  # Density in Å³/atom
+    
+    # Symmetry properties
+    point_group = Column(String(20), nullable=True, index=True)
+    space_group = Column(String(50), nullable=True, index=True)
+    space_group_number = Column(Integer, nullable=True, index=True)
+    crystal_system = Column(String(20), nullable=True, index=True)
+    
+    # Energy properties
+    uncorrected_energy = Column(Float, nullable=True)
+    corrected_energy = Column(Float, nullable=True)  # MP2020 corrections
+    formation_energy_per_atom = Column(Float, nullable=True, index=True)
+    decomposition_energy_per_atom = Column(Float, nullable=True, index=True)
+    decomposition_energy_per_atom_all = Column(Float, nullable=True)
+    decomposition_energy_per_atom_relative = Column(Float, nullable=True)
+    decomposition_energy_per_atom_mp = Column(Float, nullable=True)
+    decomposition_energy_per_atom_mp_oqmd = Column(Float, nullable=True)
+    
+    # Electronic properties
+    bandgap = Column(Float, nullable=True, index=True)
+    
+    # Classification and ML
+    dimensionality_cheon = Column(Integer, nullable=True, index=True)  # Cheon et al. 2017
+    is_train = Column(Boolean, default=False, index=True)  # Training set flag
+    
+    # Additional properties (stored as JSON for flexibility)
+    structure_data = Column(JSON, nullable=True)  # Crystal structure details
+    properties_data = Column(JSON, nullable=True)  # Additional calculated properties
+    source_metadata = Column(JSON, nullable=True)  # Source-specific metadata
+    
+    # Data management
+    job_id = Column(UUID(as_uuid=True), ForeignKey('data_ingestion_jobs.id'), nullable=True, index=True)
+    processing_status = Column(String(20), default="raw", index=True)  # raw, processed, validated, failed
+    data_quality_score = Column(Float, nullable=True)  # Quality assessment score
+    last_validated = Column(DateTime, nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    fetched_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    # Relationships
+    job = relationship("Job", back_populates="materials")
+    
+    # Indexes for performance
+    __table_args__ = (
+        Index('idx_materials_origin_source_id', 'origin', 'source_id'),
+        Index('idx_materials_composition_elements', 'composition', 'elements'),
+        Index('idx_materials_formation_energy', 'formation_energy_per_atom'),
+        Index('idx_materials_bandgap_range', 'bandgap'),
+        Index('idx_materials_space_group_system', 'space_group_number', 'crystal_system'),
+    )
+
+
+# Add relationship to Job model
+Job.materials = relationship("MaterialEntry", back_populates="job")
 
 
 class DataSource(Base):

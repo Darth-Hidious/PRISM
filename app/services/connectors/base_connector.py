@@ -25,6 +25,7 @@ from tenacity import (
 )
 
 # Import rate limiter components
+from ..rate_limiter import DistributedRateLimiter
 from .rate_limiter import RateLimiter, TokenBucket
 
 

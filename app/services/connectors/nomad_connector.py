@@ -18,6 +18,7 @@ Key Features:
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union, AsyncGenerator
 from urllib.parse import urlencode
@@ -292,15 +293,14 @@ class NOMADConnector(DatabaseConnector):
         if not self.client:
             raise RuntimeError("Connector not connected. Call connect() first.")
         
-        # Build query
+        # Build query parameters for URL
         if query_builder:
+            # For complex queries, still try the query builder approach
+            # but we may need to convert this to URL parameters
             query_params = query_builder.build()
         else:
+            # Use simple URL parameters that we know work
             query_params = self._build_simple_query(**kwargs)
-        
-        # Add required sections for complete material data
-        if "required" not in query_params:
-            query_params["required"] = "results,run,system"
         
         materials = []
         
@@ -552,45 +552,37 @@ class NOMADConnector(DatabaseConnector):
         return materials
     
     def _build_simple_query(self, **kwargs) -> Dict[str, Any]:
-        """Build simple query from keyword arguments."""
-        query_builder = NOMADQueryBuilder()
+        """Build simple query from keyword arguments using URL parameters."""
+        params = {}
         
+        # Handle chemical formula
         if "formula" in kwargs:
-            query_builder.formula(kwargs["formula"])
+            params["results.material.chemical_formula_reduced"] = kwargs["formula"]
         
+        # Handle elements (use the working parameter name from our test)
         if "elements" in kwargs:
             elements = kwargs["elements"]
             if isinstance(elements, str):
                 elements = [elements]
-            query_builder.elements(elements)
+            # Use the parameter format that works with NOMAD API
+            params["results.material.elements"] = ",".join(elements)
         
-        if "min_elements" in kwargs:
-            query_builder.element_count(kwargs["min_elements"], "gte")
-        
-        if "max_elements" in kwargs:
-            query_builder.element_count(kwargs["max_elements"], "lte")
-        
+        # Handle space group
         if "space_group" in kwargs:
-            query_builder.space_group(kwargs["space_group"])
-        
-        # Handle property ranges
-        if "band_gap_min" in kwargs or "band_gap_max" in kwargs:
-            query_builder.band_gap_range(
-                kwargs.get("band_gap_min"),
-                kwargs.get("band_gap_max")
-            )
-        
-        if "formation_energy_min" in kwargs or "formation_energy_max" in kwargs:
-            query_builder.formation_energy_range(
-                kwargs.get("formation_energy_min"),
-                kwargs.get("formation_energy_max")
-            )
+            space_group = kwargs["space_group"]
+            if isinstance(space_group, int):
+                params["results.material.symmetry.space_group_number"] = space_group
+            else:
+                params["results.material.symmetry.space_group_symbol"] = space_group
         
         # Set default pagination
         page_size = kwargs.get("limit", 100)
-        query_builder.paginate(page_size=page_size)
+        params["page_size"] = min(page_size, 10000)  # NOMAD max limit
         
-        return query_builder.build()
+        # Add required sections for complete material data
+        params["required"] = "results"
+        
+        return params
     
     def _convert_to_standard_material(
         self, 
@@ -768,6 +760,37 @@ class NOMADConnector(DatabaseConnector):
         # Most NOMAD data is computational, but some experimental data exists
         experimental_indicators = ["exp", "experimental", "measurement", "xrd", "neutron"]
         return any(indicator in program for indicator in experimental_indicators)
+    
+    async def health_check(self) -> bool:
+        """
+        Check if the NOMAD API is accessible by making a simple query.
+        
+        Returns:
+            True if NOMAD API is healthy, False otherwise
+        """
+        try:
+            if not self.client:
+                await self.connect()
+            
+            start_time = time.time()
+            
+            # Use a simple entries query with limit 1 to test connectivity
+            test_params = {
+                "page_size": 1,
+                "page": 0
+            }
+            
+            response = await self.client.get(self.endpoints["entries"], params=test_params)
+            
+            latency = time.time() - start_time
+            self._update_metrics(True, latency)
+            
+            return response.status_code == 200
+            
+        except Exception as e:
+            logger.warning(f"NOMAD health check failed: {e}")
+            self._update_metrics(False, 0.0, e)
+            return False
 
 
 # Convenience function to create NOMAD query builder

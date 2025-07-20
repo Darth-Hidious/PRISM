@@ -340,6 +340,15 @@ class SettingsNoEnv(BaseSettings):
 
     database_url: Optional[str] = Field(default=None, description="Full database connection URL")
     
+    def get_database_url(self) -> str:
+        """Get database URL, constructing it if not provided directly."""
+        if self.database_url:
+            return self.database_url
+        return (
+            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_server}:{self.postgres_port}/{self.postgres_db}"
+        )
+    
     @property
     def redis_url(self) -> str:
         """Construct Redis URL."""
@@ -372,8 +381,8 @@ def create_development_settings() -> Settings:
             "reload": True,
             "cors_origins": ["http://localhost:3000", "http://localhost:8080"],
             "cors_allow_credentials": True,
-            "cors_allow_methods": ["*"],
-            "cors_allow_headers": ["*"],
+            "cors_allow_methods": "*",
+            "cors_allow_headers": "*",
             "postgres_server": "localhost",
             "postgres_user": "postgres", 
             "postgres_password": "password",

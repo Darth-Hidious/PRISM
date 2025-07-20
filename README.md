@@ -1,185 +1,313 @@
-# Data Ingestion Microservice
+# 🚀 PRISM Platform - Materials Science Data Management
 
-A high-performance FastAPI microservice for data ingestion with Redis job queue and PostgreSQL storage.
+PRISM (Platform for Research in Integrated Scientific Materials) is a comprehensive, production-ready materials science data ingestion and processing platform that provides unified access to multiple materials databases including NOMAD Laboratory and JARVIS through a powerful CLI interface with PostgreSQL database storage.
 
-## Features
-
-- **FastAPI Framework**: High-performance async web framework
-- **Async/Await Patterns**: Full async support throughout the application
-- **PostgreSQL Integration**: AsyncPG for high-performance database operations
-- **Redis Job Queue**: Background job processing with priority support
-- **Pydantic Validation**: Comprehensive data validation and serialization
-- **CORS Support**: Configurable cross-origin resource sharing
-- **Health Checks**: Kubernetes-ready health and readiness probes
-- **Structured Logging**: JSON-structured logging with correlation IDs
-- **Environment Configuration**: Pydantic-settings based configuration
-- **Error Handling**: Comprehensive error handling and logging
-
-## Architecture
-
-```
-/app
-├── api/
-│   └── v1/
-│       ├── endpoints/
-│       │   ├── health.py      # Health check endpoints
-│       │   ├── jobs.py        # Job management endpoints
-│       │   ├── sources.py     # Data source management
-│       │   └── destinations.py # Data destination management
-│       └── __init__.py
-├── core/
-│   ├── config.py              # Application configuration
-│   └── dependencies.py       # FastAPI dependencies
-├── db/
-│   ├── database.py           # Database connection management
-│   └── models.py             # SQLAlchemy models
-├── services/
-│   └── connectors/
-│       └── redis_connector.py # Redis connection and job queue
-├── schemas/
-│   └── __init__.py           # Pydantic schemas
-└── main.py                   # FastAPI application
-```
-
-## Quick Start
+## ⚡ Quick Start
 
 ### Prerequisites
+- Python 3.9+
+- PostgreSQL 12+ (for production database)
+- Redis (optional, for caching and job queues)
 
-- Python 3.11+
-- PostgreSQL 13+
-- Redis 6+
-
-### Installation
-
-1. Install dependencies:
+### 🚀 One-Command Setup
 ```bash
+# Clone and initialize everything
+git clone https://github.com/Darth-Hidious/PRISM.git
+cd PRISM
+./install.sh
+```
+
+### 🐳 Docker Setup (Recommended for Production)
+```bash
+# Start PostgreSQL and Redis with Docker
+docker-compose up -d postgres redis
+
+# Initialize database
+python init_database.py
+
+# Start using PRISM
+./prism fetch-and-store --stats
+```
+
+## 🎯 Core Features
+
+### Materials Database Integration
+- **NOMAD Laboratory**: Access to 19M+ materials entries
+- **JARVIS Database**: NIST materials properties database
+- **Unified Data Model**: Standardized material representations
+- **PostgreSQL Storage**: Production-ready database with proper indexing
+- **Batch Processing**: Intelligent batching with progress tracking
+
+### Advanced CLI Interface
+- **Interactive Progress**: Real-time fetching progress with ETA
+- **Database Management**: Local storage with search capabilities
+- **Error Handling**: Robust error recovery and logging
+- **Configuration Management**: Environment-based configuration
+- **Production Ready**: Health checks and monitoring
+
+### Data Management
+- **Automated Storage**: Materials automatically stored with deduplication
+- **Search & Filter**: Query local database by elements, formula, properties
+- **Export Capabilities**: JSON, CSV, YAML export formats
+- **Statistics**: Database analytics and reporting
+
+## 📋 Essential Commands
+
+### Database Operations
+```bash
+# Initialize PostgreSQL database
+python init_database.py
+
+# Show database statistics
+./prism fetch-and-store --stats
+
+# Search local database only
+./prism fetch-and-store --database-only --elements Si
+```
+
+### Material Fetching
+```bash
+# Fetch Silicon materials (controlled batch processing)
+./prism fetch-and-store --elements Si --max-results 100
+
+# Fetch specific compound
+./prism fetch-and-store --formula SiO2 --max-results 50
+
+# Large dataset with progress tracking
+./prism fetch-and-store --elements Si,O --max-results 1000 --batch-size 25
+```
+
+### System Management
+```bash
+# Test all connections
+./prism test-connection --source all
+
+# Check configuration
+./prism config --list
+
+# Monitor system status
+./prism queue-status
+```
+
+## 🏗️ Architecture
+
+### Database Schema
+The platform stores materials with comprehensive metadata:
+
+**Materials Table Fields:**
+- **Identification**: material_id, origin, source_id
+- **Composition**: composition, reduced_formula, elements, nsites
+- **Physical Properties**: volume, density, bandgap
+- **Symmetry**: point_group, space_group, crystal_system
+- **Energetics**: formation_energy, decomposition_energy
+- **Metadata**: structure_data, properties_data, processing_status
+
+### Data Flow
+1. **Connect** to external databases (NOMAD/JARVIS)
+2. **Query** with intelligent parameter handling
+3. **Fetch** in optimized batches with rate limiting
+4. **Standardize** data format across sources
+5. **Store** in PostgreSQL with proper indexing
+6. **Index** for fast search and retrieval
+
+## 🔧 Configuration
+
+### Environment Setup
+The platform uses `.env` file for configuration:
+
+```bash
+# Database (PostgreSQL)
+POSTGRES_SERVER=localhost
+POSTGRES_USER=prism_user
+POSTGRES_PASSWORD=prism_password
+POSTGRES_DB=prism_materials
+POSTGRES_PORT=5432
+
+# API Settings
+NOMAD_BASE_URL=https://nomad-lab.eu/prod/rae/api/v1
+NOMAD_TIMEOUT=30.0
+NOMAD_RATE_LIMIT=120
+
+# Application
+ENVIRONMENT=production
+DEBUG=false
+```
+
+### Database Configuration
+Supports multiple database connection methods:
+- **Local PostgreSQL**: Direct connection
+- **Docker PostgreSQL**: Containerized database
+- **External Database**: Production database servers
+- **Connection URL**: Full database URLs
+
+## 🚀 Production Deployment
+
+### Method 1: Docker Compose (Recommended)
+```bash
+# Production deployment with PostgreSQL and Redis
+docker-compose up -d
+
+# Check all services are healthy
+docker-compose ps
+```
+
+### Method 2: Local Production Setup
+```bash
+# Initialize production environment
+./start_production.sh
+
+# Check database health
+./start_production.sh health-check
+```
+
+### Method 3: Manual Setup
+```bash
+# Install PostgreSQL
+sudo apt-get install postgresql postgresql-contrib  # Ubuntu
+brew install postgresql  # macOS
+
+# Create database and user
+createdb prism_materials
+createuser prism_user
+
+# Install Python dependencies
 pip install -r requirements.txt
+
+# Initialize and start
+python init_database.py
+./prism fetch-and-store --stats
 ```
 
-2. Set up environment variables:
+## 📊 Usage Examples
+
+### Basic Material Search
 ```bash
-cp .env.example .env
-# Edit .env with your configuration
+# Get database overview
+./prism fetch-and-store --stats
+
+# Search for Silicon compounds (local database)
+./prism fetch-and-store --database-only --elements Si
+
+# Fetch new Silicon materials from NOMAD
+./prism fetch-and-store --elements Si --max-results 50
 ```
 
-3. Set up PostgreSQL database:
-```sql
-CREATE DATABASE data_ingestion;
-CREATE USER postgres WITH PASSWORD 'password';
-GRANT ALL PRIVILEGES ON DATABASE data_ingestion TO postgres;
-```
-
-4. Start Redis:
+### Advanced Material Research
 ```bash
-redis-server
+# Multi-element search with progress tracking
+./prism fetch-and-store --elements "Si,O" --max-results 200 --show-progress
+
+# Specific compound research
+./prism fetch-and-store --formula "SiO2" --max-results 25
+
+# Large-scale data collection
+./prism fetch-and-store --elements Si --max-results 5000 --batch-size 50
 ```
 
-5. Run the application:
+### Database Management
 ```bash
-python app/main.py
+# View stored materials
+./prism fetch-and-store --database-only --formula SiO2
+
+# Export data
+./prism export-data --format json --output silicon_materials.json
+
+# System health check
+./prism test-connection --source nomad
 ```
 
-The API will be available at `http://localhost:8000` with automatic documentation at `http://localhost:8000/docs`.
+## 🔍 API Documentation
 
-## API Endpoints
+When running the web server (`python run.py`), access:
+- **Swagger UI**: `http://localhost:8000/docs`
+- **ReDoc**: `http://localhost:8000/redoc`
+- **Health Check**: `http://localhost:8000/api/v1/health/`
 
-### Health Check
-- `GET /api/v1/health/` - General health check
-- `GET /api/v1/health/liveness` - Kubernetes liveness probe
-- `GET /api/v1/health/readiness` - Kubernetes readiness probe
-- `GET /api/v1/health/queue` - Job queue statistics
+### Key API Endpoints
+- `GET /api/v1/health/` - System health status
+- `POST /api/v1/jobs/` - Create material fetching jobs
+- `GET /api/v1/jobs/` - List and monitor jobs
+- `GET /api/v1/sources/` - Available data sources
 
-### Jobs
-- `POST /api/v1/jobs/` - Create a new ingestion job
-- `GET /api/v1/jobs/` - List jobs with filtering
-- `GET /api/v1/jobs/{job_id}` - Get specific job
-- `GET /api/v1/jobs/{job_id}/status` - Get real-time job status
-- `PUT /api/v1/jobs/{job_id}/progress` - Update job progress
-- `GET /api/v1/jobs/{job_id}/logs` - Get job logs
-- `DELETE /api/v1/jobs/{job_id}` - Cancel job
+## 🛠️ Development
 
-### Data Sources
-- `POST /api/v1/sources/` - Create data source
-- `GET /api/v1/sources/` - List data sources
-- `GET /api/v1/sources/{source_id}` - Get specific source
-- `PUT /api/v1/sources/{source_id}` - Update source
-- `DELETE /api/v1/sources/{source_id}` - Delete source
-- `POST /api/v1/sources/{source_id}/activate` - Activate source
-- `POST /api/v1/sources/{source_id}/deactivate` - Deactivate source
-
-### Data Destinations
-- `POST /api/v1/destinations/` - Create data destination
-- `GET /api/v1/destinations/` - List destinations
-- `GET /api/v1/destinations/{destination_id}` - Get specific destination
-- `PUT /api/v1/destinations/{destination_id}` - Update destination
-- `DELETE /api/v1/destinations/{destination_id}` - Delete destination
-- `POST /api/v1/destinations/{destination_id}/activate` - Activate destination
-- `POST /api/v1/destinations/{destination_id}/deactivate` - Deactivate destination
-
-## Configuration
-
-The application uses environment variables for configuration. See `.env.example` for all available options.
-
-Key configuration sections:
-- **Application**: Basic app settings
-- **Server**: Host, port, and server settings
-- **CORS**: Cross-origin resource sharing
-- **Database**: PostgreSQL connection settings
-- **Redis**: Redis connection and job queue settings
-- **Logging**: Log level and formatting
-- **Security**: JWT tokens and secrets
-- **Job Queue**: Retry and delay settings
-
-## Development
-
-### Running Tests
+### Setup Development Environment
 ```bash
+# Clone and setup
+git clone https://github.com/Darth-Hidious/PRISM.git
+cd PRISM
+
+# Install in development mode
+pip install -e .
+
+# Run tests
 pytest
-```
 
-### Code Formatting
-```bash
+# Code formatting
 black app/
 isort app/
 ```
 
-### Linting
+### Testing
 ```bash
-flake8 app/
+# Run all tests
+pytest
+
+# Test specific connector
+python test_nomad_fix.py
+
+# Integration tests
+python -m pytest tests/integration/
 ```
 
-## Deployment
+## 🔒 Security & Production Features
 
-### Docker
-```bash
-docker build -t data-ingestion-service .
-docker run -p 8000:8000 data-ingestion-service
-```
+### Security
+- Environment-based configuration (no hardcoded secrets)
+- SQL injection prevention with SQLAlchemy ORM
+- Input validation with Pydantic schemas
+- Rate limiting for external API calls
+- Connection pooling and timeout handling
 
-### Kubernetes
-The service includes health check endpoints for Kubernetes:
-- Liveness probe: `/api/v1/health/liveness`
-- Readiness probe: `/api/v1/health/readiness`
+### Production Features
+- **Health Checks**: Kubernetes-ready liveness/readiness probes
+- **Logging**: Structured JSON logging with correlation IDs
+- **Monitoring**: Database and connection health monitoring
+- **Error Recovery**: Automatic retry logic with exponential backoff
+- **Batch Processing**: Optimized for large dataset processing
+- **Database Indexing**: Optimized queries for materials search
 
-## Monitoring
+### Performance
+- **Async Processing**: Non-blocking I/O for API calls
+- **Connection Pooling**: Efficient database connections
+- **Batch Optimization**: Intelligent batch sizing
+- **Progress Tracking**: Real-time progress with ETA calculations
+- **Memory Management**: Streaming for large datasets
 
-The service provides structured JSON logging and comprehensive health checks for monitoring:
+## 🤝 Contributing
 
-- Application logs with correlation IDs
-- Database connection health
-- Redis connection health
-- Job queue statistics
-- Performance metrics
+1. Fork the repository
+2. Create feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit changes (`git commit -m 'Add amazing feature'`)
+4. Push to branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
-## Security
+## 📞 Support
 
-- Environment-based configuration
-- CORS protection
-- Trusted host middleware
-- Input validation with Pydantic
-- SQL injection prevention with SQLAlchemy
-- Comprehensive error handling
+### Common Issues
+1. **Database Connection Failed**: Check PostgreSQL is running and credentials are correct
+2. **NOMAD API Timeout**: Reduce batch size or check network connection
+3. **Memory Issues**: Use streaming mode for large datasets
 
-## License
+### Getting Help
+- Check `./prism --help` for command documentation
+- Review logs in the application output
+- Check database connectivity with `./start_production.sh health-check`
 
-MIT License
+## 📄 License
+
+MIT License - see LICENSE file for details
+
+---
+
+**PRISM Platform** - Making materials science data accessible and manageable.

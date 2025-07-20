@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""
+PRISM Platform Executable Entry Point
+
+This is the main executable entry point for the PRISM platform CLI.
+It can be run directly without installation.
+
+Usage:
+    ./prism [COMMAND] [OPTIONS]
+    python prism [COMMAND] [OPTIONS]
+    
+Available Commands:
+    fetch-material      Fetch material from a specific source
+    bulk-fetch          Perform bulk material fetching
+    list-sources        List all available data sources
+    test-connection     Test connection to data sources
+    queue-status        Show job queue status
+    retry-failed-jobs   Retry failed jobs
+    export-data         Export data to various formats
+    monitor             Monitor system performance
+    config              Manage configuration settings
+
+Examples:
+    ./prism test-connection --source all
+    ./prism fetch-material --source jarvis --formula "Si"
+    ./prism bulk-fetch --source nomad --limit 100
+    ./prism queue-status --watch
+    ./prism export-data --format json --output materials.json
+"""
+
+import sys
+import os
+from pathlib import Path
+
+# Add the project root to Python path to ensure imports work
+project_root = Path(__file__).parent.absolute()
+sys.path.insert(0, str(project_root))
+
+def main():
+    """Main entry point for the PRISM CLI"""
+    try:
+        # Import the CLI module
+        from app.cli import cli
+        
+        # Run the CLI
+        cli()
+        
+    except ImportError as e:
+        print(f"❌ Import Error: {e}")
+        print("\n🔧 Please ensure you have installed the required dependencies:")
+        print("   pip install -r requirements.txt")
+        print("\n📖 Or install in development mode:")
+        print("   pip install -e .")
+        sys.exit(1)
+        
+    except KeyboardInterrupt:
+        print("\n\n👋 PRISM CLI interrupted by user")
+        sys.exit(0)
+        
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        print("\n🐛 If this error persists, please report it at:")
+        print("   https://github.com/Darth-Hidious/PRISM/issues")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

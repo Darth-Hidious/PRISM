@@ -19,6 +19,35 @@ from tenacity import (
     retry_if_exception_type
 )
 
+from .base_connector import DatabaseConnector, StandardizedMaterial, MaterialStructure, MaterialProperties, MaterialMetadata
+from .rate_limiter import RateLimiter
+from ...core.config import get_settings
+
+# Optional import for JARVIS tools
+try:
+    from jarvis.db.figshare import data as jdata
+    JARVIS_TOOLS_AVAILABLE = True
+except ImportError:
+    jdata = None
+    JARVIS_TOOLS_AVAILABLE = False
+    logging.warning("jarvis-tools package not available. Some features may be limited.")
+
+logger = logging.getLogger(__name__)
+
+import asyncio
+import json
+import logging
+from typing import Any, Dict, List, Optional, Union
+from datetime import datetime
+
+import httpx
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type
+)
+
 from .base_connector import (
     DatabaseConnector,
     ConnectorException,
@@ -27,7 +56,6 @@ from .base_connector import (
     ConnectorNotFoundException
 )
 from .rate_limiter import RateLimiter
-from jarvis.db.figshare import data as jdata
 
 
 logger = logging.getLogger(__name__)
@@ -138,6 +166,12 @@ class JarvisConnector(DatabaseConnector):
         Returns:
             List of matching materials
         """
+        if not JARVIS_TOOLS_AVAILABLE:
+            logger.warning("JARVIS tools not available. Using API fallback.")
+            # Fallback to API-based approach
+            return await self._api_search_materials(formula=formula, n_elements=n_elements, 
+                                                   properties=properties, limit=limit)
+        
         try:
             # Load dataset
             materials = jdata(dataset=dataset)
@@ -176,6 +210,10 @@ class JarvisConnector(DatabaseConnector):
         Returns:
             Material data dictionary
         """
+        if not JARVIS_TOOLS_AVAILABLE:
+            logger.warning("JARVIS tools not available. Using API fallback.")
+            return await self._api_get_material_by_id(jarvis_id)
+            
         try:
             materials = jdata(dataset=dataset)
             
@@ -208,6 +246,10 @@ class JarvisConnector(DatabaseConnector):
         Returns:
             List of materials
         """
+        if not JARVIS_TOOLS_AVAILABLE:
+            logger.warning("JARVIS tools not available. Using API fallback.")
+            return await self._api_fetch_bulk(limit=limit, offset=offset)
+            
         try:
             materials = jdata(dataset=dataset)
             
@@ -325,6 +367,25 @@ class JarvisConnector(DatabaseConnector):
         
         # Simple string matching - could be enhanced with chemical formula parsing
         return formula.lower() in material_formula.lower()
+    
+    async def _api_search_materials(self, formula: Optional[str] = None, 
+                                  n_elements: Optional[int] = None,
+                                  properties: Optional[List[str]] = None,
+                                  limit: int = 100) -> List[Dict[str, Any]]:
+        """Fallback API-based material search when jarvis-tools is not available."""
+        # Return empty list as fallback - could be enhanced with actual API calls
+        logger.warning("JARVIS API fallback not implemented. Returning empty results.")
+        return []
+    
+    async def _api_get_material_by_id(self, jarvis_id: str) -> Dict[str, Any]:
+        """Fallback API-based material retrieval by ID."""
+        logger.warning("JARVIS API fallback not implemented.")
+        raise ConnectorNotFoundException(f"Material with ID {jarvis_id} not found (API fallback)")
+    
+    async def _api_fetch_bulk(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """Fallback API-based bulk fetch."""
+        logger.warning("JARVIS API fallback not implemented. Returning empty results.")
+        return []
     
     async def get_available_datasets(self) -> List[str]:
         """Get list of available JARVIS datasets."""
