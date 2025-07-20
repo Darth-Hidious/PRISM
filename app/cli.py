@@ -53,7 +53,7 @@ except ImportError:
 """
     COMPANY_BRANDING = {
         'name': 'PRISM',
-        'tagline': 'Platform for Research in Smart Materials',
+        'tagline': 'Platform for Research in Intelligent Synthesis of Materials',
         'description': 'Advanced Materials Discovery & Database Integration Platform',
         'features': [
             "✨ Access 2M+ materials across NOMAD, JARVIS, OQMD & COD",
@@ -249,7 +249,7 @@ def get_database_configs():
 @click.pass_context
 def cli(ctx, debug, config_file, no_banner):
     """
-    MARC27's PRISM - Platform for Research in Smart Materials
+    MARC27's PRISM - Platform for Research in Intelligent Synthesis of Materials
     
     Advanced materials discovery and database integration platform.
     Run without arguments to see the interactive launch screen.

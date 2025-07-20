@@ -17,7 +17,7 @@ $logo = @"
          ██║     ██║  ██║██║███████║██║ ╚═╝ ██║
          ╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚═╝
 
-MARC27's Platform for Research in Smart Materials
+MARC27's Platform for Research in Intelligent Synthesis of Materials
 PowerShell Installation Script
 "@
 

@@ -17,7 +17,7 @@ Usdef main():
          ██║     ██║  ██║██║███████║██║ ╚═╝ ██║
          ╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚═╝
 
-MARC27's Platform for Research in Smart Materials
+MARC27's Platform for Research in Intelligent Synthesis of Materials
 Quick Installation Script
 """)"""quick_install.py
 """
@@ -82,10 +82,10 @@ def main():
 ██╔══██╗██╔══██╗██║██╔════╝████╗ ████║
 ██████╔╝██████╔╝██║███████╗██╔████╔██║
 ██╔═══╝ ██╔══██╗██║╚════██║██║╚██╔╝██║
-██║     ██║  ██║██║███████║██║ ╚═╝ ██║
-╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚═╝
+         ██║     ██║  ██║██║███████║██║ ╚═╝ ██║
+         ╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚═╝
 
-Platform for Research in Smart Materials
+Platform for Research in Intelligent Synthesis of Materials
 Quick Installation Script
 """)
     

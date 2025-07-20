@@ -39,7 +39,7 @@ PRISM_ASCII_ART = """
 """
 
 WELCOME_TEXT = """
-[bold cyan]Platform for Research in Smart Materials[/bold cyan]
+[bold cyan]Platform for Research in Intelligent Synthesis of Materials[/bold cyan]
 [dim]Advanced Materials Discovery & Database Integration Platform[/dim]
 
 [green]✨ Access 2M+ materials across NOMAD, JARVIS, OQMD & COD[/green]

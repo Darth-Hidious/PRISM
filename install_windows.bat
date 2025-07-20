@@ -17,7 +17,7 @@ echo         ██╔═══╝ ██╔══██╗██║╚═══
 echo         ██║     ██║  ██║██║███████║██║ ╚═╝ ██║
 echo         ╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚═╝
 echo.
-echo MARC27's Platform for Research in Smart Materials
+echo MARC27's Platform for Research in Intelligent Synthesis of Materials
 echo Windows Installation Script
 echo.
 

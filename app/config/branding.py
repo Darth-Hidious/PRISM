@@ -22,7 +22,7 @@ COMPANY_LOGO = """
 
 # Company Information
 COMPANY_NAME = "MARC27's PRISM"
-COMPANY_TAGLINE = "Platform for Research in Smart Materials"
+COMPANY_TAGLINE = "Platform for Research in Intelligent Synthesis of Materials"
 COMPANY_DESCRIPTION = "Advanced Materials Discovery & Database Integration Platform"
 
 # Color Scheme (Rich library color names)
