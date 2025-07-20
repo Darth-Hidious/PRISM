@@ -82,23 +82,38 @@ pytest
 ## ✅ Verify Installation
 
 ```bash
-# Check installation
-python run.py --version
-python run.py --help
+# Check CLI functionality (recommended)
+python -m app.cli --help
 
-# Launch MARC27's PRISM
-python run.py
+# Launch MARC27's PRISM interactive interface
+python -m app.cli
 
 # Test database connection
-python run.py list-databases
+python -m app.cli test-database
 
 # Interactive tutorial
-python run.py getting-started
+python -m app.cli getting-started
+
+# Alternative: Web server mode (requires all dependencies)
+python run.py --help
 ```
 
 ## 🛠 Troubleshooting
 
 ### Common Issues
+
+#### Build failures on macOS (pydantic-core, asyncpg)
+```bash
+# Install Xcode command line tools
+xcode-select --install
+
+# Install Rust (for pydantic-core)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Alternative: Use CLI mode (works without compilation)
+python -m app.cli --help
+```
 
 #### Python not found
 ```bash
@@ -107,6 +122,18 @@ python --version  # or python3 --version
 
 # On Windows, you might need:
 py --version
+```
+
+#### Dependencies fail to install
+```bash
+# Try minimal installation for CLI only
+pip install click rich
+
+# Test CLI functionality
+python -m app.cli --help
+
+# Install additional dependencies as needed
+pip install fastapi uvicorn  # For web interface
 ```
 
 #### Command not found after installation

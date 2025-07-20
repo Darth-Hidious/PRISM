@@ -29,11 +29,11 @@ git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
 python quick_install.py
 
-# Launch MARC27's PRISM
-python run.py
+# Launch MARC27's PRISM (CLI mode - always works)
+python -m app.cli
 
 # Start searching materials
-python run.py search --database oqmd --elements Li,O --limit 10
+python -m app.cli search --database oqmd --elements Li,O --limit 10
 ```
 
 ## ✨ Features
@@ -44,6 +44,7 @@ python run.py search --database oqmd --elements Li,O --limit 10
 - 🚀 **Interactive Modes** with guided tutorials
 - ⚡ **High Performance** with rate limiting and optimization
 - 🖥️ **Cross-Platform** (Windows, macOS, Linux)
+- 🛠️ **Multiple Interfaces**: CLI mode (always works) + Web interface (full dependencies)
 
 ## 📦 Installation
 
@@ -81,36 +82,36 @@ install_windows.bat
 
 ```bash
 # Launch with beautiful interface
-python run.py
+python -m app.cli
 
 # Interactive search
-python run.py search --interactive
+python -m app.cli search --interactive
 ```
 
 ### Command Line
 
 ```bash
 # Search materials
-python run.py search --database nomad --elements Si,O --formation-energy -2,0
+python -m app.cli search --database nomad --elements Si,O --formation-energy -2,0
 
 # List databases
-python run.py list-databases
+python -m app.cli list-databases
 
 # Export results
-python run.py search --database jarvis --elements Li --export csv
+python -m app.cli search --database jarvis --elements Li --export csv
 ```
 
 ### Getting Started
 
 ```bash
 # Built-in tutorial
-python run.py getting-started
+python -m app.cli getting-started
 
 # View examples
-python run.py examples
+python -m app.cli examples
 
 # Schema documentation
-python run.py schema --command search
+python -m app.cli schema --command search
 ```
 
 ## 🗃️ Supported Databases
