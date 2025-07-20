@@ -44,23 +44,26 @@ class TestHealthEndpoints:
 class TestConfiguration:
     """Test configuration management."""
     
-    def test_settings_creation(self):
+    def test_settings_creation(self, mocker):
         """Test settings can be created."""
+        mocker.patch("app.core.config.get_settings")
         settings = get_settings()
         assert settings.app_name is not None
         assert settings.app_version is not None
         assert isinstance(settings.debug, bool)
     
-    def test_database_url_construction(self):
+    def test_database_url_construction(self, mocker):
         """Test database URL construction."""
+        mocker.patch("app.core.config.get_settings")
         settings = get_settings()
         db_url = settings.database_url
         assert db_url.startswith("postgresql+asyncpg://")
         assert settings.postgres_user in db_url
         assert settings.postgres_db in db_url
     
-    def test_redis_url_construction(self):
+    def test_redis_url_construction(self, mocker):
         """Test Redis URL construction."""
+        mocker.patch("app.core.config.get_settings")
         settings = get_settings()
         redis_url = settings.redis_url
         assert redis_url.startswith("redis://")

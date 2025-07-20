@@ -430,28 +430,28 @@ class TestNOMADConnector:
         }
         assert nomad_connector._is_experimental(exp_data) is True
     
-    def test_validate_response(self, nomad_connector, mock_nomad_response):
+    async def test_validate_response(self, nomad_connector, mock_nomad_response):
         """Test response validation."""
         # Valid response
-        assert nomad_connector.validate_response(mock_nomad_response) is True
+        assert await nomad_connector.validate_response(mock_nomad_response) is True
         
         # Invalid response - missing data
         invalid_response = {"pagination": {}}
-        assert nomad_connector.validate_response(invalid_response) is False
+        assert await nomad_connector.validate_response(invalid_response) is False
 
 
 class TestNOMADIntegration:
     """Test NOMAD connector integration features."""
     
     @pytest.mark.asyncio
-    async def test_rate_limiting_integration(self):
+    async def test_rate_limiting_integration(self, mocker):
         """Test rate limiter integration."""
         from app.services.rate_limiter_integration import RateLimiterManager
         
         config = {"base_url": "https://nomad-lab.eu/prod/v1/api/v1"}
         
         # Mock rate limiter
-        mock_rate_limiter = AsyncMock()
+        mock_rate_limiter = mocker.AsyncMock()
         
         connector = NOMADConnector(config, rate_limiter=mock_rate_limiter)
         

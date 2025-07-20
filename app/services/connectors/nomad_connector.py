@@ -25,10 +25,10 @@ from urllib.parse import urlencode
 import httpx
 
 from .base_connector import (
-    DatabaseConnector, 
-    StandardizedMaterial, 
-    MaterialStructure, 
-    MaterialProperties, 
+    DatabaseConnector,
+    StandardizedMaterial,
+    MaterialStructure,
+    MaterialProperties,
     MaterialMetadata,
     ConnectorStatus
 )
@@ -449,7 +449,7 @@ class NOMADConnector(DatabaseConnector):
     async def _stream_materials(
         self, 
         query_params: Dict[str, Any]
-    ) -> AsyncGenerator[StandardizedMaterial, None]:
+    ):
         """Stream materials for large datasets."""
         page_size = min(query_params.get("page_size", 1000), 10000)
         page_offset = 0

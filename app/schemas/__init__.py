@@ -3,7 +3,7 @@ from typing import Optional, Dict, Any, List
 from uuid import UUID
 from enum import Enum
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class JobType(str, Enum):
@@ -59,23 +59,23 @@ class JobCreate(BaseSchema):
     schedule_config: Optional[Dict[str, Any]] = Field(default=None, description="Recurring job configuration")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="Additional metadata")
     
-    @validator("source_type")
+    @field_validator("source_type")
     def validate_source_type(cls, v):
         allowed_types = ["jarvis", "nomad", "materials_project", "aflow", "file", "database", "api", "stream"]
         if v not in allowed_types:
             raise ValueError(f"Source type must be one of: {allowed_types}")
         return v
     
-    @validator("destination_type")
+    @field_validator("destination_type")
     def validate_destination_type(cls, v):
         allowed_types = ["database", "file", "api", "warehouse"]
         if v not in allowed_types:
             raise ValueError(f"Destination type must be one of: {allowed_types}")
         return v
     
-    @validator("source_config")
-    def validate_source_config(cls, v, values):
-        job_type = values.data.get("job_type")
+    @field_validator("source_config")
+    def validate_source_config(cls, v, info):
+        job_type = info.data.get("job_type")
         
         if job_type == JobType.FETCH_SINGLE_MATERIAL:
             if "material_id" not in v:
@@ -145,9 +145,9 @@ class JobProgress(BaseSchema):
     status: Optional[str] = None
     message: Optional[str] = None
     
-    @validator("processed_records")
-    def validate_progress(cls, v, values):
-        total = values.data.get("total_records", 0)
+    @field_validator("processed_records")
+    def validate_progress(cls, v, info):
+        total = info.data.get("total_records", 0)
         if total > 0 and v > total:
             raise ValueError("Processed records cannot exceed total records")
         return v
@@ -161,16 +161,16 @@ class ScheduleConfig(BaseSchema):
     max_runs: Optional[int] = Field(None, ge=1, description="Maximum number of runs")
     next_run: Optional[datetime] = Field(None, description="Next scheduled run")
     
-    @validator("cron_expression")
-    def validate_schedule_cron(cls, v, values):
-        interval = values.data.get("interval_seconds")
+    @field_validator("cron_expression")
+    def validate_schedule_cron(cls, v, info):
+        interval = info.data.get("interval_seconds")
         if v is not None and interval is not None:
             raise ValueError("Cannot specify both cron_expression and interval_seconds")
         return v
 
-    @validator("interval_seconds")
-    def validate_schedule_interval(cls, v, values):
-        cron = values.data.get("cron_expression")
+    @field_validator("interval_seconds")
+    def validate_schedule_interval(cls, v, info):
+        cron = info.data.get("cron_expression")
         if v is not None and cron is not None:
             raise ValueError("Cannot specify both cron_expression and interval_seconds")
         return v
@@ -204,7 +204,7 @@ class DataSourceCreate(BaseSchema):
     connection_config: Dict[str, Any]
     tags: Optional[List[str]] = Field(default=None)
     
-    @validator("name")
+    @field_validator("name")
     def validate_name(cls, v):
         if not v.strip():
             raise ValueError("Name cannot be empty")

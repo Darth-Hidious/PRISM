@@ -15,7 +15,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Job, RawMaterialsData, JobLog
-from app.schemas import JobType, JobStatus, JobPriority
+from app.schemas import JobType, JobPriority, JobStatus
 from app.services.connectors.base_connector import StandardizedMaterial
 
 
@@ -156,7 +156,7 @@ class DatabaseTestHelper:
         self,
         job_type: JobType = JobType.FETCH_SINGLE_MATERIAL,
         source_type: str = "jarvis",
-        status: JobStatus = JobStatus.PENDING,
+        status: str = "pending",
         parameters: Dict[str, Any] = None,
         **kwargs
     ) -> Job:
@@ -236,7 +236,7 @@ class DatabaseTestHelper:
         
         return log_entry
     
-    async def count_jobs(self, status: JobStatus = None) -> int:
+    async def count_jobs(self, status: str = None) -> int:
         """Count jobs in database."""
         from sqlalchemy import select, func
         
@@ -497,7 +497,7 @@ def assert_material_data_complete(material: StandardizedMaterial):
 
 def assert_job_completed_successfully(job: Job):
     """Assert that job completed successfully."""
-    assert job.status == JobStatus.COMPLETED
+    assert job.status == "completed"
     assert job.completed_at is not None
     assert job.error_message is None
     assert job.progress is not None

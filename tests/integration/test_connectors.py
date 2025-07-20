@@ -119,7 +119,12 @@ async def test_redis():
 @pytest_asyncio.fixture
 async def rate_limiter_manager(test_redis):
     """Create rate limiter manager for testing."""
-    return RateLimiterManager(test_redis)
+    manager = RateLimiterManager()
+    if hasattr(test_redis, "connection_pool"):
+        await manager.initialize(redis_url=str(test_redis.connection_pool.connection_kwargs.get("host")))
+    else:
+        await manager.initialize(redis_url="redis://mock-redis:6379/0")
+    return manager
 
 
 @pytest_asyncio.fixture

@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timedelta
 from uuid import uuid4
 from typing import Dict, Any
+from asyncstdlib import anext
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from redis.asyncio import Redis
@@ -79,7 +80,8 @@ def mock_connector():
 @pytest.fixture
 async def job_processor(db_session: AsyncSession, redis_client: Redis):
     """Job processor fixture."""
-    rate_limiter_manager = RateLimiterManager(redis_client)
+    rate_limiter_manager = RateLimiterManager()
+    await rate_limiter_manager.initialize(redis_url=str(redis_client.connection_pool.connection_kwargs.get("host")))
     processor = JobProcessor(db_session, redis_client, rate_limiter_manager)
     yield processor
     await processor.stop()
@@ -93,18 +95,21 @@ async def job_scheduler(db_session: AsyncSession, redis_client: Redis):
     await scheduler.stop()
 
 
+@pytest.mark.usefixtures("db_session")
 class TestJobProcessor:
     """Test job processor functionality."""
     
     @pytest.mark.asyncio
     async def test_single_material_job(
         self, 
-        job_processor: JobProcessor, 
+        job_processor: JobProcessor,
         db_session: AsyncSession,
         mock_connector
     ):
         """Test single material fetch job."""
         # Create job
+        processor = await anext(job_processor)
+        session = await anext(db_session)
         job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
@@ -116,14 +121,14 @@ class TestJobProcessor:
             retry_count=3
         )
         
-        db_session.add(job)
-        await db_session.commit()
+        session.add(job)
+        await session.commit()
         
         # Process job
-        await job_processor._process_single_material_job(job)
+        await processor._process_single_material_job(job)
         
         # Check material was stored
-        result = await db_session.execute(
+        result = await session.execute(
             "SELECT COUNT(*) FROM raw_materials_data WHERE job_id = :job_id",
             {"job_id": job.id}
         )
@@ -139,6 +144,8 @@ class TestJobProcessor:
     ):
         """Test bulk fetch by formula job."""
         # Create job
+        processor = await anext(job_processor)
+        session = await anext(db_session)
         job = Job(
             id=uuid4(),
             job_type=JobType.BULK_FETCH_BY_FORMULA,
@@ -151,14 +158,14 @@ class TestJobProcessor:
             started_at=datetime.utcnow()
         )
         
-        db_session.add(job)
-        await db_session.commit()
+        session.add(job)
+        await session.commit()
         
         # Process job
-        await job_processor._process_bulk_formula_job(job)
+        await processor._process_bulk_formula_job(job)
         
         # Check materials were stored (2 formulas * 3 materials each = 6)
-        result = await db_session.execute(
+        result = await session.execute(
             "SELECT COUNT(*) FROM raw_materials_data WHERE job_id = :job_id",
             {"job_id": job.id}
         )
@@ -173,6 +180,8 @@ class TestJobProcessor:
     ):
         """Test job error handling and retry logic."""
         # Create job
+        processor = await anext(job_processor)
+        session = await anext(db_session)
         job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
@@ -184,15 +193,15 @@ class TestJobProcessor:
             current_retry=0
         )
         
-        db_session.add(job)
-        await db_session.commit()
+        session.add(job)
+        await session.commit()
         
         # Process job (should fail)
         error = Exception("Test error")
-        await job_processor._handle_job_error(job, error)
+        await processor._handle_job_error(job, error)
         
         # Refresh job
-        await db_session.refresh(job)
+        await session.refresh(job)
         
         # Should be queued for retry
         assert job.status == "queued"
@@ -208,6 +217,8 @@ class TestJobProcessor:
     ):
         """Test job failure after max retries."""
         # Create job at max retries
+        processor = await anext(job_processor)
+        session = await anext(db_session)
         job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
@@ -219,15 +230,15 @@ class TestJobProcessor:
             current_retry=2  # At max retries
         )
         
-        db_session.add(job)
-        await db_session.commit()
+        session.add(job)
+        await session.commit()
         
         # Process job (should fail permanently)
         error = Exception("Test error")
-        await job_processor._handle_job_error(job, error)
+        await processor._handle_job_error(job, error)
         
         # Refresh job
-        await db_session.refresh(job)
+        await session.refresh(job)
         
         # Should be marked as failed
         assert job.status == "failed"
@@ -242,6 +253,8 @@ class TestJobProcessor:
     ):
         """Test job progress tracking."""
         # Create job
+        processor = await anext(job_processor)
+        session = await anext(db_session)
         job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
@@ -251,11 +264,11 @@ class TestJobProcessor:
             status="processing"
         )
         
-        db_session.add(job)
-        await db_session.commit()
+        session.add(job)
+        await session.commit()
         
         # Update progress
-        await job_processor._update_progress(
+        await processor._update_progress(
             job.id, 
             processed=50, 
             total=100, 
@@ -264,7 +277,7 @@ class TestJobProcessor:
         )
         
         # Refresh and check
-        await db_session.refresh(job)
+        await session.refresh(job)
         assert job.processed_records == 50
         assert job.total_records == 100
         assert job.progress == 50
@@ -284,7 +297,7 @@ class TestJobScheduler:
         """Test creating a scheduled job."""
         job_template = JobCreate(
             job_type=JobType.SYNC_DATABASE,
-            source_type="mock",
+            source_type="jarvis",
             source_config={"dataset": "test"},
             destination_type="database"
         )
@@ -321,7 +334,8 @@ class TestJobScheduler:
             interval_seconds=3600  # Every hour
         )
         
-        next_run = job_scheduler._calculate_next_run(schedule_config)
+        scheduler = await anext(job_scheduler)
+        next_run = scheduler._calculate_next_run(schedule_config)
         
         # Should be approximately 1 hour from now
         now = datetime.utcnow()
@@ -337,10 +351,12 @@ class TestJobScheduler:
             interval_seconds=3600
         )
         
-        next_run = job_scheduler._calculate_next_run(schedule_config)
+        scheduler = await anext(job_scheduler)
+        next_run = scheduler._calculate_next_run(schedule_config)
         assert next_run is None
 
 
+@pytest.mark.usefixtures("db_session")
 class TestJobDependencies:
     """Test job dependency functionality."""
     
@@ -352,6 +368,8 @@ class TestJobDependencies:
     ):
         """Test job dependency checking."""
         # Create parent job
+        processor = await anext(job_processor)
+        session = await anext(db_session)
         parent_job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
@@ -372,12 +390,12 @@ class TestJobDependencies:
             dependencies=[str(parent_job.id)]
         )
         
-        db_session.add(parent_job)
-        db_session.add(dependent_job)
-        await db_session.commit()
+        session.add(parent_job)
+        session.add(dependent_job)
+        await session.commit()
         
         # Check dependencies
-        can_run = await job_processor._check_dependencies(dependent_job)
+        can_run = await processor._check_dependencies(dependent_job)
         assert can_run is True
     
     @pytest.mark.asyncio
@@ -388,6 +406,8 @@ class TestJobDependencies:
     ):
         """Test unresolved dependency blocking."""
         # Create parent job (not completed)
+        processor = await anext(job_processor)
+        session = await anext(db_session)
         parent_job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
@@ -408,12 +428,12 @@ class TestJobDependencies:
             dependencies=[str(parent_job.id)]
         )
         
-        db_session.add(parent_job)
-        db_session.add(dependent_job)
-        await db_session.commit()
+        session.add(parent_job)
+        session.add(dependent_job)
+        await session.commit()
         
         # Check dependencies
-        can_run = await job_processor._check_dependencies(dependent_job)
+        can_run = await processor._check_dependencies(dependent_job)
         assert can_run is False
 
 
@@ -426,23 +446,20 @@ class TestJobTypes:
         # Valid job type
         job_data = JobCreate(
             job_type=JobType.FETCH_SINGLE_MATERIAL,
-            source_type="mock",
+            source_type="jarvis",
             source_config={"material_id": "test"},
             destination_type="database"
         )
         assert job_data.job_type == JobType.FETCH_SINGLE_MATERIAL
         
         # Test source config validation for single material
-        try:
-            invalid_job = JobCreate(
+        with pytest.raises(ValueError, match="material_id is required"):
+            JobCreate(
                 job_type=JobType.FETCH_SINGLE_MATERIAL,
-                source_type="mock",
+                source_type="jarvis",
                 source_config={},  # Missing material_id
                 destination_type="database"
             )
-            assert False, "Should have raised validation error"
-        except ValueError as e:
-            assert "material_id is required" in str(e)
     
     @pytest.mark.asyncio
     async def test_bulk_formula_validation(self):
@@ -450,7 +467,7 @@ class TestJobTypes:
         # Valid with formulas
         job_data = JobCreate(
             job_type=JobType.BULK_FETCH_BY_FORMULA,
-            source_type="mock",
+            source_type="jarvis",
             source_config={"formulas": ["Si", "GaAs"]},
             destination_type="database"
         )
@@ -459,7 +476,7 @@ class TestJobTypes:
         # Valid with formula pattern
         job_data2 = JobCreate(
             job_type=JobType.BULK_FETCH_BY_FORMULA,
-            source_type="mock",
+            source_type="jarvis",
             source_config={"formula_pattern": "Si*"},
             destination_type="database"
         )
@@ -470,7 +487,7 @@ class TestJobTypes:
         """Test job priority levels."""
         job_data = JobCreate(
             job_type=JobType.FETCH_SINGLE_MATERIAL,
-            source_type="mock",
+            source_type="jarvis",
             source_config={"material_id": "test"},
             destination_type="database",
             priority=JobPriority.HIGH
@@ -493,7 +510,8 @@ class TestRateLimiterIntegration:
         config = {"test": "config"}
         
         # Get connector (should include rate limiter)
-        connector = await job_processor._get_connector("mock", config)
+        processor = await anext(job_processor)
+        connector = await processor._get_connector("mock", config)
         
         assert connector is not None
         assert connector.is_connected is True
@@ -503,11 +521,13 @@ class TestRateLimiterIntegration:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("redis_client")
 async def test_job_queue_integration(redis_client: Redis):
     """Test job queue integration."""
     from app.services.connectors.redis_connector import JobQueue
     
-    job_queue = JobQueue(redis_client)
+    client = await anext(redis_client)
+    job_queue = JobQueue(client)
     
     # Enqueue job
     success = await job_queue.enqueue_job(

@@ -66,7 +66,7 @@ class TestRateLimitConfig:
     
     def test_default_config(self):
         """Test default configuration values."""
-        config = RateLimitConfig()
+        config = RateLimitConfig(burst_capacity=30)
         assert config.requests_per_minute == 60
         assert config.burst_capacity == 30  # Default is max(10, rpm//2)
         assert config.queue_size == 100

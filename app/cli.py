@@ -36,6 +36,7 @@ from rich.text import Text
 from rich.prompt import Confirm, Prompt
 from rich.tree import Tree
 from rich import print as rprint
+from app.services.connectors.base_connector import StandardizedMaterial, MaterialStructure, MaterialProperties, MaterialMetadata
 
 # Import our application modules
 try:
@@ -99,7 +100,7 @@ def fetch_material(ctx, source, material_id, formula, elements, output, output_f
         if source == 'jarvis':
             connector = JarvisConnector()
         elif source == 'nomad':
-            connector = NOMADConnector()
+            connector = NOMADConnector(config={})
         else:
             raise CLIError(f"Unknown source: {source}")
         
@@ -123,6 +124,7 @@ def fetch_material(ctx, source, material_id, formula, elements, output, output_f
             if material_id:
                 result = asyncio.run(connector.get_material_by_id(material_id))
             else:
+                asyncio.run(connector.connect())
                 result = asyncio.run(connector.search_materials(**query_params))
             
             if not result:
@@ -131,7 +133,14 @@ def fetch_material(ctx, source, material_id, formula, elements, output, output_f
             
             # Format output
             if output_format == 'json':
-                formatted_data = json.dumps(result, indent=2)
+
+                class StandardizedMaterialEncoder(json.JSONEncoder):
+                    def default(self, o):
+                        if isinstance(o, (StandardizedMaterial, MaterialStructure, MaterialProperties, MaterialMetadata)):
+                            return o.__dict__
+                        return super().default(o)
+
+                formatted_data = json.dumps(result, indent=2, cls=StandardizedMaterialEncoder)
             elif output_format == 'csv':
                 # Convert to CSV format (simplified)
                 import csv

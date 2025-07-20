@@ -338,13 +338,7 @@ class SettingsNoEnv(BaseSettings):
             return ["*"]
         return [header.strip() for header in self.cors_allow_headers.split(",") if header.strip()]
 
-    @property
-    def database_url(self) -> str:
-        """Construct PostgreSQL database URL."""
-        return (
-            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
-            f"@{self.postgres_server}:{self.postgres_port}/{self.postgres_db}"
-        )
+    database_url: Optional[str] = Field(default=None, description="Full database connection URL")
     
     @property
     def redis_url(self) -> str:
