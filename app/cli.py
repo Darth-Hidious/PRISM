@@ -1388,6 +1388,122 @@ async def test_database_connections(databases):
         console.print()
 
 @cli.command()
+def examples():
+    """Show a comprehensive list of usage examples."""
+    console.clear()
+    console.print(Panel(
+        "[bold cyan]PRISM CLI Usage Examples[/bold cyan]\n"
+        "[dim]A comprehensive guide to PRISM's capabilities[/dim]",
+        style="blue",
+        border_style="bright_blue"
+    ))
+
+    # Basic Search
+    console.print("\n[bold green]🔍 Basic Search Examples[/bold green]")
+    basic_search_table = Table(box=None, show_header=False)
+    basic_search_table.add_column(width=50)
+    basic_search_table.add_column(width=70)
+    basic_search_table.add_row(
+        "[cyan]Search for materials containing Silicon and Oxygen[/cyan]",
+        "[yellow]prism search --elements Si,O[/yellow]"
+    )
+    basic_search_table.add_row(
+        "[cyan]Search for a specific chemical formula[/cyan]",
+        "[yellow]prism search --formula Li2CO3[/yellow]"
+    )
+    basic_search_table.add_row(
+        "[cyan]Limit the number of results[/cyan]",
+        "[yellow]prism search --elements Fe --limit 5[/yellow]"
+    )
+    console.print(basic_search_table)
+
+    # Advanced Search
+    console.print("\n[bold green]🔬 Advanced Search & Filtering[/bold green]")
+    advanced_search_table = Table(box=None, show_header=False)
+    advanced_search_table.add_column(width=50)
+    advanced_search_table.add_column(width=70)
+    advanced_search_table.add_row(
+        "[cyan]Find semiconductors with a wide band gap[/cyan]",
+        "[yellow]prism search --band-gap-min 2.0 --band-gap-max 5.0[/yellow]"
+    )
+    advanced_search_table.add_row(
+        "[cyan]Find stable materials with low formation energy[/cyan]",
+        "[yellow]prism search --database oqmd --formation-energy-max -1.0[/yellow]"
+    )
+    advanced_search_table.add_row(
+        "[cyan]Search for High Entropy Alloys (HEAs)[/cyan]",
+        "[yellow]prism search --database cod --min-elements 4[/yellow]"
+    )
+    advanced_search_table.add_row(
+        "[cyan]Find materials with a specific space group[/cyan]",
+        "[yellow]prism search --space-group P21/c[/yellow]"
+    )
+    console.print(advanced_search_table)
+
+    # Database Specific Searches
+    console.print("\n[bold green]💾 Database-Specific Searches[/bold green]")
+    db_search_table = Table(box=None, show_header=False)
+    db_search_table.add_column(width=50)
+    db_search_table.add_column(width=70)
+    db_search_table.add_row(
+        "[cyan]Search only the OQMD database[/cyan]",
+        "[yellow]prism search --database oqmd --elements Li,Co,O[/yellow]"
+    )
+    db_search_table.add_row(
+        "[cyan]Search only the COD database for crystal structures[/cyan]",
+        "[yellow]prism search --database cod --min-elements 4[/yellow]"
+    )
+    db_search_table.add_row(
+        "[cyan]Search NOMAD for DFT calculations[/cyan]",
+        "[yellow]prism search --database nomad --formula 'H2O'[/yellow]"
+    )
+    console.print(db_search_table)
+
+    # Data Export and Visualization
+    console.print("\n[bold green]📊 Data Export & Visualization[/bold green]")
+    export_table = Table(box=None, show_header=False)
+    export_table.add_column(width=50)
+    export_table.add_column(width=70)
+    export_table.add_row(
+        "[cyan]Export search results to a CSV file[/cyan]",
+        "[yellow]prism search --elements Fe,Ni --export csv[/yellow]"
+    )
+    export_table.add_row(
+        "[cyan]Export results to both JSON and CSV files[/cyan]",
+        "[yellow]prism search --elements Au --export both[/yellow]"
+    )
+    export_table.add_row(
+        "[cyan]Generate visualization plots from search results[/cyan]",
+        "[yellow]prism search --elements Si --plot[/yellow]"
+    )
+    console.print(export_table)
+
+    # Interactive and System Commands
+    console.print("\n[bold green]🤖 Interactive & System Commands[/bold green]")
+    interactive_table = Table(box=None, show_header=False)
+    interactive_table.add_column(width=50)
+    interactive_table.add_column(width=70)
+    interactive_table.add_row(
+        "[cyan]Start an interactive, guided search[/cyan]",
+        "[yellow]prism search --interactive[/yellow]"
+    )
+    interactive_table.add_row(
+        "[cyan]Test the connection to all databases[/cyan]",
+        "[yellow]prism test-database[/yellow]"
+    )
+    interactive_table.add_row(
+        "[cyan]List all available databases[/cyan]",
+        "[yellow]prism list-databases[/yellow]"
+    )
+    interactive_table.add_row(
+        "[cyan]View the schema for the 'search' command[/cyan]",
+        "[yellow]prism schema --command search[/yellow]"
+    )
+    console.print(interactive_table)
+
+    console.print("\n[bold yellow]💡 Tip:[/bold yellow] [cyan]Combine filters for more specific searches![/cyan]")
+
+@cli.command()
 @click.argument('config_file', type=click.Path(exists=True))
 def add_custom_database(config_file):
     """
