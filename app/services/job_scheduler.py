@@ -10,7 +10,7 @@ from sqlalchemy import select, update, and_
 from redis.asyncio import Redis
 
 from ..core.dependencies import get_database_session, get_redis_dependency
-from ..db.models import DataIngestionJob, ScheduledJob
+from ..db.models import Job, ScheduledJob
 from ..schemas import JobCreate, JobType, ScheduleConfig
 
 
@@ -212,7 +212,7 @@ class JobScheduler:
             job_template = JobCreate(**scheduled_job.job_template)
             
             # Create data ingestion job
-            job = DataIngestionJob(
+            job = Job(
                 job_type=job_template.job_type,
                 source_type=job_template.source_type,
                 source_config=job_template.source_config,

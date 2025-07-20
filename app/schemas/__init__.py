@@ -75,7 +75,7 @@ class JobCreate(BaseSchema):
     
     @validator("source_config")
     def validate_source_config(cls, v, values):
-        job_type = values.get("job_type")
+        job_type = values.data.get("job_type")
         
         if job_type == JobType.FETCH_SINGLE_MATERIAL:
             if "material_id" not in v:
@@ -147,7 +147,7 @@ class JobProgress(BaseSchema):
     
     @validator("processed_records")
     def validate_progress(cls, v, values):
-        total = values.get("total_records", 0)
+        total = values.data.get("total_records", 0)
         if total > 0 and v > total:
             raise ValueError("Processed records cannot exceed total records")
         return v
@@ -161,19 +161,18 @@ class ScheduleConfig(BaseSchema):
     max_runs: Optional[int] = Field(None, ge=1, description="Maximum number of runs")
     next_run: Optional[datetime] = Field(None, description="Next scheduled run")
     
-    @validator("cron_expression", "interval_seconds")
-    def validate_schedule(cls, v, values, field):
-        cron = values.get("cron_expression")
-        interval = values.get("interval_seconds")
-        
-        if field.name == "cron_expression" and v is not None:
-            if interval is not None:
-                raise ValueError("Cannot specify both cron_expression and interval_seconds")
-        
-        if field.name == "interval_seconds" and v is not None:
-            if cron is not None:
-                raise ValueError("Cannot specify both cron_expression and interval_seconds")
-        
+    @validator("cron_expression")
+    def validate_schedule_cron(cls, v, values):
+        interval = values.data.get("interval_seconds")
+        if v is not None and interval is not None:
+            raise ValueError("Cannot specify both cron_expression and interval_seconds")
+        return v
+
+    @validator("interval_seconds")
+    def validate_schedule_interval(cls, v, values):
+        cron = values.data.get("cron_expression")
+        if v is not None and cron is not None:
+            raise ValueError("Cannot specify both cron_expression and interval_seconds")
         return v
 
 
@@ -260,7 +259,7 @@ class QueueStats(BaseSchema):
 class JobLogCreate(BaseSchema):
     """Schema for creating a job log entry."""
     job_id: UUID
-    level: str = Field(..., regex="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
+    level: str = Field(..., pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     message: str = Field(..., min_length=1)
     metadata: Optional[Dict[str, Any]] = None
 

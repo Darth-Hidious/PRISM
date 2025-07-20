@@ -33,6 +33,12 @@ logger = logging.getLogger(__name__)
 
 
 class JarvisConnector(DatabaseConnector):
+    def standardize_data(self, data: Any) -> Any:
+        pass
+
+    def validate_response(self, response: Any) -> bool:
+        pass
+
     """
     Connector for JARVIS-DFT database.
     
@@ -42,18 +48,18 @@ class JarvisConnector(DatabaseConnector):
     
     # JARVIS API endpoints
     BASE_URL = "https://jarvis.nist.gov"
-    DATA_BASE_URL = "https://jarvis-materials-design.github.io/dbdocs/jarvisd"
+    DATA_BASE_URL = "https://raw.githubusercontent.com/usnistgov/jarvis-materials-design/main/dbdocs/jarvisd"
     
     # Common data files available in JARVIS
     DATA_FILES = {
-        "dft_3d": "dft_3d.json",
-        "dft_2d": "dft_2d.json", 
-        "ml_3d": "ml_3d.json",
-        "ml_2d": "ml_2d.json",
-        "cfid_3d": "cfid_3d.json",
-        "cfid_2d": "cfid_2d.json",
-        "qmof": "qmof.json",
-        "hmof": "hmof.json"
+        "jarvis_dft_3d": "dft_3d.json",
+        "jarvis_dft_2d": "dft_2d.json",
+        "jarvis_ml_3d": "ml_3d.json",
+        "jarvis_ml_2d": "ml_2d.json",
+        "jarvis_cfid_3d": "cfid_3d.json",
+        "jarvis_cfid_2d": "cfid_2d.json",
+        "jarvis_qmof": "qmof.json",
+        "jarvis_hmof": "hmof.json"
     }
     
     def __init__(

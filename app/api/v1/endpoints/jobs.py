@@ -9,7 +9,7 @@ from sqlalchemy import select, update, and_, func, desc
 from redis.asyncio import Redis
 
 from ....core.dependencies import get_database_session, get_redis_dependency
-from ....db.models import DataIngestionJob, JobLog, RawMaterialsData, ScheduledJob
+from ....db.models import Job, JobLog, RawMaterialsData, ScheduledJob
 from ....schemas import (
     JobCreate, JobResponse, JobStatus, JobProgress, JobType, JobPriority,
     JobLogResponse, PaginatedResponse, QueueStats, JobStats, ScheduleConfig
@@ -36,7 +36,7 @@ async def create_job(
         if job_data.dependencies:
             for dep_id in job_data.dependencies:
                 dep_result = await db.execute(
-                    select(DataIngestionJob).where(DataIngestionJob.id == dep_id)
+                    select(Job).where(Job.id == dep_id)
                 )
                 if not dep_result.scalar_one_or_none():
                     raise HTTPException(
@@ -45,7 +45,7 @@ async def create_job(
                     )
         
         # Create enhanced job in database
-        job = DataIngestionJob(
+        job = Job(
             id=uuid4(),
             job_type=job_data.job_type,
             source_type=job_data.source_type,
@@ -96,8 +96,8 @@ async def create_job(
             if success:
                 # Update job status to queued
                 await db.execute(
-                    update(DataIngestionJob)
-                    .where(DataIngestionJob.id == job.id)
+                    update(Job)
+                    .where(Job.id == job.id)
                     .values(status="queued")
                 )
                 await db.commit()
@@ -130,22 +130,22 @@ async def list_jobs(
     List data ingestion jobs with enhanced filtering.
     """
     try:
-        query = select(DataIngestionJob)
+        query = select(Job)
         
         # Apply filters
         if status_filter:
-            query = query.where(DataIngestionJob.status == status_filter)
+            query = query.where(Job.status == status_filter)
         
         if job_type_filter:
-            query = query.where(DataIngestionJob.job_type == job_type_filter)
+            query = query.where(Job.job_type == job_type_filter)
         
         if source_type_filter:
-            query = query.where(DataIngestionJob.source_type == source_type_filter)
+            query = query.where(Job.source_type == source_type_filter)
         
         if priority_filter:
-            query = query.where(DataIngestionJob.priority == priority_filter)
+            query = query.where(Job.priority == priority_filter)
         
-        query = query.offset(skip).limit(limit).order_by(DataIngestionJob.created_at.desc())
+        query = query.offset(skip).limit(limit).order_by(Job.created_at.desc())
         
         result = await db.execute(query)
         jobs = result.scalars().all()
@@ -170,7 +170,7 @@ async def get_job(
     """
     try:
         result = await db.execute(
-            select(DataIngestionJob).where(DataIngestionJob.id == job_id)
+            select(Job).where(Job.id == job_id)
         )
         job = result.scalar_one_or_none()
         
@@ -262,8 +262,8 @@ async def update_job_progress(
             update_values["progress"] = progress_pct
         
         await db.execute(
-            update(DataIngestionJob)
-            .where(DataIngestionJob.id == job_id)
+            update(Job)
+            .where(Job.id == job_id)
             .values(**update_values)
         )
         await db.commit()
@@ -339,11 +339,11 @@ async def cancel_job(
     try:
         # Update job status in database
         result = await db.execute(
-            update(DataIngestionJob)
+            update(Job)
             .where(
                 and_(
-                    DataIngestionJob.id == job_id,
-                    DataIngestionJob.status.in_(["created", "queued", "processing"])
+                    Job.id == job_id,
+                    Job.status.in_(["created", "queued", "processing"])
                 )
             )
             .values(status="cancelled")
@@ -390,11 +390,11 @@ async def get_job_statistics(
         
         # Count jobs by status
         status_query = select(
-            DataIngestionJob.status,
-            func.count(DataIngestionJob.id).label("count")
+            Job.status,
+            func.count(Job.id).label("count")
         ).where(
-            DataIngestionJob.created_at >= since
-        ).group_by(DataIngestionJob.status)
+            Job.created_at >= since
+        ).group_by(Job.status)
         
         result = await db.execute(status_query)
         status_counts = {row.status: row.count for row in result}
@@ -408,14 +408,14 @@ async def get_job_statistics(
         # Calculate average processing time
         avg_time_query = select(
             func.avg(
-                func.extract('epoch', DataIngestionJob.completed_at - DataIngestionJob.started_at)
+                func.extract('epoch', Job.completed_at - Job.started_at)
             ).label("avg_seconds")
         ).where(
             and_(
-                DataIngestionJob.status == "completed",
-                DataIngestionJob.started_at.isnot(None),
-                DataIngestionJob.completed_at.isnot(None),
-                DataIngestionJob.created_at >= since
+                Job.status == "completed",
+                Job.started_at.isnot(None),
+                Job.completed_at.isnot(None),
+                Job.created_at >= since
             )
         )
         
@@ -507,7 +507,7 @@ async def create_bulk_jobs(
         
         for job_data in jobs_data:
             # Create job
-            job = DataIngestionJob(
+            job = Job(
                 id=uuid4(),
                 job_type=job_data.job_type,
                 source_type=job_data.source_type,
@@ -550,8 +550,8 @@ async def create_bulk_jobs(
         queued_ids = [job.id for job in created_jobs if job.status == "queued"]
         if queued_ids:
             await db.execute(
-                update(DataIngestionJob)
-                .where(DataIngestionJob.id.in_(queued_ids))
+                update(Job)
+                .where(Job.id.in_(queued_ids))
                 .values(status="queued")
             )
             await db.commit()
@@ -587,11 +587,11 @@ async def cancel_bulk_jobs(
         
         # Update job statuses
         result = await db.execute(
-            update(DataIngestionJob)
+            update(Job)
             .where(
                 and_(
-                    DataIngestionJob.id.in_(job_ids),
-                    DataIngestionJob.status.in_(["created", "queued", "processing"])
+                    Job.id.in_(job_ids),
+                    Job.status.in_(["created", "queued", "processing"])
                 )
             )
             .values(status="cancelled", updated_at=datetime.utcnow())

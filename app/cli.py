@@ -44,8 +44,9 @@ try:
     from app.services.connectors.nomad_connector import NOMADConnector
     from app.services.job_processor import JobProcessor
     from app.services.job_scheduler import JobScheduler
-    from app.db.database import get_database
-    from app.db.models import Job, JobStatus, DataSource
+    from app.db.database import get_db_session
+    from app.db.models import Job, DataSource
+    from app.schemas import JobStatus
 except ImportError as e:
     print(f"Import error: {e}")
     print("Please ensure you're running from the project root directory")
@@ -60,23 +61,8 @@ class CLIError(Exception):
     pass
 
 
-def error_handler(func):
-    """Decorator for handling CLI errors gracefully"""
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except CLIError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Operation cancelled by user[/yellow]")
-            sys.exit(0)
-        except Exception as e:
-            console.print(f"[red]Unexpected error:[/red] {e}")
-            if click.get_current_context().obj.get('debug', False):
-                raise
-            sys.exit(1)
-    return wrapper
+
+
 
 
 @click.group()
@@ -94,7 +80,7 @@ def cli(ctx, debug, config_file):
 
 
 @cli.command()
-@click.option('--source', '-s', required=True, 
+@click.option('--source', '-s', required=True,
               type=click.Choice(['jarvis', 'nomad']),
               help='Data source to fetch from')
 @click.option('--material-id', '-m', help='Specific material ID to fetch')
@@ -104,9 +90,9 @@ def cli(ctx, debug, config_file):
 @click.option('--format', 'output_format', default='json',
               type=click.Choice(['json', 'csv', 'yaml']),
               help='Output format')
+@click.option('--dataset', default='jarvis_dft_3d', help='JARVIS dataset to use')
 @click.pass_context
-@error_handler
-def fetch_material(ctx, source, material_id, formula, elements, output, output_format):
+def fetch_material(ctx, source, material_id, formula, elements, output, output_format, dataset):
     """Fetch material data from a specific source"""
     
     with console.status(f"[bold green]Fetching material from {source.upper()}..."):
@@ -125,6 +111,8 @@ def fetch_material(ctx, source, material_id, formula, elements, output, output_f
             query_params['formula'] = formula
         if elements:
             query_params['elements'] = [e.strip() for e in elements.split(',')]
+        if dataset:
+            query_params['dataset'] = dataset
         
         if not query_params:
             raise CLIError("Must specify at least one search parameter")
@@ -182,7 +170,7 @@ def fetch_material(ctx, source, material_id, formula, elements, output, output_f
 @click.option('--output-dir', '-o', help='Output directory for results')
 @click.option('--dry-run', is_flag=True, help='Show what would be done without executing')
 @click.pass_context
-@error_handler
+
 def bulk_fetch(ctx, source, elements, limit, batch_size, output_dir, dry_run):
     """Perform bulk material fetching with progress tracking"""
     
@@ -250,12 +238,12 @@ def bulk_fetch(ctx, source, elements, limit, batch_size, output_dir, dry_run):
               type=click.Choice(['table', 'json', 'list']),
               help='Output format')
 @click.option('--status', help='Filter by source status')
-@error_handler
+
 def list_sources(output_format, status):
     """List all available data sources and their status"""
     
     # Get database session
-    db = next(get_database())
+    db = next(get_db_session())
     
     try:
         sources = db.query(DataSource).all()
@@ -315,7 +303,7 @@ def list_sources(output_format, status):
               default='all', help='Source to test')
 @click.option('--timeout', '-t', default=30, type=int,
               help='Connection timeout in seconds')
-@error_handler
+
 def test_connection(source, timeout):
     """Test connection to data sources"""
     
@@ -390,12 +378,12 @@ def test_connection(source, timeout):
 @cli.command()
 @click.option('--refresh', '-r', is_flag=True, help='Refresh queue status')
 @click.option('--watch', '-w', is_flag=True, help='Watch mode (continuous updates)')
-@error_handler
+
 def queue_status(refresh, watch):
     """Show job queue status and statistics"""
     
     def display_queue_status():
-        db = next(get_database())
+        db = next(get_db_session())
         try:
             # Get job statistics
             total_jobs = db.query(Job).count()
@@ -494,11 +482,11 @@ def queue_status(refresh, watch):
 @click.option('--dry-run', is_flag=True, help='Show what would be retried without executing')
 @click.option('--batch-size', '-b', default=10, type=int,
               help='Number of jobs to retry in each batch')
-@error_handler
+
 def retry_failed_jobs(max_age, source, dry_run, batch_size):
     """Retry failed jobs with filtering options"""
     
-    db = next(get_database())
+    db = next(get_db_session())
     try:
         # Build query for failed jobs
         cutoff_time = datetime.now() - timedelta(hours=max_age)
@@ -589,11 +577,11 @@ def retry_failed_jobs(max_age, source, dry_run, batch_size):
               type=click.Choice(['pending', 'running', 'completed', 'failed']),
               help='Filter by job status')
 @click.option('--limit', '-l', type=int, help='Maximum number of records')
-@error_handler
+
 def export_data(output_format, output, source, date_from, date_to, status, limit):
     """Export data to various formats"""
     
-    db = next(get_database())
+    db = next(get_db_session())
     try:
         # Build query
         query = db.query(Job)
@@ -683,7 +671,7 @@ def export_data(output_format, output, source, date_from, date_to, status, limit
               help='Update interval in seconds')
 @click.option('--duration', '-d', type=int,
               help='Monitoring duration in seconds (default: infinite)')
-@error_handler
+
 def monitor(interval, duration):
     """Monitor system performance and metrics"""
     
@@ -707,7 +695,7 @@ def monitor(interval, duration):
             ))
             
             # Get metrics
-            db = next(get_database())
+            db = next(get_db_session())
             try:
                 # Job metrics
                 total_jobs = db.query(Job).count()
@@ -765,7 +753,7 @@ def monitor(interval, duration):
 @click.option('--list', 'list_config', is_flag=True, help='List current configuration')
 @click.option('--set', 'set_value', help='Set configuration value (key=value)')
 @click.option('--get', 'get_key', help='Get configuration value')
-@error_handler
+
 def config(list_config, set_value, get_key):
     """Manage configuration settings"""
     

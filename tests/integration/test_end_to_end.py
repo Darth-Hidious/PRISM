@@ -12,7 +12,7 @@ from typing import List
 from uuid import uuid4
 
 from app.schemas import JobType, JobStatus, JobPriority
-from app.db.models import DataIngestionJob, RawMaterialsData
+from app.db.models import Job, RawMaterialsData
 from .fixtures import (
     assert_material_data_complete,
     assert_job_completed_successfully,

@@ -14,7 +14,7 @@ from uuid import uuid4
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import DataIngestionJob, RawMaterialsData, JobLog
+from app.db.models import Job, RawMaterialsData, JobLog
 from app.schemas import JobType, JobStatus, JobPriority
 from app.services.connectors.base_connector import StandardizedMaterial
 
@@ -159,12 +159,12 @@ class DatabaseTestHelper:
         status: JobStatus = JobStatus.PENDING,
         parameters: Dict[str, Any] = None,
         **kwargs
-    ) -> DataIngestionJob:
+    ) -> Job:
         """Create test job in database."""
         if parameters is None:
             parameters = {"material_id": "test-id"}
         
-        job = DataIngestionJob(
+        job = Job(
             id=uuid4(),
             job_type=job_type,
             source_type=source_type,
@@ -240,9 +240,9 @@ class DatabaseTestHelper:
         """Count jobs in database."""
         from sqlalchemy import select, func
         
-        query = select(func.count(DataIngestionJob.id))
+        query = select(func.count(Job.id))
         if status:
-            query = query.where(DataIngestionJob.status == status)
+            query = query.where(Job.status == status)
         
         result = await self.session.execute(query)
         return result.scalar()
@@ -495,7 +495,7 @@ def assert_material_data_complete(material: StandardizedMaterial):
     assert material.metadata.created_at is not None
 
 
-def assert_job_completed_successfully(job: DataIngestionJob):
+def assert_job_completed_successfully(job: Job):
     """Assert that job completed successfully."""
     assert job.status == JobStatus.COMPLETED
     assert job.completed_at is not None

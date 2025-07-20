@@ -7,7 +7,7 @@ from typing import Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from redis.asyncio import Redis
 
-from app.db.models import DataIngestionJob, RawMaterialsData, ScheduledJob
+from app.db.models import Job, RawMaterialsData, ScheduledJob
 from app.schemas import JobCreate, JobType, JobPriority, ScheduleConfig
 from app.services.job_processor import JobProcessor, ConnectorRegistry
 from app.services.job_scheduler import JobScheduler
@@ -105,7 +105,7 @@ class TestJobProcessor:
     ):
         """Test single material fetch job."""
         # Create job
-        job = DataIngestionJob(
+        job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
             source_type="mock",
@@ -139,7 +139,7 @@ class TestJobProcessor:
     ):
         """Test bulk fetch by formula job."""
         # Create job
-        job = DataIngestionJob(
+        job = Job(
             id=uuid4(),
             job_type=JobType.BULK_FETCH_BY_FORMULA,
             source_type="mock",
@@ -173,7 +173,7 @@ class TestJobProcessor:
     ):
         """Test job error handling and retry logic."""
         # Create job
-        job = DataIngestionJob(
+        job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
             source_type="nonexistent",
@@ -208,7 +208,7 @@ class TestJobProcessor:
     ):
         """Test job failure after max retries."""
         # Create job at max retries
-        job = DataIngestionJob(
+        job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
             source_type="nonexistent",
@@ -242,7 +242,7 @@ class TestJobProcessor:
     ):
         """Test job progress tracking."""
         # Create job
-        job = DataIngestionJob(
+        job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
             source_type="mock",
@@ -352,7 +352,7 @@ class TestJobDependencies:
     ):
         """Test job dependency checking."""
         # Create parent job
-        parent_job = DataIngestionJob(
+        parent_job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
             source_type="mock",
@@ -362,7 +362,7 @@ class TestJobDependencies:
         )
         
         # Create dependent job
-        dependent_job = DataIngestionJob(
+        dependent_job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
             source_type="mock",
@@ -388,7 +388,7 @@ class TestJobDependencies:
     ):
         """Test unresolved dependency blocking."""
         # Create parent job (not completed)
-        parent_job = DataIngestionJob(
+        parent_job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
             source_type="mock",
@@ -398,7 +398,7 @@ class TestJobDependencies:
         )
         
         # Create dependent job
-        dependent_job = DataIngestionJob(
+        dependent_job = Job(
             id=uuid4(),
             job_type=JobType.FETCH_SINGLE_MATERIAL,
             source_type="mock",

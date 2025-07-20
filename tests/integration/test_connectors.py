@@ -23,7 +23,7 @@ from sqlalchemy.pool import StaticPool
 # Import application components
 from app.core.config import Settings
 from app.db.models import (
-    Base, DataIngestionJob, JobLog, RawMaterialsData, 
+    Base, Job, JobLog, RawMaterialsData,
     JobDependency, ScheduledJob
 )
 from app.schemas import (
@@ -507,7 +507,7 @@ class TestJobSystemIntegration:
         
         with patch('httpx.AsyncClient', return_value=mock_httpx_client):
             # 1. Create job
-            job = DataIngestionJob(
+            job = Job(
                 id=uuid4(),
                 job_type=JobType.FETCH_SINGLE_MATERIAL,
                 source_type="jarvis",
@@ -561,7 +561,7 @@ class TestJobSystemIntegration:
         
         with patch('httpx.AsyncClient', return_value=mock_httpx_client):
             # Create bulk fetch job
-            job = DataIngestionJob(
+            job = Job(
                 id=uuid4(),
                 job_type=JobType.BULK_FETCH_BY_FORMULA,
                 source_type="jarvis",
@@ -614,7 +614,7 @@ class TestJobSystemIntegration:
         with patch('httpx.AsyncClient', return_value=mock_httpx_client):
             with patch('asyncio.sleep', new_callable=AsyncMock):  # Speed up test
                 # Create job
-                job = DataIngestionJob(
+                job = Job(
                     id=uuid4(),
                     job_type=JobType.FETCH_SINGLE_MATERIAL,
                     source_type="jarvis",
@@ -652,7 +652,7 @@ class TestJobSystemIntegration:
         
         with patch('httpx.AsyncClient', return_value=mock_httpx_client):
             # Create parent job
-            parent_job = DataIngestionJob(
+            parent_job = Job(
                 id=uuid4(),
                 job_type=JobType.FETCH_SINGLE_MATERIAL,
                 source_type="jarvis",
@@ -663,7 +663,7 @@ class TestJobSystemIntegration:
             )
             
             # Create child job with dependency
-            child_job = DataIngestionJob(
+            child_job = Job(
                 id=uuid4(),
                 job_type=JobType.BULK_FETCH_BY_FORMULA,
                 source_type="jarvis",
@@ -733,8 +733,8 @@ class TestSchedulerIntegration:
         
         # Verify job was created
         from sqlalchemy import select
-        query = select(DataIngestionJob).where(
-            DataIngestionJob.id == job_id
+        query = select(Job).where(
+            Job.id == job_id
         )
         result = await test_db_session.execute(query)
         created_job = result.scalar_one_or_none()
@@ -802,7 +802,7 @@ class TestPerformanceIntegration:
             # Create multiple jobs
             jobs = []
             for i in range(20):
-                job = DataIngestionJob(
+                job = Job(
                     id=uuid4(),
                     job_type=JobType.FETCH_SINGLE_MATERIAL,
                     source_type="jarvis",
@@ -854,7 +854,7 @@ class TestPerformanceIntegration:
         
         with patch('httpx.AsyncClient', return_value=mock_httpx_client):
             # Create bulk job
-            job = DataIngestionJob(
+            job = Job(
                 id=uuid4(),
                 job_type=JobType.BULK_FETCH_BY_FORMULA,
                 source_type="jarvis",

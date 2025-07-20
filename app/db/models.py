@@ -9,7 +9,7 @@ from sqlalchemy.orm import relationship
 from .database import Base
 
 
-class DataIngestionJob(Base):
+class Job(Base):
     """Enhanced data ingestion job model."""
     
     __tablename__ = "data_ingestion_jobs"

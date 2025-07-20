@@ -10,7 +10,7 @@ from sqlalchemy import select, update, and_
 from redis.asyncio import Redis
 
 from ..core.dependencies import get_database_session, get_redis_dependency
-from ..db.models import DataIngestionJob, JobLog, RawMaterialsData, JobDependency
+from ..db.models import Job, JobLog, RawMaterialsData, JobDependency
 from ..schemas import JobType, JobProgress
 from ..services.connectors.base_connector import DatabaseConnector, StandardizedMaterial
 from ..services.connectors.jarvis_connector import JarvisConnector
@@ -137,18 +137,18 @@ class JobProcessor:
         except Exception as e:
             logger.error(f"Error processing jobs: {e}")
     
-    async def _get_next_job(self) -> Optional[DataIngestionJob]:
+    async def _get_next_job(self) -> Optional[Job]:
         """Get the next job to process, considering dependencies."""
         try:
             # Get jobs with dependencies resolved
-            query = select(DataIngestionJob).where(
+            query = select(Job).where(
                 and_(
-                    DataIngestionJob.status == "queued",
+                    Job.status == "queued",
                     # Add dependency resolution logic here
                 )
             ).order_by(
-                DataIngestionJob.priority.desc(),
-                DataIngestionJob.created_at.asc()
+                Job.priority.desc(),
+                Job.created_at.asc()
             ).limit(1)
             
             result = await self.db.execute(query)
@@ -163,14 +163,14 @@ class JobProcessor:
             logger.error(f"Error getting next job: {e}")
             return None
     
-    async def _check_dependencies(self, job: DataIngestionJob) -> bool:
+    async def _check_dependencies(self, job: Job) -> bool:
         """Check if job dependencies are satisfied."""
         if not job.dependencies:
             return True
         
         try:
             for dep_job_id in job.dependencies:
-                dep_query = select(DataIngestionJob).where(DataIngestionJob.id == dep_job_id)
+                dep_query = select(Job).where(Job.id == dep_job_id)
                 dep_result = await self.db.execute(dep_query)
                 dep_job = dep_result.scalar_one_or_none()
                 
@@ -201,7 +201,7 @@ class JobProcessor:
         
         return self._connectors[connector_key]
     
-    async def _process_single_material_job(self, job: DataIngestionJob):
+    async def _process_single_material_job(self, job: Job):
         """Process single material fetch job."""
         material_id = job.source_config.get("material_id")
         if not material_id:
@@ -223,7 +223,7 @@ class JobProcessor:
         # Update progress
         await self._update_progress(job.id, 1, 1, "Material data fetched successfully")
     
-    async def _process_bulk_formula_job(self, job: DataIngestionJob):
+    async def _process_bulk_formula_job(self, job: Job):
         """Process bulk fetch by formula job."""
         formulas = job.source_config.get("formulas", [])
         formula_pattern = job.source_config.get("formula_pattern")
@@ -269,7 +269,7 @@ class JobProcessor:
             materials = await connector.search_materials(formula_pattern=formula_pattern)
             await self._store_material_data(job.id, materials)
     
-    async def _process_bulk_properties_job(self, job: DataIngestionJob):
+    async def _process_bulk_properties_job(self, job: Job):
         """Process bulk fetch by properties job."""
         property_filters = job.source_config.get("property_filters", {})
         
@@ -299,7 +299,7 @@ class JobProcessor:
                     processing_rate=rate
                 )
     
-    async def _process_sync_database_job(self, job: DataIngestionJob):
+    async def _process_sync_database_job(self, job: Job):
         """Process database sync job."""
         dataset = job.source_config.get("dataset")
         if not dataset:
@@ -332,7 +332,7 @@ class JobProcessor:
                     processing_rate=rate
                 )
     
-    async def _process_legacy_job(self, job: DataIngestionJob):
+    async def _process_legacy_job(self, job: Job):
         """Process legacy data ingestion job."""
         # Handle legacy job types for backward compatibility
         await self._log_job_event(job.id, "INFO", "Processing legacy job type")
@@ -367,8 +367,8 @@ class JobProcessor:
             update_values.update(kwargs)
             
             await self.db.execute(
-                update(DataIngestionJob)
-                .where(DataIngestionJob.id == job_id)
+                update(Job)
+                .where(Job.id == job_id)
                 .values(**update_values)
             )
             await self.db.commit()
@@ -408,8 +408,8 @@ class JobProcessor:
                     update_values["estimated_completion"] = eta
             
             await self.db.execute(
-                update(DataIngestionJob)
-                .where(DataIngestionJob.id == job_id)
+                update(Job)
+                .where(Job.id == job_id)
                 .values(**update_values)
             )
             await self.db.commit()
@@ -437,7 +437,7 @@ class JobProcessor:
             await self.db.rollback()
             logger.error(f"Error logging job event for {job_id}: {e}")
     
-    async def _handle_job_error(self, job: DataIngestionJob, error: Exception):
+    async def _handle_job_error(self, job: Job, error: Exception):
         """Handle job processing error with retry logic."""
         try:
             error_message = str(error)
@@ -460,8 +460,8 @@ class JobProcessor:
                 retry_at = datetime.utcnow() + timedelta(minutes=delay_minutes)
                 
                 await self.db.execute(
-                    update(DataIngestionJob)
-                    .where(DataIngestionJob.id == job.id)
+                    update(Job)
+                    .where(Job.id == job.id)
                     .values(
                         status="queued",
                         current_retry=next_retry,
@@ -480,8 +480,8 @@ class JobProcessor:
             else:
                 # Mark as failed
                 await self.db.execute(
-                    update(DataIngestionJob)
-                    .where(DataIngestionJob.id == job.id)
+                    update(Job)
+                    .where(Job.id == job.id)
                     .values(
                         status="failed",
                         error_message=error_message,

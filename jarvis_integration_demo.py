@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class DataIngestionJob:
+class Job:
     """
     Simulated data ingestion job for demonstration.
     In the real implementation, this would integrate with the full microservice.
@@ -246,12 +246,12 @@ class DataIngestionJob:
 
 async def create_and_run_ingestion_job(
     job_config: Dict[str, Any]
-) -> DataIngestionJob:
+) -> Job:
     """Create and execute a data ingestion job."""
     
     job_id = f"jarvis-job-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     
-    job = DataIngestionJob(job_id, job_config)
+    job = Job(job_id, job_config)
     success = await job.execute()
     
     return job
