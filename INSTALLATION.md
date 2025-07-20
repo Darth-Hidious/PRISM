@@ -11,7 +11,33 @@ curl -sSL https://raw.githubusercontent.com/Darth-Hidious/PRISM/main/quick_insta
 pip install git+https://github.com/Darth-Hidious/PRISM.git
 ```
 
-### Method 2: Local Development Installation
+### Method 2: Platform-Specific Installers
+
+#### **🐧 Linux/macOS**
+```bash
+# Clone and run installer
+git clone https://github.com/Darth-Hidious/PRISM.git
+cd PRISM
+chmod +x install.sh
+./install.sh
+```
+
+#### **🪟 Windows**
+```batch
+# Batch script (Classic Windows)
+git clone https://github.com/Darth-Hidious/PRISM.git
+cd PRISM
+install_windows.bat
+```
+
+```powershell
+# PowerShell script (Modern Windows)
+git clone https://github.com/Darth-Hidious/PRISM.git
+cd PRISM
+.\install_windows.ps1
+```
+
+### Method 3: Local Development Installation
 ```bash
 # Clone the repository
 git clone https://github.com/Darth-Hidious/PRISM.git
@@ -24,13 +50,6 @@ python quick_install.py
 uv pip install -e .
 # Or with pip
 pip install -e .
-```
-
-### Method 3: Using the Enhanced Install Script
-```bash
-# Run the interactive installer
-chmod +x install.sh
-./install.sh
 ```
 
 ## 📦 Installation Options
