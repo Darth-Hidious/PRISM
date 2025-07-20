@@ -24,14 +24,16 @@ A comprehensive materials science platform providing unified access to **2M+ mat
 ## ⚡ Quick Start
 
 ```bash
-# One-line installation
-pip install git+https://github.com/Darth-Hidious/PRISM.git
+# Clone and install (PyPI release coming soon)
+git clone https://github.com/Darth-Hidious/PRISM.git
+cd PRISM
+python quick_install.py
 
 # Launch MARC27's PRISM
-prism
+python run.py
 
 # Start searching materials
-prism search --database oqmd --elements Li,O --limit 10
+python run.py search --database oqmd --elements Li,O --limit 10
 ```
 
 ## ✨ Features
@@ -45,15 +47,19 @@ prism search --database oqmd --elements Li,O --limit 10
 
 ## 📦 Installation
 
-### Quick Install
-```bash
-# From GitHub
-pip install git+https://github.com/Darth-Hidious/PRISM.git
+> **Note**: PRISM is currently in internal testing phase. PyPI release coming soon!
 
-# Or clone and install
+### Development Install
+```bash
+# Clone repository
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
+
+# Quick setup
 python quick_install.py
+
+# Or manual install
+pip install -e .
 ```
 
 ### Platform-Specific
@@ -72,36 +78,39 @@ install_windows.bat
 ## 🚀 Usage
 
 ### Interactive Mode
+
 ```bash
 # Launch with beautiful interface
-prism
+python run.py
 
 # Interactive search
-prism search --interactive
+python run.py search --interactive
 ```
 
 ### Command Line
+
 ```bash
 # Search materials
-prism search --database nomad --elements Si,O --formation-energy -2,0
+python run.py search --database nomad --elements Si,O --formation-energy -2,0
 
 # List databases
-prism list-databases
+python run.py list-databases
 
 # Export results
-prism search --database jarvis --elements Li --export csv
+python run.py search --database jarvis --elements Li --export csv
 ```
 
 ### Getting Started
+
 ```bash
 # Built-in tutorial
-prism getting-started
+python run.py getting-started
 
 # View examples
-prism examples
+python run.py examples
 
 # Schema documentation
-prism schema --command search
+python run.py schema --command search
 ```
 
 ## 🗃️ Supported Databases

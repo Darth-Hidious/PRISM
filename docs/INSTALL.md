@@ -1,21 +1,27 @@
 # MARC27's PRISM Platform - Installation & Setup Guide
 
+> **Note**: PRISM is currently in internal testing phase. PyPI release coming soon!
+
 ## 🚀 Quick Installation
 
-### One-Line Installation (Recommended)
-```bash
-# Install from GitHub
-pip install git+https://github.com/Darth-Hidious/PRISM.git
+### Development Installation (Current)
 
-# Or clone and install
+```bash
+# Clone repository
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
+
+# Quick setup
 python quick_install.py
+
+# Or manual installation
+pip install -e .
 ```
 
 ## 🖥️ Platform-Specific Installation
 
 ### 🐧 Linux/macOS
+
 ```bash
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
@@ -26,6 +32,7 @@ chmod +x install.sh
 ### 🪟 Windows
 
 #### Command Prompt
+
 ```batch
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
@@ -33,6 +40,7 @@ install_windows.bat
 ```
 
 #### PowerShell (Recommended)
+
 ```powershell
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
@@ -57,11 +65,6 @@ uv pip install -e .
 pip install -e .
 ```
 
-### With pipx (Isolated)
-```bash
-pipx install git+https://github.com/Darth-Hidious/PRISM.git
-```
-
 ## 🔧 Development Installation
 
 ```bash
@@ -80,17 +83,17 @@ pytest
 
 ```bash
 # Check installation
-prism --version
-prism --help
+python run.py --version
+python run.py --help
 
 # Launch MARC27's PRISM
-prism
+python run.py
 
 # Test database connection
-prism list-databases
+python run.py list-databases
 
 # Interactive tutorial
-prism getting-started
+python run.py getting-started
 ```
 
 ## 🛠 Troubleshooting
