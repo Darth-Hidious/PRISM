@@ -19,19 +19,20 @@ class LLMService(ABC):
 class OpenAIService(LLMService):
     def __init__(self):
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = os.getenv("LLM_MODEL", "gpt-4o")
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.chat.completions.create(
-            model="gpt-4",
+            model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            stream=stream,
+            stream=stream
         )
 
 class VertexAIService(LLMService):
     def __init__(self):
         project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
         vertexai.init(project=project_id)
-        self.model = GenerativeModel("gemini-1.0-pro")
+        self.model = GenerativeModel(os.getenv("LLM_MODEL", "gemini-2.5-pro"))
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.model.generate_content(prompt, stream=stream)
@@ -39,14 +40,30 @@ class VertexAIService(LLMService):
 class AnthropicService(LLMService):
     def __init__(self):
         self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        self.model = os.getenv("LLM_MODEL", "claude-4-opus")
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.messages.create(
-            model="claude-3-opus-20240229",
+            model=self.model,
             max_tokens=1024,
             messages=[
                 {"role": "user", "content": prompt}
             ],
+            stream=stream
+        )
+
+class OpenRouterService(LLMService):
+    def __init__(self):
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+        )
+        self.model = os.getenv("LLM_MODEL", "OpenRouter-Free")
+
+    def get_completion(self, prompt: str, stream: bool = False):
+        return self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
             stream=stream
         )
 
@@ -57,5 +74,7 @@ def get_llm_service() -> LLMService:
         return VertexAIService()
     elif os.getenv("ANTHROPIC_API_KEY"):
         return AnthropicService()
+    elif os.getenv("OPENROUTER_API_KEY"):
+        return OpenRouterService()
     else:
         raise ValueError("No LLM provider configured.") 

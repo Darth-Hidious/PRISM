@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prism-platform"
-version = "1.0.0"
-description = "MARC27's PRISM - Platform for Research in Intelligent Synthesis of Materials"
+version = "1.1.0"
+description = "PRISM: Platform for Research in Intelligent Synthesis of Materials"
 readme = "README.md"
 authors = [{ name = "MARC27", email = "siddharthayashkovid@gmail.com" }]
 license = { text = "MIT" }
@@ -27,7 +27,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Chemistry",
     "Topic :: Scientific/Engineering :: Physics"
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.9, <3.13"
 dependencies = [
     "click",
     "rich",
