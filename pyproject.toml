@@ -29,29 +29,18 @@ classifiers = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "click>=8.0.0",
-    "rich>=13.0.0",
+    "click",
+    "rich",
+    "optimade-client",
     "sqlalchemy",
     "psycopg2-binary",
     "alembic",
     "python-dotenv",
-    "asyncpg",
     "openai",
     "google-cloud-aiplatform",
     "anthropic",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "black>=22.0.0",
-    "flake8>=5.0.0",
-    "mypy>=1.0.0",
-    "isort>=5.0.0"
-]
-notebook = [
-    "nglview",
-    "ipywidgets"
+    "pandas",
+    "tenacity",
 ]
 
 [project.scripts]
