@@ -16,21 +16,6 @@
 
 PRISM is a powerful, intuitive tool designed to streamline the process of materials discovery. It provides a single, unified interface to query dozens of major materials science databases and leverages the latest advances in AI to make your search process more natural and efficient.
 
-## Core Concepts
-
-- **OPTIMADE**: PRISM is built on the [Open Databases Integration for Materials Design (OPTIMADE)](https://www.optimade.org/) API specification. This allows PRISM to communicate with a wide range of materials databases using a single, standardized query language.
-- **MCP (Model Context Protocol)**: This is the internal system that allows PRISM to translate between human language and the structured query language of OPTIMADE. When you use the `ask` command, the MCP takes your question, uses an LLM to extract the key scientific concepts, and then constructs a precise OPTIMADE filter to find the data you need.
-- **BYOK (Bring Your Own Key)**: PRISM is designed to be used with your own API keys for various LLM providers. This ensures that you have full control over your usage and costs.
-
-## Features
-
-- **Unified Search**: Query dozens of materials databases (including Materials Project, OQMD, COD, and more) with a single `search` command.
-- **Intelligent Search (`ask`)**: Use natural language to ask questions about materials (e.g., `"Find me all materials containing cobalt and lithium"`). PRISM uses an LLM to translate your query into a precise OPTIMADE filter, searches the databases, and provides a summarized, easy-to-understand answer.
-- **Interactive Mode (`ask --interactive`)**: Refine your queries through a conversation with the built-in LLM research assistant. If your query is ambiguous, PRISM will ask you clarifying questions to help you narrow down your search.
-- **Local Database**: Save your search results to a local SQLite database for persistence, analysis, and future reference.
-- **Pluggable LLM Providers**: Bring your own API key for a variety of LLM providers, including OpenAI, Google Vertex AI, Anthropic, and OpenRouter.
-- **Provider Discovery**: List all available OPTIMADE databases with the `optimade list-dbs` command.
-
 ## Command Reference
 
 A detailed look at the available commands and their options.
@@ -122,3 +107,19 @@ Commands for generating the project documentation.
     ```bash
     prism ask "Find me materials containing titanium and oxygen"
     ```
+
+## Core Concepts
+
+- **OPTIMADE**: PRISM is built on the [Open Databases Integration for Materials Design (OPTIMADE)](https://www.optimade.org/) API specification. This allows PRISM to communicate with a wide range of materials databases using a single, standardized query language.
+- **MCP (Model Context Protocol)**: When you use the `ask` command, the MCP takes your question, uses an LLM to extract the key scientific concepts, and then constructs a precise OPTIMADE filter to find the data you need. [We'll be adding additional context to aid the LLM's contextual understanding]
+- **BYOK (Bring Your Own Key)**: PRISM is designed to be used with your own API keys for various LLM providers. This ensures that you have full control over your usage and costs.
+
+## Features
+
+- **Unified Search**: Query dozens of materials databases (including Materials Project, OQMD, COD, and more) with a single `search` command.
+- **Intelligent Search (`ask`)**: Use natural language to ask questions about materials (e.g., `"Find me all materials containing cobalt and lithium"`). PRISM uses an LLM to translate your query into a precise OPTIMADE filter, searches the databases, and provides a summarized, easy-to-understand answer.
+- **Interactive Mode (`ask --interactive`)**: Refine your queries through a conversation with the built-in LLM research assistant. If your query is ambiguous, PRISM will ask you clarifying questions to help you narrow down your search.
+- **Local Database**: Save your search results to a local SQLite database for persistence, analysis, and future reference.
+- **Pluggable LLM Providers**: Bring your own API key for a variety of LLM providers, including OpenAI, Google Vertex AI, Anthropic, and OpenRouter.
+- **Provider Discovery**: List all available OPTIMADE databases with the `optimade list-dbs` command.
+
