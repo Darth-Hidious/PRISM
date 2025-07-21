@@ -1,20 +1,18 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "prism-platform"
 version = "1.0.0"
-description = "PRISM - A comprehensive materials science data ingestion and processing platform"
+description = "MARC27's PRISM - Platform for Research in Intelligent Synthesis of Materials"
 readme = "README.md"
-license = {text = "MIT"}
-authors = [
-    {name = "PRISM Development Team", email = "dev@prism-platform.org"}
-]
+authors = [{ name = "MARC27", email = "siddharthayashkovid@gmail.com" }]
+license = { text = "MIT" }
 maintainers = [
     {name = "PRISM Development Team", email = "dev@prism-platform.org"}
 ]
-keywords = ["materials science", "data ingestion", "research tools", "scientific computing"]
+keywords = ["materials science", "optimade", "cli", "scientific computing"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -22,107 +20,62 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Chemistry",
-    "Topic :: Scientific/Engineering :: Physics",
-    "Topic :: Database :: Front-Ends",
-    "Topic :: System :: Distributed Computing",
+    "Topic :: Scientific/Engineering :: Physics"
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "click>=8.0.0",
     "rich>=13.0.0",
-    "fastapi>=0.100.0",
-    "uvicorn>=0.20.0",
-    "sqlalchemy>=2.0.0",
-    "alembic>=1.10.0",
-    "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
-    "httpx>=0.24.0",
-    "redis>=4.5.0",
-    "asyncio-throttle>=1.0.0",
-    "python-multipart>=0.0.6",
-    "python-dotenv>=1.0.0",
+    "sqlalchemy",
+    "psycopg2-binary",
+    "alembic",
+    "python-dotenv",
+    "asyncpg",
+    "openai",
+    "google-cloud-aiplatform",
+    "anthropic",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "pytest-mock>=3.10.0",
-    "pytest-cov>=4.0.0",
     "black>=22.0.0",
     "flake8>=5.0.0",
     "mypy>=1.0.0",
+    "isort>=5.0.0"
 ]
-export = [
-    "pandas>=1.5.0",
-    "openpyxl>=3.0.0",
-    "pyarrow>=10.0.0",
-]
-monitoring = [
-    "prometheus-client>=0.15.0",
-    "grafana-api>=1.0.0",
-]
-all = [
-    "prism-platform[dev,export,monitoring]"
+notebook = [
+    "nglview",
+    "ipywidgets"
 ]
 
 [project.scripts]
 prism = "app.cli:cli"
-prism-cli = "app.cli:cli"
-prism-platform = "app.cli:cli"
 
 [project.urls]
 Homepage = "https://github.com/Darth-Hidious/PRISM"
-Documentation = "https://github.com/Darth-Hidious/PRISM/wiki"
 Repository = "https://github.com/Darth-Hidious/PRISM"
 "Bug Reports" = "https://github.com/Darth-Hidious/PRISM/issues"
-Changelog = "https://github.com/Darth-Hidious/PRISM/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
-packages = ["app", "app.api", "app.core", "app.db", "app.schemas", "app.services"]
+packages = ["app", "app.services", "app.services.connectors"]
 include-package-data = true
-
-[tool.setuptools.package-data]
-"*" = ["*.txt", "*.md", "*.json", "*.yaml", "*.yml"]
 
 [tool.black]
 line-length = 88
-target-version = ['py38']
+target-version = ['py39']
 include = '\.pyi?$'
-extend-exclude = '''
-/(
-  # directories
-  \.eggs
-  | \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | build
-  | dist
-)/
-'''
 
-[tool.pytest.ini_options]
-minversion = "6.0"
-addopts = "-ra -q --strict-markers"
-testpaths = [
-    "tests",
-]
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "integration: marks tests as integration tests",
-    "unit: marks tests as unit tests",
-]
+[tool.isort]
+profile = "black"
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
