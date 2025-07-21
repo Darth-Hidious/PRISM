@@ -12,7 +12,7 @@ Follow these steps to get PRISM up and running on your system.
 
 1.  **Clone the Repository**
     ```bash
-    git clone <repository-url>
+    git clone https://github.com/Darth-Hidious/PRISM.git
     cd PRISM
     ```
 
