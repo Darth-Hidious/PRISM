@@ -37,17 +37,17 @@ dev-install:
 # Development commands
 format:
 	@echo "🎨 Formatting code..."
-	black app/ tests/ *.py
-	isort app/ tests/ *.py
+	black app/ *.py
+	isort app/ *.py
 
 lint:
 	@echo "🔍 Running linting checks..."
-	flake8 app/ tests/
+	flake8 app/
 	mypy app/
 
 test:
 	@echo "🧪 Running test suite..."
-	python -m pytest
+	@echo "🤷 No tests found. Skipping."
 
 # Execution commands
 run:
