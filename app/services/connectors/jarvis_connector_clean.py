@@ -33,7 +33,7 @@ class JarvisConnector(DatabaseConnector):
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
-        self.base_url = "https://jarvis.nist.gov/optimade/jarvisdft/v1"
+        self.base_url = "https://jarvis.nist.gov/optimade/jarvisdft"
         self.client = None
         self.connected = False
     
