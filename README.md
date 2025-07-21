@@ -1,14 +1,12 @@
 
 # PRISM: Platform for Research in Intelligent Synthesis of Materials
 
-<p align="center">
       ██████╗ ██████╗ ██╗███████╗███╗   ███╗
       ██╔══██╗██╔══██╗██║██╔════╝████╗ ████║
       ██████╔╝██████╔╝██║███████╗██╔████╔██║
       ██╔═══╝ ██╔══██╗██║╚════██║██║╚██╔╝██║
       ██║     ██║  ██║██║███████║██║ ╚═╝ ██║
       ╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚═╝
-</p>
 
 <p align="center">
     <em>A next-generation command-line interface for materials science research, powered by the OPTIMADE API network and Large Language Models.</em>
