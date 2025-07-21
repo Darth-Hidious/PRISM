@@ -84,6 +84,15 @@ def install_full_deps(venv_path):
     """Try to install full dependencies, with fallback"""
     print("🚀 Attempting full dependency installation...")
     
+    # Install all dependencies including the commonly missing ones
+    additional_packages = ["pandas", "numpy", "matplotlib", "seaborn", "scikit-learn"]
+    for package in additional_packages:
+        success, output = run_command(f"pip install {package}", f"Installing {package}", venv_path=venv_path, allow_failure=True)
+        if success:
+            print(f"✅ {package} installed successfully")
+        else:
+            print(f"⚠️  {package} installation failed, continuing...")
+    
     # Try to install from requirements.txt with fallback
     success, output = run_command("pip install -e .", "Installing PRISM package", venv_path=venv_path, allow_failure=True)
     
