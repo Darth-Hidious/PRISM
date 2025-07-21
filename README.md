@@ -16,110 +16,227 @@
 
 PRISM is a powerful, intuitive tool designed to streamline the process of materials discovery. It provides a single, unified interface to query dozens of major materials science databases and leverages the latest advances in AI to make your search process more natural and efficient.
 
-## Command Reference
+PRISM is a powerful, intelligent tool designed to revolutionize materials discovery. It provides a unified interface to query dozens of major materials science databases and leverages cutting-edge AI to make research natural, efficient, and conversational.
 
-A detailed look at the available commands and their options.
+## 🌟 Key Features
 
----
-### `prism search`
-Performs a structured search of the OPTIMADE network. This command is best for when you know the specific properties of the materials you are looking for.
+### **Intelligent Conversational Search**
+- **Dynamic Interactive Mode**: PRISM conducts intelligent conversations, asking targeted questions based on your research goals
+- **Multi-Step Reasoning**: Enable `--reason` flag for detailed scientific analysis with step-by-step reasoning
+- **Adaptive Learning**: The system learns from OPTIMADE API responses to refine filters automatically
 
-**Usage:**
+### **Unified Database Access**
+- **40+ Databases**: Access Materials Project, OQMD, COD, JARVIS, AFLOW, and many more through a single interface
+- **OPTIMADE Standard**: Built on the Open Databases Integration for Materials Design specification
+- **Smart Provider Selection**: AI automatically selects the best database for your query
+
+### **Multiple LLM Support**
+- **Currently Supported**: OpenAI, Google Vertex AI, Anthropic, OpenRouter
+- **Coming Soon**: Perplexity, Grok (xAI), Ollama (local models), PRISM Custom Model (trained on materials literature)
+- **Quick Switching**: Instantly switch between configured LLM providers
+
+### **Advanced Search Capabilities**
+- **Natural Language**: Ask questions like "Materials for space applications with high radiation resistance"
+- **Structured Search**: Traditional parameter-based searching with elements, formulas, properties
+- **Token-Optimized**: Smart conversation summarization to respect API limits
+
+## 🚀 Core Technologies
+
+- **OPTIMADE**: Industry-standard API for materials database integration
+- **MCP (Model Context Protocol)**: Intelligent system translating natural language to database queries
+- **Adaptive Filters**: Self-correcting filter generation with error feedback loops
+- **BYOK (Bring Your Own Key)**: Full control over LLM usage and costs
+
+## 📋 Command Reference
+
+### **Main Commands**
+
+#### `prism` (Interactive Mode)
+Start PRISM without arguments for an interactive session:
+```bash
+prism
+# Ask questions, press 's' to switch LLM, or Enter to exit
+```
+
+#### `prism ask` - Intelligent Natural Language Search
+```bash
+prism ask "Materials for battery electrodes" [OPTIONS]
+```
+
+**Advanced Options:**
+- `--interactive`: Dynamic conversational refinement with targeted questions
+- `--reason`: Multi-step scientific reasoning and analysis  
+- `--providers TEXT`: Specific databases to search (cod,mp,oqmd,aflow,jarvis)
+- `--debug-filter TEXT`: Developer mode - bypass LLM with direct OPTIMADE filter
+
+**Examples:**
+```bash
+# Basic natural language query
+prism ask "High entropy alloys with titanium"
+
+# Interactive consultation mode
+prism ask "Materials for space applications" --interactive
+
+# Multi-step reasoning analysis
+prism ask "Why are these materials suitable for batteries?" --reason
+
+# Target specific database
+prism ask "Perovskite structures" --providers "mp,cod"
+```
+
+#### `prism search` - Structured Parameter Search  
 ```bash
 prism search [OPTIONS]
 ```
 
 **Options:**
-- `--elements TEXT`: Comma-separated list of elements the material must contain (e.g., `"Si,O"`).
-- `--formula TEXT`: An exact chemical formula (e.g., `"SiO2"`).
-- `--nelements INTEGER`: The exact number of elements in the material.
-- `--providers TEXT`: A comma-separated list of OPTIMADE provider IDs to search. By default, it searches all providers.
+- `--elements TEXT`: Elements that must be present ("Si,O,Ti")
+- `--formula TEXT`: Exact chemical formula ("SiO2")
+- `--nelements INTEGER`: Number of elements (2 for binary compounds)
+- `--providers TEXT`: Specific databases to query
 
 **Examples:**
 ```bash
-# Find all materials containing Iron, Nickel, and Chromium
-prism search --elements "Fe,Ni,Cr"
+# Find titanium dioxide polymorphs
+prism search --formula "TiO2"
 
-# Find materials with the exact formula for silicon carbide
-prism search --formula "SiC"
+# All ternary compounds with lithium and cobalt
+prism search --elements "Li,Co" --nelements 3
 
-# Find all binary compounds containing Cobalt from the OQMD and Materials Project databases
-prism search --elements "Co" --nelements 2 --providers "oqmd,mp"
+# Iron-containing materials from OQMD only
+prism search --elements "Fe" --providers "oqmd"
 ```
----
-### `prism ask`
-Asks a question about materials science using natural language. This command is best for exploratory searches or when you are not sure of the exact chemical properties.
 
-**Usage:**
+### **Provider and Configuration**
+
+#### `prism switch-llm` - Quick LLM Provider Switching
 ```bash
-prism ask "[QUERY]" [OPTIONS]
+prism switch-llm
 ```
+- Lists all configured providers with current selection
+- Shows upcoming providers (Perplexity, Grok, Ollama, PRISM Custom)
+- One-command switching between active providers
 
-**Options:**
-- `--providers TEXT`: A comma-separated list of provider IDs to search.
-- `--interactive`: Enables a conversational mode where PRISM will ask clarifying questions to refine your search.
-
-**Examples:**
+#### `prism optimade list-dbs` - Database Discovery
 ```bash
-# General query
-prism ask "What are the known binary compounds of silicon and carbon?"
-
-# A more complex query targeting specific databases
-prism ask "high entropy alloys containing molybdenum" --providers "oqmd"
-
-# Start an interactive session to find a semiconductor
-prism ask "I need to find a good semiconductor for a high-power application" --interactive
+prism optimade list-dbs  
 ```
----
-### `prism optimade list-dbs`
-Lists all available OPTIMADE provider databases that PRISM can search. This is useful for finding the provider IDs to use with the `--providers` option in the `search` and `ask` commands.
----
-### `prism advanced`
-Advanced commands for database management and application configuration.
+- Lists all 40+ available OPTIMADE databases
+- Shows provider IDs for use with `--providers` flag
+- Real-time database availability status
 
-- `prism advanced init`: Initializes the local SQLite database. This is required if you want to save search results.
-- `prism advanced configure`: Guides you through setting up your database connection and LLM provider. This is required to use the `ask` command.
----
-### `prism docs`
-Commands for generating the project documentation.
+#### `prism advanced` - System Management
+```bash
+prism advanced configure  # Set up LLM providers and database
+prism advanced init       # Initialize local SQLite database
+```
 
-- `prism docs save-readme`: Saves this README file to the project root.
-- `prism docs save-install`: Saves the `INSTALL.md` file to the project root.
+#### `prism docs` - Documentation
+```bash
+prism docs save-readme   # Generate README.md
+prism docs save-install  # Generate INSTALL.md  
+```
 
-## Quick Start
+## 🎯 Usage Scenarios
 
-1.  **Installation**: See the `INSTALL.md` file for detailed instructions.
-2.  **Configuration**: To use the `ask` command, you must first configure your preferred LLM provider. PRISM will guide you through this process.
-    ```bash
-    prism advanced configure
-    ```
-    You will be prompted to choose an LLM provider (like OpenAI, OpenRouter, etc.) and enter your API key. For the easiest setup, we recommend the **OpenRouter** option.
+### **Research Discovery**
+```bash
+# Start broad, get refined through conversation
+prism ask "Materials for solar panels" --interactive
 
-3.  **Initialize the Database (Optional)**: If you want to save your search results, you first need to initialize the local database.
-    ```bash
-    prism advanced init
-    ```
-4.  **Run a Search**:
-    ```bash
-    prism search --elements "Ti,O" --nelements 2
-    ```
-5.  **Ask a Question**:
-    ```bash
-    prism ask "Find me materials containing titanium and oxygen"
-    ```
+Q1: Are you looking for photovoltaic materials, transparent conductors, or protective coatings?
+Your answer: Photovoltaic materials with high efficiency
 
-## Core Concepts
+Q2: What type of solar cell technology - silicon, perovskite, or organic?
+Your answer: Perovskite and silicon
 
-- **OPTIMADE**: PRISM is built on the [Open Databases Integration for Materials Design (OPTIMADE)](https://www.optimade.org/) API specification. This allows PRISM to communicate with a wide range of materials databases using a single, standardized query language.
-- **MCP (Model Context Protocol)**: When you use the `ask` command, the MCP takes your question, uses an LLM to extract the key scientific concepts, and then constructs a precise OPTIMADE filter to find the data you need. [We'll be adding additional context to aid the LLM's contextual understanding]
-- **BYOK (Bring Your Own Key)**: PRISM is designed to be used with your own API keys for various LLM providers. This ensures that you have full control over your usage and costs.
+Q3: Are you interested in single junction or tandem cell materials?
+Your answer: Tandem cells
+```
 
-## Features
+### **Property-Based Search**
+```bash
+# Multi-step reasoning for complex queries
+prism ask "Why do these materials have high thermal conductivity?" --reason
 
-- **Unified Search**: Query dozens of materials databases (including Materials Project, OQMD, COD, and more) with a single `search` command.
-- **Intelligent Search (`ask`)**: Use natural language to ask questions about materials (e.g., `"Find me all materials containing cobalt and lithium"`). PRISM uses an LLM to translate your query into a precise OPTIMADE filter, searches the databases, and provides a summarized, easy-to-understand answer.
-- **Interactive Mode (`ask --interactive`)**: Refine your queries through a conversation with the built-in LLM research assistant. If your query is ambiguous, PRISM will ask you clarifying questions to help you narrow down your search.
-- **Local Database**: Save your search results to a local SQLite database for persistence, analysis, and future reference.
-- **Pluggable LLM Providers**: Bring your own API key for a variety of LLM providers, including OpenAI, Google Vertex AI, Anthropic, and OpenRouter.
-- **Provider Discovery**: List all available OPTIMADE databases with the `optimade list-dbs` command.
+Step 1: Understanding the Query
+[Analysis of thermal conductivity factors]
 
+Step 2: Data Analysis  
+[Examination of crystal structures and bonding]
+
+Step 3: Scientific Conclusions
+[Materials science principles explaining properties]
+```
+
+### **Database-Specific Research**
+```bash
+# Target materials databases by expertise
+prism ask "Experimental crystal structures" --providers "cod"
+prism ask "DFT-calculated properties" --providers "mp,oqmd"  
+prism ask "2D materials" --providers "mcloud,twodmatpedia"
+```
+
+## 🔧 LLM Provider Configuration
+
+PRISM supports multiple LLM providers with easy switching:
+
+### **Active Providers**
+1. **OpenAI** (`OPENAI_API_KEY`): GPT-4, GPT-3.5-turbo
+2. **Google Vertex AI** (`GOOGLE_CLOUD_PROJECT`): Gemini models
+3. **Anthropic** (`ANTHROPIC_API_KEY`): Claude models  
+4. **OpenRouter** (`OPENROUTER_API_KEY`): Access to 200+ models
+
+### **Coming Soon**
+5. **Perplexity** (`PERPLEXITY_API_KEY`): Research-focused AI
+6. **Grok** (`GROK_API_KEY`): xAI's conversational model
+7. **Ollama** (`OLLAMA_HOST`): Local model deployment
+8. **PRISM Custom** (`PRISM_CUSTOM_API_KEY`): Materials science-trained model
+
+### **Quick Setup**
+```bash
+prism advanced configure
+# Choose provider → Enter API key → Ready to go!
+
+# Or switch anytime:
+prism switch-llm
+```
+
+## 🏁 Quick Start
+
+1. **Install** (see `INSTALL.md` for full details):
+   ```bash
+   git clone <repository-url>
+   cd PRISM
+   python -m venv .venv
+   .venv\Scripts\activate  # Windows
+   pip install -e .
+   ```
+
+2. **Configure LLM Provider**:
+   ```bash  
+   prism advanced configure
+   ```
+
+3. **Start Exploring**:
+   ```bash
+   prism ask "Materials for quantum computing" --interactive
+   ```
+
+## 💡 Pro Tips
+
+- **Use Interactive Mode** for exploratory research with unclear requirements
+- **Enable Reasoning** (`--reason`) for detailed scientific analysis
+- **Try Quick Switching** - press 's' from main screen to change LLM providers
+- **Target Databases** - use `--providers` to search specific repositories
+- **Save Results** - run `prism advanced init` to enable local data persistence
+
+## 🔬 Advanced Features
+
+- **Adaptive Filter Generation**: AI learns from API errors to improve query accuracy
+- **Token Optimization**: Smart conversation summarization for efficient API usage
+- **Error Recovery**: Multiple fallback strategies for robust operation
+- **Database Integration**: Save and analyze results in local SQLite database
+- **Extensible Architecture**: Ready for future LLM providers and databases
+
+Ready to revolutionize your materials research? Start with `prism` and let AI guide your discovery journey!
