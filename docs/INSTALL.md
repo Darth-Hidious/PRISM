@@ -153,6 +153,18 @@ python -m app.cli --help
 pip install fastapi uvicorn  # For web interface
 ```
 
+#### Database connection issues (NOMAD warnings)
+```bash
+# NOMAD may show data processing warnings during testing
+# This is normal for the development version and doesn't affect basic functionality
+
+# Test individual databases
+python -m app.cli test-database --database oqmd    # Usually works well
+python -m app.cli test-database --database cod     # Usually works well  
+python -m app.cli test-database --database jarvis  # Uses mock data fallback
+python -m app.cli test-database --database nomad   # May show warnings
+```
+
 #### Command not found after installation
 ```bash
 # Try module syntax

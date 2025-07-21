@@ -1369,9 +1369,14 @@ async def test_database_connections(databases):
                         test_materials = await connector.search_materials(elements=['Si'], max_results=1)
                     elif db_name == 'cod':
                         test_materials = await connector.search_materials(elements=['Si'], max_results=1)
+                    elif db_name == 'nomad':
+                        # For NOMAD - use proper keyword arguments
+                        test_materials = await connector.search_materials(elements=['Si'], limit=1)
+                    elif db_name == 'jarvis':
+                        # For JARVIS - uses different parameter names
+                        test_materials = await connector.search_materials(formula='Si', limit=1)
                     else:
-                        # For NOMAD/JARVIS
-                        test_materials = await connector.search_materials({'elements': ['Si']}, limit=1)
+                        test_materials = await connector.search_materials(elements=['Si'], limit=1)
                     
                     console.print(f"📊 Retrieved {len(test_materials)} test material(s)")
                     
