@@ -9,6 +9,7 @@ visualization, and export capabilities.
 
 import os
 import re
+import json
 from pathlib import Path
 
 import click
@@ -25,7 +26,7 @@ from app.db.database import Base, engine, get_db
 from app.db.models import Material
 from app.llm import get_llm_service
 from app.mcp import ModelContext
-from app.prompts import OPTIMADE_PROMPT
+from app.prompts import ROUTER_PROMPT, SUMMARIZATION_PROMPT
 
 # ==============================================================================
 # Setup
@@ -95,11 +96,16 @@ def search(elements, formula, nelements, providers):
         console.print("[red]Error: Please provide at least one search criterion (e.g., --elements, --formula).[/red]")
         return
     
-    optimade_filter = build_optimade_filter(
-        elements=elements.split(',') if elements else None,
-        formula=formula,
-        nelements=nelements
-    )
+    # Construct the filter string directly
+    filters = []
+    if elements:
+        elements_str = ", ".join(f'"{e.strip()}"' for e in elements.split(','))
+        filters.append(f"elements HAS ALL {elements_str}")
+    if formula:
+        filters.append(f'chemical_formula_descriptive="{formula}"')
+    if nelements:
+        filters.append(f"nelements={nelements}")
+    optimade_filter = " AND ".join(filters)
     
     console.print(Panel(f"🔍 [bold]Filter:[/bold] [cyan]{optimade_filter}[/cyan]", title="Search Query", border_style="blue"))
 
@@ -217,28 +223,44 @@ def ask(query: str, providers: str, interactive: bool, debug_filter: str):
         # If a debug filter is provided, bypass the LLM for filter generation
         if debug_filter:
             optimade_filter = debug_filter
+            provider_to_query = providers # Use the --providers flag for debug mode
         else:
             with console.status("[bold green]Generating OPTIMADE filter from your query...[/bold green]"):
-                # Use the LLM to extract key elements from the user's query
-                filter_prompt = OPTIMADE_PROMPT.format(query=query)
+                # Format the providers list for the prompt
+                provider_info = "\n".join([f'- {p["id"]}: {p["description"]}' for p in FALLBACK_PROVIDERS])
+                
+                # Use the LLM to get the provider and filter
+                filter_prompt = ROUTER_PROMPT.format(query=query, providers=provider_info)
                 filter_response = llm_service.get_completion(filter_prompt)
                 
-                # The response from the LLM can come in different formats depending on the provider
-                elements_str = ""
+                response_text = ""
                 if hasattr(filter_response, 'choices'):
-                    elements_str = filter_response.choices[0].message.content.strip()
+                    response_text = filter_response.choices[0].message.content.strip()
                 elif hasattr(filter_response, 'content'):
-                    elements_str = filter_response.content[0].text.strip()
+                    response_text = filter_response.content[0].text.strip()
                 else: # Fallback for providers that return a simple text response
-                    elements_str = filter_response.text.strip()
+                    response_text = filter_response.text.strip()
                 
-                elements = [e.strip() for e in elements_str.split(',')]
-                optimade_filter = build_optimade_filter(elements=elements)
-        
-        console.print(Panel(f"🔍 [bold]Generated Filter:[/bold] [cyan]{optimade_filter}[/cyan]", title="Query Analysis", border_style="blue"))
+                try:
+                    # The LLM sometimes returns a markdown code block, so we need to strip it
+                    response_text = re.sub(r'```json\n(.*?)\n```', r'\1', response_text, flags=re.DOTALL)
+                    route_info = json.loads(response_text)
+                    
+                    provider_to_query = route_info.get("provider")
+                    optimade_filter = route_info.get("filter")
 
-        with console.status("[bold green]Searching across the OPTIMADE network...[/bold green]"):
-            client = OptimadeClient(include_providers=providers.split(',') if providers else None)
+                    if not provider_to_query or not optimade_filter:
+                        console.print("[red]Could not determine the provider or filter from the query. Please be more specific.[/red]")
+                        return
+
+                except (json.JSONDecodeError, KeyError) as e:
+                    console.print(f"[red]Error: The LLM returned an invalid response. Details: {e}[/red]")
+                    return
+        
+        console.print(Panel(f"🔍 [bold]Provider:[/bold] [cyan]{provider_to_query}[/cyan]\n🔍 [bold]Filter:[/bold] [cyan]{optimade_filter}[/cyan]", title="Query Analysis", border_style="blue"))
+
+        with console.status(f"[bold green]Querying {provider_to_query}...[/bold green]"):
+            client = OptimadeClient(include_providers=[provider_to_query])
             search_results = client.get(optimade_filter)
         
         all_materials = []
@@ -269,7 +291,14 @@ def ask(query: str, providers: str, interactive: bool, debug_filter: str):
 
         # Use the LLM to summarize the findings
         with console.status("[bold green]Analyzing results and generating answer...[/bold green]"):
-            model_context = ModelContext(query=query, results=all_materials)
+            try:
+                with open("Schema.txt", "r") as f:
+                    schema_content = f.read()
+            except FileNotFoundError:
+                console.print("[yellow]Warning: Schema.txt not found. Proceeding without schema context.[/yellow]")
+                schema_content = None
+
+            model_context = ModelContext(query=query, results=all_materials, rag_context=schema_content)
             final_prompt = model_context.to_prompt()
             
             # Stream the response from the LLM for a better user experience

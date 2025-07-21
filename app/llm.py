@@ -58,7 +58,8 @@ class OpenRouterService(LLMService):
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
-        self.model = os.getenv("LLM_MODEL", "OpenRouter-Free")
+        # Use a known free model as the default
+        self.model = os.getenv("LLM_MODEL", "google/gemma-2-9b-it")
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.chat.completions.create(
