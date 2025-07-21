@@ -2,7 +2,12 @@
 # PRISM: Platform for Research in Intelligent Synthesis of Materials
 
 <p align="center">
-  <img src="https://i.imgur.com/your-logo-url.png" alt="PRISM Logo" width="200"/>
+      ██████╗ ██████╗ ██╗███████╗███╗   ███╗
+      ██╔══██╗██╔══██╗██║██╔════╝████╗ ████║
+      ██████╔╝██████╔╝██║███████╗██╔████╔██║
+      ██╔═══╝ ██╔══██╗██║╚════██║██║╚██╔╝██║
+      ██║     ██║  ██║██║███████║██║ ╚═╝ ██║
+      ╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚═╝
 </p>
 
 <p align="center">
