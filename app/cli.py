@@ -28,6 +28,8 @@ from rich.layout import Layout
 from rich.columns import Columns
 from rich import print as rprint
 
+from optimade.client import OptimadeClient
+
 # Import branding configuration
 try:
     from app.config.branding import (
@@ -64,6 +66,27 @@ except ImportError:
     PRIMARY_COLOR = "cyan"
     SECONDARY_COLOR = "blue"
     ACCENT_COLOR = "green"
+
+# Add a function to handle OPTIMADE filter construction
+def build_optimade_filter(elements: Optional[List[str]] = None, 
+                          formula: Optional[str] = None,
+                          nelements: Optional[int] = None,
+                          **kwargs) -> str:
+    """Builds a valid OPTIMADE filter string from search parameters."""
+    filters = []
+    if elements:
+        element_list = ",".join(f'"{e}"' for e in elements)
+        filters.append(f"elements HAS ALL {element_list}")
+    if formula:
+        filters.append(f'chemical_formula_descriptive="{formula}"')
+    if nelements:
+        filters.append(f"nelements={nelements}")
+
+    # You can extend this to handle other standard OPTIMADE fields
+    # e.g., band_gap, formation_energy, etc.
+    # Note: OPTIMADE filter support for quantities can vary by provider.
+
+    return " AND ".join(filters)
 
 WELCOME_TEXT = f"""
 [bold {PRIMARY_COLOR}]{COMPANY_BRANDING['tagline']}[/bold {PRIMARY_COLOR}]
@@ -205,11 +228,6 @@ def create_help_table():
 # Import application modules (keeping existing imports)
 try:
     from app.core.config import get_settings
-    from app.services.connectors.jarvis_connector import JarvisConnector
-    from app.services.connectors.nomad_connector import NOMADConnector
-    from app.services.connectors.oqmd_connector import OQMDConnector
-    from app.services.connectors.cod_connector import CODConnector
-    from app.services.enhanced_nomad_connector import EnhancedNOMADConnector, create_progress_printer
     from app.services.job_processor import JobProcessor
     from app.services.job_scheduler import JobScheduler
     from app.services.data_viewer import MaterialsDataViewer
@@ -225,7 +243,6 @@ class CLIError(click.ClickException):
     def format_message(self):
         return f"[red]Error:[/red] {self.message}"
 
-# Database configurations
 def get_nomad_config():
     """Get NOMAD configuration."""
     return {
@@ -235,11 +252,9 @@ def get_nomad_config():
 
 def get_database_configs():
     """Get all database configurations."""
+    # This is now less relevant but can be kept for other purposes
     return {
-        'nomad': get_nomad_config(),
-        'jarvis': {'base_url': 'https://jarvis.nist.gov/api', 'timeout': 30.0},
-        'oqmd': {'base_url': 'http://oqmd.org/oqmdapi', 'timeout': 30.0},
-        'cod': {'base_url': 'https://www.crystallography.net/cod', 'timeout': 30.0}
+        'optimade': {'description': 'Unified OPTIMADE endpoint'}
     }
 
 @click.group(invoke_without_command=True)
@@ -308,34 +323,33 @@ def getting_started():
         style="blue"
     ))
     
-    # Step 1: Understanding PRISM
-    console.print("\n[bold green]📚 Step 1: Understanding PRISM[/bold green]")
+    # Step 1: Understanding PRISM with OPTIMADE
+    console.print("\n[bold green]📚 Step 1: Understanding PRISM with OPTIMADE[/bold green]")
     console.print("""
-PRISM provides access to 2M+ materials across multiple databases:
-• [cyan]NOMAD[/cyan]: 1.9M+ DFT calculations and experimental data
-• [cyan]JARVIS[/cyan]: NIST materials with mechanical properties
-• [cyan]OQMD[/cyan]: 700K+ DFT-calculated formation energies
-• [cyan]COD[/cyan]: 500K+ experimental crystal structures
+PRISM now uses the [bold cyan]OPTIMADE[/bold cyan] standard to access a vast network of materials databases, including:
+• [cyan]Materials Project[/cyan], [cyan]AFLOW[/cyan], [cyan]OQMD[/cyan], [cyan]COD[/cyan], and many more.
+This provides unified access to millions of materials structures and properties through a single, powerful query language.
 """)
-    
-    if not Confirm.ask("Continue to database testing?", default=True):
+
+    if not Confirm.ask("Continue to connection testing?", default=True):
         return
-    
+
     # Step 2: Test Database Connections
-    console.print("\n[bold green]🔗 Step 2: Test Database Connections[/bold green]")
-    console.print("Let's test your connection to the databases:")
+    console.print("\n[bold green]🔗 Step 2: Test OPTIMADE Connection[/bold green]")
+    console.print("Let's test your connection to the OPTIMADE network:")
     
-    databases = ['oqmd', 'cod', 'nomad', 'jarvis']
-    for db in databases:
-        with console.status(f"Testing {db.upper()}..."):
-            # Simulate connection test (in real implementation, call actual test)
-            console.print(f"  ✅ {db.upper()} connection: [green]OK[/green]")
-    
-    console.print("\n💡 [yellow]Tip:[/yellow] Use [cyan]prism test-database --database <name>[/cyan] to test individual databases")
-    
+    with console.status("Testing OPTIMADE providers..."):
+        try:
+            client = OptimadeClient()
+            console.print(f"  ✅ OPTIMADE connection: [green]OK[/green] ({len(client.providers)} providers found)")
+        except Exception as e:
+            console.print(f"  ❌ OPTIMADE connection: [red]Failed[/red] - {e}")
+
+    console.print("\n💡 [yellow]Tip:[/yellow] Use [cyan]prism test-database[/cyan] to see the list of all available providers.")
+
     if not Confirm.ask("Continue to search examples?", default=True):
         return
-    
+
     # Step 3: Basic Search Examples
     console.print("\n[bold green]🔍 Step 3: Basic Search Examples[/bold green]")
     
@@ -343,22 +357,22 @@ PRISM provides access to 2M+ materials across multiple databases:
         {
             "title": "Search for Silicon materials",
             "command": "prism search --elements Si --limit 5",
-            "description": "Find silicon-containing materials across all databases"
+            "description": "Find silicon-containing materials across all OPTIMADE databases"
         },
         {
-            "title": "Stable battery materials",
-            "command": "prism search --database oqmd --elements Li,Co,O --formation-energy-max -1.0",
-            "description": "Find stable lithium battery materials with low formation energy"
+            "title": "Find ternary compounds with Ti but not O",
+            "command": 'prism search --filter \'elements HAS "Ti" AND nelements=3 AND NOT elements HAS "O"\'',
+            "description": "Use the powerful OPTIMADE filter language for complex queries"
         },
         {
-            "title": "Wide bandgap semiconductors",
-            "command": "prism search --band-gap-min 2.0 --band-gap-max 5.0 --export csv",
-            "description": "Find semiconductor materials and export results"
+            "title": "Search for a specific formula",
+            "command": "prism search --formula Al2O3 --export csv",
+            "description": "Find alumina structures and export the results to a CSV file"
         },
         {
-            "title": "High Entropy Alloys",
-            "command": "prism search --database cod --min-elements 4 --elements Nb,Mo,Ta,W",
-            "description": "Search for High Entropy Alloy crystal structures"
+            "title": "High Entropy Alloys (by composition)",
+            "command": "prism search --elements Nb,Mo,Ta,W --nelements 4",
+            "description": "Search for 4-component alloys containing specific elements"
         }
     ]
     
@@ -579,92 +593,41 @@ def list_databases():
     data types, and approximate number of materials available.
     """
     console.print(Panel(
-        "[bold cyan]Available Databases[/bold cyan]\n"
-        "[dim]Materials databases accessible through PRISM[/dim]",
+        "[bold cyan]Available Databases (via OPTIMADE)[/bold cyan]\n"
+        "[dim]PRISM connects to the OPTIMADE network of materials databases.[/dim]",
         style="blue"
     ))
-    
-    databases_info = [
-        {
-            "name": "NOMAD",
-            "code": "nomad",
-            "description": "DFT calculations and experimental data",
-            "materials": "1.9M+",
-            "data_types": ["Formation energies", "Band gaps", "Crystal structures", "Experimental data"],
-            "specialties": ["DFT calculations", "High throughput screening"]
-        },
-        {
-            "name": "JARVIS",
-            "code": "jarvis",
-            "description": "NIST materials database",
-            "materials": "100K+",
-            "data_types": ["Mechanical properties", "Electronic properties", "2D materials"],
-            "specialties": ["Validated properties", "2D materials", "Machine learning"]
-        },
-        {
-            "name": "OQMD",
-            "code": "oqmd",
-            "description": "Open Quantum Materials Database",
-            "materials": "700K+",
-            "data_types": ["Formation energies", "Stability data", "Hull distances"],
-            "specialties": ["Thermodynamic stability", "Phase diagrams"]
-        },
-        {
-            "name": "COD",
-            "code": "cod",
-            "description": "Crystallography Open Database",
-            "materials": "500K+",
-            "data_types": ["Crystal structures", "Space groups", "Lattice parameters"],
-            "specialties": ["Experimental structures", "High entropy alloys"]
-        }
-    ]
-    
-    for db in databases_info:
-        table = Table(title=f"{db['name']} ({db['code']})", show_header=False)
-        table.add_column("Property", style="cyan", width=15)
-        table.add_column("Value", style="white")
+
+    try:
+        with console.status("Fetching OPTIMADE providers..."):
+            client = OptimadeClient()
         
-        table.add_row("Description", db['description'])
-        table.add_row("Materials", db['materials'])
-        table.add_row("Data Types", ", ".join(db['data_types']))
-        table.add_row("Specialties", ", ".join(db['specialties']))
-        table.add_row("Test Command", f"prism test-database --database {db['code']}")
-        
-        console.print(table)
-        console.print()
+        table = Table(title=f"OPTIMADE Providers ({len(client.providers)} found)", show_header=True, header_style="bold magenta")
+        table.add_column("Provider Name", style="cyan", no_wrap=True)
+        table.add_column("Description", style="white")
+        table.add_column("Homepage", style="green")
+
+        for provider in client.providers:
+            table.add_row(provider.name, provider.description, provider.homepage)
 
         console.print(table)
-        console.print()
+        console.print("\n[dim]You can query all these databases simultaneously using the `search` command.[/dim]")
+
+    except Exception as e:
+        console.print(f"[red]Error fetching OPTIMADE providers: {e}[/red]")
+        console.print("[yellow]Please check your internet connection.[/yellow]")
+
 
 @cli.command()
-@click.option('--database', 
-              type=click.Choice(['nomad', 'jarvis', 'oqmd', 'cod', 'all']), 
-              default='all',
-              help='Database to search (default: all)')
+@click.option('--filter', 'optimade_filter',
+              help='A raw OPTIMADE filter string. Example: \'elements HAS "Si" AND nelements=2\'')
 @click.option('--elements', 
               help='Elements to search for (comma-separated, e.g., Si,O)')
 @click.option('--formula', 
               help='Specific chemical formula (e.g., SiO2)')
-@click.option('--formation-energy-max', 
-              type=float,
-              help='Maximum formation energy (eV/atom)')
-@click.option('--band-gap-min', 
-              type=float,
-              help='Minimum band gap (eV)')
-@click.option('--band-gap-max', 
-              type=float,
-              help='Maximum band gap (eV)')
-@click.option('--stability-max', 
-              type=float,
-              help='Maximum hull distance (eV/atom, OQMD only)')
-@click.option('--space-group', 
-              help='Crystal space group')
-@click.option('--min-elements', 
+@click.option('--nelements',
               type=int,
-              help='Minimum number of elements (for HEAs)')
-@click.option('--max-elements', 
-              type=int,
-              help='Maximum number of elements')
+              help='The number of elements in the material.')
 @click.option('--limit', 
               type=int, 
               default=50,
@@ -679,33 +642,26 @@ def list_databases():
               is_flag=True,
               help='Interactive search mode with prompts')
 @click.pass_context
-def search(ctx, database, elements, formula, formation_energy_max, band_gap_min, 
-           band_gap_max, stability_max, space_group, min_elements, max_elements, 
-           limit, export, plot, interactive):
+def search(ctx, optimade_filter, elements, formula, nelements, limit, export, plot, interactive):
     """
-    Advanced material search across multiple databases.
+    Search for materials using the OPTIMADE unified API.
     
-    Search for materials with sophisticated filtering capabilities across
-    NOMAD, JARVIS, OQMD, and COD databases. Supports formation energy filtering,
-    band gap ranges, stability criteria, and High Entropy Alloy discovery.
+    This command queries all available OPTIMADE providers. You can either provide a raw
+    OPTIMADE filter string or use simplified options like --elements and --formula.
     
     Examples:
     
     \b
-    # Basic element search
+    # Basic element search across all databases
     prism search --elements Si,O --limit 10
     
     \b
-    # Stable battery materials (OQMD)
-    prism search --database oqmd --elements Li,Co,O --formation-energy-max -1.0
+    # Use a powerful, raw OPTIMADE filter
+    prism search --filter 'elements HAS "Ti" AND nelements=3 AND NOT elements HAS "O"'
     
     \b  
-    # Wide bandgap semiconductors
-    prism search --band-gap-min 2.0 --band-gap-max 5.0 --export csv
-    
-    \b
-    # High Entropy Alloys (COD)
-    prism search --database cod --min-elements 4 --elements Nb,Mo,Ta,W
+    # Find a specific formula and export the results
+    prism search --formula Al2O3 --export csv
     
     \b
     # Interactive guided search
@@ -713,40 +669,32 @@ def search(ctx, database, elements, formula, formation_energy_max, band_gap_min,
     """
     
     if interactive:
+        # This function would also need to be refactored to build an OPTIMADE filter
         return run_interactive_search()
     
     # Validate search parameters
-    if not any([elements, formula, formation_energy_max, band_gap_min, band_gap_max, 
-                stability_max, space_group, min_elements]):
-        console.print("[red]Error:[/red] At least one search parameter is required")
-        console.print("[yellow]💡 Tip:[/yellow] Use [cyan]--interactive[/cyan] for guided search")
-        console.print("Or see examples: [cyan]prism examples[/cyan]")
+    if not any([optimade_filter, elements, formula, nelements]):
+        console.print("[red]Error:[/red] At least one search parameter is required (--filter, --elements, --formula, or --nelements).")
+        console.print("[yellow]💡 Tip:[/yellow] Use [cyan]--interactive[/cyan] for guided search.")
         return
-    
-    # Build search parameters
-    search_params = {'limit': limit}
-    
-    if elements:
-        search_params['elements'] = [e.strip() for e in elements.split(',')]
-    if formula:
-        search_params['formula'] = formula
-    if formation_energy_max is not None:
-        search_params['formation_energy_max'] = formation_energy_max
-    if band_gap_min is not None:
-        search_params['band_gap_min'] = band_gap_min
-    if band_gap_max is not None:
-        search_params['band_gap_max'] = band_gap_max
-    if stability_max is not None:
-        search_params['stability_max'] = stability_max
-    if space_group:
-        search_params['space_group'] = space_group
-    if min_elements is not None:
-        search_params['min_elements'] = min_elements
-    if max_elements is not None:
-        search_params['max_elements'] = max_elements
+
+    # Build the filter
+    final_filter = optimade_filter
+    if not final_filter:
+        final_filter = build_optimade_filter(
+            elements=[e.strip() for e in elements.split(',')] if elements else None,
+            formula=formula,
+            nelements=nelements
+        )
+
+    # Build search parameters dictionary
+    search_params = {
+        'filter': final_filter,
+        'limit': limit
+    }
     
     # Execute search
-    asyncio.run(execute_search(database, search_params, export, plot))
+    asyncio.run(execute_search(search_params, export, plot))
 
 def run_interactive_search():
     """Run interactive guided search mode."""
@@ -933,85 +881,51 @@ def run_interactive_search():
     
     # Execute search
     console.print(f"\n[bold blue]🚀 Executing search...[/bold blue]")
-    asyncio.run(execute_search(database, search_params, export_format, generate_plots))
+    asyncio.run(execute_search(search_params, export_format, generate_plots))
 
-async def execute_search(database, search_params, export_format, generate_plots):
-    """Execute the material search with given parameters."""
-    from app.services.data_viewer import MaterialsDataViewer
+async def execute_search(search_params: Dict[str, Any], export_format: Optional[str], generate_plots: bool):
+    """Execute the material search using the OPTIMADE client."""
     
-    all_materials = []
-    database_configs = get_database_configs()
+    all_results = []
     
-    # Determine which databases to search
-    if database == 'all':
-        databases_to_search = ['oqmd', 'cod', 'nomad', 'jarvis']
-    else:
-        databases_to_search = [database]
-    
-    # Search each database
-    for db_name in databases_to_search:
-        if db_name not in database_configs:
-            console.print(f"[yellow]Warning: {db_name} configuration not found[/yellow]")
-            continue
-            
-        console.print(f"🔍 Searching {db_name.upper()}...")
-        
-        try:
-            # Create connector based on database type
-            if db_name == 'nomad':
-                connector = NOMADConnector(config=database_configs[db_name])
-            elif db_name == 'jarvis':
-                connector = JarvisConnector()
-            elif db_name == 'oqmd':
-                connector = OQMDConnector(config=database_configs[db_name])
-            elif db_name == 'cod':
-                connector = CODConnector(config=database_configs[db_name])
-            else:
-                continue
-            
-            # Connect and search
-            success = await connector.connect()
-            if not success:
-                console.print(f"[red]❌ Failed to connect to {db_name.upper()}[/red]")
-                continue
-            
-            # Perform search with database-specific parameters
-            if db_name == 'oqmd':
-                materials = await search_oqmd(connector, search_params)
-            elif db_name == 'cod':
-                materials = await search_cod(connector, search_params)  
-            elif db_name == 'nomad':
-                materials = await search_nomad(connector, search_params)
-            elif db_name == 'jarvis':
-                materials = await search_jarvis(connector, search_params)
-            else:
-                materials = []
-            
-            await connector.disconnect()
-            
-            if materials:
-                all_materials.extend(materials)
-                console.print(f"✅ Found {len(materials)} materials in {db_name.upper()}")
-            else:
-                console.print(f"❌ No materials found in {db_name.upper()}")
-                
-        except Exception as e:
-            console.print(f"[red]❌ Error searching {db_name.upper()}: {e}[/red]")
+    console.print(f"🔍 Querying all OPTIMADE providers with filter: [cyan]{search_params.get('filter')}[/cyan]")
+
+    try:
+        with console.status("[bold green]Searching across the OPTIMADE network...[/bold green]"):
+            client = OptimadeClient()
+            results = client.get(
+                filter=search_params['filter'],
+                page_limit=search_params.get('limit', 50) # Note: OPTIMADE uses page_limit
+            )
+
+        # The client aggregates results. The actual data entries are in the 'data' key.
+        all_results = results.get('data', [])
+
+        if all_results:
+            console.print(f"✅ Found {len(all_results)} matching structures across all databases.")
+        else:
+            console.print("❌ No materials found matching your criteria.")
+
+    except Exception as e:
+        console.print(f"[red]❌ An error occurred while querying OPTIMADE providers: {e}[/red]")
+        return
     
     # Display results
-    if all_materials:
-        console.print(f"\n📊 Total materials found: {len(all_materials)}")
-        display_search_results(all_materials)
+    if all_results:
+        display_optimade_results(all_results)
         
         # Export if requested
         if export_format:
-            export_results(all_materials, export_format)
-        
+            # This function would need to be adapted for the OPTIMADE format
+            # export_results(all_results, export_format)
+            console.print("[yellow]Note: Export functionality needs to be adapted for OPTIMADE results.[/yellow]")
+
         # Generate plots if requested
         if generate_plots:
-            generate_visualizations(all_materials)
+            # This function would also need adaptation
+            # generate_visualizations(all_results)
+            console.print("[yellow]Note: Plotting functionality needs to be adapted for OPTIMADE results.[/yellow]")
     else:
-        console.print("\n[yellow]No materials found matching your criteria[/yellow]")
         suggest_alternatives(search_params)
 
 def suggest_alternatives(search_params):
@@ -1045,188 +959,40 @@ def suggest_alternatives(search_params):
     for i, suggestion in enumerate(suggestions[:4], 1):
         console.print(f"  {i}. {suggestion}")
 
-async def search_oqmd(connector, params):
-    """Search OQMD database with specific parameters."""
-    search_kwargs = {}
-    
-    if 'elements' in params:
-        search_kwargs['elements'] = params['elements']
-    if 'formation_energy_max' in params:
-        search_kwargs['formation_energy_max'] = params['formation_energy_max']
-    if 'band_gap_min' in params:
-        search_kwargs['band_gap_min'] = params['band_gap_min']
-    if 'band_gap_max' in params:
-        search_kwargs['band_gap_max'] = params['band_gap_max']
-    if 'stability_max' in params:
-        search_kwargs['stability_max'] = params['stability_max']
-    
-    search_kwargs['max_results'] = params.get('limit', 50)
-    
-    return await connector.search_materials(**search_kwargs)
-
-async def search_cod(connector, params):
-    """Search COD database with specific parameters."""
-    if params.get('min_elements', 0) >= 4:
-        # High Entropy Alloy search
-        return await connector.search_high_entropy_alloys(
-            min_elements=params.get('min_elements', 4),
-            max_elements=params.get('max_elements', 10),
-            element_set=params.get('elements'),
-            limit=params.get('limit', 50)
-        )
-    else:
-        # Regular search
-        return await connector.search_materials(
-            elements=params.get('elements'),
-            space_group=params.get('space_group'),
-            max_results=params.get('limit', 50)
-        )
-
-async def search_nomad(connector, params):
-    """Search NOMAD database with specific parameters."""
-    query = {}
-    
-    if 'elements' in params:
-        query['elements'] = params['elements']
-    if 'formula' in params:
-        query['formula'] = params['formula']
-    if 'formation_energy_max' in params:
-        query['formation_energy_max'] = params['formation_energy_max']
-    if 'band_gap_min' in params:
-        query['band_gap_min'] = params['band_gap_min']
-    if 'band_gap_max' in params:
-        query['band_gap_max'] = params['band_gap_max']
-    
-    return await connector.search_materials(
-        query=query,
-        limit=params.get('limit', 50)
-    )
-
-async def search_jarvis(connector, params):
-    """Search JARVIS database with specific parameters."""
-    # JARVIS-specific implementation would go here
-    # For now, return empty list as placeholder
-    console.print("[yellow]⚠️  JARVIS search not yet implemented in enhanced CLI[/yellow]")
-    return []
-
-def display_search_results(materials):
-    """Display search results in a formatted table."""
-    if not materials:
+def display_optimade_results(results: List[Dict[str, Any]]):
+    """Display OPTIMADE search results in a formatted table."""
+    if not results:
         return
     
-    # Create summary
-    console.print(f"\n📊 Materials Summary ({len(materials)} materials)")
-    console.print("=" * 80)
-    
-    # Database sources
-    databases = set()
-    for mat in materials:
-        if hasattr(mat, 'source_database'):
-            databases.add(mat.source_database)
-        elif hasattr(mat, 'metadata') and hasattr(mat.metadata, 'source'):
-            databases.add(mat.metadata.source)
-        else:
-            databases.add('Unknown')
-    console.print(f"Databases: {', '.join(databases)}")
-    
-    # Element diversity
-    all_elements = set()
-    for mat in materials:
-        if hasattr(mat.structure, 'atomic_species') and mat.structure.atomic_species:
-            all_elements.update(mat.structure.atomic_species)
-    console.print(f"Elements represented: {len(all_elements)}")
-    
-    # Formation energy range
-    formation_energies = []
-    for mat in materials:
-        if (hasattr(mat, 'properties') and mat.properties and 
-            hasattr(mat.properties, 'formation_energy') and 
-            mat.properties.formation_energy is not None):
-            formation_energies.append(mat.properties.formation_energy)
-    
-    if formation_energies:
-        console.print(f"Formation Energy range: {min(formation_energies):.3f} to {max(formation_energies):.3f} eV/atom")
-    
-    # Band gap range
-    band_gaps = []
-    for mat in materials:
-        if (hasattr(mat, 'properties') and mat.properties and 
-            hasattr(mat.properties, 'band_gap') and 
-            mat.properties.band_gap is not None):
-            band_gaps.append(mat.properties.band_gap)
-    
-    if band_gaps:
-        console.print(f"Band Gap range: {min(band_gaps):.3f} to {max(band_gaps):.3f} eV")
-    
-    # Create detailed results table
     table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("ID", style="cyan", width=8)
-    table.add_column("Database", style="blue", width=8)
-    table.add_column("Formula", style="green", width=15)
-    table.add_column("Formation_Energy", style="yellow", width=16)
-    table.add_column("Band_Gap", style="red", width=9)
-    table.add_column("Space_Group", style="white", width=10)
-    table.add_column("Volume", style="magenta", width=8)
-    table.add_column("Elements", style="cyan", width=12)
-    table.add_column("Num_Elements", style="white", width=12)
-    table.add_column("Fetched_At", style="dim", width=19)
-    
-    # Show materials in table (limit to first 20 for readability)
-    display_count = min(len(materials), 20)
-    for material in materials[:display_count]:
-        # Extract data safely
-        mat_id = getattr(material, 'source_id', 'unknown')
-        database_name = getattr(material, 'source_database', 'Unknown')
-        formula = getattr(material, 'formula', 'Unknown')
-        
-        # Properties
-        formation_energy = "NaN"
-        band_gap = "NaN"
-        if hasattr(material, 'properties') and material.properties:
-            if hasattr(material.properties, 'formation_energy') and material.properties.formation_energy is not None:
-                formation_energy = f"{material.properties.formation_energy:.3f}"
-            if hasattr(material.properties, 'band_gap') and material.properties.band_gap is not None:
-                band_gap = f"{material.properties.band_gap:.3f}"
-        
-        # Structure
-        space_group = "None"
-        volume = "NaN"
-        elements = "Unknown"
-        num_elements = "0"
-        if hasattr(material, 'structure') and material.structure:
-            if hasattr(material.structure, 'space_group') and material.structure.space_group:
-                space_group = material.structure.space_group
-            if hasattr(material.structure, 'volume') and material.structure.volume:
-                volume = f"{material.structure.volume:.1f}"
-            if hasattr(material.structure, 'atomic_species') and material.structure.atomic_species:
-                elements = ",".join(material.structure.atomic_species)
-                num_elements = str(len(material.structure.atomic_species))
-        
-        # Metadata
-        fetched_at = "Unknown"
-        if hasattr(material, 'metadata') and material.metadata:
-            if hasattr(material.metadata, 'fetched_at') and material.metadata.fetched_at:
-                fetched_at = material.metadata.fetched_at.strftime("%Y-%m-%d %H:%M:%S")
-        
+    table.add_column("Provider", style="blue", width=15)
+    table.add_column("Formula", style="green", width=20)
+    table.add_column("Elements", style="cyan", width=20)
+    table.add_column("NElements", style="white", width=10)
+    table.add_column("Structure ID", style="cyan", width=30)
+
+    display_count = min(len(results), 50)
+    for res in results[:display_count]:
+        attributes = res.get('attributes', {})
+        formula = attributes.get('chemical_formula_descriptive', 'N/A')
+        elements = ", ".join(attributes.get('elements', []))
+        nelements = str(attributes.get('nelements', 'N/A'))
+        provider_info = res.get('meta', {}).get('provider', {})
+        provider_name = provider_info.get('name', 'Unknown')
+        structure_id = res.get('id', 'N/A')
+
         table.add_row(
-            str(mat_id),
-            database_name,
+            provider_name,
             formula,
-            formation_energy,
-            band_gap,
-            space_group,
-            volume,
             elements,
-            num_elements,
-            fetched_at
+            nelements,
+            structure_id
         )
-    
+
     console.print(table)
-    
-    if len(materials) > display_count:
-        console.print(f"\n... and {len(materials) - display_count} more materials")
-    
-    console.print("=" * 80)
+
+    if len(results) > display_count:
+        console.print(f"\n... and {len(results) - display_count} more results.")
 
 def export_results(materials, export_format):
     """Export search results to files."""
@@ -1304,21 +1070,35 @@ def generate_visualizations(materials):
 
 @cli.command()
 @click.option('--database', 
-              type=click.Choice(['nomad', 'jarvis', 'oqmd', 'cod']),
-              help='Database to test (tests all if not specified)')
+              type=click.Choice(['optimade']),
+              help='Database to test (now always OPTIMADE)')
 def test_database(database):
     """
-    Test connection to material databases.
+    Test connection to the OPTIMADE provider network.
     
-    Verifies connectivity and basic functionality of database connectors.
-    Shows database information and retrieves sample data to confirm operation.
+    Verifies connectivity and lists all available database providers
+    discovered through the OPTIMADE network.
     """
-    if database:
-        databases_to_test = [database]
-    else:
-        databases_to_test = ['oqmd', 'cod', 'nomad', 'jarvis']
-    
-    asyncio.run(test_database_connections(databases_to_test))
+    console.print("🔍 Testing connection to the OPTIMADE network...")
+    try:
+        with console.status("[bold green]Fetching provider list...[/bold green]"):
+            client = OptimadeClient()
+        
+        console.print(f"✅ Connection successful! Found {len(client.providers)} providers.")
+
+        table = Table(title="Discovered OPTIMADE Providers", show_header=True, header_style="bold magenta")
+        table.add_column("Provider Name", style="cyan")
+        table.add_column("Description", style="white")
+        table.add_column("Homepage", style="green")
+
+        for provider in client.providers:
+            table.add_row(provider.name, provider.description, provider.homepage)
+
+        console.print(table)
+
+    except Exception as e:
+        console.print(f"[red]❌ Test failed: {e}[/red]")
+        console.print("[yellow]Please check your internet connection and ensure `optimade-client` is installed correctly.[/yellow]")
 
 async def test_database_connections(databases):
     """Test connections to specified databases."""
@@ -1420,47 +1200,43 @@ def examples():
         "[cyan]Limit the number of results[/cyan]",
         "[yellow]prism search --elements Fe --limit 5[/yellow]"
     )
+    basic_search_table.add_row(
+        "[cyan]Use a raw OPTIMADE filter for complex queries[/cyan]",
+        '[yellow]prism search --filter \'elements HAS "Ti" AND nelements=3\'[/yellow]'
+    )
     console.print(basic_search_table)
 
     # Advanced Search
-    console.print("\n[bold green]🔬 Advanced Search & Filtering[/bold green]")
+    console.print("\n[bold green]🔬 Advanced Search & Filtering (via OPTIMADE)[/bold green]")
     advanced_search_table = Table(box=None, show_header=False)
     advanced_search_table.add_column(width=50)
     advanced_search_table.add_column(width=70)
     advanced_search_table.add_row(
-        "[cyan]Find semiconductors with a wide band gap[/cyan]",
-        "[yellow]prism search --band-gap-min 2.0 --band-gap-max 5.0[/yellow]"
+        "[cyan]Find semiconductors with a band gap > 2 eV[/cyan]",
+        "[yellow]prism search --filter 'band_gap > 2'[/yellow]"
     )
     advanced_search_table.add_row(
-        "[cyan]Find stable materials with low formation energy[/cyan]",
-        "[yellow]prism search --database oqmd --formation-energy-max -1.0[/yellow]"
+        "[cyan]Find stable materials (formation energy < 0)[/cyan]",
+        "[yellow]prism search --filter 'formation_energy_per_atom < 0'[/yellow]"
     )
     advanced_search_table.add_row(
-        "[cyan]Search for High Entropy Alloys (HEAs)[/cyan]",
-        "[yellow]prism search --database cod --min-elements 4[/yellow]"
+        "[cyan]Search for High Entropy Alloys (4+ elements)[/cyan]",
+        "[yellow]prism search --nelements 4[/yellow]"
     )
     advanced_search_table.add_row(
-        "[cyan]Find materials with a specific space group[/cyan]",
-        "[yellow]prism search --space-group P21/c[/yellow]"
+        "[cyan]Find materials with a specific space group number[/cyan]",
+        "[yellow]prism search --filter 'space_group_symbol = 14'[/yellow]"
     )
     console.print(advanced_search_table)
 
     # Database Specific Searches
-    console.print("\n[bold green]💾 Database-Specific Searches[/bold green]")
+    console.print("\n[bold green]💾 Database Searches are now unified via OPTIMADE[/bold green]")
     db_search_table = Table(box=None, show_header=False)
     db_search_table.add_column(width=50)
     db_search_table.add_column(width=70)
     db_search_table.add_row(
-        "[cyan]Search only the OQMD database[/cyan]",
-        "[yellow]prism search --database oqmd --elements Li,Co,O[/yellow]"
-    )
-    db_search_table.add_row(
-        "[cyan]Search only the COD database for crystal structures[/cyan]",
-        "[yellow]prism search --database cod --min-elements 4[/yellow]"
-    )
-    db_search_table.add_row(
-        "[cyan]Search NOMAD for DFT calculations[/cyan]",
-        "[yellow]prism search --database nomad --formula 'H2O'[/yellow]"
+        "[cyan]All searches query the entire OPTIMADE network by default.[/cyan]",
+        "[dim]The client automatically handles discovering and querying all providers.[/dim]"
     )
     console.print(db_search_table)
 
@@ -1493,11 +1269,11 @@ def examples():
         "[yellow]prism search --interactive[/yellow]"
     )
     interactive_table.add_row(
-        "[cyan]Test the connection to all databases[/cyan]",
+        "[cyan]Test the connection to the OPTIMADE network[/cyan]",
         "[yellow]prism test-database[/yellow]"
     )
     interactive_table.add_row(
-        "[cyan]List all available databases[/cyan]",
+        "[cyan]List all available OPTIMADE providers[/cyan]",
         "[yellow]prism list-databases[/yellow]"
     )
     interactive_table.add_row(

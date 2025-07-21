@@ -1,201 +1,99 @@
-# MARC27's PRISM Platform - Installation & Setup Guide
+# PRISM Platform - Installation Guide
 
-> **Note**: PRISM is currently in internal testing phase. PyPI release coming soon!
+This guide provides simple instructions to get the PRISM command-line interface (CLI) up and running.
 
-## ⚡ One-Command Installation
+## Requirements
 
-### Quick Setup (Recommended)
+- **Python**: 3.9 or higher
+- **pip**: The Python package installer
+
+## Installation
+
+The recommended way to install PRISM is using `pip` in a virtual environment.
+
+### 1. Clone the Repository
+
+First, clone the project from GitHub:
 
 ```bash
-# Clone and run one command - handles everything automatically
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
+```
+
+### 2. Create and Activate a Virtual Environment (Recommended)
+
+Using a virtual environment prevents conflicts with other Python projects on your system.
+
+**On macOS / Linux:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+**On Windows:**
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+### 3. Install PRISM
+
+Now, install the PRISM package in "editable" mode. This allows you to use the `prism` command directly and also make changes to the code if you wish.
+
+```bash
+python -m pip install -e .
+```
+Alternatively, you can run the `quick_install.py` script, which does the same thing:
+```bash
 python quick_install.py
 ```
 
-That's it! The installer will:
-- ✅ Install all required dependencies (with fallback for compilation issues)
-- ✅ Set up the CLI interface
-- ✅ Verify everything works
-- ✅ Show you next steps
+## Verify Installation
 
-## 🚀 Alternative Installation Methods
-
-### Development Installation
+After the installation is complete, you can verify that the CLI is working by running:
 
 ```bash
-# Clone repository
-git clone https://github.com/Darth-Hidious/PRISM.git
-cd PRISM
-
-# Manual installation
-pip install -e .
-
-# Or minimal CLI-only install
-pip install click rich
+prism --help
 ```
 
-## 🖥️ Platform-Specific Installation
+This should display the main help message for the PRISM CLI, showing all available commands and options.
 
-### 🐧 Linux/macOS
+## Usage
+
+You can now use the `prism` command to interact with the platform. For example, to search for materials:
 
 ```bash
-git clone https://github.com/Darth-Hidious/PRISM.git
-cd PRISM
-chmod +x install.sh
-./install.sh
+# Search for structures containing Silicon and Oxygen
+prism search --elements Si O
+
+# Search for structures with a specific formula
+prism search --formula "SiO2"
 ```
 
-### 🪟 Windows
+## Troubleshooting
 
-#### Command Prompt
+### `command not found: prism`
 
-```batch
-git clone https://github.com/Darth-Hidious/PRISM.git
-cd PRISM
-install_windows.bat
-```
+If your shell cannot find the `prism` command after installation, it might be because the Python scripts directory is not in your system's `PATH`.
 
-#### PowerShell (Recommended)
+- **Solution 1 (Activate Virtual Environment):** Ensure your virtual environment is activated. The `prism` command will be available automatically when the venv is active.
+- **Solution 2 (Use `python -m`):** If you are not using a virtual environment, you can run the CLI as a Python module:
+  ```bash
+  python -m app.cli --help
+  ```
 
-```powershell
-git clone https://github.com/Darth-Hidious/PRISM.git
-cd PRISM
-.\install_windows.ps1
-```
+### Dependency Installation Issues
 
-## 📦 Package Manager Installation
+If you encounter errors during the installation of dependencies (e.g., related to `numpy` or `pandas`), you may be missing system-level development libraries.
 
-### With uv (Fastest)
-```bash
-# Install uv first
-curl -LsSf https://astral.sh/uv/install.sh | sh  # Linux/macOS
-# or
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"  # Windows
+- **On Debian/Ubuntu:**
+  ```bash
+  sudo apt-get update
+  sudo apt-get install python3-dev
+  ```
+- **On Fedora/CentOS:**
+  ```bash
+  sudo dnf install python3-devel
+  ```
 
-# Install PRISM
-uv pip install -e .
-```
-
-### With pip
-```bash
-pip install -e .
-```
-
-## 🔧 Development Installation
-
-```bash
-# Clone repository
-git clone https://github.com/Darth-Hidious/PRISM.git
-cd PRISM
-
-# Install with development dependencies
-pip install -e ".[dev,export,monitoring]"
-
-# Run tests
-pytest
-```
-
-## ✅ Verify Installation
-
-```bash
-# Check CLI functionality (recommended)
-python -m app.cli --help
-
-# Launch MARC27's PRISM interactive interface
-python -m app.cli
-
-# Test database connection
-python -m app.cli test-database
-
-# Interactive tutorial
-python -m app.cli getting-started
-
-# Alternative: Web server mode (requires all dependencies)
-python run.py --help
-```
-
-## 🛠 Troubleshooting
-
-### Common Issues
-
-#### Build failures on macOS (pydantic-core, asyncpg)
-```bash
-# Install Xcode command line tools
-xcode-select --install
-
-# Install Rust (for pydantic-core)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
-
-# Alternative: Use CLI mode (works without compilation)
-python -m app.cli --help
-```
-
-#### Python not found
-```bash
-# Make sure Python 3.8+ is installed
-python --version  # or python3 --version
-
-# On Windows, you might need:
-py --version
-```
-
-#### Dependencies fail to install
-```bash
-# Try minimal installation for CLI only
-pip install click rich
-
-# Test CLI functionality
-python -m app.cli --help
-
-# Install additional dependencies as needed
-pip install fastapi uvicorn  # For web interface
-```
-
-#### Database connection issues (NOMAD warnings)
-```bash
-# NOMAD may show data processing warnings during testing
-# This is normal for the development version and doesn't affect basic functionality
-
-# Test individual databases
-python -m app.cli test-database --database oqmd    # Usually works well
-python -m app.cli test-database --database cod     # Usually works well  
-python -m app.cli test-database --database jarvis  # Uses mock data fallback
-python -m app.cli test-database --database nomad   # May show warnings
-```
-
-#### Command not found after installation
-```bash
-# Try module syntax
-python -m app.cli --help
-
-# Or check PATH (restart terminal)
-echo $PATH  # Linux/macOS
-echo $env:PATH  # Windows PowerShell
-```
-
-#### Permission errors
-```bash
-# Use user installation
-pip install --user -e .
-
-# Or use virtual environment
-python -m venv venv
-source venv/bin/activate  # Linux/macOS
-venv\Scripts\activate     # Windows
-pip install -e .
-```
-
-## 📋 Requirements
-
-- **Python**: 3.8 or higher
-- **OS**: Windows 10+, macOS 10.15+, Linux (Ubuntu 18.04+)
-- **Memory**: 4GB RAM minimum
-- **Storage**: 2GB free space
-
-## 🆘 Support
-
-- **Issues**: https://github.com/Darth-Hidious/PRISM/issues
-- **Email**: team@marc27.com
-- **Documentation**: Built-in via `python -m app.cli getting-started`
+After installing the required system packages, try the installation command again.

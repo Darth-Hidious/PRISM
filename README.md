@@ -1,8 +1,4 @@
-# 🚀 MARC27's PRISM Platform
-
-**Platform for Research in Intelligent Synthesis of Materials**  
-Advanced Materials Discovery & Database Integration Platform
-
+# PRISM Platform
 ```
     ███╗   ███╗ █████╗ ██████╗  ██████╗██████╗ ███████╗
     ████╗ ████║██╔══██╗██╔══██╗██╔════╝╚════██╗╚════██║
@@ -18,180 +14,104 @@ Advanced Materials Discovery & Database Integration Platform
          ██║     ██║  ██║██║███████║██║ ╚═╝ ██║
          ╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚═╝
 ```
+**Platform for Research in Intelligent Synthesis of Materials**
 
-A comprehensive materials science platform providing unified access to **2M+ materials** across NOMAD, JARVIS, OQMD, and COD databases through a beautiful command-line interface.
+A modern, streamlined command-line interface for accessing materials science data from the [OPTIMADE Network](https://www.optimade.org/).
 
-## ⚡ Quick Start
+## Overview
 
-```bash
-# One-command installation (PyPI release coming soon)
-git clone https://github.com/Darth-Hidious/PRISM.git
-cd PRISM
-python quick_install.py
+PRISM provides a powerful and easy-to-use CLI to search, filter, and retrieve materials data from a vast, federated network of the world's leading materials databases. By leveraging the OPTIMADE standard, PRISM offers a single, unified interface to query dozens of data providers without needing to write custom code for each one.
 
-# Launch MARC27's PRISM (CLI mode - always works)
-python -m app.cli
+## Features
 
-# Start searching materials
-python -m app.cli search --database oqmd --elements Li,O --limit 10
-```
+- **Unified Search:** Access data from dozens of materials databases (Materials Project, AFLOW, OQMD, etc.) with a single command.
+- **Standardized Filtering:** Use the powerful [OPTIMADE filter language](https://www.optimade.org/optimade-python-tools/latest/how_to_guides/filtering_optimade_data/) to query by chemical formula, elements, number of elements, and more.
+- **Simple & Fast:** A clean, responsive CLI designed for materials scientists and researchers.
+- **Easy Installation:** Get up and running with a single `pip` command.
 
-## ✨ Features
+## Quick Start
 
-- 🎨 **Beautiful CLI** with MARC27's custom branding
-- 🔍 **Multi-Database Search** across NOMAD, JARVIS, OQMD, COD  
-- 📊 **Rich Data Visualization** and export capabilities
-- 🚀 **Interactive Modes** with guided tutorials
-- ⚡ **High Performance** with rate limiting and optimization
-- 🖥️ **Cross-Platform** (Windows, macOS, Linux)
-- 🛠️ **Multiple Interfaces**: CLI mode (always works) + Web interface (full dependencies)
-
-## 📦 Installation
-
-> **Note**: PRISM is currently in internal testing phase. PyPI release coming soon!
-
-### One-Command Setup
+The best way to install PRISM is using `pip` within a Python virtual environment.
 
 ```bash
-# Clone repository
+# 1. Clone the repository
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
 
-# One command handles everything!
-python quick_install.py
-```
+# 2. Create and activate a virtual environment
+# On macOS/Linux:
+python3 -m venv .venv
+source .venv/bin/activate
+# On Windows:
+# python -m venv .venv
+# .venv\Scripts\activate
 
-### Alternative Methods
-
-```bash
-# Manual installation
+# 3. Install PRISM in editable mode
 pip install -e .
 
-# Or minimal CLI-only
-pip install click rich
+# 4. Verify the installation
+prism --help
 ```
 
-### Platform-Specific
+For more detailed instructions, see the [Installation Guide](docs/INSTALL.md).
+
+## Usage
+
+Once installed, you can use the `prism` command to search for materials across the entire OPTIMADE network.
+
+### Basic Search
 
 ```bash
-# Linux/macOS
-./install.sh
+# Search for structures containing Silicon and Oxygen
+prism search --elements Si O
 
-# Windows
-install_windows.bat
-# or
-.\install_windows.ps1
+# Search for structures with a specific chemical formula
+prism search --formula "Fe2O3"
+
+# Find all binary compounds containing Cobalt
+prism search --elements Co --nelements 2
 ```
 
-📖 **Full installation guide**: [docs/INSTALL.md](docs/INSTALL.md)
+### Advanced Filtering
 
-## 🚀 Usage
-
-### Interactive Mode
+You can pass any valid OPTIMADE filter string directly to the `--filter` option for more complex queries.
 
 ```bash
-# Launch with beautiful interface
-python -m app.cli
+# Find silicon oxides with 2 or 3 atoms in the unit cell
+prism search --filter 'elements HAS ALL "Si", "O" AND natoms<=3'
 
-# Interactive search
-python -m app.cli search --interactive
+# Find materials with a specific space group number
+prism search --filter 'space_group_number=225'
 ```
 
-### Command Line
+## Development
+
+Contributions are welcome! To set up a development environment:
 
 ```bash
-# Search materials
-python -m app.cli search --database nomad --elements Si,O --formation-energy -2,0
-
-# List databases
-python -m app.cli list-databases
-
-# Export results
-python -m app.cli search --database jarvis --elements Li --export csv
-```
-
-### Getting Started
-
-```bash
-# Built-in tutorial
-python -m app.cli getting-started
-
-# View examples
-python -m app.cli examples
-
-# Schema documentation
-python -m app.cli schema --command search
-```
-
-## 🗃️ Supported Databases
-
-| Database | Materials | Specialization |
-|----------|-----------|----------------|
-| **NOMAD** | 1.9M+ | DFT calculations, experimental data |
-| **JARVIS** | 100K+ | NIST database, 2D materials |
-| **OQMD** | 700K+ | Formation energies, stability |
-| **COD** | 500K+ | Crystal structures, experimental |
-
-## 🛠️ Development
-
-```bash
-# Clone repository
+# Clone the repository
 git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
 
-# Install development dependencies
-pip install -e ".[dev,export,monitoring]"
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install in editable mode with development dependencies
+pip install -e ".[dev]"
 
 # Run tests
 pytest
-
-# Code formatting
-black app/
 ```
 
-## 📁 Project Structure
+## Contributing
 
-```
-PRISM/
-├── app/
-│   ├── cli.py              # Main CLI interface
-│   ├── config/
-│   │   └── branding.py     # MARC27 branding
-│   └── services/
-│       └── connectors/     # Database connectors
-├── docs/
-│   └── INSTALL.md          # Installation guide
-├── install_windows.bat     # Windows installer
-├── install_windows.ps1     # PowerShell installer
-├── quick_install.py        # Cross-platform installer
-└── README.md              # This file
-```
+1.  Fork the repository.
+2.  Create a feature branch (`git checkout -b feature/my-new-feature`).
+3.  Commit your changes (`git commit -am 'Add some feature'`).
+4.  Push to the branch (`git push origin feature/my-new-feature`).
+5.  Open a Pull Request.
 
-## 🤝 Contributing
+## License
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🆘 Support
-
-- 📧 **Email**: team@marc27.com
-- 🐛 **Issues**: [GitHub Issues](https://github.com/Darth-Hidious/PRISM/issues)
-- 📖 **Documentation**: Built-in via `prism getting-started`
-
-## 🙏 Acknowledgments
-
-- NOMAD Laboratory for materials data
-- NIST JARVIS database
-- OQMD and COD databases
-- Python community for excellent libraries
-
----
-
-**MARC27's PRISM Platform - Advancing Materials Science Through Data** 🔬✨
+This project is licensed under the MIT License. See the `LICENSE` file for details.
