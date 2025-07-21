@@ -14,7 +14,7 @@ Due to a temporary issue with a sub-dependency, the installation process is curr
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/MARC27/PRISM.git
+git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
 ```
 
