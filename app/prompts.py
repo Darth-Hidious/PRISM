@@ -1,29 +1,32 @@
 OPTIMADE_PROMPT = """
-You are a materials science expert. Your task is to convert a natural language
-query into a valid OPTIMADE filter.
+From the user's query, identify the chemical elements they are asking about. 
+Return ONLY a comma-separated list of the element symbols. 
+For example, if the user asks "Find materials with lithium and cobalt", you should return "Li,Co".
+If they ask for "silicon dioxide", you should return "Si,O".
 
-The user's query is: "{query}"
-
-Based on the query, you should generate an OPTIMADE filter.
-The filter should be a valid OPTIMADE filter string.
-
-Here are some examples:
-- "silicon with a band gap less than 1 eV" -> 'elements HAS "Si" AND band_gap < 1'
-- "materials containing iron and oxygen" -> 'elements HAS ALL "Fe", "O"'
-- "cubic crystal systems" -> 'crystal_system="cubic"'
-
-Now, generate the filter for the user's query.
+User Query: {query}
 """
 
 SUMMARIZATION_PROMPT = """
-You are a materials science expert. Your task is to summarize the results of an
-OPTIMADE search and answer the user's original question.
+You are a materials science research assistant. Your goal is to answer the user's query based on the provided context.
 
-The user's question was: "{query}"
+The context consists of two parts:
+1.  **Search Results**: A list of materials found in various databases that match the query.
+2.  **Additional Context**: Text retrieved from a local knowledge base (e.g., research papers, notes) that might be relevant.
 
-Here are the search results:
+Please synthesize an answer based on *both* sources of information. Prioritize the information from the Additional Context if it is relevant.
+
+---
+**User Query:** {query}
+
+---
+**Search Results from Databases:**
 {results}
 
-Based on these results, please provide a concise summary and answer the user's
-question.
+---
+**Additional Context from Local Knowledge Base:**
+{rag_context}
+---
+
+Based on all the information above, please provide a concise, natural-language answer to the user's query.
 """ 
