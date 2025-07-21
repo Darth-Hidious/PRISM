@@ -45,7 +45,7 @@ class AnthropicService(LLMService):
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.messages.create(
             model=self.model,
-            max_tokens=1024,
+            max_tokens=512,  # Reduced from 1024 to save tokens
             messages=[
                 {"role": "user", "content": prompt}
             ],
@@ -68,6 +68,39 @@ class OpenRouterService(LLMService):
             stream=stream
         )
 
+# Upcoming LLM providers - coming soon
+class PerplexityService(LLMService):
+    def __init__(self):
+        # Coming soon - Perplexity AI integration
+        raise NotImplementedError("Perplexity integration coming soon!")
+    
+    def get_completion(self, prompt: str, stream: bool = False):
+        raise NotImplementedError("Perplexity integration coming soon!")
+
+class GrokService(LLMService):
+    def __init__(self):
+        # Coming soon - Grok (xAI) integration
+        raise NotImplementedError("Grok integration coming soon!")
+    
+    def get_completion(self, prompt: str, stream: bool = False):
+        raise NotImplementedError("Grok integration coming soon!")
+
+class OllamaService(LLMService):
+    def __init__(self):
+        # Coming soon - Local Ollama model support
+        raise NotImplementedError("Ollama local model support coming soon!")
+    
+    def get_completion(self, prompt: str, stream: bool = False):
+        raise NotImplementedError("Ollama local model support coming soon!")
+
+class PRISMCustomService(LLMService):
+    def __init__(self):
+        # Coming soon - Custom PRISM model trained on materials science literature
+        raise NotImplementedError("PRISM Custom Model coming soon - trained on massive materials science corpus!")
+    
+    def get_completion(self, prompt: str, stream: bool = False):
+        raise NotImplementedError("PRISM Custom Model coming soon!")
+
 def get_llm_service() -> LLMService:
     if os.getenv("OPENAI_API_KEY"):
         return OpenAIService()
@@ -77,5 +110,14 @@ def get_llm_service() -> LLMService:
         return AnthropicService()
     elif os.getenv("OPENROUTER_API_KEY"):
         return OpenRouterService()
+    # Upcoming providers - will be enabled soon
+    elif os.getenv("PERPLEXITY_API_KEY"):
+        return PerplexityService()
+    elif os.getenv("GROK_API_KEY"):
+        return GrokService()
+    elif os.getenv("OLLAMA_HOST"):
+        return OllamaService()
+    elif os.getenv("PRISM_CUSTOM_API_KEY"):
+        return PRISMCustomService()
     else:
         raise ValueError("No LLM provider configured.") 

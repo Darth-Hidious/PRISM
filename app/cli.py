@@ -10,7 +10,10 @@ visualization, and export capabilities.
 import os
 import re
 import json
+import sys
 from pathlib import Path
+
+# Windows console encoding will be handled by Rich library fallbacks
 
 import click
 from rich.console import Console
@@ -25,13 +28,13 @@ from app.config.providers import FALLBACK_PROVIDERS
 from app.db.database import Base, engine, get_db
 from app.db.models import Material
 from app.llm import get_llm_service
-from app.mcp import ModelContext
+from app.mcp import ModelContext, AdaptiveOptimadeFilter
 from app.prompts import ROUTER_PROMPT, SUMMARIZATION_PROMPT
 
 # ==============================================================================
 # Setup
 # ==============================================================================
-console = Console()
+console = Console(force_terminal=True, width=120)
 
 # ==============================================================================
 # Helper Functions
@@ -74,10 +77,195 @@ def cli(ctx):
     Running PRISM without any subcommands will start the interactive 'ask' mode.
     """
     if ctx.invoked_subcommand is None:
-        console.print(Panel(PRISM_BRAND, style="bold blue", title="PRISM"))
-        query = Prompt.ask("[bold cyan]Ask a question about materials science[/bold cyan]", default=None)
-        if query:
-            ctx.invoke(ask, query=query)
+        try:
+            console.print(Panel(PRISM_BRAND, style="bold blue", title="PRISM"))
+        except UnicodeEncodeError:
+            # Fallback for Windows console encoding issues
+            print("=" * 80)
+            print("PRISM - Platform for Research in Intelligent Synthesis of Materials")
+            print("=" * 80)
+        
+        # Check LLM configuration status
+        try:
+            llm_service = get_llm_service()
+            llm_configured = True
+            # Determine which service is configured
+            if os.getenv("OPENAI_API_KEY"):
+                llm_provider = f"OpenAI ({llm_service.model})"
+            elif os.getenv("GOOGLE_CLOUD_PROJECT"):
+                llm_provider = f"Google Vertex AI ({llm_service.model})"
+            elif os.getenv("ANTHROPIC_API_KEY"):
+                llm_provider = f"Anthropic ({llm_service.model})"
+            elif os.getenv("OPENROUTER_API_KEY"):
+                llm_provider = f"OpenRouter ({llm_service.model})"
+            elif os.getenv("PERPLEXITY_API_KEY"):
+                llm_provider = "Perplexity (coming soon)"
+            elif os.getenv("GROK_API_KEY"):
+                llm_provider = "Grok (coming soon)"
+            elif os.getenv("OLLAMA_HOST"):
+                llm_provider = "Ollama Local (coming soon)"
+            elif os.getenv("PRISM_CUSTOM_API_KEY"):
+                llm_provider = "PRISM Custom Model (coming soon)"
+            else:
+                llm_provider = "Unknown"
+        except (ValueError, NotImplementedError):
+            llm_configured = False
+            llm_provider = "Not configured"
+        
+        # Show system status with quick switcher
+        try:
+            if llm_configured:
+                console.print(f"\n[green]STATUS:[/green] LLM Provider: [cyan]{llm_provider}[/cyan] [green]✓[/green]")
+                console.print("[dim]Quick switch: Use 'prism switch-llm' or press 's' below[/dim]")
+            else:
+                console.print(f"\n[yellow]STATUS:[/yellow] LLM Provider: [red]{llm_provider}[/red] [red]✗[/red]")
+                console.print("[yellow]Note: Run 'prism advanced configure' to set up LLM provider for 'ask' command[/yellow]")
+        except UnicodeEncodeError:
+            if llm_configured:
+                print(f"\nSTATUS: LLM Provider: {llm_provider} (configured)")
+                print("Quick switch: Use 'prism switch-llm' or press 's' below")
+            else:
+                print(f"\nSTATUS: LLM Provider: {llm_provider}")
+                print("Note: Run 'prism advanced configure' to set up LLM provider for 'ask' command")
+        
+        # Show available commands
+        try:
+            console.print("\n[bold green]Available Commands:[/bold green]")
+            console.print("• [cyan]search[/cyan]    - Search materials databases with specific criteria")
+            if llm_configured:
+                console.print("• [cyan]ask[/cyan]       - Ask questions using natural language")
+                console.print("  [dim]--interactive[/dim] - Get targeted questions to refine your search")
+                console.print("  [dim]--reason[/dim]      - Enable multi-step reasoning analysis")
+            else:
+                console.print("• [dim cyan]ask[/dim cyan]       - Ask questions using natural language [dim](requires LLM setup)[/dim]")
+            console.print("• [cyan]switch-llm[/cyan] - Quick switch between LLM providers")
+            console.print("• [cyan]optimade[/cyan]  - OPTIMADE network tools (list-dbs)")
+            console.print("• [cyan]advanced[/cyan]  - Database and configuration management")
+            console.print("• [cyan]docs[/cyan]      - Generate documentation files")
+            console.print("\nUse [cyan]prism COMMAND --help[/cyan] for detailed information about each command.")
+        except UnicodeEncodeError:
+            print("\nAvailable Commands:")
+            print("• search    - Search materials databases with specific criteria")
+            if llm_configured:
+                print("• ask       - Ask questions using natural language")
+                print("  --interactive - Get targeted questions to refine your search")
+                print("  --reason      - Enable multi-step reasoning analysis")
+            else:
+                print("• ask       - Ask questions using natural language (requires LLM setup)")
+            print("• switch-llm - Quick switch between LLM providers")
+            print("• optimade  - OPTIMADE network tools (list-dbs)")
+            print("• advanced  - Database and configuration management")
+            print("• docs      - Generate documentation files")
+            print("\nUse 'prism COMMAND --help' for detailed information about each command.")
+        
+        # Prompt for question or quick actions
+        if llm_configured:
+            try:
+                query = Prompt.ask("\n[bold cyan]Ask a question about materials science, press 's' to switch LLM, or Enter to exit[/bold cyan]", default="")
+            except UnicodeEncodeError:
+                # Fallback prompt
+                query = input("\nAsk a question about materials science, press 's' to switch LLM, or Enter to exit: ").strip()
+                    
+            if query == "s" or query.lower() == "switch":
+                ctx.invoke(switch_llm)
+            elif query:
+                ctx.invoke(ask, query=query)
+        else:
+            try:
+                console.print("\n[yellow]To use the 'ask' command, please run:[/yellow] [cyan]prism advanced configure[/cyan]")
+            except UnicodeEncodeError:
+                print("\nTo use the 'ask' command, please run: prism advanced configure")
+
+# ==============================================================================
+# 'switch-llm' Command
+# ==============================================================================
+@cli.command("switch-llm")
+def switch_llm():
+    """
+    Quick switch between configured LLM providers.
+    """
+    console.print("[bold cyan]LLM Provider Switcher[/bold cyan]")
+    
+    # Check what providers are configured
+    configured_providers = []
+    provider_mapping = {}
+    
+    if os.getenv("OPENAI_API_KEY"):
+        configured_providers.append("OpenAI")
+        provider_mapping["1"] = ("OPENAI_API_KEY", "OpenAI")
+    if os.getenv("GOOGLE_CLOUD_PROJECT"):
+        configured_providers.append("Google Vertex AI") 
+        provider_mapping[str(len(configured_providers))] = ("GOOGLE_CLOUD_PROJECT", "Google Vertex AI")
+    if os.getenv("ANTHROPIC_API_KEY"):
+        configured_providers.append("Anthropic")
+        provider_mapping[str(len(configured_providers))] = ("ANTHROPIC_API_KEY", "Anthropic")
+    if os.getenv("OPENROUTER_API_KEY"):
+        configured_providers.append("OpenRouter")
+        provider_mapping[str(len(configured_providers))] = ("OPENROUTER_API_KEY", "OpenRouter")
+    
+    # Add coming soon providers (for display only)
+    coming_soon = []
+    if os.getenv("PERPLEXITY_API_KEY"):
+        coming_soon.append("Perplexity")
+    if os.getenv("GROK_API_KEY"):
+        coming_soon.append("Grok")
+    if os.getenv("OLLAMA_HOST"):
+        coming_soon.append("Ollama Local")
+    if os.getenv("PRISM_CUSTOM_API_KEY"):
+        coming_soon.append("PRISM Custom Model")
+    
+    if not configured_providers:
+        console.print("[red]No LLM providers are configured.[/red]")
+        console.print("[yellow]Run 'prism advanced configure' to set up providers.[/yellow]")
+        return
+    
+    if len(configured_providers) == 1:
+        console.print(f"[yellow]Only one provider configured:[/yellow] [cyan]{configured_providers[0]}[/cyan]")
+        console.print("[dim]Configure additional providers with 'prism advanced configure' to enable switching.[/dim]")
+        return
+    
+    # Show current provider
+    try:
+        current_service = get_llm_service()
+        if os.getenv("OPENAI_API_KEY"):
+            current = f"OpenAI ({current_service.model})"
+        elif os.getenv("GOOGLE_CLOUD_PROJECT"):
+            current = f"Google Vertex AI ({current_service.model})"
+        elif os.getenv("ANTHROPIC_API_KEY"):
+            current = f"Anthropic ({current_service.model})"
+        elif os.getenv("OPENROUTER_API_KEY"):
+            current = f"OpenRouter ({current_service.model})"
+        else:
+            current = "Unknown"
+        console.print(f"[green]Current provider:[/green] [cyan]{current}[/cyan]")
+    except:
+        console.print("[yellow]Could not determine current provider[/yellow]")
+    
+    # Show available providers
+    console.print(f"\n[bold green]Configured Providers:[/bold green]")
+    for i, (choice, (env_var, name)) in enumerate(provider_mapping.items(), 1):
+        console.print(f"{choice}. [cyan]{name}[/cyan]")
+    
+    if coming_soon:
+        console.print(f"\n[dim]Coming Soon:[/dim]")
+        for provider in coming_soon:
+            console.print(f"• [dim]{provider} (configured but not yet supported)[/dim]")
+    
+    # Let user choose
+    try:
+        choice = Prompt.ask(f"\nSelect provider (1-{len(provider_mapping)}) or 'q' to quit", default="q")
+        if choice.lower() == 'q':
+            return
+        
+        if choice in provider_mapping:
+            env_var, provider_name = provider_mapping[choice]
+            console.print(f"[green]✓ Switched to {provider_name}[/green]")
+            console.print("[dim]Note: This shows what would happen. Actual switching between configured providers is automatic based on environment variables.[/dim]")
+        else:
+            console.print("[red]Invalid choice.[/red]")
+    
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Switch cancelled.[/yellow]")
 
 # ==============================================================================
 # 'search' Command
@@ -107,7 +295,7 @@ def search(elements, formula, nelements, providers):
         filters.append(f"nelements={nelements}")
     optimade_filter = " AND ".join(filters)
     
-    console.print(Panel(f"🔍 [bold]Filter:[/bold] [cyan]{optimade_filter}[/cyan]", title="Search Query", border_style="blue"))
+    console.print(Panel(f"[bold]Filter:[/bold] [cyan]{optimade_filter}[/cyan]", title="Search Query", border_style="blue"))
 
     try:
         with console.status("[bold green]Querying OPTIMADE providers...[/bold green]"):
@@ -123,7 +311,7 @@ def search(elements, formula, nelements, providers):
                     all_materials.extend(provider_results["data"])
 
         if all_materials:
-            console.print(f"✅ Found {len(all_materials)} materials.")
+            console.print(f"[green]SUCCESS:[/green] Found {len(all_materials)} materials.")
 
             # Display results in a table
             table = Table(show_header=True, header_style="bold magenta")
@@ -169,7 +357,7 @@ def search(elements, formula, nelements, providers):
                                 db.add(db_material)
                                 saved_ids.add(source_id)
                         db.commit()
-                    console.print("✅ Results saved to the database.")
+                    console.print("[green]SUCCESS:[/green] Results saved to the database.")
                     # Inform the user where the database is located
                     db_path = os.path.abspath(engine.url.database)
                     console.print(f"Database located at: [green]{db_path}[/green]")
@@ -177,7 +365,7 @@ def search(elements, formula, nelements, providers):
                 except Exception as e:
                     console.print(f"[bold red]An unexpected error occurred during save: {e}[/bold red]")
         else:
-            console.print("❌ No materials found for the given filter.")
+            console.print("[red]ERROR:[/red] No materials found for the given filter.")
 
     except Exception as e:
         console.print(f"[bold red]An error occurred during search: {e}[/bold red]")
@@ -189,8 +377,9 @@ def search(elements, formula, nelements, providers):
 @click.argument("query", required=False)
 @click.option('--providers', help='Comma-separated list of provider IDs (e.g., "cod,mp").')
 @click.option('--interactive', is_flag=True, help='Enable interactive mode to refine the query.')
+@click.option('--reason', is_flag=True, help='Enable reasoning mode for multi-step analysis.')
 @click.option('--debug-filter', help='(Dev) Bypass LLM and use this exact OPTIMADE filter.')
-def ask(query: str, providers: str, interactive: bool, debug_filter: str):
+def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filter: str):
     """
     Asks a question about materials science using natural language.
 
@@ -209,55 +398,70 @@ def ask(query: str, providers: str, interactive: bool, debug_filter: str):
         console.print("[yellow]Please run 'prism advanced configure' to set up an LLM provider.[/yellow]")
         return
 
-    # Interactive mode allows the user to refine the query with more filters
+    # Interactive mode conducts a dynamic conversation
     if interactive:
-        console.print("[bold cyan]Entering interactive mode...[/bold cyan]")
-        clarification = Prompt.ask(f"Your query is: '{query}'. Do you want to add any other filters (e.g., band_gap > 1, nelements=3)? If not, just press enter.")
-        if clarification:
-            query += " and " + clarification
+        console.print("[bold cyan]Entering interactive consultation mode...[/bold cyan]")
         
-        provider_list = Prompt.ask("Which providers should I search? (e.g., 'cod,mp,oqmd', press enter for all)")
-        providers = provider_list if provider_list else None
+        # Create adaptive filter generator for conversation
+        adaptive_filter = AdaptiveOptimadeFilter(llm_service, FALLBACK_PROVIDERS)
+        
+        # Conduct the interactive conversation
+        keywords, conversation_summary = adaptive_filter.conduct_interactive_conversation(query, console)
+        
+        if conversation_summary:
+            # Generate final filter from conversation
+            provider_to_query, optimade_filter = adaptive_filter.generate_final_filter_from_conversation(
+                query, keywords, conversation_summary
+            )
+            
+            if not provider_to_query or not optimade_filter:
+                console.print("[red]Could not generate filter from conversation. Falling back to direct generation.[/red]")
+                # Fall back to normal generation
+                temp_client = OptimadeClient()
+                provider_to_query, optimade_filter, error = adaptive_filter.generate_filter(query, temp_client)
+                if error:
+                    console.print(f"[red]Error: {error}[/red]")
+                    return
+        else:
+            console.print("[yellow]No conversation data collected. Using original query.[/yellow]")
+            # Fall back to normal generation
+            temp_client = OptimadeClient()
+            provider_to_query, optimade_filter, error = adaptive_filter.generate_filter(query, temp_client)
+            if error:
+                console.print(f"[red]Error: {error}[/red]")
+                return
 
     try:
         # If a debug filter is provided, bypass the LLM for filter generation
         if debug_filter:
             optimade_filter = debug_filter
             provider_to_query = providers # Use the --providers flag for debug mode
-        else:
-            with console.status("[bold green]Generating OPTIMADE filter from your query...[/bold green]"):
-                # Format the providers list for the prompt
-                provider_info = "\n".join([f'- {p["id"]}: {p["description"]}' for p in FALLBACK_PROVIDERS])
-                
-                # Use the LLM to get the provider and filter
-                filter_prompt = ROUTER_PROMPT.format(query=query, providers=provider_info)
-                filter_response = llm_service.get_completion(filter_prompt)
-                
-                response_text = ""
-                if hasattr(filter_response, 'choices'):
-                    response_text = filter_response.choices[0].message.content.strip()
-                elif hasattr(filter_response, 'content'):
-                    response_text = filter_response.content[0].text.strip()
-                else: # Fallback for providers that return a simple text response
-                    response_text = filter_response.text.strip()
-                
+        elif not interactive:
+            # Only generate filter if not in interactive mode (interactive mode already did this)
+            try:
+                console.print("[bold green]Generating and testing OPTIMADE filter...[/bold green]")
+            except UnicodeEncodeError:
+                print("Generating and testing OPTIMADE filter...")
+            
+            # Create the adaptive filter generator
+            adaptive_filter = AdaptiveOptimadeFilter(llm_service, FALLBACK_PROVIDERS)
+            
+            # Create a temporary OPTIMADE client for testing
+            temp_client = OptimadeClient()
+            
+            # Generate the filter with iterative refinement
+            provider_to_query, optimade_filter, error = adaptive_filter.generate_filter(query, temp_client)
+            
+            if error:
                 try:
-                    # The LLM sometimes returns a markdown code block, so we need to strip it
-                    response_text = re.sub(r'```json\n(.*?)\n```', r'\1', response_text, flags=re.DOTALL)
-                    route_info = json.loads(response_text)
-                    
-                    provider_to_query = route_info.get("provider")
-                    optimade_filter = route_info.get("filter")
-
-                    if not provider_to_query or not optimade_filter:
-                        console.print("[red]Could not determine the provider or filter from the query. Please be more specific.[/red]")
-                        return
-
-                except (json.JSONDecodeError, KeyError) as e:
-                    console.print(f"[red]Error: The LLM returned an invalid response. Details: {e}[/red]")
-                    return
+                    console.print(f"[red]Error: {error}[/red]")
+                    console.print("[yellow]Try rephrasing your query or being more specific about the database and elements.[/yellow]")
+                except UnicodeEncodeError:
+                    print(f"Error: {error}")
+                    print("Try rephrasing your query or being more specific about the database and elements.")
+                return
         
-        console.print(Panel(f"🔍 [bold]Provider:[/bold] [cyan]{provider_to_query}[/cyan]\n🔍 [bold]Filter:[/bold] [cyan]{optimade_filter}[/cyan]", title="Query Analysis", border_style="blue"))
+        console.print(Panel(f"[bold]Provider:[/bold] [cyan]{provider_to_query}[/cyan]\n[bold]Filter:[/bold] [cyan]{optimade_filter}[/cyan]", title="Query Analysis", border_style="blue"))
 
         with console.status(f"[bold green]Querying {provider_to_query}...[/bold green]"):
             client = OptimadeClient(include_providers=[provider_to_query])
@@ -270,11 +474,11 @@ def ask(query: str, providers: str, interactive: bool, debug_filter: str):
                     all_materials.extend(provider_results["data"])
 
         if not all_materials:
-            console.print("❌ No materials found for the generated filter.")
+            console.print("[red]ERROR:[/red] No materials found for the generated filter.")
             return
 
         # Display results in a table
-        console.print(f"✅ Found {len(all_materials)} materials. Showing top 10.")
+        console.print(f"[green]SUCCESS:[/green] Found {len(all_materials)} materials. Showing top 10.")
         table = Table(show_header=True, header_style="bold magenta")
         table.add_column("Source ID")
         table.add_column("Formula")
@@ -299,12 +503,13 @@ def ask(query: str, providers: str, interactive: bool, debug_filter: str):
                 schema_content = None
 
             model_context = ModelContext(query=query, results=all_materials, rag_context=schema_content)
-            final_prompt = model_context.to_prompt()
+            final_prompt = model_context.to_prompt(reasoning_mode=reason)
             
             # Stream the response from the LLM for a better user experience
             stream = llm_service.get_completion(final_prompt, stream=True)
 
-            console.print("\n[bold green]Answer:[/bold green]")
+            answer_title = "Reasoning Analysis" if reason else "Answer"
+            console.print(f"\n[bold green]{answer_title}:[/bold green]")
             full_response = []
             for chunk in stream:
                 content = ""
@@ -316,7 +521,10 @@ def ask(query: str, providers: str, interactive: bool, debug_filter: str):
                 
                 if content:
                     full_response.append(content)
-            console.print(Panel("".join(full_response), title="Answer", border_style="magenta", title_align="left"))
+            
+            panel_title = "Reasoning Analysis" if reason else "Answer"
+            panel_style = "cyan" if reason else "magenta"
+            console.print(Panel("".join(full_response), title=panel_title, border_style=panel_style, title_align="left"))
 
     except Exception as e:
         console.print(f"[bold red]An error occurred during 'ask': {e}[/bold red]")
@@ -334,7 +542,7 @@ def init():
     """Initializes the database, creating the necessary tables."""
     console.print("Initializing database...")
     Base.metadata.create_all(bind=engine)
-    console.print("✅ Database initialized.")
+    console.print("[green]SUCCESS:[/green] Database initialized.")
 
 @advanced.command()
 def configure():
@@ -350,6 +558,10 @@ def configure():
     console.print("2. Google Vertex AI")
     console.print("3. Anthropic")
     console.print("4. OpenRouter")
+    console.print("[dim]5. Perplexity (coming soon)[/dim]")
+    console.print("[dim]6. Grok (coming soon)[/dim]")
+    console.print("[dim]7. Ollama Local (coming soon)[/dim]")
+    console.print("[dim]8. PRISM Custom Model (coming soon)[/dim]")
     provider_choice = IntPrompt.ask("Enter the number of your provider", choices=["1", "2", "3", "4"])
     
     # Get optional model name from user
@@ -381,7 +593,7 @@ def configure():
         for key, value in env_vars.items():
             f.write(f'{key}="{value}"\n')
 
-    console.print(f"✅ Configuration saved to {env_path}")
+    console.print(f"[green]SUCCESS:[/green] Configuration saved to {env_path}")
 
 
 # ==============================================================================
@@ -396,179 +608,510 @@ README_CONTENT = """
 # PRISM: Platform for Research in Intelligent Synthesis of Materials
 
 <p align="center">
-  <img src="https://i.imgur.com/your-logo-url.png" alt="PRISM Logo" width="200"/>
-</p>
-
-<p align="center">
     <em>A next-generation command-line interface for materials science research, powered by the OPTIMADE API network and Large Language Models.</em>
 </p>
 
 ---
 
-PRISM is a powerful, intuitive tool designed to streamline the process of materials discovery. It provides a single, unified interface to query dozens of major materials science databases and leverages the latest advances in AI to make your search process more natural and efficient.
+PRISM is a powerful, intelligent tool designed to revolutionize materials discovery. It provides a unified interface to query dozens of major materials science databases and leverages cutting-edge AI to make research natural, efficient, and conversational.
 
-## Core Concepts
+## 🌟 Key Features
 
-- **OPTIMADE**: PRISM is built on the [Open Databases Integration for Materials Design (OPTIMADE)](https://www.optimade.org/) API specification. This allows PRISM to communicate with a wide range of materials databases using a single, standardized query language.
-- **MCP (Model Context Protocol)**: This is the internal system that allows PRISM to translate between human language and the structured query language of OPTIMADE. When you use the `ask` command, the MCP takes your question, uses an LLM to extract the key scientific concepts, and then constructs a precise OPTIMADE filter to find the data you need.
-- **BYOK (Bring Your Own Key)**: PRISM is designed to be used with your own API keys for various LLM providers. This ensures that you have full control over your usage and costs.
+### **Intelligent Conversational Search**
+- **Dynamic Interactive Mode**: PRISM conducts intelligent conversations, asking targeted questions based on your research goals
+- **Multi-Step Reasoning**: Enable `--reason` flag for detailed scientific analysis with step-by-step reasoning
+- **Adaptive Learning**: The system learns from OPTIMADE API responses to refine filters automatically
 
-## Features
+### **Unified Database Access**
+- **40+ Databases**: Access Materials Project, OQMD, COD, JARVIS, AFLOW, and many more through a single interface
+- **OPTIMADE Standard**: Built on the Open Databases Integration for Materials Design specification
+- **Smart Provider Selection**: AI automatically selects the best database for your query
 
-- **Unified Search**: Query dozens of materials databases (including Materials Project, OQMD, COD, and more) with a single `search` command.
-- **Intelligent Search (`ask`)**: Use natural language to ask questions about materials (e.g., `"Find me all materials containing cobalt and lithium"`). PRISM uses an LLM to translate your query into a precise OPTIMADE filter, searches the databases, and provides a summarized, easy-to-understand answer.
-- **Interactive Mode (`ask --interactive`)**: Refine your queries through a conversation with the built-in LLM research assistant. If your query is ambiguous, PRISM will ask you clarifying questions to help you narrow down your search.
-- **Local Database**: Save your search results to a local SQLite database for persistence, analysis, and future reference.
-- **Pluggable LLM Providers**: Bring your own API key for a variety of LLM providers, including OpenAI, Google Vertex AI, Anthropic, and OpenRouter.
-- **Provider Discovery**: List all available OPTIMADE databases with the `optimade list-dbs` command.
+### **Multiple LLM Support**
+- **Currently Supported**: OpenAI, Google Vertex AI, Anthropic, OpenRouter
+- **Coming Soon**: Perplexity, Grok (xAI), Ollama (local models), PRISM Custom Model (trained on materials literature)
+- **Quick Switching**: Instantly switch between configured LLM providers
 
-## Command Reference
+### **Advanced Search Capabilities**
+- **Natural Language**: Ask questions like "Materials for space applications with high radiation resistance"
+- **Structured Search**: Traditional parameter-based searching with elements, formulas, properties
+- **Token-Optimized**: Smart conversation summarization to respect API limits
 
-A detailed look at the available commands and their options.
+## 🚀 Core Technologies
 
----
-### `prism search`
-Performs a structured search of the OPTIMADE network. This command is best for when you know the specific properties of the materials you are looking for.
+- **OPTIMADE**: Industry-standard API for materials database integration
+- **MCP (Model Context Protocol)**: Intelligent system translating natural language to database queries
+- **Adaptive Filters**: Self-correcting filter generation with error feedback loops
+- **BYOK (Bring Your Own Key)**: Full control over LLM usage and costs
 
-**Usage:**
+## 📋 Command Reference
+
+### **Main Commands**
+
+#### `prism` (Interactive Mode)
+Start PRISM without arguments for an interactive session:
+```bash
+prism
+# Ask questions, press 's' to switch LLM, or Enter to exit
+```
+
+#### `prism ask` - Intelligent Natural Language Search
+```bash
+prism ask "Materials for battery electrodes" [OPTIONS]
+```
+
+**Advanced Options:**
+- `--interactive`: Dynamic conversational refinement with targeted questions
+- `--reason`: Multi-step scientific reasoning and analysis  
+- `--providers TEXT`: Specific databases to search (cod,mp,oqmd,aflow,jarvis)
+- `--debug-filter TEXT`: Developer mode - bypass LLM with direct OPTIMADE filter
+
+**Examples:**
+```bash
+# Basic natural language query
+prism ask "High entropy alloys with titanium"
+
+# Interactive consultation mode
+prism ask "Materials for space applications" --interactive
+
+# Multi-step reasoning analysis
+prism ask "Why are these materials suitable for batteries?" --reason
+
+# Target specific database
+prism ask "Perovskite structures" --providers "mp,cod"
+```
+
+#### `prism search` - Structured Parameter Search  
 ```bash
 prism search [OPTIONS]
 ```
 
 **Options:**
-- `--elements TEXT`: Comma-separated list of elements the material must contain (e.g., `"Si,O"`).
-- `--formula TEXT`: An exact chemical formula (e.g., `"SiO2"`).
-- `--nelements INTEGER`: The exact number of elements in the material.
-- `--providers TEXT`: A comma-separated list of OPTIMADE provider IDs to search. By default, it searches all providers.
+- `--elements TEXT`: Elements that must be present ("Si,O,Ti")
+- `--formula TEXT`: Exact chemical formula ("SiO2")
+- `--nelements INTEGER`: Number of elements (2 for binary compounds)
+- `--providers TEXT`: Specific databases to query
 
 **Examples:**
 ```bash
-# Find all materials containing Iron, Nickel, and Chromium
-prism search --elements "Fe,Ni,Cr"
+# Find titanium dioxide polymorphs
+prism search --formula "TiO2"
 
-# Find materials with the exact formula for silicon carbide
-prism search --formula "SiC"
+# All ternary compounds with lithium and cobalt
+prism search --elements "Li,Co" --nelements 3
 
-# Find all binary compounds containing Cobalt from the OQMD and Materials Project databases
-prism search --elements "Co" --nelements 2 --providers "oqmd,mp"
+# Iron-containing materials from OQMD only
+prism search --elements "Fe" --providers "oqmd"
 ```
----
-### `prism ask`
-Asks a question about materials science using natural language. This command is best for exploratory searches or when you are not sure of the exact chemical properties.
 
-**Usage:**
+### **Provider and Configuration**
+
+#### `prism switch-llm` - Quick LLM Provider Switching
 ```bash
-prism ask "[QUERY]" [OPTIONS]
+prism switch-llm
 ```
+- Lists all configured providers with current selection
+- Shows upcoming providers (Perplexity, Grok, Ollama, PRISM Custom)
+- One-command switching between active providers
 
-**Options:**
-- `--providers TEXT`: A comma-separated list of provider IDs to search.
-- `--interactive`: Enables a conversational mode where PRISM will ask clarifying questions to refine your search.
-
-**Examples:**
+#### `prism optimade list-dbs` - Database Discovery
 ```bash
-# General query
-prism ask "What are the known binary compounds of silicon and carbon?"
-
-# A more complex query targeting specific databases
-prism ask "high entropy alloys containing molybdenum" --providers "oqmd"
-
-# Start an interactive session to find a semiconductor
-prism ask "I need to find a good semiconductor for a high-power application" --interactive
+prism optimade list-dbs  
 ```
----
-### `prism optimade list-dbs`
-Lists all available OPTIMADE provider databases that PRISM can search. This is useful for finding the provider IDs to use with the `--providers` option in the `search` and `ask` commands.
----
-### `prism advanced`
-Advanced commands for database management and application configuration.
+- Lists all 40+ available OPTIMADE databases
+- Shows provider IDs for use with `--providers` flag
+- Real-time database availability status
 
-- `prism advanced init`: Initializes the local SQLite database. This is required if you want to save search results.
-- `prism advanced configure`: Guides you through setting up your database connection and LLM provider. This is required to use the `ask` command.
----
-### `prism docs`
-Commands for generating the project documentation.
+#### `prism advanced` - System Management
+```bash
+prism advanced configure  # Set up LLM providers and database
+prism advanced init       # Initialize local SQLite database
+```
 
-- `prism docs save-readme`: Saves this README file to the project root.
-- `prism docs save-install`: Saves the `INSTALL.md` file to the project root.
+#### `prism docs` - Documentation
+```bash
+prism docs save-readme   # Generate README.md
+prism docs save-install  # Generate INSTALL.md  
+```
 
-## Quick Start
+## 🎯 Usage Scenarios
 
-1.  **Installation**: See the `INSTALL.md` file for detailed instructions.
-2.  **Configuration**: To use the `ask` command, you must first configure your preferred LLM provider. PRISM will guide you through this process.
-    ```bash
-    prism advanced configure
-    ```
-    You will be prompted to choose an LLM provider (like OpenAI, OpenRouter, etc.) and enter your API key. For the easiest setup, we recommend the **OpenRouter** option.
+### **Research Discovery**
+```bash
+# Start broad, get refined through conversation
+prism ask "Materials for solar panels" --interactive
 
-3.  **Initialize the Database (Optional)**: If you want to save your search results, you first need to initialize the local database.
-    ```bash
-    prism advanced init
-    ```
-4.  **Run a Search**:
-    ```bash
-    prism search --elements "Ti,O" --nelements 2
-    ```
-5.  **Ask a Question**:
-    ```bash
-    prism ask "Find me materials containing titanium and oxygen"
-    ```
+Q1: Are you looking for photovoltaic materials, transparent conductors, or protective coatings?
+Your answer: Photovoltaic materials with high efficiency
+
+Q2: What type of solar cell technology - silicon, perovskite, or organic?
+Your answer: Perovskite and silicon
+
+Q3: Are you interested in single junction or tandem cell materials?
+Your answer: Tandem cells
+```
+
+### **Property-Based Search**
+```bash
+# Multi-step reasoning for complex queries
+prism ask "Why do these materials have high thermal conductivity?" --reason
+
+Step 1: Understanding the Query
+[Analysis of thermal conductivity factors]
+
+Step 2: Data Analysis  
+[Examination of crystal structures and bonding]
+
+Step 3: Scientific Conclusions
+[Materials science principles explaining properties]
+```
+
+### **Database-Specific Research**
+```bash
+# Target materials databases by expertise
+prism ask "Experimental crystal structures" --providers "cod"
+prism ask "DFT-calculated properties" --providers "mp,oqmd"  
+prism ask "2D materials" --providers "mcloud,twodmatpedia"
+```
+
+## 🔧 LLM Provider Configuration
+
+PRISM supports multiple LLM providers with easy switching:
+
+### **Active Providers**
+1. **OpenAI** (`OPENAI_API_KEY`): GPT-4, GPT-3.5-turbo
+2. **Google Vertex AI** (`GOOGLE_CLOUD_PROJECT`): Gemini models
+3. **Anthropic** (`ANTHROPIC_API_KEY`): Claude models  
+4. **OpenRouter** (`OPENROUTER_API_KEY`): Access to 200+ models
+
+### **Coming Soon**
+5. **Perplexity** (`PERPLEXITY_API_KEY`): Research-focused AI
+6. **Grok** (`GROK_API_KEY`): xAI's conversational model
+7. **Ollama** (`OLLAMA_HOST`): Local model deployment
+8. **PRISM Custom** (`PRISM_CUSTOM_API_KEY`): Materials science-trained model
+
+### **Quick Setup**
+```bash
+prism advanced configure
+# Choose provider → Enter API key → Ready to go!
+
+# Or switch anytime:
+prism switch-llm
+```
+
+## 🏁 Quick Start
+
+1. **Install** (see `INSTALL.md` for full details):
+   ```bash
+   git clone <repository-url>
+   cd PRISM
+   python -m venv .venv
+   .venv\\Scripts\\activate  # Windows
+   pip install -e .
+   ```
+
+2. **Configure LLM Provider**:
+   ```bash  
+   prism advanced configure
+   ```
+
+3. **Start Exploring**:
+   ```bash
+   prism ask "Materials for quantum computing" --interactive
+   ```
+
+## 💡 Pro Tips
+
+- **Use Interactive Mode** for exploratory research with unclear requirements
+- **Enable Reasoning** (`--reason`) for detailed scientific analysis
+- **Try Quick Switching** - press 's' from main screen to change LLM providers
+- **Target Databases** - use `--providers` to search specific repositories
+- **Save Results** - run `prism advanced init` to enable local data persistence
+
+## 🔬 Advanced Features
+
+- **Adaptive Filter Generation**: AI learns from API errors to improve query accuracy
+- **Token Optimization**: Smart conversation summarization for efficient API usage
+- **Error Recovery**: Multiple fallback strategies for robust operation
+- **Database Integration**: Save and analyze results in local SQLite database
+- **Extensible Architecture**: Ready for future LLM providers and databases
+
+Ready to revolutionize your materials research? Start with `prism` and let AI guide your discovery journey!
 """
 
 INSTALL_CONTENT = """
-# Installation Guide
+# PRISM Installation Guide
 
-Follow these steps to get PRISM up and running on your system.
+Complete setup guide for PRISM - Platform for Research in Intelligent Synthesis of Materials
 
-## Prerequisites
+## 🔧 Prerequisites
 
-- **Python**: PRISM requires Python version 3.9, 3.10, 3.11, or 3.12. It is **not** compatible with Python 3.13 or newer due to a dependency conflict.
-- **Git**: For cloning the repository.
+### **System Requirements**
+- **Python**: Version 3.9, 3.10, 3.11, or 3.12 (Python 3.13+ not supported due to dependency constraints)
+- **Operating System**: Windows, macOS, or Linux
+- **Memory**: 4GB+ RAM recommended for local models (Ollama)
+- **Storage**: ~500MB for installation and dependencies
 
-## Installation Steps
+### **Required Tools**
+- **Git**: For repository cloning
+- **Internet**: For database access and LLM API calls
 
-1.  **Clone the Repository**
-    ```bash
-    git clone <repository-url>
-    cd PRISM
-    ```
+### **LLM Provider Account** (Choose one or more)
+- [OpenAI API](https://platform.openai.com/) - GPT models
+- [Google Cloud](https://cloud.google.com/vertex-ai) - Gemini models  
+- [Anthropic](https://console.anthropic.com/) - Claude models
+- [OpenRouter](https://openrouter.ai/) - 200+ models (Recommended for beginners)
 
-2.  **Create and Activate a Virtual Environment**
-    It is highly recommended to install PRISM in a dedicated virtual environment.
-    ```bash
-    # Create the virtual environment
-    python -m venv .venv
+## 🚀 Installation Steps
 
-    # Activate it (on macOS/Linux)
-    source .venv/bin/activate
+### **Step 1: Clone the Repository**
+```bash
+git clone <repository-url>
+cd PRISM
+```
 
-    # Or on Windows
-    .\\venv\\Scripts\\activate
-    ```
+### **Step 2: Create Virtual Environment**
+**Highly recommended** to avoid dependency conflicts:
 
-3.  **Install Dependencies**
-    The project uses `pyproject.toml` to manage dependencies. Install the project in editable mode, which will also install all required packages.
-    ```bash
-    pip install -e .
-    ```
+```bash
+# Create virtual environment
+python -m venv .venv
 
-4.  **Configure PRISM**
-    Before you can use the `ask` command, you need to configure your preferred LLM provider.
-    ```bash
-    prism advanced configure
-    ```
-    This will prompt you to select a provider and enter your API key. 
-    
-    **💡 Tip:** For the quickest start, we recommend choosing the **OpenRouter** option. It's free and only requires a single API key to get started.
+# Activate (Windows)
+.venv\\Scripts\\activate
 
-5.  **Initialize the Database (Optional but Recommended)**
-    To save search results, you need to initialize the local SQLite database.
-    ```bash
-    prism advanced init
-    ```
-    The `search` command will also prompt you to do this automatically if you try to save results to an uninitialized database.
+# Activate (macOS/Linux) 
+source .venv/bin/activate
+```
 
-You are now ready to use PRISM!
+### **Step 3: Install PRISM**
+Install in editable mode with all dependencies:
+```bash
+pip install -e .
+```
+
+This installs:
+- Core PRISM application
+- OPTIMADE client for database access
+- Rich library for enhanced CLI display
+- SQLAlchemy for local database management
+- All LLM provider SDKs (OpenAI, Anthropic, etc.)
+
+### **Step 4: Initial Configuration**
+Configure your first LLM provider:
+```bash
+prism advanced configure
+```
+
+You'll see:
+```
+Select your LLM provider:
+1. OpenAI
+2. Google Vertex AI
+3. Anthropic  
+4. OpenRouter
+5. Perplexity (coming soon)
+6. Grok (coming soon)
+7. Ollama Local (coming soon)
+8. PRISM Custom Model (coming soon)
+
+Enter the number of your provider: 4
+Enter your OpenRouter API key: [your-key-here]
+```
+
+**💡 Recommendation**: Choose **OpenRouter** for the easiest setup - it provides access to 200+ models with a single API key.
+
+### **Step 5: Initialize Database** (Optional)
+Enable result saving and analysis:
+```bash
+prism advanced init
+```
+
+This creates a local SQLite database for:
+- Storing search results
+- Query history
+- Performance analytics
+- Offline access to previous discoveries
+
+## ✅ Verification
+
+Test your installation:
+
+### **Basic Functionality**
+```bash
+# Check PRISM status
+prism
+
+# List available databases
+prism optimade list-dbs
+
+# Test structured search
+prism search --elements "Ti,O" --nelements 2
+```
+
+### **LLM Integration**
+```bash
+# Test natural language search
+prism ask "Materials containing titanium"
+
+# Test interactive mode
+prism ask "Battery materials" --interactive
+
+# Test reasoning mode
+prism ask "Why are these good conductors?" --reason
+```
+
+### **Quick Switching**
+```bash
+# Switch LLM providers
+prism switch-llm
+
+# Or press 's' from main menu
+prism
+```
+
+## 🔧 Advanced Configuration
+
+### **Multiple LLM Providers**
+Configure multiple providers for different use cases:
+
+1. **Research**: OpenRouter (broad model access)
+2. **Production**: OpenAI (reliable, fast)
+3. **Privacy**: Ollama (local inference)
+4. **Analysis**: Anthropic (detailed reasoning)
+
+### **Environment Variables**
+Alternative to interactive configuration:
+
+```bash
+# Create app/.env file
+echo 'OPENAI_API_KEY="your-key-here"' > app/.env
+echo 'DATABASE_URL="sqlite:///prism.db"' >> app/.env
+echo 'LLM_MODEL="gpt-4"' >> app/.env
+```
+
+### **Custom Models**
+Prepare for upcoming providers:
+```bash
+# Ollama setup (when available)
+export OLLAMA_HOST="http://localhost:11434"
+
+# PRISM Custom Model (when available)  
+export PRISM_CUSTOM_API_KEY="your-research-key"
+```
+
+## 🐛 Troubleshooting
+
+### **Common Issues**
+
+#### **1. Import Errors**
+```bash
+# Solution: Ensure virtual environment is activated
+.venv\\Scripts\\activate  # Windows
+source .venv/bin/activate  # macOS/Linux
+
+# Reinstall if needed
+pip install -e .
+```
+
+#### **2. LLM Connection Failed**
+```bash
+# Check API key configuration
+prism advanced configure
+
+# Test connection
+prism switch-llm
+```
+
+#### **3. Unicode Errors (Windows)**
+- PRISM handles this automatically with fallbacks
+- Rich library provides compatible display modes
+
+#### **4. Database Initialization**
+```bash
+# Reset database if corrupted
+rm prism.db
+prism advanced init
+```
+
+### **Performance Optimization**
+
+#### **Token Management**
+- Use `--interactive` for focused conversations
+- Enable `--reason` only when detailed analysis is needed
+- Target specific `--providers` to reduce noise
+
+#### **Local Caching**
+- Save frequently used results with `prism advanced init`
+- Results are automatically cached to local database
+- Use saved data for offline analysis
+
+## 🔄 Updating PRISM
+
+Keep PRISM up-to-date with the latest features:
+
+```bash
+# Pull latest changes
+git pull origin main
+
+# Update dependencies
+pip install -e .
+
+# Regenerate documentation
+prism docs save-readme
+prism docs save-install
+```
+
+## 🆘 Getting Help
+
+### **Built-in Help**
+```bash
+prism --help                    # Main commands
+prism ask --help               # Natural language search
+prism search --help            # Structured search  
+prism advanced configure --help # Configuration options
+```
+
+### **Quick Reference**
+```bash
+prism                          # Interactive mode
+prism ask "query" --interactive # Conversational search
+prism search --elements "Fe,Ni" # Direct parameter search
+prism switch-llm               # Change LLM provider
+prism optimade list-dbs        # Available databases
+```
+
+### **Support Resources**
+- **Documentation**: Use `prism docs save-readme` for latest features
+- **Examples**: Built into help system and main interface
+- **Provider Status**: Real-time database availability via `prism optimade list-dbs`
+
+## 🎯 Next Steps
+
+After successful installation:
+
+1. **Explore Interactive Mode**:
+   ```bash
+   prism ask "Materials for renewable energy" --interactive
+   ```
+
+2. **Try Different LLM Providers**:
+   ```bash
+   prism switch-llm
+   ```
+
+3. **Analyze Results with Reasoning**:
+   ```bash
+   prism ask "Why are perovskites promising for solar cells?" --reason
+   ```
+
+4. **Save Important Discoveries**:
+   ```bash
+   prism advanced init  # Enable database
+   # Results automatically saved during searches
+   ```
+
+Welcome to the future of materials research! 🚀
 """
 
 @docs.command()
@@ -576,14 +1119,14 @@ def save_readme():
     """Saves the project README.md file."""
     with open("README.md", "w") as f:
         f.write(README_CONTENT)
-    console.print("✅ `README.md` saved successfully.")
+    console.print("[green]SUCCESS:[/green] `README.md` saved successfully.")
 
 @docs.command()
 def save_install():
     """Saves the project INSTALL.md file."""
     with open("INSTALL.md", "w") as f:
         f.write(INSTALL_CONTENT)
-    console.print("✅ `INSTALL.md` saved successfully.")
+    console.print("[green]SUCCESS:[/green] `INSTALL.md` saved successfully.")
 
 
 # ==============================================================================
