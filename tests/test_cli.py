@@ -11,7 +11,7 @@ from unittest.mock import patch, MagicMock
 from sqlalchemy.orm import sessionmaker
 
 from app.cli import cli
-from app.db.database import engine
+from app.db.database import engine, Base
 from app.db.models import Material
 
 # Create a new database session for testing
@@ -21,6 +21,14 @@ TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engin
 def runner():
     """Fixture for invoking command-line interfaces."""
     return CliRunner()
+
+
+@pytest.fixture(scope="function")
+def test_db():
+    """Fixture for creating a new database session for testing."""
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
 
 def get_mock_optimade_client(filter_str):
     """Creates a mock OptimadeClient for testing."""
@@ -118,7 +126,7 @@ def test_search_api_error(mock_optimade_constructor, runner):
 
 @patch('app.db.database.SessionLocal', new=TestingSessionLocal)
 @patch('app.cli.OptimadeClient')
-def test_search_and_save(mock_optimade_constructor, runner):
+def test_search_and_save(mock_optimade_constructor, runner, test_db):
     """Test the search command with the --save option."""
     mock_client = get_mock_optimade_client(filter_str='chemical_formula_descriptive="Si2"')
     mock_optimade_constructor.return_value = mock_client
@@ -132,4 +140,4 @@ def test_search_and_save(mock_optimade_constructor, runner):
     materials = db.query(Material).all()
     assert len(materials) == 1
     assert materials[0].formula == "Si2"
-    db.close() 
+    db.close()

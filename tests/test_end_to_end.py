@@ -42,16 +42,31 @@ def test_search_command(mock_optimade_client, runner, db_session):
     """Test the search command."""
     mock_optimade_client.return_value.get.return_value = {
         "data": [
-            {"id": "mp-149", "attributes": {"chemical_formula_descriptive": "Si"}},
-            {"id": "mp-123", "attributes": {"chemical_formula_descriptive": "SiC"}},
+            {
+                "id": "mp-149",
+                "attributes": {
+                    "chemical_formula_descriptive": "Si",
+                    "elements": ["Si"]
+                }
+            },
+            {
+                "id": "mp-123",
+                "attributes": {
+                    "chemical_formula_descriptive": "SiC",
+                    "elements": ["Si", "C"]
+                }
+            },
         ]
     }
     
-    result = runner.invoke(cli, ['search', 'elements HAS "Si"'])
+    result = runner.invoke(cli, ['search', '--elements', 'Si'])
     assert result.exit_code == 0
     assert "Found 2 materials" in result.output
 
     # Check that the materials were saved to the database
+    db_session.query(Material).delete()
+    db_session.commit()
+    runner.invoke(cli, ['search', '--elements', 'Si'])
     materials = db_session.query(Material).all()
     assert len(materials) == 2
     assert materials[0].formula == "Si"
