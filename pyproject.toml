@@ -29,18 +29,19 @@ classifiers = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "click",
-    "rich",
-    "optimade[http-client,aiida,ase,pymatgen,jarvis,cif]",
-    "sqlalchemy",
-    "psycopg2-binary",
-    "alembic",
-    "python-dotenv",
-    "openai",
-    "google-cloud-aiplatform",
-    "anthropic",
-    "pandas",
-    "tenacity",
+    "click>=8.0.0",
+    "rich>=12.0.0",
+    "optimade[http-client]>=1.2.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.0",
+    "alembic>=1.8.0",
+    "python-dotenv>=1.0.0",
+    "openai>=1.0.0",
+    "google-cloud-aiplatform>=1.0.0",
+    "anthropic>=0.20.0",
+    "pandas>=2.0.0",
+    "tenacity>=8.0.0",
+    "requests>=2.28.0",
 ]
 
 [project.scripts]
