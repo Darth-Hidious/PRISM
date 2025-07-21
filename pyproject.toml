@@ -27,11 +27,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Chemistry",
     "Topic :: Scientific/Engineering :: Physics"
 ]
-requires-python = ">=3.9, <3.13"
+requires-python = ">=3.9"
 dependencies = [
     "click",
     "rich",
-    "optimade-client",
+    "optimade[http-client,aiida,ase,pymatgen,jarvis,cif]",
     "sqlalchemy",
     "psycopg2-binary",
     "alembic",
