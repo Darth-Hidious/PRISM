@@ -2,7 +2,10 @@
 
 from .base_connector import DatabaseConnector, ConnectorException
 from .redis_connector import RedisManager, JobQueue
-from .jarvis_connector import JarvisConnector, create_jarvis_connector
+from .jarvis_connector import JarvisConnector
+from .nomad_connector import NOMADConnector
+from .oqmd_connector import OQMDConnector
+from .cod_connector import CODConnector
 from .rate_limiter import RateLimiter, TokenBucket
 
 __all__ = [
@@ -11,7 +14,9 @@ __all__ = [
     "RedisManager",
     "JobQueue",
     "JarvisConnector", 
-    "create_jarvis_connector",
+    "NOMADConnector",
+    "OQMDConnector",
+    "CODConnector",
     "RateLimiter",
     "TokenBucket"
 ]
