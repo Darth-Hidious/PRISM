@@ -1,7 +1,49 @@
 from typing import List, Dict, Any, Optional, Tuple
-from app.prompts import SUMMARIZATION_PROMPT, REASONING_PROMPT, CONVERSATIONAL_PROMPT, FINAL_FILTER_PROMPT
+from app.prompts import SUMMARIZATION_PROMPT, REASONING_PROMPT, CONVERSATIONAL_PROMPT, FINAL_FILTER_PROMPT, REASONING_FILTER_PROMPT
 import json
 import re
+import os
+
+# Global variable to cache provider fields
+PROVIDER_FIELDS_CACHE = {}
+CACHE_FILE = "provider_fields.json"
+
+def load_provider_fields_cache():
+    """Load the provider fields cache from a file."""
+    global PROVIDER_FIELDS_CACHE
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r") as f:
+            try:
+                PROVIDER_FIELDS_CACHE = json.load(f)
+            except json.JSONDecodeError:
+                PROVIDER_FIELDS_CACHE = {}
+
+def save_provider_fields_cache():
+    """Save the provider fields cache to a file."""
+    with open(CACHE_FILE, "w") as f:
+        json.dump(PROVIDER_FIELDS_CACHE, f, indent=2)
+
+def update_provider_fields(optimade_client, console=None):
+    """
+    Update the cache with the fields for each provider.
+    """
+    global PROVIDER_FIELDS_CACHE
+    if console:
+        console.print("[bold green]Updating provider capabilities cache...[/bold green]")
+
+    for provider_id, provider in optimade_client.providers.items():
+        try:
+            if provider_id not in PROVIDER_FIELDS_CACHE:
+                if console:
+                    console.print(f"[dim]Fetching fields for {provider_id}...[/dim]")
+                info = provider.info
+                properties = info.entry_endpoints_by_format['structures']['properties'].keys()
+                PROVIDER_FIELDS_CACHE[provider_id] = list(properties)
+        except Exception as e:
+            if console:
+                console.print(f"[yellow]Warning: Could not fetch fields for {provider_id}. Error: {e}[/yellow]")
+    
+    save_provider_fields_cache()
 
 class ModelContext:
     """
@@ -11,10 +53,11 @@ class ModelContext:
     understand and reason about materials science data.
     """
 
-    def __init__(self, query: str, results: List[Dict[str, Any]], rag_context: Optional[str] = None):
+    def __init__(self, query: str, results: List[Dict[str, Any]], rag_context: Optional[str] = None, provider_fields: Optional[Dict[str, List[str]]] = None):
         self.query = query
         self.results = results
         self.rag_context = rag_context
+        self.provider_fields = provider_fields or {}
 
     def to_prompt(self, reasoning_mode: bool = False) -> str:
         """
@@ -27,30 +70,37 @@ class ModelContext:
                 "formula": r.get("attributes", {}).get("chemical_formula_descriptive", "N/A"),
                 "provider": r.get("meta", {}).get("provider", {}).get("name", "N/A"),
                 "elements": r.get("attributes", {}).get("elements", []),
-                "id": r.get("id", "N/A")
+                "id": r.get("id", "N/A"),
+                # Include all available attributes for the LLM to see
+                "properties": r.get("attributes", {})
             }
             for r in self.results[:10] # Reduced to 10 results to save tokens
         ]
         
+        # Prepare provider fields context
+        provider_fields_str = json.dumps(self.provider_fields, indent=2)
+
         if reasoning_mode:
             # For reasoning mode, provide more detailed data
             results_str = "\n".join([
-                f"- Material {r['id']}: {r['formula']} (elements: {', '.join(r['elements'])}) from {r['provider']}" 
+                f"- Material {r['id']}: {r['formula']} (elements: {', '.join(r['elements'])}) from {r['provider']}\n  Properties: {json.dumps(r['properties'])}" 
                 for r in summarized_results
             ])
             
             return REASONING_PROMPT.format(
                 query=self.query,
-                results=results_str
+                results=results_str,
+                provider_fields=provider_fields_str
             )
         else:
             # Standard summarization - more concise
-            results_str = "\n".join([f"- {r['formula']} ({r['provider']})" for r in summarized_results])
+            results_str = "\n".join([f"- {r['formula']} ({r['provider']}) - Properties: {json.dumps(r['properties'])}" for r in summarized_results])
             
             return SUMMARIZATION_PROMPT.format(
                 query=self.query,
                 count=len(self.results),
-                results=results_str
+                results=results_str,
+                provider_fields=provider_fields_str
             )
 
 
@@ -174,6 +224,60 @@ class AdaptiveOptimadeFilter:
             
         except Exception as e:
             return None, None
+    
+    def generate_reasoning_filter(self, query: str, schema_content: Optional[str] = None, console=None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Generate OPTIMADE filter using reasoning mode - breaks down query into steps.
+        
+        Returns:
+            Tuple of (provider, filter, reasoning_response)
+        """
+        try:
+            providers_str = "\n".join([
+                f"- {p['id']}: {p['name']} - {p['description']}" 
+                for p in self.providers_info
+            ])
+            
+            prompt = REASONING_FILTER_PROMPT.format(
+                query=query,
+                schema_context=schema_content or "No schema context available.",
+                providers=providers_str
+            )
+            
+            if console:
+                console.print("[dim]Generating reasoning-based OPTIMADE filter...[/dim]")
+            
+            response = self.llm_service.get_completion(prompt)
+            response_text = self._extract_response_text(response)
+            
+            # Extract JSON from the reasoning response
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+                try:
+                    data = json.loads(json_str)
+                    provider = data.get("provider")
+                    filter_str = data.get("filter")
+                    return provider, filter_str, response_text
+                except json.JSONDecodeError:
+                    pass
+            
+            # Fallback: try to find any JSON in the response
+            json_match = re.search(r'\{[^{}]*"provider"[^{}]*"filter"[^{}]*\}', response_text)
+            if json_match:
+                json_str = json_match.group(0)
+                try:
+                    data = json.loads(json_str)
+                    provider = data.get("provider")
+                    filter_str = data.get("filter")
+                    return provider, filter_str, response_text
+                except json.JSONDecodeError:
+                    pass
+            
+            return None, None, "Could not extract filter from reasoning response."
+            
+        except Exception as e:
+            return None, None, f"Error in reasoning filter generation: {str(e)}"
     
     def generate_filter(self, query: str, optimade_client, console=None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """
@@ -372,4 +476,4 @@ This is attempt {attempt + 1} of {self.max_attempts}."""
         
         # For now, assume the filter is syntactically correct if it passes basic checks
         # In a production system, you might want to use a proper OPTIMADE parser
-        return None 
+        return None

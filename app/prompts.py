@@ -14,12 +14,18 @@ Return a JSON object with the following keys: "provider", "filter".
 - "provider": The ID of the selected provider (must match exactly from the list below).
 - "filter": The OPTIMADE filter string using proper syntax.
 
-Important notes:
-- Use exact provider IDs: "mp", "oqmd", "cod", "aflow", "jarvis", "mcloud"  
-- Common name variations: OQCD = oqmd, Materials Project = mp, Crystallography Open Database = cod
-- For elements, use format: elements HAS ALL "Ni", "Ta"
-- For number of elements, use: nelements=2
-- Multiple providers can be mentioned but pick the MOST appropriate one
+## CRITICAL: OPTIMADE Filter Syntax (EXACT FORMAT):
+- Elements: `elements HAS ALL "Ni", "Ta"` (double quotes, HAS ALL operator)
+- Number of elements: `nelements=2`
+- Formula: `chemical_formula_descriptive="SiO2"`
+- Combine: `elements HAS ALL "Li", "Co" AND nelements=2`
+
+## Provider Selection Guidelines:
+- Materials Project (mp): Best for general materials, DFT calculations
+- OQMD (oqmd): Good for high-throughput calculations
+- COD (cod): Best for crystal structures, experimental data
+- AFLOW (aflow): Good for alloys and intermetallics
+- JARVIS (jarvis): Good for 2D materials and properties
 
 Available providers:
 {providers}
@@ -47,6 +53,14 @@ Your Response:
 {{
   "provider": "mp",
   "filter": "nelements=2"
+}}
+
+Example 4:
+User Query: "Find lithium cobalt materials"
+Your Response:
+{{
+  "provider": "mp",
+  "filter": "elements HAS ALL \"Li\", \"Co\""
 }}
 ---
 
@@ -138,4 +152,59 @@ Return ONLY a JSON object:
   "provider": "best_database_id",
   "filter": "optimade_filter_string"
 }}
-""" 
+"""
+
+REASONING_FILTER_PROMPT = """
+You are a materials science expert AI. Your task is to generate a precise OPTIMADE filter based on a user's query. You must follow a strict reasoning process and then output a JSON object containing the filter.
+
+## User Query: 
+{query}
+
+## Available Providers:
+{providers}
+
+## OPTIMADE Schema Context:
+{schema_context}
+
+---
+
+## INSTRUCTIONS
+
+### Step 1: Deconstruct the Query
+Analyze the user's request to identify the core scientific intent, including elements, formulas, and material properties.
+
+### Step 2: Map to OPTIMADE Schema
+Translate the user's intent into the correct OPTIMADE filter syntax. Refer to the schema context and follow these critical rules:
+- **Elements**: Use `elements HAS ALL "Element1", "Element2"`. The element symbols must be in double quotes.
+- **Number of Elements**: Use `nelements=3`.
+- **Formula**: Use `chemical_formula_descriptive="H2O"`.
+- **Combining**: Use `AND` to combine filters, e.g., `elements HAS ALL "Ga", "N" AND nelements=2`.
+
+### Step 3: Generate Response
+First, write out your reasoning process following the steps above. After your reasoning, you MUST conclude with the final JSON object in a markdown block.
+
+---
+
+## EXAMPLE RESPONSE
+
+**Step 1: Deconstruct the Query**
+The user is looking for materials containing both Lithium and Cobalt.
+
+**Step 2: Map to OPTIMADE Schema**
+The key properties are the presence of two elements. This maps to the `elements` field in the OPTIMADE schema. The correct syntax is `elements HAS ALL "Li", "Co"`.
+
+**Step 3: Generate Response**
+Based on the analysis, I will select 'mp' as the provider due to its general-purpose nature and construct the filter.
+
+```json
+{{
+  "provider": "mp",
+  "filter": "elements HAS ALL \"Li\", \"Co\""
+}}
+```
+
+---
+
+## YOUR TURN
+Follow the instructions and provide your reasoning and the final JSON object for the user query.
+"""

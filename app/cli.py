@@ -449,8 +449,25 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
             # Create a temporary OPTIMADE client for testing
             temp_client = OptimadeClient()
             
-            # Generate the filter with iterative refinement
-            provider_to_query, optimade_filter, error = adaptive_filter.generate_filter(query, temp_client)
+            # Generate the filter - use reasoning mode if --reason flag is set
+            if reason:
+                # Load schema for reasoning mode
+                try:
+                    with open("Schema.txt", "r") as f:
+                        schema_content = f.read()
+                except FileNotFoundError:
+                    console.print("[yellow]Warning: Schema.txt not found. Using reasoning mode without schema context.[/yellow]")
+                    schema_content = None
+                
+                provider_to_query, optimade_filter, reasoning_response = adaptive_filter.generate_reasoning_filter(query, schema_content, console)
+                error = None if provider_to_query and optimade_filter else reasoning_response
+                
+                # Display the reasoning process
+                if reasoning_response and provider_to_query and optimade_filter:
+                    console.print(Panel(reasoning_response, title="Reasoning Process", border_style="cyan", title_align="left"))
+            else:
+                # Generate the filter with iterative refinement (normal mode)
+                provider_to_query, optimade_filter, error = adaptive_filter.generate_filter(query, temp_client)
             
             if error:
                 try:
@@ -463,9 +480,50 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
         
         console.print(Panel(f"[bold]Provider:[/bold] [cyan]{provider_to_query}[/cyan]\n[bold]Filter:[/bold] [cyan]{optimade_filter}[/cyan]", title="Query Analysis", border_style="blue"))
 
-        with console.status(f"[bold green]Querying {provider_to_query}...[/bold green]"):
-            client = OptimadeClient(include_providers=[provider_to_query])
-            search_results = client.get(optimade_filter)
+        # Define a comprehensive list of desired fields to retrieve from the OPTIMADE API
+        desired_fields = [
+            "id", "elements", "nelements", "chemical_formula_descriptive", 
+            "chemical_formula_reduced", "nsites", "volume", "density",
+            "structure_features", "species", "lattice_vectors",
+            # Common properties that may have provider-specific names
+            "band_gap", "_mp_band_gap", "_oqmd_band_gap", 
+            "formation_energy_per_atom", "_mp_formation_energy_per_atom", "_oqmd_formation_energy_per_atom",
+            "e_above_hull", "_mp_e_above_hull",
+            # Crystal structure info
+            "crystal_system", "_mp_crystal_system",
+            "spacegroup_symbol", "_mp_spacegroup_symbol",
+            "spacegroup_number", "_mp_spacegroup_number",
+        ]
+
+        with console.status(f"[bold green]Fetching provider capabilities from {provider_to_query}...[/bold green]"):
+            # Use a new client instance to get the specific provider's info
+            info_client = OptimadeClient(include_providers=[provider_to_query], verbosity=0)
+            client = info_client # Use this client for the subsequent query
+            
+            # Dynamically determine which fields the provider actually supports
+            try:
+                # Access the specific provider's info from the client
+                provider_info = info_client.info.providers[0] # We are querying one provider
+                
+                # Get the list of supported properties for the 'structures' endpoint
+                provider_properties = set(provider_info.entry_endpoints_by_format['structures']['properties'].keys())
+                
+                # Intersect our desired list with the provider's actual list
+                response_fields = [field for field in desired_fields if field in provider_properties]
+                
+                # Ensure a minimal set of fields if the intersection is empty for some reason
+                if not response_fields:
+                    response_fields = ["id", "elements", "nelements", "chemical_formula_descriptive"]
+                    console.print("[yellow]Warning: Could not find common fields. Requesting a minimal set.[/yellow]")
+
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not dynamically fetch provider fields from {provider_to_query}. Using a default set. Error: {e}[/yellow]")
+                # Fallback to a safe, minimal set of fields if the info call fails
+                response_fields = ["id", "elements", "nelements", "chemical_formula_descriptive"]
+
+        with console.status(f"[bold green]Querying {provider_to_query} for detailed properties...[/bold green]"):
+            # The client object is already created and configured
+            search_results = client.get(optimade_filter, response_fields=response_fields)
         
         all_materials = []
         if "structures" in search_results:
@@ -483,13 +541,30 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
         table.add_column("Source ID")
         table.add_column("Formula")
         table.add_column("Elements")
+        table.add_column("Band Gap (eV)")
+        table.add_column("Formation Energy (eV/atom)")
         
         for material in all_materials[:10]:
             attrs = material.get("attributes", {})
+            
+            # Helper to gracefully get potentially missing property values
+            def get_prop(keys, default="N/A"):
+                for key in keys:
+                    if key in attrs and attrs[key] is not None:
+                        val = attrs[key]
+                        # Format numbers to a reasonable precision
+                        return f"{val:.3f}" if isinstance(val, (int, float)) else str(val)
+                return default
+
+            band_gap = get_prop(["band_gap", "_mp_band_gap", "_oqmd_band_gap"])
+            formation_energy = get_prop(["formation_energy_per_atom", "_mp_formation_energy_per_atom", "_oqmd_formation_energy_per_atom"])
+
             table.add_row(
                 str(material.get("id")),
                 attrs.get("chemical_formula_descriptive", "N/A"),
-                ", ".join(attrs.get("elements", []))
+                ", ".join(attrs.get("elements", [])),
+                band_gap,
+                formation_energy
             )
         console.print(Panel(table, title="Top 10 Search Results", border_style="green"))
 
@@ -502,13 +577,15 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
                 console.print("[yellow]Warning: Schema.txt not found. Proceeding without schema context.[/yellow]")
                 schema_content = None
 
+            # In reasoning mode, we already did the reasoning for filter generation
+            # So just provide a summary of the results found
             model_context = ModelContext(query=query, results=all_materials, rag_context=schema_content)
-            final_prompt = model_context.to_prompt(reasoning_mode=reason)
+            final_prompt = model_context.to_prompt(reasoning_mode=False)
             
             # Stream the response from the LLM for a better user experience
             stream = llm_service.get_completion(final_prompt, stream=True)
 
-            answer_title = "Reasoning Analysis" if reason else "Answer"
+            answer_title = "Results Summary"
             console.print(f"\n[bold green]{answer_title}:[/bold green]")
             full_response = []
             for chunk in stream:
@@ -522,8 +599,8 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
                 if content:
                     full_response.append(content)
             
-            panel_title = "Reasoning Analysis" if reason else "Answer"
-            panel_style = "cyan" if reason else "magenta"
+            panel_title = "Results Summary"
+            panel_style = "magenta";
             console.print(Panel("".join(full_response), title=panel_title, border_style=panel_style, title_align="left"))
 
     except Exception as e:
@@ -826,9 +903,6 @@ prism switch-llm
 - **Enable Reasoning** (`--reason`) for detailed scientific analysis
 - **Try Quick Switching** - press 's' from main screen to change LLM providers
 - **Target Databases** - use `--providers` to search specific repositories
-- **Save Results** - run `prism advanced init` to enable local data persistence
-
-## 🔬 Advanced Features
 
 - **Adaptive Filter Generation**: AI learns from API errors to improve query accuracy
 - **Token Optimization**: Smart conversation summarization for efficient API usage
@@ -1121,13 +1195,15 @@ def save_readme():
         f.write(README_CONTENT)
     console.print("[green]SUCCESS:[/green] `README.md` saved successfully.")
 
+    with open("README.md", "w") as f:
+        f.write(README_CONTENT)
+    console.print("[green]SUCCESS:[/green] `README.md` saved successfully.")
+
 @docs.command()
 def save_install():
     """Saves the project INSTALL.md file."""
     with open("INSTALL.md", "w") as f:
-        f.write(INSTALL_CONTENT)
-    console.print("[green]SUCCESS:[/green] `INSTALL.md` saved successfully.")
-
+        f.write("# Installation Guide\n\nFollow these steps to install PRISM...")
 
 # ==============================================================================
 # 'optimade' Command Group
@@ -1184,7 +1260,7 @@ def list_databases():
 
 # ==============================================================================
 # CLI Entry Point
-# =================================================_
+# ==================================================
 cli.add_command(advanced)
 cli.add_command(docs)
 cli.add_command(optimade)

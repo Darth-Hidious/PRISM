@@ -17,9 +17,9 @@ class LLMService(ABC):
         pass
 
 class OpenAIService(LLMService):
-    def __init__(self):
+    def __init__(self, model: str = None):
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = os.getenv("LLM_MODEL", "gpt-4o")
+        self.model = model or os.getenv("LLM_MODEL", "gpt-4o")
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.chat.completions.create(
@@ -29,18 +29,19 @@ class OpenAIService(LLMService):
         )
 
 class VertexAIService(LLMService):
-    def __init__(self):
+    def __init__(self, model: str = None):
         project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
         vertexai.init(project=project_id)
-        self.model = GenerativeModel(os.getenv("LLM_MODEL", "gemini-2.5-pro"))
+        model_name = model or os.getenv("LLM_MODEL", "gemini-1.5-pro")
+        self.model = GenerativeModel(model_name)
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.model.generate_content(prompt, stream=stream)
 
 class AnthropicService(LLMService):
-    def __init__(self):
+    def __init__(self, model: str = None):
         self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        self.model = os.getenv("LLM_MODEL", "claude-4-opus")
+        self.model = model or os.getenv("LLM_MODEL", "claude-3-5-sonnet-20240620")
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.messages.create(
@@ -53,13 +54,13 @@ class AnthropicService(LLMService):
         )
 
 class OpenRouterService(LLMService):
-    def __init__(self):
+    def __init__(self, model: str = None):
         self.client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
-        # Use a known free model as the default
-        self.model = os.getenv("LLM_MODEL", "google/gemma-2-9b-it")
+        # Accept any model - OpenRouter supports many models
+        self.model = model or os.getenv("LLM_MODEL", "anthropic/claude-3.5-sonnet")
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.chat.completions.create(
@@ -70,7 +71,7 @@ class OpenRouterService(LLMService):
 
 # Upcoming LLM providers - coming soon
 class PerplexityService(LLMService):
-    def __init__(self):
+    def __init__(self, model: str = None):
         # Coming soon - Perplexity AI integration
         raise NotImplementedError("Perplexity integration coming soon!")
     
@@ -78,7 +79,7 @@ class PerplexityService(LLMService):
         raise NotImplementedError("Perplexity integration coming soon!")
 
 class GrokService(LLMService):
-    def __init__(self):
+    def __init__(self, model: str = None):
         # Coming soon - Grok (xAI) integration
         raise NotImplementedError("Grok integration coming soon!")
     
@@ -86,7 +87,7 @@ class GrokService(LLMService):
         raise NotImplementedError("Grok integration coming soon!")
 
 class OllamaService(LLMService):
-    def __init__(self):
+    def __init__(self, model: str = None):
         # Coming soon - Local Ollama model support
         raise NotImplementedError("Ollama local model support coming soon!")
     
@@ -94,30 +95,50 @@ class OllamaService(LLMService):
         raise NotImplementedError("Ollama local model support coming soon!")
 
 class PRISMCustomService(LLMService):
-    def __init__(self):
+    def __init__(self, model: str = None):
         # Coming soon - Custom PRISM model trained on materials science literature
         raise NotImplementedError("PRISM Custom Model coming soon - trained on massive materials science corpus!")
     
     def get_completion(self, prompt: str, stream: bool = False):
         raise NotImplementedError("PRISM Custom Model coming soon!")
 
-def get_llm_service() -> LLMService:
-    if os.getenv("OPENAI_API_KEY"):
-        return OpenAIService()
-    elif os.getenv("GOOGLE_CLOUD_PROJECT"):
-        return VertexAIService()
-    elif os.getenv("ANTHROPIC_API_KEY"):
-        return AnthropicService()
-    elif os.getenv("OPENROUTER_API_KEY"):
-        return OpenRouterService()
-    # Upcoming providers - will be enabled soon
-    elif os.getenv("PERPLEXITY_API_KEY"):
-        return PerplexityService()
-    elif os.getenv("GROK_API_KEY"):
-        return GrokService()
-    elif os.getenv("OLLAMA_HOST"):
-        return OllamaService()
-    elif os.getenv("PRISM_CUSTOM_API_KEY"):
-        return PRISMCustomService()
-    else:
-        raise ValueError("No LLM provider configured.") 
+def get_llm_service(provider: str = None, model: str = None) -> LLMService:
+    # Determine provider from environment variables if not specified
+    if provider is None:
+        if os.getenv("OPENROUTER_API_KEY"):
+            provider = "openrouter"
+        elif os.getenv("OPENAI_API_KEY"):
+            provider = "openai"
+        elif os.getenv("ANTHROPIC_API_KEY"):
+            provider = "anthropic"
+        elif os.getenv("GOOGLE_CLOUD_PROJECT"):
+            provider = "vertexai"
+        elif os.getenv("PERPLEXITY_API_KEY"):
+            provider = "perplexity"
+        elif os.getenv("GROK_API_KEY"):
+            provider = "grok"
+        elif os.getenv("OLLAMA_HOST"):
+            provider = "ollama"
+        elif os.getenv("PRISM_CUSTOM_API_KEY"):
+            provider = "prism_custom"
+        else:
+            raise ValueError("No LLM provider configured. Please set an API key in the .env file.")
+
+    # Map provider string to service class
+    provider_map = {
+        "openrouter": OpenRouterService,
+        "openai": OpenAIService,
+        "anthropic": AnthropicService,
+        "vertexai": VertexAIService,
+        "perplexity": PerplexityService,
+        "grok": GrokService,
+        "ollama": OllamaService,
+        "prism_custom": PRISMCustomService,
+    }
+
+    service_class = provider_map.get(provider.lower())
+    
+    if not service_class:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+
+    return service_class(model=model)
