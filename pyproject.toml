@@ -8,7 +8,7 @@ version = "1.1.0"
 description = "PRISM: Platform for Research in Intelligent Synthesis of Materials"
 readme = "README.md"
 authors = [{ name = "MARC27", email = "team@marc27.com" }]
-license = { text = "MIT" }
+license = "MIT"
 maintainers = [
     {name = "PRISM Development Team", email = "team@marc27.com"}
 ]
@@ -54,7 +54,7 @@ Repository = "https://github.com/Darth-Hidious/PRISM"
 "Bug Reports" = "https://github.com/Darth-Hidious/PRISM/issues"
 
 [tool.setuptools]
-packages = ["app", "app.services", "app.services.connectors"]
+packages = ["app", "app.config", "app.services", "app.services.connectors", "app.db", "app.api", "app.api.v1", "app.api.v1.endpoints"]
 include-package-data = true
 
 [tool.black]
