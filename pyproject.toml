@@ -7,10 +7,10 @@ name = "prism-platform"
 version = "1.1.0"
 description = "PRISM: Platform for Research in Intelligent Synthesis of Materials"
 readme = "README.md"
-authors = [{ name = "MARC27", email = "siddharthayashkovid@gmail.com" }]
+authors = [{ name = "MARC27", email = "team@marc27.com" }]
 license = { text = "MIT" }
 maintainers = [
-    {name = "PRISM Development Team", email = "dev@prism-platform.org"}
+    {name = "PRISM Development Team", email = "team@marc27.com"}
 ]
 keywords = ["materials science", "optimade", "cli", "scientific computing"]
 classifiers = [
@@ -42,6 +42,7 @@ dependencies = [
     "pandas>=2.0.0",
     "tenacity>=8.0.0",
     "requests>=2.28.0",
+    "mp-api>=0.45.0",
 ]
 
 [project.scripts]

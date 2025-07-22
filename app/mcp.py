@@ -26,22 +26,37 @@ def save_provider_fields_cache():
 def update_provider_fields(optimade_client, console=None):
     """
     Update the cache with the fields for each provider.
+    Note: Current OptimadeClient API doesn't expose provider fields directly,
+    so we use a fallback approach with common OPTIMADE fields.
     """
     global PROVIDER_FIELDS_CACHE
     if console:
         console.print("[bold green]Updating provider capabilities cache...[/bold green]")
 
-    for provider_id, provider in optimade_client.providers.items():
-        try:
-            if provider_id not in PROVIDER_FIELDS_CACHE:
-                if console:
-                    console.print(f"[dim]Fetching fields for {provider_id}...[/dim]")
-                info = provider.info
-                properties = info.entry_endpoints_by_format['structures']['properties'].keys()
-                PROVIDER_FIELDS_CACHE[provider_id] = list(properties)
-        except Exception as e:
+    try:
+        # Get included providers from the client
+        included_providers = getattr(optimade_client, '_included_providers', set())
+        
+        # Fallback to common OPTIMADE fields for all providers
+        common_fields = [
+            'id', 'chemical_formula_descriptive', 'elements', 'nelements',
+            'space_group_symbol', 'lattice_vectors', 'cartesian_site_positions',
+            'species', 'species_at_sites', 'structure_features'
+        ]
+        
+        if included_providers:
+            for provider_id in included_providers:
+                if provider_id not in PROVIDER_FIELDS_CACHE:
+                    if console:
+                        console.print(f"[dim]Caching common fields for {provider_id}...[/dim]")
+                    PROVIDER_FIELDS_CACHE[provider_id] = common_fields
+        else:
             if console:
-                console.print(f"[yellow]Warning: Could not fetch fields for {provider_id}. Error: {e}[/yellow]")
+                console.print("[dim]No specific providers found, using general cache[/dim]")
+                
+    except Exception as e:
+        if console:
+            console.print(f"[yellow]Warning: Could not update provider fields cache. Error: {e}[/yellow]")
     
     save_provider_fields_cache()
 
