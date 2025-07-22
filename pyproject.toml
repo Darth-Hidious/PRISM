@@ -8,7 +8,7 @@ version = "1.1.0"
 description = "PRISM: Platform for Research in Intelligent Synthesis of Materials"
 readme = "README.md"
 authors = [{ name = "MARC27", email = "team@marc27.com" }]
-license = "MIT"
+license = { text = "MIT" }
 maintainers = [
     {name = "PRISM Development Team", email = "team@marc27.com"}
 ]
