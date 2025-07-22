@@ -12,6 +12,20 @@ import re
 import json
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+# Try multiple locations to find .env file
+env_paths = [
+    '.env',  # Current directory
+    Path(__file__).parent.parent / '.env',  # Project root
+    Path.cwd() / '.env'  # Current working directory
+]
+
+for env_path in env_paths:
+    if Path(env_path).exists():
+        load_dotenv(env_path)
+        break
 
 # Windows console encoding will be handled by Rich library fallbacks
 
@@ -25,11 +39,103 @@ from optimade.client import OptimadeClient
 
 from app.config.branding import PRISM_BRAND
 from app.config.providers import FALLBACK_PROVIDERS
-from app.db.database import Base, engine, get_db
-from app.db.models import Material
+
+# Make database imports optional
+try:
+    from app.db.database import Base, engine, get_db
+    from app.db.models import Material
+    DB_AVAILABLE = True
+except ImportError:
+    DB_AVAILABLE = False
+
 from app.llm import get_llm_service
 from app.mcp import ModelContext, AdaptiveOptimadeFilter
 from app.prompts import ROUTER_PROMPT, SUMMARIZATION_PROMPT
+
+try:
+    from mp_api.client import MPRester
+    MP_API_AVAILABLE = True
+except ImportError:
+    MP_API_AVAILABLE = False
+
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
+
+def enrich_materials_with_mp_data(materials, console=None, mp_api_key=None):
+    """
+    Enrich OPTIMADE materials with Materials Project native API data.
+    Returns the enriched materials with formation energy and band gap data.
+    """
+    if not MP_API_AVAILABLE:
+        if console:
+            console.print("[yellow]Materials Project API not available. Using OPTIMADE data only.[/yellow]")
+        return materials
+    
+    # Use provided key or fall back to environment variable
+    if not mp_api_key:
+        mp_api_key = os.getenv('MATERIALS_PROJECT_API_KEY')
+    
+    if console:
+        console.print(f"[dim]Checking for MP API key... {'Found' if mp_api_key else 'Not found'}[/dim]")
+    
+    if not mp_api_key:
+        if console:
+            console.print("[yellow]No Materials Project API key found. Using OPTIMADE data only.[/yellow]")
+        return materials
+    
+    try:
+        with MPRester(mp_api_key) as mpr:
+            # Extract MP IDs from the materials
+            mp_ids = []
+            for material in materials:
+                material_id = material.get('id', '')
+                # Convert to string and check if it's a Materials Project ID
+                material_id_str = str(material_id)
+                if material_id_str.startswith('mp-'):
+                    mp_ids.append(material_id_str)
+            
+            if not mp_ids:
+                return materials
+            
+            if console:
+                console.print(f"[dim]Enriching {len(mp_ids)} Materials Project entries with native API data...[/dim]")
+            
+            # Fetch properties from MP native API
+            mp_data = mpr.materials.summary.search(
+                material_ids=mp_ids,
+                fields=['material_id', 'formation_energy_per_atom', 'band_gap', 'energy_above_hull']
+            )
+            
+            # Create a lookup dictionary
+            mp_lookup = {doc.material_id: doc for doc in mp_data}
+            
+            # Enrich the materials
+            enriched_materials = []
+            for material in materials:
+                enriched_material = material.copy()
+                material_id = str(material.get('id', ''))
+                
+                if material_id in mp_lookup:
+                    mp_doc = mp_lookup[material_id]
+                    attrs = enriched_material.setdefault('attributes', {})
+                    
+                    # Add MP native API data
+                    if mp_doc.formation_energy_per_atom is not None:
+                        attrs['_mp_formation_energy_per_atom'] = mp_doc.formation_energy_per_atom
+                    if mp_doc.band_gap is not None:
+                        attrs['_mp_band_gap'] = mp_doc.band_gap
+                    if mp_doc.energy_above_hull is not None:
+                        attrs['_mp_e_above_hull'] = mp_doc.energy_above_hull
+                
+                enriched_materials.append(enriched_material)
+            
+            return enriched_materials
+            
+    except Exception as e:
+        if console:
+            console.print(f"[yellow]Warning: Could not fetch MP native data. Error: {str(e)[:100]}[/yellow]")
+        return materials
 
 # ==============================================================================
 # Setup
@@ -66,17 +172,71 @@ def build_optimade_filter(elements=None, formula=None, nelements=None):
 # ==============================================================================
 @click.group(invoke_without_command=True)
 @click.pass_context
-def cli(ctx):
-    """
-    PRISM: A command-line tool for materials science research.
+@click.option('--version', is_flag=True, help='Show version information')
+@click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
+@click.option('--quiet', '-q', is_flag=True, help='Suppress non-essential output')
+@click.option('--mp-api-key', help='Set Materials Project API key for enhanced properties')
+def cli(ctx, version, verbose, quiet, mp_api_key):
+    f"""
+{PRISM_BRAND}
+Platform for Research in Intelligent Synthesis of Materials
 
-    This tool provides access to a network of materials science databases
-    through the OPTIMADE API. You can perform structured searches or use
-    natural language queries powered by Large Language Models (LLMs).
+A next-generation command-line interface for materials science research, 
+powered by the OPTIMADE API network and Large Language Models.
 
-    Running PRISM without any subcommands will start the interactive 'ask' mode.
+🚀 KEY FEATURES:
+• Natural language queries with AI-powered reasoning  
+• Access to 15+ materials databases via OPTIMADE
+• Enhanced properties from Materials Project API
+• Structured searches with advanced filtering
+• Rich data visualization and export capabilities
+
+🔧 COMMON USAGE:
+• prism ask "Materials for high neutron flux" --limit 10
+• prism search --elements Fe,Ni --nelements 5 --mp-api-key YOUR_KEY
+• prism --mp-api-key YOUR_API_KEY ask "High entropy alloys"
+• prism configure --mp-api-key YOUR_API_KEY
+• prism optimade list-dbs
+
+📖 DOCUMENTATION: https://github.com/Darth-Hideous/PRISM
+
+Running PRISM without any subcommands will start the interactive 'ask' mode.
     """
-    if ctx.invoked_subcommand is None:
+    # Handle MP API key if provided
+    if mp_api_key:
+        # Store the API key in environment
+        os.environ['MATERIALS_PROJECT_API_KEY'] = mp_api_key
+        
+        # Update .env file
+        env_path = Path('.env')
+        if not env_path.exists():
+            env_path = Path(__file__).parent.parent / '.env'
+        
+        if env_path.exists():
+            # Read existing .env content
+            content = env_path.read_text()
+            
+            # Update or add MP API key
+            if 'MATERIALS_PROJECT_API_KEY=' in content:
+                # Replace existing key
+                import re
+                content = re.sub(r'MATERIALS_PROJECT_API_KEY=.*', f'MATERIALS_PROJECT_API_KEY={mp_api_key}', content)
+            else:
+                # Add new key
+                content += f'\nMATERIALS_PROJECT_API_KEY={mp_api_key}\n'
+            
+            env_path.write_text(content)
+            console.print(f"[green]✓ Materials Project API key updated in {env_path}[/green]")
+        else:
+            console.print(f"[yellow]⚠ No .env file found, but API key set for this session[/yellow]")
+
+    if version:
+        console.print(f"[bold cyan]{PRISM_BRAND}[/bold cyan]")
+        console.print("[dim]Platform for Research in Intelligent Synthesis of Materials[/dim]")
+        console.print("[dim]Version: 1.1.0[/dim]")
+        ctx.exit()
+        
+    elif ctx.invoked_subcommand is None:
         try:
             console.print(Panel(PRISM_BRAND, style="bold blue", title="PRISM"))
         except UnicodeEncodeError:
@@ -275,7 +435,9 @@ def switch_llm():
 @click.option('--formula', help='Chemical formula (e.g., "SiO2").')
 @click.option('--nelements', type=int, help='Number of elements in the material.')
 @click.option('--providers', help='Comma-separated list of provider IDs (e.g., "mp,oqmd,cod").')
-def search(elements, formula, nelements, providers):
+@click.option('--limit', type=int, default=1000, help='Maximum number of results to retrieve per provider (default: 1000).')
+@click.option('--mp-api-key', help='Materials Project API key for enhanced properties (overrides environment variable).')
+def search(elements, formula, nelements, providers, limit, mp_api_key):
     """
     Performs a structured search of the OPTIMADE network based on specific criteria.
     """
@@ -300,7 +462,10 @@ def search(elements, formula, nelements, providers):
     try:
         with console.status("[bold green]Querying OPTIMADE providers...[/bold green]"):
             # If specific providers are requested, use them. Otherwise, search all.
-            client = OptimadeClient(include_providers=providers.split(',') if providers else None)
+            client = OptimadeClient(
+                include_providers=providers.split(',') if providers else None,
+                max_results_per_provider=limit
+            )
             results = client.get(optimade_filter)
 
         # The optimade-client returns a nested dictionary. We need to extract the actual list of materials.
@@ -311,23 +476,43 @@ def search(elements, formula, nelements, providers):
                     all_materials.extend(provider_results["data"])
 
         if all_materials:
-            console.print(f"[green]SUCCESS:[/green] Found {len(all_materials)} materials.")
+            # Enrich Materials Project entries with native API data
+            all_materials = enrich_materials_with_mp_data(all_materials, console, mp_api_key)
+            
+            console.print(f"[green]SUCCESS:[/green] Found {len(all_materials)} materials. Showing top 10.")
 
-            # Display results in a table
+            # Display results in a table with enhanced properties
             table = Table(show_header=True, header_style="bold magenta")
             table.add_column("Source ID")
             table.add_column("Formula")
             table.add_column("Elements")
+            table.add_column("Band Gap (eV)")
+            table.add_column("Formation Energy (eV/atom)")
             
             # Show only the first 10 results for brevity
             for material in all_materials[:10]:
                 attrs = material.get("attributes", {})
+                
+                # Helper to gracefully get potentially missing property values
+                def get_prop(keys, default="N/A"):
+                    for key in keys:
+                        if key in attrs and attrs[key] is not None:
+                            val = attrs[key]
+                            # Format numbers to a reasonable precision
+                            return f"{val:.3f}" if isinstance(val, (int, float)) else str(val)
+                    return default
+
+                band_gap = get_prop(["band_gap", "_mp_band_gap", "_oqmd_band_gap"])
+                formation_energy = get_prop(["formation_energy_per_atom", "_mp_formation_energy_per_atom", "_oqmd_formation_energy_per_atom"])
+                
                 table.add_row(
                     str(material.get("id")),
                     attrs.get("chemical_formula_descriptive", "N/A"),
-                    ", ".join(attrs.get("elements", []))
+                    ", ".join(attrs.get("elements", [])),
+                    band_gap,
+                    formation_energy
                 )
-            console.print(Panel(table, title="Search Results", border_style="green"))
+            console.print(Panel(table, title="Top 10 Search Results", border_style="green"))
 
             # Prompt user to save results to the database
             if Confirm.ask("Do you want to save these results to the database?"):
@@ -379,7 +564,9 @@ def search(elements, formula, nelements, providers):
 @click.option('--interactive', is_flag=True, help='Enable interactive mode to refine the query.')
 @click.option('--reason', is_flag=True, help='Enable reasoning mode for multi-step analysis.')
 @click.option('--debug-filter', help='(Dev) Bypass LLM and use this exact OPTIMADE filter.')
-def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filter: str):
+@click.option('--limit', type=int, default=1000, help='Maximum number of results to retrieve per provider (default: 1000).')
+@click.option('--mp-api-key', help='Materials Project API key for enhanced properties (overrides environment variable).')
+def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filter: str, limit: int, mp_api_key: str):
     """
     Asks a question about materials science using natural language.
 
@@ -497,29 +684,17 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
 
         with console.status(f"[bold green]Fetching provider capabilities from {provider_to_query}...[/bold green]"):
             # Use a new client instance to get the specific provider's info
-            info_client = OptimadeClient(include_providers=[provider_to_query], verbosity=0)
+            info_client = OptimadeClient(
+                include_providers=[provider_to_query], 
+                verbosity=0,
+                max_results_per_provider=limit
+            )
             client = info_client # Use this client for the subsequent query
             
-            # Dynamically determine which fields the provider actually supports
-            try:
-                # Access the specific provider's info from the client
-                provider_info = info_client.info.providers[0] # We are querying one provider
-                
-                # Get the list of supported properties for the 'structures' endpoint
-                provider_properties = set(provider_info.entry_endpoints_by_format['structures']['properties'].keys())
-                
-                # Intersect our desired list with the provider's actual list
-                response_fields = [field for field in desired_fields if field in provider_properties]
-                
-                # Ensure a minimal set of fields if the intersection is empty for some reason
-                if not response_fields:
-                    response_fields = ["id", "elements", "nelements", "chemical_formula_descriptive"]
-                    console.print("[yellow]Warning: Could not find common fields. Requesting a minimal set.[/yellow]")
-
-            except Exception as e:
-                console.print(f"[yellow]Warning: Could not dynamically fetch provider fields from {provider_to_query}. Using a default set. Error: {e}[/yellow]")
-                # Fallback to a safe, minimal set of fields if the info call fails
-                response_fields = ["id", "elements", "nelements", "chemical_formula_descriptive"]
+            # Request all available fields - let OPTIMADE return what it has
+            # The provider will ignore fields it doesn't support
+            response_fields = None  # None means "return all available fields"
+            console.print(f"[dim]Requesting all available fields from {provider_to_query}[/dim]")
 
         with console.status(f"[bold green]Querying {provider_to_query} for detailed properties...[/bold green]"):
             # The client object is already created and configured
@@ -534,6 +709,9 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
         if not all_materials:
             console.print("[red]ERROR:[/red] No materials found for the generated filter.")
             return
+
+        # Enrich Materials Project entries with native API data
+        all_materials = enrich_materials_with_mp_data(all_materials, console, mp_api_key)
 
         # Display results in a table
         console.print(f"[green]SUCCESS:[/green] Found {len(all_materials)} materials. Showing top 10.")
@@ -1257,6 +1435,124 @@ def list_databases():
                     provider["base_url"]
                 )
             console.print(table)
+
+# ==============================================================================
+# 'configure' Command
+# ==============================================================================
+@cli.command()
+@click.option('--mp-api-key', help='Set Materials Project API key')
+@click.option('--list-config', is_flag=True, help='List current configuration')
+@click.option('--reset', is_flag=True, help='Reset configuration to defaults')
+def configure(mp_api_key: str, list_config: bool, reset: bool):
+    """
+    Configure PRISM settings and API keys.
+    
+    This command allows you to set API keys and other configuration options
+    for PRISM. Configuration is stored in the .env file.
+    """
+    env_file = Path('.env')
+    
+    if reset:
+        if Confirm.ask("[yellow]Are you sure you want to reset all configuration?[/yellow]"):
+            # Create backup
+            if env_file.exists():
+                backup_file = Path('.env.backup')
+                env_file.rename(backup_file)
+                console.print(f"[green]Configuration backed up to {backup_file}[/green]")
+            
+            # Create new minimal .env
+            with open(env_file, 'w') as f:
+                f.write("# PRISM Configuration\n")
+                f.write("# Add your API keys and settings here\n\n")
+            console.print("[green]Configuration reset to defaults[/green]")
+        return
+    
+    if list_config:
+        console.print("[bold cyan]Current PRISM Configuration:[/bold cyan]")
+        
+        if env_file.exists():
+            with open(env_file, 'r') as f:
+                content = f.read()
+            
+            # Extract and display key settings (mask sensitive values)
+            lines = content.split('\n')
+            config_found = False
+            
+            for line in lines:
+                if line.strip() and not line.startswith('#'):
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        
+                        # Mask sensitive values
+                        if 'api_key' in key.lower() or 'password' in key.lower() or 'secret' in key.lower():
+                            if value:
+                                masked_value = value[:4] + '*' * (len(value) - 8) + value[-4:] if len(value) > 8 else '*' * len(value)
+                                console.print(f"  {key}: {masked_value}")
+                            else:
+                                console.print(f"  {key}: [red]Not set[/red]")
+                        else:
+                            console.print(f"  {key}: {value}")
+                        config_found = True
+            
+            if not config_found:
+                console.print("[yellow]No configuration found[/yellow]")
+        else:
+            console.print("[yellow]No .env file found[/yellow]")
+        return
+    
+    # Set MP API key
+    if mp_api_key:
+        # Read existing .env file
+        config_lines = []
+        if env_file.exists():
+            with open(env_file, 'r') as f:
+                config_lines = f.readlines()
+        
+        # Update or add MP API key
+        mp_key_found = False
+        for i, line in enumerate(config_lines):
+            if line.startswith('MATERIALS_PROJECT_API_KEY='):
+                config_lines[i] = f'MATERIALS_PROJECT_API_KEY={mp_api_key}\n'
+                mp_key_found = True
+                break
+        
+        if not mp_key_found:
+            config_lines.append(f'MATERIALS_PROJECT_API_KEY={mp_api_key}\n')
+        
+        # Write back to file
+        with open(env_file, 'w') as f:
+            f.writelines(config_lines)
+        
+        console.print("[green]Materials Project API key configured successfully[/green]")
+        
+        # Test the API key
+        try:
+            if MP_API_AVAILABLE:
+                with MPRester(mp_api_key) as mpr:
+                    # Simple test query
+                    test_data = mpr.materials.summary.search(
+                        material_ids=['mp-1'], 
+                        fields=['material_id']
+                    )
+                    if test_data:
+                        console.print("[green]✓ API key validated successfully[/green]")
+                    else:
+                        console.print("[yellow]⚠ API key set but validation failed[/yellow]")
+            else:
+                console.print("[yellow]⚠ Materials Project API not available for validation[/yellow]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ API key set but validation failed: {str(e)[:50]}[/yellow]")
+        
+        return
+    
+    # If no options provided, show help
+    console.print("[cyan]Use --help to see available configuration options[/cyan]")
+    console.print("[cyan]Examples:[/cyan]")
+    console.print("  prism configure --mp-api-key YOUR_KEY_HERE")
+    console.print("  prism configure --list-config")
+    console.print("  prism configure --reset")
 
 # ==============================================================================
 # CLI Entry Point
