@@ -41,7 +41,7 @@ class VertexAIService(LLMService):
 class AnthropicService(LLMService):
     def __init__(self, model: str = None):
         self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        self.model = model or os.getenv("LLM_MODEL", "claude-3-5-sonnet-20240620")
+        self.model = model or os.getenv("LLM_MODEL", "claude-sonnet-4-20250514")
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.messages.create(
@@ -69,39 +69,6 @@ class OpenRouterService(LLMService):
             stream=stream
         )
 
-# Upcoming LLM providers - coming soon
-class PerplexityService(LLMService):
-    def __init__(self, model: str = None):
-        # Coming soon - Perplexity AI integration
-        raise NotImplementedError("Perplexity integration coming soon!")
-    
-    def get_completion(self, prompt: str, stream: bool = False):
-        raise NotImplementedError("Perplexity integration coming soon!")
-
-class GrokService(LLMService):
-    def __init__(self, model: str = None):
-        # Coming soon - Grok (xAI) integration
-        raise NotImplementedError("Grok integration coming soon!")
-    
-    def get_completion(self, prompt: str, stream: bool = False):
-        raise NotImplementedError("Grok integration coming soon!")
-
-class OllamaService(LLMService):
-    def __init__(self, model: str = None):
-        # Coming soon - Local Ollama model support
-        raise NotImplementedError("Ollama local model support coming soon!")
-    
-    def get_completion(self, prompt: str, stream: bool = False):
-        raise NotImplementedError("Ollama local model support coming soon!")
-
-class PRISMCustomService(LLMService):
-    def __init__(self, model: str = None):
-        # Coming soon - Custom PRISM model trained on materials science literature
-        raise NotImplementedError("PRISM Custom Model coming soon - trained on massive materials science corpus!")
-    
-    def get_completion(self, prompt: str, stream: bool = False):
-        raise NotImplementedError("PRISM Custom Model coming soon!")
-
 def get_llm_service(provider: str = None, model: str = None) -> LLMService:
     # Determine provider from environment variables if not specified
     if provider is None:
@@ -113,14 +80,6 @@ def get_llm_service(provider: str = None, model: str = None) -> LLMService:
             provider = "anthropic"
         elif os.getenv("GOOGLE_CLOUD_PROJECT"):
             provider = "vertexai"
-        elif os.getenv("PERPLEXITY_API_KEY"):
-            provider = "perplexity"
-        elif os.getenv("GROK_API_KEY"):
-            provider = "grok"
-        elif os.getenv("OLLAMA_HOST"):
-            provider = "ollama"
-        elif os.getenv("PRISM_CUSTOM_API_KEY"):
-            provider = "prism_custom"
         else:
             raise ValueError("No LLM provider configured. Please set an API key in the .env file.")
 
@@ -130,10 +89,6 @@ def get_llm_service(provider: str = None, model: str = None) -> LLMService:
         "openai": OpenAIService,
         "anthropic": AnthropicService,
         "vertexai": VertexAIService,
-        "perplexity": PerplexityService,
-        "grok": GrokService,
-        "ollama": OllamaService,
-        "prism_custom": PRISMCustomService,
     }
 
     service_class = provider_map.get(provider.lower())
