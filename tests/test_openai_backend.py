@@ -80,3 +80,67 @@ class TestOpenAIBackend:
         resp = backend.complete(messages=[{"role": "user", "content": "test"}], tools=[])
         assert resp.has_tool_calls
         assert resp.tool_calls[0].tool_args == {}
+
+    @patch("app.agent.backends.openai_backend.OpenAI")
+    def test_complete_stream_text(self, mock_cls):
+        from app.agent.events import TextDelta, TurnComplete
+        client = mock_cls.return_value
+
+        chunks = []
+        for text in ["Hello ", "world"]:
+            chunk = MagicMock()
+            delta = MagicMock()
+            delta.content = text
+            delta.tool_calls = None
+            chunk.choices = [MagicMock(delta=delta)]
+            chunks.append(chunk)
+
+        client.chat.completions.create.return_value = iter(chunks)
+        backend = OpenAIBackend(api_key="test-key")
+        events = list(backend.complete_stream(messages=[{"role": "user", "content": "hi"}], tools=[]))
+        text_deltas = [e for e in events if isinstance(e, TextDelta)]
+        assert len(text_deltas) == 2
+        assert text_deltas[0].text == "Hello "
+        assert isinstance(events[-1], TurnComplete)
+        assert backend._last_stream_response.text == "Hello world"
+
+    @patch("app.agent.backends.openai_backend.OpenAI")
+    def test_complete_stream_tool_call(self, mock_cls):
+        from app.agent.events import ToolCallStart, TurnComplete
+        client = mock_cls.return_value
+
+        # First chunk: tool call start with name
+        chunk1 = MagicMock()
+        tc_delta1 = MagicMock()
+        tc_delta1.index = 0
+        tc_delta1.id = "call_1"
+        tc_delta1.function = MagicMock()
+        tc_delta1.function.name = "search"
+        tc_delta1.function.arguments = '{"q":'
+        delta1 = MagicMock()
+        delta1.content = None
+        delta1.tool_calls = [tc_delta1]
+        chunk1.choices = [MagicMock(delta=delta1)]
+
+        # Second chunk: more arguments
+        chunk2 = MagicMock()
+        tc_delta2 = MagicMock()
+        tc_delta2.index = 0
+        tc_delta2.id = None
+        tc_delta2.function = MagicMock()
+        tc_delta2.function.name = None
+        tc_delta2.function.arguments = '"Si"}'
+        delta2 = MagicMock()
+        delta2.content = None
+        delta2.tool_calls = [tc_delta2]
+        chunk2.choices = [MagicMock(delta=delta2)]
+
+        client.chat.completions.create.return_value = iter([chunk1, chunk2])
+        backend = OpenAIBackend(api_key="test-key")
+        events = list(backend.complete_stream(messages=[{"role": "user", "content": "find Si"}], tools=[{"name": "search", "description": "Search", "input_schema": {}}]))
+        tool_starts = [e for e in events if isinstance(e, ToolCallStart)]
+        assert len(tool_starts) == 1
+        assert tool_starts[0].tool_name == "search"
+        assert isinstance(events[-1], TurnComplete)
+        assert events[-1].has_more is True
+        assert backend._last_stream_response.tool_calls[0].tool_args == {"q": "Si"}

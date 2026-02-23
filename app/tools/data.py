@@ -1,5 +1,8 @@
 """Data tools: OPTIMADE search and Materials Project queries."""
+import csv
 import json
+import os
+from datetime import datetime
 from typing import List, Optional
 from app.tools.base import Tool, ToolRegistry
 
@@ -69,6 +72,24 @@ def _query_materials_project(**kwargs) -> dict:
         return {"error": str(e)}
 
 
+def _export_results_csv(**kwargs) -> dict:
+    results = kwargs.get("results", [])
+    filename = kwargs.get("filename")
+    if not results:
+        return {"error": "No results to export."}
+    if not filename:
+        filename = f"prism_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    try:
+        fieldnames = list(results[0].keys())
+        with open(filename, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(results)
+        return {"filename": filename, "rows": len(results), "columns": fieldnames}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def create_data_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="search_optimade",
@@ -87,3 +108,11 @@ def create_data_tools(registry: ToolRegistry) -> None:
             "material_id": {"type": "string", "description": "Materials Project ID, e.g. 'mp-1234'"},
             "properties": {"type": "array", "items": {"type": "string"}, "description": "Properties to retrieve."}}},
         func=_query_materials_project))
+    registry.register(Tool(
+        name="export_results_csv",
+        description="Export a list of result dictionaries to a CSV file. Use after gathering data to save results for the user.",
+        input_schema={"type": "object", "properties": {
+            "results": {"type": "array", "items": {"type": "object"}, "description": "List of result dictionaries to export"},
+            "filename": {"type": "string", "description": "Output CSV filename. Auto-generated if omitted."}},
+            "required": ["results"]},
+        func=_export_results_csv))

@@ -43,7 +43,7 @@ from app.mcp import ModelContext, AdaptiveOptimadeFilter
 from app.prompts import ROUTER_PROMPT, SUMMARIZATION_PROMPT
 from app.agent.factory import create_backend
 from app.agent.repl import AgentREPL
-from app.agent.autonomous import run_autonomous
+from app.agent.autonomous import run_autonomous, run_autonomous_stream
 
 try:
     from mp_api.client import MPRester
@@ -169,7 +169,8 @@ def build_optimade_filter(elements=None, formula=None, nelements=None):
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
 @click.option('--quiet', '-q', is_flag=True, help='Suppress non-essential output')
 @click.option('--mp-api-key', help='Set Materials Project API key for enhanced properties')
-def cli(ctx, version, verbose, quiet, mp_api_key):
+@click.option('--resume', default=None, help='Resume a saved session by SESSION_ID')
+def cli(ctx, version, verbose, quiet, mp_api_key, resume):
     f"""
 {PRISM_BRAND}
 Platform for Research in Intelligent Synthesis of Materials
@@ -234,6 +235,13 @@ Running PRISM without any subcommands will start the interactive 'ask' mode.
         try:
             backend = create_backend()
             repl = AgentREPL(backend=backend)
+            if resume:
+                try:
+                    repl._load_session(resume)
+                    console.print(f"[green]Resumed session: {resume}[/green]")
+                except FileNotFoundError:
+                    console.print(f"[red]Session not found: {resume}[/red]")
+                    return
             repl.run()
         except ValueError as e:
             # Fall back to showing help if no agent provider configured
@@ -250,19 +258,45 @@ Running PRISM without any subcommands will start the interactive 'ask' mode.
 @click.option("--model", default=None, help="Model name override")
 def run_goal(goal, provider, model):
     """Run PRISM agent autonomously on a research goal."""
-    console = Console()
+    from rich.live import Live
+    from rich.markdown import Markdown
+    from rich.text import Text
+    from app.agent.events import TextDelta, ToolCallStart, ToolCallResult, TurnComplete
+    run_console = Console()
     try:
         backend = create_backend(provider=provider, model=model)
-        console.print(Panel.fit(f"[bold]Goal:[/bold] {goal}", border_style="cyan"))
-        with console.status("[bold green]Agent working..."):
-            result = run_autonomous(goal=goal, backend=backend)
-        console.print()
-        from rich.markdown import Markdown
-        console.print(Markdown(result))
+        run_console.print(Panel.fit(f"[bold]Goal:[/bold] {goal}", border_style="cyan"))
+        accumulated_text = ""
+        with Live("", console=run_console, refresh_per_second=15, vertical_overflow="visible") as live:
+            for event in run_autonomous_stream(goal=goal, backend=backend):
+                if isinstance(event, TextDelta):
+                    accumulated_text += event.text
+                    live.update(Text(accumulated_text))
+                elif isinstance(event, ToolCallStart):
+                    live.update("")
+                    run_console.print(Panel(
+                        f"[dim]Calling...[/dim]",
+                        title=f"[bold yellow]{event.tool_name}[/bold yellow]",
+                        border_style="yellow",
+                        expand=False,
+                    ))
+                    accumulated_text = ""
+                elif isinstance(event, ToolCallResult):
+                    run_console.print(Panel(
+                        f"[green]{event.summary}[/green]",
+                        title=f"[bold green]{event.tool_name}[/bold green]",
+                        border_style="green",
+                        expand=False,
+                    ))
+                elif isinstance(event, TurnComplete):
+                    live.update("")
+        if accumulated_text:
+            run_console.print()
+            run_console.print(Markdown(accumulated_text))
     except ValueError as e:
-        console.print(f"[red]Error: {e}[/red]")
+        run_console.print(f"[red]Error: {e}[/red]")
     except Exception as e:
-        console.print(f"[red]Agent error: {e}[/red]")
+        run_console.print(f"[red]Agent error: {e}[/red]")
 
 # ==============================================================================
 # 'switch-llm' Command

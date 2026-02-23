@@ -28,12 +28,27 @@ class SessionMemory:
     def get_history(self) -> List[Dict]:
         return self._history
 
+    def _compute_summary(self) -> str:
+        """First user message, truncated to 80 chars."""
+        for msg in self._history:
+            if msg.get("role") == "user":
+                text = msg.get("content", "")
+                return text[:80] if len(text) > 80 else text
+        return ""
+
     def save(self) -> str:
         self._storage_dir.mkdir(parents=True, exist_ok=True)
         if not self._session_id:
             self._session_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
         filepath = self._storage_dir / f"{self._session_id}.json"
-        payload = {"session_id": self._session_id, "timestamp": datetime.now().isoformat(), "data": self._data, "history": self._history}
+        payload = {
+            "session_id": self._session_id,
+            "timestamp": datetime.now().isoformat(),
+            "summary": self._compute_summary(),
+            "message_count": len(self._history),
+            "data": self._data,
+            "history": self._history,
+        }
         filepath.write_text(json.dumps(payload, indent=2, default=str))
         return self._session_id
 
@@ -51,7 +66,12 @@ class SessionMemory:
         for f in sorted(self._storage_dir.glob("*.json"), reverse=True):
             try:
                 payload = json.loads(f.read_text())
-                sessions.append({"session_id": payload["session_id"], "timestamp": payload.get("timestamp")})
+                sessions.append({
+                    "session_id": payload["session_id"],
+                    "timestamp": payload.get("timestamp"),
+                    "summary": payload.get("summary", ""),
+                    "message_count": payload.get("message_count", 0),
+                })
             except (json.JSONDecodeError, KeyError):
                 continue
         return sessions
