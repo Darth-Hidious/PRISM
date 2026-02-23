@@ -258,14 +258,6 @@ Running PRISM without any subcommands will start the interactive 'ask' mode.
                 llm_provider = f"Anthropic ({llm_service.model})"
             elif os.getenv("OPENROUTER_API_KEY"):
                 llm_provider = f"OpenRouter ({llm_service.model})"
-            elif os.getenv("PERPLEXITY_API_KEY"):
-                llm_provider = "Perplexity (coming soon)"
-            elif os.getenv("GROK_API_KEY"):
-                llm_provider = "Grok (coming soon)"
-            elif os.getenv("OLLAMA_HOST"):
-                llm_provider = "Ollama Local (coming soon)"
-            elif os.getenv("PRISM_CUSTOM_API_KEY"):
-                llm_provider = "PRISM Custom Model (coming soon)"
             else:
                 llm_provider = "Unknown"
         except (ValueError, NotImplementedError):
@@ -363,17 +355,6 @@ def switch_llm():
         configured_providers.append("OpenRouter")
         provider_mapping[str(len(configured_providers))] = ("OPENROUTER_API_KEY", "OpenRouter")
     
-    # Add coming soon providers (for display only)
-    coming_soon = []
-    if os.getenv("PERPLEXITY_API_KEY"):
-        coming_soon.append("Perplexity")
-    if os.getenv("GROK_API_KEY"):
-        coming_soon.append("Grok")
-    if os.getenv("OLLAMA_HOST"):
-        coming_soon.append("Ollama Local")
-    if os.getenv("PRISM_CUSTOM_API_KEY"):
-        coming_soon.append("PRISM Custom Model")
-    
     if not configured_providers:
         console.print("[red]No LLM providers are configured.[/red]")
         console.print("[yellow]Run 'prism advanced configure' to set up providers.[/yellow]")
@@ -405,11 +386,6 @@ def switch_llm():
     console.print(f"\n[bold green]Configured Providers:[/bold green]")
     for i, (choice, (env_var, name)) in enumerate(provider_mapping.items(), 1):
         console.print(f"{choice}. [cyan]{name}[/cyan]")
-    
-    if coming_soon:
-        console.print(f"\n[dim]Coming Soon:[/dim]")
-        for provider in coming_soon:
-            console.print(f"• [dim]{provider} (configured but not yet supported)[/dim]")
     
     # Let user choose
     try:
@@ -813,10 +789,6 @@ def configure():
     console.print("2. Google Vertex AI")
     console.print("3. Anthropic")
     console.print("4. OpenRouter")
-    console.print("[dim]5. Perplexity (coming soon)[/dim]")
-    console.print("[dim]6. Grok (coming soon)[/dim]")
-    console.print("[dim]7. Ollama Local (coming soon)[/dim]")
-    console.print("[dim]8. PRISM Custom Model (coming soon)[/dim]")
     provider_choice = IntPrompt.ask("Enter the number of your provider", choices=["1", "2", "3", "4"])
     
     # Get optional model name from user
