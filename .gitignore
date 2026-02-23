@@ -128,5 +128,7 @@ Thumbs.db
 provider_fields.json
 models/*.joblib
 models/*.pkl
+models/*.meta.json
 data/*.parquet
 data/*.csv
+data/*.meta.json
