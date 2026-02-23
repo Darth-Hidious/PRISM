@@ -123,3 +123,10 @@ Thumbs.db
 
 # Application specific
 *.log
+*.db
+*.sqlite3
+provider_fields.json
+models/*.joblib
+models/*.pkl
+data/*.parquet
+data/*.csv

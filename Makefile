@@ -46,8 +46,8 @@ lint:
 	mypy app/
 
 test:
-	@echo "🧪 Running test suite..."
-	@echo "🤷 No tests found. Skipping."
+	@echo "Running test suite..."
+	pytest tests/ -v --tb=short
 
 # Execution commands
 run:
