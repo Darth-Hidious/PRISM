@@ -1468,5 +1468,11 @@ cli.add_command(optimade)
 from app.commands.data import data as data_group
 cli.add_command(data_group, "data")
 
+from app.commands.predict import predict as predict_cmd
+cli.add_command(predict_cmd, "predict")
+
+from app.commands.model import model as model_group
+cli.add_command(model_group, "model")
+
 if __name__ == "__main__":
     cli()
