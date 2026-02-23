@@ -1465,5 +1465,8 @@ cli.add_command(advanced)
 cli.add_command(docs)
 cli.add_command(optimade)
 
+from app.commands.data import data as data_group
+cli.add_command(data_group, "data")
+
 if __name__ == "__main__":
     cli()
