@@ -2,9 +2,23 @@
 from pathlib import Path
 from app.tools.base import Tool, ToolRegistry
 
+# Restrict file operations to current working directory
+_ALLOWED_BASE = Path.cwd().resolve()
+
+
+def _is_safe_path(path: str) -> bool:
+    """Check that path resolves within the allowed base directory."""
+    try:
+        resolved = Path(path).resolve()
+        return resolved == _ALLOWED_BASE or _ALLOWED_BASE in resolved.parents
+    except (ValueError, OSError):
+        return False
+
 
 def _read_file(**kwargs) -> dict:
     path = kwargs["path"]
+    if not _is_safe_path(path):
+        return {"error": f"Access denied: path must be within {_ALLOWED_BASE}"}
     try:
         content = Path(path).read_text()
         return {"content": content}
@@ -15,6 +29,8 @@ def _read_file(**kwargs) -> dict:
 def _write_file(**kwargs) -> dict:
     path = kwargs["path"]
     content = kwargs["content"]
+    if not _is_safe_path(path):
+        return {"error": f"Access denied: path must be within {_ALLOWED_BASE}"}
     try:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(content)
@@ -42,11 +58,11 @@ def _web_search(**kwargs) -> dict:
 
 def create_system_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
-        name="read_file", description="Read the contents of a file at the given path.",
+        name="read_file", description="Read the contents of a file at the given path (restricted to project directory).",
         input_schema={"type": "object", "properties": {"path": {"type": "string", "description": "File path to read"}}, "required": ["path"]},
         func=_read_file))
     registry.register(Tool(
-        name="write_file", description="Write content to a file at the given path.",
+        name="write_file", description="Write content to a file at the given path (restricted to project directory).",
         input_schema={"type": "object", "properties": {"path": {"type": "string", "description": "File path to write"}, "content": {"type": "string", "description": "Content to write"}}, "required": ["path", "content"]},
         func=_write_file))
     registry.register(Tool(
