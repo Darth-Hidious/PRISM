@@ -6,6 +6,7 @@ from app.tools.base import ToolRegistry
 from app.tools.data import create_data_tools
 from app.tools.system import create_system_tools
 from app.tools.visualization import create_visualization_tools
+from app.tools.prediction import create_prediction_tools
 
 
 AUTONOMOUS_SYSTEM_PROMPT = """You are PRISM, an autonomous materials science research agent.
@@ -34,5 +35,6 @@ def run_autonomous(goal: str, backend: Backend, system_prompt: Optional[str] = N
         create_system_tools(tools)
         create_data_tools(tools)
         create_visualization_tools(tools)
+        create_prediction_tools(tools)
     agent = AgentCore(backend=backend, tools=tools, system_prompt=system_prompt or AUTONOMOUS_SYSTEM_PROMPT, max_iterations=max_iterations)
     return agent.process(goal)
