@@ -14,18 +14,8 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-# Try multiple locations to find .env file
-env_paths = [
-    '.env',  # Current directory
-    Path(__file__).parent.parent / '.env',  # Project root
-    Path.cwd() / '.env'  # Current working directory
-]
-
-for env_path in env_paths:
-    if Path(env_path).exists():
-        load_dotenv(env_path)
-        break
+from app.config.settings import get_env_path
+load_dotenv(get_env_path())
 
 # Windows console encoding will be handled by Rich library fallbacks
 
