@@ -41,6 +41,9 @@ except ImportError:
 from app.llm import get_llm_service
 from app.mcp import ModelContext, AdaptiveOptimadeFilter
 from app.prompts import ROUTER_PROMPT, SUMMARIZATION_PROMPT
+from app.agent.factory import create_backend
+from app.agent.repl import AgentREPL
+from app.agent.autonomous import run_autonomous
 
 try:
     from mp_api.client import MPRester
@@ -228,95 +231,37 @@ Running PRISM without any subcommands will start the interactive 'ask' mode.
         
     elif ctx.invoked_subcommand is None:
         try:
-            console.print(Panel(PRISM_BRAND, style="bold blue", title="PRISM"))
-        except UnicodeEncodeError:
-            # Fallback for Windows console encoding issues
-            print("=" * 80)
-            print("PRISM - Platform for Research in Intelligent Synthesis of Materials")
-            print("=" * 80)
-        
-        # Check LLM configuration status
-        try:
-            llm_service = get_llm_service()
-            llm_configured = True
-            # Determine which service is configured
-            if os.getenv("OPENAI_API_KEY"):
-                llm_provider = f"OpenAI ({llm_service.model})"
-            elif os.getenv("GOOGLE_CLOUD_PROJECT"):
-                llm_provider = f"Google Vertex AI ({llm_service.model})"
-            elif os.getenv("ANTHROPIC_API_KEY"):
-                llm_provider = f"Anthropic ({llm_service.model})"
-            elif os.getenv("OPENROUTER_API_KEY"):
-                llm_provider = f"OpenRouter ({llm_service.model})"
-            else:
-                llm_provider = "Unknown"
-        except (ValueError, NotImplementedError):
-            llm_configured = False
-            llm_provider = "Not configured"
-        
-        # Show system status with quick switcher
-        try:
-            if llm_configured:
-                console.print(f"\n[green]STATUS:[/green] LLM Provider: [cyan]{llm_provider}[/cyan] [green]✓[/green]")
-                console.print("[dim]Quick switch: Use 'prism switch-llm' or press 's' below[/dim]")
-            else:
-                console.print(f"\n[yellow]STATUS:[/yellow] LLM Provider: [red]{llm_provider}[/red] [red]✗[/red]")
-                console.print("[yellow]Note: Run 'prism advanced configure' to set up LLM provider for 'ask' command[/yellow]")
-        except UnicodeEncodeError:
-            if llm_configured:
-                print(f"\nSTATUS: LLM Provider: {llm_provider} (configured)")
-                print("Quick switch: Use 'prism switch-llm' or press 's' below")
-            else:
-                print(f"\nSTATUS: LLM Provider: {llm_provider}")
-                print("Note: Run 'prism advanced configure' to set up LLM provider for 'ask' command")
-        
-        # Show available commands
-        try:
-            console.print("\n[bold green]Available Commands:[/bold green]")
-            console.print("• [cyan]search[/cyan]    - Search materials databases with specific criteria")
-            if llm_configured:
-                console.print("• [cyan]ask[/cyan]       - Ask questions using natural language")
-                console.print("  [dim]--interactive[/dim] - Get targeted questions to refine your search")
-                console.print("  [dim]--reason[/dim]      - Enable multi-step reasoning analysis")
-            else:
-                console.print("• [dim cyan]ask[/dim cyan]       - Ask questions using natural language [dim](requires LLM setup)[/dim]")
-            console.print("• [cyan]switch-llm[/cyan] - Quick switch between LLM providers")
-            console.print("• [cyan]optimade[/cyan]  - OPTIMADE network tools (list-dbs)")
-            console.print("• [cyan]advanced[/cyan]  - Database and configuration management")
-            console.print("• [cyan]docs[/cyan]      - Generate documentation files")
-            console.print("\nUse [cyan]prism COMMAND --help[/cyan] for detailed information about each command.")
-        except UnicodeEncodeError:
-            print("\nAvailable Commands:")
-            print("• search    - Search materials databases with specific criteria")
-            if llm_configured:
-                print("• ask       - Ask questions using natural language")
-                print("  --interactive - Get targeted questions to refine your search")
-                print("  --reason      - Enable multi-step reasoning analysis")
-            else:
-                print("• ask       - Ask questions using natural language (requires LLM setup)")
-            print("• switch-llm - Quick switch between LLM providers")
-            print("• optimade  - OPTIMADE network tools (list-dbs)")
-            print("• advanced  - Database and configuration management")
-            print("• docs      - Generate documentation files")
-            print("\nUse 'prism COMMAND --help' for detailed information about each command.")
-        
-        # Prompt for question or quick actions
-        if llm_configured:
-            try:
-                query = Prompt.ask("\n[bold cyan]Ask a question about materials science, press 's' to switch LLM, or Enter to exit[/bold cyan]", default="")
-            except UnicodeEncodeError:
-                # Fallback prompt
-                query = input("\nAsk a question about materials science, press 's' to switch LLM, or Enter to exit: ").strip()
-                    
-            if query == "s" or query.lower() == "switch":
-                ctx.invoke(switch_llm)
-            elif query:
-                ctx.invoke(ask, query=query)
-        else:
-            try:
-                console.print("\n[yellow]To use the 'ask' command, please run:[/yellow] [cyan]prism advanced configure[/cyan]")
-            except UnicodeEncodeError:
-                print("\nTo use the 'ask' command, please run: prism advanced configure")
+            backend = create_backend()
+            repl = AgentREPL(backend=backend)
+            repl.run()
+        except ValueError as e:
+            # Fall back to showing help if no agent provider configured
+            console.print(PRISM_BRAND)
+            console.print(f"[yellow]{e}[/yellow]")
+            console.print("\nRun [cyan]prism --help[/cyan] for available commands.")
+
+# ==============================================================================
+# 'run' Command (autonomous agent mode)
+# ==============================================================================
+@cli.command("run")
+@click.argument("goal")
+@click.option("--provider", default=None, help="LLM provider (anthropic/openai/openrouter)")
+@click.option("--model", default=None, help="Model name override")
+def run_goal(goal, provider, model):
+    """Run PRISM agent autonomously on a research goal."""
+    console = Console()
+    try:
+        backend = create_backend(provider=provider, model=model)
+        console.print(Panel.fit(f"[bold]Goal:[/bold] {goal}", border_style="cyan"))
+        with console.status("[bold green]Agent working..."):
+            result = run_autonomous(goal=goal, backend=backend)
+        console.print()
+        from rich.markdown import Markdown
+        console.print(Markdown(result))
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]Agent error: {e}[/red]")
 
 # ==============================================================================
 # 'switch-llm' Command
