@@ -33,8 +33,6 @@ dependencies = [
     "rich>=12.0.0",
     "optimade[http-client]>=1.2.0",
     "sqlalchemy>=2.0.0",
-    "psycopg2-binary>=2.9.0",
-    "alembic>=1.8.0",
     "python-dotenv>=1.0.0",
     "openai>=1.0.0",
     "google-cloud-aiplatform>=1.0.0",
@@ -54,7 +52,7 @@ Repository = "https://github.com/Darth-Hidious/PRISM"
 "Bug Reports" = "https://github.com/Darth-Hidious/PRISM/issues"
 
 [tool.setuptools]
-packages = ["app", "app.config", "app.services", "app.services.connectors", "app.db", "app.api", "app.api.v1", "app.api.v1.endpoints"]
+packages = ["app", "app.config", "app.db"]
 include-package-data = true
 
 [tool.black]
