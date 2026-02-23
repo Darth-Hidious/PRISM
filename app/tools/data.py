@@ -12,22 +12,28 @@ def _search_optimade(**kwargs) -> dict:
         from optimade.client import OptimadeClient
         from app.config.providers import FALLBACK_PROVIDERS
         if providers:
-            base_urls = {p["id"]: p["base_url"] for p in FALLBACK_PROVIDERS if p["id"] in providers}
+            base_urls = [p["base_url"] for p in FALLBACK_PROVIDERS if p["id"] in providers]
         else:
-            base_urls = {p["id"]: p["base_url"] for p in FALLBACK_PROVIDERS}
+            base_urls = [p["base_url"] for p in FALLBACK_PROVIDERS]
         client = OptimadeClient(base_urls=base_urls, max_results_per_provider=max_results)
         raw = client.get(filter_string)
+        # Response format: {endpoint: {filter: {url: {data: [entries]}}}}
         results = []
-        for provider_id, provider_data in raw.items():
-            if isinstance(provider_data, dict):
-                entries = provider_data.get("data", [])
-            elif isinstance(provider_data, list):
-                entries = provider_data
-            else:
+        for endpoint, filters in raw.items():
+            if not isinstance(filters, dict):
                 continue
-            for entry in entries[:max_results]:
-                attrs = entry.get("attributes", {}) if isinstance(entry, dict) else {}
-                results.append({"id": entry.get("id", ""), "provider": provider_id, "formula": attrs.get("chemical_formula_descriptive", ""), "elements": attrs.get("elements", []), "space_group": attrs.get("space_group_symbol", "")})
+            for filter_key, providers_data in filters.items():
+                if not isinstance(providers_data, dict):
+                    continue
+                for provider_url, response in providers_data.items():
+                    entries = []
+                    if isinstance(response, dict):
+                        entries = response.get("data", [])
+                    elif isinstance(response, list):
+                        entries = response
+                    for entry in entries[:max_results]:
+                        attrs = entry.get("attributes", {}) if isinstance(entry, dict) else {}
+                        results.append({"id": entry.get("id", ""), "provider": provider_url, "formula": attrs.get("chemical_formula_descriptive", ""), "elements": attrs.get("elements", []), "space_group": attrs.get("space_group_symbol", "")})
         return {"results": results, "count": len(results), "filter": filter_string}
     except Exception as e:
         return {"error": str(e), "filter": filter_string}
