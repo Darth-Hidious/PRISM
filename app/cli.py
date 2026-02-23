@@ -226,7 +226,8 @@ Running PRISM without any subcommands will start the interactive 'ask' mode.
     if version:
         console.print(f"[bold cyan]{PRISM_BRAND}[/bold cyan]")
         console.print("[dim]Platform for Research in Intelligent Synthesis of Materials[/dim]")
-        console.print("[dim]Version: 1.1.0[/dim]")
+        from app import __version__
+        console.print(f"[dim]Version: {__version__}[/dim]")
         ctx.exit()
         
     elif ctx.invoked_subcommand is None:
