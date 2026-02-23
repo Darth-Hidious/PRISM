@@ -1,10 +1,10 @@
 """OpenAI-compatible backend (also supports OpenRouter via base_url)."""
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Dict, Generator, List, Optional
 from openai import OpenAI
 from app.agent.backends.base import Backend
-from app.agent.events import AgentResponse, ToolCallEvent
+from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete
 
 
 class OpenAIBackend(Backend):
@@ -24,6 +24,54 @@ class OpenAIBackend(Backend):
             kwargs["tools"] = self._format_tools(tools)
         response = self.client.chat.completions.create(**kwargs)
         return self._parse_response(response)
+
+    def complete_stream(self, messages: List[Dict], tools: List[dict], system_prompt: Optional[str] = None) -> Generator:
+        formatted_messages = self._format_messages(messages, system_prompt)
+        kwargs = {"model": self.model, "messages": formatted_messages, "stream": True}
+        if tools:
+            kwargs["tools"] = self._format_tools(tools)
+        stream = self.client.chat.completions.create(**kwargs)
+
+        text_parts = []
+        tool_calls_acc = {}  # index -> {id, name, args_str}
+        seen_tool_starts = set()
+
+        for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta is None:
+                continue
+            if delta.content:
+                text_parts.append(delta.content)
+                yield TextDelta(text=delta.content)
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {"id": "", "name": "", "args_str": ""}
+                    if tc_delta.id:
+                        tool_calls_acc[idx]["id"] = tc_delta.id
+                    if tc_delta.function and tc_delta.function.name:
+                        tool_calls_acc[idx]["name"] = tc_delta.function.name
+                    if tc_delta.function and tc_delta.function.arguments:
+                        tool_calls_acc[idx]["args_str"] += tc_delta.function.arguments
+                    if idx not in seen_tool_starts and tool_calls_acc[idx]["name"]:
+                        seen_tool_starts.add(idx)
+                        yield ToolCallStart(tool_name=tool_calls_acc[idx]["name"], call_id=tool_calls_acc[idx]["id"])
+
+        # Build final AgentResponse
+        tool_calls = []
+        for idx in sorted(tool_calls_acc):
+            acc = tool_calls_acc[idx]
+            try:
+                tool_args = json.loads(acc["args_str"]) if acc["args_str"] else {}
+            except (json.JSONDecodeError, TypeError):
+                tool_args = {}
+            tool_calls.append(ToolCallEvent(tool_name=acc["name"], tool_args=tool_args, call_id=acc["id"]))
+
+        full_text = "".join(text_parts) if text_parts else None
+        response = AgentResponse(text=full_text, tool_calls=tool_calls)
+        self._last_stream_response = response
+        yield TurnComplete(text=full_text, has_more=response.has_tool_calls)
 
     def _format_messages(self, messages: List[Dict], system_prompt: Optional[str] = None) -> List[Dict]:
         formatted = []

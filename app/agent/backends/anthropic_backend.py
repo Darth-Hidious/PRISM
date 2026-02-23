@@ -1,10 +1,10 @@
 """Anthropic backend using the Anthropic Python SDK."""
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Dict, Generator, List, Optional
 from anthropic import Anthropic
 from app.agent.backends.base import Backend
-from app.agent.events import AgentResponse, ToolCallEvent
+from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete
 
 
 class AnthropicBackend(Backend):
@@ -22,6 +22,25 @@ class AnthropicBackend(Backend):
             kwargs["tools"] = tools
         response = self.client.messages.create(**kwargs)
         return self._parse_response(response)
+
+    def complete_stream(self, messages: List[Dict], tools: List[dict], system_prompt: Optional[str] = None) -> Generator:
+        kwargs = {"model": self.model, "max_tokens": 4096, "messages": self._format_messages(messages)}
+        if system_prompt:
+            kwargs["system"] = system_prompt
+        if tools:
+            kwargs["tools"] = tools
+        with self.client.messages.stream(**kwargs) as stream:
+            for event in stream:
+                if event.type == "content_block_start" and hasattr(event.content_block, "type"):
+                    if event.content_block.type == "tool_use":
+                        yield ToolCallStart(tool_name=event.content_block.name, call_id=event.content_block.id)
+                elif event.type == "content_block_delta":
+                    if hasattr(event.delta, "text"):
+                        yield TextDelta(text=event.delta.text)
+            final = stream.get_final_message()
+        response = self._parse_response(final)
+        self._last_stream_response = response
+        yield TurnComplete(text=response.text, has_more=response.has_tool_calls)
 
     def _format_messages(self, messages: List[Dict]) -> List[Dict]:
         """Convert neutral message format to Anthropic format."""
