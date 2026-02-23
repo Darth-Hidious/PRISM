@@ -16,7 +16,8 @@ class TestSearchOPTIMADETool:
     def test_search_by_elements(self):
         mock_client_cls = MagicMock()
         mock_client = mock_client_cls.return_value
-        mock_client.get.return_value = {"mp": {"data": [{"id": "mp-1", "attributes": {"chemical_formula_descriptive": "Si"}}]}}
+        # Response format: {endpoint: {filter: {url: {data: [entries]}}}}
+        mock_client.get.return_value = {"structures": {'elements HAS "Si"': {"https://optimade.materialsproject.org/": {"data": [{"id": "mp-1", "attributes": {"chemical_formula_descriptive": "Si"}}]}}}}
         mock_optimade = MagicMock()
         mock_optimade.client.OptimadeClient = mock_client_cls
         with patch.dict(sys.modules, {"optimade": mock_optimade, "optimade.client": mock_optimade.client}):

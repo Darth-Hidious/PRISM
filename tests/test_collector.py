@@ -14,18 +14,23 @@ class TestOPTIMADECollector:
     def test_collect_by_elements(self):
         mock_client_cls = MagicMock()
         mock_client = mock_client_cls.return_value
+        # Response format: {endpoint: {filter: {url: {data: [entries]}}}}
         mock_client.get.return_value = {
-            "mp": {
-                "data": [
-                    {
-                        "id": "mp-1",
-                        "attributes": {
-                            "chemical_formula_descriptive": "Si",
-                            "elements": ["Si"],
-                            "nelements": 1,
-                        },
+            "structures": {
+                'elements HAS "Si"': {
+                    "https://optimade.materialsproject.org/": {
+                        "data": [
+                            {
+                                "id": "mp-1",
+                                "attributes": {
+                                    "chemical_formula_descriptive": "Si",
+                                    "elements": ["Si"],
+                                    "nelements": 1,
+                                },
+                            }
+                        ]
                     }
-                ]
+                }
             }
         }
         mock_optimade = MagicMock()

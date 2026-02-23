@@ -12,35 +12,45 @@ class OPTIMADECollector:
             from optimade.client import OptimadeClient
         except ImportError:
             return []
-        base_urls = {}
+        base_urls = []
+        provider_map = {}
         for p in self.providers:
             if provider_ids is None or p["id"] in provider_ids:
-                base_urls[p["id"]] = p["base_url"]
+                base_urls.append(p["base_url"])
+                provider_map[p["base_url"]] = p["id"]
         try:
             client = OptimadeClient(base_urls=base_urls, max_results_per_provider=max_per_provider)
             raw = client.get(filter_string)
         except Exception:
             return []
+        # Response format: {endpoint: {filter: {url: {data: [entries]}}}}
         results = []
-        for provider_id, provider_data in raw.items():
-            entries = []
-            if isinstance(provider_data, dict):
-                entries = provider_data.get("data", [])
-            elif isinstance(provider_data, list):
-                entries = provider_data
-            for entry in entries:
-                if not isinstance(entry, dict):
+        for endpoint, filters in raw.items():
+            if not isinstance(filters, dict):
+                continue
+            for filter_key, providers_data in filters.items():
+                if not isinstance(providers_data, dict):
                     continue
-                attrs = entry.get("attributes", {})
-                results.append({
-                    "source_id": f"{provider_id}:{entry.get('id', '')}",
-                    "provider": provider_id,
-                    "formula": attrs.get("chemical_formula_descriptive", ""),
-                    "elements": attrs.get("elements", []),
-                    "nelements": attrs.get("nelements"),
-                    "space_group": attrs.get("space_group_symbol", ""),
-                    "lattice_vectors": attrs.get("lattice_vectors"),
-                })
+                for provider_url, response in providers_data.items():
+                    provider_id = provider_map.get(provider_url, provider_url)
+                    entries = []
+                    if isinstance(response, dict):
+                        entries = response.get("data", [])
+                    elif isinstance(response, list):
+                        entries = response
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        attrs = entry.get("attributes", {})
+                        results.append({
+                            "source_id": f"{provider_id}:{entry.get('id', '')}",
+                            "provider": provider_id,
+                            "formula": attrs.get("chemical_formula_descriptive", ""),
+                            "elements": attrs.get("elements", []),
+                            "nelements": attrs.get("nelements"),
+                            "space_group": attrs.get("space_group_symbol", ""),
+                            "lattice_vectors": attrs.get("lattice_vectors"),
+                        })
         return results
 
 
