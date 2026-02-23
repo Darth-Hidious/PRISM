@@ -51,5 +51,9 @@ class OpenAIBackend(Backend):
         tool_calls = []
         if msg.tool_calls:
             for tc in msg.tool_calls:
-                tool_calls.append(ToolCallEvent(tool_name=tc.function.name, tool_args=json.loads(tc.function.arguments), call_id=tc.id))
+                try:
+                    tool_args = json.loads(tc.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    tool_args = {}
+                tool_calls.append(ToolCallEvent(tool_name=tc.function.name, tool_args=tool_args, call_id=tc.id))
         return AgentResponse(text=msg.content, tool_calls=tool_calls)

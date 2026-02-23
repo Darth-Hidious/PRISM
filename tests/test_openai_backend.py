@@ -60,3 +60,23 @@ class TestOpenAIBackend:
     def test_openrouter_via_base_url(self, mock_cls):
         backend = OpenAIBackend(api_key="or-key", base_url="https://openrouter.ai/api/v1", model="anthropic/claude-3.5-sonnet")
         assert backend.model == "anthropic/claude-3.5-sonnet"
+
+    @patch("app.agent.backends.openai_backend.OpenAI")
+    def test_malformed_tool_arguments(self, mock_cls):
+        """Gracefully handle invalid JSON in tool arguments."""
+        mock = MagicMock()
+        choice = MagicMock()
+        choice.message.content = None
+        tc = MagicMock()
+        tc.function.name = "search"
+        tc.function.arguments = "{invalid json"
+        tc.id = "call_1"
+        choice.message.tool_calls = [tc]
+        mock.choices = [choice]
+        client = mock_cls.return_value
+        client.chat.completions.create.return_value = mock
+
+        backend = OpenAIBackend(api_key="test")
+        resp = backend.complete(messages=[{"role": "user", "content": "test"}], tools=[])
+        assert resp.has_tool_calls
+        assert resp.tool_calls[0].tool_args == {}
