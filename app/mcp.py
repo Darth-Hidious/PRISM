@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Optional, Tuple
 from app.prompts import SUMMARIZATION_PROMPT, REASONING_PROMPT, CONVERSATIONAL_PROMPT, FINAL_FILTER_PROMPT, REASONING_FILTER_PROMPT
+from optimade.client import OptimadeClient
 import json
 import re
 import os
@@ -460,35 +461,27 @@ This is attempt {attempt + 1} of {self.max_attempts}."""
             return None, None
     
     def _test_filter(self, optimade_client, provider: str, filter_str: str) -> Optional[str]:
-        """
-        Test the filter syntax and provider validity.
-        
-        Returns:
-            None if successful, error message if failed
-        """
-        # Check if provider is valid
+        """Test the filter by actually querying the OPTIMADE API with page_limit=1."""
         valid_providers = [p["id"] for p in self.providers_info]
         if provider not in valid_providers:
             return f"Invalid provider '{provider}'. Valid providers: {', '.join(valid_providers)}"
-        
-        # Basic syntax validation for common OPTIMADE patterns
         if not filter_str or not filter_str.strip():
             return "Empty filter string"
-        
-        # Check for common syntax issues
-        if 'HAS ALL' in filter_str:
-            # Check for single quotes (not allowed in OPTIMADE)
-            if "'" in filter_str:
-                return "OPTIMADE requires double quotes, not single quotes. Use: elements HAS ALL \"Ni\", \"Ta\""
-            
-            # Check for proper double quotes around elements
-            if not re.search(r'HAS ALL\s+"[^"]+"\s*(?:,\s*"[^"]+")*', filter_str):
-                return "Invalid HAS ALL syntax - elements must be in double quotes: elements HAS ALL \"Ni\", \"Ta\""
-        
-        # Check for unbalanced quotes
-        if filter_str.count('"') % 2 != 0:
-            return "Unbalanced quotes in filter"
-        
-        # For now, assume the filter is syntactically correct if it passes basic checks
-        # In a production system, you might want to use a proper OPTIMADE parser
-        return None
+        try:
+            test_client = OptimadeClient(
+                include_providers=[provider],
+                max_results_per_provider=1,
+            )
+            results = test_client.get(filter_str)
+            if "structures" in results:
+                filter_results = results["structures"].get(filter_str, {})
+                for provider_data in filter_results.values():
+                    if "data" in provider_data and len(provider_data["data"]) > 0:
+                        return None
+                    if "errors" in provider_data:
+                        errors = provider_data["errors"]
+                        if errors:
+                            return f"Provider error: {errors[0].get('detail', str(errors[0]))}"
+            return "Filter returned no results. Try a broader query."
+        except Exception as e:
+            return f"OPTIMADE query failed: {str(e)[:200]}"
