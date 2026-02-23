@@ -1335,15 +1335,12 @@ def save_readme():
         f.write(README_CONTENT)
     console.print("[green]SUCCESS:[/green] `README.md` saved successfully.")
 
-    with open("README.md", "w") as f:
-        f.write(README_CONTENT)
-    console.print("[green]SUCCESS:[/green] `README.md` saved successfully.")
-
 @docs.command()
 def save_install():
     """Saves the project INSTALL.md file."""
     with open("INSTALL.md", "w") as f:
-        f.write("# Installation Guide\n\nFollow these steps to install PRISM...")
+        f.write(INSTALL_CONTENT)
+    console.print("[green]SUCCESS:[/green] `INSTALL.md` saved successfully.")
 
 # ==============================================================================
 # 'optimade' Command Group
