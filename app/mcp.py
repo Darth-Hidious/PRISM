@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Optional, Tuple
 from app.prompts import SUMMARIZATION_PROMPT, REASONING_PROMPT, CONVERSATIONAL_PROMPT, FINAL_FILTER_PROMPT, REASONING_FILTER_PROMPT
+from app.config.settings import MAX_FILTER_ATTEMPTS, MAX_RESULTS_DISPLAY, MAX_INTERACTIVE_QUESTIONS, MAX_RESULTS_PER_PROVIDER
 from optimade.client import OptimadeClient
 import json
 import re
@@ -90,7 +91,7 @@ class ModelContext:
                 # Include all available attributes for the LLM to see
                 "properties": r.get("attributes", {})
             }
-            for r in self.results[:10] # Reduced to 10 results to save tokens
+            for r in self.results[:MAX_RESULTS_DISPLAY] # Limit results to save tokens
         ]
         
         # Prepare provider fields context
@@ -131,9 +132,9 @@ class AdaptiveOptimadeFilter:
     def __init__(self, llm_service, providers_info: List[Dict[str, str]]):
         self.llm_service = llm_service
         self.providers_info = providers_info
-        self.max_attempts = 3
+        self.max_attempts = MAX_FILTER_ATTEMPTS
     
-    def conduct_interactive_conversation(self, original_query: str, console=None, max_questions: int = 3) -> Tuple[List[str], str]:
+    def conduct_interactive_conversation(self, original_query: str, console=None, max_questions: int = MAX_INTERACTIVE_QUESTIONS) -> Tuple[List[str], str]:
         """
         Conduct an interactive conversation to refine the search query.
         
