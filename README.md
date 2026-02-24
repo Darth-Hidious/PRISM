@@ -76,7 +76,7 @@ orchestration.
 ### One-command install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Darth-Hidious/PRISM/main/install.sh | bash
+curl -fsSL https://prism.marc27.com/install.sh | bash
 ```
 
 ### Manual install
