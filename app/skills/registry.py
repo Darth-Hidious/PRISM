@@ -15,6 +15,8 @@ def load_builtin_skills() -> SkillRegistry:
     from app.skills.discovery import DISCOVER_SKILL
     from app.skills.simulation_plan import SIM_PLAN_SKILL
     from app.skills.phase_analysis import PHASE_ANALYSIS_SKILL
+    from app.skills.validation import VALIDATE_SKILL
+    from app.skills.review import REVIEW_SKILL
 
     registry.register(ACQUIRE_SKILL)
     registry.register(PREDICT_SKILL)
@@ -24,5 +26,7 @@ def load_builtin_skills() -> SkillRegistry:
     registry.register(DISCOVER_SKILL)
     registry.register(SIM_PLAN_SKILL)
     registry.register(PHASE_ANALYSIS_SKILL)
+    registry.register(VALIDATE_SKILL)
+    registry.register(REVIEW_SKILL)
 
     return registry
