@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] - 2026-02-24
+
+### Added
+- **Claude Code-style REPL**: Minimal `>` prompt, tool call timing display, compact welcome header, `/login` command for MARC27 managed LLM access, `/skills` command (replaces `/skill`).
+- **MARC27 Login**: `/login` REPL command stores token at `~/.prism/marc27_token`; factory auto-detects `MARC27_TOKEN` and routes through MARC27 API gateway (OpenAI-compatible).
+- **First-Run Onboarding**: On first startup, PRISM asks for LLM provider and API keys interactively. Saves to `.env` and marks onboarding complete.
+
+### Changed
+- **Python**: Bumped minimum to **3.11** (was 3.10). pyiron and CALPHAD now install by default with `pip install "prism-platform[all]"`.
+- **OPTIMADE**: All `OptimadeClient()` calls now use explicit `base_urls` from curated provider list — eliminates "Unable to retrieve databases" noise during searches.
+- **Version markers**: Simplified to upper-bound only (`python_version<'3.14'`) since floor is now 3.11.
+- **REPL aesthetics**: Removed decorative panels, switched to text-heavy minimal output matching Claude Code CLI design language.
+
+### Fixed
+- OPTIMADE search noise from auto-discovery of providers with null base_urls.
+- MCP `_test_filter` method using `include_providers` instead of `base_urls`.
+
 ## [2.1.0] - 2026-02-24
 
 ### Added
