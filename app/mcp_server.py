@@ -161,6 +161,16 @@ def _register_resources(mcp):
         except Exception:
             return json.dumps([])
 
+    # --- CALPHAD resources (only when pycalphad is available) ----------------
+    from app.simulation.calphad_bridge import check_calphad_available
+    if check_calphad_available():
+        @mcp.resource("prism://calphad/databases")
+        def list_calphad_databases() -> str:
+            """List available thermodynamic TDB databases."""
+            from app.simulation.calphad_bridge import get_calphad_bridge
+            bridge = get_calphad_bridge()
+            return json.dumps(bridge.databases.list_databases(), default=str)
+
     # --- Simulation resources (only when pyiron is available) ----------------
     from app.simulation.bridge import check_pyiron_available
     if check_pyiron_available():
@@ -203,7 +213,8 @@ def create_mcp_server(registry: Optional[ToolRegistry] = None):
         instructions=(
             "PRISM: Materials science research tools. Search OPTIMADE databases, "
             "query Materials Project, predict properties with ML, visualize results, "
-            "export data, and run atomistic simulations via pyiron."
+            "export data, run atomistic simulations via pyiron, and perform "
+            "CALPHAD thermodynamic calculations with pycalphad."
         ),
     )
 

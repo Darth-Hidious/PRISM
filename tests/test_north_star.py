@@ -28,11 +28,11 @@ class TestSkillsInToolRegistry:
         assert "materials_discovery" in names
         assert "plan_simulations" in names
 
-    def test_all_7_skills_registered(self):
+    def test_all_8_skills_registered(self):
         from app.skills.registry import load_builtin_skills
 
         reg = load_builtin_skills()
-        assert len(reg.list_skills()) == 7
+        assert len(reg.list_skills()) == 8
 
 
 # ---- Test: System prompts mention skills ----

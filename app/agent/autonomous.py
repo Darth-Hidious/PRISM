@@ -18,6 +18,7 @@ Available tool categories:
 - Visualization: Create plots and comparisons
 - System: Read/write files, search the web
 - Prediction: Predict material properties with ML models
+- Thermodynamics: CALPHAD phase diagrams, equilibrium, Gibbs energy calculations
 - Skills (multi-step workflows):
   - acquire_materials: collect data from multiple sources
   - predict_properties: predict properties using ML
@@ -25,7 +26,8 @@ Available tool categories:
   - generate_report: compile reports
   - select_materials: filter and rank candidates
   - materials_discovery: end-to-end pipeline (acquire → predict → visualize → report)
-  - plan_simulations: generate simulation job plans
+  - plan_simulations: generate simulation job plans (auto-routes CALPHAD vs DFT vs MD)
+  - analyze_phases: analyze phase stability using CALPHAD thermodynamic databases
 
 For complex goals, prefer using skills over individual tools for efficiency.
 

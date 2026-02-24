@@ -48,3 +48,16 @@ class TestBuildFullRegistry:
         registry = build_full_registry(enable_mcp=False, enable_plugins=False)
         # Should work without MCP
         assert len(registry.list_tools()) > 0
+
+    def test_works_without_pycalphad(self):
+        """build_full_registry() succeeds even when pycalphad is not installed."""
+        registry = build_full_registry(enable_mcp=False, enable_plugins=False)
+        # CALPHAD tools should not be present (pycalphad not installed)
+        names = {t.name for t in registry.list_tools()}
+        assert "calculate_phase_diagram" not in names
+
+    def test_has_analyze_phases_skill(self):
+        """The analyze_phases skill is always registered (graceful on missing pycalphad)."""
+        registry = build_full_registry(enable_mcp=False, enable_plugins=False)
+        names = {t.name for t in registry.list_tools()}
+        assert "analyze_phases" in names
