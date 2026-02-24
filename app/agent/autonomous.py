@@ -31,7 +31,7 @@ When you collect tabular data, consider using export_results_csv to save it for 
 Be thorough but efficient. Cite data sources."""
 
 
-def _make_tools(tools: Optional[ToolRegistry] = None) -> ToolRegistry:
+def _make_tools(tools: Optional[ToolRegistry] = None, enable_mcp: bool = True) -> ToolRegistry:
     if tools is not None:
         return tools
     registry = ToolRegistry()
@@ -39,19 +39,27 @@ def _make_tools(tools: Optional[ToolRegistry] = None) -> ToolRegistry:
     create_data_tools(registry)
     create_visualization_tools(registry)
     create_prediction_tools(registry)
+    if enable_mcp:
+        try:
+            from app.mcp_client import discover_and_register_mcp_tools
+            discover_and_register_mcp_tools(registry)
+        except Exception:
+            pass
     return registry
 
 
 def run_autonomous(goal: str, backend: Backend, system_prompt: Optional[str] = None,
-                   tools: Optional[ToolRegistry] = None, max_iterations: int = 30) -> str:
-    tools = _make_tools(tools)
+                   tools: Optional[ToolRegistry] = None, max_iterations: int = 30,
+                   enable_mcp: bool = True) -> str:
+    tools = _make_tools(tools, enable_mcp=enable_mcp)
     agent = AgentCore(backend=backend, tools=tools, system_prompt=system_prompt or AUTONOMOUS_SYSTEM_PROMPT, max_iterations=max_iterations)
     return agent.process(goal)
 
 
 def run_autonomous_stream(goal: str, backend: Backend, system_prompt: Optional[str] = None,
-                          tools: Optional[ToolRegistry] = None, max_iterations: int = 30) -> Generator:
+                          tools: Optional[ToolRegistry] = None, max_iterations: int = 30,
+                          enable_mcp: bool = True) -> Generator:
     """Run agent autonomously on a goal, yielding stream events."""
-    tools = _make_tools(tools)
+    tools = _make_tools(tools, enable_mcp=enable_mcp)
     agent = AgentCore(backend=backend, tools=tools, system_prompt=system_prompt or AUTONOMOUS_SYSTEM_PROMPT, max_iterations=max_iterations)
     yield from agent.process_stream(goal)

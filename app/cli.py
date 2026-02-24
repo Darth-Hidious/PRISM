@@ -170,7 +170,8 @@ def build_optimade_filter(elements=None, formula=None, nelements=None):
 @click.option('--quiet', '-q', is_flag=True, help='Suppress non-essential output')
 @click.option('--mp-api-key', help='Set Materials Project API key for enhanced properties')
 @click.option('--resume', default=None, help='Resume a saved session by SESSION_ID')
-def cli(ctx, version, verbose, quiet, mp_api_key, resume):
+@click.option('--no-mcp', is_flag=True, help='Disable loading tools from external MCP servers')
+def cli(ctx, version, verbose, quiet, mp_api_key, resume, no_mcp):
     f"""
 {PRISM_BRAND}
 Platform for Research in Intelligent Synthesis of Materials
@@ -196,6 +197,9 @@ powered by the OPTIMADE API network and Large Language Models.
 
 Running PRISM without any subcommands will start the interactive 'ask' mode.
     """
+    ctx.ensure_object(dict)
+    ctx.obj["no_mcp"] = no_mcp
+
     # Handle MP API key if provided
     if mp_api_key:
         # Store the API key in environment
@@ -234,7 +238,7 @@ Running PRISM without any subcommands will start the interactive 'ask' mode.
     elif ctx.invoked_subcommand is None:
         try:
             backend = create_backend()
-            repl = AgentREPL(backend=backend)
+            repl = AgentREPL(backend=backend, enable_mcp=not no_mcp)
             if resume:
                 try:
                     repl._load_session(resume)
@@ -250,25 +254,53 @@ Running PRISM without any subcommands will start the interactive 'ask' mode.
             console.print("\nRun [cyan]prism --help[/cyan] for available commands.")
 
 # ==============================================================================
+# 'serve' Command (MCP server mode)
+# ==============================================================================
+@cli.command("serve")
+@click.option("--transport", default="stdio", type=click.Choice(["stdio", "http"]),
+              help="MCP transport (stdio for Claude Desktop, http for web)")
+@click.option("--port", default=8000, type=int, help="HTTP port (only for http transport)")
+@click.option("--install", is_flag=True, help="Print Claude Desktop configuration JSON and exit")
+def serve(transport, port, install):
+    """Start PRISM as an MCP server for external LLM hosts."""
+    if install:
+        from app.mcp_server import generate_claude_desktop_config
+        config = generate_claude_desktop_config()
+        console.print(json.dumps(config, indent=2))
+        return
+
+    from app.mcp_server import create_mcp_server
+    server = create_mcp_server()
+    if transport == "http":
+        console.print(f"[bold cyan]PRISM MCP Server[/bold cyan] starting on http://localhost:{port}/mcp", err=True)
+        server.run(transport="streamable-http", port=port)
+    else:
+        console.print("[bold cyan]PRISM MCP Server[/bold cyan] starting on stdio", err=True)
+        server.run(transport="stdio")
+
+
+# ==============================================================================
 # 'run' Command (autonomous agent mode)
 # ==============================================================================
 @cli.command("run")
 @click.argument("goal")
 @click.option("--provider", default=None, help="LLM provider (anthropic/openai/openrouter)")
 @click.option("--model", default=None, help="Model name override")
-def run_goal(goal, provider, model):
+@click.pass_context
+def run_goal(ctx, goal, provider, model):
     """Run PRISM agent autonomously on a research goal."""
     from rich.live import Live
     from rich.markdown import Markdown
     from rich.text import Text
     from app.agent.events import TextDelta, ToolCallStart, ToolCallResult, TurnComplete
+    no_mcp = ctx.obj.get("no_mcp", False) if ctx.obj else False
     run_console = Console()
     try:
         backend = create_backend(provider=provider, model=model)
         run_console.print(Panel.fit(f"[bold]Goal:[/bold] {goal}", border_style="cyan"))
         accumulated_text = ""
         with Live("", console=run_console, refresh_per_second=15, vertical_overflow="visible") as live:
-            for event in run_autonomous_stream(goal=goal, backend=backend):
+            for event in run_autonomous_stream(goal=goal, backend=backend, enable_mcp=not no_mcp):
                 if isinstance(event, TextDelta):
                     accumulated_text += event.text
                     live.update(Text(accumulated_text))
@@ -1494,11 +1526,72 @@ def configure(mp_api_key: str, list_config: bool, reset: bool):
     console.print("  prism configure --reset")
 
 # ==============================================================================
+# 'mcp' Command Group
+# ==============================================================================
+@click.group("mcp")
+def mcp_group():
+    """Manage MCP server connections."""
+    pass
+
+
+@mcp_group.command("init")
+def mcp_init():
+    """Create a template mcp_servers.json config file."""
+    config_dir = Path.home() / ".prism"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "mcp_servers.json"
+
+    if config_path.exists():
+        console.print(f"[yellow]Config already exists: {config_path}[/yellow]")
+        console.print("[dim]Edit it directly to add or remove servers.[/dim]")
+        return
+
+    template = {
+        "mcpServers": {
+            "example-filesystem": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"],
+            },
+        }
+    }
+    config_path.write_text(json.dumps(template, indent=2))
+    console.print(f"[green]Created MCP config: {config_path}[/green]")
+    console.print("[dim]Edit the file to configure your MCP servers.[/dim]")
+
+
+@mcp_group.command("status")
+def mcp_status():
+    """Show MCP server configuration and connection status."""
+    from app.mcp_client import load_mcp_config
+    config = load_mcp_config()
+    console.print(f"[dim]Config: {config.config_path}[/dim]")
+
+    if not config.config_path.exists():
+        console.print("[yellow]No config file found. Run 'prism mcp init' to create one.[/yellow]")
+        return
+
+    if not config.servers:
+        console.print("[dim]No MCP servers configured.[/dim]")
+        return
+
+    console.print(f"[cyan]Configured servers:[/cyan] {len(config.servers)}")
+    for name, server_config in config.servers.items():
+        if "url" in server_config:
+            location = server_config["url"]
+        elif "command" in server_config:
+            location = f"{server_config['command']} {' '.join(server_config.get('args', []))}"
+        else:
+            location = "unknown"
+        console.print(f"  [green]{name}[/green] — {location}")
+
+
+# ==============================================================================
 # CLI Entry Point
 # ==================================================
 cli.add_command(advanced)
 cli.add_command(docs)
 cli.add_command(optimade)
+cli.add_command(mcp_group, "mcp")
 
 from app.commands.data import data as data_group
 cli.add_command(data_group, "data")
