@@ -250,9 +250,8 @@ Documentation: https://github.com/Darth-Hidious/PRISM
             pass
         try:
             backend = create_backend()
-            repl = AgentREPL(backend=backend, enable_mcp=not no_mcp)
-            if dangerously_accept_all:
-                repl.agent.auto_approve = True
+            repl = AgentREPL(backend=backend, enable_mcp=not no_mcp,
+                             auto_approve=dangerously_accept_all)
             if resume:
                 try:
                     repl._load_session(resume)

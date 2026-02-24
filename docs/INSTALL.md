@@ -57,8 +57,11 @@ pip install "prism-platform[data]"
 # PDF/HTML reports (markdown, weasyprint)
 pip install "prism-platform[reports]"
 
-# Everything
+# Everything (ML + data + reports, no native compilation)
 pip install "prism-platform[all]"
+
+# Full (includes CALPHAD + simulation — requires CMake and C compiler)
+pip install "prism-platform[full]"
 ```
 
 ## Development Install
