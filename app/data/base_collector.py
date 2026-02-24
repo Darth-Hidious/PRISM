@@ -45,3 +45,34 @@ class CollectorRegistry:
                 except Exception:
                     pass
         return all_records
+
+
+def get_default_collector_registry() -> CollectorRegistry:
+    """Build a CollectorRegistry with all built-in collectors."""
+    reg = CollectorRegistry()
+    try:
+        from app.data.collector import OPTIMADECollector
+        reg.register(OPTIMADECollector())
+    except Exception:
+        pass
+    try:
+        from app.data.collector import MPCollector
+        reg.register(MPCollector())
+    except Exception:
+        pass
+    try:
+        from app.data.omat24_collector import OMAT24Collector
+        reg.register(OMAT24Collector())
+    except Exception:
+        pass
+    try:
+        from app.data.literature_collector import LiteratureCollector
+        reg.register(LiteratureCollector())
+    except Exception:
+        pass
+    try:
+        from app.data.patent_collector import PatentCollector
+        reg.register(PatentCollector())
+    except Exception:
+        pass
+    return reg

@@ -24,19 +24,10 @@ def _acquire_materials(**kwargs) -> dict:
 
     all_records = []
 
-    # Build a collector registry with built-in collectors
-    from app.data.base_collector import CollectorRegistry
-    from app.data.collector import OPTIMADECollector, MPCollector
+    # Build a collector registry with all built-in collectors
+    from app.data.base_collector import get_default_collector_registry
 
-    collector_reg = CollectorRegistry()
-    try:
-        collector_reg.register(OPTIMADECollector())
-    except Exception:
-        pass
-    try:
-        collector_reg.register(MPCollector())
-    except Exception:
-        pass
+    collector_reg = get_default_collector_registry()
 
     # Collect from each requested source
     for src in sources:
@@ -54,6 +45,18 @@ def _acquire_materials(**kwargs) -> dict:
                 records = collector.collect(
                     elements=elements if elements else None,
                     max_results=max_results,
+                )
+            elif src == "omat24":
+                records = collector.collect(
+                    elements=elements if elements else None,
+                    max_results=max_results,
+                )
+            elif src in ("literature", "patents"):
+                query = kwargs.get("query", "")
+                if not query and elements:
+                    query = " ".join(elements) + " alloy"
+                records = collector.collect(
+                    query=query, max_results=max_results,
                 )
             else:
                 records = collector.collect()
@@ -95,8 +98,8 @@ ACQUIRE_SKILL = Skill(
     name="acquire_materials",
     description=(
         "Search and collect materials data from multiple sources "
-        "(OPTIMADE, Materials Project), normalize records, and save "
-        "as a named dataset for downstream analysis."
+        "(OPTIMADE, Materials Project, OMAT24, literature, patents), "
+        "normalize records, and save as a named dataset for downstream analysis."
     ),
     steps=[
         SkillStep("collect_optimade", "Query OPTIMADE providers", "search_optimade"),
@@ -124,7 +127,7 @@ ACQUIRE_SKILL = Skill(
             "sources": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Data sources to query: optimade, mp (default from preferences)",
+                "description": "Data sources to query: optimade, mp, omat24, literature, patents (default from preferences)",
             },
             "max_results": {
                 "type": "integer",

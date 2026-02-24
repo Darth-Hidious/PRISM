@@ -12,7 +12,9 @@ You have been given a research goal. Use your tools to investigate, gather data,
 analyze results, and produce a comprehensive answer.
 
 Available tool categories:
-- Data: Search OPTIMADE databases, query Materials Project, export results to CSV
+- Data: Search OPTIMADE databases, query Materials Project, query OMAT24, export results to CSV
+- Literature: Search arXiv and Semantic Scholar for scientific papers
+- Patents: Search Lens.org for materials-related patents
 - Visualization: Create plots and comparisons
 - System: Read/write files, search the web
 - Prediction: Predict material properties with ML models
