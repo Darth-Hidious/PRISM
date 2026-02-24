@@ -8,6 +8,7 @@ from app.tools.data import create_data_tools
 from app.tools.system import create_system_tools
 from app.tools.visualization import create_visualization_tools
 from app.tools.prediction import create_prediction_tools
+from app.simulation.bridge import check_pyiron_available
 
 
 AUTONOMOUS_SYSTEM_PROMPT = """You are PRISM, an autonomous materials science research agent.
@@ -39,6 +40,9 @@ def _make_tools(tools: Optional[ToolRegistry] = None, enable_mcp: bool = True) -
     create_data_tools(registry)
     create_visualization_tools(registry)
     create_prediction_tools(registry)
+    if check_pyiron_available():
+        from app.tools.simulation import create_simulation_tools
+        create_simulation_tools(registry)
     if enable_mcp:
         try:
             from app.mcp_client import discover_and_register_mcp_tools
