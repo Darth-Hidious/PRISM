@@ -30,6 +30,19 @@ from optimade.client import OptimadeClient
 from app.config.branding import PRISM_BRAND
 from app.config.providers import FALLBACK_PROVIDERS
 
+
+def _make_optimade_client(providers=None, max_results=1000):
+    """Create OptimadeClient using explicit base_urls to avoid noisy discovery."""
+    if providers:
+        ids = [p.strip() for p in providers] if isinstance(providers, list) else [p.strip() for p in providers.split(",")]
+        base_urls = [p["base_url"] for p in FALLBACK_PROVIDERS if p["id"] in ids]
+        if not base_urls:
+            base_urls = [p["base_url"] for p in FALLBACK_PROVIDERS]
+    else:
+        base_urls = [p["base_url"] for p in FALLBACK_PROVIDERS]
+    return OptimadeClient(base_urls=base_urls, max_results_per_provider=max_results)
+from app.config.providers import FALLBACK_PROVIDERS
+
 # Make database imports optional
 try:
     from app.db.database import Base, engine, get_db
@@ -470,9 +483,9 @@ def search(elements, formula, nelements, providers, limit, mp_api_key):
     try:
         with console.status("[bold green]Querying OPTIMADE providers...[/bold green]"):
             # If specific providers are requested, use them. Otherwise, search all.
-            client = OptimadeClient(
-                include_providers=providers.split(',') if providers else None,
-                max_results_per_provider=limit
+            client = _make_optimade_client(
+                providers=providers.split(',') if providers else None,
+                max_results=limit,
             )
             results = client.get(optimade_filter)
 
@@ -612,7 +625,7 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
             if not provider_to_query or not optimade_filter:
                 console.print("[red]Could not generate filter from conversation. Falling back to direct generation.[/red]")
                 # Fall back to normal generation
-                temp_client = OptimadeClient()
+                temp_client = _make_optimade_client(max_results=1)
                 provider_to_query, optimade_filter, error = adaptive_filter.generate_filter(query, temp_client)
                 if error:
                     console.print(f"[red]Error: {error}[/red]")
@@ -620,7 +633,7 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
         else:
             console.print("[yellow]No conversation data collected. Using original query.[/yellow]")
             # Fall back to normal generation
-            temp_client = OptimadeClient()
+            temp_client = _make_optimade_client(max_results=1)
             provider_to_query, optimade_filter, error = adaptive_filter.generate_filter(query, temp_client)
             if error:
                 console.print(f"[red]Error: {error}[/red]")
@@ -642,7 +655,7 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
             adaptive_filter = AdaptiveOptimadeFilter(llm_service, FALLBACK_PROVIDERS)
             
             # Create a temporary OPTIMADE client for testing
-            temp_client = OptimadeClient()
+            temp_client = _make_optimade_client(max_results=1)
             
             # Generate the filter - use reasoning mode if --reason flag is set
             if reason:
@@ -684,10 +697,9 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
 
         with console.status(f"[bold green]Fetching provider capabilities from {provider_to_query}...[/bold green]"):
             # Use a new client instance to get the specific provider's info
-            info_client = OptimadeClient(
-                include_providers=[provider_to_query], 
-                verbosity=0,
-                max_results_per_provider=limit
+            info_client = _make_optimade_client(
+                providers=[provider_to_query],
+                max_results=limit,
             )
             client = info_client # Use this client for the subsequent query
             
@@ -1380,8 +1392,8 @@ def list_databases():
     """Lists all available OPTIMADE provider databases."""
     with console.status("[bold green]Fetching all registered OPTIMADE providers...[/bold green]"):
         try:
-            # Attempt to fetch live data from the OPTIMADE network
-            client = OptimadeClient()
+            # Use our curated list to avoid noisy discovery
+            client = _make_optimade_client()
             
             table = Table(show_header=True, header_style="bold magenta", title="Live OPTIMADE Providers")
             table.add_column("ID", style="cyan")

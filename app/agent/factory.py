@@ -1,20 +1,49 @@
 """Factory for creating agent backends from configuration."""
 import os
+from pathlib import Path
 from typing import Optional
 from app.agent.backends.base import Backend
+
+MARC27_API_URL = "https://api.marc27.com/v1"
+
+
+def _load_marc27_token() -> Optional[str]:
+    """Load MARC27 token from env or ~/.prism/marc27_token."""
+    token = os.getenv("MARC27_TOKEN")
+    if token:
+        return token
+    token_path = Path.home() / ".prism" / "marc27_token"
+    if token_path.exists():
+        token = token_path.read_text().strip()
+        if token:
+            os.environ["MARC27_TOKEN"] = token
+            return token
+    return None
 
 
 def create_backend(provider: Optional[str] = None, model: Optional[str] = None) -> Backend:
     if provider is None:
-        if os.getenv("ANTHROPIC_API_KEY"):
+        if _load_marc27_token():
+            provider = "marc27"
+        elif os.getenv("ANTHROPIC_API_KEY"):
             provider = "anthropic"
         elif os.getenv("OPENAI_API_KEY"):
             provider = "openai"
         elif os.getenv("OPENROUTER_API_KEY"):
             provider = "openrouter"
         else:
-            raise ValueError("No LLM provider configured for agent mode. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or OPENROUTER_API_KEY.")
-    if provider == "anthropic":
+            raise ValueError("No LLM provider configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, or run /login for MARC27.")
+    if provider == "marc27":
+        from app.agent.backends.openai_backend import OpenAIBackend
+        token = _load_marc27_token()
+        if not token:
+            raise ValueError("MARC27 token not found. Run /login in the REPL or set MARC27_TOKEN.")
+        return OpenAIBackend(
+            model=model or "claude-3.5-sonnet",
+            base_url=MARC27_API_URL,
+            api_key=token,
+        )
+    elif provider == "anthropic":
         from app.agent.backends.anthropic_backend import AnthropicBackend
         return AnthropicBackend(model=model)
     elif provider == "openai":

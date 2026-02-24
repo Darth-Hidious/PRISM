@@ -20,7 +20,7 @@ def _make_repl(mock_backend=None, **kwargs):
 
 class TestReplSkillCommands:
     def test_commands_registered(self):
-        assert "/skill" in REPL_COMMANDS
+        assert "/skills" in REPL_COMMANDS
         assert "/plan" in REPL_COMMANDS
 
     def test_handle_skill_list(self):
