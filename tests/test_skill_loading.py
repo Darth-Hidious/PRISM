@@ -6,8 +6,7 @@ from app.tools.base import ToolRegistry
 
 
 class TestSkillLoadingAutonomous:
-    @patch("app.agent.autonomous.check_pyiron_available", return_value=False)
-    def test_make_tools_includes_skills(self, mock_pyiron):
+    def test_make_tools_includes_skills(self):
         from app.agent.autonomous import _make_tools
 
         tools = _make_tools(enable_mcp=False)
@@ -19,8 +18,7 @@ class TestSkillLoadingAutonomous:
         assert "materials_discovery" in tool_names
         assert "plan_simulations" in tool_names
 
-    @patch("app.agent.autonomous.check_pyiron_available", return_value=False)
-    def test_make_tools_preserves_existing(self, mock_pyiron):
+    def test_make_tools_preserves_existing(self):
         from app.agent.autonomous import _make_tools
 
         tools = _make_tools(enable_mcp=False)

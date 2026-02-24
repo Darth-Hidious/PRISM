@@ -15,19 +15,18 @@ import pytest
 
 class TestSkillsInToolRegistry:
     def test_skills_in_autonomous_tools(self):
-        with patch("app.agent.autonomous.check_pyiron_available", return_value=False):
-            from app.agent.autonomous import _make_tools
+        from app.agent.autonomous import _make_tools
 
-            tools = _make_tools(enable_mcp=False)
-            names = {t.name for t in tools.list_tools()}
+        tools = _make_tools(enable_mcp=False)
+        names = {t.name for t in tools.list_tools()}
 
-            assert "acquire_materials" in names
-            assert "predict_properties" in names
-            assert "visualize_dataset" in names
-            assert "generate_report" in names
-            assert "select_materials" in names
-            assert "materials_discovery" in names
-            assert "plan_simulations" in names
+        assert "acquire_materials" in names
+        assert "predict_properties" in names
+        assert "visualize_dataset" in names
+        assert "generate_report" in names
+        assert "select_materials" in names
+        assert "materials_discovery" in names
+        assert "plan_simulations" in names
 
     def test_all_7_skills_registered(self):
         from app.skills.registry import load_builtin_skills

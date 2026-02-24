@@ -83,7 +83,7 @@ Repository = "https://github.com/Darth-Hidious/PRISM"
 "Bug Reports" = "https://github.com/Darth-Hidious/PRISM/issues"
 
 [tool.setuptools]
-packages = ["app", "app.config", "app.db", "app.agent", "app.agent.backends", "app.tools", "app.data", "app.commands", "app.ml", "app.simulation", "app.skills"]
+packages = ["app", "app.config", "app.db", "app.agent", "app.agent.backends", "app.tools", "app.data", "app.commands", "app.ml", "app.simulation", "app.skills", "app.plugins"]
 include-package-data = true
 
 [tool.black]

@@ -1,9 +1,12 @@
 """Collect materials data from OPTIMADE and Materials Project."""
 from typing import Dict, List, Optional
 from app.config.providers import FALLBACK_PROVIDERS
+from app.data.base_collector import DataCollector
 
 
-class OPTIMADECollector:
+class OPTIMADECollector(DataCollector):
+    name = "optimade"
+
     def __init__(self, providers: Optional[List[Dict]] = None):
         self.providers = providers or FALLBACK_PROVIDERS
 
@@ -54,7 +57,9 @@ class OPTIMADECollector:
         return results
 
 
-class MPCollector:
+class MPCollector(DataCollector):
+    name = "mp"
+
     def collect(self, formula: str = None, elements: List[str] = None, max_results: int = 50) -> List[Dict]:
         import os
         api_key = os.getenv("MP_API_KEY")

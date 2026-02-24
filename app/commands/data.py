@@ -48,6 +48,27 @@ def collect(elements, formula, providers, max_results, name):
     console.print(f"[green]Collected {len(df)} materials -> {path}[/green]")
 
 
+@data.command("import")
+@click.argument("file_path", type=click.Path(exists=True))
+@click.option("--name", default=None, help="Dataset name (defaults to filename stem)")
+@click.option("--format", "file_format", default=None, help="File format override (csv, json, parquet)")
+def import_cmd(file_path, name, file_format):
+    """Import a local CSV, JSON, or Parquet file as a PRISM dataset."""
+    console = Console()
+    from app.tools.data import _import_dataset
+
+    result = _import_dataset(
+        file_path=file_path, dataset_name=name, file_format=file_format
+    )
+    if "error" in result:
+        console.print(f"[red]{result['error']}[/red]")
+    else:
+        console.print(
+            f"[green]Imported {result['rows']} rows as '{result['dataset_name']}'[/green]"
+        )
+        console.print(f"  Columns: {', '.join(result['columns'])}")
+
+
 @data.command()
 def status():
     """Show available datasets and their metadata."""

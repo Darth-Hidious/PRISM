@@ -24,27 +24,39 @@ def _acquire_materials(**kwargs) -> dict:
 
     all_records = []
 
-    # Collect from OPTIMADE
-    if "optimade" in sources and filter_string:
+    # Build a collector registry with built-in collectors
+    from app.data.base_collector import CollectorRegistry
+    from app.data.collector import OPTIMADECollector, MPCollector
+
+    collector_reg = CollectorRegistry()
+    try:
+        collector_reg.register(OPTIMADECollector())
+    except Exception:
+        pass
+    try:
+        collector_reg.register(MPCollector())
+    except Exception:
+        pass
+
+    # Collect from each requested source
+    for src in sources:
+        collector = None
         try:
-            from app.data.collector import OPTIMADECollector
-
-            collector = OPTIMADECollector()
-            records = collector.collect(filter_string, max_per_provider=max_results)
-            all_records.extend(records)
-        except Exception as e:
-            pass  # continue with other sources
-
-    # Collect from Materials Project
-    if "mp" in sources:
+            collector = collector_reg.get(src)
+        except KeyError:
+            continue
         try:
-            from app.data.collector import MPCollector
-
-            collector = MPCollector()
-            records = collector.collect(
-                elements=elements if elements else None,
-                max_results=max_results,
-            )
+            if src == "optimade" and filter_string:
+                records = collector.collect(
+                    filter_string=filter_string, max_per_provider=max_results
+                )
+            elif src == "mp":
+                records = collector.collect(
+                    elements=elements if elements else None,
+                    max_results=max_results,
+                )
+            else:
+                records = collector.collect()
             all_records.extend(records)
         except Exception:
             pass
