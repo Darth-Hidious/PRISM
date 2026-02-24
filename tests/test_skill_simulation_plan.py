@@ -93,3 +93,60 @@ class TestSimPlanSkill:
 
         result = _plan_simulations(dataset_name="no_formula")
         assert "error" in result
+
+    @patch("app.data.store.DataStore.load")
+    def test_plan_calphad_method(self, mock_load, mock_prefs, sample_df):
+        mock_load.return_value = sample_df
+
+        result = _plan_simulations(
+            dataset_name="test_data",
+            method="calphad",
+            simulation_types=["phase_diagram"],
+            database_name="sgte",
+        )
+
+        assert result["planned_jobs"] == 3
+        for job in result["jobs"]:
+            assert job["method"] == "calphad"
+            assert job["database_name"] == "sgte"
+            assert "code" not in job
+
+    @patch("app.data.store.DataStore.load")
+    def test_plan_auto_routes_phase_stability(self, mock_load, mock_prefs, sample_df):
+        mock_load.return_value = sample_df
+
+        result = _plan_simulations(
+            dataset_name="test_data",
+            simulation_types=["phase_stability"],
+        )
+
+        for job in result["jobs"]:
+            assert job["method"] == "calphad"
+
+    @patch("app.data.store.DataStore.load")
+    def test_plan_auto_routes_dft(self, mock_load, mock_prefs, sample_df):
+        mock_load.return_value = sample_df
+
+        result = _plan_simulations(
+            dataset_name="test_data",
+            simulation_types=["energy_minimization"],
+        )
+
+        for job in result["jobs"]:
+            assert job["method"] == "dft"
+            assert job["code"] == "lammps"
+
+    @patch("app.data.store.DataStore.load")
+    def test_plan_mixed_methods(self, mock_load, mock_prefs, sample_df):
+        mock_load.return_value = sample_df
+
+        result = _plan_simulations(
+            dataset_name="test_data",
+            simulation_types=["phase_stability", "energy_minimization"],
+        )
+
+        # 3 materials * 2 sim types = 6 jobs
+        assert result["planned_jobs"] == 6
+        methods = {j["method"] for j in result["jobs"]}
+        assert "calphad" in methods
+        assert "dft" in methods

@@ -16,7 +16,8 @@ class TestSkillRegistry:
         assert "select_materials" in names
         assert "materials_discovery" in names
         assert "plan_simulations" in names
-        assert len(skills) == 7
+        assert "analyze_phases" in names
+        assert len(skills) == 8
 
     def test_all_convert_to_tools(self):
         reg = load_builtin_skills()
@@ -24,7 +25,7 @@ class TestSkillRegistry:
         reg.register_all_as_tools(tool_reg)
 
         tools = tool_reg.list_tools()
-        assert len(tools) == 7
+        assert len(tools) == 8
         for tool in tools:
             assert tool.name
             assert tool.description

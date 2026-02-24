@@ -35,6 +35,17 @@ def build_full_registry(
     except Exception:
         pass
 
+    # CALPHAD tools (optional — pycalphad may not be installed)
+    try:
+        from app.simulation.calphad_bridge import check_calphad_available
+
+        if check_calphad_available():
+            from app.tools.calphad import create_calphad_tools
+
+            create_calphad_tools(registry)
+    except Exception:
+        pass
+
     # Built-in skills → tools
     try:
         from app.skills.registry import load_builtin_skills
