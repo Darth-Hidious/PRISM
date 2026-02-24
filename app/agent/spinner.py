@@ -1,9 +1,9 @@
 """Braille dot spinner for the PRISM REPL."""
 
+import sys
 import threading
 import time
 from rich.console import Console
-from rich.text import Text
 
 BRAILLE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -27,7 +27,11 @@ TOOL_VERBS = {
 
 
 class Spinner:
-    """Animated braille spinner with context-aware verbs."""
+    """Animated braille spinner with context-aware verbs.
+
+    Uses raw sys.stdout writes so carriage-return overwrites work
+    correctly (Rich console.print mangles \\r/\\033[K escape codes).
+    """
 
     def __init__(self, console: Console):
         self._console = console
@@ -40,6 +44,7 @@ class Spinner:
         return TOOL_VERBS.get(tool_name, "Thinking...")
 
     def start(self, verb: str = "Thinking..."):
+        self.stop()
         self._verb = verb
         self._running = True
         self._frame_idx = 0
@@ -52,18 +57,16 @@ class Spinner:
     def stop(self):
         self._running = False
         if self._thread is not None:
-            self._thread.join(timeout=0.2)
+            self._thread.join(timeout=0.3)
             self._thread = None
         # Clear the spinner line
-        self._console.print("\r\033[K", end="")
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
 
     def _animate(self):
         while self._running:
             frame = BRAILLE_FRAMES[self._frame_idx % len(BRAILLE_FRAMES)]
-            text = Text()
-            text.append(f" {frame} ", style="bold magenta")
-            text.append(self._verb, style="dim italic")
-            self._console.print(f"\r\033[K", end="")
-            self._console.print(text, end="")
+            sys.stdout.write(f"\r\033[K {frame} \033[2;3m{self._verb}\033[0m")
+            sys.stdout.flush()
             self._frame_idx += 1
             time.sleep(0.08)

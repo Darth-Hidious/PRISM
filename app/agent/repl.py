@@ -1,5 +1,6 @@
 """Interactive REPL for the PRISM agent."""
 import os
+import re
 import time
 from typing import Optional
 from rich.console import Console
@@ -118,9 +119,7 @@ class AgentREPL:
         self._show_welcome()
         while True:
             try:
-                user_input = self._session.prompt(
-                    HTML('<ansimagenta><b>❯ </b></ansimagenta>'),
-                ).strip()
+                user_input = self._get_input()
             except (EOFError, KeyboardInterrupt):
                 self._prompt_save_on_exit()
                 self.console.print("\n[dim]Goodbye.[/dim]")
@@ -138,6 +137,53 @@ class AgentREPL:
             except Exception as e:
                 self.console.print(f"\n[red]Error: {e}[/red]")
 
+    def _get_input(self) -> str:
+        """Prompt for user input inside a bordered box."""
+        width = min(self.console.width, 120)
+        border = "\u2500" * (width - 2)
+        self.console.print(f"[dim]\u256d{border}\u256e[/dim]")
+        user_input = self._session.prompt(
+            HTML('<style fg="#555555">\u2502</style> <ansimagenta><b>\u276f </b></ansimagenta>'),
+        ).strip()
+        self.console.print(f"[dim]\u2570{border}\u256f[/dim]")
+        return user_input
+
+    # ── Streaming ──────────────────────────────────────────────────────
+
+    # ── Plan step helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_plan_steps(plan_text: str) -> list:
+        """Extract numbered steps from plan text."""
+        steps = []
+        for line in plan_text.strip().splitlines():
+            m = re.match(r"\s*(\d+)[.)\s]+(.+)", line)
+            if m:
+                steps.append(m.group(2).strip())
+        return steps
+
+    def _render_step_progress(self, steps: list, current: int):
+        """Render a live-updated progress panel for plan steps."""
+        lines = Text()
+        for i, step in enumerate(steps):
+            if i > 0:
+                lines.append("\n")
+            if i < current:
+                lines.append("  \u2714 ", style="bold green")
+                lines.append(step, style="dim strikethrough")
+            elif i == current:
+                lines.append("  \u25b8 ", style="bold magenta")
+                lines.append(step, style="bold")
+            else:
+                lines.append("  \u25cb ", style="dim")
+                lines.append(step, style="dim")
+        self.console.print(Panel(
+            lines,
+            title="[bold]Progress[/bold]",
+            border_style="dim",
+            padding=(0, 1),
+        ))
+
     # ── Streaming ──────────────────────────────────────────────────────
 
     def _handle_streaming_response(self, user_input: str):
@@ -148,8 +194,17 @@ class AgentREPL:
         current_tool_name = None
         spinner = Spinner(console=self.console)
 
+        # Plan step tracking
+        plan_steps: list = []
+        step_idx = 0
+
+        # Show thinking spinner immediately while waiting for first token
+        spinner.start("Thinking...")
+
         for event in self.agent.process_stream(user_input):
             if isinstance(event, TextDelta):
+                # Stop the initial "Thinking..." spinner on first text
+                spinner.stop()
                 accumulated_text += event.text
                 if "<plan>" in accumulated_text and not in_plan:
                     in_plan = True
@@ -174,6 +229,11 @@ class AgentREPL:
                         if not Confirm.ask("  Execute?", default=True):
                             self.console.print("[dim]Cancelled.[/dim]")
                             return
+                        # Parse steps for progress tracking
+                        plan_steps = self._parse_plan_steps(plan_buffer)
+                        step_idx = 0
+                        if plan_steps:
+                            self._render_step_progress(plan_steps, step_idx)
                         remainder = event.text.split("</plan>", 1)[1] if "</plan>" in event.text else ""
                         accumulated_text = remainder
                     else:
@@ -182,6 +242,7 @@ class AgentREPL:
                 # Don't write raw text — we render as Markdown at breaks
 
             elif isinstance(event, ToolCallStart):
+                spinner.stop()
                 # Flush accumulated text as Markdown before tool card
                 if accumulated_text.strip():
                     self.console.print()
@@ -190,10 +251,13 @@ class AgentREPL:
                 tool_start_time = time.monotonic()
                 current_tool_name = event.tool_name
                 verb = spinner.verb_for_tool(event.tool_name)
+                # Show step context in spinner if we have a plan
+                if plan_steps and step_idx < len(plan_steps):
+                    verb = f"[{step_idx + 1}/{len(plan_steps)}] {verb}"
                 spinner.start(verb)
 
             elif isinstance(event, ToolApprovalRequest):
-                pass
+                spinner.stop()
 
             elif isinstance(event, ToolCallResult):
                 spinner.stop()
@@ -205,10 +269,19 @@ class AgentREPL:
                 summary = event.summary if hasattr(event, "summary") else "done"
                 self._render_tool_card(event.tool_name, summary, elapsed_str)
                 current_tool_name = None
+                # Advance plan step and show updated progress
+                if plan_steps:
+                    step_idx = min(step_idx + 1, len(plan_steps))
+                    if step_idx < len(plan_steps):
+                        self._render_step_progress(plan_steps, step_idx)
 
             elif isinstance(event, TurnComplete):
                 spinner.stop()
                 tool_start_time = None
+
+        # Show final progress (all steps done)
+        if plan_steps:
+            self._render_step_progress(plan_steps, len(plan_steps))
 
         # Flush any remaining text as Markdown
         if accumulated_text.strip():
