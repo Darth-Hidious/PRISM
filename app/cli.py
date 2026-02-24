@@ -185,7 +185,8 @@ def build_optimade_filter(elements=None, formula=None, nelements=None):
 @click.option('--resume', default=None, help='Resume a saved session by SESSION_ID')
 @click.option('--no-mcp', is_flag=True, help='Disable loading tools from external MCP servers')
 @click.option('--dangerously-accept-all', is_flag=True, help='Auto-approve all tool calls (skip consent prompts)')
-def cli(ctx, version, verbose, quiet, mp_api_key, resume, no_mcp, dangerously_accept_all):
+@click.option('--tui/--classic', default=True, help='Use Textual TUI (default) or classic REPL')
+def cli(ctx, version, verbose, quiet, mp_api_key, resume, no_mcp, dangerously_accept_all, tui):
     f"""
 {PRISM_BRAND}
 AI-Native Autonomous Materials Discovery
@@ -277,16 +278,25 @@ Documentation: https://github.com/Darth-Hidious/PRISM
         # Launch REPL
         try:
             backend = create_backend()
-            repl = AgentREPL(backend=backend, enable_mcp=not no_mcp,
-                             auto_approve=dangerously_accept_all)
-            if resume:
-                try:
-                    repl._load_session(resume)
-                    console.print(f"[green]Resumed session: {resume}[/green]")
-                except FileNotFoundError:
-                    console.print(f"[red]Session not found: {resume}[/red]")
-                    return
-            repl.run()
+            if tui:
+                from app.tui.app import PrismApp
+                app = PrismApp(
+                    backend=backend,
+                    enable_mcp=not no_mcp,
+                    auto_approve=dangerously_accept_all,
+                )
+                app.run()
+            else:
+                repl = AgentREPL(backend=backend, enable_mcp=not no_mcp,
+                                 auto_approve=dangerously_accept_all)
+                if resume:
+                    try:
+                        repl._load_session(resume)
+                        console.print(f"[green]Resumed session: {resume}[/green]")
+                    except FileNotFoundError:
+                        console.print(f"[red]Session not found: {resume}[/red]")
+                        return
+                repl.run()
         except ValueError as e:
             # No LLM key configured — offer to set one up
             console.print()
