@@ -1,11 +1,14 @@
-"""Braille dot spinner for the PRISM REPL."""
+"""Braille dot spinner for the PRISM REPL.
 
-import threading
-import time
+Uses Rich Status for clean single-line animation that doesn't leak
+into the output stream.
+"""
+
+import sys
 from rich.console import Console
 from rich.text import Text
 
-BRAILLE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+BRAILLE_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"]
 
 TOOL_VERBS = {
     "search_optimade": "Searching OPTIMADE databases...",
@@ -27,43 +30,27 @@ TOOL_VERBS = {
 
 
 class Spinner:
-    """Animated braille spinner with context-aware verbs."""
+    """Animated braille spinner using Rich Status (no thread leaking)."""
 
     def __init__(self, console: Console):
         self._console = console
-        self._verb = "Thinking..."
-        self._running = False
-        self._thread = None
-        self._frame_idx = 0
+        self._status = None
 
     def verb_for_tool(self, tool_name: str) -> str:
         return TOOL_VERBS.get(tool_name, "Thinking...")
 
     def start(self, verb: str = "Thinking..."):
-        self._verb = verb
-        self._running = True
-        self._frame_idx = 0
-        self._thread = threading.Thread(target=self._animate, daemon=True)
-        self._thread.start()
+        self.stop()  # Clean up any prior spinner
+        self._status = self._console.status(
+            verb, spinner="dots", spinner_style="bold magenta",
+        )
+        self._status.start()
 
     def update(self, verb: str):
-        self._verb = verb
+        if self._status is not None:
+            self._status.update(verb)
 
     def stop(self):
-        self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=0.2)
-            self._thread = None
-        # Clear the spinner line
-        self._console.print("\r\033[K", end="")
-
-    def _animate(self):
-        while self._running:
-            frame = BRAILLE_FRAMES[self._frame_idx % len(BRAILLE_FRAMES)]
-            text = Text()
-            text.append(f" {frame} ", style="bold magenta")
-            text.append(self._verb, style="dim italic")
-            self._console.print(f"\r\033[K", end="")
-            self._console.print(text, end="")
-            self._frame_idx += 1
-            time.sleep(0.08)
+        if self._status is not None:
+            self._status.stop()
+            self._status = None

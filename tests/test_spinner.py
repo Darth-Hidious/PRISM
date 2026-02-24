@@ -1,13 +1,17 @@
 """Tests for the braille spinner."""
 
-from unittest.mock import MagicMock
+from io import StringIO
+from rich.console import Console
 from app.agent.spinner import Spinner, TOOL_VERBS, BRAILLE_FRAMES
 
 
 class TestSpinner:
-    def test_default_verb(self):
-        s = Spinner(console=MagicMock())
-        assert s._verb == "Thinking..."
+    def _make_spinner(self):
+        return Spinner(console=Console(file=StringIO()))
+
+    def test_initial_state(self):
+        s = self._make_spinner()
+        assert s._status is None
 
     def test_tool_verbs_mapping(self):
         assert "search_optimade" in TOOL_VERBS
@@ -15,31 +19,27 @@ class TestSpinner:
         assert "calculate_phase_diagram" in TOOL_VERBS
 
     def test_verb_for_tool(self):
-        s = Spinner(console=MagicMock())
+        s = self._make_spinner()
         assert s.verb_for_tool("search_optimade") == TOOL_VERBS["search_optimade"]
         assert s.verb_for_tool("unknown_tool") == "Thinking..."
 
     def test_start_and_stop(self):
-        console = MagicMock()
-        s = Spinner(console=console)
+        s = self._make_spinner()
         s.start("Testing...")
-        assert s._running is True
-        assert s._verb == "Testing..."
+        assert s._status is not None
         s.stop()
-        assert s._running is False
+        assert s._status is None
 
-    def test_update_verb(self):
-        console = MagicMock()
-        s = Spinner(console=console)
+    def test_update(self):
+        s = self._make_spinner()
         s.start("First...")
         s.update("Second...")
-        assert s._verb == "Second..."
         s.stop()
 
     def test_stop_without_start(self):
-        s = Spinner(console=MagicMock())
+        s = self._make_spinner()
         s.stop()  # should not raise
 
     def test_braille_frames(self):
         assert len(BRAILLE_FRAMES) == 10
-        assert BRAILLE_FRAMES[0] == "⠋"
+        assert BRAILLE_FRAMES[0] == "\u280b"

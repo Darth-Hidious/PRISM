@@ -1,4 +1,8 @@
-"""Interactive REPL for the PRISM agent."""
+"""Interactive REPL for the PRISM agent.
+
+Rich panels for output + prompt_toolkit for input — the same pattern
+used by Aider, Open Interpreter, and other Python AI CLIs.
+"""
 import os
 import time
 from typing import Optional
@@ -6,7 +10,9 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm
+from rich.table import Table
 from rich.text import Text
+from rich import box
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -21,6 +27,50 @@ from app.agent.memory import SessionMemory
 from app.agent.scratchpad import Scratchpad
 from app.agent.spinner import Spinner
 from app.tools.base import ToolRegistry
+
+# ── Theme constants ──────────────────────────────────────────────────
+
+_SUCCESS = "#00cc44"
+_WARNING = "#d29922"
+_ERROR = "#cc555a"
+_INFO = "#0088ff"
+_ACCENT = "bold magenta"
+_DIM = "dim"
+_TEXT = "#e0e0e0"
+
+# Card border colors by result type
+_BORDERS = {
+    "tool": _DIM,
+    "error": _ERROR,
+    "error_partial": _WARNING,
+    "metrics": _INFO,
+    "calphad": _INFO,
+    "validation_critical": _ERROR,
+    "validation_warning": _WARNING,
+    "validation_info": _INFO,
+    "results": _DIM,
+    "plot": _SUCCESS,
+    "approval": _WARNING,
+    "plan": _INFO,
+}
+
+# Mascot: C4 glowing hex crystal
+_MASCOT = [
+    "   \u2b21 \u2b21 \u2b21",
+    "  \u2b21 \u2b22 \u2b22 \u2b22 \u2b21",
+    "  \u2b21 \u2b22 \u2b22 \u2b22 \u2b21",
+    "   \u2b21 \u2b21 \u2b21",
+]
+
+# VIBGYOR rainbow
+_RAINBOW = [
+    "#ff0000", "#ff5500", "#ff8800", "#ffcc00", "#88ff00",
+    "#00cc44", "#00cccc", "#0088ff", "#5500ff", "#8b00ff",
+    "#ff0000", "#ff5500", "#ff8800", "#ffcc00", "#88ff00",
+]
+
+# Default truncation for long output
+_TRUNCATION_LINES = 25
 
 
 REPL_COMMANDS = {
@@ -47,8 +97,27 @@ REPL_COMMANDS = {
 _COMMAND_ALIASES = {"/skill": "/skills"}
 
 
+# ── Result type detection ────────────────────────────────────────────
+
+def _detect_result_type(result: dict) -> str:
+    """Determine the display type from a tool result dict shape."""
+    if "error" in result:
+        return "error"
+    if "metrics" in result and "algorithm" in result:
+        return "metrics"
+    if "phases_present" in result or ("phases" in result and "gibbs_energy" in result):
+        return "calphad"
+    if "findings" in result and "quality_score" in result:
+        return "validation"
+    if isinstance(result.get("filename"), str) and result["filename"].endswith(".png"):
+        return "plot"
+    if isinstance(result.get("results"), list) and len(result["results"]) > 3:
+        return "results"
+    return "tool"
+
+
 class AgentREPL:
-    """Interactive REPL — Claude Code-inspired minimal interface."""
+    """Interactive REPL — Rich panels + prompt_toolkit."""
 
     def __init__(self, backend: Backend, system_prompt: Optional[str] = None,
                  tools: Optional[ToolRegistry] = None, enable_mcp: bool = True,
@@ -83,18 +152,16 @@ class AgentREPL:
             return True
         args_summary = ", ".join(f"{k}={v!r}" for k, v in list(tool_args.items())[:3])
         header = Text()
-        header.append(f" {tool_name} ", style="bold magenta")
-        header.append(" approval ", style="bold #d29922")
+        header.append(f" {tool_name} ", style=_ACCENT)
+        header.append(" approval ", style=f"bold {_WARNING}")
         body = Text()
-        body.append(f" {args_summary}", style="dim")
+        body.append(f"\u26a0 Requires approval\n", style=_WARNING)
+        body.append(f"  {args_summary}\n", style=_DIM)
+        body.append("\n  [y] approve  [n] deny  [a] always", style=_DIM)
         self.console.print(Panel(
-            body,
-            title=header,
-            title_align="left",
-            border_style="#d29922",
-            padding=(0, 1),
+            body, title=header, title_align="left",
+            border_style=_WARNING, box=box.ROUNDED, padding=(0, 1),
         ))
-        self.console.print("  [#d29922]?[/#d29922] Allow?  [bold]y[/bold] yes  [bold]n[/bold] no  [bold]a[/bold] always")
         try:
             answer = input("    ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -112,14 +179,14 @@ class AgentREPL:
             self.scratchpad = Scratchpad.from_dict(entries)
             self.agent.scratchpad = self.scratchpad
 
-    # ── Main loop ──────────────────────────────────────────────────────
+    # ── Main loop ────────────────────────────────────────────────────
 
     def run(self):
         self._show_welcome()
         while True:
             try:
                 user_input = self._session.prompt(
-                    HTML('<ansimagenta><b>❯ </b></ansimagenta>'),
+                    HTML('<ansimagenta><b>\u276f </b></ansimagenta>'),
                 ).strip()
             except (EOFError, KeyboardInterrupt):
                 self._prompt_save_on_exit()
@@ -138,7 +205,7 @@ class AgentREPL:
             except Exception as e:
                 self.console.print(f"\n[red]Error: {e}[/red]")
 
-    # ── Streaming ──────────────────────────────────────────────────────
+    # ── Streaming ────────────────────────────────────────────────────
 
     def _handle_streaming_response(self, user_input: str):
         accumulated_text = ""
@@ -162,13 +229,7 @@ class AgentREPL:
                     if "</plan>" in event.text:
                         plan_buffer += event.text.split("</plan>")[0]
                         in_plan = False
-                        self.console.print()
-                        self.console.print(Panel(
-                            Markdown(plan_buffer.strip()),
-                            title="[bold]Plan[/bold]",
-                            border_style="dim",
-                            padding=(1, 2),
-                        ))
+                        self._render_plan_card(plan_buffer.strip())
                         if self.scratchpad:
                             self.scratchpad.log("plan", summary="Plan proposed", data={"plan": plan_buffer.strip()})
                         if not Confirm.ask("  Execute?", default=True):
@@ -179,13 +240,11 @@ class AgentREPL:
                     else:
                         plan_buffer += event.text
                     continue
-                # Don't write raw text — we render as Markdown at breaks
 
             elif isinstance(event, ToolCallStart):
-                # Flush accumulated text as Markdown before tool card
+                # Flush accumulated text before tool card
                 if accumulated_text.strip():
-                    self.console.print()
-                    self.console.print(Markdown(accumulated_text.strip()))
+                    self._render_output(accumulated_text.strip())
                     accumulated_text = ""
                 tool_start_time = time.monotonic()
                 current_tool_name = event.tool_name
@@ -197,45 +256,252 @@ class AgentREPL:
 
             elif isinstance(event, ToolCallResult):
                 spinner.stop()
-                elapsed_str = ""
+                elapsed_ms = 0.0
                 if tool_start_time:
-                    ms = (time.monotonic() - tool_start_time) * 1000
-                    elapsed_str = f"{ms:.0f}ms" if ms < 2000 else f"{ms / 1000:.1f}s"
+                    elapsed_ms = (time.monotonic() - tool_start_time) * 1000
                     tool_start_time = None
-                summary = event.summary if hasattr(event, "summary") else "done"
-                self._render_tool_card(event.tool_name, summary, elapsed_str)
+                result = event.result if isinstance(event.result, dict) else {}
+                self._render_tool_result(event.tool_name, event.summary, elapsed_ms, result)
                 current_tool_name = None
 
             elif isinstance(event, TurnComplete):
                 spinner.stop()
                 tool_start_time = None
 
-        # Flush any remaining text as Markdown
+        # Flush remaining text
         if accumulated_text.strip():
-            self.console.print()
-            self.console.print(Markdown(accumulated_text.strip()))
-            self.console.print()
+            self._render_output(accumulated_text.strip())
 
-    def _render_tool_card(self, tool_name: str, summary: str, elapsed: str):
-        """Render a bordered tool call result card."""
-        header = Text()
-        header.append(f" {tool_name} ", style="bold magenta")
-        if elapsed:
-            header.append(f" {elapsed}", style="dim")
+    # ── Output rendering ─────────────────────────────────────────────
 
-        body = Text()
-        body.append(" ✓ ", style="bold green")
-        body.append(summary, style="dim")
+    def _render_output(self, text: str):
+        """Render agent text output with truncation for long content."""
+        self.console.print()
+        lines = text.split("\n")
+        if len(lines) > _TRUNCATION_LINES:
+            truncated = "\n".join(lines[:_TRUNCATION_LINES])
+            remaining = len(lines) - _TRUNCATION_LINES
+            self.console.print(Markdown(truncated))
+            self.console.print(f"  [dim]... {remaining} more lines (use /scratchpad to review)[/dim]")
+        else:
+            self.console.print(Markdown(text))
+        self.console.print()
 
+    def _render_plan_card(self, plan_text: str):
+        """Render an agent plan in a bordered panel."""
+        self.console.print()
         self.console.print(Panel(
-            body,
-            title=header,
+            Markdown(plan_text),
+            title=Text(" plan ", style=f"bold {_INFO}"),
             title_align="left",
-            border_style="dim",
-            padding=(0, 1),
+            subtitle=Text("[y] execute  [n] reject", style=_DIM),
+            subtitle_align="right",
+            border_style=_BORDERS["plan"], box=box.ROUNDED,
+            padding=(1, 2),
         ))
 
-    # ── Exit ───────────────────────────────────────────────────────────
+    def _render_tool_result(self, tool_name: str, summary: str, elapsed_ms: float, result: dict):
+        """Render a tool result as a typed, color-coded panel."""
+        result_type = _detect_result_type(result)
+
+        # Dispatch to specialized renderers
+        if result_type == "error":
+            self._render_error_card(tool_name, elapsed_ms, result)
+        elif result_type == "metrics":
+            self._render_metrics_card(tool_name, elapsed_ms, result)
+        elif result_type == "calphad":
+            self._render_calphad_card(tool_name, elapsed_ms, result)
+        elif result_type == "validation":
+            self._render_validation_card(tool_name, elapsed_ms, result)
+        elif result_type == "results":
+            self._render_results_card(tool_name, summary, elapsed_ms, result)
+        elif result_type == "plot":
+            self._render_plot_card(tool_name, elapsed_ms, result)
+        else:
+            self._render_success_card(tool_name, summary, elapsed_ms)
+
+    def _format_elapsed(self, ms: float) -> str:
+        if ms >= 2000:
+            return f"{ms / 1000:.1f}s"
+        if ms > 0:
+            return f"{ms:.0f}ms"
+        return ""
+
+    def _make_title(self, tool_name: str, elapsed_ms: float, label: str = "") -> Text:
+        title = Text()
+        title.append(f" {tool_name} ", style=_ACCENT)
+        if label:
+            title.append(f" {label} ", style=f"bold {_WARNING}")
+        elapsed = self._format_elapsed(elapsed_ms)
+        if elapsed:
+            title.append(f" {elapsed}", style=_DIM)
+        return title
+
+    def _render_success_card(self, tool_name: str, summary: str, elapsed_ms: float):
+        """Standard success tool card."""
+        title = self._make_title(tool_name, elapsed_ms)
+        body = Text()
+        body.append(" \u2714 ", style=f"bold {_SUCCESS}")
+        body.append(summary or "completed", style=_DIM)
+        self.console.print(Panel(
+            body, title=title, title_align="left",
+            border_style=_BORDERS["tool"], box=box.ROUNDED, padding=(0, 1),
+        ))
+
+    def _render_error_card(self, tool_name: str, elapsed_ms: float, result: dict):
+        """Error card with formatted error message (not raw JSON dump)."""
+        error_msg = str(result.get("error", "Unknown error"))
+        # Check for partial success (some providers succeeded)
+        succeeded = result.get("succeeded", [])
+        failed = result.get("failed", {})
+
+        if succeeded:
+            # Partial failure
+            title = self._make_title(tool_name, elapsed_ms, "PARTIAL")
+            body = Text()
+            if isinstance(failed, dict):
+                for name, err in list(failed.items())[:3]:
+                    body.append(f"  \u2717 {name}: {str(err)[:60]}\n", style=_ERROR)
+            n = len(succeeded)
+            count = result.get("count", "?")
+            body.append(f"  \u2714 {n} succeeded ({count} results)\n", style=_SUCCESS)
+            body.append(f"\n  [r] Retry failed  [s] Skip", style=_DIM)
+            border = _BORDERS["error_partial"]
+        else:
+            # Total failure — show clean error, not raw JSON
+            title = self._make_title(tool_name, elapsed_ms)
+            body = Text()
+            body.append(" \u2717 ", style=f"bold {_ERROR}")
+            # Truncate long errors to something readable
+            if len(error_msg) > 200:
+                error_msg = error_msg[:200] + "..."
+            body.append(error_msg, style=_DIM)
+            border = _BORDERS["error"]
+
+        self.console.print(Panel(
+            body, title=title, title_align="left",
+            border_style=border, box=box.ROUNDED, padding=(0, 1),
+        ))
+
+    def _render_metrics_card(self, tool_name: str, elapsed_ms: float, result: dict):
+        """ML training metrics as a compact table."""
+        title = self._make_title(tool_name, elapsed_ms)
+        metrics = result.get("metrics", {})
+        algorithm = result.get("algorithm", "")
+
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column(style="bold")
+        table.add_column()
+        if algorithm:
+            table.add_row("Algorithm", algorithm)
+        for k, v in metrics.items():
+            label = k.upper() if k in ("mae", "rmse", "r2") else k
+            val = f"{v:.4f}" if isinstance(v, float) else str(v)
+            table.add_row(label, val)
+        if result.get("filename"):
+            table.add_row("Plot", result["filename"])
+
+        self.console.print(Panel(
+            table, title=title, title_align="left",
+            border_style=_BORDERS["metrics"], box=box.ROUNDED, padding=(0, 1),
+        ))
+
+    def _render_calphad_card(self, tool_name: str, elapsed_ms: float, result: dict):
+        """CALPHAD equilibrium/phase results."""
+        title = self._make_title(tool_name, elapsed_ms)
+        body = Text()
+        system = result.get("system", "")
+        if system:
+            body.append(f"  System: {system}\n", style="bold")
+        phases = result.get("phases_present", result.get("phases", {}))
+        if isinstance(phases, dict):
+            for phase, frac in phases.items():
+                body.append(f"  {phase}: {frac:.2f}\n" if isinstance(frac, (int, float)) else f"  {phase}: {frac}\n")
+        elif isinstance(phases, list):
+            body.append(f"  Phases: {', '.join(str(p) for p in phases)}\n")
+        gibbs = result.get("gibbs_energy")
+        if gibbs is not None:
+            body.append(f"  \u0394G = {gibbs:.1f} J/mol\n", style=_DIM)
+
+        self.console.print(Panel(
+            body, title=title, title_align="left",
+            border_style=_BORDERS["calphad"], box=box.ROUNDED, padding=(0, 1),
+        ))
+
+    def _render_validation_card(self, tool_name: str, elapsed_ms: float, result: dict):
+        """Validation findings with severity colors."""
+        quality = result.get("quality_score", "")
+        findings = result.get("findings", {})
+
+        subtitle = Text()
+        if quality:
+            subtitle.append(f"Quality: {quality:.2f}", style=_DIM)
+        title = self._make_title(tool_name, elapsed_ms)
+
+        body = Text()
+        severity_styles = {"critical": _ERROR, "warning": _WARNING, "info": _INFO}
+        severity_icons = {"critical": "\u25cf", "warning": "\u25cf", "info": "\u25cf"}
+        for severity in ("critical", "warning", "info"):
+            items = findings.get(severity, [])
+            if items:
+                body.append(f"  {severity_icons[severity]} {len(items)} {severity.upper()}\n",
+                            style=f"bold {severity_styles[severity]}")
+                for item in items[:2]:
+                    msg = item.get("msg", item) if isinstance(item, dict) else str(item)
+                    body.append(f"    {msg}\n", style=_DIM)
+                if len(items) > 2:
+                    body.append(f"    ... +{len(items) - 2} more\n", style=_DIM)
+
+        border_key = "validation_critical" if findings.get("critical") else "validation_warning" if findings.get("warning") else "validation_info"
+        self.console.print(Panel(
+            body, title=title, title_align="left",
+            subtitle=subtitle, subtitle_align="right",
+            border_style=_BORDERS[border_key], box=box.ROUNDED, padding=(0, 1),
+        ))
+
+    def _render_results_card(self, tool_name: str, summary: str, elapsed_ms: float, result: dict):
+        """Tabular results with a 3-row preview."""
+        rows = result.get("results", [])
+        total = result.get("count", len(rows))
+        title = self._make_title(tool_name, elapsed_ms)
+
+        preview = rows[:3]
+        if preview:
+            cols = list(preview[0].keys())[:4]
+            table = Table(box=box.SIMPLE, padding=(0, 1))
+            for c in cols:
+                table.add_column(c, style=_DIM)
+            for row in preview:
+                table.add_row(*(str(row.get(c, ""))[:25] for c in cols))
+        else:
+            table = Text(summary or "No preview", style=_DIM)
+
+        remaining = total - len(preview)
+        subtitle = Text()
+        if remaining > 0:
+            subtitle.append(f"+{remaining} more  ", style=_DIM)
+        subtitle.append("/export to save", style=_DIM)
+
+        self.console.print(Panel(
+            table, title=title, title_align="left",
+            subtitle=subtitle, subtitle_align="right",
+            border_style=_BORDERS["results"], box=box.ROUNDED, padding=(0, 1),
+        ))
+
+    def _render_plot_card(self, tool_name: str, elapsed_ms: float, result: dict):
+        """Plot/visualization output with file path."""
+        title = self._make_title(tool_name, elapsed_ms)
+        body = Text()
+        body.append(" \u2714 ", style=f"bold {_SUCCESS}")
+        desc = result.get("description", "Plot saved")
+        body.append(f"{desc}\n", style=_DIM)
+        body.append(f"  \U0001f4ca {result.get('filename', '')}", style=_DIM)
+        self.console.print(Panel(
+            body, title=title, title_align="left",
+            border_style=_BORDERS["plot"], box=box.ROUNDED, padding=(0, 1),
+        ))
+
+    # ── Exit ─────────────────────────────────────────────────────────
 
     def _prompt_save_on_exit(self):
         if not self.agent.history:
@@ -251,57 +517,32 @@ class AgentREPL:
             sid = self.memory.save()
             self.console.print(f"[dim]Saved: {sid}[/dim]")
 
-    # ── Welcome ────────────────────────────────────────────────────────
+    # ── Welcome ──────────────────────────────────────────────────────
 
     def _show_welcome(self):
         from app import __version__
         caps = self._detect_capabilities()
 
-        # VIBGYOR letter colors
-        colors = {
-            "P": "#ff0000", "R": "#ff7700", "I": "#ffdd00",
-            "S": "#00cc44", "M": "#0066ff",
-        }
-        # 5-line block-letter art
-        art_lines = [
-            " ██████  ██████  ██  ███████ ███    ███",
-            " ██   ██ ██   ██ ██  ██      ████  ████",
-            " ██████  ██████  ██  ███████ ██ ████ ██",
-            " ██      ██   ██ ██       ██ ██  ██  ██",
-            " ██      ██   ██ ██  ███████ ██      ██",
-        ]
-        # Character ranges for each letter in the art
-        letter_spans = [
-            ("P", 0, 8), ("R", 8, 16), ("I", 16, 20),
-            ("S", 20, 28), ("M", 28, 40),
-        ]
-
         self.console.print()
-        for line in art_lines:
+
+        # Hex crystal mascot with rainbow rays
+        crystal_colors = {"outer": "#7777aa", "core": "#ffffff"}
+        for i, line in enumerate(_MASCOT):
             text = Text()
-            for letter, start, end in letter_spans:
-                segment = line[start:end] if end <= len(line) else line[start:]
-                text.append(segment, style=f"bold {colors[letter]}")
+            for ch in line:
+                if ch == "\u2b22":
+                    text.append(ch, style=f"bold {crystal_colors['core']}")
+                elif ch == "\u2b21":
+                    text.append(ch, style=crystal_colors["outer"])
+                else:
+                    text.append(ch)
+            # Add rainbow rays on middle lines
+            if i in (1, 2):
+                text.append("  ")
+                for j in range(15):
+                    text.append("\u2501", style=f"bold {_RAINBOW[j]}")
             self.console.print(text)
 
-        # Prism triangle + rainbow bar
-        self.console.print()
-        triangle = Text()
-        triangle.append("           ▲\n", style="dim")
-        triangle.append("          ╱ ╲\n", style="dim")
-        triangle.append("         ╱   ╲\n", style="dim")
-        triangle.append("        ▔▔▔▔▔▔▔\n", style="dim")
-
-        rainbow_colors = [
-            "#ff0000", "#ff3300", "#ff6600", "#ff9900", "#ffcc00",
-            "#ffff00", "#ccff00", "#66ff00", "#00cc44", "#00aa88",
-            "#0088cc", "#0055ff", "#2200ff", "#4400cc", "#6600aa",
-        ]
-        bar = Text("     ")
-        for c in rainbow_colors:
-            bar.append("━", style=c)
-        self.console.print(triangle, end="")
-        self.console.print(bar)
         self.console.print()
 
         # Provider
@@ -316,13 +557,14 @@ class AgentREPL:
             provider = "OpenRouter"
 
         info = Text()
-        info.append(f"  v{__version__}", style="dim")
+        info.append("  PRISM", style="bold")
+        info.append(f" v{__version__}", style=_DIM)
         if provider:
-            info.append("  ·  ", style="dim")
-            info.append(provider, style="bold magenta")
+            info.append("  \u00b7  ", style=_DIM)
+            info.append(provider, style=_ACCENT)
         self.console.print(info)
 
-        # Capabilities line
+        # Capabilities
         parts = []
         tool_count = len(self.agent.tools.list_tools())
         parts.append(f"{tool_count} tools")
@@ -339,7 +581,10 @@ class AgentREPL:
                 parts.append(f"[dim]{name}[/dim]")
         if self._auto_approve:
             parts.append("[yellow]auto-approve[/yellow]")
-        self.console.print("[dim]  " + " · ".join(parts) + "[/dim]")
+        self.console.print("[dim]  " + " \u00b7 ".join(parts) + "[/dim]")
+
+        # Commands hint
+        self.console.print(f"  [dim]/help for commands[/dim]")
         self.console.print()
 
     def _detect_capabilities(self) -> dict:
@@ -361,7 +606,7 @@ class AgentREPL:
             caps["CALPHAD"] = False
         return caps
 
-    # ── Command dispatch ───────────────────────────────────────────────
+    # ── Command dispatch ─────────────────────────────────────────────
 
     def _handle_command(self, cmd: str) -> bool:
         parts = cmd.strip().split(maxsplit=1)
@@ -421,7 +666,7 @@ class AgentREPL:
             self.console.print(f"[dim]Unknown: {base_cmd}  \u2014  /help for commands[/dim]")
         return False
 
-    # ── /help ──────────────────────────────────────────────────────────
+    # ── /help ────────────────────────────────────────────────────────
 
     def _handle_help(self):
         self.console.print()
@@ -431,19 +676,19 @@ class AgentREPL:
             self.console.print(f"  [bold]{name:<16}[/bold] [dim]{desc}[/dim]")
         self.console.print()
 
-    # ── /tools ─────────────────────────────────────────────────────────
+    # ── /tools ───────────────────────────────────────────────────────
 
     def _handle_tools(self):
         self.console.print()
         tools = self.agent.tools.list_tools()
         for tool in tools:
-            name_style = "bold #d29922" if tool.requires_approval else "bold"
-            flag = " [#d29922]★[/#d29922]" if tool.requires_approval else ""
+            name_style = f"bold {_WARNING}" if tool.requires_approval else "bold"
+            flag = f" [{_WARNING}]\u2605[/{_WARNING}]" if tool.requires_approval else ""
             self.console.print(f"  [{name_style}]{tool.name:<28}[/{name_style}] [dim]{tool.description[:55]}[/dim]{flag}")
-        self.console.print(f"\n  [dim]{len(tools)} tools[/dim]  [#d29922]★[/#d29922] [dim]= requires approval[/dim]")
+        self.console.print(f"\n  [dim]{len(tools)} tools[/dim]  [{_WARNING}]\u2605[/{_WARNING}] [dim]= requires approval[/dim]")
         self.console.print()
 
-    # ── /status ────────────────────────────────────────────────────────
+    # ── /status ──────────────────────────────────────────────────────
 
     def _handle_status(self):
         from app import __version__
@@ -484,7 +729,7 @@ class AgentREPL:
             self.console.print(f"  [dim]pip install \"prism-platform[all]\" for {', '.join(missing)}[/dim]")
         self.console.print()
 
-    # ── /login ─────────────────────────────────────────────────────────
+    # ── /login ───────────────────────────────────────────────────────
 
     def _handle_login(self):
         from app.config.preferences import PRISM_DIR
@@ -528,7 +773,7 @@ class AgentREPL:
         self.console.print("[dim]Token saved to ~/.prism/marc27_token[/dim]")
         self.console.print()
 
-    # ── /skills ────────────────────────────────────────────────────────
+    # ── /skills ──────────────────────────────────────────────────────
 
     def _handle_skill(self, name: Optional[str] = None):
         try:
@@ -556,7 +801,7 @@ class AgentREPL:
                 self.console.print(f"  {skill.name:<25} [dim]{skill.description[:55]}[/dim]")
         self.console.print()
 
-    # ── /plan ──────────────────────────────────────────────────────────
+    # ── /plan ────────────────────────────────────────────────────────
 
     def _handle_plan(self, goal: str):
         prompt = f"The user wants to accomplish: {goal}\n\nAvailable PRISM skills:\n"
@@ -572,7 +817,7 @@ class AgentREPL:
         except Exception as e:
             self.console.print(f"[red]Error: {e}[/red]")
 
-    # ── /scratchpad ────────────────────────────────────────────────────
+    # ── /scratchpad ──────────────────────────────────────────────────
 
     def _handle_scratchpad(self):
         if not self.scratchpad or not self.scratchpad.entries:
@@ -584,7 +829,7 @@ class AgentREPL:
             self.console.print(f"  [dim]{i}.[/dim]{tool} {entry.summary} [dim]{entry.timestamp}[/dim]")
         self.console.print()
 
-    # ── /mcp ───────────────────────────────────────────────────────────
+    # ── /mcp ─────────────────────────────────────────────────────────
 
     def _handle_mcp_status(self):
         from app.mcp_client import load_mcp_config
@@ -599,7 +844,7 @@ class AgentREPL:
             self.console.print(f"\n  [dim]{len(self._mcp_tools)} MCP tools loaded[/dim]")
         self.console.print()
 
-    # ── /export ────────────────────────────────────────────────────────
+    # ── /export ──────────────────────────────────────────────────────
 
     def _handle_export(self, filename: Optional[str] = None):
         results = None
@@ -625,7 +870,7 @@ class AgentREPL:
         else:
             self.console.print(f"Exported {out['rows']} rows to {out['filename']}")
 
-    # ── /sessions, /load ───────────────────────────────────────────────
+    # ── /sessions, /load ─────────────────────────────────────────────
 
     def _handle_sessions(self):
         sessions = self.memory.list_sessions()
