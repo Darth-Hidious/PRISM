@@ -23,6 +23,7 @@ class UserPreferences:
     compute_budget: str = "local"  # local, hpc
     hpc_queue: str = "default"
     hpc_cores: int = 4
+    check_updates: bool = True
 
     @classmethod
     def load(cls) -> "UserPreferences":
