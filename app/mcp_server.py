@@ -12,6 +12,7 @@ from app.tools.system import create_system_tools
 from app.tools.visualization import create_visualization_tools
 from app.tools.prediction import create_prediction_tools
 from app.agent.memory import SessionMemory
+from app.simulation.bridge import check_pyiron_available
 
 
 def _build_registry() -> ToolRegistry:
@@ -21,6 +22,9 @@ def _build_registry() -> ToolRegistry:
     create_data_tools(registry)
     create_visualization_tools(registry)
     create_prediction_tools(registry)
+    if check_pyiron_available():
+        from app.tools.simulation import create_simulation_tools
+        create_simulation_tools(registry)
     return registry
 
 
@@ -149,6 +153,37 @@ def _register_resources(mcp: FastMCP):
             default=str,
         )
 
+    # --- Simulation resources (only when pyiron is available) ----------------
+    if check_pyiron_available():
+        @mcp.resource("prism://simulations/structures")
+        def list_structures() -> str:
+            """List stored atomistic structures."""
+            from app.simulation.bridge import get_bridge
+            bridge = get_bridge()
+            return json.dumps(bridge.structures.to_summary_list(), default=str)
+
+        @mcp.resource("prism://simulations/jobs")
+        def list_sim_jobs() -> str:
+            """List simulation jobs."""
+            from app.simulation.bridge import get_bridge
+            bridge = get_bridge()
+            return json.dumps(bridge.jobs.to_summary_list(), default=str)
+
+        @mcp.resource("prism://simulations/jobs/{job_id}")
+        def get_sim_job(job_id: str) -> str:
+            """Get details of a specific simulation job."""
+            from app.simulation.bridge import get_bridge
+            bridge = get_bridge()
+            job = bridge.jobs.get(job_id)
+            if job is None:
+                return json.dumps({"error": f"Job {job_id} not found"})
+            info = {
+                "job_id": job_id,
+                "status": str(job.status),
+                "job_name": getattr(job, "job_name", job_id),
+            }
+            return json.dumps(info, default=str)
+
 
 def create_mcp_server(registry: Optional[ToolRegistry] = None) -> FastMCP:
     """Create a FastMCP server exposing all PRISM tools and resources."""
@@ -157,7 +192,7 @@ def create_mcp_server(registry: Optional[ToolRegistry] = None) -> FastMCP:
         instructions=(
             "PRISM: Materials science research tools. Search OPTIMADE databases, "
             "query Materials Project, predict properties with ML, visualize results, "
-            "and export data."
+            "export data, and run atomistic simulations via pyiron."
         ),
     )
 

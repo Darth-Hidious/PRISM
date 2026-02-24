@@ -56,6 +56,11 @@ ml = [
     "pyarrow>=14.0.0",
     "joblib>=1.3.0",
 ]
+simulation = [
+    "pyiron_base>=0.9",
+    "pyiron_atomistics>=0.6",
+    "pyiron_workflow>=0.12",
+]
 dev = [
     "pytest>=7.4.3",
     "pytest-cov>=4.1.0",
@@ -74,7 +79,7 @@ Repository = "https://github.com/Darth-Hidious/PRISM"
 "Bug Reports" = "https://github.com/Darth-Hidious/PRISM/issues"
 
 [tool.setuptools]
-packages = ["app", "app.config", "app.db", "app.agent", "app.agent.backends", "app.tools", "app.data", "app.commands", "app.ml"]
+packages = ["app", "app.config", "app.db", "app.agent", "app.agent.backends", "app.tools", "app.data", "app.commands", "app.ml", "app.simulation"]
 include-package-data = true
 
 [tool.black]

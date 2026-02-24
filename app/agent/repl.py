@@ -43,6 +43,13 @@ class AgentREPL:
             create_system_tools(tools)
             create_data_tools(tools)
             create_visualization_tools(tools)
+            try:
+                from app.simulation.bridge import check_pyiron_available
+                if check_pyiron_available():
+                    from app.tools.simulation import create_simulation_tools
+                    create_simulation_tools(tools)
+            except Exception:
+                pass
         # Optionally discover and register tools from external MCP servers
         if enable_mcp:
             try:
