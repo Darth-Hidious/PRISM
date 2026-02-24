@@ -16,7 +16,7 @@ from app.simulation.bridge import check_pyiron_available
 
 
 def _build_registry() -> ToolRegistry:
-    """Build a full tool registry with all PRISM tools."""
+    """Build a full tool registry with all PRISM tools and skills."""
     registry = ToolRegistry()
     create_system_tools(registry)
     create_data_tools(registry)
@@ -25,6 +25,12 @@ def _build_registry() -> ToolRegistry:
     if check_pyiron_available():
         from app.tools.simulation import create_simulation_tools
         create_simulation_tools(registry)
+    # Load built-in skills as tools
+    try:
+        from app.skills.registry import load_builtin_skills
+        load_builtin_skills().register_all_as_tools(registry)
+    except Exception:
+        pass
     return registry
 
 
@@ -152,6 +158,27 @@ def _register_resources(mcp: FastMCP):
             },
             default=str,
         )
+
+    @mcp.resource("prism://skills")
+    def list_skills_resource() -> str:
+        """List available PRISM skills with their steps."""
+        try:
+            from app.skills.registry import load_builtin_skills
+            skills = load_builtin_skills()
+            data = []
+            for s in skills.list_skills():
+                data.append({
+                    "name": s.name,
+                    "description": s.description,
+                    "category": s.category,
+                    "steps": [
+                        {"name": st.name, "description": st.description, "optional": st.optional}
+                        for st in s.steps
+                    ],
+                })
+            return json.dumps(data)
+        except Exception:
+            return json.dumps([])
 
     # --- Simulation resources (only when pyiron is available) ----------------
     if check_pyiron_available():
