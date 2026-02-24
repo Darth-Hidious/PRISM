@@ -210,7 +210,7 @@ PRISM uses a **dual license**:
 | CLI, data layer, tools, tests, docs | [MIT](LICENSE-MIT) |
 | Agent core, skills, ML, simulation, validation, plugins | [MARC27 Source-Available](LICENSE-MARC27) |
 
-See [LICENSE](LICENSE) for details. Commercial licensing: licensing@marc27.com
+See [LICENSE](LICENSE) for details. Commercial licensing: team@marc27.com
 
 ## Links
 
