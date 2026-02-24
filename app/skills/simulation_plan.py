@@ -154,4 +154,5 @@ SIM_PLAN_SKILL = Skill(
     },
     func=_plan_simulations,
     category="simulation",
+    requires_approval=True,
 )

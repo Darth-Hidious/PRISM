@@ -167,6 +167,7 @@ def create_calphad_tools(registry: ToolRegistry) -> None:
             "required": ["database_name", "components"],
         },
         func=_calculate_phase_diagram,
+        requires_approval=True,
     ))
 
     registry.register(Tool(
@@ -183,6 +184,7 @@ def create_calphad_tools(registry: ToolRegistry) -> None:
             "required": ["database_name", "components", "conditions"],
         },
         func=_calculate_equilibrium,
+        requires_approval=True,
     ))
 
     registry.register(Tool(

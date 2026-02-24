@@ -124,4 +124,5 @@ PHASE_ANALYSIS_SKILL = Skill(
     },
     func=_analyze_phases,
     category="thermodynamics",
+    requires_approval=True,
 )

@@ -13,6 +13,7 @@ class SessionMemory:
     def __init__(self, storage_dir: Optional[str] = None):
         self._data: Dict[str, Any] = {}
         self._history: List[Dict] = []
+        self._scratchpad_entries: List[Dict] = []
         self._session_id: Optional[str] = None
         self._storage_dir = Path(storage_dir) if storage_dir else Path.home() / ".prism" / "sessions"
 
@@ -27,6 +28,12 @@ class SessionMemory:
 
     def get_history(self) -> List[Dict]:
         return self._history
+
+    def set_scratchpad_entries(self, entries: List[Dict]) -> None:
+        self._scratchpad_entries = entries
+
+    def get_scratchpad_entries(self) -> List[Dict]:
+        return self._scratchpad_entries
 
     def _compute_summary(self) -> str:
         """First user message, truncated to 80 chars."""
@@ -48,6 +55,7 @@ class SessionMemory:
             "message_count": len(self._history),
             "data": self._data,
             "history": self._history,
+            "scratchpad": self._scratchpad_entries,
         }
         filepath.write_text(json.dumps(payload, indent=2, default=str))
         return self._session_id
@@ -58,6 +66,7 @@ class SessionMemory:
         self._session_id = payload["session_id"]
         self._data = payload.get("data", {})
         self._history = payload.get("history", [])
+        self._scratchpad_entries = payload.get("scratchpad", [])
 
     def list_sessions(self) -> List[Dict]:
         if not self._storage_dir.exists():

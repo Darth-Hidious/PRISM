@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-02-24
+
+### Added
+- **Dual License (Phase F-1)**: MIT for core plumbing, MARC27 Source-Available for AI orchestration. New `LICENSE-MIT` and `LICENSE-MARC27` files.
+- **Tool Consent (Phase F-2)**: `requires_approval` flag on expensive tools; REPL prompts for confirmation; `--confirm` flag for autonomous mode; `--dangerously-accept-all` to skip all prompts; `/approve-all` REPL command.
+- **Scratchpad (Phase F-3)**: Append-only execution log (`Scratchpad` class) auto-populated after each tool call; `show_scratchpad` tool for agent self-inspection; `/scratchpad` REPL command; included in session save/load and reports as "Methodology" section.
+- **Plan-then-Execute (Phase F-4)**: System prompt instructs agent to output `<plan>` blocks for complex goals; REPL detects and renders plan as a panel, gating execution on user approval.
+- **Feedback Loops (Phase F-5)**: `_post_tool_hook()` in AgentCore injects validation, review, and CALPHAD findings back into agent context as system messages, closing the Evolver-Evaluator loop.
+- **README Refresh (Phase F-6)**: Full rewrite with deck-aligned content, banner image, architecture table, dual-license section.
+
+### Changed
+- **Project Version**: Bumped from 2.0.0 to 2.1.0.
+- **License**: Changed from MIT to dual (MIT core + MARC27 Source-Available AI).
+- **CLI Help**: Updated to "AI-Native Autonomous Materials Discovery" positioning.
+- **pyproject.toml**: Updated description, keywords, license field, author.
+
 ## [2.0.0] - 2026-02-24
 
 ### Added

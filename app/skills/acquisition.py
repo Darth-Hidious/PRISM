@@ -142,4 +142,5 @@ ACQUIRE_SKILL = Skill(
     },
     func=_acquire_materials,
     category="acquisition",
+    requires_approval=True,
 )

@@ -4,15 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prism-platform"
-version = "2.0.0"
-description = "PRISM: Platform for Research in Intelligent Synthesis of Materials"
+version = "2.1.0"
+description = "AI-Native Autonomous Materials Discovery Platform"
 readme = "README.md"
 authors = [{ name = "MARC27", email = "team@marc27.com" }]
-license = "MIT"
+license = "LicenseRef-MARC27-Dual"
+license-files = ["LICENSE", "LICENSE-MIT", "LICENSE-MARC27"]
 maintainers = [
     {name = "PRISM Development Team", email = "team@marc27.com"}
 ]
-keywords = ["materials science", "optimade", "cli", "scientific computing"]
+keywords = [
+    "materials science", "materials discovery", "autonomous agents",
+    "OPTIMADE", "CALPHAD", "machine learning", "MCP",
+    "scientific computing", "AI", "LLM",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",

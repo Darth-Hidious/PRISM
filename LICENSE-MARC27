@@ -1,0 +1,63 @@
+MARC27 Source-Available License
+Version 1.0, February 2026
+
+Copyright (c) 2025-2026 MARC27
+All rights reserved.
+
+1. DEFINITIONS
+
+"Software" means the source code, object code, documentation, and any
+associated materials covered by this license.
+
+"Non-Commercial Research" means academic research, personal learning,
+and evaluation that does not directly generate revenue.
+
+2. GRANT OF RIGHTS
+
+Subject to the terms of this license, MARC27 grants you a
+non-exclusive, non-transferable, revocable license to:
+
+  a) View and inspect the Software for evaluation, security audit,
+     and non-commercial research purposes.
+  b) Run the Software internally for evaluation and non-commercial
+     research purposes.
+
+3. RESTRICTIONS
+
+You may NOT, without prior written agreement from MARC27:
+
+  a) Use the Software, or any substantial portion thereof, in a
+     commercial product or service.
+  b) Redistribute, sublicense, sell, lease, or otherwise transfer the
+     Software to third parties.
+  c) Create derivative works based on the Software for any purpose
+     other than contributing improvements back to the original project.
+  d) Remove or alter any proprietary notices, labels, or marks on
+     the Software.
+
+4. CONTRIBUTIONS
+
+Contributions submitted to the project (e.g., via pull request) are
+licensed back to MARC27 under the same terms, with an
+additional perpetual, irrevocable grant to use, modify, and
+sublicense the contribution under any license.
+
+5. COMMERCIAL LICENSING
+
+For commercial use, redistribution, or modification rights beyond
+what this license permits, contact:
+
+  MARC27
+  Email: licensing@marc27.com
+
+6. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED. IN NO EVENT SHALL MARC27 / BIMO TECH BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
+
+7. TERMINATION
+
+This license terminates automatically if you violate any of its terms.
+Upon termination, you must destroy all copies of the Software in your
+possession.

@@ -56,6 +56,15 @@ def _web_search(**kwargs) -> dict:
         return {"error": str(e), "query": query}
 
 
+def _show_scratchpad(**kwargs) -> dict:
+    """Return the agent's scratchpad as text. Requires scratchpad to be set."""
+    # The scratchpad reference is injected by the caller (AgentCore)
+    scratchpad = kwargs.get("_scratchpad")
+    if scratchpad is None:
+        return {"text": "Scratchpad is not available in this session."}
+    return {"text": scratchpad.to_text()}
+
+
 def create_system_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="read_file", description="Read the contents of a file at the given path (restricted to project directory).",
@@ -69,3 +78,8 @@ def create_system_tools(registry: ToolRegistry) -> None:
         name="web_search", description="Search the web for information. Returns relevant results.",
         input_schema={"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}}, "required": ["query"]},
         func=_web_search))
+    registry.register(Tool(
+        name="show_scratchpad",
+        description="Show the agent's execution log (scratchpad) — lists all actions taken so far in this session.",
+        input_schema={"type": "object", "properties": {}},
+        func=_show_scratchpad))

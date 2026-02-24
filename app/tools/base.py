@@ -11,6 +11,7 @@ class Tool:
     description: str
     input_schema: dict
     func: Callable
+    requires_approval: bool = False
 
     def execute(self, **kwargs) -> dict:
         """Execute the tool with given arguments."""

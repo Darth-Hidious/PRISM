@@ -1,21 +1,24 @@
-MIT License
+PRISM — Dual License
 
-Copyright (c) 2025 MARC27
+Copyright (c) 2025-2026 MARC27
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This project uses a dual-license model:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Core plumbing (CLI, data collectors, tool registry, MCP transport,
+   database layer, tests, documentation, and build tooling) is licensed
+   under the MIT License. See LICENSE-MIT for the full text.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE. 
+2. AI orchestration (agent core, skills, ML pipelines, simulation
+   planning, validation logic, and plugin framework) is licensed under
+   the MARC27 Source-Available License. See LICENSE-MARC27 for the
+   full text.
+
+The license boundary is documented in README.md.
+
+If you are unsure which license applies to a specific file, the header
+comment in that file takes precedence, followed by the table in
+README.md. When no header is present, the following rule applies:
+
+  - Files under app/agent/, app/skills/, app/ml/, app/simulation/,
+    app/validation/, and app/plugins/ → MARC27 Source-Available License
+  - Everything else → MIT License
