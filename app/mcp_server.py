@@ -3,35 +3,13 @@ import json
 import inspect
 from typing import Annotated, Optional
 
-from pydantic import Field
-from fastmcp import FastMCP
-
 from app.tools.base import Tool, ToolRegistry
-from app.tools.data import create_data_tools
-from app.tools.system import create_system_tools
-from app.tools.visualization import create_visualization_tools
-from app.tools.prediction import create_prediction_tools
-from app.agent.memory import SessionMemory
-from app.simulation.bridge import check_pyiron_available
 
 
 def _build_registry() -> ToolRegistry:
     """Build a full tool registry with all PRISM tools and skills."""
-    registry = ToolRegistry()
-    create_system_tools(registry)
-    create_data_tools(registry)
-    create_visualization_tools(registry)
-    create_prediction_tools(registry)
-    if check_pyiron_available():
-        from app.tools.simulation import create_simulation_tools
-        create_simulation_tools(registry)
-    # Load built-in skills as tools
-    try:
-        from app.skills.registry import load_builtin_skills
-        load_builtin_skills().register_all_as_tools(registry)
-    except Exception:
-        pass
-    return registry
+    from app.plugins.bootstrap import build_full_registry
+    return build_full_registry(enable_mcp=False)
 
 
 # Type mapping from JSON schema to Python types
@@ -53,6 +31,8 @@ def _make_typed_handler(tool: Tool):
     built from the tool's input_schema. Uses Annotated[type, Field(description=...)]
     to pass parameter descriptions through to the MCP schema.
     """
+    from pydantic import Field
+
     properties = tool.input_schema.get("properties", {})
     required = set(tool.input_schema.get("required", []))
 
@@ -109,8 +89,9 @@ def _make_typed_handler(tool: Tool):
     return handler
 
 
-def _register_resources(mcp: FastMCP):
+def _register_resources(mcp):
     """Register MCP resources for PRISM data."""
+    from app.agent.memory import SessionMemory
 
     @mcp.resource("prism://sessions")
     def list_sessions() -> str:
@@ -181,6 +162,7 @@ def _register_resources(mcp: FastMCP):
             return json.dumps([])
 
     # --- Simulation resources (only when pyiron is available) ----------------
+    from app.simulation.bridge import check_pyiron_available
     if check_pyiron_available():
         @mcp.resource("prism://simulations/structures")
         def list_structures() -> str:
@@ -212,8 +194,10 @@ def _register_resources(mcp: FastMCP):
             return json.dumps(info, default=str)
 
 
-def create_mcp_server(registry: Optional[ToolRegistry] = None) -> FastMCP:
+def create_mcp_server(registry: Optional[ToolRegistry] = None):
     """Create a FastMCP server exposing all PRISM tools and resources."""
+    from fastmcp import FastMCP
+
     mcp = FastMCP(
         name="prism",
         instructions=(

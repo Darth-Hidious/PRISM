@@ -72,6 +72,45 @@ def _query_materials_project(**kwargs) -> dict:
         return {"error": str(e)}
 
 
+def _import_dataset(**kwargs) -> dict:
+    """Import a local file (CSV, JSON, Parquet) into the PRISM DataStore."""
+    import pandas as pd
+    from pathlib import Path
+    from app.data.store import DataStore
+
+    file_path = kwargs["file_path"]
+    dataset_name = kwargs.get("dataset_name")
+    file_format = kwargs.get("file_format")
+
+    p = Path(file_path)
+    if not p.exists():
+        return {"error": f"File not found: {file_path}"}
+
+    fmt = file_format or p.suffix.lstrip(".")
+    try:
+        if fmt in ("csv", "tsv"):
+            df = pd.read_csv(p, sep="\t" if fmt == "tsv" else ",")
+        elif fmt == "json":
+            df = pd.read_json(p)
+        elif fmt in ("parquet", "pq"):
+            df = pd.read_parquet(p)
+        else:
+            return {"error": f"Unsupported format: {fmt}. Use csv, json, or parquet."}
+    except Exception as e:
+        return {"error": f"Failed to read file: {e}"}
+
+    name = dataset_name or p.stem
+    store = DataStore()
+    store.save(df, name)
+
+    return {
+        "dataset_name": name,
+        "rows": len(df),
+        "columns": list(df.columns),
+        "source": str(p),
+    }
+
+
 def _export_results_csv(**kwargs) -> dict:
     results = kwargs.get("results", [])
     filename = kwargs.get("filename")
@@ -116,3 +155,12 @@ def create_data_tools(registry: ToolRegistry) -> None:
             "filename": {"type": "string", "description": "Output CSV filename. Auto-generated if omitted."}},
             "required": ["results"]},
         func=_export_results_csv))
+    registry.register(Tool(
+        name="import_dataset",
+        description="Import a local CSV, JSON, or Parquet file into the PRISM DataStore as a named dataset.",
+        input_schema={"type": "object", "properties": {
+            "file_path": {"type": "string", "description": "Path to the file to import"},
+            "dataset_name": {"type": "string", "description": "Name for the dataset (defaults to filename stem)"},
+            "file_format": {"type": "string", "description": "File format override (csv, json, parquet). Auto-detected if omitted."}},
+            "required": ["file_path"]},
+        func=_import_dataset))

@@ -10,9 +10,6 @@ from app.agent.core import AgentCore
 from app.agent.events import TextDelta, ToolCallStart, ToolCallResult, TurnComplete
 from app.agent.memory import SessionMemory
 from app.tools.base import ToolRegistry
-from app.tools.data import create_data_tools
-from app.tools.system import create_system_tools
-from app.tools.visualization import create_visualization_tools
 
 
 REPL_COMMANDS = {
@@ -41,32 +38,8 @@ class AgentREPL:
         self.memory = SessionMemory()
         self._mcp_tools: list[str] = []
         if tools is None:
-            tools = ToolRegistry()
-            create_system_tools(tools)
-            create_data_tools(tools)
-            create_visualization_tools(tools)
-            try:
-                from app.simulation.bridge import check_pyiron_available
-                if check_pyiron_available():
-                    from app.tools.simulation import create_simulation_tools
-                    create_simulation_tools(tools)
-            except Exception:
-                pass
-        # Load built-in skills as tools
-        try:
-            from app.skills.registry import load_builtin_skills
-            load_builtin_skills().register_all_as_tools(tools)
-        except Exception:
-            pass
-        # Optionally discover and register tools from external MCP servers
-        if enable_mcp:
-            try:
-                from app.mcp_client import discover_and_register_mcp_tools
-                self._mcp_tools = discover_and_register_mcp_tools(tools)
-                if self._mcp_tools:
-                    self.console.print(f"[dim]Loaded {len(self._mcp_tools)} tools from MCP servers[/dim]")
-            except Exception:
-                pass  # MCP client not available or no config
+            from app.plugins.bootstrap import build_full_registry
+            tools = build_full_registry(enable_mcp=enable_mcp)
         self.agent = AgentCore(backend=backend, tools=tools, system_prompt=system_prompt)
 
     def _load_session(self, session_id: str):

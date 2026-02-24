@@ -22,24 +22,19 @@ except ImportError:
     pass
 
 
-def _create_model(algorithm: str):
-    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-    from sklearn.linear_model import LinearRegression
+_algorithm_registry = None
 
-    if algorithm == "random_forest":
-        return RandomForestRegressor(n_estimators=100, random_state=42)
-    elif algorithm == "gradient_boosting":
-        return GradientBoostingRegressor(n_estimators=100, random_state=42)
-    elif algorithm == "linear":
-        return LinearRegression()
-    elif algorithm == "xgboost":
-        import xgboost as xgb
-        return xgb.XGBRegressor(n_estimators=100, random_state=42)
-    elif algorithm == "lightgbm":
-        import lightgbm as lgb
-        return lgb.LGBMRegressor(n_estimators=100, random_state=42, verbose=-1)
-    else:
-        raise ValueError(f"Unknown algorithm: {algorithm}")
+
+def _get_algorithm_registry():
+    global _algorithm_registry
+    if _algorithm_registry is None:
+        from app.ml.algorithm_registry import get_default_registry
+        _algorithm_registry = get_default_registry()
+    return _algorithm_registry
+
+
+def _create_model(algorithm: str):
+    return _get_algorithm_registry().get(algorithm)
 
 
 def train_model(
