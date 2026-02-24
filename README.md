@@ -148,7 +148,7 @@ See [INSTALL.md](INSTALL.md) for full details.
 
 ```
 app/
-  agent/          # MARC27 License — Agent core, REPL, autonomous, memory, scratchpad
+  agent/          # MARC27 License — Agent core, REPL, autonomous, memory, scratchpad, spinner
   skills/         # MARC27 License — 10 multi-step workflow skills
   ml/             # MARC27 License — ML pipelines and algorithm registry
   simulation/     # MARC27 License — Pyiron bridge + CALPHAD bridge
@@ -159,7 +159,7 @@ app/
   db/             # MIT License — SQLAlchemy models and database
   data/           # MIT License — DataStore and collectors
   tools/          # MIT License — Tool definitions and registry
-tests/            # MIT License — 519 tests
+tests/            # MIT License — 530 tests
 docs/             # MIT License — Documentation and assets
 ```
 
@@ -169,13 +169,14 @@ docs/             # MIT License — Documentation and assets
 python3 -m pytest tests/ -v --ignore=tests/test_mcp_roundtrip.py --ignore=tests/test_mcp_server.py
 ```
 
-519 tests covering agent core, tools, skills, data collectors, ML pipelines,
+530 tests covering agent core, tools, skills, data collectors, ML pipelines,
 CALPHAD integration, validation rules, plugins, and CLI commands.
 
 ## Roadmap
 
 ### Current (v2.1.1)
-- Claude Code-style minimal REPL with tool timing
+- VIBGYOR block-letter banner, braille spinner, bordered tool cards, Markdown rendering
+- Approval cards with `[y/n/a]` (always) per-tool auto-approve
 - MARC27 managed LLM access (`/login`)
 - OPTIMADE noise-free searches (explicit provider list)
 - Python 3.11+ with pyiron/CALPHAD out of the box
