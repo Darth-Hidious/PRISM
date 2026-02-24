@@ -22,6 +22,7 @@ REPL_COMMANDS = {
     "/help": "Show available commands",
     "/history": "Show conversation history length",
     "/tools": "List available tools",
+    "/mcp": "Show connected MCP servers and their tools",
     "/save": "Save current session",
     "/export": "Export last results to CSV — /export [filename]",
     "/sessions": "List saved sessions",
@@ -32,14 +33,25 @@ REPL_COMMANDS = {
 class AgentREPL:
     """Interactive REPL for conversational agent interaction."""
 
-    def __init__(self, backend: Backend, system_prompt: Optional[str] = None, tools: Optional[ToolRegistry] = None):
+    def __init__(self, backend: Backend, system_prompt: Optional[str] = None,
+                 tools: Optional[ToolRegistry] = None, enable_mcp: bool = True):
         self.console = Console()
         self.memory = SessionMemory()
+        self._mcp_tools: list[str] = []
         if tools is None:
             tools = ToolRegistry()
             create_system_tools(tools)
             create_data_tools(tools)
             create_visualization_tools(tools)
+        # Optionally discover and register tools from external MCP servers
+        if enable_mcp:
+            try:
+                from app.mcp_client import discover_and_register_mcp_tools
+                self._mcp_tools = discover_and_register_mcp_tools(tools)
+                if self._mcp_tools:
+                    self.console.print(f"[dim]Loaded {len(self._mcp_tools)} tools from MCP servers[/dim]")
+            except Exception:
+                pass  # MCP client not available or no config
         self.agent = AgentCore(backend=backend, tools=tools, system_prompt=system_prompt)
 
     def _load_session(self, session_id: str):
@@ -140,6 +152,8 @@ class AgentREPL:
         elif base_cmd == "/tools":
             for tool in self.agent.tools.list_tools():
                 self.console.print(f"  [green]{tool.name}[/green]  {tool.description[:60]}")
+        elif base_cmd == "/mcp":
+            self._handle_mcp_status()
         elif base_cmd == "/save":
             self.memory.set_history(self.agent.history)
             sid = self.memory.save()
@@ -156,6 +170,24 @@ class AgentREPL:
         else:
             self.console.print(f"[yellow]Unknown command: {base_cmd}. Type /help.[/yellow]")
         return False
+
+    def _handle_mcp_status(self):
+        """Show MCP server connection status and tools."""
+        from app.mcp_client import load_mcp_config
+        config = load_mcp_config()
+        self.console.print(f"[dim]Config: {config.config_path}[/dim]")
+        if not config.servers:
+            self.console.print("[dim]No MCP servers configured.[/dim]")
+        else:
+            self.console.print(f"[cyan]Configured servers:[/cyan] {len(config.servers)}")
+            for name in config.servers:
+                self.console.print(f"  [green]{name}[/green]")
+        if self._mcp_tools:
+            self.console.print(f"[cyan]Loaded MCP tools:[/cyan] {len(self._mcp_tools)}")
+            for tname in self._mcp_tools:
+                self.console.print(f"  [green]{tname}[/green]")
+        else:
+            self.console.print("[dim]No MCP tools loaded.[/dim]")
 
     def _handle_export(self, filename: Optional[str] = None):
         """Find the most recent tool result with a 'results' array and export to CSV."""
