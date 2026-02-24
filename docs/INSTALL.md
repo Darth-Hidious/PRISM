@@ -24,7 +24,7 @@ uv tool install prism-platform
 ### Option 3: curl one-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Darth-Hidious/PRISM/main/install.sh | sh
+curl -fsSL https://prism.marc27.com/install.sh | sh
 ```
 
 This detects your OS, finds Python, installs pipx/uv if needed, and installs PRISM.

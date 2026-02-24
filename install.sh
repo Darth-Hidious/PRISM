@@ -1,6 +1,6 @@
 #!/bin/sh
 # PRISM One-Command Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/Darth-Hidious/PRISM/main/install.sh | sh
+# Usage: curl -fsSL https://prism.marc27.com/install.sh | sh
 set -e
 
 PACKAGE="prism-platform"
