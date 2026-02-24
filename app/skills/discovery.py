@@ -123,4 +123,5 @@ DISCOVER_SKILL = Skill(
     },
     func=_materials_discovery,
     category="discovery",
+    requires_approval=True,
 )

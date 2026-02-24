@@ -30,6 +30,7 @@ class Skill:
     input_schema: dict
     func: Callable
     category: str = "skill"
+    requires_approval: bool = False
 
     def to_tool(self) -> Tool:
         """Convert this Skill to a Tool for ToolRegistry."""
@@ -38,6 +39,7 @@ class Skill:
             description=self.description,
             input_schema=self.input_schema,
             func=self.func,
+            requires_approval=self.requires_approval,
         )
 
 

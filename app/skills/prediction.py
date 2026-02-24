@@ -163,4 +163,5 @@ PREDICT_SKILL = Skill(
     },
     func=_predict_properties,
     category="prediction",
+    requires_approval=True,
 )

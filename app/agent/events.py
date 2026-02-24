@@ -47,6 +47,21 @@ class ToolCallResult:
 
 
 @dataclass
+class ToolApprovalRequest:
+    """Requests user approval before executing an expensive tool."""
+    tool_name: str
+    tool_args: dict
+    call_id: str
+
+
+@dataclass
+class ToolApprovalResponse:
+    """User's response to a tool approval request."""
+    call_id: str
+    approved: bool
+
+
+@dataclass
 class TurnComplete:
     """Signals the end of a streaming turn."""
     text: Optional[str] = None

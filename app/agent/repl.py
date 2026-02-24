@@ -4,11 +4,16 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.prompt import Confirm
 from rich.text import Text
 from app.agent.backends.base import Backend
 from app.agent.core import AgentCore
-from app.agent.events import TextDelta, ToolCallStart, ToolCallResult, TurnComplete
+from app.agent.events import (
+    TextDelta, ToolCallStart, ToolCallResult, TurnComplete,
+    ToolApprovalRequest,
+)
 from app.agent.memory import SessionMemory
+from app.agent.scratchpad import Scratchpad
 from app.tools.base import ToolRegistry
 
 
@@ -26,6 +31,8 @@ REPL_COMMANDS = {
     "/load": "Load a saved session — /load SESSION_ID",
     "/skill": "List skills or show details — /skill [name]",
     "/plan": "Ask which skills apply to a goal — /plan <goal>",
+    "/scratchpad": "Show the agent's execution log",
+    "/approve-all": "Auto-approve all tool calls (skip consent prompts)",
 }
 
 
@@ -36,16 +43,31 @@ class AgentREPL:
                  tools: Optional[ToolRegistry] = None, enable_mcp: bool = True):
         self.console = Console()
         self.memory = SessionMemory()
+        self.scratchpad = Scratchpad()
         self._mcp_tools: list[str] = []
         if tools is None:
             from app.plugins.bootstrap import build_full_registry
             tools = build_full_registry(enable_mcp=enable_mcp)
-        self.agent = AgentCore(backend=backend, tools=tools, system_prompt=system_prompt)
+        self.agent = AgentCore(
+            backend=backend, tools=tools, system_prompt=system_prompt,
+            approval_callback=self._approval_callback, auto_approve=False,
+        )
+        self.agent.scratchpad = self.scratchpad
+
+    def _approval_callback(self, tool_name: str, tool_args: dict) -> bool:
+        """Ask the user for approval before running an expensive tool."""
+        args_summary = ", ".join(f"{k}={v!r}" for k, v in list(tool_args.items())[:3])
+        return Confirm.ask(f"  [yellow]Approve {tool_name}({args_summary})?[/yellow]", default=True)
 
     def _load_session(self, session_id: str):
         """Restore a saved session into the agent."""
         self.memory.load(session_id)
         self.agent.history = list(self.memory.get_history())
+        # Restore scratchpad if saved
+        entries = self.memory.get_scratchpad_entries()
+        if entries:
+            self.scratchpad = Scratchpad.from_dict(entries)
+            self.agent.scratchpad = self.scratchpad
 
     def run(self):
         """Main REPL loop."""
@@ -71,13 +93,41 @@ class AgentREPL:
     def _handle_streaming_response(self, user_input: str):
         """Stream agent response with Rich Live display."""
         accumulated_text = ""
+        plan_buffer = ""
+        in_plan = False
         with Live("", console=self.console, refresh_per_second=15, vertical_overflow="visible") as live:
             for event in self.agent.process_stream(user_input):
                 if isinstance(event, TextDelta):
                     accumulated_text += event.text
+                    # Detect <plan> blocks for plan-then-execute gating
+                    if "<plan>" in accumulated_text and not in_plan:
+                        in_plan = True
+                        plan_buffer = accumulated_text.split("<plan>", 1)[1]
+                        accumulated_text = accumulated_text.split("<plan>", 1)[0]
+                    elif in_plan:
+                        if "</plan>" in event.text:
+                            plan_buffer += event.text.split("</plan>")[0]
+                            in_plan = False
+                            # Show plan and ask for approval
+                            live.update("")
+                            self.console.print(Panel(
+                                plan_buffer.strip(),
+                                title="[bold cyan]Proposed Plan[/bold cyan]",
+                                border_style="cyan",
+                            ))
+                            if self.scratchpad:
+                                self.scratchpad.log("plan", summary="Plan proposed", data={"plan": plan_buffer.strip()})
+                            if not Confirm.ask("  Execute this plan?", default=True):
+                                self.console.print("[yellow]Plan rejected. Stopping.[/yellow]")
+                                return
+                            # Continue after plan approval
+                            remainder = event.text.split("</plan>", 1)[1] if "</plan>" in event.text else ""
+                            accumulated_text += remainder
+                        else:
+                            plan_buffer += event.text
+                        continue
                     live.update(Text(accumulated_text))
                 elif isinstance(event, ToolCallStart):
-                    # Print tool panel permanently, then reset live display
                     live.update("")
                     self.console.print(Panel(
                         f"[dim]Calling...[/dim]",
@@ -86,6 +136,9 @@ class AgentREPL:
                         expand=False,
                     ))
                     accumulated_text = ""
+                elif isinstance(event, ToolApprovalRequest):
+                    live.update("")
+                    # Approval is handled by the callback in AgentCore
                 elif isinstance(event, ToolCallResult):
                     self.console.print(Panel(
                         f"[green]{event.summary}[/green]",
@@ -110,6 +163,8 @@ class AgentREPL:
             return
         if answer == "y":
             self.memory.set_history(self.agent.history)
+            if self.scratchpad:
+                self.memory.set_scratchpad_entries(self.scratchpad.to_dict())
             sid = self.memory.save()
             self.console.print(f"[dim]Session saved: {sid}[/dim]")
 
@@ -144,6 +199,8 @@ class AgentREPL:
             self._handle_mcp_status()
         elif base_cmd == "/save":
             self.memory.set_history(self.agent.history)
+            if self.scratchpad:
+                self.memory.set_scratchpad_entries(self.scratchpad.to_dict())
             sid = self.memory.save()
             self.console.print(f"[dim]Session saved: {sid}[/dim]")
         elif base_cmd == "/export":
@@ -162,9 +219,22 @@ class AgentREPL:
                 self.console.print("[yellow]Usage: /plan <goal>[/yellow]")
             else:
                 self._handle_plan(arg)
+        elif base_cmd == "/scratchpad":
+            self._handle_scratchpad()
+        elif base_cmd == "/approve-all":
+            self.agent.auto_approve = True
+            self.console.print("[yellow]Auto-approve enabled. All tools will run without consent prompts.[/yellow]")
         else:
             self.console.print(f"[yellow]Unknown command: {base_cmd}. Type /help.[/yellow]")
         return False
+
+    def _handle_scratchpad(self):
+        """Display the scratchpad execution log."""
+        if not self.scratchpad or not self.scratchpad.entries:
+            self.console.print("[dim]Scratchpad is empty.[/dim]")
+            return
+        md = self.scratchpad.to_markdown()
+        self.console.print(Panel(Markdown(md), title="[bold cyan]Scratchpad[/bold cyan]", border_style="cyan"))
 
     def _handle_skill(self, name: Optional[str] = None):
         """List skills or show details for a specific skill."""

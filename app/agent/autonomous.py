@@ -3,6 +3,7 @@ from typing import Generator, Optional
 from app.agent.backends.base import Backend
 from app.agent.core import AgentCore
 from app.agent.events import TextDelta, ToolCallStart, ToolCallResult, TurnComplete
+from app.agent.scratchpad import Scratchpad
 from app.tools.base import ToolRegistry
 
 
@@ -34,11 +35,17 @@ Available tool categories:
 
 For complex goals, prefer using skills over individual tools for efficiency.
 
+PLANNING: For complex multi-step goals, FIRST output a structured plan inside
+<plan> and </plan> tags before executing any tools. The plan should list numbered
+steps with the tools or skills you intend to use. Then execute the plan step by
+step. For simple queries, skip planning and answer directly.
+
 Work step by step:
 1. Break down the research goal
-2. Use tools or skills to gather relevant data
-3. Analyze and synthesize findings
-4. Present a clear, well-structured answer with citations
+2. For multi-step goals, output a <plan>...</plan> block first
+3. Use tools or skills to gather relevant data
+4. Analyze and synthesize findings
+5. Present a clear, well-structured answer with citations
 
 When you collect tabular data, consider using export_results_csv to save it for the user.
 
@@ -54,16 +61,28 @@ def _make_tools(tools: Optional[ToolRegistry] = None, enable_mcp: bool = True) -
 
 def run_autonomous(goal: str, backend: Backend, system_prompt: Optional[str] = None,
                    tools: Optional[ToolRegistry] = None, max_iterations: int = 30,
-                   enable_mcp: bool = True) -> str:
+                   enable_mcp: bool = True, confirm: bool = False) -> str:
     tools = _make_tools(tools, enable_mcp=enable_mcp)
-    agent = AgentCore(backend=backend, tools=tools, system_prompt=system_prompt or AUTONOMOUS_SYSTEM_PROMPT, max_iterations=max_iterations)
+    agent = AgentCore(
+        backend=backend, tools=tools,
+        system_prompt=system_prompt or AUTONOMOUS_SYSTEM_PROMPT,
+        max_iterations=max_iterations,
+        auto_approve=not confirm,
+    )
+    agent.scratchpad = Scratchpad()
     return agent.process(goal)
 
 
 def run_autonomous_stream(goal: str, backend: Backend, system_prompt: Optional[str] = None,
                           tools: Optional[ToolRegistry] = None, max_iterations: int = 30,
-                          enable_mcp: bool = True) -> Generator:
+                          enable_mcp: bool = True, confirm: bool = False) -> Generator:
     """Run agent autonomously on a goal, yielding stream events."""
     tools = _make_tools(tools, enable_mcp=enable_mcp)
-    agent = AgentCore(backend=backend, tools=tools, system_prompt=system_prompt or AUTONOMOUS_SYSTEM_PROMPT, max_iterations=max_iterations)
+    agent = AgentCore(
+        backend=backend, tools=tools,
+        system_prompt=system_prompt or AUTONOMOUS_SYSTEM_PROMPT,
+        max_iterations=max_iterations,
+        auto_approve=not confirm,
+    )
+    agent.scratchpad = Scratchpad()
     yield from agent.process_stream(goal)

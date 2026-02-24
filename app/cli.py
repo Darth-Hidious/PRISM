@@ -171,18 +171,20 @@ def build_optimade_filter(elements=None, formula=None, nelements=None):
 @click.option('--mp-api-key', help='Set Materials Project API key for enhanced properties')
 @click.option('--resume', default=None, help='Resume a saved session by SESSION_ID')
 @click.option('--no-mcp', is_flag=True, help='Disable loading tools from external MCP servers')
-def cli(ctx, version, verbose, quiet, mp_api_key, resume, no_mcp):
+@click.option('--dangerously-accept-all', is_flag=True, help='Auto-approve all tool calls (skip consent prompts)')
+def cli(ctx, version, verbose, quiet, mp_api_key, resume, no_mcp, dangerously_accept_all):
     f"""
 {PRISM_BRAND}
-Platform for Research in Intelligent Synthesis of Materials
+AI-Native Autonomous Materials Discovery
 
-A next-generation CLI for materials science research, powered by the
-OPTIMADE API network, Large Language Models, and an agentic tool loop.
+MARC27 — ESA SPARK Prime Contractor | ITER Supplier
 
-Run without arguments to start the interactive REPL, or use a subcommand:
+PRISM combines LLMs, CALPHAD thermodynamics, ML property prediction,
+and federated data access into an autonomous research agent.
 
   prism                           Interactive agent REPL
   prism run "goal"                Autonomous agent mode
+  prism run "goal" --confirm      Autonomous with tool consent
   prism serve                     Start as an MCP server
   prism search --elements Fe,Ni   Structured OPTIMADE search
   prism ask "battery cathodes"    Natural-language query
@@ -192,6 +194,7 @@ Documentation: https://github.com/Darth-Hidious/PRISM
     """
     ctx.ensure_object(dict)
     ctx.obj["no_mcp"] = no_mcp
+    ctx.obj["dangerously_accept_all"] = dangerously_accept_all
 
     # Handle MP API key if provided
     if mp_api_key:
@@ -248,6 +251,8 @@ Documentation: https://github.com/Darth-Hidious/PRISM
         try:
             backend = create_backend()
             repl = AgentREPL(backend=backend, enable_mcp=not no_mcp)
+            if dangerously_accept_all:
+                repl.agent.auto_approve = True
             if resume:
                 try:
                     repl._load_session(resume)
@@ -295,8 +300,10 @@ def serve(transport, port, install):
 @click.argument("goal")
 @click.option("--provider", default=None, help="LLM provider (anthropic/openai/openrouter)")
 @click.option("--model", default=None, help="Model name override")
+@click.option("--confirm", is_flag=True, help="Require confirmation for expensive tools")
+@click.option("--dangerously-accept-all", "accept_all", is_flag=True, help="Auto-approve all tool calls")
 @click.pass_context
-def run_goal(ctx, goal, provider, model):
+def run_goal(ctx, goal, provider, model, confirm, accept_all):
     """Run PRISM agent autonomously on a research goal."""
     from rich.live import Live
     from rich.markdown import Markdown
@@ -309,7 +316,8 @@ def run_goal(ctx, goal, provider, model):
         run_console.print(Panel.fit(f"[bold]Goal:[/bold] {goal}", border_style="cyan"))
         accumulated_text = ""
         with Live("", console=run_console, refresh_per_second=15, vertical_overflow="visible") as live:
-            for event in run_autonomous_stream(goal=goal, backend=backend, enable_mcp=not no_mcp):
+            effective_confirm = confirm and not accept_all
+            for event in run_autonomous_stream(goal=goal, backend=backend, enable_mcp=not no_mcp, confirm=effective_confirm):
                 if isinstance(event, TextDelta):
                     accumulated_text += event.text
                     live.update(Text(accumulated_text))

@@ -1,10 +1,11 @@
 """AgentCore: the provider-agnostic TAOR loop."""
 import json
-from typing import Dict, Generator, List, Optional
+from typing import Callable, Dict, Generator, List, Optional
 from app.agent.backends.base import Backend
 from app.agent.events import (
     AgentResponse, ToolCallEvent,
     TextDelta, ToolCallStart, ToolCallResult, TurnComplete,
+    ToolApprovalRequest, ToolApprovalResponse,
 )
 from app.tools.base import ToolRegistry
 
@@ -32,10 +33,17 @@ You also have higher-level skills that orchestrate multi-step workflows:
 
 For complex requests, prefer using skills over individual tools.
 
+PLANNING: For complex multi-step goals, FIRST output a structured plan inside
+<plan> and </plan> tags before executing any tools. The plan should list numbered
+steps with the tools or skills you intend to use. The user will review the plan
+before you proceed. For simple single-tool questions, skip planning and answer
+directly.
+
 When a user asks a question:
 1. Think about what tools and data you need
-2. Use the appropriate tools or skills to gather information
-3. Synthesize the results into a clear answer
+2. For multi-step goals, output a <plan>...</plan> block first
+3. Use the appropriate tools or skills to gather information
+4. Synthesize the results into a clear answer
 
 When you collect tabular data, consider using export_results_csv to save it for the user.
 
@@ -45,12 +53,69 @@ Be precise with scientific data. Cite sources when possible."""
 class AgentCore:
     """Provider-agnostic agent that runs a Think-Act-Observe-Repeat loop."""
 
-    def __init__(self, backend: Backend, tools: ToolRegistry, system_prompt: Optional[str] = None, max_iterations: int = 20):
+    def __init__(self, backend: Backend, tools: ToolRegistry, system_prompt: Optional[str] = None,
+                 max_iterations: int = 20, approval_callback: Optional[Callable] = None,
+                 auto_approve: bool = True):
         self.backend = backend
         self.tools = tools
         self.system_prompt = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
         self.max_iterations = max_iterations
         self.history: List[Dict] = []
+        self.approval_callback = approval_callback
+        self.auto_approve = auto_approve
+        self.scratchpad = None  # Set by caller (AgentREPL / autonomous) if desired
+
+    def _execute_tool(self, tool, tool_args: dict) -> dict:
+        """Execute a tool, injecting scratchpad for show_scratchpad."""
+        if tool.name == "show_scratchpad":
+            tool_args = dict(tool_args)
+            tool_args["_scratchpad"] = self.scratchpad
+        return tool.execute(**tool_args)
+
+    def _should_approve(self, tool, tc) -> bool:
+        """Check if a tool call should proceed (approval gate)."""
+        if not tool.requires_approval:
+            return True
+        if self.auto_approve:
+            return True
+        if self.approval_callback:
+            return self.approval_callback(tool.name, tc.tool_args)
+        return True
+
+    def _log_to_scratchpad(self, tool_name: str, tool_args: dict, result: dict):
+        """Log a tool execution to the scratchpad if available."""
+        if self.scratchpad is not None:
+            summary = self._summarize_tool_result(tool_name, result)
+            self.scratchpad.log("tool_call", tool_name=tool_name, summary=summary, data={"args": tool_args, "result_keys": list(result.keys()) if isinstance(result, dict) else None})
+
+    def _post_tool_hook(self, tool_name: str, result: dict):
+        """Inject feedback into agent context after specific tools."""
+        feedback_tools = {
+            "validate_dataset", "review_dataset",
+            "calculate_phase_diagram", "calculate_equilibrium", "analyze_phases",
+        }
+        if tool_name not in feedback_tools:
+            return
+        if not isinstance(result, dict) or "error" in result:
+            return
+
+        # Build a concise feedback summary
+        if tool_name == "validate_dataset":
+            summary = result.get("summary", "")
+            msg = f"[Validation feedback] {summary}"
+        elif tool_name == "review_dataset":
+            prompt = result.get("review_prompt", "")
+            score = result.get("quality_score", "")
+            msg = f"[Review feedback] Quality score: {score}. {prompt[:300]}"
+        else:
+            # CALPHAD tools
+            msg = f"[CALPHAD feedback] {tool_name} completed. "
+            if "phases" in result:
+                msg += f"Phases found: {result['phases']}. "
+            if "summary" in result:
+                msg += result["summary"][:300]
+
+        self.history.append({"role": "system", "content": msg})
 
     def process(self, message: str) -> str:
         """Process a user message through the TAOR loop. Returns final text."""
@@ -68,11 +133,16 @@ class AgentCore:
                 })
                 for tc in response.tool_calls:
                     tool = self.tools.get(tc.tool_name)
-                    try:
-                        result = tool.execute(**tc.tool_args)
-                    except Exception as e:
-                        result = {"error": str(e)}
+                    if not self._should_approve(tool, tc):
+                        result = {"skipped": f"Tool {tc.tool_name} was not approved by user."}
+                    else:
+                        try:
+                            result = self._execute_tool(tool, tc.tool_args)
+                        except Exception as e:
+                            result = {"error": str(e)}
                     self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": result})
+                    self._log_to_scratchpad(tc.tool_name, tc.tool_args, result)
+                    self._post_tool_hook(tc.tool_name, result)
             else:
                 if response.text:
                     self.history.append({"role": "assistant", "content": response.text})
@@ -105,11 +175,25 @@ class AgentCore:
                 })
                 for tc in response.tool_calls:
                     tool = self.tools.get(tc.tool_name)
+                    # Approval gate
+                    if tool.requires_approval and not self.auto_approve:
+                        yield ToolApprovalRequest(tool_name=tc.tool_name, tool_args=tc.tool_args, call_id=tc.call_id)
+                        if self.approval_callback:
+                            approved = self.approval_callback(tc.tool_name, tc.tool_args)
+                        else:
+                            approved = False
+                        if not approved:
+                            result = {"skipped": f"Tool {tc.tool_name} was not approved by user."}
+                            self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": result})
+                            yield ToolCallResult(call_id=tc.call_id, tool_name=tc.tool_name, result=result, summary=f"{tc.tool_name}: skipped (not approved)")
+                            continue
                     try:
-                        result = tool.execute(**tc.tool_args)
+                        result = self._execute_tool(tool, tc.tool_args)
                     except Exception as e:
                         result = {"error": str(e)}
                     self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": result})
+                    self._log_to_scratchpad(tc.tool_name, tc.tool_args, result)
+                    self._post_tool_hook(tc.tool_name, result)
                     yield ToolCallResult(
                         call_id=tc.call_id,
                         tool_name=tc.tool_name,

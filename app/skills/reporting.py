@@ -43,6 +43,7 @@ def _generate_report(**kwargs) -> dict:
     output_path = kwargs.get("output_path")
     report_format = kwargs.get("format")
     validation_results = kwargs.get("validation_results")
+    scratchpad_entries = kwargs.get("scratchpad")
 
     prefs = UserPreferences.load()
 
@@ -192,6 +193,21 @@ def _generate_report(**kwargs) -> dict:
                     f"<h2>ML Predictions</h2><ul>{''.join(pred_html)}</ul>"
                 )
 
+    # Methodology (scratchpad)
+    if scratchpad_entries:
+        from app.agent.scratchpad import Scratchpad
+        pad = Scratchpad.from_dict(scratchpad_entries) if isinstance(scratchpad_entries, list) else scratchpad_entries
+        lines.append(pad.to_markdown() if hasattr(pad, "to_markdown") else "## Methodology\n\n*No actions recorded.*")
+        lines.append("")
+        html_sections.append("<h2>Methodology</h2><ol>")
+        entries = pad.entries if hasattr(pad, "entries") else scratchpad_entries
+        for e in entries:
+            if isinstance(e, dict):
+                html_sections.append(f"<li><strong>{e.get('step_type', '')}</strong> ({e.get('tool_name', '')}) — {e.get('summary', '')}</li>")
+            else:
+                html_sections.append(f"<li><strong>{e.step_type}</strong> ({e.tool_name}) — {e.summary}</li>")
+        html_sections.append("</ol>")
+
     # Validation summary
     if validation_results:
         n_outliers = len(validation_results.get("outliers", []))
@@ -322,6 +338,10 @@ REPORT_SKILL = Skill(
             "validation_results": {
                 "type": "object",
                 "description": "Validation results from validate_dataset skill (optional)",
+            },
+            "scratchpad": {
+                "type": "array",
+                "description": "Scratchpad entries to include as Methodology section (optional)",
             },
         },
     },

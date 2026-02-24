@@ -676,6 +676,7 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
             "required": ["structure_id"],
         },
         func=_run_simulation,
+        requires_approval=True,
     ))
 
     registry.register(Tool(
@@ -750,6 +751,7 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
             "required": ["structure_id"],
         },
         func=_submit_hpc_job,
+        requires_approval=True,
     ))
 
     registry.register(Tool(
