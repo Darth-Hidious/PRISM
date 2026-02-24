@@ -49,6 +49,7 @@ dependencies = [
     "matplotlib>=3.7.0",
     "joblib>=1.3.0",
     "fastmcp>=3.0.0",
+    "prompt_toolkit>=3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -79,7 +80,10 @@ reports = [
     "weasyprint>=60.0",
 ]
 all = [
-    "prism-platform[ml,calphad,data,reports]",
+    "prism-platform[ml,data,reports]",
+]
+full = [
+    "prism-platform[ml,calphad,simulation,data,reports]",
 ]
 dev = [
     "pytest>=7.4.3",

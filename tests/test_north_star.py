@@ -64,7 +64,7 @@ except ImportError:
 @pytest.mark.skipif(not _HAS_FASTMCP, reason="fastmcp not installed")
 class TestMCPSkills:
     def test_build_registry_includes_skills(self):
-        with patch("app.mcp_server.check_pyiron_available", return_value=False):
+        with patch("app.simulation.bridge.check_pyiron_available", return_value=False):
             from app.mcp_server import _build_registry
 
             registry = _build_registry()

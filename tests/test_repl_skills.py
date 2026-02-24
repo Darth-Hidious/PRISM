@@ -8,17 +8,24 @@ import pytest
 from app.agent.repl import AgentREPL, REPL_COMMANDS
 
 
+def _make_repl(mock_backend=None, **kwargs):
+    """Create an AgentREPL with mocked prompt_toolkit session."""
+    if mock_backend is None:
+        mock_backend = MagicMock()
+    with patch("app.agent.repl.PromptSession"):
+        with patch("app.agent.repl.AgentCore"):
+            repl = AgentREPL(backend=mock_backend, enable_mcp=False, **kwargs)
+    return repl
+
+
 class TestReplSkillCommands:
     def test_commands_registered(self):
         assert "/skill" in REPL_COMMANDS
         assert "/plan" in REPL_COMMANDS
 
-    @patch("app.agent.repl.AgentCore")
-    def test_handle_skill_list(self, MockAgent):
-        mock_backend = MagicMock()
-        repl = AgentREPL(backend=mock_backend, enable_mcp=False)
+    def test_handle_skill_list(self):
+        repl = _make_repl()
 
-        # Capture console output
         output = StringIO()
         repl.console.file = output
 
@@ -27,10 +34,8 @@ class TestReplSkillCommands:
         assert "acquire_materials" in text
         assert "materials_discovery" in text
 
-    @patch("app.agent.repl.AgentCore")
-    def test_handle_skill_detail(self, MockAgent):
-        mock_backend = MagicMock()
-        repl = AgentREPL(backend=mock_backend, enable_mcp=False)
+    def test_handle_skill_detail(self):
+        repl = _make_repl()
 
         output = StringIO()
         repl.console.file = output
@@ -38,12 +43,12 @@ class TestReplSkillCommands:
         repl._handle_skill("materials_discovery")
         text = output.getvalue()
         assert "materials_discovery" in text
-        assert "Steps" in text
+        # Check for numbered step listing (new format)
+        assert "acquire" in text
+        assert "predict" in text
 
-    @patch("app.agent.repl.AgentCore")
-    def test_handle_skill_not_found(self, MockAgent):
-        mock_backend = MagicMock()
-        repl = AgentREPL(backend=mock_backend, enable_mcp=False)
+    def test_handle_skill_not_found(self):
+        repl = _make_repl()
 
         output = StringIO()
         repl.console.file = output
@@ -52,19 +57,13 @@ class TestReplSkillCommands:
         text = output.getvalue()
         assert "not found" in text
 
-    @patch("app.agent.repl.AgentCore")
-    def test_handle_command_skill(self, MockAgent):
-        mock_backend = MagicMock()
-        repl = AgentREPL(backend=mock_backend, enable_mcp=False)
-
-        # Should not exit
+    def test_handle_command_skill(self):
+        repl = _make_repl()
         result = repl._handle_command("/skill")
         assert result is False
 
-    @patch("app.agent.repl.AgentCore")
-    def test_handle_command_plan_no_arg(self, MockAgent):
-        mock_backend = MagicMock()
-        repl = AgentREPL(backend=mock_backend, enable_mcp=False)
+    def test_handle_command_plan_no_arg(self):
+        repl = _make_repl()
 
         output = StringIO()
         repl.console.file = output

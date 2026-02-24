@@ -101,15 +101,25 @@ class TestOMAT24Collector:
 
     def test_collect_no_datasets_lib(self):
         """When datasets library is not installed, return empty."""
-        # Ensure 'datasets' is NOT in sys.modules
-        saved = sys.modules.pop("datasets", None)
+        import importlib
+        # Block the datasets import by replacing with None in sys.modules
+        saved = sys.modules.get("datasets")
+        sys.modules["datasets"] = None  # type: ignore[assignment]
         try:
-            c = OMAT24Collector()
+            # Re-import the collector module so it picks up the blocked import
+            import app.data.omat24_collector as omat_mod
+            importlib.reload(omat_mod)
+            c = omat_mod.OMAT24Collector()
             results = c.collect(elements=["W"])
             assert results == []
         finally:
             if saved is not None:
                 sys.modules["datasets"] = saved
+            else:
+                sys.modules.pop("datasets", None)
+            # Reload again to restore normal behavior
+            import app.data.omat24_collector as omat_mod
+            importlib.reload(omat_mod)
 
     def test_parse_row(self):
         c = OMAT24Collector()
