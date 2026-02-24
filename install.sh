@@ -25,15 +25,15 @@ case "$OS" in
     *)      err "Unsupported OS: $OS. PRISM supports macOS and Linux." ;;
 esac
 
-# --- Find Python >= 3.10 ---
+# --- Find Python >= 3.11 ---
 PYTHON=""
-for cmd in python3 python; do
+for cmd in python3.13 python3.12 python3.11 python3 python; do
     if command -v "$cmd" >/dev/null 2>&1; then
         ver=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || true)
         if [ -n "$ver" ]; then
             major=$(echo "$ver" | cut -d. -f1)
             minor=$(echo "$ver" | cut -d. -f2)
-            if [ "$major" -ge 3 ] && [ "$minor" -ge 10 ]; then
+            if [ "$major" -ge 3 ] && [ "$minor" -ge 11 ]; then
                 PYTHON="$cmd"
                 break
             fi
@@ -42,9 +42,10 @@ for cmd in python3 python; do
 done
 
 if [ -z "$PYTHON" ]; then
-    err "Python >= $MIN_PYTHON is required but not found. Install it from https://python.org"
+    err "Python >= $MIN_PYTHON is required but not found.\n  Install Python 3.11+ from https://python.org\n  On Debian/Ubuntu: sudo apt install python3.12\n  On macOS: brew install python@3.12"
 fi
-ok "Python:" "$($PYTHON --version)"
+PYTHON_PATH="$(command -v "$PYTHON")"
+ok "Python:" "$($PYTHON --version) ($PYTHON_PATH)"
 
 # --- Find pipx or uv ---
 INSTALLER=""
@@ -55,9 +56,55 @@ elif command -v pipx >/dev/null 2>&1; then
     INSTALLER="pipx"
     ok "Installer:" "pipx ($(pipx --version 2>/dev/null || echo 'installed'))"
 else
+    # Ensure ~/.local/bin is on PATH for --user installs
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) export PATH="$HOME/.local/bin:$PATH" ;;
+    esac
+
     info "Installing:" "pipx via pip..."
-    $PYTHON -m pip install --user pipx >/dev/null 2>&1 || $PYTHON -m pip install pipx >/dev/null 2>&1
+
+    # Check if pip is available for this Python
+    if ! $PYTHON -m pip --version >/dev/null 2>&1; then
+        printf '\n'
+        warn "Note:" "pip is not available for $($PYTHON --version)."
+        case "$OS" in
+            Linux)
+                warn "Install pip:" "sudo apt install python3-pip  (Debian/Ubuntu)"
+                warn "         or:" "sudo dnf install python3-pip  (Fedora)"
+                warn "         or:" "sudo pacman -S python-pip     (Arch)" ;;
+            Darwin)
+                warn "Install pip:" "$PYTHON -m ensurepip" ;;
+        esac
+        warn "Alternative:" "Install uv instead (no pip needed):"
+        warn "            " "curl -LsSf https://astral.sh/uv/install.sh | sh"
+        printf '\n'
+        err "pip is required to install pipx. See suggestions above."
+    fi
+
+    # Install pipx — show output so errors are visible
+    _pip_log="$(mktemp 2>/dev/null || echo "/tmp/prism-pip.$$.log")"
+    PIPX_INSTALLED=0
+    if $PYTHON -m pip install --user pipx >"$_pip_log" 2>&1; then
+        PIPX_INSTALLED=1
+    elif $PYTHON -m pip install --break-system-packages --user pipx >"$_pip_log" 2>&1; then
+        PIPX_INSTALLED=1
+    elif $PYTHON -m pip install pipx >"$_pip_log" 2>&1; then
+        PIPX_INSTALLED=1
+    fi
+
+    if [ "$PIPX_INSTALLED" -eq 0 ]; then
+        printf '\n'
+        warn "pip output:" ""
+        cat "$_pip_log" >&2
+        rm -f "$_pip_log"
+        printf '\n'
+        err "Failed to install pipx. Install pipx or uv manually:\n  pipx: https://pipx.pypa.io/stable/installation/\n  uv:   curl -LsSf https://astral.sh/uv/install.sh | sh"
+    fi
+    rm -f "$_pip_log"
+
     $PYTHON -m pipx ensurepath >/dev/null 2>&1 || true
+
     if command -v pipx >/dev/null 2>&1; then
         INSTALLER="pipx"
         ok "Installed:" "pipx"
@@ -72,17 +119,29 @@ fi
 printf '\n'
 info "Installing:" "PRISM from GitHub..."
 
+INSTALL_OK=0
 case "$INSTALLER" in
     uv)
-        uv tool install "$GIT_PACKAGE"
+        if uv tool install --python "$PYTHON_PATH" "$GIT_PACKAGE"; then
+            INSTALL_OK=1
+        fi
         ;;
     pipx)
-        pipx install "$GIT_PACKAGE"
+        if pipx install --python "$PYTHON_PATH" "$GIT_PACKAGE"; then
+            INSTALL_OK=1
+        fi
         ;;
     pipx-module)
-        $PYTHON -m pipx install "$GIT_PACKAGE"
+        if $PYTHON -m pipx install --python "$PYTHON_PATH" "$GIT_PACKAGE"; then
+            INSTALL_OK=1
+        fi
         ;;
 esac
+
+if [ "$INSTALL_OK" -eq 0 ]; then
+    printf '\n'
+    err "PRISM installation failed. You can try installing manually:\n  pip install \"$GIT_PACKAGE\"\n  Or see: https://github.com/Darth-Hidious/PRISM#installation"
+fi
 
 # --- Verify ---
 printf '\n'
@@ -95,5 +154,6 @@ if command -v prism >/dev/null 2>&1; then
 else
     warn "Installed" "but 'prism' is not on your PATH yet."
     warn "Fix:"     "Add the pipx/uv bin directory to your PATH, then restart your shell."
+    warn "Run:"     "pipx ensurepath   (or: uv tool update-shell)"
     printf '\n'
 fi
