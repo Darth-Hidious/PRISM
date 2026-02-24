@@ -1,7 +1,9 @@
 """Tests for the interactive REPL."""
 import tempfile
+from io import StringIO
 import pytest
 from unittest.mock import patch, MagicMock, PropertyMock
+from rich.console import Console
 from app.agent.repl import AgentREPL
 from app.agent.events import AgentResponse, TextDelta, TurnComplete
 
@@ -93,3 +95,24 @@ class TestAgentREPL:
         _run_repl_with_inputs(repl, ["/exit"])
         repl.memory.set_history.assert_called_once()
         repl.memory.save.assert_called_once()
+
+    @patch("builtins.input", return_value="a")
+    def test_approval_always_sets_auto(self, mock_input):
+        repl = _make_repl()
+        repl._auto_approve_tools = set()
+        result = repl._approval_callback("predict_property", {"target": "band_gap"})
+        assert result is True
+        assert "predict_property" in repl._auto_approve_tools
+
+    def test_spinner_imported(self):
+        from app.agent.spinner import Spinner
+        assert Spinner is not None
+
+    def test_welcome_banner_has_prism_art(self):
+        repl = _make_repl()
+        output = StringIO()
+        repl.console = Console(file=output, highlight=False, force_terminal=True)
+        repl._show_welcome()
+        text = output.getvalue()
+        # Block letters should contain block characters
+        assert "██" in text
