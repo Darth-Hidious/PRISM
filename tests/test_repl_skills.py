@@ -4,6 +4,7 @@ from io import StringIO
 from unittest.mock import MagicMock, patch
 
 import pytest
+from rich.console import Console
 
 from app.agent.repl import AgentREPL, REPL_COMMANDS
 
@@ -72,3 +73,11 @@ class TestReplSkillCommands:
         assert result is False
         text = output.getvalue()
         assert "Usage" in text
+
+    def test_tools_shows_approval_star(self):
+        repl = _make_repl()
+        output = StringIO()
+        repl.console = Console(file=output, highlight=False, force_terminal=True)
+        repl._handle_tools()
+        text = output.getvalue()
+        assert "★" in text

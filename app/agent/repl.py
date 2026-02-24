@@ -1,6 +1,5 @@
 """Interactive REPL for the PRISM agent."""
 import os
-import sys
 import time
 from typing import Optional
 from rich.console import Console
@@ -20,6 +19,7 @@ from app.agent.events import (
 )
 from app.agent.memory import SessionMemory
 from app.agent.scratchpad import Scratchpad
+from app.agent.spinner import Spinner
 from app.tools.base import ToolRegistry
 
 
@@ -58,6 +58,7 @@ class AgentREPL:
         self.scratchpad = Scratchpad()
         self._mcp_tools: list[str] = []
         self._auto_approve = auto_approve
+        self._auto_approve_tools: set = set()
         if tools is None:
             from app.plugins.bootstrap import build_full_registry
             tools = build_full_registry(enable_mcp=enable_mcp)
@@ -78,9 +79,30 @@ class AgentREPL:
         )
 
     def _approval_callback(self, tool_name: str, tool_args: dict) -> bool:
+        if tool_name in self._auto_approve_tools:
+            return True
         args_summary = ", ".join(f"{k}={v!r}" for k, v in list(tool_args.items())[:3])
-        self.console.print(f"  [yellow bold]?[/yellow bold] [bold]{tool_name}[/bold]({args_summary})")
-        return Confirm.ask("    Allow?", default=True)
+        header = Text()
+        header.append(f" {tool_name} ", style="bold magenta")
+        header.append(" approval ", style="bold #d29922")
+        body = Text()
+        body.append(f" {args_summary}", style="dim")
+        self.console.print(Panel(
+            body,
+            title=header,
+            title_align="left",
+            border_style="#d29922",
+            padding=(0, 1),
+        ))
+        self.console.print("  [#d29922]?[/#d29922] Allow?  [bold]y[/bold] yes  [bold]n[/bold] no  [bold]a[/bold] always")
+        try:
+            answer = input("    ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if answer == "a":
+            self._auto_approve_tools.add(tool_name)
+            return True
+        return answer in ("y", "yes", "")
 
     def _load_session(self, session_id: str):
         self.memory.load(session_id)
@@ -97,7 +119,7 @@ class AgentREPL:
         while True:
             try:
                 user_input = self._session.prompt(
-                    HTML('<b>> </b>'),
+                    HTML('<ansimagenta><b>❯ </b></ansimagenta>'),
                 ).strip()
             except (EOFError, KeyboardInterrupt):
                 self._prompt_save_on_exit()
@@ -123,6 +145,8 @@ class AgentREPL:
         plan_buffer = ""
         in_plan = False
         tool_start_time = None
+        current_tool_name = None
+        spinner = Spinner(console=self.console)
 
         for event in self.agent.process_stream(user_input):
             if isinstance(event, TextDelta):
@@ -155,35 +179,61 @@ class AgentREPL:
                     else:
                         plan_buffer += event.text
                     continue
-                sys.stdout.write(event.text)
-                sys.stdout.flush()
+                # Don't write raw text — we render as Markdown at breaks
 
             elif isinstance(event, ToolCallStart):
+                # Flush accumulated text as Markdown before tool card
                 if accumulated_text.strip():
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
+                    self.console.print()
+                    self.console.print(Markdown(accumulated_text.strip()))
                     accumulated_text = ""
                 tool_start_time = time.monotonic()
-                self.console.print(f"  [dim]{event.tool_name}[/dim] ", end="")
+                current_tool_name = event.tool_name
+                verb = spinner.verb_for_tool(event.tool_name)
+                spinner.start(verb)
 
             elif isinstance(event, ToolApprovalRequest):
                 pass
 
             elif isinstance(event, ToolCallResult):
-                elapsed = ""
+                spinner.stop()
+                elapsed_str = ""
                 if tool_start_time:
                     ms = (time.monotonic() - tool_start_time) * 1000
-                    elapsed = f" [dim]({ms:.0f}ms)[/dim]" if ms < 2000 else f" [dim]({ms/1000:.1f}s)[/dim]"
+                    elapsed_str = f"{ms:.0f}ms" if ms < 2000 else f"{ms / 1000:.1f}s"
                     tool_start_time = None
-                summary = event.summary if hasattr(event, 'summary') else "done"
-                self.console.print(f"[green]{summary}[/green]{elapsed}")
+                summary = event.summary if hasattr(event, "summary") else "done"
+                self._render_tool_card(event.tool_name, summary, elapsed_str)
+                current_tool_name = None
 
             elif isinstance(event, TurnComplete):
+                spinner.stop()
                 tool_start_time = None
 
+        # Flush any remaining text as Markdown
         if accumulated_text.strip():
-            sys.stdout.write("\n\n")
-            sys.stdout.flush()
+            self.console.print()
+            self.console.print(Markdown(accumulated_text.strip()))
+            self.console.print()
+
+    def _render_tool_card(self, tool_name: str, summary: str, elapsed: str):
+        """Render a bordered tool call result card."""
+        header = Text()
+        header.append(f" {tool_name} ", style="bold magenta")
+        if elapsed:
+            header.append(f" {elapsed}", style="dim")
+
+        body = Text()
+        body.append(" ✓ ", style="bold green")
+        body.append(summary, style="dim")
+
+        self.console.print(Panel(
+            body,
+            title=header,
+            title_align="left",
+            border_style="dim",
+            padding=(0, 1),
+        ))
 
     # ── Exit ───────────────────────────────────────────────────────────
 
@@ -207,27 +257,72 @@ class AgentREPL:
         from app import __version__
         caps = self._detect_capabilities()
 
+        # VIBGYOR letter colors
+        colors = {
+            "P": "#ff0000", "R": "#ff7700", "I": "#ffdd00",
+            "S": "#00cc44", "M": "#0066ff",
+        }
+        # 5-line block-letter art
+        art_lines = [
+            " ██████  ██████  ██  ███████ ███    ███",
+            " ██   ██ ██   ██ ██  ██      ████  ████",
+            " ██████  ██████  ██  ███████ ██ ████ ██",
+            " ██      ██   ██ ██       ██ ██  ██  ██",
+            " ██      ██   ██ ██  ███████ ██      ██",
+        ]
+        # Character ranges for each letter in the art
+        letter_spans = [
+            ("P", 0, 8), ("R", 8, 16), ("I", 16, 20),
+            ("S", 20, 28), ("M", 28, 40),
+        ]
+
+        self.console.print()
+        for line in art_lines:
+            text = Text()
+            for letter, start, end in letter_spans:
+                segment = line[start:end] if end <= len(line) else line[start:]
+                text.append(segment, style=f"bold {colors[letter]}")
+            self.console.print(text)
+
+        # Prism triangle + rainbow bar
+        self.console.print()
+        triangle = Text()
+        triangle.append("           ▲\n", style="dim")
+        triangle.append("          ╱ ╲\n", style="dim")
+        triangle.append("         ╱   ╲\n", style="dim")
+        triangle.append("        ▔▔▔▔▔▔▔\n", style="dim")
+
+        rainbow_colors = [
+            "#ff0000", "#ff3300", "#ff6600", "#ff9900", "#ffcc00",
+            "#ffff00", "#ccff00", "#66ff00", "#00cc44", "#00aa88",
+            "#0088cc", "#0055ff", "#2200ff", "#4400cc", "#6600aa",
+        ]
+        bar = Text("     ")
+        for c in rainbow_colors:
+            bar.append("━", style=c)
+        self.console.print(triangle, end="")
+        self.console.print(bar)
+        self.console.print()
+
         # Provider
         provider = None
-        if os.getenv("ANTHROPIC_API_KEY"):
+        if os.getenv("MARC27_TOKEN"):
+            provider = "MARC27"
+        elif os.getenv("ANTHROPIC_API_KEY"):
             provider = "Claude"
         elif os.getenv("OPENAI_API_KEY"):
             provider = "GPT"
         elif os.getenv("OPENROUTER_API_KEY"):
             provider = "OpenRouter"
-        elif os.getenv("MARC27_TOKEN"):
-            provider = "MARC27"
 
-        self.console.print()
-
-        # One-line header
-        header = f"[bold]PRISM[/bold] v{__version__}"
+        info = Text()
+        info.append(f"  v{__version__}", style="dim")
         if provider:
-            header += f"  [dim]\u00b7  {provider}[/dim]"
-        self.console.print(header)
-        self.console.print()
+            info.append("  ·  ", style="dim")
+            info.append(provider, style="bold magenta")
+        self.console.print(info)
 
-        # Capabilities as a compact line
+        # Capabilities line
         parts = []
         tool_count = len(self.agent.tools.list_tools())
         parts.append(f"{tool_count} tools")
@@ -237,17 +332,14 @@ class AgentREPL:
             parts.append(f"{skill_count} skills")
         except Exception:
             pass
-
         for name, ok in caps.items():
             if ok:
                 parts.append(f"[green]{name}[/green]")
             else:
                 parts.append(f"[dim]{name}[/dim]")
-
         if self._auto_approve:
             parts.append("[yellow]auto-approve[/yellow]")
-
-        self.console.print("[dim]" + " \u00b7 ".join(parts) + "[/dim]")
+        self.console.print("[dim]  " + " · ".join(parts) + "[/dim]")
         self.console.print()
 
     def _detect_capabilities(self) -> dict:
@@ -345,9 +437,10 @@ class AgentREPL:
         self.console.print()
         tools = self.agent.tools.list_tools()
         for tool in tools:
-            flag = " [yellow]*[/yellow]" if tool.requires_approval else ""
-            self.console.print(f"  {tool.name:<28} [dim]{tool.description[:55]}[/dim]{flag}")
-        self.console.print(f"\n  [dim]{len(tools)} tools[/dim]  [yellow]*[/yellow][dim] = approval required[/dim]")
+            name_style = "bold #d29922" if tool.requires_approval else "bold"
+            flag = " [#d29922]★[/#d29922]" if tool.requires_approval else ""
+            self.console.print(f"  [{name_style}]{tool.name:<28}[/{name_style}] [dim]{tool.description[:55]}[/dim]{flag}")
+        self.console.print(f"\n  [dim]{len(tools)} tools[/dim]  [#d29922]★[/#d29922] [dim]= requires approval[/dim]")
         self.console.print()
 
     # ── /status ────────────────────────────────────────────────────────
