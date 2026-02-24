@@ -4,7 +4,7 @@ Follow these steps to get PRISM up and running on your system.
 
 ## Prerequisites
 
-- **Python**: 3.10 or newer.
+- **Python**: 3.11 or newer.
 - **OS**: macOS or Linux (Windows works but is not officially tested).
 
 ## Quick Install
@@ -53,7 +53,7 @@ pip install "prism-platform[data]"        # OMAT24, HuggingFace datasets
 pip install "prism-platform[reports]"     # PDF/HTML reports
 ```
 
-> **Note:** pyiron and pycalphad require Python 3.11–3.13. On Python 3.10 or 3.14+,
+> **Note:** pyiron and pycalphad require Python <3.14. On Python 3.14+,
 > those packages are silently skipped and the rest installs normally.
 
 ## Development Install

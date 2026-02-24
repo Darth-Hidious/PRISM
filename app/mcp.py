@@ -469,8 +469,11 @@ This is attempt {attempt + 1} of {self.max_attempts}."""
         if not filter_str or not filter_str.strip():
             return "Empty filter string"
         try:
+            base_urls = [p["base_url"] for p in self.providers_info if p["id"] == provider]
+            if not base_urls:
+                base_urls = [p["base_url"] for p in self.providers_info]
             test_client = OptimadeClient(
-                include_providers=[provider],
+                base_urls=base_urls,
                 max_results_per_provider=1,
             )
             results = test_client.get(filter_str)
