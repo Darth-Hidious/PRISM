@@ -61,6 +61,9 @@ simulation = [
     "pyiron_atomistics>=0.6",
     "pyiron_workflow>=0.12",
 ]
+data = [
+    "datasets>=3.0.0",
+]
 reports = [
     "markdown>=3.5",
     "weasyprint>=60.0",

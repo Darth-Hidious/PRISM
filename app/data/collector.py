@@ -1,5 +1,6 @@
 """Collect materials data from OPTIMADE and Materials Project."""
 from typing import Dict, List, Optional
+
 from app.config.providers import FALLBACK_PROVIDERS
 from app.data.base_collector import DataCollector
 
@@ -9,6 +10,9 @@ class OPTIMADECollector(DataCollector):
 
     def __init__(self, providers: Optional[List[Dict]] = None):
         self.providers = providers or FALLBACK_PROVIDERS
+
+    def supported_params(self) -> List[str]:
+        return ["filter_string", "max_per_provider", "provider_ids"]
 
     def collect(self, filter_string: str, max_per_provider: int = 100, provider_ids: Optional[List[str]] = None) -> List[Dict]:
         try:
@@ -59,6 +63,9 @@ class OPTIMADECollector(DataCollector):
 
 class MPCollector(DataCollector):
     name = "mp"
+
+    def supported_params(self) -> List[str]:
+        return ["formula", "elements", "max_results"]
 
     def collect(self, formula: str = None, elements: List[str] = None, max_results: int = 50) -> List[Dict]:
         import os
