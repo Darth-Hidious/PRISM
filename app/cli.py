@@ -176,26 +176,19 @@ def cli(ctx, version, verbose, quiet, mp_api_key, resume, no_mcp):
 {PRISM_BRAND}
 Platform for Research in Intelligent Synthesis of Materials
 
-A next-generation command-line interface for materials science research, 
-powered by the OPTIMADE API network and Large Language Models.
+A next-generation CLI for materials science research, powered by the
+OPTIMADE API network, Large Language Models, and an agentic tool loop.
 
-🚀 KEY FEATURES:
-• Natural language queries with AI-powered reasoning  
-• Access to 15+ materials databases via OPTIMADE
-• Enhanced properties from Materials Project API
-• Structured searches with advanced filtering
-• Rich data visualization and export capabilities
+Run without arguments to start the interactive REPL, or use a subcommand:
 
-🔧 COMMON USAGE:
-• prism ask "Materials for high neutron flux" --limit 10
-• prism search --elements Fe,Ni --nelements 5 --mp-api-key YOUR_KEY
-• prism --mp-api-key YOUR_API_KEY ask "High entropy alloys"
-• prism configure --mp-api-key YOUR_API_KEY
-• prism optimade list-dbs
+  prism                           Interactive agent REPL
+  prism run "goal"                Autonomous agent mode
+  prism serve                     Start as an MCP server
+  prism search --elements Fe,Ni   Structured OPTIMADE search
+  prism ask "battery cathodes"    Natural-language query
+  prism update                    Check for updates
 
-📖 DOCUMENTATION: https://github.com/Darth-Hideous/PRISM
-
-Running PRISM without any subcommands will start the interactive 'ask' mode.
+Documentation: https://github.com/Darth-Hidious/PRISM
     """
     ctx.ensure_object(dict)
     ctx.obj["no_mcp"] = no_mcp
@@ -236,6 +229,22 @@ Running PRISM without any subcommands will start the interactive 'ask' mode.
         ctx.exit()
         
     elif ctx.invoked_subcommand is None:
+        # Check for updates on REPL startup
+        try:
+            from app.config.preferences import UserPreferences
+            prefs = UserPreferences.load()
+            if prefs.check_updates:
+                from app import __version__
+                from app.update import check_for_updates
+                update_info = check_for_updates(__version__)
+                if update_info:
+                    console.print(
+                        f"[yellow]Update available:[/yellow] "
+                        f"v{update_info['current']} -> v{update_info['latest']}  "
+                        f"[dim]({update_info['upgrade_cmd']})[/dim]"
+                    )
+        except Exception:
+            pass
         try:
             backend = create_backend()
             repl = AgentREPL(backend=backend, enable_mcp=not no_mcp)
@@ -616,15 +625,7 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
             
             # Generate the filter - use reasoning mode if --reason flag is set
             if reason:
-                # Load schema for reasoning mode
-                try:
-                    with open("Schema.txt", "r") as f:
-                        schema_content = f.read()
-                except FileNotFoundError:
-                    console.print("[yellow]Warning: Schema.txt not found. Using reasoning mode without schema context.[/yellow]")
-                    schema_content = None
-                
-                provider_to_query, optimade_filter, reasoning_response = adaptive_filter.generate_reasoning_filter(query, schema_content, console)
+                provider_to_query, optimade_filter, reasoning_response = adaptive_filter.generate_reasoning_filter(query, None, console)
                 error = None if provider_to_query and optimade_filter else reasoning_response
                 
                 # Display the reasoning process
@@ -726,16 +727,7 @@ def ask(query: str, providers: str, interactive: bool, reason: bool, debug_filte
 
         # Use the LLM to summarize the findings
         with console.status("[bold green]Analyzing results and generating answer...[/bold green]"):
-            try:
-                with open("Schema.txt", "r") as f:
-                    schema_content = f.read()
-            except FileNotFoundError:
-                console.print("[yellow]Warning: Schema.txt not found. Proceeding without schema context.[/yellow]")
-                schema_content = None
-
-            # In reasoning mode, we already did the reasoning for filter generation
-            # So just provide a summary of the results found
-            model_context = ModelContext(query=query, results=all_materials, rag_context=schema_content)
+            model_context = ModelContext(query=query, results=all_materials, rag_context=None)
             final_prompt = model_context.to_prompt(reasoning_mode=False)
             
             # Stream the response from the LLM for a better user experience
@@ -1877,6 +1869,39 @@ def calphad_import(tdb_path, name):
     else:
         console.print(f"[green]Imported database: {result['name']}[/green]")
         console.print(f"  Path: {result['path']}")
+
+
+# ==============================================================================
+# 'update' Command
+# ==============================================================================
+@cli.command()
+def update():
+    """Check for PRISM updates and show upgrade instructions."""
+    from app import __version__
+    from app.update import check_for_updates, CACHE_PATH
+
+    console.print(f"[dim]Current version: {__version__}[/dim]")
+    console.print("[dim]Checking for updates...[/dim]")
+
+    # Clear cache to force a fresh check
+    try:
+        CACHE_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    update_info = check_for_updates(__version__)
+    if update_info:
+        console.print(
+            Panel(
+                f"[bold yellow]New version available: v{update_info['latest']}[/bold yellow]\n\n"
+                f"You are running v{update_info['current']}.\n\n"
+                f"Upgrade with:\n  [cyan]{update_info['upgrade_cmd']}[/cyan]",
+                title="Update Available",
+                border_style="yellow",
+            )
+        )
+    else:
+        console.print(f"[green]You are running the latest version (v{__version__}).[/green]")
 
 
 # ==============================================================================

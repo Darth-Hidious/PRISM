@@ -6,8 +6,8 @@ We actively maintain and provide security updates for the following versions of 
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.1.x   | :white_check_mark: |
-| 1.0.x   | :white_check_mark: |
+| 2.0.x   | :white_check_mark: |
+| 1.x     | :x:                |
 | < 1.0   | :x:                |
 
 ## Reporting a Vulnerability
@@ -100,6 +100,10 @@ This security policy covers:
 - CLI interface and commands
 - API integrations with LLM providers
 - OPTIMADE database connectors
+- MCP server and client (`prism serve`, external MCP connections)
+- CALPHAD thermodynamic calculations (pycalphad, TDB file handling)
+- ML pipeline (model training, predictions, feature engineering)
+- Plugin system (entry-point and local `~/.prism/plugins/` plugins)
 - Local data storage and processing
 
 ### Out of Scope

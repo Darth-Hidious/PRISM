@@ -4,50 +4,109 @@ Follow these steps to get PRISM up and running on your system.
 
 ## Prerequisites
 
-- **Python**: PRISM requires Python version 3.9, 3.10, 3.11, or 3.12. It is **not** compatible with Python 3.13 or newer due to a dependency conflict.
-- **Git**: For cloning the repository.
+- **Python**: 3.10 or newer.
+- **OS**: macOS or Linux (Windows works but is not officially tested).
 
-## Installation Steps
+## Quick Install
 
-1.  **Clone the Repository**
-    ```bash
-    git clone https://github.com/Darth-Hidious/PRISM.git
-    cd PRISM
-    ```
+### Option 1: pipx (recommended)
 
-2.  **Create and Activate a Virtual Environment**
-    It is highly recommended to install PRISM in a dedicated virtual environment.
-    ```bash
-    # Create the virtual environment
-    python -m venv .venv
+```bash
+pipx install prism-platform
+```
 
-    # Activate it (on macOS/Linux)
-    source .venv/bin/activate
+### Option 2: uv
 
-    # Or on Windows
-    .\venv\Scripts\activate
-    ```
+```bash
+uv tool install prism-platform
+```
 
-3.  **Install Dependencies**
-    The project uses `pyproject.toml` to manage dependencies. Install the project in editable mode, which will also install all required packages.
-    ```bash
-    pip install -e .
-    ```
+### Option 3: curl one-liner
 
-4.  **Configure PRISM**
-    Before you can use the `ask` command, you need to configure your preferred LLM provider.
-    ```bash
-    prism advanced configure
-    ```
-    This will prompt you to select a provider and enter your API key. 
-    
-    **💡 Tip:** For the quickest start, we recommend choosing the **OpenRouter** option. It's free and only requires a single API key to get started.
+```bash
+curl -fsSL https://raw.githubusercontent.com/Darth-Hidious/PRISM/main/install.sh | sh
+```
 
-5.  **Initialize the Database (Optional but Recommended)**
-    To save search results, you need to initialize the local SQLite database.
-    ```bash
-    prism advanced init
-    ```
-    The `search` command will also prompt you to do this automatically if you try to save results to an uninitialized database.
+This detects your OS, finds Python, installs pipx/uv if needed, and installs PRISM.
 
-You are now ready to use PRISM!
+### Option 4: pip (in a virtualenv)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install prism-platform
+```
+
+## Optional Extras
+
+Install additional capabilities as needed:
+
+```bash
+# ML pipeline (scikit-learn, xgboost, lightgbm, optuna, matminer)
+pip install "prism-platform[ml]"
+
+# Atomistic simulation (pyiron)
+pip install "prism-platform[simulation]"
+
+# CALPHAD thermodynamics (pycalphad)
+pip install "prism-platform[calphad]"
+
+# Extra data sources (HuggingFace datasets for OMAT24)
+pip install "prism-platform[data]"
+
+# PDF/HTML reports (markdown, weasyprint)
+pip install "prism-platform[reports]"
+
+# Everything
+pip install "prism-platform[all]"
+```
+
+## Development Install
+
+```bash
+git clone https://github.com/Darth-Hidious/PRISM.git
+cd PRISM
+pip install -e ".[dev]"
+```
+
+## Configuration
+
+Before using the agent commands, configure at least one LLM provider.
+Copy the example environment file and fill in your keys:
+
+```bash
+cp .env.example .env
+# Edit .env with your API keys
+```
+
+Or configure interactively:
+
+```bash
+prism advanced configure
+```
+
+## Verification
+
+```bash
+# Show version
+prism --version
+
+# List available commands
+prism --help
+
+# Check for updates
+prism update
+```
+
+## Updating
+
+```bash
+# Check for updates
+prism update
+
+# Upgrade via pipx
+pipx upgrade prism-platform
+
+# Or via pip
+pip install --upgrade prism-platform
+```

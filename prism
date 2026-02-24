@@ -8,24 +8,33 @@ It can be run directly without installation.
 Usage:
     ./prism [COMMAND] [OPTIONS]
     python prism [COMMAND] [OPTIONS]
-    
+
 Available Commands:
-    fetch-material      Fetch material from a specific source
-    bulk-fetch          Perform bulk material fetching
-    list-sources        List all available data sources
-    test-connection     Test connection to data sources
-    queue-status        Show job queue status
-    retry-failed-jobs   Retry failed jobs
-    export-data         Export data to various formats
-    monitor             Monitor system performance
-    config              Manage configuration settings
+    (no command)        Start the interactive agent REPL
+    run GOAL            Run the agent autonomously on a research goal
+    serve               Start PRISM as an MCP server
+    search              Structured OPTIMADE search
+    ask                 Natural-language materials query
+    setup               Configure workflow preferences
+    update              Check for PRISM updates
+    configure           Manage API keys and settings
+    switch-llm          Switch between LLM providers
+    data                Data import and export commands
+    predict             Run ML predictions
+    model               Manage trained ML models
+    sim                 Atomistic simulation (pyiron)
+    calphad             CALPHAD thermodynamic tools
+    plugin              Manage plugins
+    mcp                 Manage MCP server connections
+    optimade            OPTIMADE network commands
+    advanced            Database management and configuration
 
 Examples:
-    ./prism test-connection --source all
-    ./prism fetch-material --source jarvis --formula "Si"
-    ./prism bulk-fetch --source nomad --limit 100
-    ./prism queue-status --watch
-    ./prism export-data --format json --output materials.json
+    ./prism                                   # interactive REPL
+    ./prism run "Find stable Ti-Al alloys"    # autonomous agent
+    ./prism search --elements Fe,Ni           # structured search
+    ./prism ask "Battery cathode materials"   # natural-language query
+    ./prism update                            # check for updates
 """
 
 import sys
@@ -46,10 +55,8 @@ def main():
         cli()
         
     except ImportError as e:
-        print(f"❌ Import Error: {e}")
-        print("\n🔧 Please ensure you have installed the required dependencies:")
-        print("   pip install -r requirements.txt")
-        print("\n📖 Or install in development mode:")
+        print(f"Import Error: {e}")
+        print("\nPlease install PRISM and its dependencies:")
         print("   pip install -e .")
         sys.exit(1)
         
