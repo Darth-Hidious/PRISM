@@ -91,3 +91,82 @@ class TestReportSkill:
 
         content = Path(result["report_path"]).read_text()
         assert "My Custom Title" in content
+
+    @patch("app.data.store.DataStore.load")
+    def test_html_output(self, mock_load, mock_prefs, sample_df):
+        mock_load.return_value = sample_df
+
+        result = _generate_report(dataset_name="test_data", format="html")
+
+        assert result["format"] == "html"
+        assert result["report_path"].endswith(".html")
+        content = Path(result["report_path"]).read_text()
+        assert "<!DOCTYPE html>" in content
+        assert "<h1>" in content
+        assert "Dataset Summary" in content
+        assert "Fe2O3" in content
+
+    @patch("app.data.store.DataStore.load")
+    def test_correlation_section(self, mock_load, mock_prefs):
+        """Datasets with 2+ numeric columns get a correlation section."""
+        df = pd.DataFrame({
+            "band_gap": [1.0, 2.0, 3.0],
+            "density": [5.0, 4.0, 3.0],
+            "formula": ["A", "B", "C"],
+        })
+        mock_load.return_value = df
+
+        result = _generate_report(dataset_name="test_data")
+
+        content = Path(result["report_path"]).read_text()
+        assert "Correlation Matrix" in content
+
+    @patch("app.data.store.DataStore.load")
+    def test_figure_captions(self, mock_load, mock_prefs, sample_df, tmp_path):
+        """Plot references include figure captions."""
+        mock_load.return_value = sample_df
+        # Create a fake PNG in the output dir
+        out_dir = Path(mock_prefs.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "test_data_dist.png").write_bytes(b"fake")
+
+        result = _generate_report(dataset_name="test_data")
+
+        content = Path(result["report_path"]).read_text()
+        assert "Figure 1:" in content
+        assert "auto-generated plot" in content
+
+    @patch("app.data.store.DataStore.load")
+    def test_validation_summary(self, mock_load, mock_prefs, sample_df):
+        """Validation results are included when provided."""
+        mock_load.return_value = sample_df
+
+        validation_results = {
+            "outliers": [{"type": "outlier", "column": "band_gap", "row": 0, "value": 99.0, "z_score": 4.2}],
+            "constraint_violations": [],
+            "completeness": {"overall_completeness": 0.95, "column_completeness": {}, "total_rows": 3, "columns_below_50pct": []},
+            "total_findings": 1,
+        }
+
+        result = _generate_report(dataset_name="test_data", validation_results=validation_results)
+
+        content = Path(result["report_path"]).read_text()
+        assert "Data Quality" in content
+        assert "1" in content  # total findings
+
+    @patch("app.data.store.DataStore.load")
+    def test_html_validation_summary(self, mock_load, mock_prefs, sample_df):
+        mock_load.return_value = sample_df
+
+        validation_results = {
+            "outliers": [],
+            "constraint_violations": [{"type": "constraint_violation", "column": "band_gap", "row": 0, "value": -1.0, "constraint": "band_gap >= 0"}],
+            "completeness": {"overall_completeness": 0.85, "column_completeness": {}, "total_rows": 3, "columns_below_50pct": []},
+            "total_findings": 1,
+        }
+
+        result = _generate_report(dataset_name="test_data", format="html", validation_results=validation_results)
+
+        content = Path(result["report_path"]).read_text()
+        assert "Data Quality" in content
+        assert "<!DOCTYPE html>" in content

@@ -16,6 +16,7 @@ def build_full_registry(
     from app.tools.visualization import create_visualization_tools
     from app.tools.prediction import create_prediction_tools
     from app.tools.search import create_search_tools
+    from app.tools.property_selection import create_property_selection_tools
 
     registry = ToolRegistry()
     create_system_tools(registry)
@@ -23,6 +24,7 @@ def build_full_registry(
     create_visualization_tools(registry)
     create_prediction_tools(registry)
     create_search_tools(registry)
+    create_property_selection_tools(registry)
 
     # Simulation tools (optional — pyiron may not be installed)
     try:

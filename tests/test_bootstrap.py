@@ -61,3 +61,22 @@ class TestBuildFullRegistry:
         registry = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
         assert "analyze_phases" in names
+
+    def test_has_list_predictable_properties(self):
+        """list_predictable_properties tool is registered."""
+        registry = build_full_registry(enable_mcp=False, enable_plugins=False)
+        names = {t.name for t in registry.list_tools()}
+        assert "list_predictable_properties" in names
+
+    def test_has_validate_and_review_skills(self):
+        """validate_dataset and review_dataset skills are registered."""
+        registry = build_full_registry(enable_mcp=False, enable_plugins=False)
+        names = {t.name for t in registry.list_tools()}
+        assert "validate_dataset" in names
+        assert "review_dataset" in names
+
+    def test_has_correlation_matrix_tool(self):
+        """plot_correlation_matrix tool is registered."""
+        registry = build_full_registry(enable_mcp=False, enable_plugins=False)
+        names = {t.name for t in registry.list_tools()}
+        assert "plot_correlation_matrix" in names

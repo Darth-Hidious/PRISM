@@ -15,19 +15,22 @@ Available tool categories:
 - Data: Search OPTIMADE databases, query Materials Project, query OMAT24, export results to CSV
 - Literature: Search arXiv and Semantic Scholar for scientific papers
 - Patents: Search Lens.org for materials-related patents
-- Visualization: Create plots and comparisons
+- Visualization: Create plots, comparisons, and correlation heatmaps
 - System: Read/write files, search the web
-- Prediction: Predict material properties with ML models
+- Prediction: Predict material properties with ML models, list predictable properties
 - Thermodynamics: CALPHAD phase diagrams, equilibrium, Gibbs energy calculations
+- Validation: Detect outliers, check physical constraints, score completeness
 - Skills (multi-step workflows):
   - acquire_materials: collect data from multiple sources
   - predict_properties: predict properties using ML
   - visualize_dataset: generate plots for datasets
-  - generate_report: compile reports
+  - generate_report: compile Markdown/HTML/PDF reports with correlations
   - select_materials: filter and rank candidates
   - materials_discovery: end-to-end pipeline (acquire → predict → visualize → report)
   - plan_simulations: generate simulation job plans (auto-routes CALPHAD vs DFT vs MD)
   - analyze_phases: analyze phase stability using CALPHAD thermodynamic databases
+  - validate_dataset: detect outliers, check constraints, score completeness
+  - review_dataset: comprehensive data quality review with findings and LLM prompt
 
 For complex goals, prefer using skills over individual tools for efficiency.
 
