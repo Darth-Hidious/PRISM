@@ -66,6 +66,7 @@ orchestration.
 
 ### Infrastructure
 - **Two modes**: interactive REPL (`prism`) and autonomous (`prism run "goal"`)
+- **MARC27 managed LLM**: `/login` for managed model access via MARC27 account
 - **MCP server**: `prism serve` exposes tools and resources via FastMCP 3.x
 - **Plugin system**: pip entry-points + `~/.prism/plugins/` local plugins
 - **Session memory**: save, load, and resume conversations
@@ -91,6 +92,8 @@ pip install -e ".[all,dev]"
 ### Configure
 
 ```bash
+prism                      # First run triggers onboarding wizard
+# or manually:
 prism advanced configure   # Set up LLM provider + API key
 ```
 
@@ -131,10 +134,12 @@ See [INSTALL.md](INSTALL.md) for full details.
 |---|---|
 | `/help` | Show available commands |
 | `/tools` | List available tools |
-| `/skill [name]` | List skills or show details |
+| `/skills [name]` | List skills or show details |
 | `/plan <goal>` | Suggest skills for a goal |
 | `/scratchpad` | Show execution log |
+| `/status` | Platform capabilities |
 | `/approve-all` | Auto-approve all tool calls |
+| `/login` | Connect MARC27 account |
 | `/save` | Save current session |
 | `/load ID` | Load a saved session |
 | `/export [file]` | Export last results to CSV |
@@ -154,7 +159,7 @@ app/
   db/             # MIT License — SQLAlchemy models and database
   data/           # MIT License — DataStore and collectors
   tools/          # MIT License — Tool definitions and registry
-tests/            # MIT License — 490+ tests
+tests/            # MIT License — 519 tests
 docs/             # MIT License — Documentation and assets
 ```
 
@@ -164,17 +169,18 @@ docs/             # MIT License — Documentation and assets
 python3 -m pytest tests/ -v --ignore=tests/test_mcp_roundtrip.py --ignore=tests/test_mcp_server.py
 ```
 
-490+ tests covering agent core, tools, skills, data collectors, ML pipelines,
+519 tests covering agent core, tools, skills, data collectors, ML pipelines,
 CALPHAD integration, validation rules, plugins, and CLI commands.
 
 ## Roadmap
 
-### Current (v2.1.0 — Phase F)
+### Current (v2.1.1)
+- Claude Code-style minimal REPL with tool timing
+- MARC27 managed LLM access (`/login`)
+- OPTIMADE noise-free searches (explicit provider list)
+- Python 3.11+ with pyiron/CALPHAD out of the box
 - Dual license (MIT core + MARC27 proprietary AI)
-- Tool consent and approval gates
-- Scratchpad execution log
-- Plan-then-execute mode
-- Feedback loops (validation/CALPHAD → agent context)
+- Tool consent, scratchpad, plan-then-execute, feedback loops
 
 ### Next (Phase G — deferred to ESA/seed funding)
 - GFlowNet generative sampler
