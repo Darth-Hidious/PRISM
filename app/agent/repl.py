@@ -1,17 +1,13 @@
-"""Interactive REPL for the PRISM agent — Claude Code-style interface."""
+"""Interactive REPL for the PRISM agent — polished CLI interface."""
 import os
 import sys
 from typing import Optional
 from rich.console import Console
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.text import Text
-from rich.spinner import Spinner
-from rich.columns import Columns
-from rich.rule import Rule
-from rich.style import Style
+from rich.table import Table
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -43,11 +39,12 @@ REPL_COMMANDS = {
     "/plan": "Ask which skills apply to a goal — /plan <goal>",
     "/scratchpad": "Show the agent's execution log",
     "/approve-all": "Auto-approve all tool calls (skip consent prompts)",
+    "/status": "Show platform capabilities (pyiron, CALPHAD, ML, etc.)",
 }
 
 
 class AgentREPL:
-    """Interactive REPL for conversational agent interaction — Claude Code style."""
+    """Interactive REPL for conversational agent interaction."""
 
     def __init__(self, backend: Backend, system_prompt: Optional[str] = None,
                  tools: Optional[ToolRegistry] = None, enable_mcp: bool = True,
@@ -80,8 +77,8 @@ class AgentREPL:
     def _approval_callback(self, tool_name: str, tool_args: dict) -> bool:
         """Ask the user for approval before running an expensive tool."""
         args_summary = ", ".join(f"{k}={v!r}" for k, v in list(tool_args.items())[:3])
-        self.console.print(f"  [dim yellow]Tool requires approval:[/dim yellow] [bold]{tool_name}[/bold]({args_summary})")
-        return Confirm.ask("  [yellow]Approve?[/yellow]", default=True)
+        self.console.print(f"\n  [yellow]Approval required:[/yellow] [bold]{tool_name}[/bold]({args_summary})")
+        return Confirm.ask("  [yellow]Run this tool?[/yellow]", default=True)
 
     def _load_session(self, session_id: str):
         """Restore a saved session into the agent."""
@@ -98,7 +95,7 @@ class AgentREPL:
         while True:
             try:
                 user_input = self._session.prompt(
-                    HTML('<style fg="ansibrightcyan"><b>&gt; </b></style>'),
+                    HTML('<style fg="ansibrightcyan"><b>prism > </b></style>'),
                 ).strip()
             except (EOFError, KeyboardInterrupt):
                 self._prompt_save_on_exit()
@@ -118,7 +115,7 @@ class AgentREPL:
                 self.console.print(f"[red]Error: {e}[/red]")
 
     def _handle_streaming_response(self, user_input: str):
-        """Stream agent response with Claude Code-style display."""
+        """Stream agent response with clean display."""
         accumulated_text = ""
         plan_buffer = ""
         in_plan = False
@@ -131,7 +128,6 @@ class AgentREPL:
                 if "<plan>" in accumulated_text and not in_plan:
                     in_plan = True
                     plan_buffer = accumulated_text.split("<plan>", 1)[1]
-                    # Print any text before <plan>
                     pre_plan = accumulated_text.split("<plan>", 1)[0].strip()
                     if pre_plan:
                         self.console.print(Markdown(pre_plan))
@@ -150,44 +146,39 @@ class AgentREPL:
                         if self.scratchpad:
                             self.scratchpad.log("plan", summary="Plan proposed", data={"plan": plan_buffer.strip()})
                         if not Confirm.ask("  Execute this plan?", default=True):
-                            self.console.print("[dim yellow]Plan rejected.[/dim yellow]")
+                            self.console.print("[dim]Plan rejected.[/dim]")
                             return
                         remainder = event.text.split("</plan>", 1)[1] if "</plan>" in event.text else ""
                         accumulated_text = remainder
                     else:
                         plan_buffer += event.text
                     continue
-                # Print streaming text character by character for smooth output
+                # Stream text
                 sys.stdout.write(event.text)
                 sys.stdout.flush()
 
             elif isinstance(event, ToolCallStart):
-                # Flush any accumulated text
                 if accumulated_text.strip():
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     accumulated_text = ""
                 current_tool = event.tool_name
-                # Claude Code-style tool indicator: compact inline
-                self.console.print(f"\n  [dim]>[/dim] [bold yellow]{event.tool_name}[/bold yellow] [dim]...[/dim]", end="")
+                # Compact tool indicator
+                self.console.print(f"\n  [dim]\u25b6[/dim] [bold yellow]{event.tool_name}[/bold yellow]", end="")
 
             elif isinstance(event, ToolApprovalRequest):
-                # Approval handled by callback
                 pass
 
             elif isinstance(event, ToolCallResult):
-                # Compact result indicator
                 summary = event.summary if hasattr(event, 'summary') else "done"
-                # Clear the "..." and show result
-                self.console.print(f" [green]{summary}[/green]")
+                self.console.print(f" [dim]\u2192[/dim] [green]{summary}[/green]")
                 current_tool = None
 
             elif isinstance(event, TurnComplete):
                 if current_tool:
-                    self.console.print()  # Close any pending tool line
+                    self.console.print()
                     current_tool = None
 
-        # Final newline + render accumulated text as markdown
         if accumulated_text.strip():
             sys.stdout.write("\n\n")
             sys.stdout.flush()
@@ -208,26 +199,69 @@ class AgentREPL:
             self.console.print(f"  [dim]Session saved: {sid}[/dim]")
 
     def _show_welcome(self):
-        """Claude Code-style compact welcome."""
+        """Show polished welcome with capability overview."""
         from app import __version__
+
+        # Build capability status
+        capabilities = self._detect_capabilities()
+
         self.console.print()
-        self.console.print(f"  [bold cyan]PRISM[/bold cyan] [dim]v{__version__}[/dim]  [dim]— AI-Native Materials Discovery[/dim]")
-        self.console.print(f"  [dim]Type your query or /help for commands. Ctrl+C to exit.[/dim]")
+        self.console.print(f"  [bold cyan]PRISM[/bold cyan] [dim]v{__version__}[/dim]")
+        self.console.print(f"  [dim]AI-Native Autonomous Materials Discovery \u2014 MARC27[/dim]")
         self.console.print()
 
-        # Show tool count
+        # Capability line
+        parts = []
         tool_count = len(self.agent.tools.list_tools())
-        self.console.print(f"  [dim]{tool_count} tools loaded[/dim]", end="")
+        parts.append(f"[dim]{tool_count} tools[/dim]")
         try:
             from app.skills.registry import load_builtin_skills
             skill_count = len(load_builtin_skills().list_skills())
-            self.console.print(f"[dim] · {skill_count} skills[/dim]", end="")
+            parts.append(f"[dim]{skill_count} skills[/dim]")
         except Exception:
             pass
+
+        # Status indicators
+        for name, available in capabilities.items():
+            if available:
+                parts.append(f"[green]\u2713[/green] [dim]{name}[/dim]")
+            else:
+                parts.append(f"[dim]\u2013 {name}[/dim]")
+
         if self._auto_approve:
-            self.console.print(f" [dim]·[/dim] [yellow]auto-approve ON[/yellow]", end="")
+            parts.append("[yellow]auto-approve[/yellow]")
+
+        self.console.print("  " + "  \u00b7  ".join(parts))
         self.console.print()
+        self.console.print("  [dim]Type a query, or /help for commands. Ctrl+C to exit.[/dim]")
         self.console.print()
+
+    def _detect_capabilities(self) -> dict:
+        """Detect which optional subsystems are available."""
+        caps = {}
+
+        # ML
+        try:
+            import sklearn  # noqa: F401
+            caps["ML"] = True
+        except ImportError:
+            caps["ML"] = False
+
+        # pyiron
+        try:
+            from app.simulation.bridge import check_pyiron_available
+            caps["pyiron"] = check_pyiron_available()
+        except Exception:
+            caps["pyiron"] = False
+
+        # CALPHAD
+        try:
+            from app.simulation.calphad_bridge import check_calphad_available
+            caps["CALPHAD"] = check_calphad_available()
+        except Exception:
+            caps["CALPHAD"] = False
+
+        return caps
 
     def _handle_command(self, cmd: str) -> bool:
         """Handle a slash command. Returns True to exit."""
@@ -252,11 +286,7 @@ class AgentREPL:
         elif base_cmd == "/history":
             self.console.print(f"  [dim]{len(self.agent.history)} messages in history[/dim]")
         elif base_cmd == "/tools":
-            self.console.print()
-            for tool in self.agent.tools.list_tools():
-                approval = " [yellow]*[/yellow]" if tool.requires_approval else ""
-                self.console.print(f"  [green]{tool.name:<30}[/green] [dim]{tool.description[:50]}[/dim]{approval}")
-            self.console.print(f"\n  [dim][yellow]*[/yellow] requires approval[/dim]")
+            self._handle_tools()
         elif base_cmd == "/mcp":
             self._handle_mcp_status()
         elif base_cmd == "/save":
@@ -286,10 +316,69 @@ class AgentREPL:
         elif base_cmd == "/approve-all":
             self.agent.auto_approve = True
             self._auto_approve = True
-            self.console.print("  [yellow]Auto-approve enabled. All tools will run without consent prompts.[/yellow]")
+            self.console.print("  [yellow]Auto-approve enabled for this session.[/yellow]")
+        elif base_cmd == "/status":
+            self._handle_status()
         else:
             self.console.print(f"  [dim yellow]Unknown command: {base_cmd}. Type /help.[/dim yellow]")
         return False
+
+    def _handle_tools(self):
+        """List available tools in a clean table."""
+        self.console.print()
+        tools = self.agent.tools.list_tools()
+        # Group by category
+        for tool in tools:
+            approval = " [yellow]\u2731[/yellow]" if tool.requires_approval else ""
+            desc = tool.description[:60]
+            self.console.print(f"  [green]{tool.name:<30}[/green] [dim]{desc}[/dim]{approval}")
+        self.console.print(f"\n  [dim]{len(tools)} tools  \u00b7  [yellow]\u2731[/yellow] = requires approval[/dim]")
+        self.console.print()
+
+    def _handle_status(self):
+        """Show detailed platform capability status."""
+        from app import __version__
+        caps = self._detect_capabilities()
+
+        self.console.print()
+        self.console.print(f"  [bold cyan]PRISM Platform Status[/bold cyan]  [dim]v{__version__}[/dim]")
+        self.console.print()
+
+        # LLM provider
+        provider = "none"
+        if os.getenv("ANTHROPIC_API_KEY"):
+            provider = "Anthropic (Claude)"
+        elif os.getenv("OPENAI_API_KEY"):
+            provider = "OpenAI"
+        elif os.getenv("OPENROUTER_API_KEY"):
+            provider = "OpenRouter"
+        self.console.print(f"  LLM Provider     {_status_dot(provider != 'none')} {provider}")
+
+        # Capabilities
+        for name, available in caps.items():
+            label = {
+                "ML": "ML Prediction",
+                "pyiron": "Atomistic Sim (pyiron)",
+                "CALPHAD": "Phase Diagrams (CALPHAD)",
+            }.get(name, name)
+            self.console.print(f"  {label:<19}{_status_dot(available)}")
+
+        # Tool and skill counts
+        tool_count = len(self.agent.tools.list_tools())
+        try:
+            from app.skills.registry import load_builtin_skills
+            skill_count = len(load_builtin_skills().list_skills())
+        except Exception:
+            skill_count = 0
+        self.console.print(f"\n  [dim]{tool_count} tools  \u00b7  {skill_count} skills[/dim]")
+
+        # Installation hints for missing capabilities
+        missing = [n for n, a in caps.items() if not a]
+        if missing:
+            self.console.print()
+            self.console.print("  [dim]To enable missing features:[/dim]")
+            self.console.print("  [dim]  pip install prism-platform[all][/dim]")
+        self.console.print()
 
     def _handle_scratchpad(self):
         """Display the scratchpad execution log."""
@@ -323,7 +412,7 @@ class AgentREPL:
             self.console.print()
             for i, step in enumerate(skill.steps, 1):
                 opt = " [dim](optional)[/dim]" if step.optional else ""
-                self.console.print(f"    {i}. [green]{step.name}[/green] — [dim]{step.description}[/dim]{opt}")
+                self.console.print(f"    {i}. [green]{step.name}[/green] \u2014 [dim]{step.description}[/dim]{opt}")
         else:
             for skill in skills.list_skills():
                 self.console.print(f"  [green]{skill.name:<25}[/green] [dim]{skill.description[:55]}[/dim]")
@@ -377,7 +466,7 @@ class AgentREPL:
                     results = r["results"]
                     break
         if not results:
-            self.console.print("  [dim yellow]No exportable results found in conversation history.[/dim yellow]")
+            self.console.print("  [dim yellow]No exportable results in conversation history.[/dim yellow]")
             return
         export_tool = self.agent.tools.get("export_results_csv")
         if export_tool is None:
@@ -390,7 +479,7 @@ class AgentREPL:
         if "error" in out:
             self.console.print(f"  [red]Export error: {out['error']}[/red]")
         else:
-            self.console.print(f"  [green]Exported {out['rows']} rows to {out['filename']}[/green]")
+            self.console.print(f"  [green]Exported {out['rows']} rows \u2192 {out['filename']}[/green]")
 
     def _handle_sessions(self):
         """List saved sessions."""
@@ -415,3 +504,8 @@ class AgentREPL:
             self.console.print(f"  [red]Session not found: {session_id}[/red]")
         except Exception as e:
             self.console.print(f"  [red]Error loading session: {e}[/red]")
+
+
+def _status_dot(available: bool) -> str:
+    """Return a colored status indicator."""
+    return "[green]\u25cf[/green]" if available else "[dim]\u25cb[/dim]"

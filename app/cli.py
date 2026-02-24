@@ -232,9 +232,21 @@ Documentation: https://github.com/Darth-Hidious/PRISM
         ctx.exit()
         
     elif ctx.invoked_subcommand is None:
-        # Check for updates on REPL startup
+        from app.config.preferences import UserPreferences, run_onboarding
+
+        # First-run onboarding: ask for API keys
+        if UserPreferences.is_first_run() and not UserPreferences.has_llm_key():
+            try:
+                run_onboarding(console)
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Skipped setup. Run 'prism setup' later.[/dim]")
+                # Mark onboarding done so we don't keep asking
+                prefs = UserPreferences.load()
+                prefs.onboarding_complete = True
+                prefs.save()
+
+        # Check for updates
         try:
-            from app.config.preferences import UserPreferences
             prefs = UserPreferences.load()
             if prefs.check_updates:
                 from app import __version__
@@ -248,6 +260,8 @@ Documentation: https://github.com/Darth-Hidious/PRISM
                     )
         except Exception:
             pass
+
+        # Launch REPL
         try:
             backend = create_backend()
             repl = AgentREPL(backend=backend, enable_mcp=not no_mcp,
@@ -261,10 +275,10 @@ Documentation: https://github.com/Darth-Hidious/PRISM
                     return
             repl.run()
         except ValueError as e:
-            # Fall back to showing help if no agent provider configured
-            console.print(PRISM_BRAND)
+            # No LLM key configured — offer to set one up
+            console.print()
             console.print(f"[yellow]{e}[/yellow]")
-            console.print("\nRun [cyan]prism --help[/cyan] for available commands.")
+            console.print("\nRun [cyan]prism setup[/cyan] to configure an LLM provider, or [cyan]prism --help[/cyan] for all commands.")
 
 # ==============================================================================
 # 'serve' Command (MCP server mode)

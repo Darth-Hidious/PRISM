@@ -22,7 +22,7 @@ def test_setup_defaults(tmp_path, monkeypatch):
     assert prefs_path.exists()
 
     data = json.loads(prefs_path.read_text())
-    assert data["output_format"] == "parquet"
+    assert data["output_format"] == "csv"
     assert data["default_algorithm"] == "random_forest"
 
 
