@@ -20,10 +20,21 @@ Available tool categories:
 - Data: Search OPTIMADE databases, query Materials Project, export results to CSV
 - Visualization: Create plots and comparisons
 - System: Read/write files, search the web
+- Prediction: Predict material properties with ML models
+- Skills (multi-step workflows):
+  - acquire_materials: collect data from multiple sources
+  - predict_properties: predict properties using ML
+  - visualize_dataset: generate plots for datasets
+  - generate_report: compile reports
+  - select_materials: filter and rank candidates
+  - materials_discovery: end-to-end pipeline (acquire → predict → visualize → report)
+  - plan_simulations: generate simulation job plans
+
+For complex goals, prefer using skills over individual tools for efficiency.
 
 Work step by step:
 1. Break down the research goal
-2. Use tools to gather relevant data
+2. Use tools or skills to gather relevant data
 3. Analyze and synthesize findings
 4. Present a clear, well-structured answer with citations
 
@@ -43,6 +54,12 @@ def _make_tools(tools: Optional[ToolRegistry] = None, enable_mcp: bool = True) -
     if check_pyiron_available():
         from app.tools.simulation import create_simulation_tools
         create_simulation_tools(registry)
+    # Load built-in skills as tools
+    try:
+        from app.skills.registry import load_builtin_skills
+        load_builtin_skills().register_all_as_tools(registry)
+    except Exception:
+        pass
     if enable_mcp:
         try:
             from app.mcp_client import discover_and_register_mcp_tools

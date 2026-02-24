@@ -27,6 +27,8 @@ REPL_COMMANDS = {
     "/export": "Export last results to CSV — /export [filename]",
     "/sessions": "List saved sessions",
     "/load": "Load a saved session — /load SESSION_ID",
+    "/skill": "List skills or show details — /skill [name]",
+    "/plan": "Ask which skills apply to a goal — /plan <goal>",
 }
 
 
@@ -50,6 +52,12 @@ class AgentREPL:
                     create_simulation_tools(tools)
             except Exception:
                 pass
+        # Load built-in skills as tools
+        try:
+            from app.skills.registry import load_builtin_skills
+            load_builtin_skills().register_all_as_tools(tools)
+        except Exception:
+            pass
         # Optionally discover and register tools from external MCP servers
         if enable_mcp:
             try:
@@ -174,9 +182,59 @@ class AgentREPL:
                 self.console.print("[yellow]Usage: /load SESSION_ID[/yellow]")
             else:
                 self._handle_load(arg)
+        elif base_cmd == "/skill":
+            self._handle_skill(arg if arg else None)
+        elif base_cmd == "/plan":
+            if not arg:
+                self.console.print("[yellow]Usage: /plan <goal>[/yellow]")
+            else:
+                self._handle_plan(arg)
         else:
             self.console.print(f"[yellow]Unknown command: {base_cmd}. Type /help.[/yellow]")
         return False
+
+    def _handle_skill(self, name: Optional[str] = None):
+        """List skills or show details for a specific skill."""
+        try:
+            from app.skills.registry import load_builtin_skills
+            skills = load_builtin_skills()
+        except Exception:
+            self.console.print("[dim]No skills available.[/dim]")
+            return
+
+        if name:
+            try:
+                skill = skills.get(name)
+            except KeyError:
+                self.console.print(f"[yellow]Skill not found: {name}[/yellow]")
+                return
+            self.console.print(f"[bold cyan]{skill.name}[/bold cyan]  ({skill.category})")
+            self.console.print(f"  {skill.description}")
+            self.console.print(f"\n  [bold]Steps:[/bold]")
+            for i, step in enumerate(skill.steps, 1):
+                opt = " [dim](optional)[/dim]" if step.optional else ""
+                self.console.print(f"    {i}. [green]{step.name}[/green] — {step.description}{opt}")
+        else:
+            for skill in skills.list_skills():
+                self.console.print(f"  [green]{skill.name}[/green]  {skill.description[:60]}")
+
+    def _handle_plan(self, goal: str):
+        """Send a planning prompt to the LLM to suggest skills."""
+        prompt = (
+            f"The user wants to accomplish: {goal}\n\n"
+            "Available PRISM skills:\n"
+        )
+        try:
+            from app.skills.registry import load_builtin_skills
+            for skill in load_builtin_skills().list_skills():
+                prompt += f"- {skill.name}: {skill.description}\n"
+        except Exception:
+            pass
+        prompt += "\nWhich skill(s) should be used? Explain the recommended workflow."
+        try:
+            self._handle_streaming_response(prompt)
+        except Exception as e:
+            self.console.print(f"[red]Error: {e}[/red]")
 
     def _handle_mcp_status(self):
         """Show MCP server connection status and tools."""
