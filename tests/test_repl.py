@@ -108,11 +108,11 @@ class TestAgentREPL:
         from app.agent.spinner import Spinner
         assert Spinner is not None
 
-    def test_welcome_banner_has_prism_art(self):
+    def test_welcome_banner_has_hex_crystal(self):
         repl = _make_repl()
         output = StringIO()
         repl.console = Console(file=output, highlight=False, force_terminal=True)
         repl._show_welcome()
         text = output.getvalue()
-        # Block letters should contain block characters
-        assert "██" in text
+        # Hex crystal mascot should contain hex characters
+        assert "\u2b22" in text or "\u2b21" in text
