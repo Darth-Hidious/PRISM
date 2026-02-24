@@ -80,7 +80,13 @@ orchestration.
 curl -fsSL https://prism.marc27.com/install.sh | bash
 ```
 
-### Manual install
+### pip install (from GitHub)
+
+```bash
+pip install "prism-platform[all] @ git+https://github.com/Darth-Hidious/PRISM.git"
+```
+
+### From source
 
 ```bash
 git clone https://github.com/Darth-Hidious/PRISM.git

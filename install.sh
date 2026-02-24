@@ -3,8 +3,10 @@
 # Usage: curl -fsSL https://prism.marc27.com/install.sh | sh
 set -e
 
+REPO="https://github.com/Darth-Hidious/PRISM.git"
 PACKAGE="prism-platform"
-MIN_PYTHON="3.10"
+GIT_PACKAGE="$PACKAGE @ git+$REPO"
+MIN_PYTHON="3.11"
 
 info()  { printf '  \033[1;34m%s\033[0m %s\n' "$1" "$2"; }
 ok()    { printf '  \033[1;32m%s\033[0m %s\n' "$1" "$2"; }
@@ -68,17 +70,17 @@ fi
 
 # --- Install PRISM ---
 printf '\n'
-info "Installing:" "$PACKAGE..."
+info "Installing:" "PRISM from GitHub..."
 
 case "$INSTALLER" in
     uv)
-        uv tool install "$PACKAGE"
+        uv tool install "$GIT_PACKAGE"
         ;;
     pipx)
-        pipx install "$PACKAGE"
+        pipx install "$GIT_PACKAGE"
         ;;
     pipx-module)
-        $PYTHON -m pipx install "$PACKAGE"
+        $PYTHON -m pipx install "$GIT_PACKAGE"
         ;;
 esac
 
