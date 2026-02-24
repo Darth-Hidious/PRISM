@@ -221,5 +221,5 @@ See [LICENSE](LICENSE) for details. Commercial licensing: licensing@marc27.com
 ---
 
 <p align="center">
-  <img src="docs/assets/bimo-logo.svg" alt="Bimo Tech" height="40">
+  <img src="docs/assets/marc27-logo.svg" alt="MARC27" height="40">
 </p>
