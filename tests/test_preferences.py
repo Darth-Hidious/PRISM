@@ -19,7 +19,7 @@ def tmp_prefs(tmp_path, monkeypatch):
 class TestUserPreferences:
     def test_defaults(self):
         p = UserPreferences()
-        assert p.output_format == "parquet"
+        assert p.output_format == "csv"
         assert p.default_algorithm == "random_forest"
         assert p.compute_budget == "local"
         assert p.hpc_cores == 4
@@ -27,7 +27,7 @@ class TestUserPreferences:
 
     def test_load_defaults_when_missing(self, tmp_prefs):
         p = UserPreferences.load()
-        assert p.output_format == "parquet"
+        assert p.output_format == "csv"
 
     def test_save_and_load_roundtrip(self, tmp_prefs):
         p = UserPreferences(
@@ -58,7 +58,7 @@ class TestUserPreferences:
     def test_handles_corrupt_json(self, tmp_prefs):
         tmp_prefs.write_text("not valid json{{{")
         p = UserPreferences.load()
-        assert p.output_format == "parquet"  # falls back to defaults
+        assert p.output_format == "csv"  # falls back to defaults
 
     def test_save_creates_directory(self, tmp_path, monkeypatch):
         nested = tmp_path / "sub" / "dir"

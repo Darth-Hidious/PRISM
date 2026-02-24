@@ -42,27 +42,19 @@ pip install prism-platform
 Install additional capabilities as needed:
 
 ```bash
-# ML pipeline (scikit-learn, xgboost, lightgbm, optuna, matminer)
-pip install "prism-platform[ml]"
-
-# Atomistic simulation (pyiron)
-pip install "prism-platform[simulation]"
-
-# CALPHAD thermodynamics (pycalphad)
-pip install "prism-platform[calphad]"
-
-# Extra data sources (HuggingFace datasets for OMAT24)
-pip install "prism-platform[data]"
-
-# PDF/HTML reports (markdown, weasyprint)
-pip install "prism-platform[reports]"
-
-# Everything (ML + data + reports, no native compilation)
+# Everything — ML, CALPHAD, pyiron, data sources, reports
 pip install "prism-platform[all]"
 
-# Full (includes CALPHAD + simulation — requires CMake and C compiler)
-pip install "prism-platform[full]"
+# Individual extras:
+pip install "prism-platform[ml]"          # ML (scikit-learn, xgboost, matminer)
+pip install "prism-platform[simulation]"  # Atomistic simulation (pyiron)
+pip install "prism-platform[calphad]"     # Phase diagrams (pycalphad)
+pip install "prism-platform[data]"        # OMAT24, HuggingFace datasets
+pip install "prism-platform[reports]"     # PDF/HTML reports
 ```
+
+> **Note:** pyiron and pycalphad require Python 3.11–3.13. On Python 3.10 or 3.14+,
+> those packages are silently skipped and the rest installs normally.
 
 ## Development Install
 
@@ -74,18 +66,17 @@ pip install -e ".[dev]"
 
 ## Configuration
 
-Before using the agent commands, configure at least one LLM provider.
-Copy the example environment file and fill in your keys:
+On first launch, PRISM will walk you through API key setup:
 
 ```bash
-cp .env.example .env
-# Edit .env with your API keys
+prism   # starts onboarding wizard on first run
 ```
 
-Or configure interactively:
+Or configure manually:
 
 ```bash
-prism advanced configure
+cp .env.example .env    # edit with your API keys
+prism setup             # interactive preferences wizard
 ```
 
 ## Verification
