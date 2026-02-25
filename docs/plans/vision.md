@@ -33,7 +33,7 @@
 
 | Feature | Status |
 |---------|--------|
-| Federated search engine (40+ providers, auto-discovery, caching, circuit breakers) | DONE |
+| Federated search engine (20+ providers, auto-discovery, caching, circuit breakers) | DONE |
 | Provider auto-discovery from OPTIMADE consortium (2-hop chain, weekly cache) | DONE |
 | Layer 3 marketplace catalog (mp_native, aflow_native, mpds, omat24) | DONE |
 | Split cli/main.py into cli/commands/ — 17 command modules extracted | DONE |
