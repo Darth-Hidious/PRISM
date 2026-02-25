@@ -42,23 +42,23 @@ def test_build_registry_returns_providers(tmp_path):
 
 
 def test_marketplace_mpds_auth_config():
-    """MPDS auth config is present in marketplace.json (Layer 3)."""
+    """MPDS auth config is present in catalog.json."""
     import json
     from pathlib import Path
-    marketplace_path = Path(__file__).parent.parent / "app" / "search" / "marketplace.json"
-    data = json.loads(marketplace_path.read_text())
-    mpds = data["providers"]["mpds"]
+    catalog_path = Path(__file__).parent.parent / "app" / "plugins" / "catalog.json"
+    data = json.loads(catalog_path.read_text())
+    mpds = data["plugins"]["mpds"]
     assert mpds["auth"]["required"] is True
     assert mpds["auth"]["auth_type"] == "api_key"
 
 
 def test_marketplace_mp_native_has_auth():
-    """MP native provider has auth config in marketplace.json (Layer 3)."""
+    """MP native provider has auth config in catalog.json."""
     import json
     from pathlib import Path
-    marketplace_path = Path(__file__).parent.parent / "app" / "search" / "marketplace.json"
-    data = json.loads(marketplace_path.read_text())
-    mp_native = data["providers"]["mp_native"]
+    catalog_path = Path(__file__).parent.parent / "app" / "plugins" / "catalog.json"
+    data = json.loads(catalog_path.read_text())
+    mp_native = data["plugins"]["mp_native"]
     assert mp_native["auth"]["required"] is True
     assert mp_native["base_url"] == "https://api.materialsproject.org"
 

@@ -32,11 +32,12 @@ def test_layer2_overrides_are_optimade_only():
 
 
 def test_marketplace_native_providers_have_base_url():
-    """Native API providers in marketplace.json MUST have a base_url."""
-    path = Path(__file__).parent.parent / "app" / "search" / "marketplace.json"
+    """Native API providers in catalog.json MUST have a base_url."""
+    path = Path(__file__).parent.parent / "app" / "plugins" / "catalog.json"
     data = json.loads(path.read_text())
-    for pid, entry in data["providers"].items():
-        assert "base_url" in entry, f"marketplace {pid} missing base_url"
+    for pid, entry in data["plugins"].items():
+        if entry.get("type") == "provider":
+            assert "base_url" in entry, f"catalog provider {pid} missing base_url"
 
 
 def test_apply_overrides_merges_fields():

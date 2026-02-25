@@ -86,14 +86,15 @@ def test_from_registry_json_backward_compat(tmp_path):
 
 
 def test_load_platform_providers_merges_marketplace_and_user(tmp_path):
-    """load_platform_providers merges marketplace + user overrides."""
+    """load_platform_providers merges catalog + user overrides."""
     import json
     from app.search.providers.discovery import load_platform_providers
 
-    marketplace = {
-        "_meta": {"version": "1.0.0"},
-        "providers": {
+    catalog = {
+        "_meta": {"version": "2.0.0"},
+        "plugins": {
             "test_native": {
+                "type": "provider",
                 "name": "Test Native",
                 "api_type": "test_native",
                 "base_url": "https://test.org",
@@ -102,8 +103,8 @@ def test_load_platform_providers_merges_marketplace_and_user(tmp_path):
             }
         },
     }
-    mp_path = tmp_path / "marketplace.json"
-    mp_path.write_text(json.dumps(marketplace))
+    mp_path = tmp_path / "catalog.json"
+    mp_path.write_text(json.dumps(catalog))
 
     # No user overrides file
     user_path = tmp_path / "providers.yaml"

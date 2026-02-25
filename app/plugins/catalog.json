@@ -1,17 +1,18 @@
 {
   "_meta": {
-    "version": "1.0.0",
-    "description": "MARC27 platform provider catalog. Auth-gated, native API, and dataset providers available through the PRISM platform. These are Layer 3 sources — separate from OPTIMADE auto-discovery."
+    "version": "2.0.0",
+    "description": "MARC27 plugin catalog. Dev-time reference — production reads from platform API."
   },
-
-  "providers": {
+  "plugins": {
     "mp_native": {
+      "type": "provider",
       "name": "Materials Project (Native API)",
       "description": "Direct access to MP's REST API with richer query capabilities than OPTIMADE. Requires API key from materialsproject.org.",
       "api_type": "mp_native",
       "base_url": "https://api.materialsproject.org",
       "tier": 1,
       "enabled": true,
+      "runtime": "local",
       "auth": {
         "required": true,
         "auth_type": "api_key",
@@ -30,16 +31,15 @@
     },
 
     "aflow_native": {
+      "type": "provider",
       "name": "AFLOW (Native AFLUX API)",
       "description": "Automatic FLOW for materials discovery. 3.5M+ compounds via the AFLUX REST API. OPTIMADE endpoint is broken (HTTP 500), native API works.",
       "api_type": "aflow_native",
       "base_url": "https://aflow.org/API/aflux/",
       "tier": 1,
       "enabled": false,
-      "auth": {
-        "required": false,
-        "auth_type": "none"
-      },
+      "runtime": "local",
+      "auth": { "required": false, "auth_type": "none" },
       "capabilities": {
         "filterable_fields": ["elements", "formula", "nelements", "space_group", "band_gap", "energy_cell"],
         "returned_properties": ["formula", "elements", "band_gap", "energy_cell", "space_group", "Pearson_symbol", "crystal_system"]
@@ -51,12 +51,14 @@
     },
 
     "mpds": {
+      "type": "provider",
       "name": "Materials Platform for Data Science",
       "description": "Curated experimental and computational materials data. Requires paid MPDS subscription.",
       "api_type": "mpds_native",
       "base_url": "https://api.mpds.io",
       "tier": 2,
       "enabled": false,
+      "runtime": "local",
       "auth": {
         "required": true,
         "auth_type": "api_key",
@@ -73,16 +75,15 @@
     },
 
     "omat24": {
+      "type": "provider",
       "name": "Open Materials 2024 (Meta FAIR)",
       "description": "110M DFT calculations from Meta FAIR. Derived from Alexandria structures. ML interatomic potentials + relaxation trajectories.",
       "api_type": "dataset",
       "base_url": "https://huggingface.co/datasets/facebook/OMAT24",
       "tier": 1,
       "enabled": false,
-      "auth": {
-        "required": false,
-        "auth_type": "none"
-      },
+      "runtime": "local",
+      "auth": { "required": false, "auth_type": "none" },
       "capabilities": {
         "filterable_fields": ["elements", "formula"],
         "returned_properties": ["formula", "elements", "energy", "forces", "stress"]
@@ -90,6 +91,35 @@
       "platform": {
         "status": "coming_soon",
         "notes": "Requires DatasetProvider implementation + local download from HuggingFace. ~500GB full dataset."
+      }
+    },
+
+    "phase_stability_agent": {
+      "type": "agent",
+      "name": "Phase Stability Agent",
+      "description": "Specialized agent for phase diagram analysis, CALPHAD equilibrium calculations, and stability assessment of candidate materials.",
+      "runtime": "local",
+      "system_prompt": "You are a phase stability specialist. Use CALPHAD tools to compute phase diagrams and equilibrium states. Always verify thermodynamic consistency.",
+      "tools": ["search_materials", "phase_diagram", "equilibrium", "gibbs_energy", "export_results_csv"],
+      "skills": ["analyze_phases", "validate_dataset"],
+      "max_iterations": 15,
+      "enabled": false,
+      "platform": {
+        "status": "coming_soon",
+        "notes": "Requires pycalphad. First marketplace agent."
+      }
+    },
+
+    "gnn_predictor": {
+      "type": "bundle",
+      "name": "GNN Property Predictor",
+      "description": "Graph neural network models for materials property prediction. Includes MEGNet and CGCNN architectures.",
+      "runtime": "managed",
+      "contains": ["algorithm:megnet", "algorithm:cgcnn", "tool:gnn_predict"],
+      "enabled": false,
+      "platform": {
+        "status": "coming_soon",
+        "notes": "Requires torch + torch_geometric. Runs on MARC27 managed GPU infrastructure."
       }
     }
   }
