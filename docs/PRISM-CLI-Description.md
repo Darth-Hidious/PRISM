@@ -38,7 +38,7 @@ framework over stdio or HTTP transports.
 |---------|---------|
 | `prism` | Launch the interactive REPL. On first run, triggers onboarding to configure API keys and workflow preferences. |
 | `prism run "<goal>"` | Run the autonomous agent to achieve a stated goal. Supports `--max-iterations`, `--approve-all`, `--model`, and `--resume` flags. |
-| `prism search` | Federated search across 40+ OPTIMADE-compliant materials databases. Supports filtering by elements, formula, band gap, formation energy, space group, and other properties. No LLM required. |
+| `prism search` | Federated search across 20+ OPTIMADE-compliant materials databases. Supports filtering by elements, formula, band gap, formation energy, space group, and other properties. No LLM required. |
 | `prism serve` | Start PRISM as an MCP server (stdio or HTTP transport) for integration with external AI applications. |
 
 ### 2.2 Data Commands
@@ -112,7 +112,7 @@ marked as expensive or irreversible.
 
 ### 3.1 Materials Data Tools
 
-- **search_materials** — Federated search across 40+ OPTIMADE providers with
+- **search_materials** — Federated search across 20+ OPTIMADE providers with
   parallel query execution, result fusion, deduplication, and provenance
   tracking.
 - **query_materials_project** — Native Materials Project API queries (requires
@@ -266,7 +266,7 @@ Subscription management, billing, and access control are handled by MARC27.
 
 ## 7. Federated Search Architecture
 
-PRISM's search engine federates queries across 40+ OPTIMADE-compliant materials
+PRISM's search engine federates queries across 20+ OPTIMADE-compliant materials
 databases in parallel. Results are fused with full provenance tracking
 (source attribution per material and per property value).
 

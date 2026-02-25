@@ -219,7 +219,7 @@ USER PROMPT: "Find alloys with W and Rh that are stable, and phase stability"
 
 ### `app/search/` — FEDERATED SEARCH ENGINE (v2.5 NEW)
 
-**What it does:** Queries 40+ materials databases via OPTIMADE, fuses results, caches, circuit-breaks. Full docs: `docs/search.md`.
+**What it does:** Queries 20+ materials databases via OPTIMADE, fuses results, caches, circuit-breaks. Full docs: `docs/search.md`.
 
 | File/Dir | Owns | Pipeline Stage |
 |----------|------|---------------|
@@ -239,7 +239,7 @@ USER PROMPT: "Find alloys with W and Rh that are stable, and phase stability"
 | `cache/engine.py` | `SearchCache` — in-memory + disk, query hash keying, TTL | **Stage 1** (caching) |
 | `resilience/circuit_breaker.py` | `HealthManager`, `ProviderHealth` — per-provider circuit breaker | **Stage 1** (resilience) |
 
-**EXISTS:** Complete federated search: auto-discovery, 3-layer registry, query translation, async fan-out, result fusion, caching, circuit breakers, 40+ providers live. Catalog moved to unified `app/plugins/catalog.json`.
+**EXISTS:** Complete federated search: auto-discovery, 3-layer registry, query translation, async fan-out, result fusion, caching, circuit breakers, 20+ providers live. Catalog moved to unified `app/plugins/catalog.json`.
 **MISSING:** `AflowProvider` (AFLUX native API — catalog entry exists, needs provider impl). `DatasetProvider` base class (for OMAT24 etc). Marketplace API backend (currently reads catalog.json locally).
 
 ---
@@ -321,7 +321,7 @@ USER PROMPT: "Find alloys with W and Rh that are stable, and phase stability"
 
 | Stage | Folder(s) | Status |
 |-------|-----------|--------|
-| **1. Data Acquisition** | `app/search/` (federated), `app/data/` (collectors), `app/tools/data.py`, `app/tools/search.py`, `app/skills/acquisition.py` | **Complete (v2.5)** — Federated search engine (40+ OPTIMADE providers, MP native, auto-discovery, 3-layer registry, circuit breakers, caching). Also: OMAT24, literature, patents collectors |
+| **1. Data Acquisition** | `app/search/` (federated), `app/data/` (collectors), `app/tools/data.py`, `app/tools/search.py`, `app/skills/acquisition.py` | **Complete (v2.5)** — Federated search engine (20+ OPTIMADE providers, MP native, auto-discovery, 3-layer registry, circuit breakers, caching). Also: OMAT24, literature, patents collectors |
 | **2. Curation** | `app/data/normalizer.py`, `app/data/store.py`, `app/db/` | **Exists (basic)** — normalize + Parquet store. Missing: user pref for DB/CSV, schema enforcement |
 | **3. ML Prediction** | `app/ml/`, `app/tools/prediction.py`, `app/skills/prediction.py` | **Complete (v2.5.1)** — 5 algorithms, matminer (132 Magpie features) + built-in fallback (22), pre-trained GNNs (M3GNet, MEGNet). Missing: interactive property selection, custom GNNs, surrogates |
 | **4. Visualization** | `app/tools/visualization.py`, `app/skills/visualization.py`, `app/ml/viz.py` | **Exists** — scatter, heatmap, structure. Missing: phase diagrams in viz, correlation matrices |
@@ -344,7 +344,7 @@ USER PROMPT: "Find alloys with W and Rh that are stable, and phase stability"
 
 ### Done in v2.5 / v2.5.1
 - ~~Split `cli/main.py` into `cli/commands/`~~ — **18 command modules extracted**
-- ~~Federated search engine~~ — **40+ providers, auto-discovery, caching, circuit breakers**
+- ~~Federated search engine~~ — **20+ providers, auto-discovery, caching, circuit breakers**
 - ~~`prism search` command with full flags~~ — **elements, formula, band-gap, providers, --refresh**
 - ~~Provider auto-discovery from OPTIMADE consortium~~ — **2-hop chain, weekly cache**
 - ~~Layer 3 marketplace catalog~~ — **mp_native, aflow_native, mpds, omat24**
