@@ -4,6 +4,7 @@ import os
 from typing import Dict, Generator, List, Optional
 from openai import OpenAI
 from app.agent.backends.base import Backend
+from app.agent.models import get_model_config
 from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete
 
 
@@ -16,10 +17,11 @@ class OpenAIBackend(Backend):
             kwargs["base_url"] = base_url
         self.client = OpenAI(**kwargs)
         self.model = model or os.getenv("PRISM_MODEL", "gpt-4o")
+        self.model_config = get_model_config(self.model)
 
     def complete(self, messages: List[Dict], tools: List[dict], system_prompt: Optional[str] = None) -> AgentResponse:
         formatted_messages = self._format_messages(messages, system_prompt)
-        kwargs = {"model": self.model, "messages": formatted_messages}
+        kwargs = {"model": self.model, "max_tokens": self.model_config.default_max_tokens, "messages": formatted_messages}
         if tools:
             kwargs["tools"] = self._format_tools(tools)
         response = self.client.chat.completions.create(**kwargs)
@@ -27,7 +29,7 @@ class OpenAIBackend(Backend):
 
     def complete_stream(self, messages: List[Dict], tools: List[dict], system_prompt: Optional[str] = None) -> Generator:
         formatted_messages = self._format_messages(messages, system_prompt)
-        kwargs = {"model": self.model, "messages": formatted_messages, "stream": True}
+        kwargs = {"model": self.model, "max_tokens": self.model_config.default_max_tokens, "messages": formatted_messages, "stream": True}
         if tools:
             kwargs["tools"] = self._format_tools(tools)
         stream = self.client.chat.completions.create(**kwargs)

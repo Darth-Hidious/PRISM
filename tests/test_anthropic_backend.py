@@ -49,7 +49,11 @@ class TestAnthropicBackend:
         backend = AnthropicBackend(api_key="test-key")
         backend.complete(messages=[{"role": "user", "content": "hi"}], tools=[], system_prompt="Be helpful")
         call_kwargs = client.messages.create.call_args
-        assert call_kwargs.kwargs.get("system") == "Be helpful"
+        system = call_kwargs.kwargs.get("system")
+        assert isinstance(system, list)
+        assert system[0]["type"] == "text"
+        assert system[0]["text"] == "Be helpful"
+        assert system[0]["cache_control"] == {"type": "ephemeral"}
 
     @patch("app.agent.backends.anthropic_backend.Anthropic")
     def test_complete_stream_text(self, mock_cls):

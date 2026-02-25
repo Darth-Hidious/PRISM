@@ -4,6 +4,7 @@ import os
 from typing import Dict, Generator, List, Optional
 from anthropic import Anthropic
 from app.agent.backends.base import Backend
+from app.agent.models import get_model_config
 from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete
 
 
@@ -13,20 +14,33 @@ class AnthropicBackend(Backend):
     def __init__(self, model: str = None, api_key: str = None):
         self.client = Anthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
         self.model = model or os.getenv("PRISM_MODEL", "claude-sonnet-4-20250514")
+        self.model_config = get_model_config(self.model)
 
     def complete(self, messages: List[Dict], tools: List[dict], system_prompt: Optional[str] = None) -> AgentResponse:
-        kwargs = {"model": self.model, "max_tokens": 4096, "messages": self._format_messages(messages)}
+        kwargs = {"model": self.model, "max_tokens": self.model_config.default_max_tokens, "messages": self._format_messages(messages)}
         if system_prompt:
-            kwargs["system"] = system_prompt
+            kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         if tools:
             kwargs["tools"] = tools
         response = self.client.messages.create(**kwargs)
         return self._parse_response(response)
 
     def complete_stream(self, messages: List[Dict], tools: List[dict], system_prompt: Optional[str] = None) -> Generator:
-        kwargs = {"model": self.model, "max_tokens": 4096, "messages": self._format_messages(messages)}
+        kwargs = {"model": self.model, "max_tokens": self.model_config.default_max_tokens, "messages": self._format_messages(messages)}
         if system_prompt:
-            kwargs["system"] = system_prompt
+            kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         if tools:
             kwargs["tools"] = tools
         with self.client.messages.stream(**kwargs) as stream:
