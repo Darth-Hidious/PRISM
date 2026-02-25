@@ -51,7 +51,12 @@ class OptimadeProvider(Provider):
         return self._parse_response(results, filter_string)
 
     def _parse_response(self, results: dict, filter_string: str) -> list[Material]:
-        """Parse the nested OptimadeClient response into Material objects."""
+        """Parse the nested OptimadeClient response into Material objects.
+
+        Raises ``RuntimeError`` when the OPTIMADE client captured an error
+        from the provider (e.g. 404, 500).  This propagates up so the
+        circuit breaker can record the failure.
+        """
         materials = []
         endpoint_key = "structures"
 
@@ -60,7 +65,14 @@ class OptimadeProvider(Provider):
 
         for _filter, providers_data in results[endpoint_key].items():
             for _url, response in providers_data.items():
+                # Detect errors swallowed by OptimadeClient
+                errors = response.get("errors", [])
                 entries = response.get("data", [])
+
+                if errors and not entries:
+                    # Provider returned only errors — propagate as failure
+                    raise RuntimeError(f"Provider {self.id} error: {errors[0][:200]}")
+
                 if isinstance(entries, list):
                     for entry in entries:
                         try:
@@ -101,7 +113,10 @@ class OptimadeProvider(Provider):
         extra = {}
         for key, val in attrs.items():
             if key.startswith("_") and val is not None:
-                extra[key] = PropertyValue(value=val, source=source)
+                try:
+                    extra[key] = PropertyValue(value=val, source=source)
+                except Exception:
+                    logger.debug("Skipping unparseable field %s for %s", key, entry_id)
 
         return Material(
             id=entry_id,

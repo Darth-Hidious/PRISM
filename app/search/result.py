@@ -1,7 +1,7 @@
 """Result models for materials search — every property carries provenance."""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -10,7 +10,7 @@ from app.search.query import MaterialSearchQuery
 
 class PropertyValue(BaseModel):
     """A single property with tracked provenance."""
-    value: float | str | list | None = None
+    value: float | str | list | dict[str, Any] | None = None
     source: str = ""
     method: str | None = None
     unit: str | None = None
