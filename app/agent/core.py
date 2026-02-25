@@ -71,7 +71,8 @@ class AgentCore:
                  auto_approve: bool = True):
         self.backend = backend
         self.tools = tools
-        self.system_prompt = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
+        base_prompt = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
+        self.system_prompt = self._inject_capabilities(base_prompt)
         self.max_iterations = max_iterations
         self.history: List[Dict] = []
         self.approval_callback = approval_callback
@@ -80,6 +81,18 @@ class AgentCore:
         self._total_usage = UsageInfo()
         self._result_store: dict = {}  # call_id -> full serialized result (RLM pattern)
         self._recent_calls: list = []
+
+    @staticmethod
+    def _inject_capabilities(prompt: str) -> str:
+        """Append a live capability summary to the system prompt."""
+        try:
+            from app.tools.capabilities import capabilities_summary
+            summary = capabilities_summary()
+            if summary:
+                return prompt + "\n\n--- AVAILABLE RESOURCES ---\n" + summary
+        except Exception:
+            pass
+        return prompt
 
     def _execute_tool(self, tool, tool_args: dict) -> dict:
         """Execute a tool, injecting scratchpad for show_scratchpad."""

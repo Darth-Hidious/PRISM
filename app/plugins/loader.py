@@ -7,6 +7,9 @@ from typing import Optional
 
 from app.plugins.registry import PluginRegistry
 
+# Module-level record of loaded plugins (for capability discovery)
+_loaded_plugins: list[str] = []
+
 
 def discover_entry_point_plugins(registry: PluginRegistry) -> list[str]:
     """Discover plugins registered via pip entry points (group='prism.plugins')."""
@@ -62,6 +65,8 @@ def discover_local_plugins(
 
 def discover_all_plugins(registry: PluginRegistry) -> list[str]:
     """Run both entry-point and local discovery."""
+    global _loaded_plugins
     loaded = discover_entry_point_plugins(registry)
     loaded.extend(discover_local_plugins(registry))
+    _loaded_plugins = loaded
     return loaded

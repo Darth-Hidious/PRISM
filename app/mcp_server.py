@@ -143,6 +143,12 @@ def _register_resources(mcp):
             default=str,
         )
 
+    @mcp.resource("prism://capabilities")
+    def capabilities_resource() -> str:
+        """Live snapshot of all available PRISM capabilities."""
+        from app.tools.capabilities import discover_capabilities
+        return json.dumps(discover_capabilities(), default=str)
+
     @mcp.resource("prism://skills")
     def list_skills_resource() -> str:
         """List available PRISM skills with their steps."""
