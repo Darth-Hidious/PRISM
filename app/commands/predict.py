@@ -14,9 +14,12 @@ def predict(formula, prop, algorithm, all_properties):
     console = Console()
     from app.ml.predictor import Predictor
     from app.ml.registry import ModelRegistry
+    from app.ml.features import get_feature_backend
 
     predictor = Predictor()
     registry = ModelRegistry()
+
+    console.print(f"[dim]Feature backend: {get_feature_backend()}[/dim]")
 
     if all_properties:
         models = registry.list_models()
@@ -38,6 +41,6 @@ def predict(formula, prop, algorithm, all_properties):
     else:
         result = predictor.predict(formula, prop, algorithm)
         if "prediction" in result:
-            console.print(f"[bold]{formula}[/bold] → {prop} = [green]{result['prediction']:.4f}[/green] ({algorithm})")
+            console.print(f"[bold]{formula}[/bold] -> {prop} = [green]{result['prediction']:.4f}[/green] ({algorithm})")
         else:
             console.print(f"[red]{result.get('error', 'Unknown error')}[/red]")

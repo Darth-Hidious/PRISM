@@ -40,6 +40,8 @@ We gratefully acknowledge the following communities and teams.
 | [Optuna](https://optuna.org/) | Hyperparameter optimization framework | MIT |
 | [pymatgen](https://pymatgen.org/) | Materials analysis library (Materials Project) | MIT |
 | [matminer](https://hackingmaterials.lbl.gov/matminer/) | Materials feature engineering (LBNL) | MIT |
+| [MatGL](https://matgl.ai/) | Pre-trained GNNs: M3GNet, MEGNet, CHGNet, TensorNet (UC San Diego) | BSD 3-Clause |
+| [CrabNet](https://github.com/anthony-wang/CrabNet) | Transformer model for composition-based property prediction | MIT |
 
 ## Core Libraries
 

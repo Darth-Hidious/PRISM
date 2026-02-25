@@ -8,11 +8,14 @@ class AlgorithmRegistry:
     def __init__(self):
         self._algorithms: Dict[str, dict] = {}
 
-    def register(self, name: str, description: str, factory: Callable) -> None:
+    def register(self, name: str, description: str, factory: Callable,
+                 pretrained: bool = False, requires_structure: bool = False) -> None:
         self._algorithms[name] = {
             "name": name,
             "description": description,
             "factory": factory,
+            "pretrained": pretrained,
+            "requires_structure": requires_structure,
         }
 
     def get(self, name: str):
@@ -25,18 +28,27 @@ class AlgorithmRegistry:
 
     def list_algorithms(self) -> List[dict]:
         return [
-            {"name": v["name"], "description": v["description"]}
+            {
+                "name": v["name"],
+                "description": v["description"],
+                "pretrained": v.get("pretrained", False),
+                "requires_structure": v.get("requires_structure", False),
+            }
             for v in self._algorithms.values()
         ]
 
     def has(self, name: str) -> bool:
         return name in self._algorithms
 
+    def is_pretrained(self, name: str) -> bool:
+        return self._algorithms.get(name, {}).get("pretrained", False)
+
 
 def get_default_registry() -> AlgorithmRegistry:
     """Pre-loaded with the built-in algorithms."""
     reg = AlgorithmRegistry()
 
+    # -- Composition-based (sklearn, need training) --------------------------
     reg.register(
         "random_forest",
         "Random Forest Regressor",
@@ -83,6 +95,22 @@ def get_default_registry() -> AlgorithmRegistry:
             ),
         )
     except ImportError:
+        pass
+
+    # -- Pre-trained GNNs (matgl, no training needed) ------------------------
+    try:
+        from app.ml.pretrained import PRETRAINED_MODELS, check_matgl_available
+
+        if check_matgl_available():
+            for model_name, info in PRETRAINED_MODELS.items():
+                reg.register(
+                    model_name,
+                    info["description"],
+                    factory=lambda mid=info["model_id"]: __import__("matgl").load_model(mid),
+                    pretrained=True,
+                    requires_structure=True,
+                )
+    except Exception:
         pass
 
     return reg
