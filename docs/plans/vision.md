@@ -56,12 +56,12 @@
 - AflowProvider — AFLUX native API adapter (marketplace entry exists, needs provider impl)
 - Expose OMAT24 collector as agent tool
 - Multi-objective Pareto selection
-- Correlation matrix visualization
+- ~~Correlation matrix visualization~~ — already exists (`plot_correlation_matrix`)
 - `prism plugin install` command
 - Domain-specific validation rules
 - Better downstream candidate list formatting
 - Automated figure captioning (LLM describes charts)
-- Marketplace API backend (replace local catalog with platform API call)
+- Marketplace API backend (replace local `catalog.json` with platform API call)
 
 ## Next Updates (new deps or APIs)
 
