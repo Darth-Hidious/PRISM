@@ -210,13 +210,16 @@ def apply_overrides(
     discovered: list[dict],
     overrides: dict[str, dict],
     defaults: dict,
+    url_corrections: dict[str, str] | None = None,
 ) -> list[dict]:
     """Apply PRISM overrides + defaults onto discovered endpoints.
 
     - Discovered entries get defaults applied first, then per-provider overrides.
     - Native API entries in overrides that aren't in discovered are injected.
     - base_url from discovery is NEVER overwritten by overrides (except native providers).
+    - url_corrections: explicit fixes for consortium URLs known to be wrong.
     """
+    corrections = url_corrections or {}
     result_map: dict[str, dict] = {}
 
     for ep in discovered:
@@ -233,6 +236,9 @@ def apply_overrides(
                 merged[key].update(val)
             else:
                 merged[key] = val
+        # Apply URL correction if consortium URL is known-wrong
+        if ep["id"] in corrections:
+            merged["base_url"] = corrections[ep["id"]]
         result_map[ep["id"]] = merged
 
     # Apply per-provider overrides

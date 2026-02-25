@@ -8,6 +8,10 @@
     "mcloud": "https://www.materialscloud.org/optimade/main/v1/links"
   },
 
+  "url_corrections": {
+    "mpdd": "http://mpddoptimade.phaseslab.com"
+  },
+
   "defaults": {
     "api_type": "optimade",
     "api_version": "v1",
@@ -112,7 +116,7 @@
         "returned_properties": ["formula", "elements", "band_gap", "formation_energy", "energy_above_hull", "bulk_modulus", "is_metal", "is_stable"]
       }
     },
-    "odbx.odbx-gnome": {
+    "odbx.gnome": {
       "tier": 1,
       "data_type": "ml_predicted",
       "capabilities": {
@@ -148,10 +152,10 @@
       }
     },
     "jarvis": {
-      "tier": 4,
-      "enabled": false,
+      "tier": 2,
+      "enabled": true,
       "reliability": {
-        "known_quirks": ["OPTIMADE endpoint returns 0 structures"]
+        "known_quirks": ["Previously returned 0 structures, fixed as of 2025"]
       }
     },
     "mpds": {
