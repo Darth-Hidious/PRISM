@@ -194,7 +194,7 @@ def is_cache_fresh(cache: dict, max_age_days: float = CACHE_MAX_AGE_DAYS) -> boo
 
 
 # ------------------------------------------------------------------
-# Overrides
+# Overrides (Layer 2)
 # ------------------------------------------------------------------
 
 _OVERRIDES_PATH = Path(__file__).parent / "provider_overrides.json"
@@ -204,6 +204,79 @@ def load_overrides(path: Path | None = None) -> dict:
     """Load bundled provider overrides."""
     p = path or _OVERRIDES_PATH
     return json.loads(p.read_text())
+
+
+# ------------------------------------------------------------------
+# Marketplace / Platform Providers (Layer 3)
+# ------------------------------------------------------------------
+
+_MARKETPLACE_PATH = Path(__file__).parent.parent / "marketplace.json"
+_USER_PROVIDERS_PATH = Path.home() / ".prism" / "providers.yaml"
+
+
+def load_marketplace(path: Path | None = None) -> dict:
+    """Load the MARC27 marketplace catalog."""
+    p = path or _MARKETPLACE_PATH
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def load_user_providers(path: Path | None = None) -> dict:
+    """Load user provider overrides from ~/.prism/providers.yaml.
+
+    Returns dict of provider_id -> config. User entries win over everything.
+    """
+    import yaml  # noqa: delay import — yaml is optional
+
+    p = path or _USER_PROVIDERS_PATH
+    if not p.exists():
+        return {}
+    try:
+        data = yaml.safe_load(p.read_text())
+        return data.get("providers", {}) if isinstance(data, dict) else {}
+    except Exception:
+        logger.debug("Failed to load user providers from %s", p)
+        return {}
+
+
+def load_platform_providers(
+    marketplace_path: Path | None = None,
+    user_path: Path | None = None,
+) -> list[dict]:
+    """Load Layer 3 providers: marketplace catalog + user overrides.
+
+    Only returns entries that are enabled. Marketplace entries provide
+    the base config; user providers.yaml can override any field.
+    """
+    catalog = load_marketplace(marketplace_path)
+    marketplace_providers = catalog.get("providers", {})
+
+    # Try loading user overrides (yaml is optional dep)
+    user_providers: dict = {}
+    try:
+        user_providers = load_user_providers(user_path)
+    except ImportError:
+        logger.debug("PyYAML not installed, skipping user providers.yaml")
+
+    # Merge: marketplace base + user overrides on top
+    result: list[dict] = []
+    all_ids = set(marketplace_providers.keys()) | set(user_providers.keys())
+
+    for pid in all_ids:
+        entry = {}
+        if pid in marketplace_providers:
+            entry = dict(marketplace_providers[pid])
+        if pid in user_providers:
+            for key, val in user_providers[pid].items():
+                entry[key] = val
+        entry.setdefault("id", pid)
+        result.append(entry)
+
+    return result
 
 
 def apply_overrides(
