@@ -1,0 +1,170 @@
+{
+  "_meta": {
+    "version": "2.0.0",
+    "description": "PRISM-specific overrides. OPTIMADE base_urls come from auto-discovery, not here."
+  },
+
+  "fallback_index_urls": {
+    "mcloud": "https://www.materialscloud.org/optimade/main/v1/links"
+  },
+
+  "defaults": {
+    "api_type": "optimade",
+    "api_version": "v1",
+    "tier": 3,
+    "enabled": true,
+    "behavior": {
+      "timeout_ms": 10000,
+      "max_results": 1000,
+      "use_https": true
+    },
+    "capabilities": {
+      "filterable_fields": ["elements", "formula", "nelements", "space_group"],
+      "returned_properties": ["formula", "elements", "nelements", "space_group", "lattice_vectors", "cartesian_site_positions", "species", "species_at_sites"],
+      "supports_pagination": true
+    }
+  },
+
+  "overrides": {
+    "nmd": {
+      "tier": 1,
+      "reliability": { "known_quirks": [] }
+    },
+    "mpdd": {
+      "tier": 1,
+      "behavior": { "use_https": false },
+      "capabilities": {
+        "provider_specific_fields": [
+          "_mpdd_crystal_system", "_mpdd_sipfenn_formation_energy", "_mpdd_sipfenn_stability"
+        ]
+      },
+      "reliability": {
+        "validation_score": "41/46",
+        "known_quirks": ["Uses HTTP not HTTPS", "Timeout issues on large queries"]
+      }
+    },
+    "alexandria.alexandria-pbe": {
+      "tier": 1,
+      "capabilities": {
+        "provider_specific_fields": [
+          "_alexandria_formation_energy_per_atom", "_alexandria_band_gap",
+          "_alexandria_hull_distance"
+        ]
+      },
+      "reliability": { "validation_score": "57/57" }
+    },
+    "alexandria.alexandria-pbesol": {
+      "tier": 1,
+      "capabilities": {
+        "provider_specific_fields": [
+          "_alexandria_formation_energy_per_atom", "_alexandria_band_gap",
+          "_alexandria_scan_total_energy"
+        ]
+      },
+      "reliability": { "validation_score": "57/57" }
+    },
+    "oqmd": {
+      "tier": 1,
+      "behavior": { "timeout_ms": 15000, "max_results": 500 },
+      "capabilities": {
+        "provider_specific_fields": [
+          "_oqmd_band_gap", "_oqmd_formation_energy", "_oqmd_stability"
+        ]
+      },
+      "reliability": {
+        "validation_score": "28/37",
+        "known_quirks": ["Returns IDs as integers", "Very slow on complex queries"]
+      }
+    },
+    "cod": {
+      "tier": 1,
+      "data_type": "experimental",
+      "reliability": {
+        "validation_score": "57/61",
+        "known_quirks": ["Mixed occupancy species handling"]
+      }
+    },
+    "mp": {
+      "tier": 1,
+      "capabilities": {
+        "provider_specific_fields": ["_mp_chemical_system", "_mp_stability"]
+      },
+      "reliability": {
+        "validation_score": "55/56",
+        "known_quirks": ["Returns species_at_sites only"]
+      }
+    },
+    "mp_native": {
+      "api_type": "mp_native",
+      "name": "Materials Project (Native API)",
+      "base_url": "https://api.materialsproject.org",
+      "tier": 1,
+      "enabled": true,
+      "auth": {
+        "required": true,
+        "auth_type": "api_key",
+        "auth_header": "X-API-KEY",
+        "auth_env_var": "MP_API_KEY",
+        "obtain_url": "https://materialsproject.org/dashboard"
+      },
+      "capabilities": {
+        "filterable_fields": ["elements", "formula", "nelements", "space_group", "band_gap", "formation_energy", "energy_above_hull", "bulk_modulus", "is_metal"],
+        "returned_properties": ["formula", "elements", "band_gap", "formation_energy", "energy_above_hull", "bulk_modulus", "is_metal", "is_stable"]
+      }
+    },
+    "odbx.odbx-gnome": {
+      "tier": 1,
+      "data_type": "ml_predicted",
+      "capabilities": {
+        "provider_specific_fields": [
+          "_gnome_bandgap", "_gnome_formation_energy_per_atom"
+        ]
+      },
+      "reliability": { "validation_score": "44/45" }
+    },
+    "mcloud.mc3d-pbe-v1": {
+      "tier": 2,
+      "reliability": { "validation_score": "44/50" }
+    },
+    "mcloud.mc2d": {
+      "tier": 2,
+      "reliability": { "validation_score": "44/50" }
+    },
+    "tcod": {
+      "tier": 2,
+      "reliability": { "validation_score": "46/50" }
+    },
+    "twodmatpedia": {
+      "tier": 2,
+      "behavior": { "use_https": false },
+      "reliability": { "validation_score": "57/57" }
+    },
+    "aflow": {
+      "tier": 4,
+      "enabled": false,
+      "reliability": {
+        "validation_score": "7/13",
+        "known_quirks": ["OPTIMADE endpoint barely functional", "Frequent HTTP 500"]
+      }
+    },
+    "jarvis": {
+      "tier": 4,
+      "enabled": false,
+      "reliability": {
+        "known_quirks": ["OPTIMADE endpoint returns 0 structures"]
+      }
+    },
+    "mpds": {
+      "tier": 3,
+      "enabled": false,
+      "auth": {
+        "required": true,
+        "auth_type": "api_key",
+        "auth_env_var": "MPDS_API_KEY"
+      },
+      "reliability": {
+        "known_quirks": ["Subscription required", "Rate limited"]
+      }
+    }
+  }
+}

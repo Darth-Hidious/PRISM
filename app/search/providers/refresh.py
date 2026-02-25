@@ -108,40 +108,20 @@ def merge_registries(
 
 
 async def refresh_registry(registry_path: Path | None = None) -> list[dict]:
-    """Fetch latest providers from OPTIMADE consortium, merge with local registry.
+    """Fetch latest providers from OPTIMADE consortium via 2-hop discovery.
 
-    Returns the list of changes applied (empty list if nothing changed or on
-    network failure).
+    Delegates to discovery.py. Returns the list of discovered endpoints
+    (empty list on network failure).
     """
-    from app.search.providers.endpoint import _REGISTRY_PATH
+    from app.search.providers.discovery import discover_providers, save_cache, load_overrides
 
-    path = registry_path or _REGISTRY_PATH
-
-    # Fetch from primary, fall back to GitHub mirror.
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(PROVIDERS_INDEX_URL)
-            resp.raise_for_status()
-            discovered = parse_providers_response(resp.json())
-        except Exception:
-            logger.warning("Failed to fetch from primary URL, trying fallback")
-            try:
-                resp = await client.get(PROVIDERS_FALLBACK_URL)
-                resp.raise_for_status()
-                discovered = parse_providers_response(resp.json())
-            except Exception:
-                logger.error(
-                    "Failed to refresh provider registry from any source"
-                )
-                return []
-
-    data = json.loads(path.read_text())
-    existing = data["providers"]
-    merged, changes = merge_registries(existing, discovered)
-
-    if changes:
-        data["providers"] = merged
-        path.write_text(json.dumps(data, indent=2))
-        logger.info("Registry updated: %d changes", len(changes))
-
-    return changes
+    try:
+        overrides = load_overrides()
+        fallbacks = overrides.get("fallback_index_urls", {})
+        endpoints = await discover_providers(fallback_index_urls=fallbacks)
+        if endpoints:
+            save_cache(endpoints)
+        return endpoints
+    except Exception:
+        logger.error("Failed to refresh provider registry from any source")
+        return []

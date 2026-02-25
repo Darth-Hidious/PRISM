@@ -1,8 +1,6 @@
-"""Provider endpoint configuration — loaded from provider_registry.json."""
+"""Provider endpoint configuration models."""
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -58,11 +56,11 @@ class ProviderEndpoint(BaseModel):
     reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
 
 
-_REGISTRY_PATH = Path(__file__).parent / "provider_registry.json"
+def load_registry():
+    """Legacy compat -- returns list of ProviderEndpoint from the new registry.
 
-
-def load_registry(path: Path | None = None) -> list[ProviderEndpoint]:
-    """Load all provider endpoints from the registry JSON."""
-    p = path or _REGISTRY_PATH
-    data = json.loads(p.read_text())
-    return [ProviderEndpoint.model_validate(entry) for entry in data["providers"]]
+    Prefer build_registry() directly.
+    """
+    from app.search.providers.registry import build_registry
+    reg = build_registry()
+    return [p._endpoint for p in reg.get_all() if hasattr(p, "_endpoint")]
