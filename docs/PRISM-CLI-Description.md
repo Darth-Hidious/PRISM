@@ -120,8 +120,6 @@ marked as expensive or irreversible.
   API key).
 - **export_results_csv** — Export search results to CSV files.
 - **import_dataset** — Import external data files into the local data store.
-- **query_omat24** — Query Meta's Open Materials 2024 dataset (110M DFT
-  calculations) via HuggingFace streaming. Filter by elements or formula.
 
 ### 3.2 Literature and Patent Tools
 

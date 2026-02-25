@@ -141,33 +141,6 @@ def _export_results_csv(**kwargs) -> dict:
         return {"error": str(e)}
 
 
-def _query_omat24(**kwargs) -> dict:
-    """Query Meta's OMAT24 dataset (110M DFT calculations) via HuggingFace."""
-    elements = kwargs.get("elements")
-    formula = kwargs.get("formula")
-    max_results = kwargs.get("max_results", 50)
-
-    try:
-        from app.data.omat24_collector import OMAT24Collector
-        collector = OMAT24Collector()
-        results = collector.collect(
-            elements=elements,
-            formula=formula,
-            max_results=max_results,
-        )
-        return {
-            "results": results,
-            "count": len(results),
-            "source": "omat24",
-            "note": "OMAT24 (Meta FAIR) — 110M DFT calculations. "
-                    "Results include energy, forces, stress tensors.",
-        }
-    except ImportError:
-        return {"error": "OMAT24 requires the 'datasets' package. Install: pip install datasets"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
 def create_data_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="search_materials",
@@ -209,17 +182,3 @@ def create_data_tools(registry: ToolRegistry) -> None:
             "file_format": {"type": "string", "description": "File format override (csv, json, parquet). Auto-detected if omitted."}},
             "required": ["file_path"]},
         func=_import_dataset))
-    registry.register(Tool(
-        name="query_omat24",
-        description=(
-            "Query Meta's Open Materials 2024 (OMAT24) dataset — 110M DFT calculations "
-            "from Meta FAIR. Streams from HuggingFace. Filter by elements or formula. "
-            "Returns energy, forces, stress tensors, and atomic positions."
-        ),
-        input_schema={"type": "object", "properties": {
-            "elements": {"type": "array", "items": {"type": "string"},
-                         "description": "Filter: materials containing ALL these elements (e.g., ['Fe', 'O'])"},
-            "formula": {"type": "string", "description": "Exact formula match (e.g., 'Fe2O3')"},
-            "max_results": {"type": "integer", "description": "Max results to return (default 50)", "default": 50}},
-        },
-        func=_query_omat24))
