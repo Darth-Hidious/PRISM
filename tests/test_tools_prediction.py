@@ -25,4 +25,6 @@ class TestPredictionTools:
         create_prediction_tools(registry)
         tool = registry.get("list_models")
         result = tool.execute()
-        assert "models" in result
+        assert "trained_models" in result
+        assert "pretrained_models" in result
+        assert "feature_backend" in result

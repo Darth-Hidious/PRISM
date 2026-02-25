@@ -33,10 +33,11 @@ class TestMCPRoundTrip:
                 return result
 
         result = asyncio.run(run())
-        # Result should be parseable JSON with "models" key
+        # Result should be parseable JSON with model lists
         text = result.content[0].text if result.content else str(result)
         data = json.loads(text)
-        assert "models" in data
+        assert "trained_models" in data
+        assert "pretrained_models" in data
 
     def test_read_resources_via_client(self):
         """Client can read PRISM resources."""

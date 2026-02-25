@@ -37,10 +37,12 @@ def _make_typed_handler(tool: Tool):
     properties = tool.input_schema.get("properties", {})
     required = set(tool.input_schema.get("required", []))
 
-    # Build inspect.Parameter list for the signature
+    # Build inspect.Parameter list for the signature.
+    # Required params must come before optional to satisfy inspect.Signature.
     params = []
     annotations = {}
-    for pname, pdef in properties.items():
+    sorted_props = sorted(properties.items(), key=lambda x: x[0] not in required)
+    for pname, pdef in sorted_props:
         base_type = _JSON_TO_PYTHON_TYPE.get(pdef.get("type", "string"), str)
         desc = pdef.get("description", "")
 
