@@ -1,7 +1,33 @@
-"""Data pipeline CLI commands: collect, status, export."""
+"""Data pipeline CLI commands: collect, status, import."""
+import asyncio
+
 import click
 from rich.console import Console
 from rich.table import Table
+
+
+def _materials_to_dataframe(materials):
+    """Convert list[Material] to pandas DataFrame, preserving sources."""
+    import pandas as pd
+
+    rows = []
+    for m in materials:
+        row = {
+            "id": m.id,
+            "formula": m.formula,
+            "elements": ",".join(sorted(m.elements)),
+            "n_elements": m.n_elements,
+            "sources": ",".join(m.sources),
+        }
+        for prop_name in ("space_group", "crystal_system", "band_gap",
+                          "formation_energy", "energy_above_hull",
+                          "bulk_modulus", "debye_temperature"):
+            pv = getattr(m, prop_name, None)
+            if pv and pv.value is not None:
+                row[prop_name] = pv.value
+                row[f"{prop_name}_source"] = pv.source
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 @click.group()
@@ -14,38 +40,51 @@ def data():
 @click.option("--elements", default=None, help="Elements to search, e.g. 'Si,O'")
 @click.option("--formula", default=None, help="Chemical formula, e.g. 'SiO2'")
 @click.option("--providers", default=None, help="Comma-separated provider IDs")
-@click.option("--max-results", default=100, help="Max results per provider")
+@click.option("--limit", default=100, type=int, help="Maximum results (default: 100)")
 @click.option("--name", default=None, help="Dataset name (auto-generated if not given)")
-def collect(elements, formula, providers, max_results, name):
-    """Collect materials data from OPTIMADE databases."""
+def collect(elements, formula, providers, limit, name):
+    """Collect materials data from federated OPTIMADE search and save as a dataset."""
     console = Console()
-    from app.data.collector import OPTIMADECollector
-    from app.data.normalizer import normalize_records
+    from app.search import SearchEngine, MaterialSearchQuery
+    from app.search.providers.registry import build_registry
     from app.data.store import DataStore
+
     if not elements and not formula:
         console.print("[red]Provide --elements or --formula[/red]")
         return
-    filter_parts = []
-    if elements:
-        elems = [e.strip() for e in elements.split(",")]
-        quoted = ", ".join(f'"{e}"' for e in elems)
-        filter_parts.append(f"elements HAS ALL {quoted}")
-    if formula:
-        filter_parts.append(f'chemical_formula_descriptive="{formula}"')
-    filter_string = " AND ".join(filter_parts)
-    provider_ids = [p.strip() for p in providers.split(",")] if providers else None
-    console.print(f"[bold]Filter:[/bold] {filter_string}")
-    with console.status("[bold green]Collecting data..."):
-        collector = OPTIMADECollector()
-        records = collector.collect(filter_string=filter_string, max_per_provider=max_results, provider_ids=provider_ids)
-    if not records:
+
+    elems = [e.strip() for e in elements.split(",")] if elements else None
+    prov_list = [p.strip() for p in providers.split(",")] if providers else None
+
+    query = MaterialSearchQuery(
+        elements=elems,
+        formula=formula,
+        providers=prov_list,
+        limit=limit,
+    )
+    console.print(f"[bold]Query:[/bold] elements={elems}, formula={formula}, limit={limit}")
+
+    with console.status("[bold green]Searching federated providers..."):
+        registry = build_registry()
+        engine = SearchEngine(registry=registry)
+        result = asyncio.run(engine.search(query))
+
+    if not result.materials:
         console.print("[yellow]No results found.[/yellow]")
+        if result.warnings:
+            for w in result.warnings:
+                console.print(f"[dim]  {w}[/dim]")
         return
-    df = normalize_records(records)
+
+    df = _materials_to_dataframe(result.materials)
     dataset_name = name or f"collect_{elements or formula}".replace(",", "_")
     store = DataStore()
     path = store.save(df, dataset_name)
-    console.print(f"[green]Collected {len(df)} materials -> {path}[/green]")
+
+    console.print(f"[green]Collected {len(df)} materials ({len(result.query_log)} providers) -> {path}[/green]")
+    if result.warnings:
+        for w in result.warnings:
+            console.print(f"[dim]  {w}[/dim]")
 
 
 @data.command("import")
