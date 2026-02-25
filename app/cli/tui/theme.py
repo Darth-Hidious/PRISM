@@ -34,6 +34,7 @@ BORDERS = {
     "error_partial": WARNING,
     "metrics": INFO,
     "calphad": SECONDARY,
+    "labs": ACCENT_MAGENTA,
     "validation_critical": ERROR,
     "validation_warning": WARNING,
     "validation_info": INFO,
@@ -79,6 +80,7 @@ ICONS = {
     "success": "\u2714",     # ✔
     "metrics": "\u25a0",     # ■
     "calphad": "\u2206",     # ∆
+    "labs": "\u2726",        # ✦
     "validation": "\u25cf",  # ●
     "results": "\u2261",     # ≡
     "plot": "\u25a3",        # ▣

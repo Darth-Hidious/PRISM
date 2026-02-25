@@ -67,6 +67,18 @@ We gratefully acknowledge the following communities and teams.
 | [Google](https://cloud.google.com/vertex-ai) (Gemini) | google-cloud-aiplatform | Apache 2.0 |
 | [OpenRouter](https://openrouter.ai/) | via openai SDK | N/A (service) |
 
+## Premium Lab Service Partners
+
+| Partner | Service | Category |
+|---------|---------|----------|
+| [Berkeley Lab A-Lab](https://ceder.berkeley.edu/) | Autonomous solid-state synthesis (Ceder Group) | A-Labs |
+| [Kebotix](https://www.kebotix.com/) | ChemOS automated R&D platform | A-Labs |
+| [Matlantis](https://matlantis.com/) | Universal neural network potential (Preferred Networks) | Cloud DFT |
+| [Mat3ra](https://www.mat3ra.com/) | Cloud materials simulation platform | Cloud DFT |
+| [HQS Quantum Simulations](https://quantumsimulations.de/) | Quantum chemistry simulation toolkit | Quantum |
+| [AQT](https://www.aqt.eu/) | Trapped-ion quantum computing (ARNICA) | Quantum |
+| [SSRL/SLAC](https://www-ssrl.slac.stanford.edu/) | Stanford Synchrotron Radiation Lightsource | Synchrotron |
+
 ## Reporting
 
 | Project | Description | License |

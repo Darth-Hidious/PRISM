@@ -168,8 +168,21 @@ cli.add_command(sim_group, "sim")
 from app.commands.plugin import plugin_group
 cli.add_command(plugin_group, "plugin")
 
-from app.commands.calphad import calphad_group
-cli.add_command(calphad_group, "calphad")
+# calphad is deprecated — now under 'prism model calphad'
+import click as _click_calphad
+
+@_click_calphad.group("calphad", hidden=True, deprecated=True)
+def _calphad_deprecated():
+    """Deprecated: use 'prism model calphad' instead."""
+    _click_calphad.echo("Warning: 'prism calphad' is deprecated. Use 'prism model calphad' instead.", err=True)
+
+from app.commands.calphad import calphad_group as _old_calphad
+for cmd_name, cmd in _old_calphad.commands.items():
+    _calphad_deprecated.add_command(cmd, cmd_name)
+cli.add_command(_calphad_deprecated, "calphad")
+
+from app.commands.labs import labs_group
+cli.add_command(labs_group, "labs")
 
 from app.commands.data import data as data_group
 cli.add_command(data_group, "data")

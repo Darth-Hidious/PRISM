@@ -124,7 +124,7 @@ Agent:
 
 ## Related
 
-- [`prism calphad`](calphad.md) -- CALPHAD thermodynamic calculations
+- [`prism model calphad`](predict.md) -- CALPHAD thermodynamic models
 - [`prism run`](run.md) -- Autonomous agent mode
 - [`prism data`](data.md) -- Data pipeline
 - [Plugins](plugins.md) -- Extend with custom tools
