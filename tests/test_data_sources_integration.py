@@ -30,13 +30,13 @@ class TestGetDefaultCollectorRegistry:
 class TestBuildFullRegistryIncludesSearchTools:
     def test_has_literature_search(self):
         from app.plugins.bootstrap import build_full_registry
-        reg = build_full_registry(enable_mcp=False, enable_plugins=False)
+        reg, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = [t.name for t in reg.list_tools()]
         assert "literature_search" in names
 
     def test_has_patent_search(self):
         from app.plugins.bootstrap import build_full_registry
-        reg = build_full_registry(enable_mcp=False, enable_plugins=False)
+        reg, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = [t.name for t in reg.list_tools()]
         assert "patent_search" in names
 

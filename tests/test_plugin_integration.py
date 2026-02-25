@@ -32,7 +32,7 @@ class TestPluginIntegration:
             return original_discover(reg, plugin_dir=tmp_path)
 
         with patch("app.plugins.loader.discover_local_plugins", side_effect=patched_discover):
-            registry = build_full_registry(enable_mcp=False, enable_plugins=True)
+            registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=True)
 
         names = {t.name for t in registry.list_tools()}
         assert "integration_test_tool" in names
@@ -81,7 +81,7 @@ class TestPluginIntegration:
 
     def test_build_full_registry_without_plugins(self):
         """build_full_registry with plugins disabled still loads all built-in tools."""
-        registry = build_full_registry(enable_mcp=False, enable_plugins=False)
+        registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
         # Core tools
         assert "search_materials" in names
@@ -92,7 +92,7 @@ class TestPluginIntegration:
 
     def test_build_full_registry_tool_count(self):
         """Verify we have a reasonable number of tools (no regression)."""
-        registry = build_full_registry(enable_mcp=False, enable_plugins=False)
+        registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         tools = registry.list_tools()
         # At minimum: 4 data + 3 system + 2 viz + 2 prediction + 7 skills = 18
         assert len(tools) >= 18
