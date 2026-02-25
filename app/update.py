@@ -94,7 +94,7 @@ def check_for_updates(current_version: str) -> Optional[dict]:
         return {
             "latest": latest,
             "current": current_version,
-            "upgrade_cmd": f"pipx upgrade prism-platform  # or: pip install --upgrade prism-platform",
+            "upgrade_cmd": "curl -fsSL https://prism.marc27.com/install.sh | bash -s -- --upgrade",
         }
     except Exception:
         return None

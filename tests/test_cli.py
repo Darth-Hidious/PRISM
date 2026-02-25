@@ -24,8 +24,8 @@ class TestCLI:
         assert result.exit_code == 0
         assert "goal" in result.output.lower() or "GOAL" in result.output
 
-    @patch("app.cli.create_backend")
-    @patch("app.cli.run_autonomous_stream")
+    @patch("app.agent.factory.create_backend")
+    @patch("app.agent.autonomous.run_autonomous_stream")
     def test_run_command(self, mock_stream, mock_backend):
         mock_stream.return_value = iter([TextDelta(text="Silicon has band gap 1.1 eV"), TurnComplete(text="Silicon has band gap 1.1 eV")])
         runner = CliRunner()
@@ -37,8 +37,8 @@ class TestCLI:
         result = runner.invoke(cli, ["--help"])
         assert "--resume" in result.output
 
-    @patch("app.cli.create_backend")
-    @patch("app.cli.AgentREPL")
+    @patch("app.cli.main.create_backend")
+    @patch("app.cli.main.AgentREPL")
     def test_resume_not_found(self, mock_repl_cls, mock_backend):
         mock_repl = mock_repl_cls.return_value
         mock_repl._load_session.side_effect = FileNotFoundError("not found")

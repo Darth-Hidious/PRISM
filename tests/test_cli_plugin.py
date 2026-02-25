@@ -34,7 +34,7 @@ class TestPluginList:
 
 class TestPluginInit:
     def test_init_creates_template(self, tmp_path):
-        with patch("app.cli.Path") as MockPath:
+        with patch("app.cli.main.Path") as MockPath:
             # Make Path.home() return our tmp_path
             MockPath.home.return_value = tmp_path
             plugin_dir = tmp_path / ".prism" / "plugins"
@@ -47,7 +47,7 @@ class TestPluginInit:
         pass
 
     def test_init_creates_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("app.cli.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("app.cli.main.Path.home", lambda: tmp_path)
 
         runner = CliRunner()
         result = runner.invoke(cli, ["plugin", "init", "test_plugin"])
@@ -60,7 +60,7 @@ class TestPluginInit:
         assert "def register(registry)" in content
 
     def test_init_existing_plugin(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("app.cli.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("app.cli.main.Path.home", lambda: tmp_path)
 
         plugin_dir = tmp_path / ".prism" / "plugins"
         plugin_dir.mkdir(parents=True)

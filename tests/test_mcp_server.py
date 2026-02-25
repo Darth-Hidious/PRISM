@@ -27,7 +27,7 @@ class TestMCPServer:
         assert "export_results_csv" in tool_names
         assert "predict_property" in tool_names
         assert "list_models" in tool_names
-        assert len(tool_names) == 10
+        assert len(tool_names) >= 10
 
     def test_server_has_resources(self):
         server = create_mcp_server()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prism-platform"
-version = "2.1.1"
+version = "2.5.0"
 description = "AI-Native Autonomous Materials Discovery Platform"
 readme = "README.md"
 authors = [{ name = "MARC27", email = "team@marc27.com" }]
@@ -97,7 +97,7 @@ Repository = "https://github.com/Darth-Hidious/PRISM"
 "Bug Reports" = "https://github.com/Darth-Hidious/PRISM/issues"
 
 [tool.setuptools]
-packages = ["app", "app.config", "app.db", "app.agent", "app.agent.backends", "app.tools", "app.data", "app.commands", "app.ml", "app.simulation", "app.skills", "app.plugins", "app.validation"]
+packages = ["app", "app.config", "app.db", "app.agent", "app.agent.backends", "app.tools", "app.data", "app.commands", "app.ml", "app.simulation", "app.skills", "app.plugins", "app.validation", "app.cli", "app.cli.tui", "app.cli.slash"]
 include-package-data = true
 
 [tool.black]

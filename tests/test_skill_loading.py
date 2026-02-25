@@ -30,10 +30,10 @@ class TestSkillLoadingAutonomous:
 
 
 class TestSkillLoadingREPL:
-    @patch("app.agent.repl.AgentCore")
+    @patch("app.cli.tui.app.AgentCore")
     def test_repl_init_loads_skills(self, MockAgent):
         mock_backend = MagicMock()
-        from app.agent.repl import AgentREPL
+        from app.cli.tui.app import AgentREPL
 
         repl = AgentREPL(backend=mock_backend, enable_mcp=False)
 

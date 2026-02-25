@@ -21,7 +21,7 @@ class TestSpinner:
     def test_verb_for_tool(self):
         s = self._make_spinner()
         assert s.verb_for_tool("search_optimade") == TOOL_VERBS["search_optimade"]
-        assert s.verb_for_tool("unknown_tool") == "Thinking..."
+        assert s.verb_for_tool("unknown_tool") == "Thinking\u2026"
 
     def test_start_and_stop(self):
         s = self._make_spinner()
