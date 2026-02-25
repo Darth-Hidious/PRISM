@@ -6,7 +6,7 @@ set -e
 
 REPO="https://github.com/Darth-Hidious/PRISM.git"
 PACKAGE="prism-platform"
-GIT_PACKAGE="$PACKAGE @ git+$REPO"
+GIT_PACKAGE="$PACKAGE[all] @ git+$REPO"
 MIN_PYTHON="3.11"
 CURRENT_VERSION="2.5.0"
 
