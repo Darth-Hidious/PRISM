@@ -1,15 +1,28 @@
 """Collect materials data from OPTIMADE and Materials Project."""
 from typing import Dict, List, Optional
 
-from app.config.providers import FALLBACK_PROVIDERS
 from app.data.base_collector import DataCollector
+
+
+def _get_fallback_providers():
+    """Get provider list from search registry instead of stale config."""
+    try:
+        from app.search.providers.registry import build_registry
+        reg = build_registry(skip_network=True)
+        return [
+            {"id": p.id, "name": p.name, "base_url": p._endpoint.base_url}
+            for p in reg.get_all()
+            if hasattr(p, "_endpoint") and p._endpoint
+        ]
+    except Exception:
+        return []
 
 
 class OPTIMADECollector(DataCollector):
     name = "optimade"
 
     def __init__(self, providers: Optional[List[Dict]] = None):
-        self.providers = providers or FALLBACK_PROVIDERS
+        self.providers = providers or _get_fallback_providers()
 
     def supported_params(self) -> List[str]:
         return ["filter_string", "max_per_provider", "provider_ids"]

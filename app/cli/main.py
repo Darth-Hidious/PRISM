@@ -183,14 +183,24 @@ cli.add_command(model_group, "model")
 from app.commands.search import search as search_cmd
 cli.add_command(search_cmd, "search")
 
-from app.commands.ask import ask as ask_cmd
-cli.add_command(ask_cmd, "ask")
-
 from app.commands.serve import serve as serve_cmd
 cli.add_command(serve_cmd, "serve")
 
 from app.commands.run import run_goal as run_cmd
 cli.add_command(run_cmd, "run")
+
+# ask is deprecated — redirect to run
+import click as _click
+
+@_click.command("ask", hidden=True, deprecated=True)
+@_click.argument("query", required=False)
+@_click.pass_context
+def _ask_deprecated(ctx, query):
+    """Deprecated: use 'prism run' instead."""
+    _click.echo("Warning: 'prism ask' is deprecated. Use 'prism run \"query\"' instead.", err=True)
+    if query:
+        ctx.invoke(run_cmd, goal=query)
+cli.add_command(_ask_deprecated, "ask")
 
 from app.commands.setup import setup as setup_cmd
 cli.add_command(setup_cmd, "setup")
