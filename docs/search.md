@@ -379,7 +379,7 @@ app/search/
   result.py                # Material, PropertyValue, SearchResult, ProviderQueryLog
   translator.py            # QueryTranslator: query -> OPTIMADE filter string
   fusion.py                # FusionEngine: dedup + merge across providers
-  SEARCH.md                # this file
+  # docs/search.md         # this file (moved from app/search/)
 
   # marketplace.json moved to app/plugins/catalog.json (unified plugin catalog)
 
@@ -406,3 +406,12 @@ app/search/
   databases/                  # Future: Layer 3 dataset storage
   providers.yaml              # Future: Layer 3 user overrides
 ```
+
+## Related
+
+- [`prism data`](data.md) -- Collect and store search results
+- [`prism predict`](predict.md) -- Predict properties of found materials
+- [`prism sim`](sim.md) -- Simulate structures from search
+- [`prism model calphad`](predict.md) -- Phase diagrams for found compositions
+- [`prism labs`](labs.md) -- Premium services for deeper analysis
+- [Plugins](plugins.md) -- Register custom search providers

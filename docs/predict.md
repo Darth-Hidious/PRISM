@@ -145,7 +145,9 @@ Plugin model → AlgorithmRegistry.register() or Tool → callable by agent
 
 ## Related
 
+- [`prism search`](search.md) -- Find materials to predict on
 - [`prism data`](data.md) -- Collect training data
 - [`prism sim`](sim.md) -- Generate structures for GNN prediction
+- [`prism labs`](labs.md) -- Premium cloud DFT and quantum compute
 - [Plugins](plugins.md) -- Register custom models
 - [ACKNOWLEDGMENTS](../ACKNOWLEDGMENTS.md) -- matminer, matgl, scikit-learn credits
