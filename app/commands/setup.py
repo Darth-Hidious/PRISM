@@ -10,10 +10,24 @@ def setup():
     """Interactive wizard to configure workflow preferences."""
     from app.config.preferences import UserPreferences
 
-    console = Console(force_terminal=True, width=120)
-    console.print(Panel("[bold cyan]PRISM Workflow Setup[/bold cyan]\nConfigure defaults for skills and workflows.", expand=False))
+    console = Console()
+    console.print(Panel(
+        "[bold cyan]PRISM Workflow Setup[/bold cyan]\n"
+        "Configure defaults for search, prediction, simulation, and reporting.",
+        expand=False,
+    ))
 
     prefs = UserPreferences.load()
+
+    # Show current capabilities
+    console.print()
+    try:
+        from app.tools.capabilities import capabilities_summary
+        summary = capabilities_summary()
+        console.print("[dim]" + summary + "[/dim]")
+        console.print()
+    except Exception:
+        pass
 
     # Output format
     fmt = Prompt.ask(
@@ -25,7 +39,7 @@ def setup():
 
     # Default providers
     prov_str = Prompt.ask(
-        "Default data providers (comma-separated)",
+        "Default search providers (comma-separated)",
         default=",".join(prefs.default_providers),
     )
     prefs.default_providers = [p.strip() for p in prov_str.split(",") if p.strip()]
@@ -38,7 +52,7 @@ def setup():
     # ML algorithm
     algo = Prompt.ask(
         "Default ML algorithm",
-        choices=["random_forest", "gradient_boosting", "linear"],
+        choices=["random_forest", "gradient_boosting", "linear", "xgboost", "lightgbm"],
         default=prefs.default_algorithm,
     )
     prefs.default_algorithm = algo
@@ -63,5 +77,14 @@ def setup():
         prefs.hpc_queue = Prompt.ask("HPC queue name", default=prefs.hpc_queue)
         prefs.hpc_cores = IntPrompt.ask("HPC cores", default=prefs.hpc_cores)
 
+    # Update check preference
+    check_str = Prompt.ask(
+        "Check for updates on startup",
+        choices=["yes", "no"],
+        default="yes" if prefs.check_updates else "no",
+    )
+    prefs.check_updates = check_str == "yes"
+
     path = prefs.save()
     console.print(f"\n[green]Preferences saved to {path}[/green]")
+    console.print("[dim]API keys: prism configure --show[/dim]")
