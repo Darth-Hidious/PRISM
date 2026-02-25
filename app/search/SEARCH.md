@@ -105,18 +105,51 @@ prism search --elements Ti,O --crystal-system tetragonal --space-group "I4/mmm"
 
 ## Provider Registry
 
-Providers are auto-discovered from `providers.optimade.org/v1/links` via a 2-hop chain:
+### Three-Layer Architecture
 
 ```
-providers.optimade.org/v1/links  (hop 1: provider index)
-  -> {index-metadb}/v1/links     (hop 2: child databases)
-    -> actual base_urls
+Layer 1 -- Discovered (OPTIMADE consortium, auto-refreshed weekly)
+  Source: providers.optimade.org/v1/links -> {index}/v1/links chain
+  Cache:  ~/.prism/cache/discovered_registry.json
+  Contains: id, name, base_url, homepage, parent_provider
+
+Layer 2 -- Bundled overrides (shipped with PRISM)
+  File: app/search/providers/provider_overrides.json
+  Contains: tiers, capabilities, auth config, native API entries, known quirks
+  Also: fallback_index_urls (proxies that 404), url_corrections (consortium typos)
+
+Layer 3 -- User & marketplace sources (NOT YET IMPLEMENTED)
+  File: ~/.prism/providers.yaml
+  Contains: user enable/disable, custom DB entries, personal auth config
+  See: "Extending Search" section below
 ```
 
-Three layers, merge order highest wins:
-1. **Discovered** -- URLs from OPTIMADE consortium (cached weekly at `~/.prism/cache/discovered_registry.json`)
-2. **Bundled overrides** -- `provider_overrides.json` (tiers, capabilities, quirks, native API entries)
-3. **User overrides** -- `~/.prism/providers.yaml` (enable/disable, custom entries)
+Merge order: discovered -> bundled overrides -> user overrides. Higher layer wins per field.
+
+### Discovery: 2-Hop OPTIMADE Chain
+
+```
+providers.optimade.org/v1/links  (hop 1: provider index, ~28 entries)
+  -> {index-metadb}/v1/links     (hop 2: child databases per provider)
+    -> actual base_urls           (flattened into discovery cache)
+```
+
+Single-child providers (COD, MP, OQMD) produce one endpoint.
+Multi-child providers (Alexandria, Materials Cloud, odbx) produce multiple endpoints
+with IDs like `alexandria.alexandria-pbe`, `mcloud.mc3d-pbe-v1`.
+
+### Layer 2 Corrections
+
+Some consortium URLs are wrong. Layer 2 handles two types of corrections:
+
+- **fallback_index_urls**: For providers whose proxy at `providers.optimade.org` 404s
+  (e.g. Materials Cloud). Maps `provider_id -> working /v1/links URL`.
+- **url_corrections**: For providers where the consortium lists a wrong base_url
+  (e.g. MPDD `.org` vs `.com`). Maps `provider_id -> correct base_url`. Applied
+  after discovery, before overrides.
+
+These are consortium data errors, not server issues. When fixed upstream, our
+corrections become harmless no-ops.
 
 ## Provider Status (2026-02-25)
 
@@ -131,16 +164,16 @@ Three layers, merge order highest wins:
 | OQMD | `oqmd` | OK | 1M+ structures, slow on complex queries |
 | COD | `cod` | OK | 500K+ experimental structures |
 | GNoME (Google DeepMind) | `odbx.gnome` | OK | 380K ML-predicted structures |
-| MPDD | `mpdd` | URL FIX | Consortium has wrong `.org`, corrected to `.com` |
+| MPDD | `mpdd` | OK | URL corrected: consortium lists `.org`, actual is `.com` |
 
 ### Tier 2 -- Secondary
 | Provider | ID | Status | Notes |
 |----------|-----|--------|-------|
-| JARVIS | `jarvis` | OK | Re-enabled, NIST fixed their endpoint (2025) |
+| JARVIS (NIST) | `jarvis` | OK | Re-enabled 2025, NIST fixed their endpoint |
 | TCOD | `tcod` | OK | Theoretical crystal structures |
 | 2DMatpedia | `twodmatpedia` | OK | 2D materials, HTTP only |
-| Materials Cloud MC3D | `mcloud.mc3d-pbe-v1` | OK | Via fallback URL |
-| Materials Cloud MC2D | `mcloud.mc2d` | OK | Via fallback URL |
+| Materials Cloud MC3D | `mcloud.mc3d-pbe-v1` | OK | Via fallback URL (proxy 404s) |
+| Materials Cloud MC2D | `mcloud.mc2d` | OK | Via fallback URL (proxy 404s) |
 
 ### Tier 3 -- Available but limited
 | Provider | ID | Status | Notes |
@@ -151,23 +184,96 @@ Three layers, merge order highest wins:
 | odbx-misc | `odbx.odbx_misc` | OK | Miscellaneous data |
 | MPDS | `mpds` | DISABLED | Requires paid subscription |
 
-### Tier 4 -- Disabled
-| Provider | ID | Status | Notes |
-|----------|-----|--------|-------|
-| AFLOW | `aflow` | HTTP 500 | OPTIMADE endpoint broken, returns server errors |
+### Tier 4 -- Disabled (broken endpoints)
+| Provider | ID | Status | Issue | Last checked |
+|----------|-----|--------|-------|-------------|
+| AFLOW | `aflow` | HTTP 500 | Server returns 500 on all queries | 2026-02-25 |
 
 ### Offline / Dead
-| Provider | ID | Status | Notes |
-|----------|-----|--------|-------|
-| CMR | `cmr` | 404 | GitHub Pages site gone |
-| MatCloud | `matcloud` | 404 | Index proxy, not a structures endpoint |
-| MPOD | `mpod` | TIMEOUT | Server unreachable |
+| Provider | ID | Status | Issue | Last checked |
+|----------|-----|--------|-------|-------------|
+| CMR | `cmr` | 404 | GitHub Pages site gone entirely | 2026-02-25 |
+| MatCloud | `matcloud` | 404 | Index proxy at providers.optimade.org, not a structures endpoint | 2026-02-25 |
+| MPOD | `mpod` | TIMEOUT | Server unreachable, connection refused | 2026-02-25 |
 
-### Not in OPTIMADE
-| Dataset | Notes |
-|---------|-------|
-| OMAT24 (Meta) | 110M DFT calculations. HuggingFace dataset only, no OPTIMADE endpoint. Derived from Alexandria structures. |
-| AFLOW (native) | Has REST API at `aflow.org/API/` but not OPTIMADE-compatible. Future native provider candidate. |
+## Extending Search
+
+### Current Provider Types
+
+Search currently supports two provider types, both registered in `ProviderRegistry`:
+
+| Type | Base Class | How it queries | Example |
+|------|-----------|---------------|---------|
+| `optimade` | `OptimadeProvider` | OPTIMADE filter via `optimade-python-tools` | mp, cod, oqmd |
+| `mp_native` | `MaterialsProjectProvider` | Materials Project REST API | mp_native |
+
+### Adding a New Provider Type
+
+To add a new provider type (e.g. `aflow_native`, `jarvis_native`):
+
+1. Create `app/search/providers/<name>.py` implementing `Provider` ABC
+2. Add the type string to `ProviderRegistry.from_endpoints()` dispatch
+3. Add the provider entry in `provider_overrides.json` with `api_type` and `base_url`
+
+### Future: Dataset Providers (Layer 3)
+
+Non-OPTIMADE datasets like OMAT24, user-imported data, and marketplace sources
+will be handled through a separate **Dataset Provider** system:
+
+```
+~/.prism/
+  providers.yaml           # user OPTIMADE overrides (enable/disable, auth)
+  databases/               # local/downloaded dataset storage
+    omat24/                # example: installed from marketplace
+    my_local_data/         # example: user's own data
+```
+
+These are fundamentally different from OPTIMADE providers:
+- **OPTIMADE providers**: live REST APIs, queried in real-time, discovered automatically
+- **Dataset providers**: static or cached data, installed locally or via SDK,
+  registered through a separate catalog
+
+**Planned architecture:**
+
+```python
+# New base class (separate from Provider ABC)
+class DatasetProvider:
+    """Queryable local/cached dataset."""
+    def search(self, query: MaterialSearchQuery) -> list[Material]: ...
+    def info(self) -> DatasetInfo: ...  # size, schema, source, version
+
+# Marketplace catalog (served by MARC27 platform)
+class MarketplaceCatalog:
+    """Browse and install datasets from the MARC27 marketplace."""
+    def list_available() -> list[DatasetInfo]: ...
+    def install(dataset_id: str) -> DatasetProvider: ...
+```
+
+**Datasets planned for marketplace:**
+
+| Dataset | Source | Size | Notes |
+|---------|--------|------|-------|
+| OMAT24 | Meta FAIR / HuggingFace | 110M DFT calculations | Derived from Alexandria structures |
+| AFLOW (full) | aflow.org | 3.5M+ compounds | Native REST API, not OPTIMADE |
+| User local | User import | Varies | Parquet/CSV/CIF import |
+| Cloud storage | User S3/GCS | Varies | Remote dataset mounting |
+
+**SDK integration:**
+
+```python
+# Future: prism SDK for dataset providers
+from prism.sdk import DatasetProvider, register_provider
+
+class MyDatasetProvider(DatasetProvider):
+    """Custom provider for proprietary data."""
+    ...
+
+register_provider("my_data", MyDatasetProvider(...))
+```
+
+This is NOT part of the OPTIMADE auto-discovery pipeline. It's a separate
+registration path managed through `~/.prism/databases/` and the MARC27
+marketplace platform.
 
 ## Architecture
 
@@ -179,12 +285,13 @@ app/search/
   result.py                # Material, PropertyValue, SearchResult, ProviderQueryLog
   translator.py            # QueryTranslator: query -> OPTIMADE filter string
   fusion.py                # FusionEngine: dedup + merge across providers
+  SEARCH.md                # this file
 
   providers/
     discovery.py           # 2-hop OPTIMADE auto-discovery + cache + overrides
     registry.py            # ProviderRegistry + build_registry()
     endpoint.py            # ProviderEndpoint Pydantic model
-    provider_overrides.json # tiers, capabilities, quirks, native API entries
+    provider_overrides.json # Layer 2: tiers, capabilities, quirks, URL corrections
     base.py                # Provider ABC, ProviderCapabilities
     optimade.py            # OptimadeProvider (wraps optimade-python-tools)
     materials_project.py   # MaterialsProjectProvider (native API)
@@ -195,4 +302,11 @@ app/search/
 
   resilience/
     circuit_breaker.py     # HealthManager: per-provider circuit breaker
+
+~/.prism/                  # User data directory
+  cache/
+    discovered_registry.json  # Layer 1: auto-discovery cache (refreshed weekly)
+    provider_health.json      # circuit breaker state
+  databases/                  # Future: Layer 3 dataset storage
+  providers.yaml              # Future: Layer 3 user overrides
 ```
