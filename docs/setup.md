@@ -108,12 +108,91 @@ Sources: PyPI first, GitHub releases as fallback.
 
 | File | Purpose | Managed By |
 |------|---------|-----------|
-| `.env` | API keys, secrets, model default | `prism configure` / onboarding |
-| `~/.prism/preferences.json` | Workflow preferences | `prism setup` / onboarding |
+| `~/.prism/settings.json` | Global settings (agent, search, ML, etc.) | `prism setup` / manual edit |
+| `.prism/settings.json` | Project-level overrides (can be checked into git) | Manual edit |
+| `.env` | API keys, secrets | `prism configure` / onboarding |
+| `~/.prism/preferences.json` | Legacy workflow preferences | `prism setup` / onboarding |
 | `~/.prism/.update_check` | Version check cache | `prism update` (auto) |
 | `~/.prism/cache/` | Search cache, provider health | Search engine (auto) |
 | `~/.prism/databases/` | TDB thermodynamic databases | `prism model calphad import` |
 | `~/.prism/labs_subscriptions.json` | Lab service subscriptions | `prism labs subscribe` |
+
+## `settings.json`
+
+PRISM uses a two-tier settings file, similar to Claude Code:
+
+- **Global**: `~/.prism/settings.json` -- user-level defaults
+- **Project**: `.prism/settings.json` -- per-project overrides (check into git)
+
+Merge order: **defaults < global < project < environment variables**.
+
+### Schema
+
+```json
+{
+  "agent": {
+    "model": "claude-sonnet-4-20250514",
+    "provider": "anthropic",
+    "max_iterations": 30,
+    "auto_approve": false,
+    "temperature": 0.0,
+    "max_tokens": 0
+  },
+  "search": {
+    "default_providers": ["optimade"],
+    "max_results_per_source": 100,
+    "cache_ttl_hours": 24,
+    "timeout_seconds": 30,
+    "retry_attempts": 3
+  },
+  "output": {
+    "format": "csv",
+    "directory": "output",
+    "report_format": "markdown"
+  },
+  "compute": {
+    "budget": "local",
+    "hpc_queue": "default",
+    "hpc_cores": 4
+  },
+  "ml": {
+    "algorithm": "random_forest",
+    "feature_backend": ""
+  },
+  "updates": {
+    "check_on_startup": true,
+    "cache_ttl_hours": 24,
+    "channel": "stable"
+  },
+  "permissions": {
+    "require_approval": ["execute_python", "write_file", "submit_lab_job"],
+    "deny": []
+  }
+}
+```
+
+### Environment Variable Overrides
+
+Settings can be overridden with `PRISM_<SECTION>_<KEY>` environment variables:
+
+```bash
+PRISM_AGENT_MODEL=gpt-4o          # overrides agent.model
+PRISM_SEARCH_TIMEOUT=60           # overrides search.timeout_seconds (planned)
+PRISM_DEFAULT_MODEL=gpt-4o        # legacy, maps to agent.model
+```
+
+### Project-Level Example
+
+Create `.prism/settings.json` in your project root to share settings with
+collaborators:
+
+```json
+{
+  "agent": { "model": "claude-sonnet-4-20250514" },
+  "search": { "max_results_per_source": 500 },
+  "output": { "format": "parquet", "directory": "data/output" }
+}
+```
 
 ## Related
 

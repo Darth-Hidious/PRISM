@@ -111,10 +111,11 @@ Documentation: https://github.com/Darth-Hidious/PRISM
                 prefs.onboarding_complete = True
                 prefs.save()
 
-        # Check for updates
+        # Check for updates (reads from settings.json > preferences)
         try:
-            prefs = UserPreferences.load()
-            if prefs.check_updates:
+            from app.config.settings_schema import get_settings
+            settings = get_settings()
+            if settings.updates.check_on_startup:
                 from app import __version__
                 from app.update import check_for_updates
                 update_info = check_for_updates(__version__)
