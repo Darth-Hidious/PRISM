@@ -135,3 +135,12 @@ models/*.meta.json
 data/*.parquet
 data/*.csv
 data/*.meta.json
+
+# Tests (not shipped)
+tests/
+
+# Local clones / vendored deps
+optimade-python-tools/
+
+# Output artifacts
+output/
