@@ -210,17 +210,23 @@ def load_overrides(path: Path | None = None) -> dict:
 # Marketplace / Platform Providers (Layer 3)
 # ------------------------------------------------------------------
 
-_MARKETPLACE_PATH = Path(__file__).parent.parent / "marketplace.json"
+_CATALOG_PATH = Path(__file__).parent.parent.parent / "plugins" / "catalog.json"
 _USER_PROVIDERS_PATH = Path.home() / ".prism" / "providers.yaml"
 
 
 def load_marketplace(path: Path | None = None) -> dict:
-    """Load the MARC27 marketplace catalog."""
-    p = path or _MARKETPLACE_PATH
+    """Load provider entries from the MARC27 plugin catalog."""
+    p = path or _CATALOG_PATH
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text())
+        catalog = json.loads(p.read_text())
+        # Filter to provider-type plugins only
+        providers = {}
+        for pid, entry in catalog.get("plugins", {}).items():
+            if entry.get("type") == "provider":
+                providers[pid] = entry
+        return {"providers": providers}
     except Exception:
         return {}
 
