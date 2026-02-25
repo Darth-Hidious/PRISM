@@ -184,10 +184,10 @@ corrections become harmless no-ops.
 | odbx-misc | `odbx.odbx_misc` | OK | Miscellaneous data |
 | MPDS | `mpds` | DISABLED | Requires paid subscription |
 
-### Tier 4 -- Disabled (broken endpoints)
+### Tier 4 -- Disabled (broken OPTIMADE endpoints)
 | Provider | ID | Status | Issue | Last checked |
 |----------|-----|--------|-------|-------------|
-| AFLOW | `aflow` | HTTP 500 | Server returns 500 on all queries | 2026-02-25 |
+| AFLOW | `aflow` | HTTP 500 | OPTIMADE wrapper crashes on queries (`/v1/info` returns 200, `/v1/structures` returns 500). Native AFLUX API works fine (3.5M+ compounds). Future `aflow_native` provider candidate. | 2026-02-25 |
 
 ### Offline / Dead
 | Provider | ID | Status | Issue | Last checked |
@@ -254,7 +254,7 @@ class MarketplaceCatalog:
 | Dataset | Source | Size | Notes |
 |---------|--------|------|-------|
 | OMAT24 | Meta FAIR / HuggingFace | 110M DFT calculations | Derived from Alexandria structures |
-| AFLOW (full) | aflow.org | 3.5M+ compounds | Native REST API, not OPTIMADE |
+| AFLOW (native) | aflow.org AFLUX API | 3.5M+ compounds | Native REST API works, OPTIMADE wrapper broken (HTTP 500) |
 | User local | User import | Varies | Parquet/CSV/CIF import |
 | Cloud storage | User S3/GCS | Varies | Remote dataset mounting |
 
