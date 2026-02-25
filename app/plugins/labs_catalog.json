@@ -1,0 +1,183 @@
+{
+  "_meta": {
+    "version": "1.0.0",
+    "description": "PRISM Labs service catalog. Premium marketplace tools — vendors register at prism.marc27.com/labs."
+  },
+  "services": {
+    "alab_synthesis": {
+      "name": "A-Lab Autonomous Synthesis",
+      "category": "a-labs",
+      "provider": "Berkeley Lab (Ceder Group)",
+      "description": "Closed-loop autonomous materials synthesis. AI proposes compositions, robots synthesize and characterize, results feed back. Targets oxide and phosphate compounds from Materials Project predictions.",
+      "cost_model": "per-experiment ($50-500)",
+      "status": "coming_soon",
+      "capabilities": [
+        "Autonomous solid-state synthesis",
+        "XRD characterization feedback loop",
+        "Active learning target selection",
+        "Integration with Materials Project predictions"
+      ],
+      "requirements": [
+        "PRISM marketplace account",
+        "Approved research proposal"
+      ],
+      "tools": ["submit_synthesis", "check_synthesis_status", "get_synthesis_results"]
+    },
+    "kebotix_discovery": {
+      "name": "Kebotix Automated Discovery",
+      "category": "a-labs",
+      "provider": "Kebotix",
+      "description": "ChemOS-powered automated R&D. AI-driven experiment design with robotic execution. Handles multi-objective optimization, constraint satisfaction, and retrosynthetic pathway prediction.",
+      "cost_model": "per-campaign ($1,000-10,000)",
+      "status": "coming_soon",
+      "capabilities": [
+        "ChemOS experiment orchestration",
+        "Automus batch experiment design",
+        "Multi-objective Bayesian optimization",
+        "Forward/retro synthesis prediction"
+      ],
+      "requirements": [
+        "PRISM marketplace account",
+        "Enterprise subscription"
+      ],
+      "tools": ["design_experiment_batch", "submit_campaign", "get_campaign_results"]
+    },
+    "matlantis_dft": {
+      "name": "Matlantis Cloud DFT",
+      "category": "cloud-dft",
+      "provider": "Preferred Networks",
+      "description": "Ultra-fast universal neural network potential. 100,000x faster than classical DFT for structures up to 20,000 atoms. Covers 72 elements. REST API with Jupyter integration.",
+      "cost_model": "per-calculation ($0.10-5.00)",
+      "status": "coming_soon",
+      "capabilities": [
+        "Structure relaxation",
+        "Formation energy prediction",
+        "Phonon calculations",
+        "NEB transition state search",
+        "Molecular dynamics"
+      ],
+      "requirements": [
+        "PRISM marketplace account",
+        "Matlantis API key"
+      ],
+      "tools": ["matlantis_relax", "matlantis_energy", "matlantis_phonon", "matlantis_md"]
+    },
+    "mat3ra_platform": {
+      "name": "Mat3ra Simulation Platform",
+      "category": "cloud-dft",
+      "provider": "Mat3ra",
+      "description": "End-to-end cloud materials modeling. Integrates VASP, Quantum ESPRESSO, LAMMPS with ML workflows. REST API for job submission, monitoring, and result retrieval.",
+      "cost_model": "per-core-hour ($0.05-0.50)",
+      "status": "coming_soon",
+      "capabilities": [
+        "Cloud DFT (VASP, QE, ABINIT)",
+        "Cloud MD (LAMMPS)",
+        "ML model training",
+        "Workflow orchestration",
+        "2D materials support"
+      ],
+      "requirements": [
+        "PRISM marketplace account",
+        "Mat3ra API key"
+      ],
+      "tools": ["mat3ra_submit", "mat3ra_status", "mat3ra_results"]
+    },
+    "hqs_quantum": {
+      "name": "HQS Quantum Chemistry",
+      "category": "quantum",
+      "provider": "HQS Quantum Simulations",
+      "description": "HQStage modular quantum simulation toolkit. 10 simulation modules for quantum chemistry on real quantum hardware or classical emulators. Battery materials, photocatalysts, novel compounds.",
+      "cost_model": "per-qubit-hour ($10-100)",
+      "status": "coming_soon",
+      "capabilities": [
+        "VQE ground state energy",
+        "Quantum chemistry on real hardware",
+        "Classical emulation fallback",
+        "Battery material screening",
+        "Photocatalyst discovery"
+      ],
+      "requirements": [
+        "PRISM marketplace account",
+        "HQS account"
+      ],
+      "tools": ["quantum_vqe", "quantum_ground_state", "quantum_emulate"]
+    },
+    "aqt_quantum": {
+      "name": "AQT ARNICA Quantum Computing",
+      "category": "quantum",
+      "provider": "Alpine Quantum Technologies",
+      "description": "Cloud access to trapped-ion quantum computers via ARNICA platform. Simulate material properties that are intractable for classical DFT. Strong decoherence resistance.",
+      "cost_model": "per-circuit ($5-50)",
+      "status": "coming_soon",
+      "capabilities": [
+        "Trapped-ion quantum simulation",
+        "Material property calculation",
+        "Quantum advantage for strongly correlated systems"
+      ],
+      "requirements": [
+        "PRISM marketplace account",
+        "AQT ARNICA credentials"
+      ],
+      "tools": ["aqt_submit_circuit", "aqt_get_results"]
+    },
+    "dfm_assessment": {
+      "name": "Materials DfM Assessment",
+      "category": "dfm",
+      "provider": "MARC27",
+      "description": "Design for Manufacturability assessment for novel materials. Evaluates synthesis feasibility, scalability, cost projections, and identifies manufacturing risks. Domain-specific rules for ceramics, alloys, thin films, and composites.",
+      "cost_model": "per-assessment ($25-100)",
+      "status": "coming_soon",
+      "capabilities": [
+        "Synthesis route feasibility analysis",
+        "Scalability assessment (lab → pilot → production)",
+        "Cost projection by manufacturing method",
+        "Risk identification (yield, purity, reproducibility)",
+        "Alternative synthesis route suggestion"
+      ],
+      "requirements": [
+        "PRISM marketplace account"
+      ],
+      "tools": ["assess_manufacturability", "estimate_production_cost", "suggest_synthesis_routes"]
+    },
+    "synchrotron_ssrl": {
+      "name": "SSRL Beamtime Booking",
+      "category": "synchrotron",
+      "provider": "Stanford Synchrotron Radiation Lightsource",
+      "description": "Book beamtime at SSRL for X-ray diffraction, scattering, absorption spectroscopy, and microscopy. 30 experimental stations. Remote access available.",
+      "cost_model": "per-shift ($500-2,000)",
+      "status": "coming_soon",
+      "capabilities": [
+        "X-ray diffraction (XRD)",
+        "X-ray absorption spectroscopy (XAS)",
+        "Small-angle X-ray scattering (SAXS)",
+        "X-ray microscopy",
+        "Remote beamtime access"
+      ],
+      "requirements": [
+        "PRISM marketplace account",
+        "Approved beam proposal"
+      ],
+      "tools": ["check_beamline_availability", "submit_beam_proposal", "retrieve_beam_data"]
+    },
+    "ht_screening": {
+      "name": "High-Throughput Screening",
+      "category": "ht-screening",
+      "provider": "MARC27",
+      "description": "Combinatorial high-throughput materials screening. Automated synthesis of composition libraries, rapid characterization, and ML-guided iteration. Covers alloys, oxides, and thin-film systems.",
+      "cost_model": "per-campaign ($5,000-50,000)",
+      "status": "coming_soon",
+      "capabilities": [
+        "Combinatorial library synthesis",
+        "Rapid XRD/SEM/EDX characterization",
+        "ML-guided adaptive sampling",
+        "Composition-property mapping",
+        "Alloy, oxide, and thin-film systems"
+      ],
+      "requirements": [
+        "PRISM marketplace account",
+        "Enterprise subscription"
+      ],
+      "tools": ["design_library", "submit_screening_campaign", "get_screening_results"]
+    }
+  }
+}

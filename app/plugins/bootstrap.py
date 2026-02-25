@@ -65,6 +65,10 @@ def build_full_registry(
     create_property_selection_tools(registry)
     create_code_tools(registry)
 
+    # Premium labs tools (marketplace services)
+    from app.tools.labs import create_labs_tools
+    create_labs_tools(registry)
+
     # Simulation tools (optional — pyiron may not be installed)
     try:
         from app.simulation.bridge import check_pyiron_available
