@@ -119,8 +119,8 @@ Layer 2 -- Bundled overrides (shipped with PRISM)
   Also: fallback_index_urls (proxies that 404), url_corrections (consortium typos)
 
 Layer 3 -- Platform & user sources
-  Dev:  app/search/marketplace.json (MARC27 catalog, NOT shipped to users)
-  Prod: MARC27 marketplace API (auth-gated, native API, dataset providers)
+  Dev:  app/plugins/catalog.json (unified plugin catalog, NOT shipped to users)
+  Prod: MARC27 marketplace API (auth-gated, native API, dataset, agent plugins)
   User: ~/.prism/providers.yaml (personal overrides, optional)
 ```
 
@@ -212,16 +212,16 @@ To add a new provider type (e.g. `aflow_native`, `jarvis_native`):
 
 1. Create `app/search/providers/<name>.py` implementing `Provider` ABC
 2. Add the type string to `ProviderRegistry.from_endpoints()` dispatch
-3. Add the provider entry in `marketplace.json` with `api_type` and `base_url`
+3. Add the provider entry in `app/plugins/catalog.json` with `type: "provider"`, `api_type`, and `base_url`
 
-### Layer 3: MARC27 Marketplace Providers
+### Layer 3: MARC27 Plugin Catalog
 
-Auth-gated, native API, and dataset providers are accessed through the MARC27
-platform. These are NOT shipped in the package — `marketplace.json` is a
-development-time catalog only. In production, Layer 3 providers come from the
+Auth-gated, native API, dataset, and agent plugins are accessed through the MARC27
+platform. These are NOT shipped in the package — `catalog.json` is a
+development-time catalog only. In production, Layer 3 plugins come from the
 MARC27 marketplace API.
 
-**Current marketplace catalog (`app/search/marketplace.json`):**
+**Current plugin catalog (`app/plugins/catalog.json`, providers only):**
 
 | Provider | API Type | Status | Notes |
 |----------|----------|--------|-------|
@@ -381,7 +381,7 @@ app/search/
   fusion.py                # FusionEngine: dedup + merge across providers
   SEARCH.md                # this file
 
-  marketplace.json         # Layer 3 dev catalog (NOT shipped, replaced by platform API)
+  # marketplace.json moved to app/plugins/catalog.json (unified plugin catalog)
 
   providers/
     discovery.py           # 2-hop OPTIMADE auto-discovery + cache + overrides + Layer 3
