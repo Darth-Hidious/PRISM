@@ -41,24 +41,24 @@ def test_build_registry_returns_providers(tmp_path):
     assert "mp" in ids
 
 
-def test_overrides_mpds_auth_config():
-    """MPDS auth config is present in overrides file."""
+def test_marketplace_mpds_auth_config():
+    """MPDS auth config is present in marketplace.json (Layer 3)."""
     import json
     from pathlib import Path
-    overrides_path = Path(__file__).parent.parent / "app" / "search" / "providers" / "provider_overrides.json"
-    data = json.loads(overrides_path.read_text())
-    mpds = data["overrides"]["mpds"]
+    marketplace_path = Path(__file__).parent.parent / "app" / "search" / "marketplace.json"
+    data = json.loads(marketplace_path.read_text())
+    mpds = data["providers"]["mpds"]
     assert mpds["auth"]["required"] is True
     assert mpds["auth"]["auth_type"] == "api_key"
 
 
-def test_overrides_mp_native_has_auth():
-    """MP native provider has auth config in overrides."""
+def test_marketplace_mp_native_has_auth():
+    """MP native provider has auth config in marketplace.json (Layer 3)."""
     import json
     from pathlib import Path
-    overrides_path = Path(__file__).parent.parent / "app" / "search" / "providers" / "provider_overrides.json"
-    data = json.loads(overrides_path.read_text())
-    mp_native = data["overrides"]["mp_native"]
+    marketplace_path = Path(__file__).parent.parent / "app" / "search" / "marketplace.json"
+    data = json.loads(marketplace_path.read_text())
+    mp_native = data["providers"]["mp_native"]
     assert mp_native["auth"]["required"] is True
     assert mp_native["base_url"] == "https://api.materialsproject.org"
 

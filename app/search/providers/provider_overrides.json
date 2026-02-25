@@ -98,24 +98,6 @@
         "known_quirks": ["Returns species_at_sites only"]
       }
     },
-    "mp_native": {
-      "api_type": "mp_native",
-      "name": "Materials Project (Native API)",
-      "base_url": "https://api.materialsproject.org",
-      "tier": 1,
-      "enabled": true,
-      "auth": {
-        "required": true,
-        "auth_type": "api_key",
-        "auth_header": "X-API-KEY",
-        "auth_env_var": "MP_API_KEY",
-        "obtain_url": "https://materialsproject.org/dashboard"
-      },
-      "capabilities": {
-        "filterable_fields": ["elements", "formula", "nelements", "space_group", "band_gap", "formation_energy", "energy_above_hull", "bulk_modulus", "is_metal"],
-        "returned_properties": ["formula", "elements", "band_gap", "formation_energy", "energy_above_hull", "bulk_modulus", "is_metal", "is_stable"]
-      }
-    },
     "odbx.gnome": {
       "tier": 1,
       "data_type": "ml_predicted",
@@ -148,7 +130,7 @@
       "enabled": false,
       "reliability": {
         "validation_score": "7/13",
-        "known_quirks": ["OPTIMADE endpoint barely functional", "Frequent HTTP 500"]
+        "known_quirks": ["OPTIMADE wrapper broken (HTTP 500). Native AFLUX API available via marketplace."]
       }
     },
     "jarvis": {
@@ -161,13 +143,8 @@
     "mpds": {
       "tier": 3,
       "enabled": false,
-      "auth": {
-        "required": true,
-        "auth_type": "api_key",
-        "auth_env_var": "MPDS_API_KEY"
-      },
       "reliability": {
-        "known_quirks": ["Subscription required", "Rate limited"]
+        "known_quirks": ["Auth-gated, access via PRISM marketplace. OPTIMADE endpoint limited."]
       }
     }
   }

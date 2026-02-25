@@ -65,26 +65,27 @@ def build_registry(
     overrides_path=None,
     skip_network: bool = False,
 ) -> ProviderRegistry:
-    """Build the provider registry from discovery cache + overrides.
+    """Build the provider registry from all three layers.
 
-    1. Load discovery cache (or run discovery if missing/stale)
-    2. Apply bundled overrides
-    3. Return ProviderRegistry
+    Layer 1: Discovery cache (OPTIMADE auto-discovery)
+    Layer 2: Bundled overrides (tiers, capabilities, URL corrections)
+    Layer 3: Platform/marketplace providers + user overrides
     """
     from pathlib import Path
     from app.search.providers.discovery import (
         load_cache, save_cache, is_cache_fresh, discover_providers,
-        load_overrides, apply_overrides, DEFAULT_CACHE_PATH,
+        load_overrides, apply_overrides, load_platform_providers,
+        DEFAULT_CACHE_PATH,
     )
     import asyncio
 
+    # --- Layer 1: OPTIMADE discovery ---
     c_path = cache_path or DEFAULT_CACHE_PATH
     cache = load_cache(c_path)
 
     if cache and is_cache_fresh(cache):
         endpoints = cache["endpoints"]
     elif not skip_network:
-        # Discovery needed
         try:
             overrides_data = load_overrides(overrides_path)
             fallbacks = overrides_data.get("fallback_index_urls", {})
@@ -92,7 +93,6 @@ def build_registry(
             if endpoints:
                 save_cache(endpoints, c_path)
             elif cache:
-                # Discovery failed but stale cache exists -- use it
                 logger.warning("Discovery failed, using stale cache")
                 endpoints = cache["endpoints"]
             else:
@@ -103,11 +103,15 @@ def build_registry(
     else:
         endpoints = cache["endpoints"] if cache else []
 
-    # Apply overrides
+    # --- Layer 2: Bundled overrides ---
     overrides_data = load_overrides(overrides_path)
     overrides = overrides_data.get("overrides", {})
     defaults = overrides_data.get("defaults", {})
     url_corrections = overrides_data.get("url_corrections", {})
     resolved = apply_overrides(endpoints, overrides, defaults, url_corrections)
+
+    # --- Layer 3: Platform providers + user overrides ---
+    platform = load_platform_providers()
+    resolved.extend(platform)
 
     return ProviderRegistry.from_endpoints(resolved)

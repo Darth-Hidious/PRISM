@@ -20,8 +20,8 @@ def test_build_registry_from_cache(tmp_path):
     assert len(providers) >= 2  # mp + cod + mp_native from overrides
 
 
-def test_build_registry_includes_native_providers(tmp_path):
-    """Native API providers from overrides are included even if not discovered."""
+def test_build_registry_includes_platform_providers(tmp_path):
+    """Platform providers from marketplace.json (Layer 3) are included."""
     from app.search.providers.registry import build_registry
     from app.search.providers.discovery import save_cache
 
@@ -31,6 +31,7 @@ def test_build_registry_includes_native_providers(tmp_path):
 
     reg = build_registry(cache_path=cache_path, skip_network=True)
     ids = {p.id for p in reg.get_all()}
+    # mp_native comes from marketplace.json (Layer 3), not overrides
     assert "mp_native" in ids
 
 
@@ -82,3 +83,32 @@ def test_from_registry_json_backward_compat(tmp_path):
         # so just verify it calls build_registry
         reg = build_registry(cache_path=cache_path, skip_network=True)
         assert len(reg.get_all()) >= 1
+
+
+def test_load_platform_providers_merges_marketplace_and_user(tmp_path):
+    """load_platform_providers merges marketplace + user overrides."""
+    import json
+    from app.search.providers.discovery import load_platform_providers
+
+    marketplace = {
+        "_meta": {"version": "1.0.0"},
+        "providers": {
+            "test_native": {
+                "name": "Test Native",
+                "api_type": "test_native",
+                "base_url": "https://test.org",
+                "tier": 2,
+                "enabled": True,
+            }
+        },
+    }
+    mp_path = tmp_path / "marketplace.json"
+    mp_path.write_text(json.dumps(marketplace))
+
+    # No user overrides file
+    user_path = tmp_path / "providers.yaml"
+
+    result = load_platform_providers(marketplace_path=mp_path, user_path=user_path)
+    assert len(result) == 1
+    assert result[0]["id"] == "test_native"
+    assert result[0]["base_url"] == "https://test.org"

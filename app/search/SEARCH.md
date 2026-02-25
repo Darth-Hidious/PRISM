@@ -118,10 +118,10 @@ Layer 2 -- Bundled overrides (shipped with PRISM)
   Contains: tiers, capabilities, auth config, native API entries, known quirks
   Also: fallback_index_urls (proxies that 404), url_corrections (consortium typos)
 
-Layer 3 -- User & marketplace sources (NOT YET IMPLEMENTED)
-  File: ~/.prism/providers.yaml
-  Contains: user enable/disable, custom DB entries, personal auth config
-  See: "Extending Search" section below
+Layer 3 -- Platform & user sources
+  Dev:  app/search/marketplace.json (MARC27 catalog, NOT shipped to users)
+  Prod: MARC27 marketplace API (auth-gated, native API, dataset providers)
+  User: ~/.prism/providers.yaml (personal overrides, optional)
 ```
 
 Merge order: discovered -> bundled overrides -> user overrides. Higher layer wins per field.
@@ -157,7 +157,6 @@ corrections become harmless no-ops.
 | Provider | ID | Status | Notes |
 |----------|-----|--------|-------|
 | Materials Project (OPTIMADE) | `mp` | OK | 155K structures |
-| Materials Project (Native) | `mp_native` | OK | Requires `MP_API_KEY` |
 | NOMAD | `nmd` | OK | 12M+ structures |
 | Alexandria PBE | `alexandria.alexandria-pbe` | OK | 5M+ structures |
 | Alexandria PBEsol | `alexandria.alexandria-pbesol` | OK | 5M+ structures |
@@ -187,7 +186,7 @@ corrections become harmless no-ops.
 ### Tier 4 -- Disabled (broken OPTIMADE endpoints)
 | Provider | ID | Status | Issue | Last checked |
 |----------|-----|--------|-------|-------------|
-| AFLOW | `aflow` | HTTP 500 | OPTIMADE wrapper crashes on queries (`/v1/info` returns 200, `/v1/structures` returns 500). Native AFLUX API works fine (3.5M+ compounds). Future `aflow_native` provider candidate. | 2026-02-25 |
+| AFLOW | `aflow` | HTTP 500 | OPTIMADE wrapper broken (`/v1/structures` returns 500). Native AFLUX API works (3.5M+ compounds) — available as `aflow_native` in Layer 3 marketplace. | 2026-02-25 |
 
 ### Offline / Dead
 | Provider | ID | Status | Issue | Last checked |
@@ -213,67 +212,39 @@ To add a new provider type (e.g. `aflow_native`, `jarvis_native`):
 
 1. Create `app/search/providers/<name>.py` implementing `Provider` ABC
 2. Add the type string to `ProviderRegistry.from_endpoints()` dispatch
-3. Add the provider entry in `provider_overrides.json` with `api_type` and `base_url`
+3. Add the provider entry in `marketplace.json` with `api_type` and `base_url`
 
-### Future: Dataset Providers (Layer 3)
+### Layer 3: MARC27 Marketplace Providers
 
-Non-OPTIMADE datasets like OMAT24, user-imported data, and marketplace sources
-will be handled through a separate **Dataset Provider** system:
+Auth-gated, native API, and dataset providers are accessed through the MARC27
+platform. These are NOT shipped in the package — `marketplace.json` is a
+development-time catalog only. In production, Layer 3 providers come from the
+MARC27 marketplace API.
 
-```
-~/.prism/
-  providers.yaml           # user OPTIMADE overrides (enable/disable, auth)
-  databases/               # local/downloaded dataset storage
-    omat24/                # example: installed from marketplace
-    my_local_data/         # example: user's own data
-```
+**Current marketplace catalog (`app/search/marketplace.json`):**
 
-These are fundamentally different from OPTIMADE providers:
-- **OPTIMADE providers**: live REST APIs, queried in real-time, discovered automatically
-- **Dataset providers**: static or cached data, installed locally or via SDK,
-  registered through a separate catalog
+| Provider | API Type | Status | Notes |
+|----------|----------|--------|-------|
+| Materials Project (Native) | `mp_native` | available | Requires `MP_API_KEY` |
+| AFLOW (AFLUX API) | `aflow_native` | coming_soon | 3.5M+ compounds, native API confirmed working |
+| MPDS | `mpds_native` | coming_soon | Paid subscription required |
+| OMAT24 (Meta FAIR) | `dataset` | coming_soon | 110M DFT calculations on HuggingFace |
 
-**Planned architecture:**
+**User overrides** (`~/.prism/providers.yaml`, optional):
+Users can override any marketplace field (enable/disable, custom auth, etc.)
+via a local YAML file. User entries win over marketplace defaults.
+
+**Planned architecture for datasets:**
 
 ```python
-# New base class (separate from Provider ABC)
 class DatasetProvider:
     """Queryable local/cached dataset."""
     def search(self, query: MaterialSearchQuery) -> list[Material]: ...
-    def info(self) -> DatasetInfo: ...  # size, schema, source, version
+    def info(self) -> DatasetInfo: ...
 
-# Marketplace catalog (served by MARC27 platform)
-class MarketplaceCatalog:
-    """Browse and install datasets from the MARC27 marketplace."""
-    def list_available() -> list[DatasetInfo]: ...
-    def install(dataset_id: str) -> DatasetProvider: ...
+# Marketplace sources are NOT part of the OPTIMADE discovery pipeline.
+# They are served by the MARC27 platform at runtime.
 ```
-
-**Datasets planned for marketplace:**
-
-| Dataset | Source | Size | Notes |
-|---------|--------|------|-------|
-| OMAT24 | Meta FAIR / HuggingFace | 110M DFT calculations | Derived from Alexandria structures |
-| AFLOW (native) | aflow.org AFLUX API | 3.5M+ compounds | Native REST API works, OPTIMADE wrapper broken (HTTP 500) |
-| User local | User import | Varies | Parquet/CSV/CIF import |
-| Cloud storage | User S3/GCS | Varies | Remote dataset mounting |
-
-**SDK integration:**
-
-```python
-# Future: prism SDK for dataset providers
-from prism.sdk import DatasetProvider, register_provider
-
-class MyDatasetProvider(DatasetProvider):
-    """Custom provider for proprietary data."""
-    ...
-
-register_provider("my_data", MyDatasetProvider(...))
-```
-
-This is NOT part of the OPTIMADE auto-discovery pipeline. It's a separate
-registration path managed through `~/.prism/databases/` and the MARC27
-marketplace platform.
 
 ## Architecture
 
@@ -287,8 +258,10 @@ app/search/
   fusion.py                # FusionEngine: dedup + merge across providers
   SEARCH.md                # this file
 
+  marketplace.json         # Layer 3 dev catalog (NOT shipped, replaced by platform API)
+
   providers/
-    discovery.py           # 2-hop OPTIMADE auto-discovery + cache + overrides
+    discovery.py           # 2-hop OPTIMADE auto-discovery + cache + overrides + Layer 3
     registry.py            # ProviderRegistry + build_registry()
     endpoint.py            # ProviderEndpoint Pydantic model
     provider_overrides.json # Layer 2: tiers, capabilities, quirks, URL corrections
