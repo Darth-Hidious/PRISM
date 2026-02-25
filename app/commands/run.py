@@ -50,6 +50,17 @@ def run_goal(ctx, goal, agent, provider, model, confirm, accept_all):
     try:
         backend = create_backend(provider=provider, model=model)
         accumulated_text = ""
+
+        def _flush_text(live):
+            """Flush accumulated text permanently above the live area."""
+            nonlocal accumulated_text
+            if accumulated_text.strip():
+                live.update("")
+                run_console.print(Markdown(accumulated_text))
+            else:
+                live.update("")
+            accumulated_text = ""
+
         with Live("", console=run_console, refresh_per_second=15, vertical_overflow="visible") as live:
             effective_confirm = confirm and not accept_all
             for event in run_autonomous_stream(
@@ -61,14 +72,13 @@ def run_goal(ctx, goal, agent, provider, model, confirm, accept_all):
                     accumulated_text += event.text
                     live.update(Text(accumulated_text))
                 elif isinstance(event, ToolCallStart):
-                    live.update("")
+                    _flush_text(live)
                     run_console.print(Panel(
                         f"[dim]Calling...[/dim]",
                         title=f"[bold yellow]{event.tool_name}[/bold yellow]",
                         border_style="yellow",
                         expand=False,
                     ))
-                    accumulated_text = ""
                 elif isinstance(event, ToolCallResult):
                     run_console.print(Panel(
                         f"[green]{event.summary}[/green]",
@@ -77,10 +87,13 @@ def run_goal(ctx, goal, agent, provider, model, confirm, accept_all):
                         expand=False,
                     ))
                 elif isinstance(event, TurnComplete):
-                    live.update("")
-        if accumulated_text:
-            run_console.print()
-            run_console.print(Markdown(accumulated_text))
+                    _flush_text(live)
+                    if event.estimated_cost is not None:
+                        run_console.print(
+                            f"[dim]tokens: {event.total_usage.input_tokens:,}in "
+                            f"+ {event.total_usage.output_tokens:,}out "
+                            f"| cost: ${event.estimated_cost:.4f}[/dim]"
+                        )
     except ValueError as e:
         run_console.print(f"[red]Error: {e}[/red]")
     except Exception as e:
