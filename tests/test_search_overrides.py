@@ -23,12 +23,12 @@ def test_overrides_have_no_base_url_for_optimade_providers():
 
 def test_layer2_overrides_are_optimade_only():
     """Layer 2 overrides should only contain OPTIMADE providers.
-    Native/auth-gated providers belong in Layer 3 (marketplace.json)."""
+    Native/auth-gated providers belong in Layer 3 (catalog.json)."""
     path = Path(__file__).parent.parent / "app" / "search" / "providers" / "provider_overrides.json"
     data = json.loads(path.read_text())
     for pid, override in data["overrides"].items():
         api_type = override.get("api_type", "optimade")
-        assert api_type == "optimade", f"{pid} has api_type={api_type} — should be in marketplace.json"
+        assert api_type == "optimade", f"{pid} has api_type={api_type} — should be in catalog.json"
 
 
 def test_marketplace_native_providers_have_base_url():

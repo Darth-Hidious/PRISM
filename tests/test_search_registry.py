@@ -21,7 +21,7 @@ def test_build_registry_from_cache(tmp_path):
 
 
 def test_build_registry_includes_platform_providers(tmp_path):
-    """Platform providers from marketplace.json (Layer 3) are included."""
+    """Platform providers from catalog.json (Layer 3) are included."""
     from app.search.providers.registry import build_registry
     from app.search.providers.discovery import save_cache
 
@@ -31,7 +31,7 @@ def test_build_registry_includes_platform_providers(tmp_path):
 
     reg = build_registry(cache_path=cache_path, skip_network=True)
     ids = {p.id for p in reg.get_all()}
-    # mp_native comes from marketplace.json (Layer 3), not overrides
+    # mp_native comes from catalog.json (Layer 3), not overrides
     assert "mp_native" in ids
 
 

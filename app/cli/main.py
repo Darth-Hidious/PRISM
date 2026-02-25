@@ -200,6 +200,8 @@ def _ask_deprecated(ctx, query):
     _click.echo("Warning: 'prism ask' is deprecated. Use 'prism run \"query\"' instead.", err=True)
     if query:
         ctx.invoke(run_cmd, goal=query)
+    else:
+        _click.echo("Usage: prism run \"your question here\"", err=True)
 cli.add_command(_ask_deprecated, "ask")
 
 from app.commands.setup import setup as setup_cmd
