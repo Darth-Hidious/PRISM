@@ -9,6 +9,8 @@ from app.agent.events import (
 )
 from app.tools.base import ToolRegistry
 
+MAX_TOOL_RESULT_CHARS = 30_000
+
 
 DEFAULT_SYSTEM_PROMPT = """You are PRISM, an AI research assistant for materials science.
 
@@ -47,7 +49,12 @@ When a user asks a question:
 
 When you collect tabular data, consider using export_results_csv to save it for the user.
 
-Be precise with scientific data. Cite sources when possible."""
+Be precise with scientific data. Cite sources when possible.
+
+When a tool result is too large to fit in context, it will be stored and you'll receive
+a preview + result_id. Use the peek_result tool to examine specific sections:
+  peek_result(result_id="<id>", offset=0, limit=5000)
+You can also use export_results_csv to save the full result to a file for the user."""
 
 
 class AgentCore:
@@ -65,6 +72,7 @@ class AgentCore:
         self.auto_approve = auto_approve
         self.scratchpad = None  # Set by caller (AgentREPL / autonomous) if desired
         self._total_usage = UsageInfo()
+        self._result_store: dict = {}  # call_id -> full serialized result (RLM pattern)
 
     def _execute_tool(self, tool, tool_args: dict) -> dict:
         """Execute a tool, injecting scratchpad for show_scratchpad."""
@@ -93,6 +101,70 @@ class AgentCore:
         if usage.cache_read_tokens:
             cost += usage.cache_read_tokens * config.input_price_per_mtok * 0.1 / 1_000_000
         return cost
+
+    _PEEK_RESULT_TOOL_DEF = {
+        "name": "peek_result",
+        "description": "Examine a section of a stored large tool result. Use when a tool result was too large and was stored with a result_id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "result_id": {"type": "string", "description": "The result_id from the stored result"},
+                "offset": {"type": "integer", "description": "Character offset to start reading from (default 0)"},
+                "limit": {"type": "integer", "description": "Number of characters to read (default 5000)"},
+            },
+            "required": ["result_id"],
+        },
+    }
+
+    def _process_tool_result(self, result, call_id: str):
+        """Process a tool result. If it exceeds MAX_TOOL_RESULT_CHARS, store it
+        in the ResultStore and return a summary with peek_result instructions.
+        Inspired by the RLM paradigm (Zhang et al., 2025).
+        """
+        try:
+            serialized = json.dumps(result) if isinstance(result, dict) else json.dumps(str(result))
+        except (TypeError, ValueError):
+            serialized = str(result)
+
+        if len(serialized) <= MAX_TOOL_RESULT_CHARS:
+            return result if isinstance(result, dict) else {"value": result}
+
+        # Store full result for peek access
+        self._result_store[call_id] = serialized
+
+        return {
+            "_stored": True,
+            "_result_id": call_id,
+            "_total_size": len(serialized),
+            "preview": serialized[:2000],
+            "notice": (
+                f"Result too large ({len(serialized):,} chars). Stored as '{call_id}'. "
+                "Use the peek_result tool to examine specific sections: "
+                f"peek_result(result_id='{call_id}', offset=0, limit=5000). "
+                "You can also use export_results_csv to save the full result to a file."
+            ),
+        }
+
+    def _peek_result(self, result_id: str, offset: int = 0, limit: int = 5000) -> dict:
+        """Peek at a stored tool result. Returns a character slice."""
+        if result_id not in self._result_store:
+            return {"error": f"No stored result with id '{result_id}'"}
+        data = self._result_store[result_id]
+        chunk = data[offset:offset + limit]
+        return {
+            "chunk": chunk,
+            "offset": offset,
+            "limit": limit,
+            "total_size": len(data),
+            "has_more": offset + limit < len(data),
+        }
+
+    def _get_tool_defs(self) -> list:
+        """Get tool definitions, including peek_result if there are stored results."""
+        defs = self.tools.to_anthropic_format()
+        if self._result_store:
+            defs = list(defs) + [self._PEEK_RESULT_TOOL_DEF]
+        return defs
 
     def _log_to_scratchpad(self, tool_name: str, tool_args: dict, result: dict):
         """Log a tool execution to the scratchpad if available."""
@@ -132,9 +204,9 @@ class AgentCore:
     def process(self, message: str) -> str:
         """Process a user message through the TAOR loop. Returns final text."""
         self.history.append({"role": "user", "content": message})
-        tool_defs = self.tools.to_anthropic_format()
 
         for _iteration in range(self.max_iterations):
+            tool_defs = self._get_tool_defs()
             response = self.backend.complete(messages=self.history, tools=tool_defs, system_prompt=self.system_prompt)
             if response.usage:
                 self._total_usage = self._total_usage + response.usage
@@ -146,17 +218,22 @@ class AgentCore:
                     "calls": [{"id": tc.call_id, "name": tc.tool_name, "args": tc.tool_args} for tc in response.tool_calls],
                 })
                 for tc in response.tool_calls:
-                    tool = self.tools.get(tc.tool_name)
-                    if not self._should_approve(tool, tc):
-                        result = {"skipped": f"Tool {tc.tool_name} was not approved by user."}
+                    # Handle internal peek_result tool
+                    if tc.tool_name == "peek_result":
+                        result = self._peek_result(**tc.tool_args)
                     else:
-                        try:
-                            result = self._execute_tool(tool, tc.tool_args)
-                        except Exception as e:
-                            result = {"error": str(e)}
-                    self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": result})
+                        tool = self.tools.get(tc.tool_name)
+                        if not self._should_approve(tool, tc):
+                            result = {"skipped": f"Tool {tc.tool_name} was not approved by user."}
+                        else:
+                            try:
+                                result = self._execute_tool(tool, tc.tool_args)
+                            except Exception as e:
+                                result = {"error": str(e)}
                     self._log_to_scratchpad(tc.tool_name, tc.tool_args, result)
                     self._post_tool_hook(tc.tool_name, result)
+                    processed = self._process_tool_result(result, call_id=tc.call_id)
+                    self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": processed})
             else:
                 if response.text:
                     self.history.append({"role": "assistant", "content": response.text})
@@ -167,9 +244,9 @@ class AgentCore:
     def process_stream(self, message: str) -> Generator:
         """Process a user message through the TAOR loop, yielding stream events."""
         self.history.append({"role": "user", "content": message})
-        tool_defs = self.tools.to_anthropic_format()
 
         for _iteration in range(self.max_iterations):
+            tool_defs = self._get_tool_defs()
             for event in self.backend.complete_stream(messages=self.history, tools=tool_defs, system_prompt=self.system_prompt):
                 if isinstance(event, (TextDelta, ToolCallStart)):
                     yield event
@@ -190,31 +267,37 @@ class AgentCore:
                     "calls": [{"id": tc.call_id, "name": tc.tool_name, "args": tc.tool_args} for tc in response.tool_calls],
                 })
                 for tc in response.tool_calls:
-                    tool = self.tools.get(tc.tool_name)
-                    # Approval gate
-                    if tool.requires_approval and not self.auto_approve:
-                        yield ToolApprovalRequest(tool_name=tc.tool_name, tool_args=tc.tool_args, call_id=tc.call_id)
-                        if self.approval_callback:
-                            approved = self.approval_callback(tc.tool_name, tc.tool_args)
-                        else:
-                            approved = False
-                        if not approved:
-                            result = {"skipped": f"Tool {tc.tool_name} was not approved by user."}
-                            self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": result})
-                            yield ToolCallResult(call_id=tc.call_id, tool_name=tc.tool_name, result=result, summary=f"{tc.tool_name}: skipped (not approved)")
-                            continue
-                    try:
-                        result = self._execute_tool(tool, tc.tool_args)
-                    except Exception as e:
-                        result = {"error": str(e)}
-                    self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": result})
+                    # Handle internal peek_result tool
+                    if tc.tool_name == "peek_result":
+                        result = self._peek_result(**tc.tool_args)
+                    else:
+                        tool = self.tools.get(tc.tool_name)
+                        # Approval gate
+                        if tool.requires_approval and not self.auto_approve:
+                            yield ToolApprovalRequest(tool_name=tc.tool_name, tool_args=tc.tool_args, call_id=tc.call_id)
+                            if self.approval_callback:
+                                approved = self.approval_callback(tc.tool_name, tc.tool_args)
+                            else:
+                                approved = False
+                            if not approved:
+                                result = {"skipped": f"Tool {tc.tool_name} was not approved by user."}
+                                processed = self._process_tool_result(result, call_id=tc.call_id)
+                                self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": processed})
+                                yield ToolCallResult(call_id=tc.call_id, tool_name=tc.tool_name, result=processed, summary=f"{tc.tool_name}: skipped (not approved)")
+                                continue
+                        try:
+                            result = self._execute_tool(tool, tc.tool_args)
+                        except Exception as e:
+                            result = {"error": str(e)}
                     self._log_to_scratchpad(tc.tool_name, tc.tool_args, result)
                     self._post_tool_hook(tc.tool_name, result)
+                    processed = self._process_tool_result(result, call_id=tc.call_id)
+                    self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": processed})
                     yield ToolCallResult(
                         call_id=tc.call_id,
                         tool_name=tc.tool_name,
-                        result=result,
-                        summary=self._summarize_tool_result(tc.tool_name, result),
+                        result=processed,
+                        summary=self._summarize_tool_result(tc.tool_name, processed),
                     )
             else:
                 if response.text:
@@ -251,3 +334,4 @@ class AgentCore:
         """Clear conversation history and usage tracking."""
         self.history.clear()
         self._total_usage = UsageInfo()
+        self._result_store.clear()
