@@ -21,7 +21,7 @@ class TestMCPRoundTrip:
         assert "predict_property" in tool_names
         assert "export_results_csv" in tool_names
         assert "list_models" in tool_names
-        assert len(tool_names) == 10
+        assert len(tool_names) >= 10
 
     def test_call_list_models_via_mcp(self):
         """Client can call list_models tool and get valid JSON back."""

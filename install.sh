@@ -1,12 +1,22 @@
 #!/bin/sh
-# PRISM One-Command Installer
+# PRISM One-Command Installer v2.5
 # Usage: curl -fsSL https://prism.marc27.com/install.sh | bash
+#        curl -fsSL https://prism.marc27.com/install.sh | bash -s -- --upgrade
 set -e
 
 REPO="https://github.com/Darth-Hidious/PRISM.git"
 PACKAGE="prism-platform"
 GIT_PACKAGE="$PACKAGE @ git+$REPO"
 MIN_PYTHON="3.11"
+CURRENT_VERSION="2.5.0"
+
+# ── Parse flags ──────────────────────────────────────────────────────
+UPGRADE=0
+for arg in "$@"; do
+    case "$arg" in
+        --upgrade|-u) UPGRADE=1 ;;
+    esac
+done
 
 # ── Helpers ──────────────────────────────────────────────────────────
 info()  { printf '  \033[1;34m%s\033[0m %s\n' "$1" "$2"; }
@@ -14,8 +24,32 @@ ok()    { printf '  \033[1;32m%s\033[0m %s\n' "$1" "$2"; }
 warn()  { printf '  \033[1;33m%s\033[0m %s\n' "$1" "$2"; }
 err()   { printf '  \033[1;31m%s\033[0m %s\n' "ERROR:" "$1" >&2; exit 1; }
 
-printf '\n\033[1;36mPRISM Installer\033[0m\n'
-printf '  Platform for Research in Intelligent Synthesis of Materials\n\n'
+# ── Banner ───────────────────────────────────────────────────────────
+printf '\n'
+printf '  \033[1;36m⬡ PRISM\033[0m v%s\n' "$CURRENT_VERSION"
+printf '  \033[2mPlatform for Research in Intelligent Synthesis of Materials\033[0m\n'
+printf '  \033[2mBy MARC27 — marc27.com\033[0m\n\n'
+
+# ── Check if already installed & handle upgrade ──────────────────────
+if command -v prism >/dev/null 2>&1; then
+    INSTALLED_VERSION=$(prism --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+    if [ "$UPGRADE" -eq 0 ]; then
+        ok "Found:" "PRISM v$INSTALLED_VERSION already installed"
+        if [ "$INSTALLED_VERSION" != "$CURRENT_VERSION" ]; then
+            warn "Update:" "v$CURRENT_VERSION available (you have v$INSTALLED_VERSION)"
+            info "Run:" "curl -fsSL https://prism.marc27.com/install.sh | bash -s -- --upgrade"
+        else
+            ok "Up to date!" ""
+        fi
+        printf '\n'
+        info "Run:" "prism"
+        info "Help:" "prism --help"
+        printf '\n'
+        exit 0
+    else
+        info "Upgrading:" "v$INSTALLED_VERSION → v$CURRENT_VERSION"
+    fi
+fi
 
 # ── Ensure ~/.local/bin is on PATH (used by pip --user, pipx, uv) ──
 case ":$PATH:" in
@@ -221,7 +255,11 @@ fi
 
 # ── Install PRISM ────────────────────────────────────────────────────
 printf '\n'
-info "Installing:" "PRISM from GitHub..."
+if [ "$UPGRADE" -eq 1 ]; then
+    info "Upgrading:" "PRISM from GitHub..."
+else
+    info "Installing:" "PRISM from GitHub..."
+fi
 
 INSTALL_OK=0
 case "$INSTALLER" in
@@ -231,20 +269,27 @@ case "$INSTALLER" in
             PYTHON_PATH="$(command -v "$PYTHON")"
             UV_ARGS="--python $PYTHON_PATH"
         fi
-        if uv tool install $UV_ARGS "$GIT_PACKAGE"; then
-            INSTALL_OK=1
+        if [ "$UPGRADE" -eq 1 ]; then
+            # Force reinstall for upgrade
+            uv tool install $UV_ARGS --force "$GIT_PACKAGE" && INSTALL_OK=1
+        else
+            uv tool install $UV_ARGS "$GIT_PACKAGE" && INSTALL_OK=1
         fi
         ;;
     pipx)
         PYTHON_PATH="$(command -v "$PYTHON")"
-        if pipx install --python "$PYTHON_PATH" "$GIT_PACKAGE"; then
-            INSTALL_OK=1
+        if [ "$UPGRADE" -eq 1 ]; then
+            pipx install --python "$PYTHON_PATH" --force "$GIT_PACKAGE" && INSTALL_OK=1
+        else
+            pipx install --python "$PYTHON_PATH" "$GIT_PACKAGE" && INSTALL_OK=1
         fi
         ;;
     pipx-module)
         PYTHON_PATH="$(command -v "$PYTHON")"
-        if $PYTHON -m pipx install --python "$PYTHON_PATH" "$GIT_PACKAGE"; then
-            INSTALL_OK=1
+        if [ "$UPGRADE" -eq 1 ]; then
+            $PYTHON -m pipx install --python "$PYTHON_PATH" --force "$GIT_PACKAGE" && INSTALL_OK=1
+        else
+            $PYTHON -m pipx install --python "$PYTHON_PATH" "$GIT_PACKAGE" && INSTALL_OK=1
         fi
         ;;
 esac
@@ -264,11 +309,18 @@ case ":$PATH:" in
 esac
 
 if command -v prism >/dev/null 2>&1; then
-    ok "Success!" "PRISM is installed."
+    FINAL_VERSION=$(prism --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "$CURRENT_VERSION")
+    if [ "$UPGRADE" -eq 1 ]; then
+        ok "Upgraded!" "PRISM v$FINAL_VERSION"
+    else
+        ok "Installed!" "PRISM v$FINAL_VERSION"
+    fi
     printf '\n'
-    info "Run:" "prism"
-    info "Help:" "prism --help"
-    info "Docs:" "https://github.com/Darth-Hidious/PRISM"
+    printf '  \033[1;36m⬡\033[0m Get started:\n'
+    printf '\n'
+    info "  Run:" "prism"
+    info "  Help:" "prism --help"
+    info "  Docs:" "https://github.com/Darth-Hidious/PRISM"
     printf '\n'
 
     # Warn if user's login shell won't see the binary
