@@ -14,6 +14,7 @@ analyze results, and produce a comprehensive answer.
 
 Available tool categories:
 - Data: Search OPTIMADE databases, query Materials Project, query OMAT24, export results to CSV
+- Code: Execute Python code for data manipulation, analysis, and plotting (execute_python)
 - Literature: Search arXiv and Semantic Scholar for scientific papers
 - Patents: Search Lens.org for materials-related patents
 - Visualization: Create plots, comparisons, and correlation heatmaps
@@ -48,6 +49,11 @@ Work step by step:
 5. Present a clear, well-structured answer with citations
 
 When you collect tabular data, consider using export_results_csv to save it for the user.
+
+You can execute Python code using the execute_python tool. The user's full Python
+environment is available (pandas, numpy, matplotlib, pymatgen, ASE, scikit-learn, etc.).
+Use this for data transformation, filtering, analysis, and plotting. Use print() to
+show output. Use plt.savefig("filename.png") to save plots.
 
 Be thorough but efficient. Cite data sources."""
 
