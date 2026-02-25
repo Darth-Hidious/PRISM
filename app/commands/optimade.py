@@ -3,8 +3,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from app.config.providers import FALLBACK_PROVIDERS
-from app.commands.search import _make_optimade_client
+from app.search.providers.endpoint import load_registry
 
 
 @click.group()
@@ -18,44 +17,29 @@ def list_databases():
     """Lists all available OPTIMADE provider databases."""
     console = Console(force_terminal=True, width=120)
 
-    with console.status("[bold green]Fetching all registered OPTIMADE providers...[/bold green]"):
-        try:
-            # Use our curated list to avoid noisy discovery
-            client = _make_optimade_client()
+    try:
+        endpoints = load_registry()
 
-            table = Table(show_header=True, header_style="bold magenta", title="Live OPTIMADE Providers")
-            table.add_column("ID", style="cyan")
-            table.add_column("Name")
-            table.add_column("Description")
-            table.add_column("Base URL")
+        table = Table(show_header=True, header_style="bold magenta", title="PRISM Provider Registry")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name")
+        table.add_column("Tier")
+        table.add_column("Status")
+        table.add_column("Structures")
+        table.add_column("Base URL")
 
-            if hasattr(client, 'info') and client.info and hasattr(client.info, 'providers'):
-                for provider in client.info.providers:
-                    table.add_row(
-                        provider.id,
-                        provider.name,
-                        provider.description,
-                        str(provider.base_url) if provider.base_url else "N/A"
-                    )
-                console.print(table)
-            else:
-                raise Exception("Could not retrieve live provider information from client.")
+        for ep in sorted(endpoints, key=lambda e: (e.tier, e.id)):
+            status_style = "green" if ep.enabled else ("yellow" if ep.status == "namespace_reserved" else "red")
+            table.add_row(
+                ep.id,
+                ep.name,
+                str(ep.tier),
+                f"[{status_style}]{ep.status}[/{status_style}]",
+                f"{ep.structures_approx:,}" if ep.structures_approx else "N/A",
+                ep.base_url or "[dim]no endpoint[/dim]",
+            )
+        console.print(table)
+        console.print(f"\n[dim]Total: {len(endpoints)} providers, {sum(1 for e in endpoints if e.enabled)} enabled[/dim]")
 
-        except Exception as e:
-            # If the live fetch fails, fall back to a hardcoded list
-            console.print(f"[yellow]Warning: Could not fetch the live list of OPTIMADE providers ({e}). Displaying a fallback list of known providers.[/yellow]")
-
-            table = Table(show_header=True, header_style="bold magenta", title="Fallback List of Known Providers")
-            table.add_column("ID", style="cyan")
-            table.add_column("Name")
-            table.add_column("Description")
-            table.add_column("Base URL")
-
-            for provider in FALLBACK_PROVIDERS:
-                table.add_row(
-                    provider["id"],
-                    provider["name"],
-                    provider["description"],
-                    provider["base_url"]
-                )
-            console.print(table)
+    except Exception as e:
+        console.print(f"[bold red]Error loading registry: {e}[/bold red]")

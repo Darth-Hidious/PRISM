@@ -12,7 +12,7 @@ class TestBuildFullRegistry:
     def test_has_core_tools(self):
         registry = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
-        assert "search_optimade" in names
+        assert "search_materials" in names
         assert "query_materials_project" in names
         assert "export_results_csv" in names
         assert "import_dataset" in names

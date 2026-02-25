@@ -6,7 +6,56 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 from app.config.providers import FALLBACK_PROVIDERS
-from app.commands.search import _make_optimade_client, enrich_materials_with_mp_data
+
+
+def _make_optimade_client(providers=None, max_results=1000):
+    """Create OptimadeClient using explicit base_urls. Compat shim for ask command."""
+    from optimade.client import OptimadeClient
+    if providers:
+        ids = [p.strip() for p in providers] if isinstance(providers, list) else [p.strip() for p in providers.split(",")]
+        base_urls = [p["base_url"] for p in FALLBACK_PROVIDERS if p["id"] in ids]
+        if not base_urls:
+            base_urls = [p["base_url"] for p in FALLBACK_PROVIDERS]
+    else:
+        base_urls = [p["base_url"] for p in FALLBACK_PROVIDERS]
+    return OptimadeClient(base_urls=base_urls, max_results_per_provider=max_results)
+
+
+def enrich_materials_with_mp_data(materials, console=None, mp_api_key=None):
+    """Enrich OPTIMADE materials with MP native API data. Compat shim for ask command."""
+    import os
+    try:
+        from mp_api.client import MPRester
+    except ImportError:
+        return materials
+    if not mp_api_key:
+        mp_api_key = os.getenv('MATERIALS_PROJECT_API_KEY')
+    if not mp_api_key:
+        return materials
+    try:
+        with MPRester(mp_api_key) as mpr:
+            mp_ids = [str(m.get('id', '')) for m in materials if str(m.get('id', '')).startswith('mp-')]
+            if not mp_ids:
+                return materials
+            mp_data = mpr.materials.summary.search(
+                material_ids=mp_ids,
+                fields=['material_id', 'formation_energy_per_atom', 'band_gap', 'energy_above_hull'],
+            )
+            mp_lookup = {doc.material_id: doc for doc in mp_data}
+            for material in materials:
+                mid = str(material.get('id', ''))
+                if mid in mp_lookup:
+                    doc = mp_lookup[mid]
+                    attrs = material.setdefault('attributes', {})
+                    if doc.formation_energy_per_atom is not None:
+                        attrs['_mp_formation_energy_per_atom'] = doc.formation_energy_per_atom
+                    if doc.band_gap is not None:
+                        attrs['_mp_band_gap'] = doc.band_gap
+                    if doc.energy_above_hull is not None:
+                        attrs['_mp_e_above_hull'] = doc.energy_above_hull
+    except Exception:
+        pass
+    return materials
 
 
 @click.command()

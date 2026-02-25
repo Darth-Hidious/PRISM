@@ -7,39 +7,51 @@ from typing import List, Optional
 from app.tools.base import Tool, ToolRegistry
 
 
-def _search_optimade(**kwargs) -> dict:
-    filter_string = kwargs["filter_string"]
-    providers = kwargs.get("providers", None)
-    max_results = kwargs.get("max_results", 10)
+def _search_materials(**kwargs) -> dict:
+    """Search materials via the PRISM federated search engine."""
+    import asyncio
+    from app.search import SearchEngine, MaterialSearchQuery, PropertyRange
+    from app.search.providers.registry import ProviderRegistry
+
     try:
-        from optimade.client import OptimadeClient
-        from app.config.providers import FALLBACK_PROVIDERS
-        if providers:
-            base_urls = [p["base_url"] for p in FALLBACK_PROVIDERS if p["id"] in providers]
-        else:
-            base_urls = [p["base_url"] for p in FALLBACK_PROVIDERS]
-        client = OptimadeClient(base_urls=base_urls, max_results_per_provider=max_results)
-        raw = client.get(filter_string)
-        # Response format: {endpoint: {filter: {url: {data: [entries]}}}}
-        results = []
-        for endpoint, filters in raw.items():
-            if not isinstance(filters, dict):
-                continue
-            for filter_key, providers_data in filters.items():
-                if not isinstance(providers_data, dict):
-                    continue
-                for provider_url, response in providers_data.items():
-                    entries = []
-                    if isinstance(response, dict):
-                        entries = response.get("data", [])
-                    elif isinstance(response, list):
-                        entries = response
-                    for entry in entries[:max_results]:
-                        attrs = entry.get("attributes", {}) if isinstance(entry, dict) else {}
-                        results.append({"id": entry.get("id", ""), "provider": provider_url, "formula": attrs.get("chemical_formula_descriptive", ""), "elements": attrs.get("elements", []), "space_group": attrs.get("space_group_symbol", "")})
-        return {"results": results, "count": len(results), "filter": filter_string}
+        query = MaterialSearchQuery(
+            elements=kwargs.get("elements"),
+            formula=kwargs.get("formula"),
+            n_elements=PropertyRange(min=kwargs["n_elements_min"], max=kwargs["n_elements_max"]) if kwargs.get("n_elements_min") or kwargs.get("n_elements_max") else None,
+            band_gap=PropertyRange(min=kwargs.get("band_gap_min"), max=kwargs.get("band_gap_max")) if kwargs.get("band_gap_min") is not None or kwargs.get("band_gap_max") is not None else None,
+            space_group=kwargs.get("space_group"),
+            crystal_system=kwargs.get("crystal_system"),
+            providers=kwargs.get("providers"),
+            limit=kwargs.get("limit", 20),
+        )
+        registry = ProviderRegistry.from_registry_json()
+        engine = SearchEngine(registry=registry)
+        result = asyncio.run(engine.search(query))
+
+        materials = []
+        for m in result.materials:
+            entry = {
+                "id": m.id, "formula": m.formula, "elements": m.elements,
+                "sources": m.sources,
+            }
+            if m.band_gap:
+                entry["band_gap"] = {"value": m.band_gap.value, "unit": m.band_gap.unit, "source": m.band_gap.source}
+            if m.space_group:
+                entry["space_group"] = m.space_group.value
+            if m.formation_energy:
+                entry["formation_energy"] = {"value": m.formation_energy.value, "unit": m.formation_energy.unit}
+            materials.append(entry)
+
+        return {
+            "results": materials,
+            "count": result.total_count,
+            "search_time_ms": result.search_time_ms,
+            "cached": result.cached,
+            "warnings": result.warnings,
+            "providers_queried": [{"id": log.provider_id, "status": log.status, "results": log.result_count} for log in result.query_log],
+        }
     except Exception as e:
-        return {"error": str(e), "filter": filter_string}
+        return {"error": str(e)}
 
 
 def _query_materials_project(**kwargs) -> dict:
@@ -131,14 +143,20 @@ def _export_results_csv(**kwargs) -> dict:
 
 def create_data_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
-        name="search_optimade",
-        description="Search materials databases using OPTIMADE filter syntax. Queries 6 providers: Materials Project, OQMD, COD, AFLOW, JARVIS, Materials Cloud. Use OPTIMADE filter syntax like: elements HAS ALL \"Si\",\"O\" AND nelements=2",
+        name="search_materials",
+        description="Search materials databases via PRISM's federated search engine. Queries 20+ providers (NOMAD, MP, OQMD, COD, Alexandria, GNoME, etc.) in parallel with automatic cross-provider fusion.",
         input_schema={"type": "object", "properties": {
-            "filter_string": {"type": "string", "description": "OPTIMADE filter string"},
-            "providers": {"type": "array", "items": {"type": "string"}, "description": "Optional provider IDs"},
-            "max_results": {"type": "integer", "description": "Max results per provider. Default 10.", "default": 10}},
-            "required": ["filter_string"]},
-        func=_search_optimade))
+            "elements": {"type": "array", "items": {"type": "string"}, "description": "Must contain ALL these elements (e.g., ['Fe', 'O'])"},
+            "formula": {"type": "string", "description": "Chemical formula (e.g., 'SiO2')"},
+            "n_elements_min": {"type": "integer", "description": "Minimum number of elements"},
+            "n_elements_max": {"type": "integer", "description": "Maximum number of elements"},
+            "band_gap_min": {"type": "number", "description": "Minimum band gap in eV"},
+            "band_gap_max": {"type": "number", "description": "Maximum band gap in eV"},
+            "space_group": {"type": "string", "description": "Space group symbol (e.g., 'Fm-3m')"},
+            "crystal_system": {"type": "string", "enum": ["cubic", "hexagonal", "tetragonal", "orthorhombic", "monoclinic", "triclinic", "trigonal"], "description": "Crystal system"},
+            "providers": {"type": "array", "items": {"type": "string"}, "description": "Optional: only query these provider IDs"},
+            "limit": {"type": "integer", "description": "Max results (default 20)", "default": 20}}},
+        func=_search_materials))
     registry.register(Tool(
         name="query_materials_project",
         description="Query Materials Project for detailed material properties like band gap, formation energy, bulk modulus. Requires MP_API_KEY.",
