@@ -107,6 +107,7 @@ def build_registry(
     overrides_data = load_overrides(overrides_path)
     overrides = overrides_data.get("overrides", {})
     defaults = overrides_data.get("defaults", {})
-    resolved = apply_overrides(endpoints, overrides, defaults)
+    url_corrections = overrides_data.get("url_corrections", {})
+    resolved = apply_overrides(endpoints, overrides, defaults, url_corrections)
 
     return ProviderRegistry.from_endpoints(resolved)
