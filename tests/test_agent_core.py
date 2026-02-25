@@ -60,7 +60,8 @@ class TestAgentCore:
         agent = AgentCore(backend=backend, tools=ToolRegistry(), system_prompt="You are PRISM.")
         agent.process("hi")
         call_kwargs = backend.complete.call_args
-        assert call_kwargs.kwargs.get("system_prompt") == "You are PRISM."
+        # System prompt starts with the provided base, with capabilities appended
+        assert call_kwargs.kwargs.get("system_prompt").startswith("You are PRISM.")
 
     def test_max_iterations_safety(self):
         backend = MagicMock()

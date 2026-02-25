@@ -55,6 +55,7 @@ def build_full_registry(
     from app.tools.search import create_search_tools
     from app.tools.property_selection import create_property_selection_tools
     from app.tools.code import create_code_tools
+    from app.tools.capabilities import create_capabilities_tools
 
     registry = ToolRegistry()
     create_system_tools(registry)
@@ -64,6 +65,7 @@ def build_full_registry(
     create_search_tools(registry)
     create_property_selection_tools(registry)
     create_code_tools(registry)
+    create_capabilities_tools(registry)
 
     # Premium labs tools (marketplace services)
     from app.tools.labs import create_labs_tools
