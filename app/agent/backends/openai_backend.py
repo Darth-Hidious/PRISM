@@ -2,13 +2,15 @@
 import json
 import os
 from typing import Dict, Generator, List, Optional
-from openai import OpenAI
+from openai import OpenAI, APIStatusError as OpenAIAPIError
 from app.agent.backends.base import Backend
 from app.agent.models import get_model_config
 from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete
 
 
 class OpenAIBackend(Backend):
+    _retryable_exceptions = (OpenAIAPIError,)
+
     def __init__(self, model: str = None, api_key: str = None, base_url: str = None):
         kwargs = {}
         if api_key:
@@ -24,7 +26,7 @@ class OpenAIBackend(Backend):
         kwargs = {"model": self.model, "max_tokens": self.model_config.default_max_tokens, "messages": formatted_messages}
         if tools:
             kwargs["tools"] = self._format_tools(tools)
-        response = self.client.chat.completions.create(**kwargs)
+        response = self._retry_api_call(lambda: self.client.chat.completions.create(**kwargs))
         return self._parse_response(response)
 
     def complete_stream(self, messages: List[Dict], tools: List[dict], system_prompt: Optional[str] = None) -> Generator:
@@ -32,7 +34,7 @@ class OpenAIBackend(Backend):
         kwargs = {"model": self.model, "max_tokens": self.model_config.default_max_tokens, "messages": formatted_messages, "stream": True}
         if tools:
             kwargs["tools"] = self._format_tools(tools)
-        stream = self.client.chat.completions.create(**kwargs)
+        stream = self._retry_api_call(lambda: self.client.chat.completions.create(**kwargs))
 
         text_parts = []
         tool_calls_acc = {}  # index -> {id, name, args_str}

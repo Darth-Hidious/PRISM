@@ -2,7 +2,7 @@
 import json
 import os
 from typing import Dict, Generator, List, Optional
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError as AnthropicAPIError
 from app.agent.backends.base import Backend
 from app.agent.models import get_model_config
 from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete
@@ -10,6 +10,8 @@ from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallSt
 
 class AnthropicBackend(Backend):
     """Backend that uses Anthropic's Messages API with tool use."""
+
+    _retryable_exceptions = (AnthropicAPIError,)
 
     def __init__(self, model: str = None, api_key: str = None):
         self.client = Anthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
@@ -28,7 +30,7 @@ class AnthropicBackend(Backend):
             ]
         if tools:
             kwargs["tools"] = tools
-        response = self.client.messages.create(**kwargs)
+        response = self._retry_api_call(lambda: self.client.messages.create(**kwargs))
         return self._parse_response(response)
 
     def complete_stream(self, messages: List[Dict], tools: List[dict], system_prompt: Optional[str] = None) -> Generator:
@@ -43,7 +45,7 @@ class AnthropicBackend(Backend):
             ]
         if tools:
             kwargs["tools"] = tools
-        with self.client.messages.stream(**kwargs) as stream:
+        with self._retry_api_call(lambda: self.client.messages.stream(**kwargs)) as stream:
             for event in stream:
                 if event.type == "content_block_start" and hasattr(event.content_block, "type"):
                     if event.content_block.type == "tool_use":
