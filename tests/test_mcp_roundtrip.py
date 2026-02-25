@@ -17,7 +17,7 @@ class TestMCPRoundTrip:
                 return [t.name for t in tools]
 
         tool_names = asyncio.run(run())
-        assert "search_optimade" in tool_names
+        assert "search_materials" in tool_names
         assert "predict_property" in tool_names
         assert "export_results_csv" in tool_names
         assert "list_models" in tool_names
@@ -66,5 +66,5 @@ class TestMCPRoundTrip:
         text = asyncio.run(run())
         data = json.loads(text)
         tool_names = [t["name"] for t in data]
-        assert "search_optimade" in tool_names
+        assert "search_materials" in tool_names
         assert "list_models" in tool_names

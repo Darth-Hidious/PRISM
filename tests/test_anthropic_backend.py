@@ -35,11 +35,11 @@ class TestAnthropicBackend:
     @patch("app.agent.backends.anthropic_backend.Anthropic")
     def test_tool_call_response(self, mock_cls):
         client = mock_cls.return_value
-        client.messages.create.return_value = self._make_tool_response("search_optimade", {"query": "silicon"}, "call_abc")
+        client.messages.create.return_value = self._make_tool_response("search_materials", {"query": "silicon"}, "call_abc")
         backend = AnthropicBackend(api_key="test-key")
-        resp = backend.complete(messages=[{"role": "user", "content": "Find silicon"}], tools=[{"name": "search_optimade", "description": "Search", "input_schema": {}}])
+        resp = backend.complete(messages=[{"role": "user", "content": "Find silicon"}], tools=[{"name": "search_materials", "description": "Search", "input_schema": {}}])
         assert resp.has_tool_calls is True
-        assert resp.tool_calls[0].tool_name == "search_optimade"
+        assert resp.tool_calls[0].tool_name == "search_materials"
         assert resp.tool_calls[0].call_id == "call_abc"
 
     @patch("app.agent.backends.anthropic_backend.Anthropic")
@@ -91,20 +91,20 @@ class TestAnthropicBackend:
         ev1.type = "content_block_start"
         ev1.content_block = MagicMock()
         ev1.content_block.type = "tool_use"
-        ev1.content_block.name = "search_optimade"
+        ev1.content_block.name = "search_materials"
         ev1.content_block.id = "call_1"
 
         stream_ctx = MagicMock()
         stream_ctx.__enter__ = lambda s: s
         stream_ctx.__exit__ = MagicMock(return_value=False)
         stream_ctx.__iter__ = MagicMock(return_value=iter([ev1]))
-        stream_ctx.get_final_message.return_value = self._make_tool_response("search_optimade", {"q": "Si"}, "call_1")
+        stream_ctx.get_final_message.return_value = self._make_tool_response("search_materials", {"q": "Si"}, "call_1")
         client.messages.stream.return_value = stream_ctx
 
         backend = AnthropicBackend(api_key="test-key")
-        events = list(backend.complete_stream(messages=[{"role": "user", "content": "find Si"}], tools=[{"name": "search_optimade"}]))
+        events = list(backend.complete_stream(messages=[{"role": "user", "content": "find Si"}], tools=[{"name": "search_materials"}]))
         tool_starts = [e for e in events if isinstance(e, ToolCallStart)]
         assert len(tool_starts) == 1
-        assert tool_starts[0].tool_name == "search_optimade"
+        assert tool_starts[0].tool_name == "search_materials"
         assert isinstance(events[-1], TurnComplete)
         assert events[-1].has_more is True

@@ -25,7 +25,7 @@ class TestSkillLoadingAutonomous:
 
         # Original tools should also be present
         tool_names = {t.name for t in tools.list_tools()}
-        assert "search_optimade" in tool_names
+        assert "search_materials" in tool_names
         assert "plot_materials_comparison" in tool_names
 
 

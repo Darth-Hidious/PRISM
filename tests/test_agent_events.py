@@ -39,14 +39,14 @@ class TestStreamEvents:
         assert delta.text == "Hello"
 
     def test_tool_call_start(self):
-        event = ToolCallStart(tool_name="search_optimade", call_id="c1")
-        assert event.tool_name == "search_optimade"
+        event = ToolCallStart(tool_name="search_materials", call_id="c1")
+        assert event.tool_name == "search_materials"
         assert event.call_id == "c1"
 
     def test_tool_call_result(self):
-        event = ToolCallResult(call_id="c1", tool_name="search_optimade", result={"count": 5}, summary="Found 5 materials")
+        event = ToolCallResult(call_id="c1", tool_name="search_materials", result={"count": 5}, summary="Found 5 materials")
         assert event.call_id == "c1"
-        assert event.tool_name == "search_optimade"
+        assert event.tool_name == "search_materials"
         assert event.result == {"count": 5}
         assert event.summary == "Found 5 materials"
 

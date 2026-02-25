@@ -7,7 +7,7 @@ from rich.console import Console
 from app.cli.tui.theme import PRIMARY
 
 TOOL_VERBS = {
-    "search_optimade": "Searching OPTIMADE databases\u2026",
+    "search_materials": "Searching materials databases\u2026",
     "query_materials_project": "Querying Materials Project\u2026",
     "predict_property": "Training ML model\u2026",
     "calculate_phase_diagram": "Computing phase diagram\u2026",

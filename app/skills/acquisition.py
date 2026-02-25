@@ -102,7 +102,7 @@ ACQUIRE_SKILL = Skill(
         "normalize records, and save as a named dataset for downstream analysis."
     ),
     steps=[
-        SkillStep("collect_optimade", "Query OPTIMADE providers", "search_optimade"),
+        SkillStep("collect_optimade", "Query materials databases", "search_materials"),
         SkillStep(
             "collect_mp",
             "Query Materials Project",

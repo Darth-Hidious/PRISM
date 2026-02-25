@@ -75,12 +75,12 @@ class TestPostToolHook:
     def test_no_feedback_for_safe_tools(self):
         """Regular tools don't trigger feedback injection."""
         agent, backend = _make_agent_with_tool(
-            "search_optimade",
+            "search_materials",
             lambda **kw: {"count": 5, "results": []},
         )
         backend.complete.side_effect = [
             AgentResponse(tool_calls=[
-                ToolCallEvent(tool_name="search_optimade", tool_args={}, call_id="c1"),
+                ToolCallEvent(tool_name="search_materials", tool_args={}, call_id="c1"),
             ]),
             AgentResponse(text="Found 5."),
         ]

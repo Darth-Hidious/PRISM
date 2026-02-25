@@ -11,9 +11,9 @@ class TestScratchpad:
 
     def test_log_entry(self):
         pad = Scratchpad()
-        pad.log("tool_call", tool_name="search_optimade", summary="5 results")
+        pad.log("tool_call", tool_name="search_materials", summary="5 results")
         assert len(pad.entries) == 1
-        assert pad.entries[0].tool_name == "search_optimade"
+        assert pad.entries[0].tool_name == "search_materials"
         assert pad.entries[0].summary == "5 results"
         assert pad.entries[0].step_type == "tool_call"
 

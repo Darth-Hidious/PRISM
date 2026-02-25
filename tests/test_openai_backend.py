@@ -38,11 +38,11 @@ class TestOpenAIBackend:
     @patch("app.agent.backends.openai_backend.OpenAI")
     def test_tool_call_response(self, mock_cls):
         client = mock_cls.return_value
-        client.chat.completions.create.return_value = self._make_tool_response("search_optimade", {"query": "Fe"}, "call_xyz")
+        client.chat.completions.create.return_value = self._make_tool_response("search_materials", {"query": "Fe"}, "call_xyz")
         backend = OpenAIBackend(api_key="test-key")
-        resp = backend.complete(messages=[{"role": "user", "content": "Find iron"}], tools=[{"name": "search_optimade", "description": "Search", "input_schema": {}}])
+        resp = backend.complete(messages=[{"role": "user", "content": "Find iron"}], tools=[{"name": "search_materials", "description": "Search", "input_schema": {}}])
         assert resp.has_tool_calls is True
-        assert resp.tool_calls[0].tool_name == "search_optimade"
+        assert resp.tool_calls[0].tool_name == "search_materials"
         assert resp.tool_calls[0].call_id == "call_xyz"
 
     @patch("app.agent.backends.openai_backend.OpenAI")

@@ -7,32 +7,26 @@ from app.tools.data import create_data_tools
 from app.tools.base import ToolRegistry
 
 
-class TestSearchOPTIMADETool:
+class TestSearchMaterialsTool:
     def test_tool_registered(self):
         registry = ToolRegistry()
         create_data_tools(registry)
         names = [t.name for t in registry.list_tools()]
-        assert "search_optimade" in names
+        assert "search_materials" in names
 
     def test_search_by_elements(self):
-        mock_client_cls = MagicMock()
-        mock_client = mock_client_cls.return_value
-        # Response format: {endpoint: {filter: {url: {data: [entries]}}}}
-        mock_client.get.return_value = {"structures": {'elements HAS "Si"': {"https://optimade.materialsproject.org/": {"data": [{"id": "mp-1", "attributes": {"chemical_formula_descriptive": "Si"}}]}}}}
-        mock_optimade = MagicMock()
-        mock_optimade.client.OptimadeClient = mock_client_cls
-        with patch.dict(sys.modules, {"optimade": mock_optimade, "optimade.client": mock_optimade.client}):
-            registry = ToolRegistry()
-            create_data_tools(registry)
-            tool = registry.get("search_optimade")
-            result = tool.execute(filter_string='elements HAS "Si"', providers=["mp"], max_results=5)
-            assert "results" in result or "error" in result
-
-    def test_search_optimade_schema(self):
         registry = ToolRegistry()
         create_data_tools(registry)
-        tool = registry.get("search_optimade")
-        assert "filter_string" in tool.input_schema["properties"]
+        tool = registry.get("search_materials")
+        # The tool uses the federated search engine; verify it handles element args
+        result = tool.execute(elements=["Si"], limit=5)
+        assert "results" in result or "error" in result
+
+    def test_search_materials_schema(self):
+        registry = ToolRegistry()
+        create_data_tools(registry)
+        tool = registry.get("search_materials")
+        assert "elements" in tool.input_schema["properties"]
 
 
 class TestQueryMPTool:

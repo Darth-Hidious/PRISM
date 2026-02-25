@@ -84,7 +84,7 @@ class TestPluginIntegration:
         registry = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
         # Core tools
-        assert "search_optimade" in names
+        assert "search_materials" in names
         assert "import_dataset" in names
         # Skills as tools
         assert "acquire_materials" in names

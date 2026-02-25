@@ -22,7 +22,7 @@ class TestMCPServer:
                 return [t.name for t in tools]
 
         tool_names = asyncio.run(run())
-        assert "search_optimade" in tool_names
+        assert "search_materials" in tool_names
         assert "query_materials_project" in tool_names
         assert "export_results_csv" in tool_names
         assert "predict_property" in tool_names
@@ -53,12 +53,12 @@ class TestMCPServer:
                 return {t.name: t.inputSchema for t in tools}
 
         schemas = asyncio.run(run())
-        # search_optimade has filter_string with a description
-        search_schema = schemas["search_optimade"]
-        assert "filter_string" in search_schema["properties"]
-        assert search_schema["properties"]["filter_string"]["type"] == "string"
-        # Required fields should be marked
-        assert "filter_string" in search_schema.get("required", [])
+        # search_materials has elements with a description
+        search_schema = schemas["search_materials"]
+        assert "elements" in search_schema["properties"]
+        assert search_schema["properties"]["elements"]["type"] == "array"
+        # elements is optional (no required fields for search_materials)
+        assert "elements" not in search_schema.get("required", [])
 
     def test_tool_schema_required_optional(self):
         """Required and optional params should be correctly marked in schema."""
@@ -89,7 +89,7 @@ class TestMCPServer:
         result = asyncio.run(run())
         # Result should be parseable JSON with tool names
         text = str(result)
-        assert "search_optimade" in text
+        assert "search_materials" in text
         assert "list_models" in text
 
     def test_server_has_dataset_and_model_resources(self):
