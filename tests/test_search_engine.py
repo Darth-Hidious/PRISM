@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.search.cache.engine import SearchCache
 from app.search.query import MaterialSearchQuery, PropertyRange
+from app.search.resilience.circuit_breaker import HealthManager
 from app.search.result import Material, PropertyValue
 
 
@@ -16,17 +18,25 @@ def _mock_material(pid="mp", formula="Fe2O3"):
     )
 
 
-def test_engine_creates():
+def _isolated_engine(registry):
+    """Create a SearchEngine with no disk persistence (fully isolated)."""
     from app.search.engine import SearchEngine
+    return SearchEngine(
+        registry=registry,
+        cache=SearchCache(disk_dir=None),
+        health_manager=HealthManager(persist_path=None),
+    )
+
+
+def test_engine_creates():
     from app.search.providers.registry import ProviderRegistry
-    engine = SearchEngine(registry=ProviderRegistry())
+    engine = _isolated_engine(ProviderRegistry())
     assert engine is not None
 
 
 def test_engine_search_empty_registry():
-    from app.search.engine import SearchEngine
     from app.search.providers.registry import ProviderRegistry
-    engine = SearchEngine(registry=ProviderRegistry())
+    engine = _isolated_engine(ProviderRegistry())
     q = MaterialSearchQuery(elements=["Fe"])
     result = asyncio.run(engine.search(q))
     assert result.total_count == 0
@@ -34,7 +44,6 @@ def test_engine_search_empty_registry():
 
 
 def test_engine_search_with_mock_provider():
-    from app.search.engine import SearchEngine
     from app.search.providers.registry import ProviderRegistry
     from app.search.providers.base import Provider, ProviderCapabilities
 
@@ -47,7 +56,7 @@ def test_engine_search_with_mock_provider():
 
     reg = ProviderRegistry()
     reg.register(MockProvider())
-    engine = SearchEngine(registry=reg)
+    engine = _isolated_engine(reg)
     q = MaterialSearchQuery(elements=["Fe", "O"])
     result = asyncio.run(engine.search(q))
     assert result.total_count == 1
@@ -57,7 +66,6 @@ def test_engine_search_with_mock_provider():
 
 
 def test_engine_search_provider_failure_graceful():
-    from app.search.engine import SearchEngine
     from app.search.providers.registry import ProviderRegistry
     from app.search.providers.base import Provider, ProviderCapabilities
 
@@ -78,7 +86,7 @@ def test_engine_search_provider_failure_graceful():
     reg = ProviderRegistry()
     reg.register(FailProvider())
     reg.register(GoodProvider())
-    engine = SearchEngine(registry=reg)
+    engine = _isolated_engine(reg)
     q = MaterialSearchQuery(elements=["Fe"])
     result = asyncio.run(engine.search(q))
     assert result.total_count == 1
@@ -89,7 +97,6 @@ def test_engine_search_provider_failure_graceful():
 
 
 def test_engine_caches_result():
-    from app.search.engine import SearchEngine
     from app.search.providers.registry import ProviderRegistry
     from app.search.providers.base import Provider, ProviderCapabilities
 
@@ -105,7 +112,7 @@ def test_engine_caches_result():
 
     reg = ProviderRegistry()
     reg.register(CountingProvider())
-    engine = SearchEngine(registry=reg)
+    engine = _isolated_engine(reg)
     q = MaterialSearchQuery(elements=["Fe"])
     r1 = asyncio.run(engine.search(q))
     r2 = asyncio.run(engine.search(q))
@@ -114,7 +121,6 @@ def test_engine_caches_result():
 
 
 def test_engine_audit_trail_has_url():
-    from app.search.engine import SearchEngine
     from app.search.providers.registry import ProviderRegistry
     from app.search.providers.base import Provider, ProviderCapabilities
 
@@ -127,7 +133,7 @@ def test_engine_audit_trail_has_url():
 
     reg = ProviderRegistry()
     reg.register(MockProvider())
-    engine = SearchEngine(registry=reg)
+    engine = _isolated_engine(reg)
     q = MaterialSearchQuery(elements=["Fe"])
     result = asyncio.run(engine.search(q))
     assert len(result.query_log) == 1
