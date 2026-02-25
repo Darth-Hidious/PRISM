@@ -86,5 +86,25 @@ def setup():
     prefs.check_updates = check_str == "yes"
 
     path = prefs.save()
+
+    # Also sync to settings.json for the unified config system
+    try:
+        from app.config.settings_schema import get_settings, save_global_settings
+        settings = get_settings()
+        settings.output.format = fmt
+        settings.output.report_format = rfmt
+        settings.output.directory = prefs.output_dir
+        settings.search.default_providers = prefs.default_providers
+        settings.search.max_results_per_source = prefs.max_results_per_source
+        settings.ml.algorithm = algo
+        settings.compute.budget = budget
+        if budget == "hpc":
+            settings.compute.hpc_queue = prefs.hpc_queue
+            settings.compute.hpc_cores = prefs.hpc_cores
+        settings.updates.check_on_startup = prefs.check_updates
+        save_global_settings(settings)
+    except Exception:
+        pass
+
     console.print(f"\n[green]Preferences saved to {path}[/green]")
-    console.print("[dim]API keys: prism configure --show[/dim]")
+    console.print("[dim]API keys: prism configure --show | Settings: ~/.prism/settings.json[/dim]")

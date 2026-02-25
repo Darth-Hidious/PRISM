@@ -67,13 +67,17 @@ class AgentCore:
     """Provider-agnostic agent that runs a Think-Act-Observe-Repeat loop."""
 
     def __init__(self, backend: Backend, tools: ToolRegistry, system_prompt: Optional[str] = None,
-                 max_iterations: int = 20, approval_callback: Optional[Callable] = None,
+                 max_iterations: int = 0, approval_callback: Optional[Callable] = None,
                  auto_approve: bool = True):
+        from app.config.settings_schema import get_settings
+        settings = get_settings()
+
         self.backend = backend
         self.tools = tools
         base_prompt = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
         self.system_prompt = self._inject_capabilities(base_prompt)
-        self.max_iterations = max_iterations
+        # Settings < explicit arg (0 means "use settings default")
+        self.max_iterations = max_iterations if max_iterations > 0 else settings.agent.max_iterations
         self.history: List[Dict] = []
         self.approval_callback = approval_callback
         self.auto_approve = auto_approve

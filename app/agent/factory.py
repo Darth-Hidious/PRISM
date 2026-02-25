@@ -22,6 +22,25 @@ def _load_marc27_token() -> Optional[str]:
 
 
 def create_backend(provider: Optional[str] = None, model: Optional[str] = None) -> Backend:
+    """Create an LLM backend.
+
+    Resolution order for provider/model:
+      1. Explicit arguments (from CLI flags)
+      2. settings.json (agent.provider / agent.model)
+      3. Environment variables (API keys)
+      4. Error if nothing configured
+    """
+    from app.config.settings_schema import get_settings
+    settings = get_settings()
+
+    # Resolve model from settings if not explicitly provided
+    if model is None and settings.agent.model:
+        model = settings.agent.model
+
+    # Resolve provider from settings, then env vars
+    if provider is None and settings.agent.provider:
+        provider = settings.agent.provider
+
     if provider is None:
         if _load_marc27_token():
             provider = "marc27"
@@ -33,6 +52,7 @@ def create_backend(provider: Optional[str] = None, model: Optional[str] = None) 
             provider = "openrouter"
         else:
             raise ValueError("No LLM provider configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, or run /login for MARC27.")
+
     if provider == "marc27":
         from app.agent.backends.openai_backend import OpenAIBackend
         token = _load_marc27_token()

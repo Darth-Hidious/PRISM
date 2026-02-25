@@ -201,9 +201,24 @@ def _show_config(console: Console, env_path: Path):
     except Exception:
         pass
 
+    # Settings files
+    console.print()
+    try:
+        from app.config.settings_schema import get_settings_paths
+        paths = get_settings_paths()
+        console.print("[bold]Settings Files[/bold]")
+        for level, path in paths.items():
+            if path:
+                console.print(f"  {level}: {path}")
+            else:
+                console.print(f"  {level}: [dim]not created[/dim]")
+    except Exception:
+        pass
+
     console.print()
     console.print("[dim]Edit: prism configure --anthropic-key KEY | prism setup[/dim]")
     console.print(f"[dim]Env file: {env_path}[/dim]")
+    console.print("[dim]Settings: ~/.prism/settings.json | .prism/settings.json[/dim]")
 
 
 def _validate_mp_key(key: str, console: Console):

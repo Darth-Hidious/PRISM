@@ -10,7 +10,16 @@ from packaging.version import Version
 
 PRISM_DIR = Path.home() / ".prism"
 CACHE_PATH = PRISM_DIR / ".update_check"
-CACHE_TTL = 86400  # 24 hours
+_DEFAULT_CACHE_TTL = 86400  # 24 hours
+
+
+def _get_cache_ttl() -> int:
+    """Get cache TTL from settings, falling back to 24 hours."""
+    try:
+        from app.config.settings_schema import get_settings
+        return get_settings().updates.cache_ttl_hours * 3600
+    except Exception:
+        return _DEFAULT_CACHE_TTL
 
 PYPI_URL = "https://pypi.org/pypi/prism-platform/json"
 GITHUB_URL = "https://api.github.com/repos/Darth-Hidious/PRISM/releases/latest"
@@ -22,7 +31,7 @@ def _read_cache() -> Optional[dict]:
         if not CACHE_PATH.exists():
             return None
         data = json.loads(CACHE_PATH.read_text())
-        if time.time() - data.get("checked_at", 0) < CACHE_TTL:
+        if time.time() - data.get("checked_at", 0) < _get_cache_ttl():
             return data
     except Exception:
         pass
