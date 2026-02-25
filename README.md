@@ -12,7 +12,8 @@
   <a href="#quick-start">Quick Start</a> &bull;
   <a href="#architecture">Architecture</a> &bull;
   <a href="#capabilities">Capabilities</a> &bull;
-  <a href="#license">License</a>
+  <a href="#license">License</a> &bull;
+  <a href="ACKNOWLEDGMENTS.md">Acknowledgments</a>
 </p>
 
 ---
