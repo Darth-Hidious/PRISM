@@ -3,7 +3,7 @@ import os
 import sys
 import pytest
 from unittest.mock import patch, MagicMock
-from app.tools.data import create_data_tools
+from app.tools.data import create_data_tools, _query_omat24
 from app.tools.base import ToolRegistry
 
 
@@ -73,3 +73,40 @@ class TestExportResultsCSV:
         out = tool.execute(results=[{"a": 1}])
         assert "filename" in out
         assert out["filename"].startswith("prism_export_")
+
+
+class TestQueryOMAT24Tool:
+    def test_tool_registered(self):
+        registry = ToolRegistry()
+        create_data_tools(registry)
+        names = [t.name for t in registry.list_tools()]
+        assert "query_omat24" in names
+
+    def test_schema_has_elements_and_formula(self):
+        registry = ToolRegistry()
+        create_data_tools(registry)
+        tool = registry.get("query_omat24")
+        props = tool.input_schema["properties"]
+        assert "elements" in props
+        assert "formula" in props
+        assert "max_results" in props
+
+    @patch("app.data.omat24_collector.OMAT24Collector")
+    def test_returns_results(self, mock_cls):
+        mock_collector = MagicMock()
+        mock_collector.collect.return_value = [
+            {"source": "omat24", "formula": "Fe2O3", "energy": -10.5},
+        ]
+        mock_cls.return_value = mock_collector
+
+        result = _query_omat24(elements=["Fe", "O"], max_results=10)
+
+        assert result["count"] == 1
+        assert result["source"] == "omat24"
+        assert result["results"][0]["formula"] == "Fe2O3"
+
+    def test_handles_collector_error(self):
+        """If collector raises, tool returns error dict."""
+        with patch("app.data.omat24_collector.OMAT24Collector", side_effect=Exception("connection failed")):
+            result = _query_omat24(elements=["Si"])
+        assert "error" in result
