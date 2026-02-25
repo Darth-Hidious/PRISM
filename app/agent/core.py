@@ -73,6 +73,7 @@ class AgentCore:
         self.scratchpad = None  # Set by caller (AgentREPL / autonomous) if desired
         self._total_usage = UsageInfo()
         self._result_store: dict = {}  # call_id -> full serialized result (RLM pattern)
+        self._recent_calls: list = []
 
     def _execute_tool(self, tool, tool_args: dict) -> dict:
         """Execute a tool, injecting scratchpad for show_scratchpad."""
@@ -90,6 +91,25 @@ class AgentCore:
         if self.approval_callback:
             return self.approval_callback(tool.name, tc.tool_args)
         return True
+
+    def _check_doom_loop(self, tool_name: str, tool_args: dict, result) -> Optional[str]:
+        """Detect if the agent is stuck calling the same failing tool repeatedly.
+        Returns a warning message if same tool+args has failed 3 times, else None.
+        """
+        sig = (tool_name, json.dumps(tool_args, sort_keys=True))
+        is_error = isinstance(result, dict) and "error" in result
+        self._recent_calls.append((sig, is_error))
+        if len(self._recent_calls) > 10:
+            self._recent_calls.pop(0)
+
+        # Check last 3 calls with same signature
+        matching = [(s, err) for s, err in self._recent_calls if s == sig]
+        if len(matching) >= 3 and all(err for _, err in matching[-3:]):
+            return (
+                f"DOOM LOOP DETECTED: {tool_name} has failed 3 times with the same arguments. "
+                "Try a different approach, different arguments, or ask the user for help."
+            )
+        return None
 
     def _calculate_cost(self, usage: UsageInfo) -> float:
         """Calculate estimated cost in USD from usage and backend's model config."""
@@ -232,8 +252,11 @@ class AgentCore:
                                 result = {"error": str(e)}
                     self._log_to_scratchpad(tc.tool_name, tc.tool_args, result)
                     self._post_tool_hook(tc.tool_name, result)
+                    doom_msg = self._check_doom_loop(tc.tool_name, tc.tool_args, result)
                     processed = self._process_tool_result(result, call_id=tc.call_id)
                     self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": processed})
+                    if doom_msg:
+                        self.history.append({"role": "system", "content": doom_msg})
             else:
                 if response.text:
                     self.history.append({"role": "assistant", "content": response.text})
@@ -281,8 +304,11 @@ class AgentCore:
                                 approved = False
                             if not approved:
                                 result = {"skipped": f"Tool {tc.tool_name} was not approved by user."}
+                                doom_msg = self._check_doom_loop(tc.tool_name, tc.tool_args, result)
                                 processed = self._process_tool_result(result, call_id=tc.call_id)
                                 self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": processed})
+                                if doom_msg:
+                                    self.history.append({"role": "system", "content": doom_msg})
                                 yield ToolCallResult(call_id=tc.call_id, tool_name=tc.tool_name, result=processed, summary=f"{tc.tool_name}: skipped (not approved)")
                                 continue
                         try:
@@ -291,8 +317,11 @@ class AgentCore:
                             result = {"error": str(e)}
                     self._log_to_scratchpad(tc.tool_name, tc.tool_args, result)
                     self._post_tool_hook(tc.tool_name, result)
+                    doom_msg = self._check_doom_loop(tc.tool_name, tc.tool_args, result)
                     processed = self._process_tool_result(result, call_id=tc.call_id)
                     self.history.append({"role": "tool_result", "tool_call_id": tc.call_id, "result": processed})
+                    if doom_msg:
+                        self.history.append({"role": "system", "content": doom_msg})
                     yield ToolCallResult(
                         call_id=tc.call_id,
                         tool_name=tc.tool_name,
@@ -335,3 +364,4 @@ class AgentCore:
         self.history.clear()
         self._total_usage = UsageInfo()
         self._result_store.clear()
+        self._recent_calls.clear()
