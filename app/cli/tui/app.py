@@ -43,7 +43,7 @@ class AgentREPL:
 
         if tools is None:
             from app.plugins.bootstrap import build_full_registry
-            tools = build_full_registry(enable_mcp=enable_mcp)
+            tools, _provider_reg, _agent_reg = build_full_registry(enable_mcp=enable_mcp)
 
         self.session = create_prompt_session()
 

@@ -9,7 +9,8 @@ from app.tools.base import Tool, ToolRegistry
 def _build_registry() -> ToolRegistry:
     """Build a full tool registry with all PRISM tools and skills."""
     from app.plugins.bootstrap import build_full_registry
-    return build_full_registry(enable_mcp=False)
+    tool_reg, _provider_reg, _agent_reg = build_full_registry(enable_mcp=False)
+    return tool_reg
 
 
 # Type mapping from JSON schema to Python types

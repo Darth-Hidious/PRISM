@@ -56,7 +56,8 @@ def _make_tools(tools: Optional[ToolRegistry] = None, enable_mcp: bool = True) -
     if tools is not None:
         return tools
     from app.plugins.bootstrap import build_full_registry
-    return build_full_registry(enable_mcp=enable_mcp)
+    tool_reg, _provider_reg, _agent_reg = build_full_registry(enable_mcp=enable_mcp)
+    return tool_reg
 
 
 def run_autonomous(goal: str, backend: Backend, system_prompt: Optional[str] = None,

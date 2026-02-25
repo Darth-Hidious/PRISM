@@ -26,7 +26,7 @@ class TestBootstrapWithoutPycalphad:
         """build_full_registry() works without pycalphad (graceful skip)."""
         from app.plugins.bootstrap import build_full_registry
 
-        registry = build_full_registry(enable_mcp=False, enable_plugins=False)
+        registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
         # CALPHAD tools should NOT be registered
         assert "calculate_phase_diagram" not in names
