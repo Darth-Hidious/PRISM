@@ -5,7 +5,7 @@ from typing import Dict, Generator, List, Optional
 from anthropic import Anthropic, APIStatusError as AnthropicAPIError
 from app.agent.backends.base import Backend
 from app.agent.models import get_model_config
-from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete
+from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete, UsageInfo
 
 
 class AnthropicBackend(Backend):
@@ -86,4 +86,16 @@ class AnthropicBackend(Backend):
                 text_parts.append(block.text)
             elif block.type == "tool_use":
                 tool_calls.append(ToolCallEvent(tool_name=block.name, tool_args=block.input, call_id=block.id))
-        return AgentResponse(text="\n".join(text_parts) if text_parts else None, tool_calls=tool_calls)
+        usage = None
+        if hasattr(response, "usage") and response.usage:
+            usage = UsageInfo(
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                cache_creation_tokens=getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
+                cache_read_tokens=getattr(response.usage, "cache_read_input_tokens", 0) or 0,
+            )
+        return AgentResponse(
+            text="\n".join(text_parts) if text_parts else None,
+            tool_calls=tool_calls,
+            usage=usage,
+        )
