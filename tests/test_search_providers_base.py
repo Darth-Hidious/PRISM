@@ -23,38 +23,53 @@ def test_provider_capabilities_can_handle():
     assert cap.can_handle(q2) is False
 
 
-def test_provider_endpoint_from_registry_json():
-    from app.search.providers.endpoint import ProviderEndpoint, load_registry
-    endpoints = load_registry()
-    assert len(endpoints) > 0
-    mp = next(e for e in endpoints if e.id == "mp")
-    assert "materialsproject" in mp.base_url
-    assert mp.auth.required is False
+def test_build_registry_returns_providers(tmp_path):
+    """build_registry returns working providers from cache + overrides."""
+    from app.search.providers.registry import build_registry
+    from app.search.providers.discovery import save_cache
+
+    endpoints = [
+        {"id": "mp", "name": "MP", "base_url": "https://optimade.materialsproject.org", "parent": "mp"},
+    ]
+    cache_path = tmp_path / "cache.json"
+    save_cache(endpoints, path=cache_path)
+
+    reg = build_registry(cache_path=cache_path, skip_network=True)
+    providers = reg.get_all()
+    assert len(providers) > 0
+    ids = {p.id for p in providers}
+    assert "mp" in ids
 
 
-def test_provider_endpoint_mpds_requires_auth():
-    from app.search.providers.endpoint import load_registry
-    endpoints = load_registry()
-    mpds = next(e for e in endpoints if e.id == "mpds")
-    assert mpds.auth.required is True
-    assert mpds.auth.auth_header == "Key"
+def test_overrides_mpds_auth_config():
+    """MPDS auth config is present in overrides file."""
+    import json
+    from pathlib import Path
+    overrides_path = Path(__file__).parent.parent / "app" / "search" / "providers" / "provider_overrides.json"
+    data = json.loads(overrides_path.read_text())
+    mpds = data["overrides"]["mpds"]
+    assert mpds["auth"]["required"] is True
+    assert mpds["auth"]["auth_type"] == "api_key"
 
 
-def test_provider_endpoint_namespace_placeholders():
-    from app.search.providers.endpoint import load_registry
-    endpoints = load_registry()
-    ids = {e.id for e in endpoints}
-    assert "ccdc" in ids
-    assert "aiida" in ids
-    assert "pcod" in ids
-    ccdc = next(e for e in endpoints if e.id == "ccdc")
-    assert ccdc.enabled is False
-    assert ccdc.status == "namespace_reserved"
+def test_overrides_mp_native_has_auth():
+    """MP native provider has auth config in overrides."""
+    import json
+    from pathlib import Path
+    overrides_path = Path(__file__).parent.parent / "app" / "search" / "providers" / "provider_overrides.json"
+    data = json.loads(overrides_path.read_text())
+    mp_native = data["overrides"]["mp_native"]
+    assert mp_native["auth"]["required"] is True
+    assert mp_native["base_url"] == "https://api.materialsproject.org"
 
 
-def test_load_registry_includes_all_tiers():
-    from app.search.providers.endpoint import load_registry
-    endpoints = load_registry()
-    tiers = {e.tier for e in endpoints}
-    assert 1 in tiers
-    assert 2 in tiers
+def test_provider_endpoint_model():
+    """ProviderEndpoint Pydantic model validates correctly."""
+    from app.search.providers.endpoint import ProviderEndpoint
+    ep = ProviderEndpoint(
+        id="test", name="Test Provider", base_url="https://test.org",
+        tier=2, enabled=True,
+    )
+    assert ep.id == "test"
+    assert ep.api_type == "optimade"
+    assert ep.behavior.timeout_ms == 5000

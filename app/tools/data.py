@@ -11,7 +11,7 @@ def _search_materials(**kwargs) -> dict:
     """Search materials via the PRISM federated search engine."""
     import asyncio
     from app.search import SearchEngine, MaterialSearchQuery, PropertyRange
-    from app.search.providers.registry import ProviderRegistry
+    from app.search.providers.registry import build_registry
 
     try:
         query = MaterialSearchQuery(
@@ -24,7 +24,7 @@ def _search_materials(**kwargs) -> dict:
             providers=kwargs.get("providers"),
             limit=kwargs.get("limit", 20),
         )
-        registry = ProviderRegistry.from_registry_json()
+        registry = build_registry()
         engine = SearchEngine(registry=registry)
         result = asyncio.run(engine.search(query))
 

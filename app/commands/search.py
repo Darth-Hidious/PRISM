@@ -7,7 +7,8 @@ from rich.panel import Panel
 from rich.table import Table
 
 from app.search import SearchEngine, MaterialSearchQuery, PropertyRange
-from app.search.providers.registry import ProviderRegistry
+from app.search.providers.registry import ProviderRegistry, build_registry
+from app.search.providers.discovery import discover_providers, save_cache, load_overrides
 
 
 @click.command()
@@ -23,9 +24,32 @@ from app.search.providers.registry import ProviderRegistry
     ["cubic", "hexagonal", "tetragonal", "orthorhombic", "monoclinic", "triclinic", "trigonal"],
     case_sensitive=False,
 ), help='Crystal system filter.')
-def search(elements, formula, nelements, providers, limit, band_gap_min, band_gap_max, space_group, crystal_system):
+@click.option('--refresh', is_flag=True, help='Refresh the provider registry from OPTIMADE consortium and exit.')
+def search(elements, formula, nelements, providers, limit, band_gap_min, band_gap_max, space_group, crystal_system, refresh):
     """Search materials databases via the PRISM federated search engine."""
     console = Console(force_terminal=True, width=120)
+
+    if refresh:
+        console.print("[bold green]Refreshing provider registry from OPTIMADE consortium...[/bold green]")
+        try:
+            overrides_data = load_overrides()
+            fallbacks = overrides_data.get("fallback_index_urls", {})
+            endpoints = asyncio.run(discover_providers(fallback_index_urls=fallbacks))
+            if endpoints:
+                save_cache(endpoints)
+                console.print(f"[green]Discovered {len(endpoints)} provider endpoints.[/green]")
+                table = Table(show_header=True, header_style="bold dim")
+                table.add_column("ID")
+                table.add_column("Name")
+                table.add_column("Base URL")
+                for ep in sorted(endpoints, key=lambda e: e["id"]):
+                    table.add_row(ep["id"], ep["name"], ep.get("base_url", "N/A"))
+                console.print(table)
+            else:
+                console.print("[red]Discovery failed -- no endpoints found.[/red]")
+        except Exception as e:
+            console.print(f"[red]Refresh error: {e}[/red]")
+        return
 
     if not any([elements, formula, nelements, band_gap_min, band_gap_max, space_group, crystal_system]):
         console.print("[red]Error: Please provide at least one search criterion.[/red]")
@@ -59,7 +83,7 @@ def search(elements, formula, nelements, providers, limit, band_gap_min, band_ga
 
     try:
         with console.status("[bold green]Searching materials databases...[/bold green]"):
-            registry = ProviderRegistry.from_registry_json()
+            registry = build_registry()
             engine = SearchEngine(registry=registry)
             result = asyncio.run(engine.search(query))
 
