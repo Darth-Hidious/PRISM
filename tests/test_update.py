@@ -31,7 +31,8 @@ def test_returns_none_when_up_to_date(clean_cache):
 
 def test_returns_update_info_when_outdated(clean_cache):
     """If latest > current, return upgrade info."""
-    with patch("app.update._check_pypi", return_value="2.1.0"):
+    with patch("app.update._check_pypi", return_value="2.1.0"), \
+         patch("app.update.detect_install_method", return_value="pip"):
         result = check_for_updates("2.0.0")
     assert result is not None
     assert result["latest"] == "2.1.0"
@@ -42,7 +43,8 @@ def test_returns_update_info_when_outdated(clean_cache):
 def test_pypi_failure_falls_back_to_github(clean_cache):
     """When PyPI is unreachable, GitHub releases are tried."""
     with patch("app.update._check_pypi", side_effect=Exception("timeout")), \
-         patch("app.update._check_github", return_value="2.2.0"):
+         patch("app.update._check_github", return_value="2.2.0"), \
+         patch("app.update.detect_install_method", return_value="pip"):
         result = check_for_updates("2.0.0")
     assert result is not None
     assert result["latest"] == "2.2.0"
@@ -62,13 +64,15 @@ def test_both_fail_returns_none(clean_cache):
 def test_cache_prevents_repeated_checks(clean_cache):
     """Within the TTL window, the cached value is used (no network calls)."""
     # Prime the cache
-    with patch("app.update._check_pypi", return_value="2.1.0"):
+    with patch("app.update._check_pypi", return_value="2.1.0"), \
+         patch("app.update.detect_install_method", return_value="pip"):
         first = check_for_updates("2.0.0")
     assert first is not None
 
     # Second call should use cache — mock should NOT be called
     with patch("app.update._check_pypi", side_effect=AssertionError("should not be called")), \
-         patch("app.update._check_github", side_effect=AssertionError("should not be called")):
+         patch("app.update._check_github", side_effect=AssertionError("should not be called")), \
+         patch("app.update.detect_install_method", return_value="pip"):
         second = check_for_updates("2.0.0")
     assert second is not None
     assert second["latest"] == "2.1.0"

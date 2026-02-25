@@ -14,8 +14,8 @@ def test_setup_defaults(tmp_path, monkeypatch):
     monkeypatch.setattr("app.config.preferences.PREFERENCES_PATH", prefs_path)
 
     runner = CliRunner()
-    # Press enter for each prompt to accept defaults (7 prompts for local budget)
-    result = runner.invoke(cli, ["setup"], input="\n\n\n\n\n\n")
+    # Press enter for each prompt to accept defaults (7 prompts for local budget + update check)
+    result = runner.invoke(cli, ["setup"], input="\n\n\n\n\n\n\n")
 
     assert result.exit_code == 0
     assert "Preferences saved" in result.output
@@ -33,9 +33,9 @@ def test_setup_custom_values(tmp_path, monkeypatch):
     monkeypatch.setattr("app.config.preferences.PREFERENCES_PATH", prefs_path)
 
     runner = CliRunner()
-    # csv, optimade,mp, 50, gradient_boosting, markdown, local
+    # csv, optimade,mp, 50, gradient_boosting, markdown, local, yes (update check)
     result = runner.invoke(
-        cli, ["setup"], input="csv\noptimade,mp\n50\ngradient_boosting\nmarkdown\nlocal\n"
+        cli, ["setup"], input="csv\noptimade,mp\n50\ngradient_boosting\nmarkdown\nlocal\nyes\n"
     )
 
     assert result.exit_code == 0
@@ -52,11 +52,11 @@ def test_setup_hpc_prompts(tmp_path, monkeypatch):
     monkeypatch.setattr("app.config.preferences.PREFERENCES_PATH", prefs_path)
 
     runner = CliRunner()
-    # parquet, optimade, 100, random_forest, markdown, hpc, gpu_queue, 32
+    # parquet, optimade, 100, random_forest, markdown, hpc, gpu_queue, 32, yes (update check)
     result = runner.invoke(
         cli,
         ["setup"],
-        input="parquet\noptimade\n100\nrandom_forest\nmarkdown\nhpc\ngpu_queue\n32\n",
+        input="parquet\noptimade\n100\nrandom_forest\nmarkdown\nhpc\ngpu_queue\n32\nyes\n",
     )
 
     assert result.exit_code == 0
