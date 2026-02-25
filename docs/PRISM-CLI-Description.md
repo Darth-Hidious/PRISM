@@ -106,7 +106,8 @@ framework over stdio or HTTP transports.
 
 ## 3. Agent Tools
 
-The PRISM agent has access to 26 tools that it may invoke during interactive or
+The PRISM agent has access to 33 built-in tools (plus 19 additional tools when
+optional dependencies are installed) that it may invoke during interactive or
 autonomous sessions. Tool invocation requires user approval for operations
 marked as expensive or irreversible.
 
@@ -191,7 +192,8 @@ marked as expensive or irreversible.
 
 Skills are pre-defined multi-step workflows the agent can invoke. Each skill
 orchestrates multiple tool calls in sequence to accomplish a complex research
-task.
+task. All skills are also registered as callable tools, making them directly
+invocable by the agent during autonomous operation.
 
 | Skill | Purpose |
 |-------|---------|

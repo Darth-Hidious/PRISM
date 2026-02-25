@@ -1,7 +1,7 @@
 # PRISM Folder-to-Vision Map
 
 > What each folder does, what it owns in the pipeline, what exists, what's missing.
-> **Updated:** 2026-02-25 — All CLI commands complete. 861 tests passing.
+> **Updated:** 2026-02-25 — All CLI commands complete. 33 base tools + 19 optional. 861 tests passing.
 
 ---
 
@@ -106,8 +106,8 @@ USER PROMPT: "Find alloys with W and Rh that are stable, and phase stability"
 | `labs.py` | `list_lab_services()`, `get_lab_service_info()`, `check_lab_subscriptions()`, `submit_lab_job()` | Premium marketplace services |
 | `pretrained.py` | Pre-trained GNN models (M3GNet, MEGNet via MatGL) | **Stage 3** (GNN prediction) |
 
-**EXISTS:** 26+ tools for every stage. Full Python code execution (with approval). Unified capability discovery auto-injected into system prompt. Labs marketplace tools. Pre-trained GNN tools.
-**MISSING:** Interactive property selection tool (asks user which properties to predict). ThermoCalc connector tool. DFT result parser tools. Structure generation tools for GenAI materials.
+**EXISTS:** 33 always-available tools (23 standalone + 10 skills-as-tools) plus 19 optional (13 simulation, 6 CALPHAD). Full Python code execution (with approval). Unified capability discovery auto-injected into system prompt. Labs marketplace tools. Pre-trained GNN tools.
+**MISSING:** Interactive property selection tool (asks user which properties to predict). ThermoCalc connector tool (skeleton only in `app/plugins/thermocalc.py`). DFT result parser tools. Structure generation tools for GenAI materials.
 
 ---
 
@@ -130,8 +130,8 @@ USER PROMPT: "Find alloys with W and Rh that are stable, and phase stability"
 | `registry.py` | `load_builtin_skills()`: loads all 10 skills | Infrastructure |
 | `base.py` | `Skill`, `SkillStep`, `SkillRegistry` dataclasses | Infrastructure |
 
-**EXISTS:** 10 skills covering stages 1-4, 6-8. Master discovery pipeline.
-**MISSING:** Explicit stage 7 integration in master pipeline (selection happens but isn't a named step). Review agent as separate LLM call (currently rule-based only). Interactive ML selection skill. GenAI materials generation skill. Feedback loop skills (CALPHAD result -> re-select -> re-simulate).
+**EXISTS:** 10 skills covering stages 1-4, 6-8. Master discovery pipeline. All 10 exposed as agent-callable tools.
+**MISSING:** Explicit stage 7 integration in master pipeline (selection happens but isn't a named step). Review agent as separate LLM call (currently rule-based validation only — `review_dataset` uses statistical checks, not a second LLM call). Interactive ML selection skill. GenAI materials generation skill. Feedback loop skills (CALPHAD result -> re-select -> re-simulate).
 
 ---
 
@@ -324,7 +324,7 @@ USER PROMPT: "Find alloys with W and Rh that are stable, and phase stability"
 | **1. Data Acquisition** | `app/search/` (federated), `app/data/` (collectors), `app/tools/data.py`, `app/tools/search.py`, `app/skills/acquisition.py` | **Complete (v2.5)** — Federated search engine (20+ OPTIMADE providers, MP native, auto-discovery, 3-layer registry, circuit breakers, caching). Also: OMAT24, literature, patents collectors |
 | **2. Curation** | `app/data/normalizer.py`, `app/data/store.py`, `app/db/` | **Exists (basic)** — normalize + Parquet store. Missing: user pref for DB/CSV, schema enforcement |
 | **3. ML Prediction** | `app/ml/`, `app/tools/prediction.py`, `app/skills/prediction.py` | **Complete (v2.5.1)** — 5 algorithms, matminer (132 Magpie features) + built-in fallback (22), pre-trained GNNs (M3GNet, MEGNet). Missing: interactive property selection, custom GNNs, surrogates |
-| **4. Visualization** | `app/tools/visualization.py`, `app/skills/visualization.py`, `app/ml/viz.py` | **Exists** — scatter, heatmap, structure. Missing: phase diagrams in viz, correlation matrices |
+| **4. Visualization** | `app/tools/visualization.py`, `app/skills/visualization.py`, `app/ml/viz.py` | **Complete (v2.5.1)** — scatter, heatmap, correlation matrix, property distribution, structure viz. Missing: phase diagrams in viz |
 | **5. LLM Analysis** | `app/agent/core.py` (TAOR loop) | **Exists** — agent feeds results to LLM naturally |
 | **6. Simulation** | `app/simulation/`, `app/tools/simulation.py`, `app/tools/calphad.py`, `app/skills/simulation_plan.py`, `app/skills/phase_analysis.py` | **Exists (optional)** — pyiron + pycalphad. Missing: ThermoCalc, VASP, user DB connectors, compute detection |
 | **7. Selection** | `app/tools/property_selection.py`, `app/skills/selection.py` | **Exists** — range filter + rank. Missing: multi-objective Pareto, downstream list formatting |
@@ -369,12 +369,12 @@ USER PROMPT: "Find alloys with W and Rh that are stable, and phase stability"
 - `AflowProvider` — AFLUX native API adapter (marketplace entry exists, needs provider impl)
 - Expose OMAT24 collector as agent tool
 - Multi-objective Pareto selection
-- Correlation matrix visualization
+- ~~Correlation matrix visualization~~ — **already exists** (`plot_correlation_matrix`)
 - `prism plugin install` command
 - Domain-specific validation rules
 - Better downstream candidate list formatting
 - Automated figure captioning (LLM describes charts)
-- Marketplace API backend (replace local `marketplace.json` with platform API call)
+- Marketplace API backend (replace local `catalog.json` with platform API call)
 
 ### Next Updates (new deps or APIs)
 - Custom GNN models (`torch`, `torch_geometric`)
