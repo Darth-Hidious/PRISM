@@ -54,7 +54,7 @@
 - Interactive ML property selection in REPL (wire `list_predictable_properties` -> user choice -> predict)
 - LLM review agent (second AgentCore call in review skill)
 - AflowProvider — AFLUX native API adapter (marketplace entry exists, needs provider impl)
-- ~~Expose OMAT24 collector as agent tool~~ — done (`query_omat24` tool)
+- ~~Expose OMAT24 as platform-hosted database~~ — catalog entry exists, will be hosted on MARC27 platform
 - Multi-objective Pareto selection
 - ~~Correlation matrix visualization~~ — already exists (`plot_correlation_matrix`)
 - `prism plugin install` command
