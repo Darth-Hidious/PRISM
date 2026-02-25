@@ -3,7 +3,7 @@ import json
 from typing import Callable, Dict, Generator, List, Optional
 from app.agent.backends.base import Backend
 from app.agent.events import (
-    AgentResponse, ToolCallEvent,
+    AgentResponse, ToolCallEvent, UsageInfo,
     TextDelta, ToolCallStart, ToolCallResult, TurnComplete,
     ToolApprovalRequest, ToolApprovalResponse,
 )
@@ -64,6 +64,7 @@ class AgentCore:
         self.approval_callback = approval_callback
         self.auto_approve = auto_approve
         self.scratchpad = None  # Set by caller (AgentREPL / autonomous) if desired
+        self._total_usage = UsageInfo()
 
     def _execute_tool(self, tool, tool_args: dict) -> dict:
         """Execute a tool, injecting scratchpad for show_scratchpad."""
@@ -81,6 +82,17 @@ class AgentCore:
         if self.approval_callback:
             return self.approval_callback(tool.name, tc.tool_args)
         return True
+
+    def _calculate_cost(self, usage: UsageInfo) -> float:
+        """Calculate estimated cost in USD from usage and backend's model config."""
+        config = getattr(self.backend, "model_config", None)
+        if not config:
+            return 0.0
+        cost = (usage.input_tokens * config.input_price_per_mtok / 1_000_000
+                + usage.output_tokens * config.output_price_per_mtok / 1_000_000)
+        if usage.cache_read_tokens:
+            cost += usage.cache_read_tokens * config.input_price_per_mtok * 0.1 / 1_000_000
+        return cost
 
     def _log_to_scratchpad(self, tool_name: str, tool_args: dict, result: dict):
         """Log a tool execution to the scratchpad if available."""
@@ -124,6 +136,8 @@ class AgentCore:
 
         for _iteration in range(self.max_iterations):
             response = self.backend.complete(messages=self.history, tools=tool_defs, system_prompt=self.system_prompt)
+            if response.usage:
+                self._total_usage = self._total_usage + response.usage
 
             if response.has_tool_calls:
                 self.history.append({
@@ -166,6 +180,8 @@ class AgentCore:
             response = self.backend._last_stream_response
             if response is None:
                 return
+            if response.usage:
+                self._total_usage = self._total_usage + response.usage
 
             if response.has_tool_calls:
                 self.history.append({
@@ -203,10 +219,20 @@ class AgentCore:
             else:
                 if response.text:
                     self.history.append({"role": "assistant", "content": response.text})
-                yield TurnComplete(text=response.text, has_more=False)
+                yield TurnComplete(
+                    text=response.text, has_more=False,
+                    usage=response.usage if response else None,
+                    total_usage=self._total_usage,
+                    estimated_cost=self._calculate_cost(self._total_usage),
+                )
                 return
 
-        yield TurnComplete(text=f"Reached max iterations ({self.max_iterations}). Stopping.", has_more=False)
+        yield TurnComplete(
+            text=f"Reached max iterations ({self.max_iterations}). Stopping.",
+            has_more=False,
+            total_usage=self._total_usage,
+            estimated_cost=self._calculate_cost(self._total_usage),
+        )
 
     @staticmethod
     def _summarize_tool_result(tool_name: str, result: dict) -> str:
@@ -222,5 +248,6 @@ class AgentCore:
         return f"{tool_name}: completed"
 
     def reset(self):
-        """Clear conversation history."""
+        """Clear conversation history and usage tracking."""
         self.history.clear()
+        self._total_usage = UsageInfo()
