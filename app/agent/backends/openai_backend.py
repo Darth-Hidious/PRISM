@@ -5,7 +5,7 @@ from typing import Dict, Generator, List, Optional
 from openai import OpenAI, APIStatusError as OpenAIAPIError
 from app.agent.backends.base import Backend
 from app.agent.models import get_model_config
-from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete
+from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete, UsageInfo
 
 
 class OpenAIBackend(Backend):
@@ -108,4 +108,10 @@ class OpenAIBackend(Backend):
                 except (json.JSONDecodeError, TypeError):
                     tool_args = {}
                 tool_calls.append(ToolCallEvent(tool_name=tc.function.name, tool_args=tool_args, call_id=tc.id))
-        return AgentResponse(text=msg.content, tool_calls=tool_calls)
+        usage = None
+        if hasattr(response, "usage") and response.usage:
+            usage = UsageInfo(
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            )
+        return AgentResponse(text=msg.content, tool_calls=tool_calls, usage=usage)

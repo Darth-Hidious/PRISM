@@ -106,3 +106,45 @@ class TestAnthropicPromptCaching:
                 msgs = call_kwargs["messages"]
                 assert msgs[0]["role"] == "system"
                 assert isinstance(msgs[0]["content"], str)
+
+
+class TestAnthropicUsageExtraction:
+    def test_usage_extracted_from_response(self):
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            with patch("app.agent.backends.anthropic_backend.Anthropic") as MockClient:
+                mock_client = MockClient.return_value
+                mock_response = MagicMock()
+                mock_response.content = [MagicMock(type="text", text="hi")]
+                mock_response.usage = MagicMock(
+                    input_tokens=150, output_tokens=50,
+                    cache_creation_input_tokens=10, cache_read_input_tokens=5,
+                )
+                mock_client.messages.create.return_value = mock_response
+                from app.agent.backends.anthropic_backend import AnthropicBackend
+                backend = AnthropicBackend()
+                result = backend.complete([], [])
+                assert result.usage is not None
+                assert result.usage.input_tokens == 150
+                assert result.usage.output_tokens == 50
+                assert result.usage.cache_creation_tokens == 10
+                assert result.usage.cache_read_tokens == 5
+
+
+class TestOpenAIUsageExtraction:
+    def test_usage_extracted_from_response(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            with patch("app.agent.backends.openai_backend.OpenAI") as MockClient:
+                mock_client = MockClient.return_value
+                mock_msg = MagicMock()
+                mock_msg.content = "hi"
+                mock_msg.tool_calls = None
+                mock_response = MagicMock()
+                mock_response.choices = [MagicMock(message=mock_msg)]
+                mock_response.usage = MagicMock(prompt_tokens=200, completion_tokens=80)
+                mock_client.chat.completions.create.return_value = mock_response
+                from app.agent.backends.openai_backend import OpenAIBackend
+                backend = OpenAIBackend()
+                result = backend.complete([], [])
+                assert result.usage is not None
+                assert result.usage.input_tokens == 200
+                assert result.usage.output_tokens == 80
