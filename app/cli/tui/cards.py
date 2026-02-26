@@ -6,6 +6,10 @@ No class state — pure functions.
 Visual design inspired by OpenCode's typed output panels.
 """
 
+import hashlib
+import json
+import os
+
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -143,6 +147,37 @@ def render_tool_result(console: Console, tool_name: str, summary: str,
         render_plot_card(console, tool_name, elapsed_ms, result)
     else:
         render_success_card(console, tool_name, summary, elapsed_ms)
+
+    # Character-based truncation notice for large results
+    _check_large_result(console, result)
+
+
+def _check_large_result(console: Console, result: dict):
+    """If result exceeds TRUNCATION_CHARS, persist to disk and show notice."""
+    from app.cli.tui.theme import TRUNCATION_CHARS
+    try:
+        serialized = json.dumps(result, default=str)
+    except (TypeError, ValueError):
+        return
+    if len(serialized) <= TRUNCATION_CHARS:
+        return
+    result_id = hashlib.md5(serialized[:1000].encode()).hexdigest()[:8]
+    cache_dir = os.path.join(
+        os.environ.get("PRISM_CACHE_DIR", os.path.expanduser("~/.prism/cache")),
+        "results",
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{result_id}.json")
+    try:
+        with open(path, "w") as f:
+            f.write(serialized)
+    except OSError:
+        pass
+    console.print(
+        f" [dim]\u2500 {len(serialized):,} chars truncated \u00b7 "
+        f"stored as {result_id} \u00b7 "
+        f"use peek_result(\"{result_id}\") \u2500[/dim]"
+    )
 
 
 def render_success_card(console: Console, tool_name: str,
