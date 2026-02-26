@@ -297,6 +297,38 @@ if [ "$INSTALL_OK" -eq 0 ]; then
     err "PRISM installation failed. Try manually:\n  pip install \"$GIT_PACKAGE\"\n  Or see: https://github.com/Darth-Hidious/PRISM#quick-start"
 fi
 
+# ── Download TUI binary ─────────────────────────────────────────
+TUI_BIN_DIR="$HOME/.prism/bin"
+TUI_BIN_NAME=""
+case "$OS" in
+    Darwin)
+        case "$ARCH" in
+            arm64)  TUI_BIN_NAME="prism-tui-darwin-arm64" ;;
+            x86_64) TUI_BIN_NAME="prism-tui-darwin-x64" ;;
+        esac
+        ;;
+    Linux)
+        case "$ARCH" in
+            x86_64)  TUI_BIN_NAME="prism-tui-linux-x64" ;;
+            aarch64) TUI_BIN_NAME="prism-tui-linux-arm64" ;;
+        esac
+        ;;
+esac
+
+if [ -n "$TUI_BIN_NAME" ]; then
+    TUI_URL="https://github.com/Darth-Hidious/PRISM/releases/latest/download/$TUI_BIN_NAME"
+    info "TUI:" "Downloading Ink frontend binary..."
+    mkdir -p "$TUI_BIN_DIR"
+    if curl -fsSL "$TUI_URL" -o "$TUI_BIN_DIR/prism-tui" 2>/dev/null; then
+        chmod +x "$TUI_BIN_DIR/prism-tui"
+        ok "TUI:" "Ink frontend installed ($TUI_BIN_NAME)"
+    else
+        warn "TUI:" "Binary not available for $OS/$ARCH (Rich UI will be used)"
+    fi
+else
+    warn "TUI:" "No pre-built binary for $OS/$ARCH (Rich UI will be used)"
+fi
+
 # ── Verify ───────────────────────────────────────────────────────────
 printf '\n'
 

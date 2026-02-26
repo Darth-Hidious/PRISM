@@ -123,6 +123,68 @@ def upgrade_command(method: Optional[str] = None) -> str:
         return "curl -fsSL https://prism.marc27.com/install.sh | bash -s -- --upgrade"
 
 
+def _tui_binary_name() -> Optional[str]:
+    """Return the platform-specific TUI binary asset name, or None."""
+    import platform
+    system = platform.system()
+    machine = platform.machine()
+    if system == "Darwin":
+        return "prism-tui-darwin-arm64" if machine == "arm64" else "prism-tui-darwin-x64"
+    elif system == "Linux":
+        if machine == "x86_64":
+            return "prism-tui-linux-x64"
+        elif machine == "aarch64":
+            return "prism-tui-linux-arm64"
+    return None
+
+
+def download_tui_binary() -> Optional[str]:
+    """Download the latest TUI binary for this platform.
+
+    Returns the path on success, or None on failure. Never raises.
+    """
+    import urllib.request
+
+    bin_name = _tui_binary_name()
+    if not bin_name:
+        return None
+
+    url = f"https://github.com/Darth-Hidious/PRISM/releases/latest/download/{bin_name}"
+    dest_dir = PRISM_DIR / "bin"
+    dest = dest_dir / "prism-tui"
+
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(url, str(dest))
+        dest.chmod(0o755)
+        return str(dest)
+    except Exception:
+        return None
+
+
+def run_upgrade(method: Optional[str] = None) -> bool:
+    """Actually run the upgrade command. Returns True on success."""
+    import subprocess
+
+    method = method or detect_install_method()
+    cmd = upgrade_command(method)
+
+    # For the curl-based install, we can't run it from Python easily
+    if method == "unknown":
+        return False
+
+    try:
+        result = subprocess.run(
+            cmd.split(),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def check_for_updates(current_version: str) -> Optional[dict]:
     """Check if a newer version of PRISM is available.
 
