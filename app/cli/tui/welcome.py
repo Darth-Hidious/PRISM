@@ -1,4 +1,4 @@
-"""Welcome banner with crystal mascot and capability detection.
+"""Welcome banner with crystal mascot and status checks.
 
 Design inspired by OpenCode's centered home screen with tips and footer.
 """
@@ -8,50 +8,53 @@ from rich.console import Console
 from rich.text import Text
 
 from app.cli.tui.theme import (
-    PRIMARY, SECONDARY, ACCENT, ACCENT_MAGENTA, MUTED, DIM,
-    SUCCESS, WARNING, STATUS_DOT_ON, STATUS_DOT_OFF, SEPARATOR,
+    PRIMARY, SECONDARY, ACCENT, ACCENT_MAGENTA, ACCENT_CYAN, MUTED, DIM,
+    SUCCESS, WARNING, ERROR, STATUS_DOT_ON, STATUS_DOT_OFF, SEPARATOR,
     CRYSTAL_OUTER_DIM, CRYSTAL_OUTER, CRYSTAL_INNER, CRYSTAL_CORE,
     HEADER_COMMANDS_L, HEADER_COMMANDS_R, RAINBOW,
 )
 
 
+# Keep for backwards compat — other modules may import these
 def detect_capabilities() -> dict:
-    caps = {}
-    try:
-        import sklearn  # noqa: F401
-        caps["ML"] = True
-    except ImportError:
-        caps["ML"] = False
-    try:
-        from app.simulation.bridge import check_pyiron_available
-        caps["pyiron"] = check_pyiron_available()
-    except Exception:
-        caps["pyiron"] = False
-    try:
-        from app.simulation.calphad_bridge import check_calphad_available
-        caps["CALPHAD"] = check_calphad_available()
-    except Exception:
-        caps["CALPHAD"] = False
-    return caps
+    """Legacy capability detection. Use app.backend.status instead."""
+    from app.backend.status import detect_llm, detect_commands
+    llm = detect_llm()
+    cmds = detect_commands()
+    return {
+        "LLM": llm["connected"],
+        "search": any(t["healthy"] for t in cmds["tools"] if t["name"] == "search_materials"),
+    }
 
 
 def _detect_provider() -> str | None:
     """Detect the active LLM provider from environment."""
-    if os.getenv("MARC27_TOKEN"):
-        return "MARC27"
-    if os.getenv("ANTHROPIC_API_KEY"):
-        return "Claude"
-    if os.getenv("OPENAI_API_KEY"):
-        return "GPT"
-    if os.getenv("OPENROUTER_API_KEY"):
-        return "OpenRouter"
-    return None
+    from app.backend.status import detect_llm
+    result = detect_llm()
+    return result["provider"]
+
+
+# Short display names for tools
+_SHORT_NAMES = {
+    "search_materials": "search",
+    "query_materials_project": "MP",
+    "literature_search": "literature",
+    "predict_property": "predict",
+    "execute_python": "python",
+    "web_search": "web",
+}
 
 
 def show_welcome(console: Console, agent, auto_approve: bool = False):
-    """Render the crystal mascot banner with provider and capability info."""
+    """Render the crystal mascot banner with status checks."""
     from app import __version__
-    caps = detect_capabilities()
+    from app.backend.status import build_status
+
+    status = build_status(tool_registry=agent.tools)
+    llm = status["llm"]
+    plugins = status["plugins"]
+    commands = status["commands"]
+    skills = status["skills"]
 
     console.print()
 
@@ -128,35 +131,62 @@ def show_welcome(console: Console, agent, auto_approve: bool = False):
 
     console.print()
 
-    # Capabilities bar: provider + ML/pyiron/CALPHAD dots + tool/skill count
-    status = Text("  ")
-    provider = _detect_provider()
-    if provider:
-        status.append(provider, style=f"bold {SECONDARY}")
-        status.append(SEPARATOR, style=DIM)
+    # 1. LLM status
+    line = Text("  ")
+    if llm["connected"]:
+        line.append(STATUS_DOT_ON, style=SUCCESS)
+        line.append(" ")
+        line.append(llm["provider"], style=f"bold {SECONDARY}")
+        line.append(" connected", style=DIM)
+    else:
+        line.append(STATUS_DOT_OFF, style=MUTED)
+        line.append(" ")
+        line.append("No LLM configured", style=ERROR)
+        line.append(" \u2014 run ", style=DIM)
+        line.append("prism setup", style=ACCENT_CYAN)
+        line.append(" or visit ", style=DIM)
+        line.append("platform.marc27.com", style=SECONDARY)
+    console.print(line)
 
-    for name, ok in caps.items():
-        status.append(name, style=DIM)
-        status.append(" ")
-        if ok:
-            status.append(STATUS_DOT_ON, style=SUCCESS)
+    # 2. Plugins
+    line = Text("  ")
+    line.append(STATUS_DOT_OFF, style=MUTED)
+    line.append(" ")
+    line.append("Plugins", style=DIM)
+    line.append(" coming soon", style=MUTED)
+    console.print(line)
+
+    # 3. Commands
+    line = Text("  ")
+    any_healthy = any(t["healthy"] for t in commands["tools"])
+    line.append(STATUS_DOT_ON if any_healthy else STATUS_DOT_OFF,
+                style=SUCCESS if any_healthy else MUTED)
+    line.append(" ")
+    line.append("Commands ", style=DIM)
+    for i, tool in enumerate(commands["tools"]):
+        name = _SHORT_NAMES.get(tool["name"], tool["name"])
+        if tool["registered"]:
+            line.append(name, style=SUCCESS if tool["healthy"] else WARNING)
         else:
-            status.append(STATUS_DOT_OFF, style=MUTED)
-        status.append("  ")
+            line.append(name, style=MUTED)
+        if i < len(commands["tools"]) - 1:
+            line.append(" \u00b7 ", style=DIM)
+    if commands["healthy_providers"] > 0:
+        line.append(f" ({commands['healthy_providers']}/{commands['total_providers']} providers)", style=DIM)
+    console.print(line)
 
-    tool_count = len(agent.tools.list_tools())
-    status.append(f"{tool_count} tools", style=MUTED)
-    try:
-        from app.skills.registry import load_builtin_skills
-        skill_count = len(load_builtin_skills().list_skills())
-        status.append(SEPARATOR, style=DIM)
-        status.append(f"{skill_count} skills", style=MUTED)
-    except Exception:
-        pass
+    # 4. Skills
+    line = Text("  ")
+    line.append(STATUS_DOT_ON if skills["count"] > 0 else STATUS_DOT_OFF,
+                style=SUCCESS if skills["count"] > 0 else MUTED)
+    line.append(" ")
+    line.append(f"{skills['count']} skills", style=DIM)
+    console.print(line)
 
+    # Auto-approve warning
     if auto_approve:
-        status.append(SEPARATOR, style=DIM)
-        status.append("auto-approve", style=WARNING)
+        line = Text("  ")
+        line.append("\u26a0 auto-approve enabled", style=WARNING)
+        console.print(line)
 
-    console.print(status)
     console.print()

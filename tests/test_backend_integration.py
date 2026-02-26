@@ -26,8 +26,12 @@ def test_full_roundtrip():
     with patch("app.agent.factory.create_backend"), \
          patch("app.agent.core.AgentCore") as MockAgent, \
          patch("app.plugins.bootstrap.build_full_registry") as mock_reg, \
-         patch("app.backend.ui_emitter.detect_capabilities", return_value={"ML": True}), \
-         patch("app.backend.ui_emitter._detect_provider", return_value="Claude"):
+         patch("app.backend.ui_emitter.build_status", return_value={
+             "llm": {"connected": True, "provider": "Claude"},
+             "plugins": {"count": 0, "available": False, "names": []},
+             "commands": {"tools": [], "total": 1, "healthy_providers": 0, "total_providers": 0},
+             "skills": {"count": 0, "names": []},
+         }):
 
         mock_tools = MagicMock()
         mock_tools.list_tools.return_value = [MagicMock(name="t1")]
@@ -71,7 +75,7 @@ def test_full_roundtrip():
     welcome = events[1]
     assert welcome["method"] == "ui.welcome"
     assert welcome["params"]["version"]  # non-empty version string
-    assert welcome["params"]["provider"] == "Claude"
+    assert welcome["params"]["status"]["llm"]["provider"] == "Claude"
 
     # Find streaming events (everything after init + welcome)
     methods = [e.get("method") for e in events[2:]]
@@ -101,8 +105,12 @@ def test_command_roundtrip():
     with patch("app.agent.factory.create_backend"), \
          patch("app.agent.core.AgentCore") as MockAgent, \
          patch("app.plugins.bootstrap.build_full_registry") as mock_reg, \
-         patch("app.backend.ui_emitter.detect_capabilities", return_value={}), \
-         patch("app.backend.ui_emitter._detect_provider", return_value="mock"):
+         patch("app.backend.ui_emitter.build_status", return_value={
+             "llm": {"connected": True, "provider": "mock"},
+             "plugins": {"count": 0, "available": False, "names": []},
+             "commands": {"tools": [], "total": 0, "healthy_providers": 0, "total_providers": 0},
+             "skills": {"count": 0, "names": []},
+         }):
 
         mock_tools = MagicMock()
         mock_tools.list_tools.return_value = []

@@ -15,21 +15,12 @@ from app.agent.events import (
 from app.backend.protocol import make_event
 from app.cli.tui.cards import detect_result_type
 from app.cli.tui.spinner import TOOL_VERBS
-from app.cli.tui.welcome import detect_capabilities, _detect_provider
+from app.backend.status import build_status
 
 
 def _verb_for_tool(tool_name: str) -> str:
     """Look up a human-readable verb for a tool, falling back to 'Thinking...'."""
     return TOOL_VERBS.get(tool_name, "Thinking\u2026")
-
-
-def _skill_count() -> int:
-    """Count available built-in skills, returning 0 on import failure."""
-    try:
-        from app.skills.registry import load_builtin_skills
-        return len(load_builtin_skills().list_skills())
-    except Exception:
-        return 0
 
 
 class UIEmitter:
@@ -45,17 +36,11 @@ class UIEmitter:
         self.message_count: int = 0
 
     def welcome(self) -> dict:
-        """Emit a ui.welcome event with version, provider, and capabilities."""
-        capabilities = detect_capabilities()
-        provider = _detect_provider() or "unknown"
-        tool_count = len(self.agent.tools.list_tools())
-        skill_count = _skill_count()
+        """Emit a ui.welcome event with version and full status."""
+        status = build_status(tool_registry=self.agent.tools)
         return make_event("ui.welcome", {
             "version": __version__,
-            "provider": provider,
-            "capabilities": capabilities,
-            "tool_count": tool_count,
-            "skill_count": skill_count,
+            "status": status,
             "auto_approve": self.auto_approve,
         })
 
