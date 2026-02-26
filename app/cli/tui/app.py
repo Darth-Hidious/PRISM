@@ -40,6 +40,7 @@ class AgentREPL:
         self._mcp_tools: list[str] = []
         self._auto_approve = auto_approve
         self._auto_approve_tools: set = set()
+        self.session_cost = 0.0
 
         if tools is None:
             from app.plugins.bootstrap import build_full_registry
@@ -110,9 +111,10 @@ class AgentREPL:
                 continue
 
             try:
-                handle_streaming_response(
+                self.session_cost = handle_streaming_response(
                     self.console, self.agent, user_input,
                     self.session, self.scratchpad,
+                    session_cost=self.session_cost,
                 )
             except KeyboardInterrupt:
                 self.console.print("\n[dim]Interrupted.[/dim]")
