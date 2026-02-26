@@ -174,15 +174,19 @@ class TestUIEmitter:
 
         emitter = UIEmitter(agent, auto_approve=True)
 
-        with patch("app.backend.ui_emitter.detect_capabilities", return_value={"ML": True, "CALPHAD": False}), \
-             patch("app.backend.ui_emitter._detect_provider", return_value="Claude"):
+        mock_status = {
+            "llm": {"connected": True, "provider": "Claude"},
+            "plugins": {"count": 0, "available": False, "names": []},
+            "commands": {"tools": [], "total": 12, "healthy_providers": 5, "total_providers": 10},
+            "skills": {"count": 10, "names": []},
+        }
+        with patch("app.backend.ui_emitter.build_status", return_value=mock_status):
             event = emitter.welcome()
 
         assert event["method"] == "ui.welcome"
         assert event["params"]["version"]
-        assert event["params"]["provider"] == "Claude"
-        assert event["params"]["capabilities"] == {"ML": True, "CALPHAD": False}
-        assert event["params"]["tool_count"] == 12
+        assert event["params"]["status"]["llm"]["provider"] == "Claude"
+        assert event["params"]["status"]["llm"]["connected"] is True
         assert event["params"]["auto_approve"] is True
 
     def test_emitter_detects_error_card_type(self):

@@ -156,10 +156,7 @@ function HistoryRenderer({
       return (
         <Welcome
           version={item.data.version}
-          provider={item.data.provider}
-          capabilities={item.data.capabilities}
-          toolCount={item.data.tool_count}
-          skillCount={item.data.skill_count}
+          status={item.data.status}
           autoApprove={item.data.auto_approve}
         />
       );

@@ -9,9 +9,16 @@ def test_server_handles_init():
     server = StdioServer()
     output = StringIO()
 
+    mock_status = {
+        "llm": {"connected": True, "provider": "mock"},
+        "plugins": {"count": 0, "available": False, "names": []},
+        "commands": {"tools": [], "total": 0, "healthy_providers": 0, "total_providers": 0},
+        "skills": {"count": 0, "names": []},
+    }
     with patch("app.agent.factory.create_backend") as mock_cb, \
          patch("app.agent.core.AgentCore") as mock_ac, \
-         patch("app.plugins.bootstrap.build_full_registry") as mock_reg:
+         patch("app.plugins.bootstrap.build_full_registry") as mock_reg, \
+         patch("app.backend.ui_emitter.build_status", return_value=mock_status):
         mock_reg.return_value = (MagicMock(), None, None)
         mock_agent = MagicMock()
         mock_agent.tools.list_tools.return_value = []
