@@ -39,7 +39,8 @@ console = Console(force_terminal=True, width=120)
 @click.option('--resume', default=None, help='Resume a saved session by SESSION_ID')
 @click.option('--no-mcp', is_flag=True, help='Disable loading tools from external MCP servers')
 @click.option('--dangerously-accept-all', is_flag=True, help='Auto-approve all tool calls (skip consent prompts)')
-def cli(ctx, version, verbose, quiet, mp_api_key, resume, no_mcp, dangerously_accept_all):
+@click.option('--classic', is_flag=True, help='Use classic Rich terminal UI')
+def cli(ctx, version, verbose, quiet, mp_api_key, resume, no_mcp, dangerously_accept_all, classic):
     f"""
 {PRISM_BRAND}
 AI-Native Autonomous Materials Discovery
@@ -128,7 +129,20 @@ Documentation: https://github.com/Darth-Hidious/PRISM
         except Exception:
             pass
 
-        # Launch REPL
+        # Try Ink TUI binary (unless --classic or binary not found)
+        from app.cli._binary import has_tui_binary, tui_binary_path
+
+        if not classic and has_tui_binary():
+            import sys
+            binary = tui_binary_path()
+            args = [str(binary), "--python", sys.executable]
+            if dangerously_accept_all:
+                args.append("--auto-approve")
+            if resume:
+                args.extend(["--resume", resume])
+            os.execvp(str(binary), args)
+
+        # Launch classic Rich REPL
         try:
             backend = create_backend()
             repl = AgentREPL(backend=backend, enable_mcp=not no_mcp,
