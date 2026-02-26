@@ -1,6 +1,7 @@
 import React from "react";
 import { Box, Text } from "ink";
 import { BORDERS, ICONS, MUTED } from "../theme.js";
+import { MarkdownText } from "./MarkdownText.js";
 
 interface Props {
   cardType: string;
@@ -29,7 +30,7 @@ export function ToolCard({ cardType, toolName, elapsedMs, content, data }: Props
         {toolName && <Text color={MUTED}>{toolName} </Text>}
         {elapsed && <Text dimColor>{elapsed}</Text>}
       </Box>
-      {content && <Text>{content}</Text>}
+      {content && <MarkdownText text={content} />}
     </Box>
   );
 }
