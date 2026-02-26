@@ -179,3 +179,11 @@ def test_backward_compat_shim_imports():
     assert callable(_detect_result_type)
     assert "/help" in REPL_COMMANDS
     assert Spinner is not None
+
+
+def test_crystal_mascot_alignment():
+    """Top/bottom rows should be centered under middle rows."""
+    from app.cli.tui.theme import MASCOT
+    for i in [0, 3]:
+        leading_spaces = len(MASCOT[i]) - len(MASCOT[i].lstrip())
+        assert leading_spaces == 4, f"Row {i} has {leading_spaces} leading spaces, expected 4"
