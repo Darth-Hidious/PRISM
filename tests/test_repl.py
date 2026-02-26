@@ -132,3 +132,9 @@ class TestAgentREPL:
         show_welcome(repl.console, repl.agent, repl._auto_approve)
         text = output.getvalue()
         assert "\u2b22" in text or "\u2b21" in text
+
+
+def test_repl_has_session_cost():
+    repl = _make_repl()
+    assert hasattr(repl, "session_cost")
+    assert repl.session_cost == 0.0
