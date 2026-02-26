@@ -52,10 +52,10 @@ CRYSTAL_INNER = "#ccccff"
 CRYSTAL_CORE = "#ffffff"
 
 MASCOT = [
-    "   \u2b21 \u2b21 \u2b21",
+    "    \u2b21 \u2b21 \u2b21",
     "  \u2b21 \u2b22 \u2b22 \u2b22 \u2b21",
     "  \u2b21 \u2b22 \u2b22 \u2b22 \u2b21",
-    "   \u2b21 \u2b21 \u2b21",
+    "    \u2b21 \u2b21 \u2b21",
 ]
 
 # ── Welcome header commands (shown next to rainbow rays) ─────────────
