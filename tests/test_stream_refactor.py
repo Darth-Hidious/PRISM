@@ -29,7 +29,7 @@ def _make_mock_emitter(events, final_session_cost=0.0):
 class TestStreamUsesUIEmitter:
     """Verify that handle_streaming_response delegates to UIEmitter."""
 
-    @patch("app.cli.tui.stream.UIEmitter")
+    @patch("app.backend.ui_emitter.UIEmitter")
     @patch("app.cli.tui.stream.render_input_card")
     def test_stream_uses_ui_emitter(self, mock_render_input, MockUIEmitter):
         """UIEmitter is instantiated with the agent and process() is called."""
@@ -61,7 +61,7 @@ class TestStreamUsesUIEmitter:
 class TestStreamRendersToolCard:
     """Verify that ui.card events dispatch to render_tool_result."""
 
-    @patch("app.cli.tui.stream.UIEmitter")
+    @patch("app.backend.ui_emitter.UIEmitter")
     @patch("app.cli.tui.stream.render_input_card")
     @patch("app.cli.tui.stream.render_tool_result")
     def test_stream_renders_tool_card(

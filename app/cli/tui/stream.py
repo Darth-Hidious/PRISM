@@ -13,7 +13,6 @@ from rich.markdown import Markdown
 
 from app.agent.events import UsageInfo
 from app.agent.scratchpad import Scratchpad
-from app.backend.ui_emitter import UIEmitter
 from app.cli.tui.cards import (
     render_input_card,
     render_plan_card, render_tool_result, render_cost_line,
@@ -43,6 +42,7 @@ def handle_streaming_response(
     """
     render_input_card(console, user_input)
 
+    from app.backend.ui_emitter import UIEmitter  # lazy to avoid circular import
     emitter = UIEmitter(agent)
     emitter.session_cost = session_cost
 
