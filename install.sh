@@ -316,10 +316,16 @@ case "$OS" in
 esac
 
 if [ -n "$TUI_BIN_NAME" ]; then
-    TUI_URL="https://github.com/Darth-Hidious/PRISM/releases/latest/download/$TUI_BIN_NAME"
-    info "TUI:" "Downloading Ink frontend binary..."
+    # Get the latest release tag (including pre-releases) from GitHub API
+    TUI_TAG=$(curl -fsSL "https://api.github.com/repos/Darth-Hidious/PRISM/releases" 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    if [ -z "$TUI_TAG" ]; then
+        TUI_TAG="v2.5.0b1.0.3"  # fallback
+    fi
+    TUI_URL="https://github.com/Darth-Hidious/PRISM/releases/download/$TUI_TAG/$TUI_BIN_NAME"
+    info "TUI:" "Downloading Ink frontend binary ($TUI_TAG)..."
     mkdir -p "$TUI_BIN_DIR"
-    if curl -fsSL "$TUI_URL" -o "$TUI_BIN_DIR/prism-tui" 2>/dev/null; then
+    if curl -fsSL -L "$TUI_URL" -o "$TUI_BIN_DIR/prism-tui" 2>/dev/null; then
         chmod +x "$TUI_BIN_DIR/prism-tui"
         ok "TUI:" "Ink frontend installed ($TUI_BIN_NAME)"
     else
