@@ -272,3 +272,33 @@ def test_render_tool_result_small_no_truncation():
     render_tool_result(console, "search_materials", "5 results", 500.0, small_result)
     text = output.getvalue()
     assert "chars truncated" not in text
+
+
+def test_streaming_response_renders_live_text():
+    """handle_streaming_response should stream text and show cost line."""
+    from unittest.mock import MagicMock
+    from app.cli.tui.stream import handle_streaming_response
+    from app.agent.events import TextDelta, TurnComplete, UsageInfo
+    from rich.console import Console
+    from io import StringIO
+
+    output = StringIO()
+    console = Console(file=output, highlight=False, force_terminal=True, width=120)
+    session = MagicMock()
+
+    agent = MagicMock()
+    agent.process_stream.return_value = iter([
+        TextDelta(text="Hello "),
+        TextDelta(text="world!"),
+        TurnComplete(
+            text="Hello world!",
+            usage=UsageInfo(input_tokens=100, output_tokens=20),
+            total_usage=UsageInfo(input_tokens=100, output_tokens=20),
+            estimated_cost=0.0001,
+        ),
+    ])
+
+    result = handle_streaming_response(console, agent, "test input", session, session_cost=0.0)
+    text = output.getvalue()
+    assert "Hello" in text or "world" in text
+    assert isinstance(result, float)
