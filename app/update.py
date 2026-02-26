@@ -138,6 +138,22 @@ def _tui_binary_name() -> Optional[str]:
     return None
 
 
+def _latest_release_tag() -> Optional[str]:
+    """Get the latest release tag from GitHub (including pre-releases)."""
+    import urllib.request
+
+    url = "https://api.github.com/repos/Darth-Hidious/PRISM/releases"
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        if data and isinstance(data, list):
+            return data[0].get("tag_name")
+    except Exception:
+        pass
+    return None
+
+
 def download_tui_binary() -> Optional[str]:
     """Download the latest TUI binary for this platform.
 
@@ -149,7 +165,8 @@ def download_tui_binary() -> Optional[str]:
     if not bin_name:
         return None
 
-    url = f"https://github.com/Darth-Hidious/PRISM/releases/latest/download/{bin_name}"
+    tag = _latest_release_tag() or "v2.5.0b1.0.3"
+    url = f"https://github.com/Darth-Hidious/PRISM/releases/download/{tag}/{bin_name}"
     dest_dir = PRISM_DIR / "bin"
     dest = dest_dir / "prism-tui"
 
