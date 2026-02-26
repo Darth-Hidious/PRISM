@@ -1,0 +1,69 @@
+name: Build Frontend
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build-frontend:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: bun-darwin-arm64
+            wheel_plat: macosx_11_0_arm64
+          - os: macos-13
+            target: bun-darwin-x64
+            wheel_plat: macosx_11_0_x86_64
+          - os: ubuntu-latest
+            target: bun-linux-x64
+            wheel_plat: manylinux_2_17_x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install frontend deps
+        run: cd frontend && bun install
+
+      - name: Compile binary
+        run: |
+          cd frontend
+          bun build src/index.tsx --compile \
+            --target=${{ matrix.target }} \
+            --outfile ../app/_bin/prism-tui
+
+      - name: Build wheel
+        run: |
+          pip install build wheel
+          python -m build --wheel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.wheel_plat }}
+          path: dist/*.whl
+
+  build-pure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build pure Python wheel
+        run: |
+          rm -rf app/_bin/
+          pip install build
+          python -m build --wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-pure
+          path: dist/*.whl
