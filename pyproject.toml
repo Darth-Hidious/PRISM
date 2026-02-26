@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prism-platform"
-version = "2.5.0"
+version = "2.5.0b1"
 description = "AI-Native Autonomous Materials Discovery Platform"
 readme = "README.md"
 authors = [{ name = "MARC27", email = "team@marc27.com" }]

@@ -8,7 +8,7 @@ REPO="https://github.com/Darth-Hidious/PRISM.git"
 PACKAGE="prism-platform"
 GIT_PACKAGE="$PACKAGE[all] @ git+$REPO"
 MIN_PYTHON="3.11"
-CURRENT_VERSION="2.5.0"
+CURRENT_VERSION="2.5.0b1"
 
 # ── Parse flags ──────────────────────────────────────────────────────
 UPGRADE=0
