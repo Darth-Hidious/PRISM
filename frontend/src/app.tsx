@@ -136,7 +136,7 @@ export function App({ pythonPath, autoApprove }: Props) {
         )}
       </Static>
 
-      {streamingText ? <StreamingText text={streamingText} /> : null}
+      {streamingText ? <StreamingText text={streamingText} streaming /> : null}
       {spinnerVerb ? <Spinner verb={spinnerVerb} /> : null}
 
       <Prompt onSubmit={handleSubmit} />
