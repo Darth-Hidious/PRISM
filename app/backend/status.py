@@ -131,8 +131,10 @@ def detect_skills() -> dict:
     try:
         from app.skills.registry import load_builtin_skills
         registry = load_builtin_skills()
-        names = registry.list_skills()
-        return {"count": len(names), "names": list(names)}
+        skills = registry.list_skills()
+        # list_skills() may return Skill objects — extract names as strings
+        names = [str(getattr(s, "name", s)) for s in skills]
+        return {"count": len(names), "names": names}
     except Exception:
         return {"count": 0, "names": []}
 
