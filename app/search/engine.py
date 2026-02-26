@@ -18,6 +18,15 @@ from app.search.translator import QueryTranslator
 logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = Path.home() / ".prism" / "cache"
+
+
+def _sanitize_error(msg: str) -> str:
+    """Strip HTML tags and truncate to a single readable line."""
+    import re
+    clean = re.sub(r"<[^>]+>", "", msg)          # strip HTML tags
+    clean = re.sub(r"\s+", " ", clean).strip()    # collapse whitespace
+    return clean[:120] if clean else "unknown error"
+
 DEFAULT_HEALTH_PATH = Path.home() / ".prism" / "cache" / "provider_health.json"
 
 
@@ -95,7 +104,7 @@ class SearchEngine:
                     latency_ms=(time.time() - start) * 1000,
                     status="http_error",
                     error_type=type(result).__name__,
-                    error_message=str(result)[:200],
+                    error_message=_sanitize_error(str(result)),
                 )
                 query_log.append(log)
                 warnings.append(f"Provider '{pid}' failed: {type(result).__name__}")

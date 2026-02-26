@@ -14,10 +14,19 @@ def _search_materials(**kwargs) -> dict:
     from app.search.providers.registry import build_registry
 
     try:
+        elements = kwargs.get("elements")
+        # Auto-infer n_elements from elements list when not explicitly set
+        n_elements = None
+        if kwargs.get("n_elements_min") or kwargs.get("n_elements_max"):
+            n_elements = PropertyRange(min=kwargs.get("n_elements_min"), max=kwargs.get("n_elements_max"))
+        elif elements and not kwargs.get("formula"):
+            # Constrain to exactly these elements (avoid Fe-C returning Fe-C-Lu)
+            n_elements = PropertyRange(min=len(elements), max=len(elements))
+
         query = MaterialSearchQuery(
-            elements=kwargs.get("elements"),
+            elements=elements,
             formula=kwargs.get("formula"),
-            n_elements=PropertyRange(min=kwargs["n_elements_min"], max=kwargs["n_elements_max"]) if kwargs.get("n_elements_min") or kwargs.get("n_elements_max") else None,
+            n_elements=n_elements,
             band_gap=PropertyRange(min=kwargs.get("band_gap_min"), max=kwargs.get("band_gap_max")) if kwargs.get("band_gap_min") is not None or kwargs.get("band_gap_max") is not None else None,
             space_group=kwargs.get("space_group"),
             crystal_system=kwargs.get("crystal_system"),

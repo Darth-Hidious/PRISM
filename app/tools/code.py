@@ -7,8 +7,12 @@ from pathlib import Path
 from app.tools.base import Tool, ToolRegistry
 
 
+MAX_TIMEOUT = 300  # Hard cap: 5 minutes regardless of agent request
+
+
 def _execute_python(code: str, timeout: int = 60, description: str = "") -> dict:
     """Execute Python code in a subprocess. Returns stdout, stderr, exit code."""
+    timeout = min(timeout, MAX_TIMEOUT)
     try:
         result = subprocess.run(
             [sys.executable, "-c", code],
