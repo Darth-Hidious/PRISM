@@ -238,3 +238,37 @@ def test_render_cost_line_no_cost():
     assert "500 in" in text
     assert "200 out" in text
     assert "$" not in text
+
+
+def test_render_tool_result_truncation_notice(tmp_path, monkeypatch):
+    """Large tool results should show a truncation notice."""
+    from app.cli.tui.cards import render_tool_result
+    from rich.console import Console
+    from io import StringIO
+    import json
+
+    monkeypatch.setenv("PRISM_CACHE_DIR", str(tmp_path))
+
+    output = StringIO()
+    console = Console(file=output, highlight=False, force_terminal=True, width=120)
+
+    big_result = {"results": [{"id": f"mp-{i}", "formula": "Si"} for i in range(2000)], "count": 2000}
+    assert len(json.dumps(big_result)) > 50_000
+
+    render_tool_result(console, "search_materials", "2000 results", 1500.0, big_result)
+    text = output.getvalue()
+    assert "chars truncated" in text or "stored as" in text
+
+
+def test_render_tool_result_small_no_truncation():
+    """Small tool results should NOT show truncation notice."""
+    from app.cli.tui.cards import render_tool_result
+    from rich.console import Console
+    from io import StringIO
+
+    output = StringIO()
+    console = Console(file=output, highlight=False, force_terminal=True, width=120)
+    small_result = {"results": [{"id": "mp-1", "formula": "Si"}] * 5, "count": 5}
+    render_tool_result(console, "search_materials", "5 results", 500.0, small_result)
+    text = output.getvalue()
+    assert "chars truncated" not in text
