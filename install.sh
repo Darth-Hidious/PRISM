@@ -19,16 +19,14 @@ for arg in "$@"; do
 done
 
 # ── Helpers ──────────────────────────────────────────────────────────
-info()  { printf '  \033[1;34m%s\033[0m %s\n' "$1" "$2"; }
-ok()    { printf '  \033[1;32m%s\033[0m %s\n' "$1" "$2"; }
-warn()  { printf '  \033[1;33m%s\033[0m %s\n' "$1" "$2"; }
-err()   { printf '  \033[1;31m%s\033[0m %s\n' "ERROR:" "$1" >&2; exit 1; }
+info()  { printf '  \033[2m→\033[0m %s %s\n' "$1" "$2"; }
+ok()    { printf '  \033[1;32m✓\033[0m %s %s\n' "$1" "$2"; }
+warn()  { printf '  \033[1;33m!\033[0m %s %s\n' "$1" "$2"; }
+err()   { printf '  \033[1;31m✗\033[0m %s\n' "$1" >&2; exit 1; }
 
 # ── Banner ───────────────────────────────────────────────────────────
 printf '\n'
-printf '  \033[1;36m⬡ PRISM\033[0m v%s\n' "$CURRENT_VERSION"
-printf '  \033[2mPlatform for Research in Intelligent Synthesis of Materials\033[0m\n'
-printf '  \033[2mBy MARC27 — marc27.com\033[0m\n\n'
+printf '  \033[1;36m⬡ PRISM\033[0m v%s \033[2m— Materials Discovery Platform\033[0m\n\n' "$CURRENT_VERSION"
 
 # ── Check if already installed & handle upgrade ──────────────────────
 if command -v prism >/dev/null 2>&1; then
@@ -256,9 +254,9 @@ fi
 # ── Install PRISM ────────────────────────────────────────────────────
 printf '\n'
 if [ "$UPGRADE" -eq 1 ]; then
-    info "Upgrading:" "PRISM from GitHub..."
+    info "Upgrading" "PRISM..."
 else
-    info "Installing:" "PRISM from GitHub..."
+    info "Installing" "PRISM..."
 fi
 
 INSTALL_OK=0
@@ -316,11 +314,9 @@ if command -v prism >/dev/null 2>&1; then
         ok "Installed!" "PRISM v$FINAL_VERSION"
     fi
     printf '\n'
-    printf '  \033[1;36m⬡\033[0m Get started:\n'
     printf '\n'
-    info "  Run:" "prism"
-    info "  Help:" "prism --help"
-    info "  Docs:" "https://github.com/Darth-Hidious/PRISM"
+    ok "Run" "'prism' to start"
+    info "Help:" "prism --help"
     printf '\n'
 
     # Warn if user's login shell won't see the binary
