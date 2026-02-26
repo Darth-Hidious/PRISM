@@ -173,3 +173,87 @@ class UIEmitter:
                     })
 
                 yield make_event("ui.turn.complete", {})
+
+    def handle_command(self, command: str) -> Generator[dict, None, None]:
+        """Handle slash commands. Yields ui.* events."""
+        parts = command.strip().split(maxsplit=1)
+        base_cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if base_cmd in ("/exit", "/quit"):
+            yield make_event("ui.status", {
+                "auto_approve": self.auto_approve,
+                "message_count": self.message_count,
+                "has_plan": False,
+            })
+            return
+
+        if base_cmd == "/help":
+            from app.cli.slash.registry import REPL_COMMANDS
+            lines = []
+            for name, desc in REPL_COMMANDS.items():
+                if name == "/quit":
+                    continue
+                lines.append(f"  {name:<16} {desc}")
+            yield make_event("ui.card", {
+                "card_type": "info",
+                "tool_name": "",
+                "elapsed_ms": 0,
+                "content": "\n".join(lines),
+                "data": {},
+            })
+            return
+
+        if base_cmd == "/tools":
+            tools = self.agent.tools.list_tools()
+            lines = []
+            for tool in tools:
+                flag = " \u2605" if tool.requires_approval else ""
+                lines.append(f"  {tool.name:<28} {tool.description[:55]}{flag}")
+            lines.append(f"\n  {len(tools)} tools  \u2605 = requires approval")
+            yield make_event("ui.card", {
+                "card_type": "info",
+                "tool_name": "",
+                "elapsed_ms": 0,
+                "content": "\n".join(lines),
+                "data": {},
+            })
+            return
+
+        if base_cmd == "/approve-all":
+            self.auto_approve = True
+            self.agent.auto_approve = True
+            yield make_event("ui.status", {
+                "auto_approve": True,
+                "message_count": self.message_count,
+                "has_plan": False,
+            })
+            return
+
+        if base_cmd == "/history":
+            yield make_event("ui.card", {
+                "card_type": "info", "tool_name": "", "elapsed_ms": 0,
+                "content": f"{len(self.agent.history)} messages",
+                "data": {},
+            })
+            return
+
+        if base_cmd == "/sessions":
+            from app.agent.memory import SessionMemory
+            sessions = SessionMemory.list_sessions()
+            yield make_event("ui.session.list", {
+                "sessions": [
+                    {"session_id": s["session_id"],
+                     "timestamp": s.get("timestamp", ""),
+                     "message_count": s.get("message_count", 0)}
+                    for s in sessions[:20]
+                ],
+            })
+            return
+
+        # Unknown command
+        yield make_event("ui.card", {
+            "card_type": "info", "tool_name": "", "elapsed_ms": 0,
+            "content": f"Unknown: {base_cmd}  \u2014  /help for commands",
+            "data": {},
+        })

@@ -248,3 +248,78 @@ class TestUIEmitter:
         assert len(approval_prompts) == 1
         assert approval_prompts[0]["params"]["tool_name"] == "submit_hpc_job"
         assert approval_prompts[0]["params"]["tool_args"] == {"nodes": 4, "walltime": "2h"}
+
+    # --- handle_command tests ---
+
+    def test_handle_command_help(self):
+        from app.backend.ui_emitter import UIEmitter
+
+        agent = MagicMock()
+        agent.tools.list_tools.return_value = []
+        emitter = UIEmitter(agent)
+
+        with patch("app.cli.slash.registry.REPL_COMMANDS", {"/help": "Show help", "/tools": "List tools", "/quit": "Exit"}):
+            events = list(emitter.handle_command("/help"))
+
+        cards = [e for e in events if e["method"] == "ui.card"]
+        assert len(cards) == 1
+        assert cards[0]["params"]["card_type"] == "info"
+        assert "/tools" in cards[0]["params"]["content"]
+
+    def test_handle_command_approve_all(self):
+        from app.backend.ui_emitter import UIEmitter
+
+        agent = MagicMock()
+        agent.tools.list_tools.return_value = []
+        emitter = UIEmitter(agent, auto_approve=False)
+
+        events = list(emitter.handle_command("/approve-all"))
+
+        assert emitter.auto_approve is True
+        status = [e for e in events if e["method"] == "ui.status"]
+        assert len(status) == 1
+        assert status[0]["params"]["auto_approve"] is True
+
+    def test_handle_command_unknown(self):
+        from app.backend.ui_emitter import UIEmitter
+
+        agent = MagicMock()
+        agent.tools.list_tools.return_value = []
+        emitter = UIEmitter(agent)
+
+        events = list(emitter.handle_command("/foobar"))
+
+        cards = [e for e in events if e["method"] == "ui.card"]
+        assert len(cards) == 1
+        assert "Unknown" in cards[0]["params"]["content"]
+
+    def test_handle_command_tools(self):
+        from app.backend.ui_emitter import UIEmitter
+
+        mock_tool = MagicMock()
+        mock_tool.name = "search_materials"
+        mock_tool.description = "Search across materials databases"
+        mock_tool.requires_approval = False
+
+        agent = MagicMock()
+        agent.tools.list_tools.return_value = [mock_tool]
+        emitter = UIEmitter(agent)
+
+        events = list(emitter.handle_command("/tools"))
+
+        cards = [e for e in events if e["method"] == "ui.card"]
+        assert len(cards) == 1
+        assert "search_materials" in cards[0]["params"]["content"]
+        assert "1 tools" in cards[0]["params"]["content"]
+
+    def test_handle_command_exit(self):
+        from app.backend.ui_emitter import UIEmitter
+
+        agent = MagicMock()
+        agent.tools.list_tools.return_value = []
+        emitter = UIEmitter(agent)
+
+        events = list(emitter.handle_command("/exit"))
+
+        status = [e for e in events if e["method"] == "ui.status"]
+        assert len(status) == 1
