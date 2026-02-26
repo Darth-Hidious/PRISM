@@ -50,7 +50,7 @@ def handle_streaming_response(
     spinner = Spinner(console=console)
 
     with Live("", console=console, refresh_per_second=15,
-              vertical_overflow="visible") as live:
+              transient=True, vertical_overflow="visible") as live:
 
         for event in emitter.process(user_input):
             method = event["method"]

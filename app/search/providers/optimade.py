@@ -48,7 +48,10 @@ class OptimadeProvider(Provider):
             logger.warning("OPTIMADE query failed for %s: %s", self.id, e)
             raise
 
-        return self._parse_response(results, filter_string)
+        materials = self._parse_response(results, filter_string)
+        # Hard cap to requested limit (OptimadeClient may over-fetch)
+        limit = min(query.limit, self._endpoint.behavior.max_results)
+        return materials[:limit]
 
     def _parse_response(self, results: dict, filter_string: str) -> list[Material]:
         """Parse the nested OptimadeClient response into Material objects.

@@ -7,7 +7,7 @@ from app.agent.scratchpad import Scratchpad
 from app.tools.base import ToolRegistry
 
 
-AUTONOMOUS_SYSTEM_PROMPT = """You are PRISM, an autonomous materials science research agent.
+AUTONOMOUS_SYSTEM_PROMPT_TEMPLATE = """You are PRISM, an autonomous materials science research agent.
 
 You have been given a research goal. Use your tools to investigate, gather data,
 analyze results, and produce a comprehensive answer.
@@ -19,8 +19,7 @@ Available tool categories:
 - Patents: Search Lens.org for materials-related patents
 - Visualization: Create plots, comparisons, and correlation heatmaps
 - System: Read/write files, search the web
-- Prediction: Predict material properties with ML models, list predictable properties
-- Thermodynamics: CALPHAD phase diagrams, equilibrium, Gibbs energy calculations
+- Prediction: Predict material properties with ML models, list predictable properties{calphad_section}
 - Validation: Detect outliers, check physical constraints, score completeness
 - Skills (multi-step workflows):
   - acquire_materials: collect data from multiple sources
@@ -29,8 +28,7 @@ Available tool categories:
   - generate_report: compile Markdown/HTML/PDF reports with correlations
   - select_materials: filter and rank candidates
   - materials_discovery: end-to-end pipeline (acquire → predict → visualize → report)
-  - plan_simulations: generate simulation job plans (auto-routes CALPHAD vs DFT vs MD)
-  - analyze_phases: analyze phase stability using CALPHAD thermodynamic databases
+  - plan_simulations: generate simulation job plans (auto-routes CALPHAD vs DFT vs MD){calphad_skill}
   - validate_dataset: detect outliers, check constraints, score completeness
   - review_dataset: comprehensive data quality review with findings and LLM prompt
 
@@ -56,6 +54,31 @@ Use this for data transformation, filtering, analysis, and plotting. Use print()
 show output. Use plt.savefig("filename.png") to save plots.
 
 Be thorough but efficient. Cite data sources."""
+
+
+def _build_autonomous_prompt() -> str:
+    """Build the autonomous system prompt with capability-aware sections."""
+    try:
+        from app.tools.capabilities import discover_capabilities
+        caps = discover_capabilities()
+        calphad_available = caps.get("calphad", {}).get("available", False)
+    except Exception:
+        calphad_available = False
+
+    calphad_section = ""
+    calphad_skill = ""
+    if calphad_available:
+        calphad_section = "\n- Thermodynamics: CALPHAD phase diagrams, equilibrium, Gibbs energy calculations"
+        calphad_skill = "\n  - analyze_phases: analyze phase stability using CALPHAD thermodynamic databases"
+
+    return AUTONOMOUS_SYSTEM_PROMPT_TEMPLATE.format(
+        calphad_section=calphad_section,
+        calphad_skill=calphad_skill,
+    )
+
+
+# Keep a module-level constant for backwards compatibility
+AUTONOMOUS_SYSTEM_PROMPT = _build_autonomous_prompt()
 
 
 def _make_tools(tools: Optional[ToolRegistry] = None, enable_mcp: bool = True) -> ToolRegistry:
