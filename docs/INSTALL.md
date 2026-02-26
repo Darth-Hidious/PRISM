@@ -9,25 +9,28 @@ Follow these steps to get PRISM up and running on your system.
 
 ## Quick Install
 
-### Option 1: pipx (recommended)
+### Option 1: curl one-liner (recommended)
+
+```bash
+curl -fsSL https://prism.marc27.com/install.sh | bash
+```
+
+This detects your OS, finds Python, installs pipx/uv if needed, installs PRISM,
+and downloads the compiled Ink frontend binary for your platform.
+
+### Option 2: pipx
 
 ```bash
 pipx install prism-platform
+prism update    # downloads the Ink frontend binary
 ```
 
-### Option 2: uv
+### Option 3: uv
 
 ```bash
 uv tool install prism-platform
+prism update    # downloads the Ink frontend binary
 ```
-
-### Option 3: curl one-liner
-
-```bash
-curl -fsSL https://prism.marc27.com/install.sh | sh
-```
-
-This detects your OS, finds Python, installs pipx/uv if needed, and installs PRISM.
 
 ### Option 4: pip (in a virtualenv)
 
@@ -35,6 +38,7 @@ This detects your OS, finds Python, installs pipx/uv if needed, and installs PRI
 python3 -m venv .venv
 source .venv/bin/activate
 pip install prism-platform
+prism update    # downloads the Ink frontend binary
 ```
 
 ## Optional Extras
@@ -88,19 +92,40 @@ prism --version
 # List available commands
 prism --help
 
-# Check for updates
-prism update
+# Launch (Ink frontend)
+prism
+
+# Launch with classic Rich UI
+prism --classic
 ```
 
 ## Updating
 
 ```bash
-# Check for updates
+# Check for updates, upgrade, and download latest Ink binary
 prism update
 
-# Upgrade via pipx
-pipx upgrade prism-platform
-
-# Or via pip
-pip install --upgrade prism-platform
+# Or with auto-confirm
+prism update -y
 ```
+
+`prism update` auto-detects how PRISM was installed (uv, pipx, pip) and runs
+the correct upgrade command. It also downloads the latest Ink frontend binary
+for your platform to `~/.prism/bin/prism-tui`.
+
+## Ink Frontend Binary
+
+The installer and `prism update` automatically download a pre-compiled Ink
+frontend binary for your platform:
+
+| Platform | Binary |
+|----------|--------|
+| macOS Apple Silicon | `prism-tui-darwin-arm64` |
+| macOS Intel | `prism-tui-darwin-x64` |
+| Linux x86_64 | `prism-tui-linux-x64` |
+| Linux ARM64 | `prism-tui-linux-arm64` |
+
+The binary is stored at `~/.prism/bin/prism-tui`. If no binary is available
+for your platform, PRISM falls back to the classic Rich UI automatically.
+
+To force the classic UI: `prism --classic`

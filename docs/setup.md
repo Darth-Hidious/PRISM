@@ -85,11 +85,13 @@ and CLI commands (`prism data collect`, `prism model train`).
 
 ## `prism update`
 
-Check for newer versions and show the correct upgrade command.
+Check for newer versions, upgrade the Python package, and download the latest
+Ink frontend binary.
 
 ```bash
-prism update                       # Check and show upgrade instructions
-prism update --check-only          # Just check, no instructions
+prism update                       # Check, confirm, upgrade + download binary
+prism update -y                    # Auto-confirm upgrade
+prism update --check-only          # Just check, no upgrade
 ```
 
 Auto-detects your installation method:
@@ -100,6 +102,10 @@ Auto-detects your installation method:
 | pipx | `pipx list --short` | `pipx upgrade prism-platform` |
 | pip | `importlib.metadata` | `pip install --upgrade prism-platform` |
 | curl/unknown | fallback | `curl -fsSL .../install.sh \| bash -s -- --upgrade` |
+
+After upgrading the Python package, `prism update` also downloads the latest
+Ink frontend binary for your platform to `~/.prism/bin/prism-tui`. If no
+binary is available, the classic Rich UI is used as fallback.
 
 Version checks are cached for 24 hours (`~/.prism/.update_check`).
 Sources: PyPI first, GitHub releases as fallback.
@@ -113,6 +119,7 @@ Sources: PyPI first, GitHub releases as fallback.
 | `.env` | API keys, secrets | `prism configure` / onboarding |
 | `~/.prism/preferences.json` | Legacy workflow preferences | `prism setup` / onboarding |
 | `~/.prism/.update_check` | Version check cache | `prism update` (auto) |
+| `~/.prism/bin/prism-tui` | Compiled Ink frontend binary | `install.sh` / `prism update` |
 | `~/.prism/cache/` | Search cache, provider health | Search engine (auto) |
 | `~/.prism/databases/` | TDB thermodynamic databases | `prism model calphad import` |
 | `~/.prism/labs_subscriptions.json` | Lab service subscriptions | `prism labs subscribe` |
