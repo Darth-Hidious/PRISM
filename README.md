@@ -8,7 +8,7 @@
   <em>MARC27 &mdash; ESA SPARK Prime Contractor | ITER Supplier</em>
 </p>
 <p align="center">
-  <code>v2.5.0-beta</code>
+  <code>v2.5.0-beta</code> &nbsp;|&nbsp; <code>Ink frontend</code>
 </p>
 
 <p align="center">
@@ -46,6 +46,11 @@ The agent runs a **Think-Act-Observe-Repeat (TAOR)** loop with provider-agnostic
 LLM backends (Anthropic, OpenAI, Google, Zhipu AI, OpenRouter), a tool registry
 with 33 built-in tools + 19 optional, and 10 multi-step skills.
 
+A **Protocol-Driven UI** layer (`UIEmitter`) emits structured JSON-RPC 2.0
+events that both the Ink (TypeScript/React) frontend and the classic Rich
+(Python) frontend consume as dumb renderers. The Ink frontend is the default;
+pass `--classic` to use the Rich fallback.
+
 ## Capabilities
 
 ### Data Access
@@ -70,7 +75,9 @@ with 33 built-in tools + 19 optional, and 10 multi-step skills.
 - **Feedback loops**: validation and CALPHAD findings feed back into agent context
 
 ### Terminal Experience
-- **Live streaming**: LLM tokens appear as they arrive (Rich Live)
+- **Dual frontend**: Ink (TypeScript/React) as default, Rich (Python) as `--classic` fallback
+- **Protocol-Driven UI**: UIEmitter emits JSON-RPC 2.0 events; both frontends are dumb renderers
+- **Live streaming**: LLM tokens appear as they arrive
 - **Typed card renderers**: 11 card types with color-coded borders (input, output, tool, error, metrics, calphad, validation, results, plot, approval, plan)
 - **Smart truncation**: 6-line display truncation + 50K character threshold with disk persistence
 - **Cost tracking**: per-turn and cumulative session cost display
@@ -95,11 +102,16 @@ with 33 built-in tools + 19 optional, and 10 multi-step skills.
 curl -fsSL https://prism.marc27.com/install.sh | bash
 ```
 
+The installer sets up the Python package **and** downloads the compiled Ink
+frontend binary for your platform (`~/.prism/bin/prism-tui`).
+
 ### pip install (from GitHub)
 
 ```bash
 pip install "prism-platform[all] @ git+https://github.com/Darth-Hidious/PRISM.git"
 ```
+
+> After pip install, run `prism update` once to download the Ink frontend binary.
 
 ### From source
 
@@ -108,6 +120,9 @@ git clone https://github.com/Darth-Hidious/PRISM.git
 cd PRISM
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[all,dev]"
+# Build the Ink frontend (requires bun):
+cd frontend && bun install && bun run build -- darwin-arm64
+mkdir -p ~/.prism/bin && cp dist/prism-tui-darwin-arm64 ~/.prism/bin/prism-tui
 ```
 
 ### Configure
@@ -122,8 +137,11 @@ prism configure --show     # View current settings
 ### Run
 
 ```bash
-# Interactive REPL
+# Interactive REPL (Ink frontend)
 prism
+
+# Classic Rich UI
+prism --classic
 
 # Autonomous mode
 prism run "Find W-Rh alloys that are thermodynamically stable"
@@ -138,7 +156,8 @@ See [docs/INSTALL.md](docs/INSTALL.md) for full installation details including o
 
 | Command | Description |
 |---|---|
-| `prism` | Interactive agent REPL |
+| `prism` | Interactive agent REPL (Ink frontend) |
+| `prism --classic` | Interactive REPL with Rich (Python) UI |
 | `prism run "goal"` | Autonomous agent mode |
 | `prism run "goal" --confirm` | Autonomous with tool consent |
 | `prism run "goal" --dangerously-accept-all` | Auto-approve all tool calls |
@@ -179,6 +198,11 @@ app/
   cli/            # MIT License — CLI entry point, TUI cards, streaming, status
     tui/          # Rich-based terminal UI (cards, spinner, welcome, streaming)
     slash/        # REPL slash-command registry and handlers
+    _binary.py    # Ink binary discovery (user override + package-bundled)
+  backend/        # MIT License — Protocol-Driven UI layer
+    protocol.py   # JSON-RPC 2.0 event definitions (single source of truth)
+    ui_emitter.py # Shared presentation logic consumed by both frontends
+    server.py     # stdio JSON-RPC server for the Ink frontend
   config/         # MIT License — Unified settings, branding, preferences
   db/             # MIT License — SQLAlchemy models and database
   data/           # MIT License — DataStore and collectors
@@ -191,7 +215,14 @@ app/
   validation/     # MARC27 License — Rule-based validation engine
   plugins/        # MARC27 License — Plugin framework, catalog, bootstrap
   commands/       # CLI command implementations (run, search, data, predict, etc.)
-tests/            # MIT License — 870+ tests
+frontend/         # MIT License — Ink (TypeScript/React) terminal frontend
+  src/
+    bridge/       # JSON-RPC client + auto-generated types from protocol.py
+    components/   # 11 React components (Prompt, StreamingText, ToolCard, etc.)
+    hooks/        # useBackend hook for BackendClient lifecycle
+    app.tsx       # Root App with Static/Live split pattern
+  build.ts        # Cross-platform bun build script
+tests/            # MIT License — 900+ tests
 docs/             # MIT License — Documentation and assets
 ```
 
@@ -201,16 +232,19 @@ docs/             # MIT License — Documentation and assets
 python3 -m pytest tests/ -v
 ```
 
-870+ tests covering agent core, tools, skills, data collectors, ML pipelines,
+900+ tests covering agent core, tools, skills, data collectors, ML pipelines,
 CALPHAD integration, validation rules, plugins, CLI commands, card renderers,
-streaming, and cost tracking.
+streaming, cost tracking, protocol layer, UIEmitter, backend server, and
+binary discovery.
 
 ## Roadmap
 
 ### Current (v2.5.0-beta)
+- **Ink (React) frontend** as default terminal UI, Rich as `--classic` fallback
+- **Protocol-Driven UI**: UIEmitter emits JSON-RPC 2.0 events for both frontends
+- **Auto binary download**: `install.sh` and `prism update` fetch the compiled Ink binary
 - All 16 CLI commands built and documented
-- Live text streaming with Rich Live
-- Typed card renderers (11 types) for tool results
+- Live text streaming with 11 typed card renderers
 - Character-based truncation (50K threshold) with disk persistence
 - Per-turn and cumulative session cost display
 - Unified rendering across REPL and `prism run`

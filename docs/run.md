@@ -25,6 +25,7 @@ prism run "plan DFT relaxations for Fe-Ni alloys" --agent calphad_expert
 | `--model NAME` | Model override (e.g. `claude-sonnet-4-6`, `gpt-4.1`, `glm-4.7`) |
 | `--confirm` | Require user confirmation before expensive tool calls |
 | `--dangerously-accept-all` | Auto-approve all tool calls without prompting |
+| `--classic` | Use the Rich (Python) UI instead of the Ink frontend |
 | `--no-mcp` | Disable loading tools from external MCP servers (parent flag) |
 
 ## Related Commands
@@ -62,7 +63,10 @@ The loop runs up to 30 iterations by default.
 
 ### Display Output
 
-The `run` command streams output with persistent display — nothing gets wiped:
+The `run` command uses a **Protocol-Driven UI** architecture. The agent core
+emits structured JSON-RPC 2.0 events via `UIEmitter`, which both the Ink
+(TypeScript/React) frontend and the classic Rich (Python) frontend consume.
+Output is streamed with persistent display — nothing gets wiped:
 
 ```
 ╭───────────────────────────────────────────────────────╮
@@ -93,16 +97,20 @@ Let me also check the literature for crystal structure data.     ← more reason
 tokens: 26,716in + 1,098out | cost: $0.1070                     ← usage/cost footer
 ```
 
-### Output Events
+### Output Events (Protocol)
 
-The stream produces four event types, all displayed persistently:
+The `UIEmitter` emits JSON-RPC 2.0 events defined in `app/backend/protocol.py`.
+Both frontends render these events identically:
 
-| Event | Display | Description |
-|-------|---------|-------------|
-| `TextDelta` | Markdown text | LLM reasoning or final answer, streamed token-by-token |
-| `ToolCallStart` | Yellow panel | Tool name, shown when the agent begins a tool call |
-| `ToolCallResult` | Green panel | Tool name + one-line summary of result |
-| `TurnComplete` | Cost footer | Marks end of run with token/cost summary |
+| Event | JSON-RPC Method | Display | Description |
+|-------|----------------|---------|-------------|
+| `TextDelta` | `ui.text_delta` | Markdown text | LLM reasoning or final answer, streamed token-by-token |
+| `ToolCallStart` | `ui.tool_start` | Yellow panel | Tool name, shown when the agent begins a tool call |
+| `ToolCallResult` | `ui.tool_result` | Green panel | Tool name + one-line summary of result |
+| `TurnComplete` | `ui.turn_complete` | Cost footer | Marks end of run with token/cost summary |
+| Approval prompt | `ui.approval_prompt` | Prompt | Tool requiring user consent |
+| Plan | `ui.plan` | Plan card | Agent's proposed plan before execution |
+| Welcome | `ui.welcome` | Banner | Session info with capability badges |
 
 ---
 
@@ -152,7 +160,8 @@ Cache reads are billed at 10% of the input token rate (Anthropic pricing).
 ### TUI Integration Points
 
 The `TurnComplete` event and `UsageInfo` dataclass are the integration
-surface for future TUI billing display:
+surface for TUI billing display. Both the Ink and Rich frontends consume
+these events via `UIEmitter`:
 
 - **Session cost widget**: accumulate `estimated_cost` across runs in a session
 - **Token budget bar**: compare `total_usage.total_tokens` against model's `context_window`
@@ -161,8 +170,9 @@ surface for future TUI billing display:
 - **Cost-per-query history**: log `estimated_cost` per run for billing dashboard
 - **Provider cost comparison**: same query across providers using model registry pricing
 
-These fields are already emitted by `AgentCore` — the TUI just needs to
-subscribe to `TurnComplete` events and render the data.
+The Ink frontend receives these as JSON-RPC 2.0 messages over stdio from
+`app.backend.server`. The Rich frontend reads them directly from the
+`UIEmitter` generator in-process.
 
 ---
 
