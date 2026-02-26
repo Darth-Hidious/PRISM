@@ -226,8 +226,9 @@ class TestTokenCostDisplay:
             result = runner.invoke(cli, ["run", "silicon band gap"])
 
             assert result.exit_code == 0
-            assert "tokens:" in result.output or "1,500" in result.output
-            assert "cost:" in result.output or "$0.0075" in result.output
+            # render_cost_line format: "─ 1.5k in · 200 out · $0.0075 · total: $0.0075 ─"
+            assert "1.5k in" in result.output
+            assert "$0.0075" in result.output
 
     def test_turn_complete_without_cost_no_crash(self):
         """When TurnComplete has no cost info, the command should still succeed."""

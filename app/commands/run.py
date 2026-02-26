@@ -1,6 +1,9 @@
 """Run CLI command: autonomous agent mode."""
+import time
 import click
 from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
 
 
@@ -14,16 +17,15 @@ from rich.panel import Panel
 @click.pass_context
 def run_goal(ctx, goal, agent, provider, model, confirm, accept_all):
     """Run PRISM agent autonomously on a research goal."""
-    from rich.live import Live
-    from rich.markdown import Markdown
-    from rich.text import Text
     from app.agent.events import TextDelta, ToolCallStart, ToolCallResult, TurnComplete
     from app.agent.factory import create_backend
     from app.agent.autonomous import run_autonomous_stream
     from app.plugins.bootstrap import build_full_registry
+    from app.cli.tui.cards import render_tool_result, render_cost_line
+    from app.cli.tui.spinner import Spinner
 
     no_mcp = ctx.obj.get("no_mcp", False) if ctx.obj else False
-    run_console = Console()
+    run_console = Console(highlight=False)
 
     # Build registries
     tool_reg, _provider_reg, agent_reg = build_full_registry(enable_mcp=not no_mcp)
@@ -49,19 +51,13 @@ def run_goal(ctx, goal, agent, provider, model, confirm, accept_all):
 
     try:
         backend = create_backend(provider=provider, model=model)
+        spinner = Spinner(console=run_console)
         accumulated_text = ""
+        session_cost = 0.0
+        tool_start_time = None
 
-        def _flush_text(live):
-            """Flush accumulated text permanently above the live area."""
-            nonlocal accumulated_text
-            if accumulated_text.strip():
-                live.update("")
-                run_console.print(Markdown(accumulated_text))
-            else:
-                live.update("")
-            accumulated_text = ""
-
-        with Live("", console=run_console, refresh_per_second=15, vertical_overflow="visible") as live:
+        with Live("", console=run_console, refresh_per_second=15,
+                  vertical_overflow="visible") as live:
             effective_confirm = confirm and not accept_all
             for event in run_autonomous_stream(
                 goal=goal, backend=backend, tools=tool_reg,
@@ -70,30 +66,42 @@ def run_goal(ctx, goal, agent, provider, model, confirm, accept_all):
             ):
                 if isinstance(event, TextDelta):
                     accumulated_text += event.text
-                    live.update(Text(accumulated_text))
+                    live.update(Markdown(accumulated_text))
+
                 elif isinstance(event, ToolCallStart):
-                    _flush_text(live)
-                    run_console.print(Panel(
-                        f"[dim]Calling...[/dim]",
-                        title=f"[bold yellow]{event.tool_name}[/bold yellow]",
-                        border_style="yellow",
-                        expand=False,
-                    ))
+                    live.update("")
+                    if accumulated_text.strip():
+                        run_console.print(Markdown(accumulated_text))
+                    accumulated_text = ""
+                    tool_start_time = time.monotonic()
+                    verb = spinner.verb_for_tool(event.tool_name)
+                    spinner.start(verb)
+
                 elif isinstance(event, ToolCallResult):
-                    run_console.print(Panel(
-                        f"[green]{event.summary}[/green]",
-                        title=f"[bold green]{event.tool_name}[/bold green]",
-                        border_style="green",
-                        expand=False,
-                    ))
+                    spinner.stop()
+                    elapsed_ms = 0.0
+                    if tool_start_time:
+                        elapsed_ms = (time.monotonic() - tool_start_time) * 1000
+                        tool_start_time = None
+                    result = event.result if isinstance(event.result, dict) else {}
+                    render_tool_result(
+                        run_console, event.tool_name, event.summary, elapsed_ms, result,
+                    )
+
                 elif isinstance(event, TurnComplete):
-                    _flush_text(live)
-                    if event.estimated_cost is not None:
-                        run_console.print(
-                            f"[dim]tokens: {event.total_usage.input_tokens:,}in "
-                            f"+ {event.total_usage.output_tokens:,}out "
-                            f"| cost: ${event.estimated_cost:.4f}[/dim]"
-                        )
+                    spinner.stop()
+                    live.update("")
+                    if accumulated_text.strip():
+                        run_console.print(Markdown(accumulated_text))
+                    accumulated_text = ""
+                    tool_start_time = None
+                    usage = event.usage or event.total_usage
+                    if usage:
+                        turn_cost = event.estimated_cost
+                        if turn_cost is not None:
+                            session_cost += turn_cost
+                        render_cost_line(run_console, usage, turn_cost, session_cost)
+
     except ValueError as e:
         run_console.print(f"[red]Error: {e}[/red]")
     except Exception as e:
