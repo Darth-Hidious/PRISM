@@ -39,6 +39,23 @@ export const ICONS: Record<string, string> = {
   pending: "\u223c",     // ∼
 };
 
+// ── Crystal mascot — 3-tier glow ──────────────────────────────────
+export const CRYSTAL_OUTER_DIM = "#555577";
+export const CRYSTAL_OUTER = "#7777aa";
+export const CRYSTAL_INNER = "#ccccff";
+export const CRYSTAL_CORE = "#ffffff";
+
+// VIBGYOR rainbow (15 stops for ray length)
+export const RAINBOW = [
+  "#ff0000", "#ff5500", "#ff8800", "#ffcc00", "#88ff00",
+  "#00cc44", "#00cccc", "#0088ff", "#5500ff", "#8b00ff",
+  "#ff0000", "#ff5500", "#ff8800", "#ffcc00", "#88ff00",
+];
+
+// Welcome header commands (shown next to rainbow rays)
+export const HEADER_COMMANDS_L = ["/help", "/tools", "/skills"];
+export const HEADER_COMMANDS_R = ["/scratchpad", "/status", "/save"];
+
 // ── Card border colours by result type ─────────────────────────────
 export const BORDERS: Record<string, string> = {
   input: ACCENT_CYAN,
