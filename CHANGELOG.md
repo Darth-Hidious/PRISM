@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0-beta] - 2026-02-26
+
+### Added
+- **All 16 CLI Commands**: `prism`, `run`, `serve`, `search`, `data`, `predict`, `model` (+ calphad subgroup), `sim`, `labs`, `setup`, `configure`, `update`, `plugin`, `optimade`, `mcp`, `advanced`. Every command built, wired, and documented.
+- **Live Text Streaming**: LLM tokens now appear in real-time via Rich Live. Text "freezes" permanently when a tool call starts or the turn ends (Claude Code-inspired Static/Live pattern).
+- **Typed Card Renderers**: 11 card types — input, output, tool, error (with partial), metrics, calphad, validation, results (table preview), plot, approval, plan. Color-coded borders and icons.
+- **Character-Based Truncation**: Tool results exceeding 50K characters are persisted to `~/.prism/cache/results/` and display a truncation notice with `peek_result()` hint. Builds on the existing RLM-pattern ResultStore.
+- **Cost Tracking**: Per-turn token count and cost display (`─ 2.1k in · 340 out · $0.0008 · total: $0.0142 ─`). Cumulative session total for billing.
+- **Unified Rendering**: `prism run` now uses the same card system, spinner, and cost line as the REPL. No more inline yellow/green panels.
+- **Unified Settings**: Two-tier `settings.json` (global `~/.prism/settings.json` + project `.prism/settings.json`) with env var overrides. Schema covers agent, search, output, compute, ml, updates, permissions.
+- **LLM Provider Abstraction**: Anthropic, OpenAI, Google, Zhipu AI (GLM-4), OpenRouter, MARC27 managed — all via a single `create_backend()` factory.
+- **Federated Search**: 3-layer provider registry (OPTIMADE discovery + per-provider overrides + platform catalog). OMAT24 and AFLOW as catalog entries for future platform-hosted databases.
+- **PRISM Labs Marketplace**: `prism labs browse/subscribe/status` for premium services (Cloud DFT, Quantum Computing, Autonomous Labs, Synchrotron, HTS, DfM).
+- **Plugin System**: 7 plugin types (Tool, Skill, Provider, Agent, Algorithm, Collector, Bundle) with pip entry-points + `~/.prism/plugins/` local loading.
+- **Crystal Mascot**: Hex-glyph welcome banner with 3-tier glow, rainbow rays, and live capability detection. Fixed alignment of top/bottom rows.
+- **install.sh Polish**: Unicode step markers (✓/→/✗), tightened one-line banner, consistent ANSI styling.
+
+### Changed
+- **Version**: Bumped from 2.1.1 to 2.5.0-beta.
+- **stream.py**: Full rewrite — now uses Rich Live for token-by-token display instead of accumulating text.
+- **run.py**: Replaced inline Panel rendering with shared card imports from `app.cli.tui`.
+- **Test count**: 530 → 870+ tests. Added tests for card renderers, streaming, cost line, truncation, crystal alignment, spinner, and backward-compat shims.
+
+### Fixed
+- Crystal mascot top/bottom row alignment (3→4 space indent).
+- Tool count in docs: corrected from "26" to "33 base + 19 optional".
+- OMAT24 reference: removed standalone tool, clarified as platform-hosted catalog entry.
+
 ## [2.1.1] - 2026-02-24
 
 ### Added
