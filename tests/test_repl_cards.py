@@ -187,3 +187,54 @@ def test_crystal_mascot_alignment():
     for i in [0, 3]:
         leading_spaces = len(MASCOT[i]) - len(MASCOT[i].lstrip())
         assert leading_spaces == 4, f"Row {i} has {leading_spaces} leading spaces, expected 4"
+
+
+def test_truncation_chars_constant():
+    from app.cli.tui.theme import TRUNCATION_CHARS
+    assert TRUNCATION_CHARS == 50_000
+
+
+def test_format_tokens_small():
+    from app.cli.tui.cards import format_tokens
+    assert format_tokens(500) == "500"
+
+
+def test_format_tokens_large():
+    from app.cli.tui.cards import format_tokens
+    assert format_tokens(2100) == "2.1k"
+
+
+def test_format_tokens_exact_k():
+    from app.cli.tui.cards import format_tokens
+    assert format_tokens(1000) == "1.0k"
+
+
+def test_render_cost_line():
+    from app.cli.tui.cards import render_cost_line
+    from app.agent.events import UsageInfo
+    from rich.console import Console
+    from io import StringIO
+    output = StringIO()
+    console = Console(file=output, highlight=False, force_terminal=True, width=120)
+    usage = UsageInfo(input_tokens=2100, output_tokens=340)
+    render_cost_line(console, usage, turn_cost=0.0008, session_cost=0.0142)
+    text = output.getvalue()
+    assert "2.1k in" in text
+    assert "340 out" in text
+    assert "$0.0008" in text
+    assert "total: $0.0142" in text
+
+
+def test_render_cost_line_no_cost():
+    from app.cli.tui.cards import render_cost_line
+    from app.agent.events import UsageInfo
+    from rich.console import Console
+    from io import StringIO
+    output = StringIO()
+    console = Console(file=output, highlight=False, force_terminal=True, width=120)
+    usage = UsageInfo(input_tokens=500, output_tokens=200)
+    render_cost_line(console, usage, turn_cost=None, session_cost=0.0)
+    text = output.getvalue()
+    assert "500 in" in text
+    assert "200 out" in text
+    assert "$" not in text

@@ -342,3 +342,24 @@ def render_approval_card(console: Console, tool_name: str, tool_args: dict):
         border_style=BORDERS["approval"], box=box.ROUNDED,
         padding=(0, 1),
     ))
+
+
+def format_tokens(n: int) -> str:
+    """Format token count: 500 -> '500', 2100 -> '2.1k'."""
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def render_cost_line(console: Console, usage, turn_cost: float | None = None,
+                     session_cost: float = 0.0):
+    """Print a dim cost/token summary line after a turn."""
+    parts = [
+        f"{format_tokens(usage.input_tokens)} in",
+        f"{format_tokens(usage.output_tokens)} out",
+    ]
+    if turn_cost is not None:
+        parts.append(f"${turn_cost:.4f}")
+        parts.append(f"total: ${session_cost:.4f}")
+    line = " \u00b7 ".join(parts)
+    console.print(f" [dim]\u2500 {line} \u2500[/dim]")

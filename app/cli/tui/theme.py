@@ -92,6 +92,7 @@ ICONS = {
 # ── Output truncation ───────────────────────────────────────────────
 
 TRUNCATION_LINES = 6
+TRUNCATION_CHARS = 50_000
 
 # ── Footer status indicators ────────────────────────────────────────
 
