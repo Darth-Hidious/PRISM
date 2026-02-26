@@ -56,7 +56,7 @@ def show_welcome(console: Console, agent, auto_approve: bool = False):
     console.print()
 
     # Line 0: top outer rim
-    t = Text("   ")
+    t = Text("    ")
     t.append("\u2b21", style=CRYSTAL_OUTER_DIM)
     t.append(" ")
     t.append("\u2b21", style=CRYSTAL_OUTER_DIM)
@@ -105,7 +105,7 @@ def show_welcome(console: Console, agent, auto_approve: bool = False):
     console.print(t)
 
     # Line 3: bottom rim
-    t = Text("   ")
+    t = Text("    ")
     t.append("\u2b21", style=CRYSTAL_OUTER_DIM)
     t.append(" ")
     t.append("\u2b21", style=CRYSTAL_OUTER_DIM)
