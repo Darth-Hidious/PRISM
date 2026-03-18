@@ -1,16 +1,25 @@
 //! WebSocket daemon: register, heartbeat, job dispatch, reconnection.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use prism_proto::{NodeCapabilities, NodeMessage, PlatformMessage};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
+use serde::Serialize;
 use sysinfo::System;
 use tokio::signal;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
+
+use crate::executor::{self, ContainerJobSpec, ContainerRuntime};
+use crate::state::{self, ActiveJobRecord};
 
 /// Options for the node daemon.
 #[derive(Debug, Clone)]
@@ -20,6 +29,7 @@ pub struct DaemonOptions {
     pub price_per_hour_usd: Option<f64>,
     pub no_compute: bool,
     pub no_storage: bool,
+    pub ssh: Option<SshCapability>,
 }
 
 impl Default for DaemonOptions {
@@ -30,8 +40,47 @@ impl Default for DaemonOptions {
             price_per_hour_usd: None,
             no_compute: false,
             no_storage: false,
+            ssh: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshCapability {
+    pub host: String,
+    pub port: u16,
+    pub user: Option<String>,
+}
+
+impl SshCapability {
+    fn endpoint(&self) -> String {
+        match self.user.as_deref().filter(|value| !value.is_empty()) {
+            Some(user) => format!("ssh://{user}@{}:{}", self.host, self.port),
+            None => format!("ssh://{}:{}", self.host, self.port),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RunningJobHandle {
+    runtime: ContainerRuntime,
+    handle: String,
+    cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    workspace_dir: PathBuf,
+}
+
+type RunningJobs = Arc<Mutex<HashMap<Uuid, RunningJobHandle>>>;
+
+#[derive(Debug, Serialize)]
+struct SignedServiceClaim<'a> {
+    version: u8,
+    service_kind: &'a str,
+    owner_user_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org_id: Option<&'a str>,
+    node_name: &'a str,
+    endpoint: String,
+    issued_at: String,
 }
 
 /// Run the node daemon with reconnection logic.
@@ -40,6 +89,9 @@ pub async fn run_daemon(
     paths: &PrismPaths,
     options: DaemonOptions,
 ) -> Result<()> {
+    let cli_state = paths.load_cli_state()?;
+    let stored_credentials = cli_state.credentials.as_ref();
+
     let mut capabilities = crate::detect::probe_local_capabilities_async().await;
     capabilities.visibility = options.visibility.clone();
     capabilities.price_per_hour_usd = options.price_per_hour_usd;
@@ -50,16 +102,45 @@ pub async fn run_daemon(
     if options.no_storage {
         capabilities.services.retain(|s| s.kind != "storage");
     }
+    let (_node_secret, node_public) = crate::crypto::load_or_generate_key(&paths.state_dir)
+        .context("failed to load/generate node keypair")?;
+    let (node_signing_secret, node_signing_public) =
+        crate::crypto::load_or_generate_signing_key(&paths.state_dir)
+            .context("failed to load/generate node signing keypair")?;
 
-    // Strip absolute paths before sending over the wire — security requirement.
-    let wire_capabilities = strip_paths_for_wire(&capabilities);
+    capabilities.labels.insert(
+        "identity.signing_public_key".to_string(),
+        crate::crypto::encode_signing_public_key(&node_signing_public),
+    );
 
-    // Load org_id from stored credentials
-    let org_id = paths
-        .load_cli_state()
-        .ok()
-        .and_then(|s| s.credentials)
-        .and_then(|c| c.org_id)
+    let owner_user_id = stored_credentials
+        .and_then(|creds| creds.user_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(ssh) = &options.ssh {
+        let owner_user_id = owner_user_id.context(
+            "SSH capability requires a logged-in PRISM user with a persisted user id. Run `prism login` first.",
+        )?;
+        let owner_org_id = stored_credentials
+            .and_then(|creds| creds.org_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        advertise_ssh_service(
+            &mut capabilities,
+            ssh,
+            owner_user_id,
+            owner_org_id,
+            &options.name,
+            &node_signing_secret,
+        )?;
+    }
+
+    let mut wire_capabilities = strip_paths_for_wire(&capabilities);
+    wire_capabilities.public_key = Some(crate::crypto::encode_public_key(&node_public));
+
+    let org_id = stored_credentials
+        .and_then(|creds| creds.org_id.clone())
         .and_then(|id| Uuid::parse_str(&id).ok());
 
     tracing::info!(
@@ -72,19 +153,28 @@ pub async fn run_daemon(
         "node probe complete"
     );
 
-    // Write PID file so `node down` can find us
+    state::clear_shutdown_request(&paths.state_dir);
+    cleanup_orphaned_jobs(&paths.state_dir).await?;
+
     let pid_path = pid_file_path(paths);
     write_pid_file(&pid_path)?;
-
-    // Ensure PID file is cleaned up on exit
-    let _pid_guard = PidFileGuard(pid_path.clone());
+    let _pid_guard = PidFileGuard(pid_path);
 
     let mut delay_secs: u64 = 1;
 
     loop {
         let token = load_access_token(paths, endpoints).await?;
 
-        match connect_and_run(endpoints, &token, &options.name, org_id, &wire_capabilities).await {
+        match connect_and_run(
+            endpoints,
+            paths,
+            &token,
+            &options.name,
+            org_id,
+            &wire_capabilities,
+        )
+        .await
+        {
             Ok(ShutdownReason::Graceful) => {
                 tracing::info!("node shut down gracefully");
                 return Ok(());
@@ -92,14 +182,9 @@ pub async fn run_daemon(
             Ok(ShutdownReason::TokenExpired) => {
                 tracing::info!("token expired, refreshing and reconnecting");
                 delay_secs = 1;
-                continue;
             }
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    delay_secs,
-                    "disconnected, reconnecting"
-                );
+                tracing::warn!(error = %e, delay_secs, "disconnected, reconnecting");
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                 delay_secs = (delay_secs * 2).min(300);
             }
@@ -107,46 +192,37 @@ pub async fn run_daemon(
     }
 }
 
-/// Stop a running node daemon by sending SIGTERM to the PID in the PID file.
+/// Stop a running node daemon in a cross-platform way.
 pub fn stop_daemon(paths: &PrismPaths) -> Result<()> {
     let pid_path = pid_file_path(paths);
     if !pid_path.exists() {
-        bail!("no running node found (PID file not present at {})", pid_path.display());
+        bail!(
+            "no running node found (PID file not present at {})",
+            pid_path.display()
+        );
     }
 
-    let pid_str = std::fs::read_to_string(&pid_path)
-        .context("failed to read PID file")?;
-    let pid: u32 = pid_str
-        .trim()
-        .parse()
-        .context("PID file contains invalid PID")?;
+    state::write_shutdown_request(&paths.state_dir)?;
 
-    // Check if process is alive
-    let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-    if !alive {
-        // Stale PID file — clean up
-        std::fs::remove_file(&pid_path).ok();
-        bail!("node process (PID {pid}) is not running (stale PID file removed)");
-    }
-
-    // Send SIGTERM
-    let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-    if result != 0 {
-        bail!("failed to send SIGTERM to PID {pid}: {}", std::io::Error::last_os_error());
-    }
-
-    // Wait briefly for process to exit, then clean up PID file
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(250));
-        let still_alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-        if !still_alive {
-            std::fs::remove_file(&pid_path).ok();
-            println!("Node (PID {pid}) stopped.");
-            return Ok(());
+    #[cfg(unix)]
+    {
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            }
         }
     }
 
-    println!("Sent SIGTERM to PID {pid}. Process may still be shutting down.");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if !pid_path.exists() {
+            println!("Node stopped.");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    println!("Shutdown requested. Node is still draining or shutting down.");
     Ok(())
 }
 
@@ -157,13 +233,13 @@ enum ShutdownReason {
 
 async fn connect_and_run(
     endpoints: &PlatformEndpoints,
+    paths: &PrismPaths,
     token: &str,
     name: &str,
     org_id: Option<Uuid>,
     capabilities: &NodeCapabilities,
 ) -> Result<ShutdownReason> {
     let url = format!("{}?token={}", endpoints.node_ws, token);
-
     tracing::info!(url = %endpoints.node_ws, "connecting to platform");
 
     let (ws, _response) = tokio_tungstenite::connect_async(&url)
@@ -172,18 +248,16 @@ async fn connect_and_run(
 
     let (mut sink, mut stream) = ws.split();
 
-    // Send Register message
     let register = NodeMessage::Register {
         name: name.to_string(),
         org_id,
         capabilities: Box::new(capabilities.clone()),
     };
-    let register_json = serde_json::to_string(&register)?;
-    sink.send(Message::Text(register_json)).await?;
+    sink.send(Message::Text(serde_json::to_string(&register)?.into()))
+        .await?;
 
     tracing::info!("register message sent, waiting for confirmation");
 
-    // Wait for Registered response
     let mut node_id: Option<Uuid> = None;
     let mut heartbeat_interval = Duration::from_secs(30);
 
@@ -206,11 +280,9 @@ async fn connect_and_run(
                     }
                     bail!("platform error: [{code}] {message}");
                 }
-                Ok(other) => {
-                    tracing::warn!(?other, "unexpected first message from platform");
-                }
+                Ok(other) => tracing::warn!(?other, "unexpected first message from platform"),
                 Err(e) => {
-                    tracing::warn!(error = %e, raw = %text, "failed to parse platform message");
+                    tracing::warn!(error = %e, raw = %text, "failed to parse platform message")
                 }
             }
         }
@@ -218,9 +290,14 @@ async fn connect_and_run(
 
     let _node_id = node_id.context("did not receive Registered message")?;
 
-    // Main loop: heartbeat + message handling + Ctrl-C
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<String>(128);
+    let active_jobs = Arc::new(AtomicU32::new(0));
+    let running_jobs: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
-    heartbeat_timer.tick().await; // consume first immediate tick
+    heartbeat_timer.tick().await;
+    let mut shutdown_timer = tokio::time::interval(Duration::from_secs(1));
+    shutdown_timer.tick().await;
 
     let mut system = System::new_all();
 
@@ -232,40 +309,52 @@ async fn connect_and_run(
                 let used_mem = system.used_memory() as f64;
                 let total_mem = system.total_memory() as f64;
                 let memory_usage = if total_mem > 0.0 { used_mem / total_mem } else { 0.0 };
-
                 let hb = NodeMessage::Heartbeat {
                     cpu_load,
                     memory_usage,
-                    gpus_free: 0, // TODO: real GPU status
-                    active_jobs: 0,
+                    gpus_free: 0,
+                    active_jobs: active_jobs.load(Ordering::Relaxed),
                 };
-                let hb_json = serde_json::to_string(&hb)?;
-                sink.send(Message::Text(hb_json)).await?;
-                tracing::debug!(cpu = cpu_load, mem = memory_usage, "heartbeat sent");
+                sink.send(Message::Text(serde_json::to_string(&hb)?.into())).await?;
+            }
+            _ = shutdown_timer.tick() => {
+                if state::shutdown_requested(&paths.state_dir) {
+                    tracing::info!("shutdown request detected");
+                    request_stop_all_jobs(&running_jobs).await;
+                    sink.send(Message::Close(None)).await.ok();
+                    return Ok(ShutdownReason::Graceful);
+                }
+            }
+            Some(outgoing) = outgoing_rx.recv() => {
+                sink.send(Message::Text(outgoing.into())).await?;
             }
             msg = stream.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_platform_message(&text, &mut sink).await?;
+                        handle_platform_message(
+                            paths,
+                            &text,
+                            &outgoing_tx,
+                            &active_jobs,
+                            &running_jobs,
+                        ).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
                         sink.send(Message::Pong(data)).await?;
                     }
                     Some(Ok(Message::Close(_))) => {
                         tracing::info!("server closed connection");
-                        return Err(anyhow::anyhow!("server closed connection"));
+                        return Err(anyhow!("server closed connection"));
                     }
-                    Some(Err(e)) => {
-                        return Err(e.into());
-                    }
-                    None => {
-                        return Err(anyhow::anyhow!("WebSocket stream ended"));
-                    }
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Err(anyhow!("WebSocket stream ended")),
                     _ => {}
                 }
             }
             _ = signal::ctrl_c() => {
                 tracing::info!("Ctrl-C received, shutting down");
+                state::write_shutdown_request(&paths.state_dir).ok();
+                request_stop_all_jobs(&running_jobs).await;
                 sink.send(Message::Close(None)).await.ok();
                 return Ok(ShutdownReason::Graceful);
             }
@@ -274,77 +363,292 @@ async fn connect_and_run(
 }
 
 async fn handle_platform_message(
+    paths: &PrismPaths,
     text: &str,
-    sink: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        Message,
-    >,
-) -> Result<()> {
+    outgoing_tx: &mpsc::Sender<String>,
+    active_jobs: &Arc<AtomicU32>,
+    running_jobs: &RunningJobs,
+) {
     let msg: PlatformMessage = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(error = %e, raw = %text, "failed to parse platform message");
-            return Ok(());
+            return;
         }
     };
 
     match msg {
-        PlatformMessage::Ping => {
-            // Platform-level ping (not WS ping)
-            tracing::debug!("received platform ping");
+        PlatformMessage::Ping => tracing::debug!("received platform ping"),
+        PlatformMessage::Registered { .. } => {}
+        PlatformMessage::Error { code, message } => {
+            tracing::error!(code = %code, message = %message, "platform error");
+        }
+        PlatformMessage::CancelJob { job_id } => {
+            tracing::info!(%job_id, "cancel requested");
+            let mut jobs = running_jobs.lock().await;
+            if let Some(job) = jobs.get_mut(&job_id) {
+                if let Some(cancel_tx) = job.cancel_tx.take() {
+                    let _ = cancel_tx.send(());
+                }
+            }
         }
         PlatformMessage::SubmitJob {
             job_id,
             image,
-            inputs: _,
-            env_vars: _,
-            gpu_type: _,
+            inputs,
+            env_vars,
+            gpu_type,
             timeout_secs,
         } => {
-            tracing::info!(
-                %job_id,
-                %image,
-                timeout = timeout_secs,
-                "received job"
+            tracing::info!(%job_id, %image, timeout = timeout_secs, "received job");
+
+            let Some(runtime) = executor::resolve_container_runtime(
+                std::env::var("PRISM_NODE_CONTAINER_RUNTIME")
+                    .ok()
+                    .as_deref(),
+            ) else {
+                send_msg(
+                    outgoing_tx,
+                    &NodeMessage::JobFailed {
+                        job_id,
+                        error: "no supported container runtime available (docker or podman)"
+                            .to_string(),
+                        output: None,
+                        duration_secs: 0,
+                    },
+                )
+                .await;
+                return;
+            };
+
+            let workspace_dir = match prepare_job_workspace(
+                &paths.state_dir,
+                job_id,
+                &image,
+                &inputs,
+                &env_vars,
+                gpu_type.as_deref(),
+                timeout_secs,
+            ) {
+                Ok(path) => path,
+                Err(e) => {
+                    send_msg(
+                        outgoing_tx,
+                        &NodeMessage::JobFailed {
+                            job_id,
+                            error: format!("failed to prepare job workspace: {e}"),
+                            output: None,
+                            duration_secs: 0,
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            let handle = executor::runtime_handle(job_id);
+            if let Err(e) = state::register_active_job(
+                &paths.state_dir,
+                ActiveJobRecord {
+                    job_id,
+                    runtime: runtime.as_str().to_string(),
+                    handle: handle.clone(),
+                    workspace_dir: workspace_dir.display().to_string(),
+                    image: image.clone(),
+                    started_at: chrono::Utc::now(),
+                },
+            ) {
+                send_msg(
+                    outgoing_tx,
+                    &NodeMessage::JobFailed {
+                        job_id,
+                        error: format!("failed to persist active job state: {e}"),
+                        output: None,
+                        duration_secs: 0,
+                    },
+                )
+                .await;
+                return;
+            }
+
+            let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            running_jobs.lock().await.insert(
+                job_id,
+                RunningJobHandle {
+                    runtime,
+                    handle: handle.clone(),
+                    cancel_tx: Some(cancel_tx),
+                    workspace_dir: workspace_dir.clone(),
+                },
             );
 
-            // Send initial update
-            let update = NodeMessage::JobUpdate {
-                job_id,
-                progress: 0.0,
-                message: Some("Received, queuing...".to_string()),
-            };
-            sink.send(Message::Text(serde_json::to_string(&update)?))
-                .await?;
+            let tx = outgoing_tx.clone();
+            let jobs = active_jobs.clone();
+            let running_jobs = running_jobs.clone();
+            let state_dir = paths.state_dir.clone();
+            jobs.fetch_add(1, Ordering::Relaxed);
 
-            // TODO: actual container execution
-            // For now, report as failed (not implemented)
-            let failed = NodeMessage::JobFailed {
-                job_id,
-                error: "job execution not yet implemented".to_string(),
-                duration_secs: 0,
-            };
-            sink.send(Message::Text(serde_json::to_string(&failed)?))
-                .await?;
-        }
-        PlatformMessage::CancelJob { job_id } => {
-            tracing::info!(%job_id, "cancel requested");
-            // TODO: kill running container
-        }
-        PlatformMessage::Error { code, message } => {
-            tracing::error!(code = %code, message = %message, "platform error");
-        }
-        PlatformMessage::Registered { .. } => {
-            // Duplicate, ignore
+            tokio::spawn(async move {
+                send_msg(
+                    &tx,
+                    &NodeMessage::JobUpdate {
+                        job_id,
+                        progress: 0.0,
+                        message: Some("Starting...".to_string()),
+                    },
+                )
+                .await;
+
+                let spec = ContainerJobSpec {
+                    job_id,
+                    image: image.clone(),
+                    env_vars: env_vars.clone().into_iter().collect(),
+                    gpu_type: gpu_type.clone(),
+                    timeout_secs,
+                    allow_network: false,
+                    workspace_dir: workspace_dir.clone(),
+                };
+
+                let execute = executor::execute_container_job(runtime, &spec, |progress, msg| {
+                    let tx = tx.clone();
+                    let update = NodeMessage::JobUpdate {
+                        job_id,
+                        progress,
+                        message: Some(msg.to_string()),
+                    };
+                    if let Ok(json) = serde_json::to_string(&update) {
+                        tx.try_send(json).ok();
+                    }
+                });
+                tokio::pin!(execute);
+
+                let cancelled = tokio::select! {
+                    _ = &mut cancel_rx => {
+                        tracing::info!(%job_id, handle = %handle, "cancelling running job");
+                        executor::cancel_container_job(runtime, &handle).await;
+                        true
+                    }
+                    result = &mut execute => {
+                        match result {
+                            Ok(output) => {
+                                if !output.log_lines.is_empty() {
+                                    send_msg(&tx, &NodeMessage::JobLogs {
+                                        job_id,
+                                        lines: output.log_lines.clone(),
+                                    }).await;
+                                }
+                                let result_json = serde_json::json!({
+                                    "stdout_preview": output.stdout_preview,
+                                    "stderr_preview": output.stderr_preview,
+                                    "exit_code": output.exit_code,
+                                });
+                                send_msg(&tx, &NodeMessage::JobComplete {
+                                    job_id,
+                                    output: result_json,
+                                    output_path: Some(output.output_path.display().to_string()),
+                                    duration_secs: output.duration_secs,
+                                }).await;
+                            }
+                            Err(e) => {
+                                send_msg(&tx, &NodeMessage::JobFailed {
+                                    job_id,
+                                    error: e.to_string(),
+                                    output: None,
+                                    duration_secs: 0,
+                                }).await;
+                            }
+                        }
+                        false
+                    }
+                };
+
+                if cancelled {
+                    tracing::info!(%job_id, "job cancelled locally");
+                }
+
+                let mut jobs_map = running_jobs.lock().await;
+                if let Some(job) = jobs_map.remove(&job_id) {
+                    tracing::debug!(%job_id, workspace = %job.workspace_dir.display(), "job handle removed");
+                }
+                drop(jobs_map);
+
+                if let Err(e) = state::remove_active_job(&state_dir, job_id) {
+                    tracing::warn!(%job_id, error = %e, "failed to remove active job state");
+                }
+                jobs.fetch_sub(1, Ordering::Relaxed);
+            });
         }
     }
+}
 
+async fn send_msg(tx: &mpsc::Sender<String>, msg: &NodeMessage) {
+    if let Ok(json) = serde_json::to_string(msg) {
+        tx.send(json).await.ok();
+    }
+}
+
+async fn request_stop_all_jobs(running_jobs: &RunningJobs) {
+    let mut jobs = running_jobs.lock().await;
+    for (job_id, handle) in jobs.iter_mut() {
+        tracing::info!(
+            %job_id,
+            runtime = handle.runtime.as_str(),
+            handle = %handle.handle,
+            "requesting job shutdown"
+        );
+        if let Some(cancel_tx) = handle.cancel_tx.take() {
+            let _ = cancel_tx.send(());
+        }
+    }
+}
+
+fn prepare_job_workspace(
+    state_dir: &Path,
+    job_id: Uuid,
+    image: &str,
+    inputs: &serde_json::Value,
+    env_vars: &std::collections::BTreeMap<String, String>,
+    gpu_type: Option<&str>,
+    timeout_secs: u64,
+) -> Result<PathBuf> {
+    let workspace = state::ensure_workspace(state_dir, job_id)?;
+    let metadata = serde_json::json!({
+        "job_id": job_id,
+        "image": image,
+        "gpu_type": gpu_type,
+        "timeout_secs": timeout_secs,
+        "created_at": chrono::Utc::now(),
+    });
+    std::fs::write(
+        state::inputs_path(&workspace),
+        serde_json::to_vec_pretty(inputs)?,
+    )
+    .context("failed to write inputs.json")?;
+    std::fs::write(
+        state::metadata_path(&workspace),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "job": metadata,
+            "env_keys": env_vars.keys().collect::<Vec<_>>(),
+        }))?,
+    )
+    .context("failed to write metadata.json")?;
+    Ok(workspace)
+}
+
+async fn cleanup_orphaned_jobs(state_dir: &Path) -> Result<()> {
+    for record in state::active_jobs(state_dir)? {
+        tracing::warn!(
+            job_id = %record.job_id,
+            runtime = %record.runtime,
+            handle = %record.handle,
+            "cleaning up orphaned job from previous node session"
+        );
+        executor::cleanup_orphaned_job(&record.runtime, &record.handle).await;
+        state::remove_active_job(state_dir, record.job_id).ok();
+    }
     Ok(())
 }
 
-/// Load access token, refreshing if expired.
 async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) -> Result<String> {
     let state = paths.load_cli_state()?;
     let creds = state
@@ -352,7 +656,6 @@ async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) ->
         .as_ref()
         .context("not logged in — run `prism login` first")?;
 
-    // Check if token is expired
     if let Some(expires_at) = creds.expires_at {
         if chrono::Utc::now() >= expires_at {
             tracing::info!("access token expired, refreshing");
@@ -374,9 +677,7 @@ async fn refresh_token(
 
     let resp = client
         .post(format!("{}/auth/refresh", endpoints.api_base))
-        .json(&serde_json::json!({
-            "refresh_token": creds.refresh_token,
-        }))
+        .json(&serde_json::json!({ "refresh_token": creds.refresh_token }))
         .send()
         .await
         .context("failed to refresh token")?
@@ -391,8 +692,6 @@ async fn refresh_token(
     }
 
     let refreshed: RefreshResponse = resp.json().await?;
-
-    // Update stored credentials
     let mut state = paths.load_cli_state()?;
     if let Some(stored) = state.credentials.as_mut() {
         stored.access_token = refreshed.access_token.clone();
@@ -412,8 +711,6 @@ fn hostname() -> String {
     System::host_name().unwrap_or_else(|| "prism-node".to_string())
 }
 
-// --- PID file management ---
-
 fn pid_file_path(paths: &PrismPaths) -> PathBuf {
     paths.state_dir.join("node.pid")
 }
@@ -423,7 +720,6 @@ fn write_pid_file(path: &PathBuf) -> Result<()> {
     let pid = std::process::id();
     std::fs::write(path, pid.to_string())?;
 
-    // Set file permissions to 0600 (owner read/write only)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -433,7 +729,6 @@ fn write_pid_file(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// RAII guard that removes the PID file on drop.
 struct PidFileGuard(PathBuf);
 
 impl Drop for PidFileGuard {
@@ -442,32 +737,228 @@ impl Drop for PidFileGuard {
     }
 }
 
-// --- Wire safety: strip absolute paths ---
-
-/// Create a copy of capabilities with absolute paths stripped.
-/// Only the sanitized name and metadata are sent — never local filesystem paths.
 fn strip_paths_for_wire(caps: &NodeCapabilities) -> NodeCapabilities {
     let mut wire = caps.clone();
 
     for ds in &mut wire.datasets {
-        // Replace absolute path with just the sanitized name
         ds.path = ds.name.clone();
     }
-
-    for m in &mut wire.models {
-        m.path = m.name.clone();
+    for model in &mut wire.models {
+        model.path = model.name.clone();
     }
-
-    // Strip Ollama localhost endpoints — keep those since they're
-    // needed for the platform to route inference requests.
-    // But strip any filesystem-path endpoints that might leak.
     for svc in &mut wire.services {
         if let Some(ep) = &svc.endpoint {
-            if !ep.starts_with("http://") && !ep.starts_with("https://") {
+            if !ep.starts_with("http://")
+                && !ep.starts_with("https://")
+                && !ep.starts_with("ssh://")
+            {
                 svc.endpoint = None;
             }
         }
     }
 
     wire
+}
+
+fn advertise_ssh_service(
+    caps: &mut NodeCapabilities,
+    ssh: &SshCapability,
+    owner_user_id: &str,
+    org_id: Option<&str>,
+    node_name: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<()> {
+    caps.services.retain(|service| service.kind != "ssh");
+    caps.labels
+        .insert("ssh.enabled".to_string(), "true".to_string());
+    caps.labels.insert(
+        "ssh.consent_mode".to_string(),
+        "owner_user_id_required".to_string(),
+    );
+    caps.labels
+        .insert("ssh.owner_user_id".to_string(), owner_user_id.to_string());
+    let claim = SignedServiceClaim {
+        version: 1,
+        service_kind: "ssh",
+        owner_user_id,
+        org_id,
+        node_name,
+        endpoint: ssh.endpoint(),
+        issued_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let claim_payload = serde_json::to_vec(&claim).context("failed to serialize ssh claim")?;
+    let claim_signature = crate::crypto::sign_bytes(signing_key, &claim_payload);
+    caps.labels.insert(
+        "ssh.claim_payload".to_string(),
+        base64::engine::general_purpose::STANDARD.encode(claim_payload),
+    );
+    caps.labels
+        .insert("ssh.claim_signature".to_string(), claim_signature);
+    caps.labels
+        .insert("ssh.claim_algorithm".to_string(), "ed25519".to_string());
+    caps.labels
+        .insert("ssh.claim_version".to_string(), "1".to_string());
+    caps.services.push(prism_proto::NodeService {
+        kind: "ssh".to_string(),
+        name: "SSH Access (owner consent required)".to_string(),
+        status: "ready".to_string(),
+        endpoint: Some(ssh.endpoint()),
+        model: None,
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use tempfile::TempDir;
+
+    #[test]
+    fn strip_paths_for_wire_redacts_dataset_and_model_paths() {
+        let caps = NodeCapabilities {
+            gpus: vec![],
+            cpu_cores: 8,
+            ram_gb: 32,
+            disk_gb: 100,
+            software: vec![],
+            container_runtime: Some("docker".to_string()),
+            docker: true,
+            scheduler: None,
+            labels: std::collections::BTreeMap::new(),
+            storage_available_gb: 80,
+            datasets: vec![prism_proto::DatasetInfo {
+                name: "dataset".to_string(),
+                path: "/secret/data.csv".to_string(),
+                size_gb: 1.0,
+                entries: None,
+                format: Some("csv".to_string()),
+            }],
+            models: vec![prism_proto::ModelInfo {
+                name: "model".to_string(),
+                path: "/secret/model.onnx".to_string(),
+                format: Some("onnx".to_string()),
+                size_gb: Some(2.0),
+            }],
+            services: vec![
+                prism_proto::NodeService {
+                    kind: "llm".to_string(),
+                    name: "Ollama".to_string(),
+                    status: "ready".to_string(),
+                    endpoint: Some("/private/socket".to_string()),
+                    model: None,
+                },
+                prism_proto::NodeService {
+                    kind: "ssh".to_string(),
+                    name: "SSH Access".to_string(),
+                    status: "ready".to_string(),
+                    endpoint: Some("ssh://sid@node.example.com:2222".to_string()),
+                    model: None,
+                },
+            ],
+            visibility: "private".to_string(),
+            price_per_hour_usd: None,
+            public_key: None,
+        };
+
+        let wire = strip_paths_for_wire(&caps);
+        assert_eq!(wire.datasets[0].path, "dataset");
+        assert_eq!(wire.models[0].path, "model");
+        assert_eq!(wire.services[0].endpoint, None);
+        assert_eq!(
+            wire.services[1].endpoint.as_deref(),
+            Some("ssh://sid@node.example.com:2222")
+        );
+    }
+
+    #[test]
+    fn prepare_job_workspace_writes_inputs_and_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let job_id = Uuid::new_v4();
+        let workspace = prepare_job_workspace(
+            tmp.path(),
+            job_id,
+            "marc27/test:latest",
+            &serde_json::json!({"x": 1}),
+            &std::collections::BTreeMap::new(),
+            Some("A100-80GB"),
+            60,
+        )
+        .unwrap();
+
+        assert!(state::inputs_path(&workspace).exists());
+        assert!(state::metadata_path(&workspace).exists());
+    }
+
+    #[test]
+    fn advertise_ssh_service_adds_endpoint() {
+        let mut caps = NodeCapabilities {
+            gpus: vec![],
+            cpu_cores: 8,
+            ram_gb: 32,
+            disk_gb: 100,
+            software: vec![],
+            container_runtime: Some("docker".to_string()),
+            docker: true,
+            scheduler: None,
+            labels: std::collections::BTreeMap::new(),
+            storage_available_gb: 80,
+            datasets: vec![],
+            models: vec![],
+            services: vec![],
+            visibility: "private".to_string(),
+            price_per_hour_usd: None,
+            public_key: None,
+        };
+
+        let signing_tmp = TempDir::new().unwrap();
+        let (signing_key, signing_public) =
+            crate::crypto::load_or_generate_signing_key(signing_tmp.path()).unwrap();
+
+        advertise_ssh_service(
+            &mut caps,
+            &SshCapability {
+                host: "node.example.com".to_string(),
+                port: 2222,
+                user: Some("sid".to_string()),
+            },
+            "user_123",
+            Some("00000000-0000-4000-b000-000000000001"),
+            "test-node",
+            &signing_key,
+        )
+        .unwrap();
+
+        let ssh = caps
+            .services
+            .iter()
+            .find(|service| service.kind == "ssh")
+            .unwrap();
+        assert_eq!(
+            ssh.endpoint.as_deref(),
+            Some("ssh://sid@node.example.com:2222")
+        );
+        assert_eq!(ssh.name, "SSH Access (owner consent required)");
+        assert_eq!(
+            caps.labels.get("ssh.enabled").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            caps.labels.get("ssh.consent_mode").map(String::as_str),
+            Some("owner_user_id_required")
+        );
+        assert_eq!(
+            caps.labels.get("ssh.owner_user_id").map(String::as_str),
+            Some("user_123")
+        );
+        assert_eq!(
+            caps.labels.get("ssh.claim_algorithm").map(String::as_str),
+            Some("ed25519")
+        );
+        let claim_payload = base64::engine::general_purpose::STANDARD
+            .decode(caps.labels.get("ssh.claim_payload").unwrap())
+            .unwrap();
+        let signature = caps.labels.get("ssh.claim_signature").unwrap();
+        crate::crypto::verify_signature(&signing_public, &claim_payload, signature).unwrap();
+    }
 }

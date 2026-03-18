@@ -70,6 +70,8 @@ pub struct NodeCapabilities {
     #[serde(default)]
     pub software: Vec<String>,
     pub container_runtime: Option<String>,
+    #[serde(default)]
+    pub docker: bool,
     pub scheduler: Option<String>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
@@ -85,6 +87,9 @@ pub struct NodeCapabilities {
     pub visibility: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price_per_hour_usd: Option<f64>,
+    /// Base64-encoded X25519 public key for E2EE node-to-node communication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 fn default_visibility() -> String {
@@ -152,12 +157,20 @@ pub enum NodeMessage {
     JobComplete {
         job_id: Uuid,
         output: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_path: Option<String>,
         duration_secs: u64,
     },
     JobFailed {
         job_id: Uuid,
         error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<serde_json::Value>,
         duration_secs: u64,
+    },
+    JobLogs {
+        job_id: Uuid,
+        lines: Vec<String>,
     },
 }
 
@@ -218,6 +231,7 @@ mod tests {
                 disk_gb: 512,
                 software: vec!["docker".to_string(), "pyiron".to_string()],
                 container_runtime: Some("docker".to_string()),
+                docker: true,
                 scheduler: Some("slurm".to_string()),
                 labels: BTreeMap::new(),
                 storage_available_gb: 256,
@@ -226,6 +240,7 @@ mod tests {
                 services: vec![],
                 visibility: "private".to_string(),
                 price_per_hour_usd: None,
+                public_key: Some("dGVzdC1wdWJsaWMta2V5".to_string()),
             }),
         };
 
