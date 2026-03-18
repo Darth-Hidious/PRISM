@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use prism_proto::NodeCapabilities;
 use prism_python_bridge::PythonWorkerConfig;
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
     discover_workflows, execute_workflow, find_workflow, parse_workflow_command_args,
     WorkflowRunResult, WorkflowSpec,
 };
-use prism_proto::NodeCapabilities;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
@@ -97,6 +97,25 @@ enum NodeCommands {
         /// Don't offer storage services.
         #[arg(long)]
         no_storage: bool,
+        #[arg(
+            long,
+            help = "Advertise an SSH endpoint for this node, bound to the logged-in user"
+        )]
+        ssh_host: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 22,
+            help = "SSH port for the advertised endpoint"
+        )]
+        ssh_port: u16,
+        #[arg(long, help = "SSH user for the advertised endpoint")]
+        ssh_user: Option<String>,
+        /// Run as a background daemon (detach from terminal).
+        #[arg(long)]
+        background: bool,
+        /// Serve a specific model for inference via Ollama.
+        #[arg(long)]
+        serve: Option<String>,
     },
     /// Stop a running node daemon.
     Down,
@@ -104,6 +123,19 @@ enum NodeCommands {
     Status,
     /// Probe local capabilities without connecting.
     Probe,
+    /// Manage E2EE node keypair.
+    Key {
+        #[command(subcommand)]
+        command: KeyCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyCommands {
+    /// Show the node's public key (base64-encoded).
+    Show,
+    /// Rotate the keypair — generates a new key, old data unrecoverable.
+    Rotate,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +254,23 @@ async fn main() -> Result<()> {
                 }
                 paths.save_cli_state(&state)?;
             }
+            // Auto-refresh expired token before launching TUI
+            if let Some(creds) = state.credentials.as_ref() {
+                if let Some(expires_at) = creds.expires_at {
+                    if chrono::Utc::now() >= expires_at && !creds.refresh_token.is_empty() {
+                        match refresh_access_token(&endpoints, creds).await {
+                            Ok(new_creds) => {
+                                state.credentials = Some(new_creds);
+                                paths.save_cli_state(&state)?;
+                                tracing::info!("access token refreshed");
+                            }
+                            Err(e) => {
+                                eprintln!("warning: token refresh failed ({e}), you may need to run `prism login`");
+                            }
+                        }
+                    }
+                }
+            }
             launch_tui(&paths, &python, &project_root, state.credentials.as_ref())?;
         }
         Commands::Login => {
@@ -305,7 +354,63 @@ async fn main() -> Result<()> {
                 model_paths,
                 no_compute,
                 no_storage,
+                ssh_host,
+                ssh_port,
+                ssh_user,
+                background,
+                serve,
             } => {
+                // --background: re-exec self as a detached process
+                if background {
+                    let exe = std::env::current_exe()
+                        .context("failed to determine current executable")?;
+                    let log_path = paths.state_dir.join("node.log");
+                    std::fs::create_dir_all(&paths.state_dir)?;
+                    let log_file =
+                        std::fs::File::create(&log_path).context("failed to create log file")?;
+
+                    let mut cmd = std::process::Command::new(exe);
+                    cmd.arg("node").arg("up");
+                    if let Some(ref n) = name {
+                        cmd.args(["--name", n]);
+                    }
+                    cmd.args(["--visibility", &visibility]);
+                    if let Some(p) = price {
+                        cmd.args(["--price", &p.to_string()]);
+                    }
+                    if !data_paths.is_empty() {
+                        cmd.args(["--data-paths", &data_paths.join(",")]);
+                    }
+                    if !model_paths.is_empty() {
+                        cmd.args(["--model-paths", &model_paths.join(",")]);
+                    }
+                    if no_compute {
+                        cmd.arg("--no-compute");
+                    }
+                    if no_storage {
+                        cmd.arg("--no-storage");
+                    }
+                    if let Some(ref host) = ssh_host {
+                        cmd.args(["--ssh-host", host]);
+                        cmd.args(["--ssh-port", &ssh_port.to_string()]);
+                        if let Some(ref user) = ssh_user {
+                            cmd.args(["--ssh-user", user]);
+                        }
+                    }
+                    if let Some(ref m) = serve {
+                        cmd.args(["--serve", m]);
+                    }
+
+                    cmd.stdout(log_file.try_clone()?)
+                        .stderr(log_file)
+                        .stdin(std::process::Stdio::null());
+
+                    let child = cmd.spawn().context("failed to start background daemon")?;
+                    println!("Node daemon started in background (PID {}).", child.id());
+                    println!("Log: {}", log_path.display());
+                    return Ok(());
+                }
+
                 // Inject extra scan paths into env
                 if !data_paths.is_empty() {
                     let existing = std::env::var("PRISM_DATA_PATHS").unwrap_or_default();
@@ -326,15 +431,43 @@ async fn main() -> Result<()> {
                     std::env::set_var("PRISM_MODEL_PATHS", combined);
                 }
 
+                // --serve: check Ollama has the model
+                if let Some(ref model) = serve {
+                    println!("Checking Ollama for model '{model}'...");
+                    match check_ollama_model(model).await {
+                        Ok(true) => println!("Model '{model}' available."),
+                        Ok(false) => {
+                            println!("Model '{model}' not found, pulling...");
+                            let status = tokio::process::Command::new("ollama")
+                                .args(["pull", model])
+                                .status()
+                                .await
+                                .context("failed to run ollama pull")?;
+                            if !status.success() {
+                                bail!("ollama pull {model} failed");
+                            }
+                        }
+                        Err(e) => {
+                            bail!("Ollama not reachable: {e}. Is Ollama running?");
+                        }
+                    }
+                    // Set env so the probe detects the served model
+                    std::env::set_var("PRISM_NODE_SERVE_MODEL", model);
+                }
+
                 let options = prism_node::daemon::DaemonOptions {
                     name: name.unwrap_or_else(|| {
-                        sysinfo::System::host_name()
-                            .unwrap_or_else(|| "prism-node".to_string())
+                        sysinfo::System::host_name().unwrap_or_else(|| "prism-node".to_string())
                     }),
                     visibility,
                     price_per_hour_usd: price,
                     no_compute,
                     no_storage,
+                    ssh: ssh_host.map(|host| prism_node::daemon::SshCapability {
+                        host,
+                        port: ssh_port,
+                        user: ssh_user.or_else(default_ssh_user),
+                    }),
                 };
 
                 prism_node::daemon::run_daemon(&endpoints, &paths, options).await?;
@@ -350,6 +483,21 @@ async fn main() -> Result<()> {
                 let caps = prism_node::detect::probe_local_capabilities_async().await;
                 println!("{}", serde_json::to_string_pretty(&caps)?);
             }
+            NodeCommands::Key { command } => match command {
+                KeyCommands::Show => {
+                    let (_secret, public) =
+                        prism_node::crypto::load_or_generate_key(&paths.state_dir)?;
+                    println!("{}", prism_node::crypto::encode_public_key(&public));
+                }
+                KeyCommands::Rotate => {
+                    let public = prism_node::crypto::rotate_key(&paths.state_dir)?;
+                    println!("Key rotated.");
+                    println!(
+                        "New public key: {}",
+                        prism_node::crypto::encode_public_key(&public)
+                    );
+                }
+            },
         },
         Commands::External(args) => {
             if try_run_workflow_alias(&project_root, &args).await? {
@@ -754,6 +902,13 @@ fn default_project_slug() -> String {
     format!("prism-{timestamp}")
 }
 
+fn default_ssh_user() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn prompt_select<'a, T, F>(label: &'a str, items: &'a [T], formatter: F) -> Result<&'a T>
 where
     F: Fn(&T) -> String,
@@ -779,6 +934,44 @@ where
     items
         .get(index)
         .ok_or_else(|| anyhow!("selection out of range"))
+}
+
+async fn refresh_access_token(
+    endpoints: &PlatformEndpoints,
+    creds: &StoredCredentials,
+) -> Result<StoredCredentials> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    #[derive(Deserialize)]
+    struct RefreshResponse {
+        access_token: String,
+        refresh_token: Option<String>,
+        expires_in: Option<u64>,
+    }
+
+    let resp = client
+        .post(format!("{}/auth/refresh", endpoints.api_base))
+        .json(&serde_json::json!({ "refresh_token": creds.refresh_token }))
+        .send()
+        .await
+        .context("failed to refresh token")?
+        .error_for_status()
+        .context("token refresh returned error")?;
+
+    let refreshed: RefreshResponse = resp.json().await?;
+
+    let mut new_creds = creds.clone();
+    new_creds.access_token = refreshed.access_token;
+    if let Some(rt) = refreshed.refresh_token {
+        new_creds.refresh_token = rt;
+    }
+    new_creds.expires_at = refreshed.expires_in.and_then(|secs| {
+        chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
+    });
+
+    Ok(new_creds)
 }
 
 async fn fetch_current_user(
@@ -971,9 +1164,33 @@ fn open_browser(url: &str) -> Result<()> {
     }
 }
 
+/// Check if Ollama has a specific model available.
+async fn check_ollama_model(model: &str) -> Result<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let resp = client
+        .get("http://localhost:11434/api/tags")
+        .send()
+        .await
+        .context("failed to connect to Ollama")?;
+    let data: serde_json::Value = resp.json().await?;
+    let has_model = data
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|models| {
+            models.iter().any(|m| {
+                m.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| n == model || n.starts_with(&format!("{model}:")))
+            })
+        })
+        .unwrap_or(false);
+    Ok(has_model)
+}
+
 fn print_node_status(caps: &NodeCapabilities, endpoints: &PlatformEndpoints) {
-    let hostname =
-        sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string());
+    let hostname = sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string());
     println!("Node: {hostname}");
     println!("Visibility: {}", caps.visibility);
     println!("Platform: {}", endpoints.node_ws);
@@ -1013,7 +1230,10 @@ fn print_node_status(caps: &NodeCapabilities, endpoints: &PlatformEndpoints) {
                 .map(|n| format!(", {n} entries"))
                 .unwrap_or_default();
             let fmt = ds.format.as_deref().unwrap_or("unknown");
-            println!("  Dataset: {} ({:.2} GB, {fmt}{entries})", ds.name, ds.size_gb);
+            println!(
+                "  Dataset: {} ({:.2} GB, {fmt}{entries})",
+                ds.name, ds.size_gb
+            );
         }
     }
     if caps.models.is_empty() {
@@ -1038,7 +1258,15 @@ fn print_node_status(caps: &NodeCapabilities, endpoints: &PlatformEndpoints) {
             .as_ref()
             .map(|m| format!(" ({m})"))
             .unwrap_or_default();
-        println!("  {icon} {} [{}]{model_info}", svc.kind, svc.status);
+        let endpoint_info = svc
+            .endpoint
+            .as_ref()
+            .map(|ep| format!(" <{ep}>"))
+            .unwrap_or_default();
+        println!(
+            "  {icon} {} [{}]{model_info}{endpoint_info}",
+            svc.kind, svc.status
+        );
     }
     println!();
 
@@ -1075,5 +1303,16 @@ mod tests {
         let slug = default_project_slug();
         assert!(slug.starts_with("prism-"));
         assert!(slug.len() > "prism-".len());
+    }
+
+    #[test]
+    fn default_ssh_user_ignores_empty_values() {
+        std::env::remove_var("USER");
+        assert_eq!(default_ssh_user(), None);
+        std::env::set_var("USER", "   ");
+        assert_eq!(default_ssh_user(), None);
+        std::env::set_var("USER", "sid");
+        assert_eq!(default_ssh_user(), Some("sid".to_string()));
+        std::env::remove_var("USER");
     }
 }

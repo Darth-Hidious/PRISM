@@ -31,6 +31,7 @@ pub fn probe_local_capabilities() -> NodeCapabilities {
 
     let gpus = detect_gpus();
     let container_runtime = detect_container_runtime();
+    let has_docker = matches!(container_runtime.as_deref(), Some("docker"));
     let datasets = detect_datasets();
     let models = detect_models();
     let services = detect_services(&gpus, storage_available_gb, &models);
@@ -42,6 +43,7 @@ pub fn probe_local_capabilities() -> NodeCapabilities {
         disk_gb,
         software: detect_software(),
         container_runtime,
+        docker: has_docker,
         scheduler: detect_scheduler(),
         labels,
         storage_available_gb,
@@ -50,6 +52,7 @@ pub fn probe_local_capabilities() -> NodeCapabilities {
         services,
         visibility: "private".to_string(),
         price_per_hour_usd: None,
+        public_key: None,
     }
 }
 
@@ -226,7 +229,11 @@ fn estimate_entries(path: &Path, ext: &str) -> Option<u64> {
             let file = std::fs::File::open(path).ok()?;
             let reader = BufReader::new(file);
             let count = reader.lines().count() as u64;
-            Some(if ext == "csv" { count.saturating_sub(1) } else { count })
+            Some(if ext == "csv" {
+                count.saturating_sub(1)
+            } else {
+                count
+            })
         }
         _ => None,
     }
@@ -234,9 +241,7 @@ fn estimate_entries(path: &Path, ext: &str) -> Option<u64> {
 
 // --- Model detection ---
 
-const MODEL_EXTENSIONS: &[&str] = &[
-    "pt", "pth", "onnx", "safetensors", "h5", "pkl", "joblib",
-];
+const MODEL_EXTENSIONS: &[&str] = &["pt", "pth", "onnx", "safetensors", "h5", "pkl", "joblib"];
 
 fn detect_models() -> Vec<ModelInfo> {
     let mut search_dirs = vec![];
