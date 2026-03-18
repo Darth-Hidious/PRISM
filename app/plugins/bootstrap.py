@@ -67,6 +67,13 @@ def build_full_registry(
     create_code_tools(registry)
     create_capabilities_tools(registry)
 
+    # Web browsing tools (Firecrawl + DuckDuckGo fallback)
+    try:
+        from app.tools.web import create_web_tools
+        create_web_tools(registry)
+    except Exception:
+        pass
+
     # MARC27 Knowledge Plane tools (graph search, semantic search, ingest)
     try:
         from app.tools.knowledge import create_knowledge_tools
