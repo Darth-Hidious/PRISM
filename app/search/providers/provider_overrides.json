@@ -5,6 +5,7 @@
   },
 
   "fallback_index_urls": {
+    "matcloud": "https://www.materialscloud.org/optimade/main/v1/links",
     "mcloud": "https://www.materialscloud.org/optimade/main/v1/links"
   },
 
@@ -32,10 +33,14 @@
   "overrides": {
     "nmd": {
       "tier": 1,
+      "description": "NOMAD — DFT calculations archive, broad coverage of computed structures and properties",
+      "data_type": "dft",
       "reliability": { "known_quirks": [] }
     },
     "mpdd": {
       "tier": 1,
+      "description": "MPDD (PhasesLab) — ML stability predictions via SIPFENN, formation energies",
+      "data_type": "ml_predicted",
       "behavior": { "use_https": false },
       "capabilities": {
         "provider_specific_fields": [
@@ -49,6 +54,8 @@
     },
     "alexandria.alexandria-pbe": {
       "tier": 1,
+      "description": "Alexandria PBE — DFT bulk properties: formation energy, band gap, hull distance",
+      "data_type": "dft",
       "capabilities": {
         "provider_specific_fields": [
           "_alexandria_formation_energy_per_atom", "_alexandria_band_gap",
@@ -59,6 +66,8 @@
     },
     "alexandria.alexandria-pbesol": {
       "tier": 1,
+      "description": "Alexandria PBESol — DFT bulk properties with PBESol functional",
+      "data_type": "dft",
       "capabilities": {
         "provider_specific_fields": [
           "_alexandria_formation_energy_per_atom", "_alexandria_band_gap",
@@ -69,6 +78,8 @@
     },
     "oqmd": {
       "tier": 1,
+      "description": "OQMD — DFT formation energies, band gaps, thermodynamic stability",
+      "data_type": "dft",
       "behavior": { "timeout_ms": 15000, "max_results": 500 },
       "capabilities": {
         "provider_specific_fields": [
@@ -82,6 +93,7 @@
     },
     "cod": {
       "tier": 1,
+      "description": "COD — experimental crystal structures from published literature",
       "data_type": "experimental",
       "reliability": {
         "validation_score": "57/61",
@@ -90,6 +102,8 @@
     },
     "mp": {
       "tier": 1,
+      "description": "Materials Project (OPTIMADE) — comprehensive DFT properties: band gap, formation energy, stability, elastic",
+      "data_type": "dft",
       "capabilities": {
         "provider_specific_fields": ["_mp_chemical_system", "_mp_stability"]
       },
@@ -100,6 +114,7 @@
     },
     "odbx.gnome": {
       "tier": 1,
+      "description": "GNoME (Google DeepMind) — ML-predicted stable crystal structures, formation energy, band gap",
       "data_type": "ml_predicted",
       "capabilities": {
         "provider_specific_fields": [
@@ -110,23 +125,32 @@
     },
     "mcloud.mc3d-pbe-v1": {
       "tier": 2,
+      "description": "Materials Cloud 3D — curated DFT 3D structures (PBE)",
+      "data_type": "dft",
       "reliability": { "validation_score": "44/50" }
     },
     "mcloud.mc2d": {
       "tier": 2,
+      "description": "Materials Cloud 2D — curated DFT 2D materials",
+      "data_type": "dft",
       "reliability": { "validation_score": "44/50" }
     },
     "tcod": {
       "tier": 2,
+      "description": "TCOD — experimental crystal structures (theoretical crystallography)",
+      "data_type": "experimental",
       "reliability": { "validation_score": "46/50" }
     },
     "twodmatpedia": {
       "tier": 2,
+      "description": "2DMatPedia — DFT properties of 2D materials",
+      "data_type": "dft",
       "behavior": { "use_https": false },
       "reliability": { "validation_score": "57/57" }
     },
     "aflow": {
       "tier": 4,
+      "description": "AFLOW — DFT computed properties (OPTIMADE endpoint broken)",
       "enabled": false,
       "reliability": {
         "validation_score": "7/13",
@@ -135,6 +159,8 @@
     },
     "jarvis": {
       "tier": 2,
+      "description": "JARVIS — DFT + ML predictions for diverse material properties",
+      "data_type": "dft_and_ml",
       "enabled": true,
       "reliability": {
         "known_quirks": ["Previously returned 0 structures, fixed as of 2025"]
@@ -142,9 +168,25 @@
     },
     "mpds": {
       "tier": 3,
+      "description": "MPDS — experimental + curated properties (auth-gated)",
+      "data_type": "experimental",
       "enabled": false,
       "reliability": {
         "known_quirks": ["Auth-gated, access via PRISM marketplace. OPTIMADE endpoint limited."]
+      }
+    },
+    "cmr": {
+      "tier": 4,
+      "enabled": false,
+      "reliability": {
+        "known_quirks": ["Endpoint cmr-optimade.fysik.dtu.dk redirects to optimade.org (dead). Provider offline."]
+      }
+    },
+    "mpod": {
+      "tier": 4,
+      "enabled": false,
+      "reliability": {
+        "known_quirks": ["Server mpod_optimade.cimav.edu.mx is down. Provider offline."]
       }
     }
   }

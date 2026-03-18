@@ -30,6 +30,8 @@ class OptimadeProvider(Provider):
 
     async def search(self, query: MaterialSearchQuery) -> list[Material]:
         """Query this OPTIMADE endpoint and return normalized materials."""
+        import contextlib
+        import io
         from optimade.client import OptimadeClient
 
         filter_string = QueryTranslator.to_optimade(query)
@@ -42,8 +44,14 @@ class OptimadeProvider(Provider):
                 base_urls=[base_url],
                 max_results_per_provider=min(query.limit, self._endpoint.behavior.max_results),
                 use_async=False,
+                silent=True,
             )
-            results = client.structures.get(filter=filter_string) if filter_string else client.structures.get()
+            # Suppress optimade-python's own console output (error messages,
+            # progress boxes) so it doesn't leak into the Ink TUI or corrupt
+            # the JSON-RPC stdio stream.
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                results = client.structures.get(filter=filter_string) if filter_string else client.structures.get()
         except Exception as e:
             logger.warning("OPTIMADE query failed for %s: %s", self.id, e)
             raise
@@ -74,7 +82,11 @@ class OptimadeProvider(Provider):
 
                 if errors and not entries:
                     # Provider returned only errors — propagate as failure
-                    raise RuntimeError(f"Provider {self.id} error: {errors[0][:200]}")
+                    err = errors[0]
+                    if isinstance(err, dict):
+                        err = err.get("detail", err.get("title", str(err)))
+                    err = str(err)[:200]
+                    raise RuntimeError(f"Provider '{self.id}' returned an error: {err}")
 
                 if isinstance(entries, list):
                     for entry in entries:

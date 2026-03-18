@@ -112,3 +112,54 @@ class TestAnthropicBackend:
         assert tool_starts[0].tool_name == "search_materials"
         assert isinstance(events[-1], TurnComplete)
         assert events[-1].has_more is True
+
+    @patch("app.agent.backends.anthropic_backend.Anthropic")
+    def test_complete_stream_tool_call_missing_id_gets_synthesized(self, mock_cls):
+        client = mock_cls.return_value
+
+        ev1 = MagicMock()
+        ev1.type = "content_block_start"
+        ev1.content_block = MagicMock()
+        ev1.content_block.type = "tool_use"
+        ev1.content_block.name = "search_materials"
+        ev1.content_block.id = None
+
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = lambda s: s
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        stream_ctx.__iter__ = MagicMock(return_value=iter([ev1]))
+        stream_ctx.get_final_message.return_value = self._make_tool_response(
+            "search_materials", {"q": "Si"}, None
+        )
+        client.messages.stream.return_value = stream_ctx
+
+        backend = AnthropicBackend(api_key="test-key")
+        events = list(backend.complete_stream(
+            messages=[{"role": "user", "content": "find Si"}],
+            tools=[{"name": "search_materials"}],
+        ))
+        tool_starts = [e for e in events if e.__class__.__name__ == "ToolCallStart"]
+        assert len(tool_starts) == 1
+        assert tool_starts[0].call_id.startswith("prism_call_")
+        assert backend._last_stream_response.tool_calls[0].call_id.startswith("prism_call_")
+
+    @patch("app.agent.backends.anthropic_backend.Anthropic")
+    def test_format_messages_backfills_missing_tool_result_id(self, mock_cls):
+        backend = AnthropicBackend(api_key="test-key")
+        messages = [
+            {
+                "role": "tool_calls",
+                "text": None,
+                "calls": [{"id": "", "name": "search_materials", "args": {"q": "Si"}}],
+            },
+            {
+                "role": "tool_result",
+                "tool_call_id": "",
+                "result": {"count": 1},
+            },
+        ]
+        formatted = backend._format_messages(messages)
+        tool_use = formatted[0]["content"][0]
+        tool_result = formatted[1]["content"][0]
+        assert tool_use["id"].startswith("prism_call_")
+        assert tool_result["tool_use_id"] == tool_use["id"]

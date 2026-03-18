@@ -63,6 +63,31 @@ _reg("glm-4.5-air",                  "zhipu",     128_000,  16_384,  4_096, 0.10
 del _reg
 
 
+DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
+    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-5",
+    "google": "gemini-2.5-pro",
+    "vertexai": "gemini-2.5-pro",
+    "zhipu": "glm-5",
+    "marc27": "claude-sonnet-4-6",
+    "openrouter": "anthropic/claude-sonnet-4-6",
+}
+
+_PROVIDER_ALIASES: dict[str, str] = {
+    "vertexai": "google",
+}
+
+
+def get_default_model(provider: str | None = None) -> str:
+    """Return the current default model for a provider.
+
+    Defaults are intentionally centralized here so runtime code does not
+    silently drift onto stale model IDs.
+    """
+    normalized = _PROVIDER_ALIASES.get((provider or "anthropic").lower(), (provider or "anthropic").lower())
+    return DEFAULT_MODEL_BY_PROVIDER.get(normalized, DEFAULT_MODEL_BY_PROVIDER["anthropic"])
+
+
 def get_model_config(model_id: str) -> ModelConfig:
     """Look up model configuration by ID.
 

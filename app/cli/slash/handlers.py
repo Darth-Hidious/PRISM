@@ -122,13 +122,22 @@ def handle_status(app):
     app.console.print()
 
     provider = "not configured"
-    if os.getenv("MARC27_TOKEN"):
+    if os.getenv("MARC27_API_KEY") or os.getenv("MARC27_TOKEN"):
         provider = "MARC27"
-    elif os.getenv("ANTHROPIC_API_KEY"):
+    else:
+        try:
+            from marc27.credentials import CredentialsManager
+
+            creds = CredentialsManager().load()
+            if creds and creds.access_token:
+                provider = "MARC27"
+        except Exception:
+            pass
+    if provider == "not configured" and os.getenv("ANTHROPIC_API_KEY"):
         provider = "Anthropic (Claude)"
-    elif os.getenv("OPENAI_API_KEY"):
+    elif provider == "not configured" and os.getenv("OPENAI_API_KEY"):
         provider = "OpenAI"
-    elif os.getenv("OPENROUTER_API_KEY"):
+    elif provider == "not configured" and os.getenv("OPENROUTER_API_KEY"):
         provider = "OpenRouter"
     app.console.print(
         f"  LLM          {_dot(provider != 'not configured')} {provider}"
@@ -160,6 +169,8 @@ def handle_login(app):
     from app.config.preferences import PRISM_DIR
     from rich.prompt import Prompt
 
+    platform_url = os.getenv("MARC27_PLATFORM_URL", "https://api.marc27.com")
+
     app.console.print()
     app.console.print("[bold]MARC27 Login[/bold]")
     app.console.print(
@@ -167,14 +178,45 @@ def handle_login(app):
     )
     app.console.print()
 
-    token = os.getenv("MARC27_TOKEN")
-    if token:
+    api_key = os.getenv("MARC27_API_KEY") or os.getenv("MARC27_TOKEN")
+    if api_key:
         app.console.print(
-            f"  Already logged in. [dim](token: {token[:8]}...)[/dim]"
+            f"  Already configured via env. [dim](key: {api_key[:8]}...)[/dim]"
         )
-        app.console.print("  [dim]To logout: unset MARC27_TOKEN[/dim]")
+        app.console.print("  [dim]To logout: unset MARC27_API_KEY/MARC27_TOKEN[/dim]")
         app.console.print()
         return
+
+    # Native SDK login path (device flow + stored credentials)
+    try:
+        from marc27 import PlatformClient
+        from marc27.credentials import CredentialsManager
+
+        creds = CredentialsManager().load()
+        if creds and creds.access_token:
+            app.console.print("  Already logged in via marc27-sdk credentials.")
+            if creds.project_id:
+                app.console.print(f"  [dim]Active project: {creds.project_id}[/dim]")
+            app.console.print("  [dim]Credentials: ~/.prism/credentials.json[/dim]")
+            app.console.print()
+            return
+
+        app.console.print("  Starting browser login via marc27-sdk device flow...")
+        client = PlatformClient(platform_url=platform_url)
+        creds = client.login(open_browser=True)
+        if creds.project_id:
+            os.environ["MARC27_PROJECT_ID"] = str(creds.project_id)
+        app.console.print("[green]Logged in to MARC27 via SDK.[/green]")
+        app.console.print("[dim]Credentials saved to ~/.prism/credentials.json[/dim]")
+        app.console.print()
+        return
+    except ImportError:
+        # marc27-sdk optional dependency; fall back to legacy token mode.
+        pass
+    except Exception as e:
+        app.console.print(f"[yellow]SDK login failed:[/yellow] {e}")
+        app.console.print("[dim]Falling back to token login.[/dim]")
+        app.console.print()
 
     app.console.print(
         "  [dim]1.[/dim] Go to [bold]https://marc27.com/account/tokens[/bold]"
@@ -198,9 +240,10 @@ def handle_login(app):
     token_path.write_text(token_input.strip())
     token_path.chmod(0o600)
     os.environ["MARC27_TOKEN"] = token_input.strip()
+    os.environ.setdefault("MARC27_API_KEY", token_input.strip())
 
     app.console.print("[green]Logged in to MARC27.[/green]")
-    app.console.print("[dim]Token saved to ~/.prism/marc27_token[/dim]")
+    app.console.print("[dim]Token saved to ~/.prism/marc27_token (legacy fallback)[/dim]")
     app.console.print()
 
 

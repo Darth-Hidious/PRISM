@@ -40,10 +40,7 @@ export interface UiPrompt {
 
 export interface UiWelcome {
   version: string;
-  provider: string;
-  capabilities: Record<string, any>;
-  tool_count: number;
-  skill_count: number;
+  status: Record<string, any>;
   auto_approve: boolean;
 }
 

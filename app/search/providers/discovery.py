@@ -21,9 +21,10 @@ PROVIDERS_FALLBACK_URL = (
 
 _SKIP_IDS = frozenset({"exmpl", "optimade", "optimake"})
 
-# Providers whose proxy at providers.optimade.org 404s.
+# Providers whose proxy at providers.optimade.org 404s or returns null child URLs.
 # Map provider_id -> working index URL.
 FALLBACK_INDEX_URLS: dict[str, str] = {
+    "matcloud": "https://www.materialscloud.org/optimade/main/v1/links",
     "mcloud": "https://www.materialscloud.org/optimade/main/v1/links",
 }
 
@@ -135,6 +136,14 @@ async def discover_providers(
                 continue
 
             children = parse_links_response(links_data)
+
+            # If proxy returned no usable children (e.g. all null base_urls),
+            # try the fallback index URL before giving up.
+            if not children and pid in fallbacks:
+                fb_data = await _fetch_json(client, fallbacks[pid])
+                if fb_data is not None:
+                    children = parse_links_response(fb_data)
+
             if children:
                 for child in children:
                     endpoints.append({

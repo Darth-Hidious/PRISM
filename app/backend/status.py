@@ -22,6 +22,7 @@ def detect_llm() -> dict:
     Returns {"connected": bool, "provider": str | None}.
     """
     providers = [
+        ("MARC27_API_KEY", "MARC27"),
         ("MARC27_TOKEN", "MARC27"),
         ("ANTHROPIC_API_KEY", "Claude"),
         ("OPENAI_API_KEY", "OpenAI"),
@@ -36,6 +37,16 @@ def detect_llm() -> dict:
     token_path = Path.home() / ".prism" / "marc27_token"
     if token_path.exists() and token_path.read_text().strip():
         return {"connected": True, "provider": "MARC27"}
+
+    # Check MARC27 SDK credentials file
+    try:
+        from marc27.credentials import CredentialsManager
+
+        creds = CredentialsManager().load()
+        if creds and creds.access_token:
+            return {"connected": True, "provider": "MARC27"}
+    except Exception:
+        pass
 
     return {"connected": False, "provider": None}
 
@@ -139,6 +150,29 @@ def detect_skills() -> dict:
         return {"count": 0, "names": []}
 
 
+def detect_account() -> dict:
+    """Detect active platform account context propagated by the Rust launcher."""
+    user_id = os.getenv("PRISM_ACCOUNT_USER_ID")
+    display_name = os.getenv("PRISM_ACCOUNT_DISPLAY_NAME")
+    org_id = os.getenv("PRISM_ACCOUNT_ORG_ID")
+    org_name = os.getenv("PRISM_ACCOUNT_ORG_NAME")
+    project_id = os.getenv("PRISM_ACCOUNT_PROJECT_ID") or os.getenv("MARC27_PROJECT_ID")
+    project_name = os.getenv("PRISM_ACCOUNT_PROJECT_NAME")
+    platform_url = os.getenv("MARC27_PLATFORM_URL")
+
+    signed_in = bool(os.getenv("MARC27_TOKEN") or user_id or display_name or project_id)
+    return {
+        "signed_in": signed_in,
+        "user_id": user_id,
+        "display_name": display_name,
+        "org_id": org_id,
+        "org_name": org_name,
+        "project_id": project_id,
+        "project_name": project_name,
+        "platform_url": platform_url,
+    }
+
+
 # ── Aggregate ────────────────────────────────────────────────────────
 
 def build_status(tool_registry=None) -> dict:
@@ -148,4 +182,5 @@ def build_status(tool_registry=None) -> dict:
         "plugins": detect_plugins(),
         "commands": detect_commands(tool_registry),
         "skills": detect_skills(),
+        "account": detect_account(),
     }

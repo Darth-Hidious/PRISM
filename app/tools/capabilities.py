@@ -120,6 +120,24 @@ def discover_capabilities(**kwargs) -> dict:
     return caps
 
 
+def _load_provider_descriptions() -> dict:
+    """Load provider descriptions from overrides JSON."""
+    try:
+        import json
+        from pathlib import Path
+        overrides_path = Path(__file__).parent.parent / "search" / "providers" / "provider_overrides.json"
+        if overrides_path.exists():
+            data = json.loads(overrides_path.read_text())
+            return {
+                pid: pdata.get("description", "")
+                for pid, pdata in data.get("overrides", {}).items()
+                if pdata.get("enabled", True) and pdata.get("description")
+            }
+    except Exception:
+        pass
+    return {}
+
+
 def capabilities_summary() -> str:
     """Generate a concise text summary for system prompt injection.
 
@@ -129,11 +147,19 @@ def capabilities_summary() -> str:
     caps = discover_capabilities()
     lines = []
 
-    # Search providers
+    # Search providers — include descriptions so agent knows what each has
     providers = caps.get("search_providers", [])
     if providers:
-        names = [p["id"] for p in providers]
-        lines.append(f"Search providers: {', '.join(names)}")
+        descriptions = _load_provider_descriptions()
+        provider_lines = []
+        for p in providers:
+            pid = p["id"]
+            desc = descriptions.get(pid, "")
+            if desc:
+                provider_lines.append(f"  {pid}: {desc}")
+            else:
+                provider_lines.append(f"  {pid}")
+        lines.append("Search providers:\n" + "\n".join(provider_lines))
 
     # Datasets
     datasets = caps.get("datasets", [])

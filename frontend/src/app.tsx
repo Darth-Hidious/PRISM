@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from "react";
-import { Box, Static } from "ink";
+import { Box, Static, Text } from "ink";
 import { useBackend } from "./hooks/useBackend.js";
 import { Welcome } from "./components/Welcome.js";
 import { Prompt } from "./components/Prompt.js";
@@ -12,6 +12,7 @@ import { InputCard } from "./components/InputCard.js";
 import { PlanCard } from "./components/PlanCard.js";
 import { ApprovalPrompt } from "./components/ApprovalPrompt.js";
 import { SessionList } from "./components/SessionList.js";
+import { DIM, PRIMARY, MUTED, TEXT, WARNING } from "./theme.js";
 
 interface HistoryItem {
   id: number;
@@ -21,16 +22,24 @@ interface HistoryItem {
 
 interface Props {
   pythonPath: string;
+  backendBin?: string;
   autoApprove?: boolean;
+  resume?: string;
 }
 
-export function App({ pythonPath, autoApprove }: Props) {
+export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
   const { ready, events, sendMessage, sendCommand, sendPromptResponse } =
-    useBackend(pythonPath);
+    useBackend(pythonPath, backendBin, autoApprove ?? false, resume);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [streamingText, setStreamingText] = useState("");
   const [spinnerVerb, setSpinnerVerb] = useState<string | null>(null);
+  const [pendingApproval, setPendingApproval] = useState<{
+    toolName: string;
+    toolArgs: Record<string, any>;
+  } | null>(null);
   const nextIdRef = React.useRef(0);
+  const lastProcessedRef = React.useRef(0);
+  const streamingRef = React.useRef("");
 
   // Helper to get a unique id and bump the counter
   const takeId = () => {
@@ -39,73 +48,89 @@ export function App({ pythonPath, autoApprove }: Props) {
     return id;
   };
 
-  // Process events into history + live state
+  // Process ALL events sequentially — never skip events between renders
   React.useEffect(() => {
-    if (events.length === 0) return;
-    const latest = events[events.length - 1];
+    const start = lastProcessedRef.current;
+    const end = events.length;
+    if (start >= end) return;
+    lastProcessedRef.current = end;
 
-    switch (latest.method) {
-      case "ui.welcome":
-        setHistory((h) => [...h, { id: takeId(), type: "welcome", data: latest.params }]);
-        break;
-      case "ui.text.delta":
-        setStreamingText((t) => t + latest.params.text);
-        break;
-      case "ui.text.flush":
-        if (latest.params.text.trim()) {
-          setHistory((h) => [
-            ...h,
-            { id: takeId(), type: "text", data: { text: latest.params.text } },
-          ]);
-        }
-        setStreamingText("");
-        break;
-      case "ui.tool.start":
-        setSpinnerVerb(latest.params.verb);
-        break;
-      case "ui.card":
-        setSpinnerVerb(null);
-        if (latest.params.card_type === "plan") {
-          setHistory((h) => [...h, { id: takeId(), type: "plan", data: latest.params }]);
-        } else {
-          setHistory((h) => [...h, { id: takeId(), type: "card", data: latest.params }]);
-        }
-        break;
-      case "ui.cost":
-        setHistory((h) => [...h, { id: takeId(), type: "cost", data: latest.params }]);
-        break;
-      case "ui.turn.complete":
-        setSpinnerVerb(null);
-        setStreamingText((current) => {
-          if (current.trim()) {
-            setHistory((h) => [
-              ...h,
-              { id: takeId(), type: "text", data: { text: current } },
-            ]);
+    let localText = streamingRef.current;
+    let localSpinner: string | null = spinnerVerb;
+    const newItems: HistoryItem[] = [];
+
+    for (let i = start; i < end; i++) {
+      const ev = events[i];
+      switch (ev.method) {
+        case "ui.welcome":
+          newItems.push({ id: takeId(), type: "welcome", data: ev.params });
+          break;
+        case "ui.text.delta":
+          localText += ev.params.text;
+          break;
+        case "ui.text.flush":
+          if (ev.params.text.trim()) {
+            newItems.push({ id: takeId(), type: "text", data: { text: ev.params.text } });
           }
-          return "";
-        });
-        break;
-      case "ui.status":
-        setHistory((h) => [...h, { id: takeId(), type: "status", data: latest.params }]);
-        break;
-      case "ui.prompt":
-        if (latest.params.prompt_type === "approval") {
-          setHistory((h) => [
-            ...h,
-            { id: takeId(), type: "approval", data: latest.params },
-          ]);
-        }
-        break;
-      case "ui.session.list":
-        setHistory((h) => [
-          ...h,
-          { id: takeId(), type: "sessions", data: latest.params },
-        ]);
-        break;
+          localText = "";
+          break;
+        case "ui.tool.start":
+          localSpinner = ev.params.verb;
+          setPendingApproval(null);
+          break;
+        case "ui.card":
+          localSpinner = null;
+          if (ev.params.card_type === "plan") {
+            newItems.push({ id: takeId(), type: "plan", data: ev.params });
+          } else {
+            newItems.push({ id: takeId(), type: "card", data: ev.params });
+          }
+          break;
+        case "ui.cost":
+          newItems.push({ id: takeId(), type: "cost", data: ev.params });
+          break;
+        case "ui.turn.complete":
+          localSpinner = null;
+          if (localText.trim()) {
+            newItems.push({ id: takeId(), type: "text", data: { text: localText } });
+          }
+          localText = "";
+          break;
+        case "ui.status":
+          newItems.push({ id: takeId(), type: "status", data: ev.params });
+          break;
+        case "ui.prompt":
+          if (ev.params.prompt_type === "approval") {
+            newItems.push({ id: takeId(), type: "approval", data: ev.params });
+            setPendingApproval({
+              toolName: ev.params.tool_name,
+              toolArgs: ev.params.tool_args,
+            });
+          }
+          break;
+        case "ui.session.list":
+          newItems.push({ id: takeId(), type: "sessions", data: ev.params });
+          break;
+      }
     }
+
+    // Batch all state updates into a single render
+    if (newItems.length > 0) {
+      setHistory((h) => [...h, ...newItems]);
+    }
+    streamingRef.current = localText;
+    setStreamingText(localText);
+    setSpinnerVerb(localSpinner);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [events.length]);
+
+  const handleApprovalResponse = useCallback(
+    (response: string) => {
+      sendPromptResponse("approval", response);
+      setPendingApproval(null);
+    },
+    [sendPromptResponse],
+  );
 
   const handleSubmit = useCallback(
     (text: string) => {
@@ -125,7 +150,23 @@ export function App({ pythonPath, autoApprove }: Props) {
   if (!ready) return <Spinner verb="Starting PRISM..." />;
 
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" paddingX={1}>
+      <Box justifyContent="space-between" marginBottom={1}>
+        <Text>
+          <Text color={PRIMARY} bold>PRISM</Text>
+          <Text color={MUTED}>  coding shell</Text>
+        </Text>
+        <Text color={DIM}>
+          {pendingApproval ? (
+            <Text color={WARNING}>approval pending</Text>
+          ) : spinnerVerb ? (
+            "working"
+          ) : (
+            <Text color={TEXT}>ready</Text>
+          )}
+        </Text>
+      </Box>
+
       <Static items={history}>
         {(item) => (
           <HistoryRenderer
@@ -139,7 +180,18 @@ export function App({ pythonPath, autoApprove }: Props) {
       {streamingText ? <StreamingText text={streamingText} streaming /> : null}
       {spinnerVerb ? <Spinner verb={spinnerVerb} /> : null}
 
-      <Prompt onSubmit={handleSubmit} />
+      {pendingApproval ? (
+        <ApprovalPrompt
+          toolName={pendingApproval.toolName}
+          toolArgs={pendingApproval.toolArgs}
+          onResponse={handleApprovalResponse}
+        />
+      ) : (
+        <Prompt
+          onSubmit={handleSubmit}
+          active={!streamingText && !spinnerVerb}
+        />
+      )}
     </Box>
   );
 }
@@ -194,13 +246,9 @@ function HistoryRenderer({
         />
       );
     case "approval":
-      return (
-        <ApprovalPrompt
-          toolName={item.data.tool_name}
-          toolArgs={item.data.tool_args}
-          onResponse={(r) => sendPromptResponse("approval", r)}
-        />
-      );
+      // Approval is rendered as live interactive element at the bottom,
+      // not in Static history. Show a placeholder in scroll-back.
+      return null;
     case "sessions":
       return <SessionList sessions={item.data.sessions} />;
     default:

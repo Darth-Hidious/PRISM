@@ -6,23 +6,33 @@ export interface BackendEvent {
   params: Record<string, any>;
 }
 
-export function useBackend(pythonPath: string) {
+export function useBackend(
+  pythonPath: string,
+  backendBin?: string,
+  autoApprove = false,
+  resume?: string,
+) {
   const clientRef = useRef<BackendClient | null>(null);
   const [ready, setReady] = useState(false);
   const [events, setEvents] = useState<BackendEvent[]>([]);
 
   useEffect(() => {
-    const client = new BackendClient(pythonPath);
+    const client = new BackendClient(pythonPath, backendBin);
     clientRef.current = client;
 
     client.on("event", (event: BackendEvent) => {
       setEvents((prev) => [...prev, event]);
     });
 
-    client.request("init", {}).then(() => setReady(true));
+    client
+      .request("init", {
+        auto_approve: autoApprove,
+        resume: resume ?? "",
+      })
+      .then(() => setReady(true));
 
     return () => client.destroy();
-  }, [pythonPath]);
+  }, [pythonPath, backendBin, autoApprove, resume]);
 
   const sendMessage = useCallback((text: string) => {
     clientRef.current?.send("input.message", { text });

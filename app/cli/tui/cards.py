@@ -73,18 +73,11 @@ def detect_result_type(result: dict) -> str:
 # ── Card renderers ────────────────────────────────────────────────────
 
 def render_input_card(console: Console, text: str):
-    """Teal-bordered input card with ❯ icon."""
-    console.print()
-    title = Text()
-    title.append(f" {ICONS['input']} ", style=f"bold {ACCENT_CYAN}")
-    title.append("input ", style=DIM)
-    console.print(Panel(
-        Text(text, style=TEXT),
-        title=title,
-        title_align="left",
-        border_style=BORDERS["input"], box=box.ROUNDED,
-        padding=(0, 1),
-    ))
+    """Show past user input with ⬡ hexagon icon (matches the prompt)."""
+    line = Text("  ")
+    line.append("\u2b21 ", style=f"bold {PRIMARY}")
+    line.append(text, style=MUTED)
+    console.print(line)
 
 
 def render_output_card(console: Console, text: str):
@@ -362,21 +355,64 @@ def render_plot_card(console: Console, tool_name: str,
     ))
 
 
+def _tool_summary(tool_name: str, tool_args: dict) -> str:
+    """One-line summary of tool args for approval display."""
+    if "python" in tool_name or "execute" in tool_name:
+        return f"$ {str(tool_args.get('code', tool_args.get('command', '')))[:120]}"
+    if "search" in tool_name or "query" in tool_name:
+        return tool_args.get("formula", tool_args.get("query", tool_args.get("text", "")))
+    if "command" in tool_args:
+        return f"$ {str(tool_args['command'])[:120]}"
+    pairs = [f"{k}={v}" for k, v in list(tool_args.items())[:3]]
+    return ", ".join(pairs)
+
+
 def render_approval_card(console: Console, tool_name: str, tool_args: dict):
-    """Render the approval request panel (card only, no input)."""
-    args_summary = ", ".join(
-        f"{k}={v!r}" for k, v in list(tool_args.items())[:3]
-    )
-    title = make_title("approval", tool_name)
-    body = Text()
-    body.append(f"{ICONS['approval']} Requires approval\n", style=WARNING)
-    body.append(f"  {args_summary}\n", style=MUTED)
-    body.append("\n  [y] approve  [n] deny  [a] always approve", style=MUTED)
-    console.print(Panel(
-        body, title=title, title_align="left",
-        border_style=BORDERS["approval"], box=box.ROUNDED,
-        padding=(0, 1),
-    ))
+    """Render the approval request panel matching OpenCode's permission dialog.
+
+    Layout:
+      ┃ △ Permission required
+      ┃ → tool_name  summary
+      ┃
+      ┃  [y] allow once  [n] reject  [a] allow always
+    """
+    width = console.width
+    summary = _tool_summary(tool_name, tool_args)
+
+    # Separator
+    sep = Text()
+    sep.append("\u25c8", style=WARNING)
+    sep.append("\u2500" * max(width - 1, 10), style=f"dim {MUTED}")
+    console.print(sep)
+
+    # Header
+    line1 = Text()
+    line1.append("\u2503 ", style=WARNING)
+    line1.append("\u25b3 ", style=WARNING)
+    line1.append("Permission required", style=TEXT)
+    console.print(line1)
+
+    # Tool info
+    line2 = Text()
+    line2.append("\u2503 ", style=WARNING)
+    line2.append("\u2192 ", style=MUTED)
+    line2.append(tool_name, style=f"bold {TEXT}")
+    if summary:
+        line2.append(f"  {summary}", style=MUTED)
+    console.print(line2)
+
+    # Spacer
+    console.print(Text("\u2503", style=WARNING))
+
+    # Options
+    line3 = Text()
+    line3.append("\u2503 ", style=WARNING)
+    line3.append(" [y] allow once ", style=MUTED)
+    line3.append("  ", style="")
+    line3.append(" [n] reject ", style=MUTED)
+    line3.append("  ", style="")
+    line3.append(" [a] allow always ", style=MUTED)
+    console.print(line3)
 
 
 def format_tokens(n: int) -> str:

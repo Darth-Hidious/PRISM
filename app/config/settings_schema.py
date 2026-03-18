@@ -38,7 +38,7 @@ def _find_project_settings() -> Optional[Path]:
 @dataclass
 class AgentSettings:
     """Agent behavior configuration."""
-    model: str = ""                         # e.g. "claude-sonnet-4-20250514"
+    model: str = ""                         # e.g. "claude-sonnet-4-6"
     provider: str = ""                      # anthropic, openai, openrouter, marc27
     max_iterations: int = 30                # TAOR loop limit
     auto_approve: bool = False              # auto-approve tool calls
@@ -176,7 +176,7 @@ def _apply_env_overrides(data: dict) -> dict:
     """Apply environment variable overrides to settings dict.
 
     Env vars follow the pattern: PRISM_<SECTION>_<KEY>=value
-    e.g. PRISM_AGENT_MODEL=gpt-4o -> data["agent"]["model"] = "gpt-4o"
+    e.g. PRISM_AGENT_MODEL=gpt-5 -> data["agent"]["model"] = "gpt-5"
     """
     prefix = "PRISM_"
     for key, value in os.environ.items():

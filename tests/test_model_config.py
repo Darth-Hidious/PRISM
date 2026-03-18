@@ -1,6 +1,11 @@
 """Tests for ModelConfig registry and lookup."""
 import pytest
-from app.agent.models import ModelConfig, MODEL_REGISTRY, get_model_config
+from app.agent.models import (
+    ModelConfig,
+    MODEL_REGISTRY,
+    get_default_model,
+    get_model_config,
+)
 
 
 class TestModelConfigDataclass:
@@ -145,3 +150,17 @@ class TestRegistryInvariants:
         valid_providers = {"anthropic", "openai", "google", "zhipu"}
         for model_id, config in MODEL_REGISTRY.items():
             assert config.provider in valid_providers, f"{model_id} has unknown provider {config.provider}"
+
+
+class TestDefaultModels:
+    def test_current_openai_default(self):
+        assert get_default_model("openai") == "gpt-5"
+
+    def test_current_anthropic_default(self):
+        assert get_default_model("anthropic") == "claude-sonnet-4-6"
+
+    def test_openrouter_default_is_prefixed(self):
+        assert get_default_model("openrouter") == "anthropic/claude-sonnet-4-6"
+
+    def test_unknown_provider_falls_back_to_anthropic_default(self):
+        assert get_default_model("unknown-provider") == "claude-sonnet-4-6"
