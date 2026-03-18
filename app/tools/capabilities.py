@@ -117,6 +117,26 @@ def discover_capabilities(**kwargs) -> dict:
     except Exception:
         caps["plugins"] = []
 
+    # 10. MARC27 Knowledge Plane
+    try:
+        from marc27 import PlatformClient
+        client = PlatformClient()
+        stats = client.knowledge.graph_stats()
+        caps["marc27_knowledge"] = {
+            "connected": True,
+            "nodes": stats.get("nodes", 0),
+            "edges": stats.get("edges", 0),
+            "entity_types": stats.get("entity_types", 0),
+        }
+        embed_stats = client.knowledge.embedding_stats()
+        caps["marc27_embeddings"] = {
+            "count": embed_stats.get("embeddings", 0),
+            "dimensions": 3072,
+        }
+    except Exception:
+        caps["marc27_knowledge"] = {"connected": False}
+        caps["marc27_embeddings"] = {"count": 0}
+
     return caps
 
 

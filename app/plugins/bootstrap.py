@@ -67,6 +67,20 @@ def build_full_registry(
     create_code_tools(registry)
     create_capabilities_tools(registry)
 
+    # MARC27 Knowledge Plane tools (graph search, semantic search, ingest)
+    try:
+        from app.tools.knowledge import create_knowledge_tools
+        create_knowledge_tools(registry)
+    except Exception:
+        pass
+
+    # MARC27 Compute Broker tools (GPU dispatch, job management)
+    try:
+        from app.tools.compute import create_compute_tools
+        create_compute_tools(registry)
+    except Exception:
+        pass
+
     # Premium labs tools (marketplace services)
     from app.tools.labs import create_labs_tools
     create_labs_tools(registry)
