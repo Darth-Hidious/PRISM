@@ -398,10 +398,10 @@ OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 
 BINARY_NAME=""
 case "$OS-$ARCH" in
-    darwin-arm64)  BINARY_NAME="prism-darwin-arm64.tar.gz" ;;
-    darwin-x86_64) BINARY_NAME="prism-darwin-arm64.tar.gz" ;; # Rosetta fallback
-    linux-x86_64)  BINARY_NAME="" ;; # not yet available
-    linux-aarch64) BINARY_NAME="" ;; # not yet available
+    darwin-arm64)   BINARY_NAME="prism-darwin-arm64.tar.gz" ;;
+    darwin-x86_64)  BINARY_NAME="prism-darwin-x86_64.tar.gz" ;;
+    linux-x86_64)   BINARY_NAME="prism-linux-x86_64.tar.gz" ;;
+    linux-aarch64)  BINARY_NAME="prism-linux-arm64.tar.gz" ;;
 esac
 
 if [ -n "$BINARY_NAME" ]; then
