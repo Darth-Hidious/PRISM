@@ -12,6 +12,7 @@ use prism_workflows::{
     discover_workflows, execute_workflow, find_workflow, parse_workflow_command_args,
     WorkflowRunResult, WorkflowSpec,
 };
+use prism_proto::NodeCapabilities;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
@@ -73,8 +74,36 @@ enum WorkflowCommands {
 
 #[derive(Debug, Subcommand)]
 enum NodeCommands {
-    Up,
+    /// Start the node daemon — register with the platform and wait for jobs.
+    Up {
+        /// Node name (default: hostname).
+        #[arg(long)]
+        name: Option<String>,
+        /// Visibility: public, org, or private.
+        #[arg(long, default_value = "private")]
+        visibility: String,
+        /// Price per hour in USD if public (default: free).
+        #[arg(long)]
+        price: Option<f64>,
+        /// Additional paths to scan for datasets (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        data_paths: Vec<String>,
+        /// Additional paths to scan for models (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        model_paths: Vec<String>,
+        /// Don't offer compute services.
+        #[arg(long)]
+        no_compute: bool,
+        /// Don't offer storage services.
+        #[arg(long)]
+        no_storage: bool,
+    },
+    /// Stop a running node daemon.
+    Down,
+    /// Show current node capabilities and status.
     Status,
+    /// Probe local capabilities without connecting.
+    Probe,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,24 +297,58 @@ async fn main() -> Result<()> {
             std::process::exit(status.code().unwrap_or(1));
         }
         Commands::Node { command } => match command {
-            NodeCommands::Up => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "scaffolded",
-                        "message": "Use the dedicated prism-node binary for long-lived node runtime.",
-                        "node_ws": endpoints.node_ws,
-                    }))?
-                );
+            NodeCommands::Up {
+                name,
+                visibility,
+                price,
+                data_paths,
+                model_paths,
+                no_compute,
+                no_storage,
+            } => {
+                // Inject extra scan paths into env
+                if !data_paths.is_empty() {
+                    let existing = std::env::var("PRISM_DATA_PATHS").unwrap_or_default();
+                    let combined = if existing.is_empty() {
+                        data_paths.join(",")
+                    } else {
+                        format!("{},{}", existing, data_paths.join(","))
+                    };
+                    std::env::set_var("PRISM_DATA_PATHS", combined);
+                }
+                if !model_paths.is_empty() {
+                    let existing = std::env::var("PRISM_MODEL_PATHS").unwrap_or_default();
+                    let combined = if existing.is_empty() {
+                        model_paths.join(",")
+                    } else {
+                        format!("{},{}", existing, model_paths.join(","))
+                    };
+                    std::env::set_var("PRISM_MODEL_PATHS", combined);
+                }
+
+                let options = prism_node::daemon::DaemonOptions {
+                    name: name.unwrap_or_else(|| {
+                        sysinfo::System::host_name()
+                            .unwrap_or_else(|| "prism-node".to_string())
+                    }),
+                    visibility,
+                    price_per_hour_usd: price,
+                    no_compute,
+                    no_storage,
+                };
+
+                prism_node::daemon::run_daemon(&endpoints, &paths, options).await?;
+            }
+            NodeCommands::Down => {
+                prism_node::daemon::stop_daemon(&paths)?;
             }
             NodeCommands::Status => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "node_ws": endpoints.node_ws,
-                        "mode": "rust-backbone-scaffold",
-                    }))?
-                );
+                let caps = prism_node::detect::probe_local_capabilities_async().await;
+                print_node_status(&caps, &endpoints);
+            }
+            NodeCommands::Probe => {
+                let caps = prism_node::detect::probe_local_capabilities_async().await;
+                println!("{}", serde_json::to_string_pretty(&caps)?);
             }
         },
         Commands::External(args) => {
@@ -906,6 +969,80 @@ fn open_browser(url: &str) -> Result<()> {
     } else {
         bail!("browser opener exited with status {status}")
     }
+}
+
+fn print_node_status(caps: &NodeCapabilities, endpoints: &PlatformEndpoints) {
+    let hostname =
+        sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string());
+    println!("Node: {hostname}");
+    println!("Visibility: {}", caps.visibility);
+    println!("Platform: {}", endpoints.node_ws);
+    println!();
+
+    println!("Compute:");
+    println!("  CPU: {} cores, {} MB RAM", caps.cpu_cores, caps.ram_gb);
+    if caps.gpus.is_empty() {
+        println!("  GPUs: none");
+    } else {
+        for gpu in &caps.gpus {
+            println!(
+                "  GPU: {} x{} ({} GB VRAM)",
+                gpu.gpu_type, gpu.count, gpu.vram_gb
+            );
+        }
+    }
+    if let Some(rt) = &caps.container_runtime {
+        println!("  Container runtime: {rt}");
+    }
+    if let Some(sched) = &caps.scheduler {
+        println!("  Scheduler: {sched}");
+    }
+    println!();
+
+    println!("Storage:");
+    println!(
+        "  Total: {} GB, Available: {} GB",
+        caps.disk_gb, caps.storage_available_gb
+    );
+    if caps.datasets.is_empty() {
+        println!("  Datasets: none detected");
+    } else {
+        for ds in &caps.datasets {
+            let entries = ds
+                .entries
+                .map(|n| format!(", {n} entries"))
+                .unwrap_or_default();
+            let fmt = ds.format.as_deref().unwrap_or("unknown");
+            println!("  Dataset: {} ({:.2} GB, {fmt}{entries})", ds.name, ds.size_gb);
+        }
+    }
+    if caps.models.is_empty() {
+        println!("  Models: none detected");
+    } else {
+        for m in &caps.models {
+            let fmt = m.format.as_deref().unwrap_or("unknown");
+            let size = m
+                .size_gb
+                .map(|s| format!(", {s:.2} GB"))
+                .unwrap_or_default();
+            println!("  Model: {} ({fmt}{size})", m.name);
+        }
+    }
+    println!();
+
+    println!("Services:");
+    for svc in &caps.services {
+        let icon = if svc.status == "ready" { "●" } else { "○" };
+        let model_info = svc
+            .model
+            .as_ref()
+            .map(|m| format!(" ({m})"))
+            .unwrap_or_default();
+        println!("  {icon} {} [{}]{model_info}", svc.kind, svc.status);
+    }
+    println!();
+
+    println!("Software: {}", caps.software.join(", "));
 }
 
 #[cfg(test)]

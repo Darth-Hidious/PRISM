@@ -60,7 +60,7 @@ pub struct BackendError {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeCapabilities {
     #[serde(default)]
     pub gpus: Vec<GpuInfo>,
@@ -73,6 +73,22 @@ pub struct NodeCapabilities {
     pub scheduler: Option<String>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub storage_available_gb: u32,
+    #[serde(default)]
+    pub datasets: Vec<DatasetInfo>,
+    #[serde(default)]
+    pub models: Vec<ModelInfo>,
+    #[serde(default)]
+    pub services: Vec<NodeService>,
+    #[serde(default = "default_visibility")]
+    pub visibility: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_per_hour_usd: Option<f64>,
+}
+
+fn default_visibility() -> String {
+    "private".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,12 +99,44 @@ pub struct GpuInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DatasetInfo {
+    pub name: String,
+    pub path: String,
+    pub size_gb: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entries: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelInfo {
+    pub name: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_gb: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeService {
+    pub kind: String,
+    pub name: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeMessage {
     Register {
         name: String,
         org_id: Option<Uuid>,
-        capabilities: NodeCapabilities,
+        capabilities: Box<NodeCapabilities>,
     },
     Heartbeat {
         cpu_load: f64,
@@ -163,7 +211,7 @@ mod tests {
         let message = NodeMessage::Register {
             name: "node-1".to_string(),
             org_id: None,
-            capabilities: NodeCapabilities {
+            capabilities: Box::new(NodeCapabilities {
                 gpus: vec![],
                 cpu_cores: 8,
                 ram_gb: 32,
@@ -172,7 +220,13 @@ mod tests {
                 container_runtime: Some("docker".to_string()),
                 scheduler: Some("slurm".to_string()),
                 labels: BTreeMap::new(),
-            },
+                storage_available_gb: 256,
+                datasets: vec![],
+                models: vec![],
+                services: vec![],
+                visibility: "private".to_string(),
+                price_per_hour_usd: None,
+            }),
         };
 
         let json = serde_json::to_string(&message).unwrap();
