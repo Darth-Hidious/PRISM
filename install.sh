@@ -8,7 +8,9 @@ REPO="https://github.com/Darth-Hidious/PRISM.git"
 PACKAGE="prism-platform"
 GIT_PACKAGE="$PACKAGE[all] @ git+$REPO"
 MIN_PYTHON="3.11"
-CURRENT_VERSION="2.5.0b1"
+CURRENT_VERSION="2.5.0"
+RELEASE_TAG="v2.5.0"
+GITHUB_RELEASE="https://github.com/Darth-Hidious/PRISM/releases/download/$RELEASE_TAG"
 
 # ── Parse flags ──────────────────────────────────────────────────────
 UPGRADE=0
@@ -386,3 +388,46 @@ else
     fi
     printf '\n'
 fi
+
+# ── Install Rust backbone (prebuilt binary) ──────────────────────────
+printf '\n'
+info "Installing" "Rust control-plane binary..."
+
+ARCH=$(uname -m)
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+BINARY_NAME=""
+case "$OS-$ARCH" in
+    darwin-arm64)  BINARY_NAME="prism-darwin-arm64.tar.gz" ;;
+    darwin-x86_64) BINARY_NAME="prism-darwin-arm64.tar.gz" ;; # Rosetta fallback
+    linux-x86_64)  BINARY_NAME="" ;; # not yet available
+    linux-aarch64) BINARY_NAME="" ;; # not yet available
+esac
+
+if [ -n "$BINARY_NAME" ]; then
+    INSTALL_DIR="$HOME/.local/bin"
+    mkdir -p "$INSTALL_DIR"
+    TMP_DIR=$(mktemp -d)
+
+    if curl -fsSL "$GITHUB_RELEASE/$BINARY_NAME" -o "$TMP_DIR/$BINARY_NAME" 2>/dev/null; then
+        tar xzf "$TMP_DIR/$BINARY_NAME" -C "$TMP_DIR"
+        mv "$TMP_DIR/prism" "$INSTALL_DIR/prism" 2>/dev/null && chmod +x "$INSTALL_DIR/prism"
+        mv "$TMP_DIR/prism-node" "$INSTALL_DIR/prism-node" 2>/dev/null && chmod +x "$INSTALL_DIR/prism-node"
+        ok "Installed" "prism + prism-node to $INSTALL_DIR"
+    else
+        warn "Skipped" "prebuilt binary download failed (build from source with: cargo build --release)"
+    fi
+
+    rm -rf "$TMP_DIR"
+else
+    warn "Skipped" "no prebuilt binary for $OS/$ARCH (build from source with: cargo build --release)"
+fi
+
+# ── Final instructions ───────────────────────────────────────────────
+printf '\n'
+printf '  \033[1;36m⬡ PRISM\033[0m installed successfully!\n\n'
+printf '  \033[1mQuick start:\033[0m\n'
+printf '    prism login     \033[2m# authenticate with MARC27 platform\033[0m\n'
+printf '    prism status    \033[2m# verify connection\033[0m\n'
+printf '    prism           \033[2m# start interactive agent\033[0m\n'
+printf '\n'
