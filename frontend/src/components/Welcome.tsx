@@ -1,9 +1,7 @@
 import React from "react";
 import { Box, Text } from "ink";
 import {
-  PRIMARY, MUTED, SECONDARY, SUCCESS, WARNING, ERROR, DIM, ACCENT_CYAN,
-  CRYSTAL_OUTER_DIM, CRYSTAL_OUTER, CRYSTAL_INNER, CRYSTAL_CORE,
-  RAINBOW, HEADER_COMMANDS_L, HEADER_COMMANDS_R,
+  PRIMARY, MUTED, SECONDARY, SUCCESS, WARNING, ERROR, ACCENT_CYAN, TEXT,
 } from "../theme.js";
 
 interface LLMStatus {
@@ -35,11 +33,23 @@ interface SkillStatus {
   names: string[];
 }
 
+interface AccountStatus {
+  signed_in: boolean;
+  user_id: string | null;
+  display_name: string | null;
+  org_id: string | null;
+  org_name: string | null;
+  project_id: string | null;
+  project_name: string | null;
+  platform_url: string | null;
+}
+
 interface Status {
   llm: LLMStatus;
   plugins: PluginStatus;
   commands: CommandStatus;
   skills: SkillStatus;
+  account: AccountStatus;
 }
 
 interface Props {
@@ -50,46 +60,6 @@ interface Props {
 
 function Dot({ ok }: { ok: boolean }) {
   return <Text color={ok ? SUCCESS : MUTED}>{ok ? "\u25cf" : "\u25cb"}</Text>;
-}
-
-/** Crystal mascot row — outer dim hexagons */
-function CrystalOuterRow() {
-  return (
-    <Text>
-      {"    "}
-      <Text color={CRYSTAL_OUTER_DIM}>{"\u2b21"}</Text>
-      {" "}
-      <Text color={CRYSTAL_OUTER_DIM}>{"\u2b21"}</Text>
-      {" "}
-      <Text color={CRYSTAL_OUTER_DIM}>{"\u2b21"}</Text>
-    </Text>
-  );
-}
-
-/** Crystal mascot middle row + rainbow rays + commands */
-function CrystalMiddleRow({ commands }: { commands: string[] }) {
-  return (
-    <Text>
-      {"  "}
-      <Text color={CRYSTAL_OUTER}>{"\u2b21"}</Text>
-      {" "}
-      <Text color={CRYSTAL_INNER} bold>{"\u2b22"}</Text>
-      {" "}
-      <Text color={CRYSTAL_CORE} bold>{"\u2b22"}</Text>
-      {" "}
-      <Text color={CRYSTAL_INNER} bold>{"\u2b22"}</Text>
-      {" "}
-      <Text color={CRYSTAL_OUTER}>{"\u2b21"}</Text>
-      {"  "}
-      {RAINBOW.map((c, i) => (
-        <Text key={i} color={c} bold>{"\u2501"}</Text>
-      ))}
-      {"  "}
-      {commands.map((cmd, i) => (
-        <Text key={i} color={MUTED}>{cmd} </Text>
-      ))}
-    </Text>
-  );
 }
 
 /** Short tool name for display */
@@ -105,94 +75,100 @@ function shortName(name: string): string {
   return map[name] || name;
 }
 
+function CrystalMascot() {
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      <Text color={PRIMARY}>    ⬡ ⬡ ⬡</Text>
+      <Text color={PRIMARY}>  ⬡ ⬢ ⬢ ⬢ ⬡</Text>
+      <Text color={PRIMARY}>  ⬡ ⬢ ⬢ ⬢ ⬡</Text>
+      <Text color={PRIMARY}>    ⬡ ⬡ ⬡</Text>
+    </Box>
+  );
+}
+
 export function Welcome({ version, status, autoApprove }: Props) {
-  const { llm, plugins, commands, skills } = status;
+  const { llm, plugins, commands, skills, account } = status;
 
   return (
-    <Box flexDirection="column" marginY={1}>
-      {/* Crystal mascot */}
-      <CrystalOuterRow />
-      <CrystalMiddleRow commands={HEADER_COMMANDS_L} />
-      <CrystalMiddleRow commands={HEADER_COMMANDS_R} />
-      <CrystalOuterRow />
-
-      <Text> </Text>
-
-      {/* Title + version */}
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={MUTED}
+      paddingX={1}
+      marginBottom={1}
+    >
+      <CrystalMascot />
       <Text>
-        {"  "}
         <Text color={PRIMARY} bold>PRISM</Text>
-        <Text dimColor>{` v${version}`}</Text>
+        <Text color={MUTED}>{`  native shell  v${version}`}</Text>
       </Text>
-      <Text dimColor>{"  AI-Native Autonomous Materials Discovery"}</Text>
-
+      <Text color={TEXT}>Autonomous materials research and compute orchestration.</Text>
+      <Text color={MUTED}>Ask for a task or start with /help, /status, /workflow, /sessions.</Text>
       <Text> </Text>
 
-      {/* 1. LLM */}
       <Text>
-        {"  "}
-        <Dot ok={llm.connected} />
-        {" "}
+        <Dot ok={llm.connected} />{" "}
+        <Text color={MUTED}>model</Text>{" "}
         {llm.connected ? (
-          <Text>
-            <Text bold>{llm.provider}</Text>
-            <Text dimColor> connected</Text>
+          <Text color={TEXT}>
+            <Text bold>{llm.provider}</Text> ready
           </Text>
         ) : (
-          <Text>
-            <Text color={ERROR}>No LLM configured</Text>
-            <Text dimColor> — run </Text>
-            <Text color={ACCENT_CYAN}>prism setup</Text>
-            <Text dimColor> or visit </Text>
-            <Text color={SECONDARY}>platform.marc27.com</Text>
-          </Text>
+          <Text color={ERROR}>not configured</Text>
         )}
       </Text>
 
-      {/* 2. Plugins */}
       <Text>
-        {"  "}
-        <Dot ok={false} />
-        {" "}
-        <Text dimColor>Plugins</Text>
-        <Text color={MUTED}> coming soon</Text>
-      </Text>
-
-      {/* 3. Commands */}
-      <Text>
-        {"  "}
-        <Dot ok={commands.tools.some((t) => t.healthy)} />
-        {" "}
-        <Text dimColor>Commands </Text>
-        {commands.tools.map((t, i) => (
-          <React.Fragment key={t.name}>
-            <Text color={t.registered ? (t.healthy ? SUCCESS : WARNING) : MUTED}>
-              {shortName(t.name)}
-            </Text>
-            {i < commands.tools.length - 1 && <Text dimColor> · </Text>}
-          </React.Fragment>
-        ))}
-        {commands.healthy_providers > 0 && (
-          <Text dimColor>
-            {" "}({commands.healthy_providers}/{commands.total_providers} providers)
-          </Text>
+        <Dot ok={commands.tools.some((t) => t.healthy)} />{" "}
+        <Text color={MUTED}>tools</Text>{" "}
+        {commands.tools.length > 0 ? (
+          commands.tools.map((t, i) => (
+            <React.Fragment key={t.name}>
+              <Text color={t.registered ? (t.healthy ? SUCCESS : WARNING) : MUTED}>
+                {shortName(t.name)}
+              </Text>
+              {i < commands.tools.length - 1 && <Text color={MUTED}> · </Text>}
+            </React.Fragment>
+          ))
+        ) : (
+          <Text color={MUTED}>none</Text>
         )}
       </Text>
 
-      {/* 4. Skills */}
       <Text>
-        {"  "}
-        <Dot ok={skills.count > 0} />
-        {" "}
-        <Text dimColor>{skills.count} skills</Text>
+        <Dot ok={skills.count > 0} /> <Text color={MUTED}>skills</Text>{" "}
+        <Text color={TEXT}>{skills.count}</Text>
+        <Text color={MUTED}>{`  plugins ${plugins.available ? plugins.count : 0}`}</Text>
       </Text>
 
-      {autoApprove && (
-        <Text>
-          {"  "}
-          <Text color={WARNING}>{"\u26a0"} auto-approve enabled</Text>
+      <Text>
+        <Dot ok={account.signed_in} /> <Text color={MUTED}>account</Text>{" "}
+        {account.signed_in ? (
+          <Text color={TEXT}>
+            <Text bold>{account.display_name || account.user_id || "signed in"}</Text>
+            {account.org_name || account.org_id ? (
+              <Text color={MUTED}>{`  ·  ${account.org_name || account.org_id}`}</Text>
+            ) : null}
+            {account.project_name || account.project_id ? (
+              <Text color={MUTED}>{`  ·  ${account.project_name || account.project_id}`}</Text>
+            ) : null}
+          </Text>
+        ) : (
+          <Text color={ERROR}>not signed in</Text>
+        )}
+      </Text>
+
+      <Text color={MUTED}>
+        {commands.healthy_providers}/{commands.total_providers} providers healthy
+        {autoApprove ? "  ·  auto-approve ON" : ""}
+      </Text>
+
+      {!llm.connected ? (
+        <Text color={MUTED}>
+          Configure keys with <Text color={ACCENT_CYAN}>prism setup</Text> or via{" "}
+          <Text color={SECONDARY}>platform.marc27.com</Text>.
         </Text>
-      )}
+      ) : null}
     </Box>
   );
 }

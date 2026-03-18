@@ -11,7 +11,7 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.formatted_text import HTML
 from rich.console import Console
 
-from app.cli.tui.theme import PRIMARY, ACCENT_MAGENTA, WARNING
+from app.cli.tui.theme import PRIMARY, ACCENT_MAGENTA, WARNING, CRYSTAL_INNER, CRYSTAL_OUTER_DIM, MUTED
 from app.cli.tui.cards import render_approval_card
 
 
@@ -27,17 +27,41 @@ def create_prompt_session() -> PromptSession:
     )
 
 
-def get_user_input(session: PromptSession) -> str:
-    """Get input using the styled PRISM prompt."""
-    return session.prompt(
-        HTML(f'<style fg="{PRIMARY}"><b>\u276f </b></style>'),
+def print_top_separator(console: Console):
+    """Print crystal-themed separator line above the prompt."""
+    width = console.width
+    from rich.text import Text
+    sep = Text()
+    sep.append("\u25c8", style=CRYSTAL_INNER)
+    sep.append("\u2500" * max(width - 1, 10), style=CRYSTAL_OUTER_DIM)
+    console.print(sep)
+
+
+def print_bottom_separator(console: Console):
+    """Print subtle dotted separator line below the prompt."""
+    width = console.width
+    console.print(f"[{MUTED}]{chr(0x2508) * width}[/{MUTED}]")
+
+
+def get_user_input(session: PromptSession, console: Console | None = None) -> str:
+    """Get input using the styled PRISM prompt.
+
+    If console is provided, prints crystal separator above the prompt.
+    """
+    if console:
+        print_top_separator(console)
+    result = session.prompt(
+        HTML(f'<style fg="{PRIMARY}"><b>\u2b21 </b></style>'),
     ).strip()
+    if console:
+        print_bottom_separator(console)
+    return result
 
 
 def ask_approval(session: PromptSession, console: Console,
                  tool_name: str, tool_args: dict,
                  auto_approve_tools: set) -> bool:
-    """Ask for tool approval using prompt_toolkit (not bare input()).
+    """Ask for tool approval with OpenCode-style permission prompt.
 
     Returns True if approved. Mutates auto_approve_tools on 'a'.
     """
@@ -48,7 +72,7 @@ def ask_approval(session: PromptSession, console: Console,
 
     try:
         answer = session.prompt(
-            HTML(f'<style fg="{WARNING}">  \u203a </style>'),
+            HTML(f'<style fg="{WARNING}">\u2503 \u203a </style>'),
         ).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False

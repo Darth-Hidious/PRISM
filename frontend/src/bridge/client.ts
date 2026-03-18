@@ -21,11 +21,17 @@ export class BackendClient extends EventEmitter {
     { resolve: (value: unknown) => void; reject: (reason: Error) => void }
   >();
 
-  constructor(pythonPath: string) {
+  constructor(pythonPath: string, backendBin?: string) {
     super();
-    this.process = spawn(pythonPath, ["-m", "app.backend"], {
-      stdio: ["pipe", "pipe", "inherit"],
-    });
+    this.process = backendBin
+      ? spawn(
+          backendBin,
+          ["backend", "--python", pythonPath, "--project-root", process.cwd()],
+          { stdio: ["pipe", "pipe", "inherit"] },
+        )
+      : spawn(pythonPath, ["-m", "app.backend"], {
+          stdio: ["pipe", "pipe", "inherit"],
+        });
 
     this.rl = createInterface({ input: this.process.stdout! });
     this.rl.on("line", (line) => this.handleLine(line));

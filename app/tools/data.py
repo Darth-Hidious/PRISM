@@ -15,13 +15,12 @@ def _search_materials(**kwargs) -> dict:
 
     try:
         elements = kwargs.get("elements")
-        # Auto-infer n_elements from elements list when not explicitly set
+        # Only constrain n_elements when explicitly requested by the LLM.
+        # elements HAS ALL already ensures the listed elements are present;
+        # auto-adding nelements<=N would exclude valid ternary+ compounds.
         n_elements = None
         if kwargs.get("n_elements_min") or kwargs.get("n_elements_max"):
             n_elements = PropertyRange(min=kwargs.get("n_elements_min"), max=kwargs.get("n_elements_max"))
-        elif elements and not kwargs.get("formula"):
-            # Constrain to exactly these elements (avoid Fe-C returning Fe-C-Lu)
-            n_elements = PropertyRange(min=len(elements), max=len(elements))
 
         query = MaterialSearchQuery(
             elements=elements,

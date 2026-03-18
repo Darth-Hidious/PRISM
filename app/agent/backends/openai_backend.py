@@ -4,7 +4,7 @@ import os
 from typing import Dict, Generator, List, Optional
 from openai import OpenAI, APIStatusError as OpenAIAPIError
 from app.agent.backends.base import Backend
-from app.agent.models import get_model_config
+from app.agent.models import get_default_model, get_model_config
 from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete, UsageInfo
 
 
@@ -18,8 +18,18 @@ class OpenAIBackend(Backend):
         if base_url:
             kwargs["base_url"] = base_url
         self.client = OpenAI(**kwargs)
-        self.model = model or os.getenv("PRISM_MODEL", "gpt-4o")
+        self.model = model or os.getenv("PRISM_MODEL") or get_default_model("openai")
         self.model_config = get_model_config(self.model)
+        self._synthetic_tool_call_seq = 0
+
+    def _new_tool_call_id(self) -> str:
+        """Generate a stable, non-empty fallback tool call id.
+
+        Some OpenAI-compatible providers can omit tool ids in streaming deltas.
+        We synthesize ids so tool results always attach to a valid call id.
+        """
+        self._synthetic_tool_call_seq += 1
+        return f"prism_call_{self._synthetic_tool_call_seq}"
 
     def complete(self, messages: List[Dict], tools: List[dict], system_prompt: Optional[str] = None) -> AgentResponse:
         formatted_messages = self._format_messages(messages, system_prompt)
@@ -58,6 +68,8 @@ class OpenAIBackend(Backend):
                         tool_calls_acc[idx]["name"] = tc_delta.function.name
                     if tc_delta.function and tc_delta.function.arguments:
                         tool_calls_acc[idx]["args_str"] += tc_delta.function.arguments
+                    if not tool_calls_acc[idx]["id"]:
+                        tool_calls_acc[idx]["id"] = self._new_tool_call_id()
                     if idx not in seen_tool_starts and tool_calls_acc[idx]["name"]:
                         seen_tool_starts.add(idx)
                         yield ToolCallStart(tool_name=tool_calls_acc[idx]["name"], call_id=tool_calls_acc[idx]["id"])
@@ -70,7 +82,8 @@ class OpenAIBackend(Backend):
                 tool_args = json.loads(acc["args_str"]) if acc["args_str"] else {}
             except (json.JSONDecodeError, TypeError):
                 tool_args = {}
-            tool_calls.append(ToolCallEvent(tool_name=acc["name"], tool_args=tool_args, call_id=acc["id"]))
+            call_id = acc["id"] or self._new_tool_call_id()
+            tool_calls.append(ToolCallEvent(tool_name=acc["name"], tool_args=tool_args, call_id=call_id))
 
         full_text = "".join(text_parts) if text_parts else None
         response = AgentResponse(text=full_text, tool_calls=tool_calls)
@@ -79,24 +92,42 @@ class OpenAIBackend(Backend):
 
     def _format_messages(self, messages: List[Dict], system_prompt: Optional[str] = None) -> List[Dict]:
         formatted = []
+        pending_tool_call_ids: List[str] = []
         if system_prompt:
             formatted.append({"role": "system", "content": system_prompt})
         for msg in messages:
             role = msg["role"]
             if role == "tool_calls":
                 tool_calls = []
+                pending_tool_call_ids = []
                 for tc in msg["calls"]:
-                    tool_calls.append({"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])}})
+                    call_id = tc.get("id") or self._new_tool_call_id()
+                    pending_tool_call_ids.append(call_id)
+                    tool_calls.append({"id": call_id, "type": "function", "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])}})
                 formatted.append({"role": "assistant", "content": msg.get("text"), "tool_calls": tool_calls})
             elif role == "tool_result":
-                formatted.append({"role": "tool", "tool_call_id": msg["tool_call_id"],
+                tool_call_id = msg.get("tool_call_id") or (pending_tool_call_ids.pop(0) if pending_tool_call_ids else self._new_tool_call_id())
+                formatted.append({"role": "tool", "tool_call_id": tool_call_id,
                     "content": json.dumps(msg["result"]) if isinstance(msg["result"], dict) else str(msg["result"])})
             else:
                 formatted.append({"role": role, "content": msg["content"]})
         return formatted
 
     def _format_tools(self, tools: List[dict]) -> List[dict]:
-        return [{"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t.get("input_schema", {})}} for t in tools]
+        formatted = []
+        for t in tools:
+            if t.get("type") == "function" and isinstance(t.get("function"), dict):
+                formatted.append(t)
+                continue
+            formatted.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t.get("input_schema", {}),
+                },
+            })
+        return formatted
 
     def _parse_response(self, response) -> AgentResponse:
         msg = response.choices[0].message
@@ -107,7 +138,8 @@ class OpenAIBackend(Backend):
                     tool_args = json.loads(tc.function.arguments)
                 except (json.JSONDecodeError, TypeError):
                     tool_args = {}
-                tool_calls.append(ToolCallEvent(tool_name=tc.function.name, tool_args=tool_args, call_id=tc.id))
+                call_id = tc.id or self._new_tool_call_id()
+                tool_calls.append(ToolCallEvent(tool_name=tc.function.name, tool_args=tool_args, call_id=call_id))
         usage = None
         if hasattr(response, "usage") and response.usage:
             usage = UsageInfo(

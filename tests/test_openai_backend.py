@@ -144,3 +144,52 @@ class TestOpenAIBackend:
         assert isinstance(events[-1], TurnComplete)
         assert events[-1].has_more is True
         assert backend._last_stream_response.tool_calls[0].tool_args == {"q": "Si"}
+
+    @patch("app.agent.backends.openai_backend.OpenAI")
+    def test_complete_stream_tool_call_missing_id_gets_synthesized(self, mock_cls):
+        client = mock_cls.return_value
+
+        chunk1 = MagicMock()
+        tc_delta1 = MagicMock()
+        tc_delta1.index = 0
+        tc_delta1.id = None
+        tc_delta1.function = MagicMock()
+        tc_delta1.function.name = "search"
+        tc_delta1.function.arguments = '{"q":"Si"}'
+        delta1 = MagicMock()
+        delta1.content = None
+        delta1.tool_calls = [tc_delta1]
+        chunk1.choices = [MagicMock(delta=delta1)]
+
+        client.chat.completions.create.return_value = iter([chunk1])
+        backend = OpenAIBackend(api_key="test-key")
+        list(backend.complete_stream(
+            messages=[{"role": "user", "content": "find Si"}],
+            tools=[{"name": "search", "description": "Search", "input_schema": {}}],
+        ))
+
+        tc = backend._last_stream_response.tool_calls[0]
+        assert tc.call_id.startswith("prism_call_")
+        assert tc.tool_args == {"q": "Si"}
+
+    @patch("app.agent.backends.openai_backend.OpenAI")
+    def test_format_messages_backfills_missing_tool_result_id(self, mock_cls):
+        backend = OpenAIBackend(api_key="test-key")
+        messages = [
+            {
+                "role": "tool_calls",
+                "text": None,
+                "calls": [{"id": "", "name": "search", "args": {"q": "Si"}}],
+            },
+            {
+                "role": "tool_result",
+                "tool_call_id": "",
+                "result": {"count": 1},
+            },
+        ]
+
+        formatted = backend._format_messages(messages)
+        assert formatted[0]["role"] == "assistant"
+        assert formatted[0]["tool_calls"][0]["id"].startswith("prism_call_")
+        assert formatted[1]["role"] == "tool"
+        assert formatted[1]["tool_call_id"] == formatted[0]["tool_calls"][0]["id"]

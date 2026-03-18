@@ -4,7 +4,7 @@ import os
 from typing import Dict, Generator, List, Optional
 from anthropic import Anthropic, APIStatusError as AnthropicAPIError
 from app.agent.backends.base import Backend
-from app.agent.models import get_model_config
+from app.agent.models import get_default_model, get_model_config
 from app.agent.events import AgentResponse, ToolCallEvent, TextDelta, ToolCallStart, TurnComplete, UsageInfo
 
 
@@ -15,8 +15,14 @@ class AnthropicBackend(Backend):
 
     def __init__(self, model: str = None, api_key: str = None):
         self.client = Anthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
-        self.model = model or os.getenv("PRISM_MODEL", "claude-sonnet-4-20250514")
+        self.model = model or os.getenv("PRISM_MODEL") or get_default_model("anthropic")
         self.model_config = get_model_config(self.model)
+        self._synthetic_tool_call_seq = 0
+
+    def _new_tool_call_id(self) -> str:
+        """Generate fallback ids for defensive tool-result linkage."""
+        self._synthetic_tool_call_seq += 1
+        return f"prism_call_{self._synthetic_tool_call_seq}"
 
     def complete(self, messages: List[Dict], tools: List[dict], system_prompt: Optional[str] = None) -> AgentResponse:
         kwargs = {"model": self.model, "max_tokens": self.model_config.default_max_tokens, "messages": self._format_messages(messages)}
@@ -49,7 +55,8 @@ class AnthropicBackend(Backend):
             for event in stream:
                 if event.type == "content_block_start" and hasattr(event.content_block, "type"):
                     if event.content_block.type == "tool_use":
-                        yield ToolCallStart(tool_name=event.content_block.name, call_id=event.content_block.id)
+                        call_id = event.content_block.id or self._new_tool_call_id()
+                        yield ToolCallStart(tool_name=event.content_block.name, call_id=call_id)
                 elif event.type == "content_block_delta":
                     if hasattr(event.delta, "text"):
                         yield TextDelta(text=event.delta.text)
@@ -61,17 +68,22 @@ class AnthropicBackend(Backend):
     def _format_messages(self, messages: List[Dict]) -> List[Dict]:
         """Convert neutral message format to Anthropic format."""
         formatted = []
+        pending_tool_call_ids: List[str] = []
         for msg in messages:
             role = msg["role"]
             if role == "tool_calls":
                 content = []
+                pending_tool_call_ids = []
                 if msg.get("text"):
                     content.append({"type": "text", "text": msg["text"]})
                 for tc in msg["calls"]:
-                    content.append({"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["args"]})
+                    call_id = tc.get("id") or self._new_tool_call_id()
+                    pending_tool_call_ids.append(call_id)
+                    content.append({"type": "tool_use", "id": call_id, "name": tc["name"], "input": tc["args"]})
                 formatted.append({"role": "assistant", "content": content})
             elif role == "tool_result":
-                content = [{"type": "tool_result", "tool_use_id": msg["tool_call_id"],
+                call_id = msg.get("tool_call_id") or (pending_tool_call_ids.pop(0) if pending_tool_call_ids else self._new_tool_call_id())
+                content = [{"type": "tool_result", "tool_use_id": call_id,
                     "content": json.dumps(msg["result"]) if isinstance(msg["result"], dict) else str(msg["result"])}]
                 formatted.append({"role": "user", "content": content})
             else:
@@ -85,7 +97,8 @@ class AnthropicBackend(Backend):
             if block.type == "text":
                 text_parts.append(block.text)
             elif block.type == "tool_use":
-                tool_calls.append(ToolCallEvent(tool_name=block.name, tool_args=block.input, call_id=block.id))
+                call_id = block.id or self._new_tool_call_id()
+                tool_calls.append(ToolCallEvent(tool_name=block.name, tool_args=block.input, call_id=call_id))
         usage = None
         if hasattr(response, "usage") and response.usage:
             usage = UsageInfo(

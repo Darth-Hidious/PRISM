@@ -1,6 +1,6 @@
 import React from "react";
 import { Text } from "ink";
-import { DIM } from "../theme.js";
+import { DIM, PRIMARY, MUTED } from "../theme.js";
 
 interface Props {
   autoApprove: boolean;
@@ -14,5 +14,11 @@ export function StatusLine({ autoApprove, messageCount, hasPlan }: Props) {
   parts.push(`${messageCount} messages`);
   if (hasPlan) parts.push("plan active");
 
-  return <Text color={DIM}>{`\u2500 ${parts.join(" \u2502 ")} \u2500`}</Text>;
+  return (
+    <Text color={DIM}>
+      <Text color={PRIMARY}>prism</Text>
+      <Text color={MUTED}>  </Text>
+      {parts.join("  ·  ")}
+    </Text>
+  );
 }

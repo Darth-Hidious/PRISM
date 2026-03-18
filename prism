@@ -48,11 +48,8 @@ sys.path.insert(0, str(project_root))
 def main():
     """Main entry point for the PRISM CLI"""
     try:
-        # Import the CLI module
-        from app.cli import cli
-        
-        # Run the CLI
-        cli()
+        from app.cli.bootstrap import main as bootstrap_main
+        bootstrap_main()
         
     except ImportError as e:
         print(f"Import Error: {e}")

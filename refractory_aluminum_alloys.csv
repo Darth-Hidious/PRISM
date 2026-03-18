@@ -1,0 +1,6 @@
+Formula,Elements,Number_of_Elements,Sources,Type,Application_Potential
+AlMoTaW,"Al, Mo, Ta, W",4,"nmd, oqmd, alexandria.alexandria-pbe",4 refractory + Al,High temperature structural
+AlMoNbW,"Al, Mo, Nb, W",4,"nmd, oqmd, alexandria.alexandria-pbe",4 refractory + Al,High temperature structural
+AlCrMoW,"Al, Cr, Mo, W",4,"nmd, oqmd, alexandria.alexandria-pbe",4 refractory + Al,High temperature structural
+Al12Mo2NbOs7Sc6W,"Al, Mo, Nb, Os, Sc, W",6,"odbx.gnome, oqmd",6+ element complex alloy,Ultra-high temperature applications
+MoNbTaW,"Mo, Nb, Ta, W",4,"alexandria, oqmd, nmd",4 refractory base,Can be modified with Al addition

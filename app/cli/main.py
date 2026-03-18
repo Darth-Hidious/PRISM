@@ -9,6 +9,7 @@ visualization, and export capabilities.
 
 import os
 import re
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -130,12 +131,14 @@ Documentation: https://github.com/Darth-Hidious/PRISM
             pass
 
         # Try Ink TUI binary (unless --classic or binary not found)
-        from app.cli._binary import has_tui_binary, tui_binary_path
+        from app.cli._binary import has_tui_binary, rust_cli_binary_path, tui_binary_path
 
-        if not classic and has_tui_binary():
-            import sys
+        if not classic and sys.stdin.isatty() and sys.stdout.isatty() and has_tui_binary():
             binary = tui_binary_path()
             args = [str(binary), "--python", sys.executable]
+            rust_cli = rust_cli_binary_path()
+            if rust_cli:
+                args.extend(["--backend-bin", str(rust_cli)])
             if dangerously_accept_all:
                 args.append("--auto-approve")
             if resume:
@@ -240,6 +243,9 @@ cli.add_command(update_cmd, "update")
 
 from app.commands.configure import configure as configure_cmd
 cli.add_command(configure_cmd, "configure")
+
+from app.commands.workflow import register_workflow_commands
+register_workflow_commands(cli)
 
 if __name__ == "__main__":
     cli()

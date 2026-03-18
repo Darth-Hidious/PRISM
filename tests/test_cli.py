@@ -45,3 +45,11 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(cli, ["--resume", "fake-session-id"])
         assert "not found" in result.output.lower() or "Session not found" in result.output
+
+    @patch("app.cli._binary.has_tui_binary", return_value=True)
+    @patch("app.cli.main.os.execvp")
+    def test_non_interactive_cli_does_not_exec_tui(self, mock_execvp, _mock_has_tui):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        mock_execvp.assert_not_called()

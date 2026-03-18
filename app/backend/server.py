@@ -3,19 +3,32 @@
 Usage: python3 -m app.backend
 The Ink frontend spawns this as a child process and communicates
 via stdin (JSON lines) / stdout (JSON lines).
+
+Approvals: When the agent needs tool approval, the generator thread blocks
+on _approval_queue. The main loop reads stdin for input.prompt_response
+messages and unblocks the generator by putting the response on the queue.
 """
 import json
+import queue
+import select
 import sys
+import threading
 from typing import TextIO
 
 from app.backend.protocol import parse_input
 
 
 class StdioServer:
-    """JSON-RPC server on stdin/stdout."""
+    """JSON-RPC server on stdin/stdout with mid-stream approval support."""
 
     def __init__(self):
         self.emitter = None
+        self._approval_queue: queue.Queue = queue.Queue()
+        self._event_queue: queue.Queue = queue.Queue()
+
+    def _approval_callback(self, tool_name: str, tool_args: dict) -> bool:
+        """Called from the generator thread. Blocks until frontend responds."""
+        return self._approval_queue.get()
 
     def handle_message(self, raw: str, output: TextIO):
         """Process a single JSON-RPC message and write responses to output."""
@@ -52,7 +65,11 @@ class StdioServer:
 
         backend = create_backend(provider=provider)
         tools, _, _ = build_full_registry(enable_mcp=True)
-        agent = AgentCore(backend=backend, tools=tools, auto_approve=auto_approve)
+        agent = AgentCore(
+            backend=backend, tools=tools,
+            auto_approve=auto_approve,
+            approval_callback=self._approval_callback,
+        )
 
         from app.backend.ui_emitter import UIEmitter
         self.emitter = UIEmitter(agent, auto_approve=auto_approve)
@@ -61,10 +78,74 @@ class StdioServer:
         self._emit(output, self.emitter.welcome())
 
     def _handle_input(self, params: dict, output: TextIO):
+        """Run the UIEmitter generator in a thread, drain events while checking stdin."""
         if not self.emitter:
             return
-        for event in self.emitter.process(params.get("text", "")):
-            self._emit(output, event)
+
+        # Clear queues from any previous run
+        while not self._event_queue.empty():
+            try:
+                self._event_queue.get_nowait()
+            except queue.Empty:
+                break
+        while not self._approval_queue.empty():
+            try:
+                self._approval_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        text = params.get("text", "")
+
+        def run_generator():
+            try:
+                for event in self.emitter.process(text):
+                    self._event_queue.put(event)
+            except Exception:
+                pass
+            self._event_queue.put(None)  # done sentinel
+
+        thread = threading.Thread(target=run_generator, daemon=True)
+        thread.start()
+
+        self._drain_events_with_stdin(output)
+
+    def _drain_events_with_stdin(self, output: TextIO):
+        """Drain event queue while also reading stdin for mid-stream messages.
+
+        This allows the frontend to send approval responses while the
+        generator is blocked waiting for one.
+        """
+        while True:
+            # Drain all available events
+            try:
+                while True:
+                    event = self._event_queue.get_nowait()
+                    if event is None:
+                        return
+                    self._emit(output, event)
+            except queue.Empty:
+                pass
+
+            # Check stdin for approval responses (10ms timeout)
+            try:
+                readable, _, _ = select.select([sys.stdin], [], [], 0.01)
+            except (ValueError, OSError):
+                # stdin closed
+                return
+
+            if readable:
+                line = sys.stdin.readline()
+                if not line:
+                    return  # EOF
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    if msg.get("method") == "input.prompt_response":
+                        self._handle_prompt_response(msg.get("params", {}), output)
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
     def _handle_command(self, params: dict, output: TextIO):
         if not self.emitter:
@@ -73,8 +154,13 @@ class StdioServer:
             self._emit(output, event)
 
     def _handle_prompt_response(self, params: dict, output: TextIO):
-        # Store response for UIEmitter to consume
-        pass
+        """Unblock the approval callback with the frontend's response."""
+        response = params.get("response", "n")
+        approved = response in ("y", "yes", "a")
+        if response == "a" and self.emitter:
+            self.emitter.auto_approve = True
+            self.emitter.agent.auto_approve = True
+        self._approval_queue.put(approved)
 
     def _handle_load_session(self, params: dict, msg_id, output: TextIO):
         if not self.emitter:

@@ -1,5 +1,6 @@
 """AgentCore: the provider-agnostic TAOR loop."""
 import json
+from pathlib import Path
 from typing import Callable, Dict, Generator, List, Optional
 from app.agent.backends.base import Backend
 from app.agent.events import (
@@ -7,60 +8,24 @@ from app.agent.events import (
     TextDelta, ToolCallStart, ToolCallResult, TurnComplete,
     ToolApprovalRequest, ToolApprovalResponse,
 )
+from app.agent.prompts import INTERACTIVE_SYSTEM_PROMPT
 from app.tools.base import ToolRegistry
 
 MAX_TOOL_RESULT_CHARS = 30_000
 
 
-DEFAULT_SYSTEM_PROMPT = """You are PRISM, an AI research assistant for materials science.
+def _load_system_prompt(settings_path: str = "") -> str:
+    """Load system prompt from file or return default.
 
-You have access to tools for searching materials databases (OPTIMADE, Materials Project, OMAT24),
-predicting material properties, visualizing results, exporting data to CSV,
-searching scientific literature (arXiv, Semantic Scholar), searching patents (Lens.org),
-performing CALPHAD thermodynamic calculations (phase diagrams, equilibrium, Gibbs energy),
-and validating data quality (outlier detection, constraint checking, completeness scoring).
-Use these tools to help researchers find, analyze, and understand materials.
-
-You also have higher-level skills that orchestrate multi-step workflows:
-- acquire_materials: search and collect data from multiple sources
-- predict_properties: predict material properties using ML models
-- visualize_dataset: generate plots for dataset columns
-- generate_report: compile a Markdown/HTML/PDF report with correlations and quality info
-- select_materials: filter and rank candidates by criteria
-- materials_discovery: end-to-end pipeline (acquire → predict → visualize → report)
-- plan_simulations: generate simulation job plans (auto-routes CALPHAD vs DFT vs MD)
-- analyze_phases: analyze phase stability using CALPHAD thermodynamic databases
-- validate_dataset: detect outliers, check physical constraints, score completeness
-- review_dataset: comprehensive data quality review with structured findings
-
-For complex requests, prefer using skills over individual tools.
-
-PLANNING: For complex multi-step goals, FIRST output a structured plan inside
-<plan> and </plan> tags before executing any tools. The plan should list numbered
-steps with the tools or skills you intend to use. The user will review the plan
-before you proceed. For simple single-tool questions, skip planning and answer
-directly.
-
-When a user asks a question:
-1. Think about what tools and data you need
-2. For multi-step goals, output a <plan>...</plan> block first
-3. Use the appropriate tools or skills to gather information
-4. Synthesize the results into a clear answer
-
-When you collect tabular data, consider using export_results_csv to save it for the user.
-
-You can execute Python code for data analysis using the execute_python tool.
-The user's full Python environment is available (pandas, numpy, matplotlib,
-pymatgen, ASE, scikit-learn, pycalphad, etc.). Use this for data manipulation,
-filtering, plotting, and custom calculations. Use print() to show output.
-Use plt.savefig("filename.png") to save plots.
-
-Be precise with scientific data. Cite sources when possible.
-
-When a tool result is too large to fit in context, it will be stored and you'll receive
-a preview + result_id. Use the peek_result tool to examine specific sections:
-  peek_result(result_id="<id>", offset=0, limit=5000)
-You can also use export_results_csv to save the full result to a file for the user."""
+    Resolution order:
+    1. settings.agent.system_prompt_file (if non-empty)
+    2. INTERACTIVE_SYSTEM_PROMPT (default)
+    """
+    if settings_path:
+        p = Path(settings_path).expanduser()
+        if p.exists():
+            return p.read_text().strip()
+    return INTERACTIVE_SYSTEM_PROMPT
 
 
 class AgentCore:
@@ -74,7 +39,9 @@ class AgentCore:
 
         self.backend = backend
         self.tools = tools
-        base_prompt = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
+        base_prompt = system_prompt if system_prompt is not None else _load_system_prompt(
+            settings.agent.system_prompt_file
+        )
         self.system_prompt = self._inject_capabilities(base_prompt)
         # Settings < explicit arg (0 means "use settings default")
         self.max_iterations = max_iterations if max_iterations > 0 else settings.agent.max_iterations

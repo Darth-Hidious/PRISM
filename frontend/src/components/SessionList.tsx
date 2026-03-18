@@ -18,13 +18,13 @@ export function SessionList({ sessions }: Props) {
   }
 
   return (
-    <Box flexDirection="column">
-      <Text color={SECONDARY} bold>Saved Sessions</Text>
+    <Box flexDirection="column" marginBottom={1}>
+      <Text color={SECONDARY} bold>sessions</Text>
       {sessions.map((s) => (
         <Box key={s.session_id}>
-          <Text color={MUTED}>{`  ${s.session_id.slice(0, 8)}  `}</Text>
+          <Text color={MUTED}>{`${s.session_id.slice(0, 8)}  `}</Text>
           <Text dimColor>{s.timestamp}</Text>
-          <Text dimColor>{`  (${s.message_count} msgs)`}</Text>
+          <Text dimColor>{`  ${s.message_count} msgs`}</Text>
         </Box>
       ))}
     </Box>

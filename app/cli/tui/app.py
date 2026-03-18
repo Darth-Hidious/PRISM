@@ -96,7 +96,7 @@ class AgentREPL:
                 render_status_line(
                     self.console, self.agent, self._auto_approve,
                 )
-                user_input = get_user_input(self.session)
+                user_input = get_user_input(self.session, self.console)
             except (EOFError, KeyboardInterrupt):
                 self.prompt_save_on_exit()
                 self.console.print("\n[dim]Goodbye.[/dim]")

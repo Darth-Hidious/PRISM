@@ -1,6 +1,6 @@
 import React from "react";
 import { Box, Text } from "ink";
-import { BORDERS, ICONS, MUTED } from "../theme.js";
+import { BORDERS, ICONS, MUTED, TEXT } from "../theme.js";
 import { MarkdownText } from "./MarkdownText.js";
 
 interface Props {
@@ -23,14 +23,23 @@ export function ToolCard({ cardType, toolName, elapsedMs, content, data }: Props
   const elapsed = formatElapsed(elapsedMs);
 
   return (
-    <Box borderStyle="round" borderColor={border} paddingX={1} flexDirection="column">
+    <Box
+      borderStyle="round"
+      borderColor={border}
+      paddingX={1}
+      marginBottom={1}
+      flexDirection="column"
+    >
       <Box>
-        <Text color={border}>{icon} </Text>
-        <Text dimColor>{cardType} </Text>
-        {toolName && <Text color={MUTED}>{toolName} </Text>}
-        {elapsed && <Text dimColor>{elapsed}</Text>}
+        <Text color={border}>{icon}</Text>
+        <Text color={MUTED}>{` ${cardType}`}</Text>
+        {toolName && <Text color={TEXT}>{`  ${toolName}`}</Text>}
+        {elapsed && <Text color={MUTED}>{`  ${elapsed}`}</Text>}
       </Box>
       {content && <MarkdownText text={content} />}
+      {!content && data ? (
+        <Text color={MUTED}>{JSON.stringify(data).slice(0, 200)}</Text>
+      ) : null}
     </Box>
   );
 }

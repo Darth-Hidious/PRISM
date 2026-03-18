@@ -165,7 +165,7 @@ def download_tui_binary() -> Optional[str]:
     if not bin_name:
         return None
 
-    tag = _latest_release_tag() or "v2.5.0b1.0.3"
+    tag = _latest_release_tag() or "v2.5.0"
     url = f"https://github.com/Darth-Hidious/PRISM/releases/download/{tag}/{bin_name}"
     dest_dir = PRISM_DIR / "bin"
     dest = dest_dir / "prism-tui"

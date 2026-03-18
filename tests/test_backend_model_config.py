@@ -29,6 +29,13 @@ class TestAnthropicBackendUsesModelConfig:
 
 
 class TestOpenAIBackendUsesModelConfig:
+    def test_default_model_is_current_registry_default(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "PRISM_MODEL": ""}, clear=False):
+            with patch("app.agent.backends.openai_backend.OpenAI"):
+                from app.agent.backends.openai_backend import OpenAIBackend
+                backend = OpenAIBackend()
+                assert backend.model == "gpt-5"
+
     def test_init_stores_model_config(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
             with patch("app.agent.backends.openai_backend.OpenAI"):

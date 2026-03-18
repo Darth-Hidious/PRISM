@@ -145,7 +145,7 @@ def show_welcome(console: Console, agent, auto_approve: bool = False):
         line.append(" \u2014 run ", style=DIM)
         line.append("prism setup", style=ACCENT_CYAN)
         line.append(" or visit ", style=DIM)
-        line.append("platform.marc27.com", style=SECONDARY)
+        line.append("api.marc27.com", style=SECONDARY)
     console.print(line)
 
     # 2. Plugins

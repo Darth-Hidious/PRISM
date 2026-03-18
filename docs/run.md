@@ -66,6 +66,8 @@ The loop runs up to 30 iterations by default.
 The `run` command uses a **Protocol-Driven UI** architecture. The agent core
 emits structured JSON-RPC 2.0 events via `UIEmitter`, which both the Ink
 (TypeScript/React) frontend and the classic Rich (Python) frontend consume.
+This same protocol boundary is suitable for a native Rust launcher/binary that
+starts fast and renders the same event stream.
 Output is streamed with persistent display — nothing gets wiped:
 
 ```
@@ -180,12 +182,15 @@ The Ink frontend receives these as JSON-RPC 2.0 messages over stdio from
 
 If `--provider` is not specified, PRISM checks environment variables in order:
 
-1. `MARC27_TOKEN` or `~/.prism/marc27_token` — MARC27 managed backend
+1. `MARC27_API_KEY`, SDK credentials (`~/.prism/credentials.json`), or legacy `MARC27_TOKEN` — MARC27 managed backend
 2. `ANTHROPIC_API_KEY` — Anthropic (Claude models)
 3. `OPENAI_API_KEY` — OpenAI (GPT/o3 models)
 4. `OPENROUTER_API_KEY` — OpenRouter (multi-provider gateway)
 
 Run `prism setup` to configure keys interactively.
+
+For MARC27, PRISM defaults to `https://api.marc27.com`. Override with
+`MARC27_PLATFORM_URL` when targeting a different deployment.
 
 ---
 
@@ -225,6 +230,18 @@ Transient API errors (HTTP 429, 500, 502, 503) are retried up to 3 times
 with exponential backoff: 1s, 2s, 4s (capped at 8s). The `Retry-After`
 header is respected when present. Auth errors (401) and bad requests (400)
 are never retried.
+
+### Tool Call ID Normalization (OpenAI-Compatible Backends)
+
+Some OpenAI-compatible providers can stream function/tool calls without a
+stable `tool_call_id` on every chunk. PRISM now normalizes this by generating
+a synthetic non-empty id when missing, then using that same id for:
+
+- the assistant tool call record
+- the corresponding `tool` role result message
+
+This preserves tool-result linkage so the model can reliably read tool outputs
+in subsequent TAOR iterations.
 
 ### Large Result Handling (RLM-Inspired ResultStore)
 
