@@ -20,6 +20,10 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+sysinfo.workspace = true
+
+prism-node = { path = "../node" }
+prism-proto = { path = "../proto" }
 prism-python-bridge = { path = "../python-bridge" }
 prism-runtime = { path = "../runtime" }
 prism-workflows = { path = "../workflows" }
