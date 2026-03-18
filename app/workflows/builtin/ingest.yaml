@@ -1,0 +1,85 @@
+name: ingest
+description: >
+  Ingest data from a source into the MARC27 Knowledge Plane.
+  The agent browses the web, reads content, extracts entities,
+  and stores everything with provenance.
+version: "1.0.0"
+author: MARC27
+
+inputs:
+  - name: source
+    type: string
+    description: URL, search query, or file path to ingest
+    required: true
+  - name: mode
+    type: string
+    description: "What to extract: graph (entities), embed (vectors), full (both)"
+    default: "full"
+  - name: corpus
+    type: string
+    description: Corpus slug to associate with (for provenance)
+    required: false
+
+steps:
+  - name: discover
+    skill: web_search
+    description: If source is a query, search the web to find URLs
+    inputs:
+      query: "$source"
+    outputs:
+      urls: "$urls"
+    # Skip if source is already a URL
+    llm_can_modify_inputs: true
+
+  - name: fetch
+    skill: web_read
+    description: Read the source URL and get clean text content
+    inputs:
+      url: "$source"
+    outputs:
+      content: "$content"
+      title: "$title"
+
+  - name: extract
+    skill: llm_extract
+    description: >
+      Use the LLM to extract structured entities and relationships
+      from the fetched content. Entity types: MAT, PRO, ELM, DSC,
+      SMT, CMT, APL, PUB, AUT, TOP, CMF.
+    inputs:
+      text: "$content"
+      title: "$title"
+    outputs:
+      entities: "$entities"
+      relationships: "$relationships"
+
+  - name: store_graph
+    skill: knowledge_ingest
+    description: Store extracted entities and relationships in Neo4j
+    inputs:
+      entities: "$entities"
+      relationships: "$relationships"
+    outputs:
+      entities_created: "$entities_created"
+      relationships_created: "$relationships_created"
+
+  - name: store_embeddings
+    skill: knowledge_embed
+    description: Embed the source text into pgvector for semantic search
+    inputs:
+      content: "$content"
+      doc_id: "$source"
+    outputs:
+      embedding_id: "$embedding_id"
+    # Only run if mode is "full" or "embed"
+
+  - name: record_provenance
+    skill: knowledge_provenance
+    description: Record where this data came from
+    inputs:
+      entities: "$entities"
+      source_url: "$source"
+      pipeline: ["web_read", "llm_extract", "graph_ingest"]
+      confidence: 0.85
+
+on_fail: stabilize
