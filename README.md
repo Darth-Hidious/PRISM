@@ -1,3 +1,11 @@
+# ⚠️ REPOSITORY TEMPORARILY BROKEN ⚠️
+
+# MAJOR CHANGES INCOMING — KERNEL REWRITE IN RUST
+
+> **This repository is currently in a broken state. We are in the process of rewriting the core kernel in Rust. Significant breaking changes are coming very soon. Use at your own risk.**
+
+---
+
 <p align="center">
   <img src="docs/assets/prism-banner.png" alt="PRISM Banner" width="800">
 </p>
