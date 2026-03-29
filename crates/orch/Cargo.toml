@@ -1,0 +1,19 @@
+[package]
+name = "prism-orch"
+description = "Container orchestration — Docker/Podman lifecycle management for Neo4j, Qdrant, Kafka, and Spark."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bollard = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures-util = { workspace = true }
+tokio-util = { workspace = true }
+url = "2"
