@@ -1,3 +1,9 @@
+//! PRISM CLI — the main entry point for the `prism` binary.
+//!
+//! Handles command routing (setup, login, node, workflow, etc.), auth bootstrap
+//! via device-flow OAuth, Python worker supervision, and dynamic workflow
+//! discovery from `~/.prism/workflows/`.
+
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,7 +19,10 @@ use prism_workflows::{
     discover_workflows, execute_workflow, find_workflow, parse_workflow_command_args,
     WorkflowRunResult, WorkflowSpec,
 };
-use serde::{Deserialize, Serialize};
+use prism_client::api::PlatformClient;
+use prism_client::auth::{DeviceCodeResponse, TokenResponse};
+use prism_client::DeviceFlowAuth;
+use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -52,6 +61,75 @@ enum Commands {
     Node {
         #[command(subcommand)]
         command: NodeCommands,
+    },
+    /// Ingest a data file into the knowledge graph.
+    Ingest {
+        /// Path to a CSV/Parquet file or directory to watch.
+        path: PathBuf,
+        /// Ollama model for entity extraction.
+        #[arg(long, default_value = "qwen2.5:7b")]
+        model: String,
+        /// Ollama base URL.
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        /// Neo4j HTTP endpoint.
+        #[arg(long, default_value = "http://localhost:7474")]
+        neo4j_url: String,
+        /// Neo4j username.
+        #[arg(long, default_value = "neo4j")]
+        neo4j_user: String,
+        /// Neo4j password.
+        #[arg(long, default_value = "prism-local")]
+        neo4j_pass: String,
+        /// Qdrant HTTP endpoint.
+        #[arg(long, default_value = "http://localhost:6333")]
+        qdrant_url: String,
+        /// Skip LLM extraction (schema detection only).
+        #[arg(long)]
+        schema_only: bool,
+        /// Watch a directory for new/modified files and ingest continuously.
+        #[arg(long)]
+        watch: bool,
+        /// Path to a YAML ontology mapping file (custom entity/relationship rules).
+        #[arg(long)]
+        mapping: Option<PathBuf>,
+    },
+    /// Query the knowledge graph.
+    Query {
+        /// Natural language or Cypher query.
+        text: String,
+        /// Direct Cypher query (skip LLM translation).
+        #[arg(long)]
+        cypher: bool,
+        /// Semantic vector search.
+        #[arg(long)]
+        semantic: bool,
+        /// Neo4j HTTP endpoint.
+        #[arg(long, default_value = "http://localhost:7474")]
+        neo4j_url: String,
+        /// Neo4j username.
+        #[arg(long, default_value = "neo4j")]
+        neo4j_user: String,
+        /// Neo4j password.
+        #[arg(long, default_value = "prism-local")]
+        neo4j_pass: String,
+        /// Qdrant HTTP endpoint.
+        #[arg(long, default_value = "http://localhost:6333")]
+        qdrant_url: String,
+        /// Ollama base URL (for embedding queries).
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        /// Ollama model.
+        #[arg(long, default_value = "qwen2.5:7b")]
+        model: String,
+        /// Max results to return.
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
+    /// Mesh networking — discover peers, publish datasets, manage subscriptions.
+    Mesh {
+        #[command(subcommand)]
+        command: MeshCommands,
     },
     #[command(external_subcommand)]
     External(Vec<String>),
@@ -116,6 +194,28 @@ enum NodeCommands {
         /// Serve a specific model for inference via Ollama.
         #[arg(long)]
         serve: Option<String>,
+        /// Run in offline mode (no platform registration, local Kafka for mesh).
+        #[arg(long)]
+        offline: bool,
+        /// Dashboard HTTP port (default: 7327).
+        #[arg(long, default_value_t = 7327)]
+        dashboard_port: u16,
+        /// Skip starting managed services (Neo4j, Qdrant, Kafka).
+        #[arg(long)]
+        no_services: bool,
+        /// Connect to existing Neo4j instead of starting a container.
+        #[arg(long)]
+        external_neo4j: Option<String>,
+        /// Connect to existing Qdrant instead of starting a container.
+        #[arg(long)]
+        external_qdrant: Option<String>,
+        /// Also start Kafka (for mesh/pub-sub, off by default in dev).
+        #[arg(long)]
+        with_kafka: bool,
+        /// Broadcast this node on the local network (mDNS) and register for platform discovery.
+        /// Without this flag, the node runs privately — it can discover peers but won't be found.
+        #[arg(long)]
+        broadcast: bool,
     },
     /// Stop a running node daemon.
     Down,
@@ -123,6 +223,14 @@ enum NodeCommands {
     Status,
     /// Probe local capabilities without connecting.
     Probe,
+    /// Stream logs from a managed service (neo4j, qdrant, kafka).
+    Logs {
+        /// Service name: neo4j, qdrant, or kafka.
+        service: String,
+        /// Number of tail lines to show (default: 100).
+        #[arg(long, default_value_t = 100)]
+        tail: usize,
+    },
     /// Manage E2EE node keypair.
     Key {
         #[command(subcommand)]
@@ -138,44 +246,59 @@ enum KeyCommands {
     Rotate,
 }
 
-#[derive(Debug, Deserialize)]
-struct DeviceStartResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    expires_in: i64,
-    interval: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct DevicePollResponse {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    #[serde(rename = "token_type")]
-    _token_type: Option<String>,
-    expires_in: Option<u64>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct OrgSummary {
-    id: String,
-    name: String,
-    slug: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct ProjectSummary {
-    id: String,
-    name: String,
-    slug: String,
-    org_id: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct UserProfile {
-    id: String,
-    display_name: Option<String>,
+#[derive(Debug, Subcommand)]
+enum MeshCommands {
+    /// Discover peers on the local network via mDNS.
+    Discover {
+        /// Timeout in seconds for discovery.
+        #[arg(long, default_value_t = 5)]
+        timeout: u64,
+    },
+    /// List known mesh peers (from a running node).
+    Peers {
+        /// Dashboard URL of the running node.
+        #[arg(long, default_value = "http://127.0.0.1:7327")]
+        dashboard_url: String,
+    },
+    /// Publish a dataset to the mesh.
+    Publish {
+        /// Name of the dataset to publish.
+        name: String,
+        /// Schema version.
+        #[arg(long, default_value = "1.0")]
+        schema_version: String,
+        /// Dashboard URL of the running node.
+        #[arg(long, default_value = "http://127.0.0.1:7327")]
+        dashboard_url: String,
+    },
+    /// Subscribe to a dataset on a remote node.
+    Subscribe {
+        /// Dataset name to subscribe to.
+        dataset_name: String,
+        /// Publisher node UUID.
+        #[arg(long)]
+        publisher: String,
+        /// Dashboard URL of the running node.
+        #[arg(long, default_value = "http://127.0.0.1:7327")]
+        dashboard_url: String,
+    },
+    /// Unsubscribe from a remote dataset.
+    Unsubscribe {
+        /// Dataset name to unsubscribe from.
+        dataset_name: String,
+        /// Publisher node UUID.
+        #[arg(long)]
+        publisher: String,
+        /// Dashboard URL of the running node.
+        #[arg(long, default_value = "http://127.0.0.1:7327")]
+        dashboard_url: String,
+    },
+    /// Show current subscriptions.
+    Subscriptions {
+        /// Dashboard URL of the running node.
+        #[arg(long, default_value = "http://127.0.0.1:7327")]
+        dashboard_url: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -204,12 +327,11 @@ async fn main() -> Result<()> {
             state.preferred_python = Some(python.display().to_string());
             if state.credentials.is_none() {
                 let credentials = run_device_login(&endpoints).await?;
-                let profile = fetch_current_user(&endpoints, &credentials.access_token)
-                    .await
-                    .ok();
+                let platform = PlatformClient::new(&endpoints.api_base)
+                    .with_token(&credentials.access_token);
+                let profile = platform.fetch_current_user().await.ok();
                 let selected = select_project(
-                    &endpoints,
-                    &credentials.access_token,
+                    &platform,
                     profile
                         .as_ref()
                         .and_then(|user| user.display_name.as_deref()),
@@ -229,8 +351,10 @@ async fn main() -> Result<()> {
                 });
                 paths.save_cli_state(&state)?;
             } else if let Some(creds) = state.credentials.as_mut() {
+                let platform = PlatformClient::new(&endpoints.api_base)
+                    .with_token(&creds.access_token);
                 if creds.user_id.is_none() || creds.display_name.is_none() {
-                    if let Ok(profile) = fetch_current_user(&endpoints, &creds.access_token).await {
+                    if let Ok(profile) = platform.fetch_current_user().await {
                         creds.user_id = Some(profile.id);
                         creds.display_name = profile.display_name;
                     }
@@ -242,8 +366,7 @@ async fn main() -> Result<()> {
                         .is_some_and(|project_id| Some(project_id) != creds.project_id.as_ref())
                 {
                     let selected = select_project(
-                        &endpoints,
-                        &creds.access_token,
+                        &platform,
                         creds.display_name.as_deref(),
                     )
                     .await?;
@@ -276,12 +399,11 @@ async fn main() -> Result<()> {
         Commands::Login => {
             let mut state = paths.load_cli_state()?;
             let credentials = run_device_login(&endpoints).await?;
-            let profile = fetch_current_user(&endpoints, &credentials.access_token)
-                .await
-                .ok();
+            let platform = PlatformClient::new(&endpoints.api_base)
+                .with_token(&credentials.access_token);
+            let profile = platform.fetch_current_user().await.ok();
             let selected = select_project(
-                &endpoints,
-                &credentials.access_token,
+                &platform,
                 profile
                     .as_ref()
                     .and_then(|user| user.display_name.as_deref()),
@@ -359,7 +481,18 @@ async fn main() -> Result<()> {
                 ssh_user,
                 background,
                 serve,
+                offline,
+                dashboard_port,
+                no_services,
+                external_neo4j,
+                external_qdrant,
+                with_kafka,
+                broadcast,
             } => {
+                let node_name = name.unwrap_or_else(|| {
+                    sysinfo::System::host_name().unwrap_or_else(|| "prism-node".to_string())
+                });
+
                 // --background: re-exec self as a detached process
                 if background {
                     let exe = std::env::current_exe()
@@ -371,9 +504,7 @@ async fn main() -> Result<()> {
 
                     let mut cmd = std::process::Command::new(exe);
                     cmd.arg("node").arg("up");
-                    if let Some(ref n) = name {
-                        cmd.args(["--name", n]);
-                    }
+                    cmd.args(["--name", &node_name]);
                     cmd.args(["--visibility", &visibility]);
                     if let Some(p) = price {
                         cmd.args(["--price", &p.to_string()]);
@@ -384,12 +515,13 @@ async fn main() -> Result<()> {
                     if !model_paths.is_empty() {
                         cmd.args(["--model-paths", &model_paths.join(",")]);
                     }
-                    if no_compute {
-                        cmd.arg("--no-compute");
-                    }
-                    if no_storage {
-                        cmd.arg("--no-storage");
-                    }
+                    if no_compute { cmd.arg("--no-compute"); }
+                    if no_storage { cmd.arg("--no-storage"); }
+                    if offline { cmd.arg("--offline"); }
+                    if no_services { cmd.arg("--no-services"); }
+                    if with_kafka { cmd.arg("--with-kafka"); }
+                    if broadcast { cmd.arg("--broadcast"); }
+                    cmd.args(["--dashboard-port", &dashboard_port.to_string()]);
                     if let Some(ref host) = ssh_host {
                         cmd.args(["--ssh-host", host]);
                         cmd.args(["--ssh-port", &ssh_port.to_string()]);
@@ -397,9 +529,9 @@ async fn main() -> Result<()> {
                             cmd.args(["--ssh-user", user]);
                         }
                     }
-                    if let Some(ref m) = serve {
-                        cmd.args(["--serve", m]);
-                    }
+                    if let Some(ref m) = serve { cmd.args(["--serve", m]); }
+                    if let Some(ref uri) = external_neo4j { cmd.args(["--external-neo4j", uri]); }
+                    if let Some(ref uri) = external_qdrant { cmd.args(["--external-qdrant", uri]); }
 
                     cmd.stdout(log_file.try_clone()?)
                         .stderr(log_file)
@@ -451,14 +583,145 @@ async fn main() -> Result<()> {
                             bail!("Ollama not reachable: {e}. Is Ollama running?");
                         }
                     }
-                    // Set env so the probe detects the served model
                     std::env::set_var("PRISM_NODE_SERVE_MODEL", model);
                 }
 
-                let options = prism_node::daemon::DaemonOptions {
-                    name: name.unwrap_or_else(|| {
-                        sysinfo::System::host_name().unwrap_or_else(|| "prism-node".to_string())
-                    }),
+                // ── V2: Start managed services (Docker containers) ──
+                let mut service_handles = None;
+                if !no_services && external_neo4j.is_none() {
+                    println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
+                    if offline { println!("  (OFFLINE MODE)"); }
+                    println!("  Node: {node_name}\n");
+                    println!("  Starting services...");
+
+                    match prism_orch::DockerOrchestrator::new() {
+                        Ok(orch) => {
+                            use prism_orch::ServiceOrchestrator;
+                            let mut svc_config = prism_orch::ServiceConfig::default();
+                            if with_kafka {
+                                svc_config.kafka = Some(prism_orch::services::KafkaConfig::default());
+                            }
+
+                            match orch.start_all(&svc_config).await {
+                                Ok(handles) => {
+                                    for h in &handles.services {
+                                        let mark = if h.healthy { "\u{2713}" } else { "~" };
+                                        println!("  {mark} {:<12} localhost:{}", h.name, h.port);
+                                    }
+                                    service_handles = Some(handles);
+                                }
+                                Err(e) => {
+                                    eprintln!("  Warning: Failed to start managed services: {e}");
+                                    eprintln!("  (Is Docker running? Continuing without containers.)");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  Warning: Docker not available: {e}");
+                            eprintln!("  (Continuing without managed services.)");
+                        }
+                    }
+                }
+
+                // ── V2: Start the embedded dashboard server ──
+                let mut server_node_state = prism_server::NodeState::new(node_name.clone());
+
+                // Wire core databases (RBAC + audit)
+                let state_dir = &paths.state_dir;
+                std::fs::create_dir_all(state_dir)?;
+                server_node_state.audit_db_path = Some(state_dir.join("audit.db"));
+                server_node_state.rbac_db_path = Some(state_dir.join("rbac.db"));
+                server_node_state.session_db_path = Some(state_dir.join("sessions.db"));
+
+                // Scan for tools
+                let tools_dir = paths.config_dir.join("tools");
+                if tools_dir.is_dir() {
+                    if let Ok(mut reg) = server_node_state.tool_registry.write() {
+                        let _ = reg.scan_directory(&tools_dir);
+                    }
+                }
+
+                // Wire backend configs based on managed vs external services
+                if external_neo4j.is_some() || service_handles.is_some() {
+                    let neo4j_url = external_neo4j
+                        .clone()
+                        .unwrap_or_else(|| "http://localhost:7474".into());
+                    server_node_state.neo4j = Some(prism_ingest::Neo4jConfig {
+                        base_url: neo4j_url,
+                        database: "neo4j".into(),
+                        username: "neo4j".into(),
+                        password: "prism-local".into(),
+                    });
+                }
+                if external_qdrant.is_some() || service_handles.is_some() {
+                    let qdrant_url = external_qdrant
+                        .clone()
+                        .unwrap_or_else(|| "http://localhost:6333".into());
+                    server_node_state.qdrant = Some(prism_ingest::QdrantConfig {
+                        base_url: qdrant_url,
+                        collection: "prism_embeddings".into(),
+                        api_key: None,
+                    });
+                }
+
+                // Wire LLM config for NL query translation (Ollama by default)
+                server_node_state.llm = Some(prism_ingest::LlmConfig::default());
+
+                // ── Platform registration (unless --offline) ──
+                let mut daemon_platform_client: Option<PlatformClient> = None;
+                let mut daemon_platform_node_id: Option<String> = None;
+                let mut daemon_org_id: Option<String> = None;
+
+                if !offline {
+                    let cli_state = paths.load_cli_state()?;
+                    if let Some(ref creds) = cli_state.credentials {
+                        daemon_org_id = creds.org_id.clone();
+                        let platform = PlatformClient::new(&endpoints.api_base)
+                            .with_token(&creds.access_token);
+                        let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
+                        let caps = serde_json::json!({
+                            "compute": !no_compute,
+                            "storage": !no_storage,
+                            "dashboard_port": dashboard_port,
+                        });
+                        match registry.register_node(&node_name, &caps).await {
+                            Ok(reg) => {
+                                println!("  \u{2713} Registered with platform (node_id: {})", reg.node_id);
+                                daemon_platform_node_id = Some(reg.node_id);
+                                server_node_state.platform_client = Some(platform.clone());
+                                daemon_platform_client = Some(platform);
+                            }
+                            Err(e) => {
+                                eprintln!("  Warning: Platform registration failed: {e}");
+                                eprintln!("  (Continuing in offline mode.)");
+                            }
+                        }
+                    } else {
+                        eprintln!("  Warning: No credentials — run `prism setup` first to register with platform.");
+                    }
+                }
+
+                let daemon_rbac_db_path = server_node_state.rbac_db_path.clone();
+                let server_state = std::sync::Arc::new(server_node_state);
+                if let Some(ref handles) = service_handles {
+                    server_state.update_services(
+                        handles.services.iter().map(|h| prism_server::ServiceEntry {
+                            name: h.name.clone(),
+                            port: h.port,
+                            healthy: h.healthy,
+                        }).collect(),
+                    );
+                }
+                let (_addr, _server_handle) =
+                    prism_server::start_server(server_state.clone(), dashboard_port)
+                        .await
+                        .context("Failed to start dashboard server")?;
+                println!("  \u{2713} {:<12} http://localhost:{}", "Dashboard", dashboard_port);
+                println!();
+
+                // ── V1: Run the platform daemon (heartbeat, job dispatch) ──
+                let daemon_options = prism_node::daemon::DaemonOptions {
+                    name: node_name,
                     visibility,
                     price_per_hour_usd: price,
                     no_compute,
@@ -468,9 +731,60 @@ async fn main() -> Result<()> {
                         port: ssh_port,
                         user: ssh_user.or_else(default_ssh_user),
                     }),
+                    broadcast,
+                    platform_client: daemon_platform_client,
+                    platform_node_id: daemon_platform_node_id,
+                    rbac_db_path: daemon_rbac_db_path,
+                    org_id: daemon_org_id,
                 };
 
-                prism_node::daemon::run_daemon(&endpoints, &paths, options).await?;
+                // ── Start mesh networking (mDNS discovery + optional broadcast) ──
+                let mesh_cancel = tokio_util::sync::CancellationToken::new();
+                let mesh_config = prism_mesh::MeshConfig {
+                    node_name: daemon_options.name.clone(),
+                    publish_port: dashboard_port,
+                    discovery: vec![prism_mesh::DiscoveryMethod::Mdns],
+                };
+                let mesh_handle = prism_mesh::init_mesh(mesh_config)?;
+                let mesh_task = prism_mesh::start_mesh(
+                    mesh_handle,
+                    prism_mesh::MeshStartOptions {
+                        node_name: daemon_options.name.clone(),
+                        publish_port: dashboard_port,
+                        broadcast,
+                        capabilities: Vec::new(),
+                        discovery_interval_secs: 30,
+                        event_tx: Some(server_state.ws_broadcast.clone()),
+                    },
+                    mesh_cancel.clone(),
+                );
+                if broadcast {
+                    println!("  \u{2713} Mesh: broadcasting (mDNS + platform discovery)");
+                } else {
+                    println!("  \u{2713} Mesh: passive discovery (use --broadcast to advertise)");
+                }
+
+                // Run daemon until Ctrl+C — on shutdown, stop Docker containers
+                let result = prism_node::daemon::run_daemon(&endpoints, &paths, daemon_options).await;
+
+                // Stop mesh
+                mesh_cancel.cancel();
+                mesh_task.await.ok();
+
+                // Graceful shutdown: stop managed services
+                if let Some(handles) = service_handles {
+                    println!("\nStopping managed services...");
+                    if let Ok(orch) = prism_orch::DockerOrchestrator::new() {
+                        use prism_orch::ServiceOrchestrator;
+                        if let Err(e) = orch.stop_all(&handles).await {
+                            eprintln!("Warning: Failed to stop some containers: {e}");
+                        } else {
+                            println!("All services stopped.");
+                        }
+                    }
+                }
+
+                result?;
             }
             NodeCommands::Down => {
                 prism_node::daemon::stop_daemon(&paths)?;
@@ -482,6 +796,16 @@ async fn main() -> Result<()> {
             NodeCommands::Probe => {
                 let caps = prism_node::detect::probe_local_capabilities_async().await;
                 println!("{}", serde_json::to_string_pretty(&caps)?);
+            }
+            NodeCommands::Logs { service, tail } => {
+                let orch = prism_orch::DockerOrchestrator::new()?;
+                match orch.container_logs(&service, tail).await {
+                    Ok(logs) => print!("{logs}"),
+                    Err(e) => {
+                        eprintln!("Failed to get logs for '{service}': {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
             NodeCommands::Key { command } => match command {
                 KeyCommands::Show => {
@@ -499,6 +823,74 @@ async fn main() -> Result<()> {
                 }
             },
         },
+        Commands::Ingest {
+            path,
+            model,
+            ollama_url,
+            neo4j_url,
+            neo4j_user,
+            neo4j_pass,
+            qdrant_url,
+            schema_only,
+            watch,
+            mapping,
+        } => {
+            if watch {
+                handle_ingest_watch(
+                    &path,
+                    &model,
+                    &ollama_url,
+                    &neo4j_url,
+                    &neo4j_user,
+                    &neo4j_pass,
+                    &qdrant_url,
+                    schema_only,
+                    mapping.as_deref(),
+                )
+                .await?;
+            } else {
+                handle_ingest(
+                    &path,
+                    &model,
+                    &ollama_url,
+                    &neo4j_url,
+                    &neo4j_user,
+                    &neo4j_pass,
+                    &qdrant_url,
+                    schema_only,
+                )
+                .await?;
+            }
+        }
+        Commands::Query {
+            text,
+            cypher,
+            semantic,
+            neo4j_url,
+            neo4j_user,
+            neo4j_pass,
+            qdrant_url,
+            ollama_url,
+            model,
+            limit,
+        } => {
+            handle_query(
+                &text,
+                cypher,
+                semantic,
+                &neo4j_url,
+                &neo4j_user,
+                &neo4j_pass,
+                &qdrant_url,
+                &ollama_url,
+                &model,
+                limit,
+            )
+            .await?;
+        }
+        Commands::Mesh { command } => {
+            handle_mesh_command(command).await?;
+        }
         Commands::External(args) => {
             if try_run_workflow_alias(&project_root, &args).await? {
                 return Ok(());
@@ -595,6 +987,508 @@ fn render_workflow_result(spec: &WorkflowSpec, result: &WorkflowRunResult) {
     }
 }
 
+// ── prism mesh ─────────────────────────────────────────────────────────
+
+async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
+    match command {
+        MeshCommands::Discover { timeout } => {
+            println!("Discovering PRISM nodes on local network ({}s timeout)...", timeout);
+            let config = prism_mesh::MeshConfig {
+                node_name: "discovery-probe".into(),
+                publish_port: 0,
+                discovery: vec![prism_mesh::DiscoveryMethod::Mdns],
+            };
+            let handle = prism_mesh::init_mesh(config)?;
+            // mDNS discovery is async — wait for the timeout period.
+            tokio::time::sleep(Duration::from_secs(timeout)).await;
+            let peers = handle.peers();
+            if peers.is_empty() {
+                println!("No peers found.");
+            } else {
+                println!("{:<36}  {:<20}  {:<22}  Capabilities", "ID", "Name", "Address");
+                println!("{}", "-".repeat(90));
+                for p in &peers {
+                    println!(
+                        "{:<36}  {:<20}  {}:{:<5}  {}",
+                        p.node_id,
+                        p.name,
+                        p.address,
+                        p.port,
+                        p.capabilities.join(", ")
+                    );
+                }
+                println!("\n{} peer(s) found.", peers.len());
+            }
+        }
+        MeshCommands::Peers { dashboard_url } => {
+            let url = format!("{dashboard_url}/api/mesh/nodes");
+            let resp = reqwest::get(&url)
+                .await
+                .with_context(|| format!("Failed to reach node at {url}"))?;
+            let body = resp.text().await?;
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+
+            let online = status["online"].as_bool().unwrap_or(false);
+            if !online {
+                println!("Mesh: offline");
+                return Ok(());
+            }
+
+            println!("Mesh: online (node {})", status["node_id"].as_str().unwrap_or("?"));
+            let peers = status["peers"].as_array();
+            match peers {
+                Some(list) if !list.is_empty() => {
+                    println!("{} peer(s):", list.len());
+                    for p in list {
+                        println!(
+                            "  {} — {}:{}  (last seen: {})",
+                            p["name"].as_str().unwrap_or("?"),
+                            p["address"].as_str().unwrap_or("?"),
+                            p["port"].as_u64().unwrap_or(0),
+                            p["last_seen"].as_str().unwrap_or("?"),
+                        );
+                    }
+                }
+                _ => println!("No peers connected."),
+            }
+        }
+        MeshCommands::Publish {
+            name,
+            schema_version,
+            dashboard_url,
+        } => {
+            println!("Publishing dataset '{name}' (v{schema_version}) to mesh...");
+            let url = format!("{dashboard_url}/api/mesh/publish");
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({
+                    "name": name,
+                    "schema_version": schema_version,
+                }))
+                .send()
+                .await
+                .with_context(|| format!("Failed to reach node at {dashboard_url}"))?;
+            if resp.status().is_success() {
+                println!("Dataset '{name}' published. Other nodes can subscribe via mesh discovery.");
+            } else {
+                bail!("Node returned error: {} — {}", resp.status(), resp.text().await.unwrap_or_default());
+            }
+        }
+        MeshCommands::Subscribe {
+            dataset_name,
+            publisher,
+            dashboard_url,
+        } => {
+            println!("Subscribing to '{dataset_name}' from node {publisher}...");
+            let url = format!("{dashboard_url}/api/mesh/subscribe");
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({
+                    "dataset_name": dataset_name,
+                    "publisher_node": publisher,
+                }))
+                .send()
+                .await
+                .with_context(|| format!("Failed to reach node at {dashboard_url}"))?;
+            if resp.status().is_success() {
+                println!("Subscribed to '{dataset_name}'. Updates will sync automatically.");
+            } else {
+                bail!("Node returned error: {} — {}", resp.status(), resp.text().await.unwrap_or_default());
+            }
+        }
+        MeshCommands::Unsubscribe {
+            dataset_name,
+            publisher,
+            dashboard_url,
+        } => {
+            println!("Unsubscribing from '{dataset_name}'...");
+            let url = format!("{dashboard_url}/api/mesh/subscribe");
+            let client = reqwest::Client::new();
+            let resp = client
+                .delete(&url)
+                .json(&serde_json::json!({
+                    "dataset_name": dataset_name,
+                    "publisher_node": publisher,
+                }))
+                .send()
+                .await
+                .with_context(|| format!("Failed to reach node at {dashboard_url}"))?;
+            if resp.status().is_success() {
+                println!("Unsubscribed from '{dataset_name}'.");
+            } else {
+                bail!("Node returned error: {} — {}", resp.status(), resp.text().await.unwrap_or_default());
+            }
+        }
+        MeshCommands::Subscriptions { dashboard_url } => {
+            let url = format!("{dashboard_url}/api/mesh/subscriptions");
+            let resp = reqwest::get(&url)
+                .await
+                .with_context(|| format!("Failed to reach node at {url}"))?;
+            let body = resp.text().await?;
+            let data: serde_json::Value = serde_json::from_str(&body)?;
+
+            let published = data["published"].as_array();
+            let subscribed = data["subscribed"].as_array();
+
+            println!("Published datasets:");
+            match published {
+                Some(list) if !list.is_empty() => {
+                    for d in list {
+                        println!(
+                            "  {} (v{}) — {} subscriber(s)",
+                            d["name"].as_str().unwrap_or("?"),
+                            d["schema_version"].as_str().unwrap_or("?"),
+                            d["subscriber_count"].as_u64().unwrap_or(0),
+                        );
+                    }
+                }
+                _ => println!("  (none)"),
+            }
+
+            println!("\nActive subscriptions:");
+            match subscribed {
+                Some(list) if !list.is_empty() => {
+                    for s in list {
+                        println!(
+                            "  {} from node {} (since {})",
+                            s["dataset_name"].as_str().unwrap_or("?"),
+                            s["publisher_node"].as_str().unwrap_or("?"),
+                            s["subscribed_at"].as_str().unwrap_or("?"),
+                        );
+                    }
+                }
+                _ => println!("  (none)"),
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── prism ingest ────────────────────────────────────────────────────────
+
+async fn handle_ingest(
+    path: &Path,
+    model: &str,
+    ollama_url: &str,
+    neo4j_url: &str,
+    neo4j_user: &str,
+    neo4j_pass: &str,
+    qdrant_url: &str,
+    schema_only: bool,
+) -> Result<()> {
+    use prism_ingest::pipeline::{IngestPipeline, PipelineConfig};
+    use prism_ingest::{LlmConfig, Neo4jConfig, QdrantConfig};
+
+    if !path.exists() {
+        bail!("File not found: {}", path.display());
+    }
+
+    println!("Ingesting: {}", path.display());
+
+    let config = if schema_only {
+        PipelineConfig {
+            llm: None,
+            neo4j: None,
+            qdrant: None,
+            max_sample_rows: 10,
+        }
+    } else {
+        PipelineConfig {
+            llm: Some(LlmConfig {
+                base_url: ollama_url.into(),
+                model: model.into(),
+                max_sample_rows: 10,
+                timeout_secs: 120,
+            }),
+            neo4j: Some(Neo4jConfig {
+                base_url: neo4j_url.into(),
+                database: "neo4j".into(),
+                username: neo4j_user.into(),
+                password: neo4j_pass.into(),
+            }),
+            qdrant: Some(QdrantConfig {
+                base_url: qdrant_url.into(),
+                collection: "prism_embeddings".into(),
+                api_key: None,
+            }),
+            max_sample_rows: 10,
+        }
+    };
+
+    let pipeline = IngestPipeline::with_config(config);
+    let result = pipeline.ingest_file(path).await?;
+
+    println!();
+    println!("  Schema: {} columns, {} rows", result.column_count, result.row_count);
+    println!("  Columns: {}", result.schema.columns.join(", "));
+
+    if !result.validation.passed {
+        println!(
+            "  Warnings: {} issues",
+            result.validation.issues.len()
+        );
+    }
+
+    if let Some(ref entities) = result.entities {
+        println!(
+            "  Entities: {} extracted, {} relationships",
+            entities.entities.len(),
+            entities.relationships.len()
+        );
+    }
+
+    if let Some(ref graph) = result.graph {
+        println!(
+            "  Graph: {} nodes, {} edges written to Neo4j",
+            graph.nodes_created, graph.edges_created
+        );
+    }
+
+    if let Some(ref embeddings) = result.embeddings {
+        println!(
+            "  Embeddings: {} vectors (dim={})",
+            embeddings.vectors.len(),
+            embeddings.dimension.unwrap_or(0)
+        );
+    }
+
+    if schema_only {
+        println!("  (schema-only mode — LLM/graph/vector steps skipped)");
+    }
+
+    println!("\n  Done.");
+    Ok(())
+}
+
+/// Watch a directory for new/modified CSV/Parquet files and ingest them.
+#[allow(clippy::too_many_arguments)]
+async fn handle_ingest_watch(
+    dir: &Path,
+    model: &str,
+    ollama_url: &str,
+    neo4j_url: &str,
+    neo4j_user: &str,
+    neo4j_pass: &str,
+    qdrant_url: &str,
+    schema_only: bool,
+    _mapping: Option<&Path>,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+
+    if !dir.is_dir() {
+        bail!(
+            "Watch mode requires a directory, got: {}",
+            dir.display()
+        );
+    }
+
+    println!("Watching {} for CSV/Parquet files (Ctrl+C to stop)...\n", dir.display());
+
+    // Track file modification times to detect changes
+    let mut seen: HashMap<PathBuf, SystemTime> = HashMap::new();
+
+    // Initial scan — ingest all existing files
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !is_ingestable(&path) {
+            continue;
+        }
+        if let Ok(meta) = path.metadata() {
+            if let Ok(modified) = meta.modified() {
+                seen.insert(path.clone(), modified);
+            }
+        }
+        println!("[initial] Ingesting {}", path.display());
+        if let Err(e) = handle_ingest(
+            &path, model, ollama_url, neo4j_url, neo4j_user, neo4j_pass, qdrant_url, schema_only,
+        )
+        .await
+        {
+            eprintln!("  Error: {e}");
+        }
+    }
+
+    // Poll loop — check for new/modified files every 5 seconds
+    let poll_interval = Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let entries: Vec<_> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+            Err(e) => {
+                eprintln!("Failed to read directory: {e}");
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let path = entry.path();
+            if !is_ingestable(&path) {
+                continue;
+            }
+
+            let modified = match path.metadata().and_then(|m| m.modified()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            let is_new = match seen.get(&path) {
+                Some(prev) => modified > *prev,
+                None => true,
+            };
+
+            if is_new {
+                seen.insert(path.clone(), modified);
+                println!("\n[watch] Detected: {}", path.display());
+                if let Err(e) = handle_ingest(
+                    &path, model, ollama_url, neo4j_url, neo4j_user, neo4j_pass, qdrant_url,
+                    schema_only,
+                )
+                .await
+                {
+                    eprintln!("  Error: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Check if a file has an ingestable extension.
+fn is_ingestable(path: &Path) -> bool {
+    path.is_file()
+        && matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("csv" | "tsv" | "parquet" | "pq")
+        )
+}
+
+// ── prism query ─────────────────────────────────────────────────────────
+
+async fn handle_query(
+    text: &str,
+    cypher: bool,
+    semantic: bool,
+    neo4j_url: &str,
+    neo4j_user: &str,
+    neo4j_pass: &str,
+    qdrant_url: &str,
+    ollama_url: &str,
+    model: &str,
+    limit: usize,
+) -> Result<()> {
+    use prism_ingest::embeddings::{QdrantVectorStore, VectorStore};
+    use prism_ingest::graph::{GraphStore, Neo4jGraphStore};
+    use prism_ingest::{Neo4jConfig, QdrantConfig};
+
+    let neo4j_config = Neo4jConfig {
+        base_url: neo4j_url.into(),
+        database: "neo4j".into(),
+        username: neo4j_user.into(),
+        password: neo4j_pass.into(),
+    };
+
+    if cypher {
+        // Direct Cypher query
+        let store = Neo4jGraphStore::new(neo4j_config);
+        let stats = store.stats().await?;
+        println!("Graph: {} nodes, {} relationships\n", stats.node_count, stats.relationship_count);
+
+        // Execute the user's Cypher via the graph's neighbor API (limited)
+        // For direct Cypher, we expose a raw query path.
+        println!("Querying: {text}");
+        let result = store.neighbors(text, 2).await?;
+        for entity in &result.entities {
+            println!(
+                "  [{type}] {name} {props}",
+                r#type = entity.entity_type,
+                name = entity.name,
+                props = entity.properties,
+            );
+        }
+        if result.entities.is_empty() {
+            println!("  (no results)");
+        }
+    } else if semantic {
+        // Semantic vector search
+        let qdrant_config = QdrantConfig {
+            base_url: qdrant_url.into(),
+            collection: "prism_embeddings".into(),
+            api_key: None,
+        };
+
+        // Generate embedding for the query text
+        println!("Generating query embedding...");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()?;
+        let resp = client
+            .post(format!("{}/api/embed", ollama_url))
+            .json(&serde_json::json!({
+                "model": model,
+                "input": [text],
+            }))
+            .send()
+            .await
+            .context("failed to call Ollama for query embedding")?;
+
+        #[derive(Deserialize)]
+        struct EmbedResp {
+            embeddings: Vec<Vec<f32>>,
+        }
+
+        let embed: EmbedResp = resp.json().await.context("bad embedding response")?;
+        let query_vec = embed
+            .embeddings
+            .into_iter()
+            .next()
+            .context("no embedding returned")?;
+
+        let store = QdrantVectorStore::new(qdrant_config);
+        let results = store.query(&query_vec, limit).await?;
+
+        println!("\nSemantic search results ({} matches):\n", results.len());
+        for (i, (id, score)) in results.iter().enumerate() {
+            println!("  {}. {id}  (score: {score:.4})", i + 1);
+        }
+        if results.is_empty() {
+            println!("  (no results — collection may be empty)");
+        }
+    } else {
+        // Natural language → graph traversal
+        // Find entities whose names match the query text, then traverse neighbors.
+        let store = Neo4jGraphStore::new(neo4j_config);
+        println!("Querying knowledge graph: \"{text}\"\n");
+
+        let result = store.neighbors(text, 3).await?;
+        if result.entities.is_empty() {
+            println!("  No direct matches. Try --semantic for vector search.");
+        } else {
+            println!("  Found {} connected entities:\n", result.entities.len());
+            for entity in &result.entities {
+                let props_str = if entity.properties.is_object()
+                    && entity.properties.as_object().map_or(true, |o| o.is_empty())
+                {
+                    String::new()
+                } else {
+                    format!("  {}", entity.properties)
+                };
+                println!(
+                    "  [{type}] {name}{props}",
+                    r#type = entity.entity_type,
+                    name = entity.name,
+                    props = props_str,
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn proxy_python_cli(python: &Path, project_root: &Path, args: &[String]) -> Result<()> {
     let mut cmd = tokio::process::Command::new(python);
     cmd.arg("-m")
@@ -610,20 +1504,11 @@ async fn proxy_python_cli(python: &Path, project_root: &Path, args: &[String]) -
 }
 
 async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredentials> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    let platform = PlatformClient::new(&endpoints.api_base);
+    let http = platform.inner().clone();
 
-    let response = client
-        .post(format!("{}/auth/device/start", endpoints.api_base))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .context("failed to start device flow")?
-        .error_for_status()
-        .context("device flow start returned error status")?;
-
-    let start: DeviceStartResponse = response.json().await?;
+    let start: DeviceCodeResponse =
+        DeviceFlowAuth::start_device_flow(&http, &endpoints.api_base).await?;
 
     println!();
     println!("PRISM setup needs MARC27 platform login.");
@@ -635,77 +1520,48 @@ async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredent
     }
     println!("Approve the device in your browser, then return here.");
 
-    let poll_url = format!("{}/auth/device/poll", endpoints.api_base);
-    let deadline = std::time::Instant::now() + Duration::from_secs(start.expires_in as u64);
-    let mut interval = Duration::from_secs(start.interval.max(1) as u64);
+    let token: TokenResponse = DeviceFlowAuth::poll_for_token(
+        &http,
+        &endpoints.api_base,
+        &start.device_code,
+        start.interval.max(1) as u64,
+    )
+    .await?;
 
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(interval).await;
+    let expires_at = token.expires_in.and_then(|secs| {
+        chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
+    });
 
-        let poll = client
-            .post(&poll_url)
-            .json(&serde_json::json!({ "device_code": start.device_code }))
-            .send()
-            .await
-            .context("failed to poll device flow")?;
-
-        let status = poll.status();
-        let payload: DevicePollResponse = poll.json().await?;
-
-        if payload.error.is_none()
-            && payload.access_token.is_some()
-            && payload.refresh_token.is_some()
-        {
-            let expires_at = payload.expires_in.and_then(|secs| {
-                chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
-            });
-            return Ok(StoredCredentials {
-                access_token: payload.access_token.unwrap_or_default(),
-                refresh_token: payload.refresh_token.unwrap_or_default(),
-                platform_url: endpoints.api_base.trim_end_matches("/api/v1").to_string(),
-                user_id: None,
-                display_name: None,
-                org_id: None,
-                org_name: None,
-                project_id: None,
-                project_name: None,
-                expires_at,
-            });
-        }
-
-        match payload.error.as_deref() {
-            Some("authorization_pending") => continue,
-            Some("slow_down") => {
-                interval += Duration::from_secs(5);
-                continue;
-            }
-            Some("access_denied") => bail!("device login denied by user"),
-            Some("expired_token") => bail!("device login expired before approval"),
-            Some(other) => bail!("device login failed: {other} (http {status})"),
-            None => bail!("device login returned unexpected payload"),
-        }
-    }
-
-    bail!("device login timed out")
+    Ok(StoredCredentials {
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        platform_url: endpoints.api_base.trim_end_matches("/api/v1").to_string(),
+        user_id: None,
+        display_name: None,
+        org_id: None,
+        org_name: None,
+        project_id: None,
+        project_name: None,
+        expires_at,
+    })
 }
 
 async fn select_project(
-    endpoints: &PlatformEndpoints,
-    access_token: &str,
+    platform: &PlatformClient,
     display_name: Option<&str>,
 ) -> Result<SelectedContext> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-
     if let Some(project_id) = env_project_override() {
-        match fetch_project_by_id(&client, endpoints, access_token, &project_id).await {
+        match platform.get_project(&project_id).await {
             Ok(project) => {
-                let org_name =
-                    fetch_org_name_for_project(&client, endpoints, access_token, &project)
-                        .await
-                        .ok()
-                        .flatten();
+                let org_name = platform
+                    .list_orgs()
+                    .await
+                    .ok()
+                    .and_then(|orgs| {
+                        orgs.into_iter()
+                            .find(|org| org.id == project.org_id)
+                            .map(|org| org.name)
+                    });
                 println!(
                     "Using project from MARC27_PROJECT_ID: {} ({})",
                     project.name, project.id
@@ -726,17 +1582,7 @@ async fn select_project(
         }
     }
 
-    let orgs: Vec<OrgSummary> = client
-        .get(format!("{}/orgs", endpoints.api_base))
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .context("failed to list orgs")?
-        .error_for_status()
-        .context("listing orgs returned error status")?
-        .json()
-        .await
-        .context("failed to parse org list")?;
+    let orgs = platform.list_orgs().await?;
 
     if orgs.is_empty() {
         println!("No organizations available for this account yet.");
@@ -752,35 +1598,21 @@ async fn select_project(
         format!("{} ({})", org.name, org.slug)
     })?;
 
-    let projects: Vec<ProjectSummary> = client
-        .get(format!("{}/projects", endpoints.api_base))
-        .query(&[("org_id", &selected_org.id)])
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .context("failed to list projects")?
-        .error_for_status()
-        .context("listing projects returned error status")?
-        .json()
-        .await
-        .context("failed to parse project list")?;
+    let projects = platform.list_projects_for_org(&selected_org.id).await?;
 
     if projects.is_empty() {
         println!("No projects found in organization {}.", selected_org.name);
-        let created = create_default_project(
-            &client,
-            endpoints,
-            access_token,
-            &selected_org,
-            display_name,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to auto-create a PRISM project in organization {}",
-                selected_org.name
-            )
-        })?;
+        let name = default_project_name(display_name);
+        let slug = default_project_slug();
+        let created = platform
+            .create_project(&selected_org.id, &name, &slug)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to auto-create a PRISM project in organization {}",
+                    selected_org.name
+                )
+            })?;
         println!("Created PRISM project: {} ({})", created.name, created.slug);
         return Ok(SelectedContext {
             org_id: Some(selected_org.id.clone()),
@@ -809,83 +1641,7 @@ fn env_project_override() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn fetch_project_by_id(
-    client: &reqwest::Client,
-    endpoints: &PlatformEndpoints,
-    access_token: &str,
-    project_id: &str,
-) -> Result<ProjectSummary> {
-    client
-        .get(format!("{}/projects/{project_id}", endpoints.api_base))
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .context("failed to fetch project by id")?
-        .error_for_status()
-        .context("project lookup returned error status")?
-        .json()
-        .await
-        .context("failed to parse project payload")
-}
 
-async fn fetch_org_name_for_project(
-    client: &reqwest::Client,
-    endpoints: &PlatformEndpoints,
-    access_token: &str,
-    project: &ProjectSummary,
-) -> Result<Option<String>> {
-    let orgs: Vec<OrgSummary> = client
-        .get(format!("{}/orgs", endpoints.api_base))
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .context("failed to list orgs")?
-        .error_for_status()
-        .context("listing orgs returned error status")?
-        .json()
-        .await
-        .context("failed to parse org list")?;
-    Ok(orgs
-        .into_iter()
-        .find(|org| org.id == project.org_id)
-        .map(|org| org.name))
-}
-
-async fn create_default_project(
-    client: &reqwest::Client,
-    endpoints: &PlatformEndpoints,
-    access_token: &str,
-    org: &OrgSummary,
-    display_name: Option<&str>,
-) -> Result<ProjectSummary> {
-    let name = default_project_name(display_name);
-    let slug = default_project_slug();
-    let response = client
-        .post(format!("{}/projects", endpoints.api_base))
-        .bearer_auth(access_token)
-        .json(&serde_json::json!({
-            "name": name,
-            "slug": slug,
-            "org_id": org.id,
-        }))
-        .send()
-        .await
-        .context("failed to create default project")?;
-
-    if response.status() == reqwest::StatusCode::FORBIDDEN {
-        bail!(
-            "project creation forbidden for organization {}. Set MARC27_PROJECT_ID to an existing project you can access, or create a project from the platform dashboard first",
-            org.name
-        );
-    }
-
-    response
-        .error_for_status()
-        .context("project creation returned error status")?
-        .json()
-        .await
-        .context("failed to parse created project payload")
-}
 
 fn default_project_name(display_name: Option<&str>) -> String {
     match display_name
@@ -940,33 +1696,17 @@ async fn refresh_access_token(
     endpoints: &PlatformEndpoints,
     creds: &StoredCredentials,
 ) -> Result<StoredCredentials> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-
-    #[derive(Deserialize)]
-    struct RefreshResponse {
-        access_token: String,
-        refresh_token: Option<String>,
-        expires_in: Option<u64>,
-    }
-
-    let resp = client
-        .post(format!("{}/auth/refresh", endpoints.api_base))
-        .json(&serde_json::json!({ "refresh_token": creds.refresh_token }))
-        .send()
-        .await
-        .context("failed to refresh token")?
-        .error_for_status()
-        .context("token refresh returned error")?;
-
-    let refreshed: RefreshResponse = resp.json().await?;
+    let platform = PlatformClient::new(&endpoints.api_base);
+    let refreshed = DeviceFlowAuth::refresh_token(
+        platform.inner(),
+        &endpoints.api_base,
+        &creds.refresh_token,
+    )
+    .await?;
 
     let mut new_creds = creds.clone();
     new_creds.access_token = refreshed.access_token;
-    if let Some(rt) = refreshed.refresh_token {
-        new_creds.refresh_token = rt;
-    }
+    new_creds.refresh_token = refreshed.refresh_token;
     new_creds.expires_at = refreshed.expires_in.and_then(|secs| {
         chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
     });
@@ -974,25 +1714,6 @@ async fn refresh_access_token(
     Ok(new_creds)
 }
 
-async fn fetch_current_user(
-    endpoints: &PlatformEndpoints,
-    access_token: &str,
-) -> Result<UserProfile> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-    client
-        .get(format!("{}/users/me", endpoints.api_base))
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .context("failed to fetch current user")?
-        .error_for_status()
-        .context("current user request returned error status")?
-        .json()
-        .await
-        .context("failed to parse current user payload")
-}
 
 fn launch_tui(
     paths: &PrismPaths,
@@ -1197,7 +1918,7 @@ fn print_node_status(caps: &NodeCapabilities, endpoints: &PlatformEndpoints) {
     println!();
 
     println!("Compute:");
-    println!("  CPU: {} cores, {} MB RAM", caps.cpu_cores, caps.ram_gb);
+    println!("  CPU: {} cores, {} GB RAM", caps.cpu_cores, caps.ram_gb);
     if caps.gpus.is_empty() {
         println!("  GPUs: none");
     } else {
@@ -1314,5 +2035,63 @@ mod tests {
         std::env::set_var("USER", "sid");
         assert_eq!(default_ssh_user(), Some("sid".to_string()));
         std::env::remove_var("USER");
+    }
+
+    #[test]
+    fn cli_parses_ingest_command() {
+        let cli = Cli::try_parse_from(["prism", "ingest", "/tmp/data.csv"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Ingest { path, schema_only, model, .. } => {
+                assert_eq!(path, PathBuf::from("/tmp/data.csv"));
+                assert!(!schema_only);
+                assert_eq!(model, "qwen2.5:7b");
+            }
+            _ => panic!("expected Ingest command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_ingest_schema_only() {
+        let cli = Cli::try_parse_from([
+            "prism", "ingest", "--schema-only", "/tmp/data.parquet",
+        ]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Ingest { path, schema_only, .. } => {
+                assert_eq!(path, PathBuf::from("/tmp/data.parquet"));
+                assert!(schema_only);
+            }
+            _ => panic!("expected Ingest command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_query_command() {
+        let cli = Cli::try_parse_from([
+            "prism", "query", "NbMoTaW alloys",
+        ]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Query { text, cypher, semantic, limit, .. } => {
+                assert_eq!(text, "NbMoTaW alloys");
+                assert!(!cypher);
+                assert!(!semantic);
+                assert_eq!(limit, 10);
+            }
+            _ => panic!("expected Query command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_query_semantic() {
+        let cli = Cli::try_parse_from([
+            "prism", "query", "--semantic", "--limit", "5", "similar to Ti-6Al-4V",
+        ]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Query { text, semantic, limit, .. } => {
+                assert_eq!(text, "similar to Ti-6Al-4V");
+                assert!(semantic);
+                assert_eq!(limit, 5);
+            }
+            _ => panic!("expected Query command"),
+        }
     }
 }
