@@ -1,0 +1,25 @@
+[package]
+name = "prism-server"
+description = "Embedded Axum HTTP/WebSocket server — REST API, role-gated routes, and web dashboard host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+axum = { workspace = true, features = ["ws"] }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+prism-client = { path = "../client" }
+prism-core = { path = "../core" }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+prism-ingest = { path = "../ingest" }
+prism-mesh = { path = "../mesh" }
+uuid = { workspace = true }
