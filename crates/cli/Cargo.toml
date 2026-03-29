@@ -1,5 +1,6 @@
 [package]
 name = "prism-cli"
+description = "CLI entry point for PRISM — command routing, auth bootstrap, and worker supervision."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,13 +18,22 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 sysinfo.workspace = true
+uuid.workspace = true
 
+prism-client = { path = "../client" }
+prism-compute = { path = "../compute" }
+prism-ingest = { path = "../ingest" }
+prism-mesh = { path = "../mesh" }
 prism-node = { path = "../node" }
+prism-orch = { path = "../orch" }
+prism-ipc = { path = "../ipc" }
 prism-proto = { path = "../proto" }
 prism-python-bridge = { path = "../python-bridge" }
 prism-runtime = { path = "../runtime" }
+prism-server = { path = "../server" }
 prism-workflows = { path = "../workflows" }
