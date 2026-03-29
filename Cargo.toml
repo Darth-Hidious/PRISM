@@ -4,7 +4,6 @@ members = [
     "crates/client",
     "crates/compute",
     "crates/core",
-    "crates/forge",
     "crates/ingest",
     "crates/ipc",
     "crates/mesh",
