@@ -1,0 +1,35 @@
+name: Dashboard
+
+on:
+  pull_request:
+    paths:
+      - "dashboard/**"
+      - ".github/workflows/dashboard.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "dashboard/**"
+      - ".github/workflows/dashboard.yml"
+
+concurrency:
+  group: dashboard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck-and-build:
+    name: Dashboard Typecheck & Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npx tsc -b --noEmit
+      - run: npx vite build

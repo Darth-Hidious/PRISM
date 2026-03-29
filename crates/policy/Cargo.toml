@@ -1,0 +1,18 @@
+[package]
+name = "prism-policy"
+description = "OPA/Rego policy engine — evaluates workflow, tool, and agent actions against declarative policies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+regorus = "0.5"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
