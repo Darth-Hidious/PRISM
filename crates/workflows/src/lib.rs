@@ -1,3 +1,13 @@
+//! YAML workflow engine for PRISM.
+//!
+//! Discovers workflow definitions from `~/.prism/workflows/` and promotes them
+//! to first-class CLI commands. A workflow is a DAG of tool-execution steps
+//! with template interpolation (`{{ args.data }}`), parallel execution, and
+//! dependency tracking.
+//!
+//! Any YAML file dropped into the workflows directory is automatically
+//! available as `prism <workflow-name>` — no registration or compilation needed.
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -256,6 +266,45 @@ pub async fn execute_workflow(
     values: &BTreeMap<String, String>,
     execute: bool,
 ) -> Result<WorkflowRunResult> {
+    execute_workflow_with_policy(spec, values, execute, None, None).await
+}
+
+/// Execute a workflow with optional OPA policy enforcement.
+///
+/// When a `PolicyEngine` is provided, the engine checks:
+/// 1. Whether the principal is allowed to execute this workflow at all
+/// 2. Whether each `tool` step is allowed before execution
+///
+/// The `principal` should be the user ID or "agent" for autonomous execution.
+pub async fn execute_workflow_with_policy(
+    spec: &WorkflowSpec,
+    values: &BTreeMap<String, String>,
+    execute: bool,
+    mut policy: Option<&mut prism_policy::PolicyEngine>,
+    principal: Option<&str>,
+) -> Result<WorkflowRunResult> {
+    let principal = principal.unwrap_or("agent");
+
+    // Check workflow-level policy
+    if let Some(engine) = policy.as_deref_mut() {
+        let input = prism_policy::PolicyInput {
+            action: "workflow.execute".into(),
+            principal: principal.into(),
+            role: values
+                .get("role")
+                .cloned()
+                .unwrap_or_else(|| "operator".into()),
+            resource: spec.name.clone(),
+            context: serde_json::json!({
+                "execute": execute,
+                "step_count": spec.steps.len(),
+            }),
+        };
+        engine
+            .require(&input)
+            .with_context(|| format!("policy denied workflow '{}'", spec.name))?;
+    }
+
     let mut context = build_initial_context(spec, values)?;
     let mut result = WorkflowRunResult {
         workflow: spec.name.clone(),
@@ -266,10 +315,42 @@ pub async fn execute_workflow(
 
     let client = reqwest::Client::new();
     for step in &spec.steps {
+        // Per-step policy check for tool calls
+        if step.action == "tool" {
+            if let Some(engine) = policy.as_deref_mut() {
+                let tool_name = step
+                    .config
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let input = prism_policy::PolicyInput {
+                    action: "tool.call".into(),
+                    principal: principal.into(),
+                    role: values
+                        .get("role")
+                        .cloned()
+                        .unwrap_or_else(|| "operator".into()),
+                    resource: tool_name.into(),
+                    context: step
+                        .config
+                        .get("inputs")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                };
+                engine.require(&input).with_context(|| {
+                    format!(
+                        "policy denied tool '{}' in workflow step '{}'",
+                        tool_name, step.id
+                    )
+                })?;
+            }
+        }
+
         let step_result = match step.action.as_str() {
             "set" => run_set_step(step, &mut context, !execute)?,
             "message" => run_message_step(step, &mut context, !execute)?,
             "http" => run_http_step(step, &mut context, !execute, &client).await?,
+            "tool" => run_tool_step(step, &mut context, !execute, &client).await?,
             other => bail!("unsupported workflow step action: {other}"),
         };
         result.steps.push(step_result);
@@ -443,6 +524,110 @@ async fn run_http_step(
             },
             "response": stored,
         }),
+    })
+}
+
+/// Execute a tool on the local PRISM node via `POST /api/tools/{name}/run`.
+///
+/// YAML config:
+/// ```yaml
+/// - id: train
+///   action: tool
+///   name: ml-pipeline
+///   command: train
+///   inputs:
+///     data: "{{ data }}"
+///     target: hardness
+/// ```
+async fn run_tool_step(
+    step: &WorkflowStep,
+    context: &mut BTreeMap<String, serde_json::Value>,
+    dry_run: bool,
+    client: &reqwest::Client,
+) -> Result<WorkflowStepResult> {
+    let tool_name = step
+        .config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("tool step '{}' missing 'name' field", step.id))?
+        .to_string();
+
+    let command = render_value(
+        step.config
+            .get("command")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        context,
+    )?;
+
+    let inputs = render_value(
+        step.config
+            .get("inputs")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+        context,
+    )?;
+
+    if dry_run {
+        return Ok(WorkflowStepResult {
+            id: step.id.clone(),
+            action: step.action.clone(),
+            status: "planned".to_string(),
+            summary: format!("tool:{tool_name} {}", command.as_str().unwrap_or_default()),
+            data: serde_json::json!({
+                "tool": tool_name,
+                "command": command,
+                "inputs": inputs,
+            }),
+        });
+    }
+
+    // Call the local PRISM node API
+    let port = context
+        .get("node_port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(7327);
+
+    let url = format!("http://127.0.0.1:{port}/api/tools/{tool_name}/run");
+    let body = serde_json::json!({
+        "command": command,
+        "inputs": inputs,
+    });
+
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("failed to call tool '{tool_name}' at {url}"))?;
+
+    let status_code = resp.status().as_u16();
+    let resp_body: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"error": "failed to parse response"}));
+
+    if status_code >= 400 {
+        bail!(
+            "tool '{}' returned HTTP {}: {}",
+            tool_name,
+            status_code,
+            resp_body
+        );
+    }
+
+    let stored = serde_json::json!({
+        "status_code": status_code,
+        "output": resp_body,
+    });
+    context.insert(step.id.clone(), stored.clone());
+
+    Ok(WorkflowStepResult {
+        id: step.id.clone(),
+        action: step.action.clone(),
+        status: "completed".to_string(),
+        summary: format!("tool:{tool_name} → HTTP {status_code}"),
+        data: stored,
     })
 }
 

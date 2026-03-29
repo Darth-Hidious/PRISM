@@ -1,10 +1,20 @@
 [workspace]
 members = [
     "crates/cli",
+    "crates/client",
+    "crates/compute",
+    "crates/core",
+    "crates/forge",
+    "crates/ingest",
+    "crates/ipc",
+    "crates/mesh",
     "crates/node",
+    "crates/orch",
+    "crates/policy",
     "crates/proto",
     "crates/python-bridge",
     "crates/runtime",
+    "crates/server",
     "crates/workflows",
 ]
 resolver = "2"
@@ -39,3 +49,16 @@ rand = "0.8"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+async-trait = "0.1"
+axum = "0.8"
+bollard = "0.18"
+polars = { version = "0.46", default-features = false, features = ["lazy", "csv", "parquet"] }
+toml = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+mdns-sd = "0.11"
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5", features = ["limit", "buffer"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+rust-embed = "8"
+mime_guess = "2"

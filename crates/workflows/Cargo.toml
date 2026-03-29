@@ -1,5 +1,6 @@
 [package]
 name = "prism-workflows"
+description = "YAML workflow engine — discovery, template interpolation, step execution, and CLI command promotion."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +13,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+prism-policy = { path = "../policy" }
 
 [dev-dependencies]
 tokio.workspace = true
