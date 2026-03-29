@@ -104,6 +104,9 @@ enum Commands {
         /// Semantic vector search.
         #[arg(long)]
         semantic: bool,
+        /// Query all known mesh peers and merge results.
+        #[arg(long)]
+        federated: bool,
         /// Neo4j HTTP endpoint.
         #[arg(long, default_value = "http://localhost:7474")]
         neo4j_url: String,
@@ -125,6 +128,31 @@ enum Commands {
         /// Max results to return.
         #[arg(long, default_value = "10")]
         limit: usize,
+        /// Dashboard URL for federated query peer discovery.
+        #[arg(long, default_value = "http://127.0.0.1:7327")]
+        dashboard_url: String,
+    },
+    /// Submit a compute job (run a container on local Docker, MARC27 cloud, or BYOC).
+    Run {
+        /// Container image to run.
+        image: String,
+        /// Job name.
+        #[arg(long, default_value = "experiment")]
+        name: String,
+        /// JSON inputs (key=value pairs merged into inputs object).
+        #[arg(long, value_delimiter = ',')]
+        input: Vec<String>,
+        /// Backend: local, marc27, or byoc.
+        #[arg(long, default_value = "local")]
+        backend: String,
+        /// MARC27 platform API URL (for marc27 backend).
+        #[arg(long, default_value = "https://platform.marc27.com/api/v1")]
+        platform_url: String,
+    },
+    /// Check status of a compute job.
+    JobStatus {
+        /// Job UUID.
+        job_id: String,
     },
     /// Mesh networking — discover peers, publish datasets, manage subscriptions.
     Mesh {
@@ -866,6 +894,7 @@ async fn main() -> Result<()> {
             text,
             cypher,
             semantic,
+            federated,
             neo4j_url,
             neo4j_user,
             neo4j_pass,
@@ -873,20 +902,37 @@ async fn main() -> Result<()> {
             ollama_url,
             model,
             limit,
+            dashboard_url,
         } => {
-            handle_query(
-                &text,
-                cypher,
-                semantic,
-                &neo4j_url,
-                &neo4j_user,
-                &neo4j_pass,
-                &qdrant_url,
-                &ollama_url,
-                &model,
-                limit,
-            )
-            .await?;
+            if federated {
+                handle_federated_query(&text, &dashboard_url).await?;
+            } else {
+                handle_query(
+                    &text,
+                    cypher,
+                    semantic,
+                    &neo4j_url,
+                    &neo4j_user,
+                    &neo4j_pass,
+                    &qdrant_url,
+                    &ollama_url,
+                    &model,
+                    limit,
+                )
+                .await?;
+            }
+        }
+        Commands::Run {
+            image,
+            name,
+            input,
+            backend,
+            platform_url,
+        } => {
+            handle_run(&name, &image, &input, &backend, &platform_url).await?;
+        }
+        Commands::JobStatus { job_id } => {
+            handle_job_status(&job_id).await?;
         }
         Commands::Mesh { command } => {
             handle_mesh_command(command).await?;
@@ -1992,6 +2038,156 @@ fn print_node_status(caps: &NodeCapabilities, endpoints: &PlatformEndpoints) {
     println!();
 
     println!("Software: {}", caps.software.join(", "));
+}
+
+// ── prism query --federated ────────────────────────────────────────────
+
+async fn handle_federated_query(query: &str, dashboard_url: &str) -> Result<()> {
+    // Step 1: Get peer list from the running node
+    let peers_url = format!("{dashboard_url}/api/mesh/nodes");
+    let resp: serde_json::Value = reqwest::get(&peers_url)
+        .await
+        .with_context(|| format!("Failed to reach node at {dashboard_url}"))?
+        .json()
+        .await?;
+
+    let peer_list = resp["peers"].as_array();
+    let peer_count = peer_list.map(|a| a.len()).unwrap_or(0);
+
+    if peer_count == 0 {
+        println!("No mesh peers found. Run with mDNS discovery or register via platform.");
+        return Ok(());
+    }
+
+    println!("Querying {} peer(s) + local node...\n", peer_count);
+
+    // Step 2: Query local node
+    let local_url = format!("{dashboard_url}/api/query");
+    let local_body = serde_json::json!({"query": query, "mode": "nl"});
+    let local_result = reqwest::Client::new()
+        .post(&local_url)
+        .json(&local_body)
+        .send()
+        .await;
+
+    println!("[local] ");
+    match local_result {
+        Ok(r) => {
+            let data: serde_json::Value = r.json().await.unwrap_or_default();
+            let count = data["count"].as_u64().unwrap_or(0);
+            println!("  {} result(s)", count);
+            if let Some(results) = data["results"].as_array() {
+                for r in results.iter().take(5) {
+                    println!("  {}", serde_json::to_string(r).unwrap_or_default());
+                }
+            }
+        }
+        Err(e) => println!("  error: {e}"),
+    }
+
+    // Step 3: Query each peer
+    let peers = peer_list.unwrap();
+    for peer in peers {
+        let addr = peer["address"].as_str().unwrap_or("127.0.0.1");
+        let port = peer["port"].as_u64().unwrap_or(7327);
+        let name = peer["name"].as_str().unwrap_or("unknown");
+        let peer_url = format!("http://{}:{}/api/query", addr, port);
+        let body = serde_json::json!({"query": query, "mode": "nl"});
+
+        print!("[{name}] ");
+        match reqwest::Client::new()
+            .post(&peer_url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) => {
+                let data: serde_json::Value = r.json().await.unwrap_or_default();
+                let count = data["count"].as_u64().unwrap_or(0);
+                println!("{} result(s)", count);
+                if let Some(results) = data["results"].as_array() {
+                    for r in results.iter().take(5) {
+                        println!("  {}", serde_json::to_string(r).unwrap_or_default());
+                    }
+                }
+            }
+            Err(e) => println!("unreachable ({e})"),
+        }
+    }
+
+    Ok(())
+}
+
+// ── prism run ─────────────────────────────────────────────────────────
+
+async fn handle_run(
+    name: &str,
+    image: &str,
+    inputs: &[String],
+    backend: &str,
+    platform_url: &str,
+) -> Result<()> {
+    use prism_compute::backend::ComputeRouter;
+    use prism_compute::ExperimentPlan;
+
+    // Parse key=value inputs into JSON
+    let mut input_map = serde_json::Map::new();
+    for kv in inputs {
+        if let Some((k, v)) = kv.split_once('=') {
+            input_map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        }
+    }
+
+    let plan = ExperimentPlan {
+        name: name.to_string(),
+        image: image.to_string(),
+        inputs: serde_json::Value::Object(input_map),
+    };
+
+    let router = match backend {
+        "marc27" | "platform" => {
+            // Read token from credentials
+            let token = std::env::var("MARC27_API_TOKEN")
+                .unwrap_or_else(|_| "".to_string());
+            ComputeRouter::with_marc27(platform_url, &token)
+        }
+        _ => ComputeRouter::local_only(),
+    };
+
+    println!("Submitting job '{name}' (image: {image}, backend: {backend})...");
+    let job_id = router.submit(&plan).await?;
+    println!("Job submitted: {job_id}");
+    println!("Check status:  prism job-status {job_id}");
+
+    // Poll for initial status
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    match router.status(job_id).await {
+        Ok(status) => println!("Status: {:?}", status),
+        Err(e) => println!("Status check failed: {e}"),
+    }
+
+    Ok(())
+}
+
+async fn handle_job_status(job_id_str: &str) -> Result<()> {
+    let job_id: uuid::Uuid = job_id_str
+        .parse()
+        .with_context(|| format!("invalid job UUID: {job_id_str}"))?;
+
+    // Try local backend first
+    let router = prism_compute::backend::ComputeRouter::local_only();
+    match router.status(job_id).await {
+        Ok(status) => {
+            println!("Job: {job_id}");
+            println!("Status: {:?}", status);
+        }
+        Err(e) => {
+            println!("Job {job_id}: {e}");
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

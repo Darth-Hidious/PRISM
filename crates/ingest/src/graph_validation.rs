@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Entity, EntitySet, Relationship};
+use crate::EntitySet;
 
 /// A graph validation issue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +241,7 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Entity, Relationship};
 
     fn make_entity(etype: &str, name: &str) -> Entity {
         Entity {
