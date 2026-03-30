@@ -436,4 +436,162 @@ mod tests {
 
         assert_eq!(public.as_bytes(), decoded.as_bytes());
     }
+
+    // -- Edge cases and error paths ---
+
+    #[test]
+    fn decrypt_empty_data_fails() {
+        let shared = [42u8; 32];
+        assert!(decrypt(&shared, &[]).is_err());
+    }
+
+    #[test]
+    fn decrypt_too_short_data_fails() {
+        let shared = [42u8; 32];
+        // Need at least 12 (nonce) + 16 (tag) = 28 bytes.
+        assert!(decrypt(&shared, &[0u8; 27]).is_err());
+    }
+
+    #[test]
+    fn decrypt_corrupted_data_fails() {
+        let secret = StaticSecret::random_from_rng(OsRng);
+        let public = PublicKey::from(&secret);
+        let shared = compute_shared_secret(&secret, &public);
+
+        let mut encrypted = encrypt(&shared, b"hello").unwrap();
+        // Flip a byte in the ciphertext portion.
+        let last = encrypted.len() - 1;
+        encrypted[last] ^= 0xFF;
+
+        assert!(decrypt(&shared, &encrypted).is_err());
+    }
+
+    #[test]
+    fn encrypt_empty_plaintext() {
+        let shared = [1u8; 32];
+        let encrypted = encrypt(&shared, b"").unwrap();
+        let decrypted = decrypt(&shared, &encrypted).unwrap();
+        assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn encrypt_large_plaintext() {
+        let shared = [2u8; 32];
+        let big = vec![0xAB; 100_000];
+        let encrypted = encrypt(&shared, &big).unwrap();
+        let decrypted = decrypt(&shared, &encrypted).unwrap();
+        assert_eq!(decrypted, big);
+    }
+
+    #[test]
+    fn encrypted_output_has_nonce_prefix() {
+        let shared = [3u8; 32];
+        let encrypted = encrypt(&shared, b"test").unwrap();
+        // Output should be: 12 (nonce) + plaintext_len + 16 (tag)
+        assert!(encrypted.len() >= 12 + 16);
+    }
+
+    #[test]
+    fn two_encryptions_produce_different_ciphertext() {
+        let shared = [4u8; 32];
+        let plain = b"same data twice";
+        let enc1 = encrypt(&shared, plain).unwrap();
+        let enc2 = encrypt(&shared, plain).unwrap();
+        // Different nonces → different ciphertext.
+        assert_ne!(enc1, enc2);
+        // But both decrypt to the same plaintext.
+        assert_eq!(decrypt(&shared, &enc1).unwrap(), plain);
+        assert_eq!(decrypt(&shared, &enc2).unwrap(), plain);
+    }
+
+    #[test]
+    fn decode_public_key_invalid_base64() {
+        assert!(decode_public_key("not-valid-base64!!!").is_err());
+    }
+
+    #[test]
+    fn decode_public_key_wrong_length() {
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
+        assert!(decode_public_key(&short).is_err());
+    }
+
+    #[test]
+    fn decode_signing_public_key_invalid_base64() {
+        assert!(decode_signing_public_key("%%%invalid%%%").is_err());
+    }
+
+    #[test]
+    fn decode_signing_public_key_wrong_length() {
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
+        assert!(decode_signing_public_key(&short).is_err());
+    }
+
+    #[test]
+    fn verify_signature_invalid_base64() {
+        let tmp = TempDir::new().unwrap();
+        let (_, public) = load_or_generate_signing_key(tmp.path()).unwrap();
+        assert!(verify_signature(&public, b"data", "not-base64!!!").is_err());
+    }
+
+    #[test]
+    fn verify_signature_wrong_length() {
+        let tmp = TempDir::new().unwrap();
+        let (_, public) = load_or_generate_signing_key(tmp.path()).unwrap();
+        let short_sig = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        assert!(verify_signature(&public, b"data", &short_sig).is_err());
+    }
+
+    #[test]
+    fn verify_signature_wrong_data_fails() {
+        let tmp = TempDir::new().unwrap();
+        let (signing, public) = load_or_generate_signing_key(tmp.path()).unwrap();
+        let sig = sign_bytes(&signing, b"original data");
+        assert!(verify_signature(&public, b"tampered data", &sig).is_err());
+    }
+
+    #[test]
+    fn load_key_wrong_length_fails() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("node_key");
+        std::fs::write(&key_path, [0u8; 16]).unwrap(); // Too short.
+        assert!(load_or_generate_key(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn load_signing_key_wrong_length_fails() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("node_signing_key");
+        std::fs::write(&key_path, [0u8; 64]).unwrap(); // Too long.
+        assert!(load_or_generate_signing_key(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn rotate_signing_key_produces_new_key() {
+        let tmp = TempDir::new().unwrap();
+        let (_, public1) = load_or_generate_signing_key(tmp.path()).unwrap();
+        let public2 = rotate_signing_key(tmp.path()).unwrap();
+        assert_ne!(public1.as_bytes(), public2.as_bytes());
+    }
+
+    #[test]
+    fn shared_secret_is_symmetric() {
+        let a_secret = StaticSecret::random_from_rng(OsRng);
+        let a_public = PublicKey::from(&a_secret);
+        let b_secret = StaticSecret::random_from_rng(OsRng);
+        let b_public = PublicKey::from(&b_secret);
+
+        let ab = compute_shared_secret(&a_secret, &b_public);
+        let ba = compute_shared_secret(&b_secret, &a_public);
+        assert_eq!(ab, ba);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_has_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        load_or_generate_key(tmp.path()).unwrap();
+        let meta = std::fs::metadata(tmp.path().join("node_key")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
 }

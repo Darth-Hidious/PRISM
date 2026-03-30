@@ -1,5 +1,6 @@
 [package]
 name = "prism-proto"
+description = "Typed protocol contracts shared between the Rust backbone, Python worker, and MARC27 platform."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

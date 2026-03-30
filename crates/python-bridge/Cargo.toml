@@ -1,5 +1,6 @@
 [package]
 name = "prism-python-bridge"
+description = "Python worker launch and supervision — subprocess management, venv discovery, and stdio piping."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

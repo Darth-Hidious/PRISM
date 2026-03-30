@@ -1,4 +1,8 @@
 //! Shared runtime primitives for PRISM Rust binaries.
+//!
+//! Provides [`PrismPaths`] (XDG-based directory discovery), [`PrismCliState`]
+//! (credential persistence), and [`PlatformEndpoints`] (URL derivation for
+//! the MARC27 platform API, WebSocket, and dashboard).
 
 use std::env;
 use std::fs;
@@ -54,7 +58,7 @@ impl PrismPaths {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct StoredCredentials {
     pub access_token: String,
     pub refresh_token: String,
@@ -66,6 +70,23 @@ pub struct StoredCredentials {
     pub project_id: Option<String>,
     pub project_name: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for StoredCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCredentials")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("platform_url", &self.platform_url)
+            .field("user_id", &self.user_id)
+            .field("display_name", &self.display_name)
+            .field("org_id", &self.org_id)
+            .field("org_name", &self.org_name)
+            .field("project_id", &self.project_id)
+            .field("project_name", &self.project_name)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,8 +130,29 @@ impl PrismPaths {
         let path = self.cli_state_path();
         let text =
             serde_json::to_string_pretty(state).expect("serializing cli state should not fail");
-        fs::write(&path, format!("{text}\n"))
-            .map_err(|source| RuntimeError::WriteState { path, source })
+        // Write with restricted permissions (0600) — file contains tokens.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|source| RuntimeError::WriteState {
+                    path: path.clone(),
+                    source,
+                })?;
+            file.write_all(format!("{text}\n").as_bytes())
+                .map_err(|source| RuntimeError::WriteState { path, source })
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(&path, format!("{text}\n"))
+                .map_err(|source| RuntimeError::WriteState { path, source })
+        }
     }
 }
 

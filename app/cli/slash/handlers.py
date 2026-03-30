@@ -10,7 +10,7 @@ from typing import Optional
 
 from app.agent.scratchpad import Scratchpad
 from app.cli.slash.registry import REPL_COMMANDS, COMMAND_ALIASES
-from app.cli.tui.theme import WARNING, SUCCESS, DIM
+from app.backend.tool_meta import WARNING, SUCCESS, DIM
 
 
 def _dot(ok: bool) -> str:
@@ -114,7 +114,7 @@ def handle_tools(app):
 
 def handle_status(app):
     from app import __version__
-    from app.cli.tui.welcome import detect_capabilities
+    from app.backend.tool_meta import detect_capabilities
     caps = detect_capabilities()
 
     app.console.print()
@@ -290,10 +290,12 @@ def handle_plan(app, goal: str):
         pass
     prompt += "\nWhich skill(s) should be used? Explain the recommended workflow."
     try:
-        from app.cli.tui.stream import handle_streaming_response
-        handle_streaming_response(
-            app.console, app.agent, prompt, app.session, app.scratchpad,
-        )
+        # Send as a regular message — the UIEmitter/frontend handles rendering
+        app.console.print(f"[dim]Sending recommendation query to agent...[/dim]")
+        response = app.agent.process(prompt)
+        if response:
+            from rich.markdown import Markdown
+            app.console.print(Markdown(response))
     except Exception as e:
         app.console.print(f"[red]Error: {e}[/red]")
 

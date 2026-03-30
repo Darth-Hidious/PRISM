@@ -11,296 +11,224 @@
 </p>
 
 <h1 align="center">PRISM</h1>
-<p align="center"><strong>AI-Native Autonomous Materials Discovery</strong></p>
+<p align="center"><strong>AI-Native Autonomous Materials Discovery Platform</strong></p>
 <p align="center">
-  <em>MARC27 &mdash; ESA SPARK Prime Contractor | ITER Supplier</em>
+  <em>MARC27</em>
 </p>
 <p align="center">
-  <code>v2.5.0-beta</code> &nbsp;|&nbsp; <code>Ink frontend</code>
+  <code>v2.5.0</code> &nbsp;|&nbsp; <code>15 Rust crates</code> &nbsp;|&nbsp; <code>411 tests</code> &nbsp;|&nbsp; <code>47 tools</code>
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> &bull;
   <a href="#architecture">Architecture</a> &bull;
+  <a href="#commands">Commands</a> &bull;
   <a href="#capabilities">Capabilities</a> &bull;
-  <a href="#cli-commands">Commands</a> &bull;
-  <a href="#license">License</a> &bull;
-  <a href="ACKNOWLEDGMENTS.md">Acknowledgments</a>
+  <a href="#license">License</a>
 </p>
 
 ---
 
-PRISM is an AI-native platform for autonomous materials discovery. It combines
-large language models, multi-step agent orchestration, CALPHAD thermodynamics,
-ML property prediction, and federated data access into a single CLI that
-researchers can use to go from a hypothesis to a validated alloy candidate.
-
-Built for the [OSIP](https://ideas.esa.int/servlet/hype/IMT?documentTableId=45087607031874021&userAction=Browse&templateName=&documentId=17c4b07a1c3b309ca9d56ea19d8e8fc0) programme, PRISM targets refractory high-entropy alloys (RHEAs)
-for space propulsion but is domain-agnostic by design.
-
-## Architecture
-
-PRISM implements a four-module closed-loop architecture inspired by biological
-evolution:
-
-| Module | Role | Current Implementation |
-|---|---|---|
-| **Evolver (ACE)** | Propose candidate compositions | Agent + GFlowNet (Phase G) |
-| **Mutator Fleet** | Perturb and explore the design space | Skills + tool chaining |
-| **Evaluator** | Three-tier validation (surrogate / CALPHAD / experiment) | ML predict + CALPHAD bridge + validation rules |
-| **MKG** | Materials Knowledge Graph for memory and retrieval | Session memory + DataStore + scratchpad |
-
-The agent runs a **Think-Act-Observe-Repeat (TAOR)** loop with provider-agnostic
-LLM backends (Anthropic, OpenAI, Google, Zhipu AI, OpenRouter), a tool registry
-with 33 built-in tools + 19 optional, and 10 multi-step skills.
-
-A **Protocol-Driven UI** layer (`UIEmitter`) emits structured JSON-RPC 2.0
-events that both the Ink (TypeScript/React) frontend and the classic Rich
-(Python) frontend consume as dumb renderers. The Ink frontend is the default;
-pass `--classic` to use the Rich fallback.
-
-## Capabilities
-
-### Data Access
-- **40+ databases** via OPTIMADE federation (Materials Project, OQMD, COD, JARVIS, AFLOW...)
-- **Materials Project** native API with formation energy, band gap, hull distance
-- **OMAT24** and **AFLOW** available as platform-hosted databases via the provider catalog
-- **Literature** search (arXiv + Semantic Scholar)
-- **Patent** search (Lens.org)
-- **Local data import** (CSV, JSON, Parquet)
-
-### AI & ML
-- **Property prediction** with auto-training (Random Forest, XGBoost, LightGBM)
-- **Feature importance** and correlation analysis
-- **CALPHAD** phase diagrams, equilibrium, and Gibbs energy (pycalphad)
-- **Simulation planning** with auto-routing (CALPHAD vs DFT vs MD)
-
-### Agent Orchestration
-- **10 skills**: acquire, predict, visualize, report, select, discover, simulate, analyze phases, validate, review
-- **Plan-then-execute**: agent proposes a plan, user approves before execution
-- **Tool consent**: expensive operations require explicit approval
-- **Scratchpad**: append-only execution log for reproducibility
-- **Feedback loops**: validation and CALPHAD findings feed back into agent context
-
-### Terminal Experience
-- **Dual frontend**: Ink (TypeScript/React) as default, Rich (Python) as `--classic` fallback
-- **Protocol-Driven UI**: UIEmitter emits JSON-RPC 2.0 events; both frontends are dumb renderers
-- **Live streaming**: LLM tokens appear as they arrive
-- **Typed card renderers**: 11 card types with color-coded borders (input, output, tool, error, metrics, calphad, validation, results, plot, approval, plan)
-- **Smart truncation**: 6-line display truncation + 50K character threshold with disk persistence
-- **Cost tracking**: per-turn and cumulative session cost display
-- **Crystal mascot**: hex-glyph welcome banner with capability detection
-
-### Infrastructure
-- **Two modes**: interactive REPL (`prism`) and autonomous (`prism run "goal"`)
-- **Unified rendering**: both modes use the same card system and spinner
-- **LLM providers**: Anthropic, OpenAI, Google, Zhipu AI, MARC27 managed
-- **MCP server**: `prism serve` exposes tools and resources via FastMCP 3.x
-- **Plugin system**: 7 types (Tool, Skill, Provider, Agent, Algorithm, Collector, Bundle)
-- **PRISM Labs**: marketplace for premium services (Cloud DFT, Quantum Computing, Autonomous Labs, Synchrotron, HTS, DfM)
-- **Unified settings**: two-tier `settings.json` (global + project) with env var overrides
-- **Session memory**: save, load, and resume conversations
-- **Reports**: Markdown, HTML, and PDF with embedded charts
+PRISM is an open-source, enterprise-deployable data platform node that connects
+to the MARC27 network. One command &mdash; `prism node up` &mdash; bootstraps a
+complete local data infrastructure that automatically converts raw datasets into
+structured, queryable knowledge (ontologies, knowledge graphs, vector
+embeddings). Running nodes can subscribe to each other, creating a federated
+mesh of searchable data across departments, organizations, and MARC27's cloud.
 
 ## Quick Start
 
-### One-command install
-
 ```bash
+# Install
 curl -fsSL https://prism.marc27.com/install.sh | bash
+
+# Or via Homebrew
+brew install marc27/tap/prism
+
+# Authenticate with MARC27 platform
+prism login
+
+# Start local node (launches Neo4j + Qdrant containers)
+prism node up
+
+# Ingest materials data
+prism ingest ./alloys.csv
+
+# Query the knowledge graph
+prism query "refractory alloys with hardness above 500 HV"
+prism query --cypher "MATCH (a:Alloy)-[:CONTAINS]->(e:Element) RETURN a.name, e.name"
+prism query --semantic "similar to Ti-6Al-4V"
+prism query --federated "high entropy alloys"   # queries all mesh peers
 ```
 
-The installer sets up the Python package **and** downloads the compiled Ink
-frontend binary for your platform (`~/.prism/bin/prism-tui`).
+## Architecture
 
-### pip install (from GitHub)
+PRISM compiles to two Rust binaries backed by a Python intelligence layer:
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                         PRISM NODE                            │
+│                                                               │
+│  Rust Core                                                    │
+│  ├── prism-cli ········· command routing, auth, config        │
+│  ├── prism-node ········ daemon, probe, executor, E2EE        │
+│  ├── prism-core ········ RBAC, audit, sessions, config        │
+│  ├── prism-ingest ······ LLM ontology → Neo4j + Qdrant        │
+│  ├── prism-server ······ Axum REST API + WebSocket + dashboard│
+│  ├── prism-orch ········ Docker container lifecycle            │
+│  ├── prism-mesh ········ mDNS + Kafka pub/sub + federation    │
+│  ├── prism-compute ····· Docker/MARC27/SSH/K8s/SLURM jobs     │
+│  ├── prism-policy ······ OPA/Rego policy engine               │
+│  └── prism-workflows ··· YAML workflow engine                 │
+│                                                               │
+│  Managed Services (Docker containers or external)             │
+│  ├── Neo4j ············· knowledge graph                      │
+│  ├── Qdrant ············ vector embeddings                    │
+│  └── Kafka ············· mesh data sync (optional)            │
+│                                                               │
+│  Python TAOR Runtime (Think-Act-Observe-Repeat)               │
+│  ├── 47 tools ·········· search, predict, simulate, visualize │
+│  ├── 10 skills ········· multi-step workflows                 │
+│  └── LLM backends ······ MARC27, Anthropic, OpenAI, Ollama    │
+│                                                               │
+│  Rendering                                                    │
+│  ├── Ink TUI ··········· TypeScript/React terminal UI         │
+│  └── Web Dashboard ····· React SPA embedded in Axum           │
+└───────────────────────────────────────────────────────────────┘
+```
+
+## Commands
 
 ```bash
-pip install "prism-platform[all] @ git+https://github.com/Darth-Hidious/PRISM.git"
+# Node lifecycle
+prism node up                    # Start services + register with platform
+prism node up --external-neo4j bolt://db:7687  # Use existing infrastructure
+prism node down                  # Graceful shutdown
+prism node status                # Health check
+prism node logs neo4j            # Stream container logs
+
+# Data
+prism ingest ./data.csv          # CSV/Parquet → schema → LLM → graph → embeddings
+prism ingest --watch ./data/     # Watch directory for new files
+prism ingest --llm-provider marc27 --llm-url https://platform.marc27.com/api/v1/llm
+
+# Query
+prism query "..."                # Natural language → Cypher
+prism query --cypher "MATCH..."  # Direct Cypher
+prism query --semantic "..."     # Vector similarity
+prism query --federated "..."    # Query all mesh peers
+
+# Mesh networking
+prism mesh discover              # Find LAN nodes via mDNS
+prism mesh publish my-dataset    # Publish dataset to mesh
+prism mesh subscribe alloy-db --publisher <node-id>
+prism mesh subscriptions         # Show active subscriptions
+
+# Compute
+prism run python:3.11 --input data=x.csv   # Local Docker job
+prism run marc27/calphad:latest --backend marc27  # Cloud compute
+prism job-status <uuid>
+
+# Workflows
+prism forge --paper arxiv:2106.09685 --dataset materials-project --target runpod:A100
+prism workflow list
+
+# Agent (Python TAOR)
+prism                            # Interactive REPL (Ink TUI)
+prism serve                      # Start as MCP server
 ```
 
-> After pip install, run `prism update` once to download the Ink frontend binary.
+## Capabilities
 
-### From source
-
-```bash
-git clone https://github.com/Darth-Hidious/PRISM.git
-cd PRISM
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[all,dev]"
-# Build the Ink frontend (requires bun):
-cd frontend && bun install && bun run build -- darwin-arm64
-mkdir -p ~/.prism/bin && cp dist/prism-tui-darwin-arm64 ~/.prism/bin/prism-tui
-```
-
-### Configure
-
-```bash
-prism                      # First run triggers onboarding wizard
-# or manually:
-prism setup                # Workflow preferences wizard
-prism configure --show     # View current settings
-```
-
-### Run
-
-```bash
-# Interactive REPL (Ink frontend)
-prism
-
-# Classic Rich UI
-prism --classic
-
-# Autonomous mode
-prism run "Find W-Rh alloys that are thermodynamically stable"
-
-# MCP server for Claude Desktop
-prism serve
-```
-
-See [docs/INSTALL.md](docs/INSTALL.md) for full installation details including optional extras (`[ml]`, `[simulation]`, `[calphad]`, `[data]`, `[reports]`, `[all]`).
-
-## CLI Commands
-
-| Command | Description |
-|---|---|
-| `prism` | Interactive agent REPL (Ink frontend) |
-| `prism --classic` | Interactive REPL with Rich (Python) UI |
-| `prism run "goal"` | Autonomous agent mode |
-| `prism run "goal" --confirm` | Autonomous with tool consent |
-| `prism run "goal" --dangerously-accept-all` | Auto-approve all tool calls |
-| `prism serve` | Start as MCP server (FastMCP 3.x) |
-| `prism search --elements Fe,Ni` | Structured OPTIMADE search |
-| `prism data import file.csv` | Import local dataset |
-| `prism predict --target band_gap` | Train and predict material properties |
-| `prism model calphad status` | CALPHAD installation status |
-| `prism sim status` | Simulation engine status |
-| `prism labs browse` | Browse PRISM Labs marketplace |
-| `prism setup` | Workflow preferences wizard |
-| `prism configure --show` | View unified settings |
-| `prism update` | Check for updates |
-| `prism plugin list` | List installed plugins |
-
-### REPL Commands
-
-| Command | Description |
-|---|---|
-| `/help` | Show available commands |
-| `/tools` | List available tools (33 built-in + optional) |
-| `/skills [name]` | List skills or show details |
-| `/plan <goal>` | Suggest skills for a goal |
-| `/scratchpad` | Show execution log |
-| `/status` | Platform capabilities |
-| `/approve-all` | Auto-approve all tool calls |
-| `/login` | Connect MARC27 account |
-| `/save` | Save current session |
-| `/load ID` | Load a saved session |
-| `/export [file]` | Export last results to CSV |
-| `/sessions` | List saved sessions |
-| `/clear` | Clear conversation history |
-
-## Project Structure
+### Ingestion Pipeline (verified end-to-end)
 
 ```
-app/
-  cli/            # MIT License — CLI entry point, TUI cards, streaming, status
-    tui/          # Rich-based terminal UI (cards, spinner, welcome, streaming)
-    slash/        # REPL slash-command registry and handlers
-    _binary.py    # Ink binary discovery (user override + package-bundled)
-  backend/        # MIT License — Protocol-Driven UI layer
-    protocol.py   # JSON-RPC 2.0 event definitions (single source of truth)
-    ui_emitter.py # Shared presentation logic consumed by both frontends
-    server.py     # stdio JSON-RPC server for the Ink frontend
-  config/         # MIT License — Unified settings, branding, preferences
-  db/             # MIT License — SQLAlchemy models and database
-  data/           # MIT License — DataStore and collectors
-  tools/          # MIT License — Tool definitions and registry (33 built-in)
-  search/         # MIT License — Federated search with providers and cache
-  agent/          # MARC27 License — Agent core, TAOR loop, backends, memory
-  skills/         # MARC27 License — 10 multi-step workflow skills
-  ml/             # MARC27 License — ML pipelines and algorithm registry
-  simulation/     # MARC27 License — Pyiron bridge + CALPHAD bridge
-  validation/     # MARC27 License — Rule-based validation engine
-  plugins/        # MARC27 License — Plugin framework, catalog, bootstrap
-  commands/       # CLI command implementations (run, search, data, predict, etc.)
-frontend/         # MIT License — Ink (TypeScript/React) terminal frontend
-  src/
-    bridge/       # JSON-RPC client + auto-generated types from protocol.py
-    components/   # 11 React components (Prompt, StreamingText, ToolCard, etc.)
-    hooks/        # useBackend hook for BackendClient lifecycle
-    app.tsx       # Root App with Static/Live split pattern
-  build.ts        # Cross-platform bun build script
-tests/            # MIT License — 900+ tests
-docs/             # MIT License — Documentation and assets
+CSV/Parquet → Schema Detection → LLM Entity Extraction → Neo4j Graph → Qdrant Embeddings
+                                 (any provider)           (96 nodes)    (768-dim vectors)
 ```
+
+Supports any LLM provider: MARC27 managed, Ollama (local), OpenAI, vLLM, LiteLLM.
+
+### 47 Python Tools
+
+| Category | Tools | Status |
+|----------|-------|--------|
+| Materials search (17 OPTIMADE providers) | search_materials, query_materials_project | Working |
+| Web browsing | web_read, web_search | Working |
+| ML prediction | predict_property, predict_structure, list_models | Working |
+| CALPHAD thermodynamics | phase diagrams, equilibrium, Gibbs energy | Requires pycalphad |
+| Visualization | scatter, histogram, correlation matrix | Working |
+| Code execution | execute_python (sandboxed, approval-gated) | Working |
+| Data I/O | import, export, read_file, write_file | Working |
+| MARC27 Knowledge Graph | graph search, entity lookup, paths, semantic search | Requires `prism login` |
+| MARC27 Compute | GPU job submission, cost estimation | Requires `prism login` |
+| Literature/Patent search | arXiv, Semantic Scholar, Lens.org | Working |
+
+### Security
+
+- **OPA/Rego policy engine**: role-based tool/workflow authorization
+- **E2EE**: X25519 key agreement + ChaCha20-Poly1305
+- **RBAC**: 4-tier local roles (admin, operator, agent, viewer)
+- **Audit logging**: every action logged to SQLite
+- **Rate limiting**: per-endpoint (sessions: 10/s, API: 100/s)
+
+### Mesh Federation
+
+- **mDNS discovery**: zero-config LAN (`_prism._tcp.local`)
+- **Platform discovery**: cross-org via platform.marc27.com
+- **Kafka data sync**: published datasets replicate to subscribers
+- **Federated queries**: `--federated` queries all peers in parallel
+
+## Configuration
+
+PRISM reads `prism.toml` from `~/.prism/prism.toml` (global) and `.prism/prism.toml` (project):
+
+```toml
+[node]
+name = "lab-alpha"
+port = 7327
+
+[services]
+mode = "managed"   # or "external"
+neo4j_uri = "bolt://db.internal:7687"
+
+[indexer]
+mode = "platform"  # MARC27 cloud LLM (default)
+model = "claude-sonnet-4-6"
+
+[searcher]
+mode = "managed"   # local Ollama
+model = "qwen2.5:7b"
+
+[calphad]
+mode = "local"
+databases = ["thermodynamics/steel.tdb", "thermodynamics/ni-alloys.tdb"]
+
+[mesh]
+discovery = ["mdns", "platform"]
+```
+
+CLI flags always override config file values.
 
 ## Testing
 
 ```bash
-python3 -m pytest tests/ -v
+cargo test --workspace          # 411 Rust tests
+cargo check --workspace         # Type check
+cd frontend && npx tsc --noEmit # TypeScript check
+cd dashboard && npx vite build  # Dashboard build
 ```
-
-900+ tests covering agent core, tools, skills, data collectors, ML pipelines,
-CALPHAD integration, validation rules, plugins, CLI commands, card renderers,
-streaming, cost tracking, protocol layer, UIEmitter, backend server, and
-binary discovery.
-
-## Roadmap
-
-### Current (v2.5.0-beta)
-- **Ink (React) frontend** as default terminal UI, Rich as `--classic` fallback
-- **Protocol-Driven UI**: UIEmitter emits JSON-RPC 2.0 events for both frontends
-- **Auto binary download**: `install.sh` and `prism update` fetch the compiled Ink binary
-- All 16 CLI commands built and documented
-- Live text streaming with 11 typed card renderers
-- Character-based truncation (50K threshold) with disk persistence
-- Per-turn and cumulative session cost display
-- Unified rendering across REPL and `prism run`
-- Two-tier settings system (`settings.json` global + project)
-- LLM provider abstraction (Anthropic, OpenAI, Google, Zhipu AI, MARC27)
-- Federated search with 3-layer provider registry (OPTIMADE + overrides + catalog)
-- PRISM Labs premium marketplace
-- Tool consent, scratchpad, plan-then-execute, feedback loops
-- Polished `install.sh` with unicode step markers
-
-### Next (Phase G — deferred to ESA/seed funding)
-- GFlowNet generative sampler (Evolver module)
-- GNN surrogate models
-- Active learning loops
-- Multi-agent coordination
-- Playbook system
-
-### Buildable Now (no new dependencies)
-- Interactive ML property selection UI
-- AflowProvider (native API)
-- Multi-objective Pareto optimization
-- Domain validation rules expansion
-- Automated figure captioning
-- PRISM Labs marketplace API backend
-
-### Future (Phase H — deferred)
-- A-Lab robotic integration
-- Federated compute
-- Automated experimental validation
-- MARC27 SDK (`marc27-sdk` package)
 
 ## License
 
 PRISM uses a **dual license**:
 
 | Component | License |
-|---|---|
-| CLI, config, data layer, tools, search, tests, docs | [MIT](LICENSE-MIT) |
+|-----------|---------|
+| Rust crates, CLI, config, data layer, tools, search, frontend, tests, docs | [MIT](LICENSE-MIT) |
 | Agent core, skills, ML, simulation, validation, plugins | [MARC27 Source-Available](LICENSE-MARC27) |
 
 See [LICENSE](LICENSE) for details. Commercial licensing: team@marc27.com
-
-## Links
-
-- [docs/INSTALL.md](docs/INSTALL.md) — Installation guide
-- [SECURITY.md](SECURITY.md) — Security policy
-- [CHANGELOG.md](CHANGELOG.md) — Version history
-- [docs/PRISM-CLI-Description.md](docs/PRISM-CLI-Description.md) — Full CLI reference
 
 ---
 

@@ -1,5 +1,6 @@
 [package]
 name = "prism-node"
+description = "PRISM node daemon — hardware probing, container job execution, E2EE, and platform registration."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -28,6 +29,8 @@ x25519-dalek.workspace = true
 zeroize.workspace = true
 ed25519-dalek.workspace = true
 
+prism-client = { path = "../client" }
+prism-core = { path = "../core" }
 prism-proto = { path = "../proto" }
 prism-runtime = { path = "../runtime" }
 

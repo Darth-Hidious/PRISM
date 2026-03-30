@@ -13,8 +13,7 @@ from app.agent.events import (
     ToolApprovalRequest,
 )
 from app.backend.protocol import make_event
-from app.cli.tui.cards import detect_result_type
-from app.cli.tui.spinner import TOOL_VERBS
+from app.backend.tool_meta import detect_result_type, TOOL_VERBS
 from app.backend.status import build_status
 
 
@@ -159,6 +158,132 @@ class UIEmitter:
 
                 yield make_event("ui.turn.complete", {})
 
+    def _emit_model_list(self) -> Generator[dict, None, None]:
+        """Emit a ui.model.list event with MARC27 API models + local registry + Ollama."""
+        import os
+        import json as _json
+        import urllib.request
+        from app.agent.models import MODEL_REGISTRY
+
+        current_model = getattr(self.agent.backend, "model", "unknown")
+        models = []
+        seen_ids = set()
+
+        # 1. Fetch from MARC27 API (primary source — has all routed models + pricing)
+        token = os.getenv("MARC27_API_KEY") or os.getenv("MARC27_TOKEN")
+        platform_url = os.getenv("MARC27_PLATFORM_URL", "https://api.marc27.com")
+        if token:
+            for endpoint in ["/api/v1/llm/models", "/api/v1/models"]:
+                try:
+                    req = urllib.request.Request(
+                        f"{platform_url}{endpoint}",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    resp = urllib.request.urlopen(req, timeout=5)
+                    data = _json.loads(resp.read())
+                    api_models = data if isinstance(data, list) else data.get("models", data.get("data", []))
+                    for m in api_models:
+                        mid = m.get("id") or m.get("model_id") or m.get("name", "")
+                        if not mid or mid in seen_ids:
+                            continue
+                        seen_ids.add(mid)
+                        models.append({
+                            "id": mid,
+                            "provider": m.get("provider", "marc27"),
+                            "context_window": m.get("context_window", 0),
+                            "input_price": m.get("input_price_per_mtok", m.get("input_price", 0.0)),
+                            "output_price": m.get("output_price_per_mtok", m.get("output_price", 0.0)),
+                            "supports_tools": m.get("supports_tools", True),
+                            "supports_thinking": m.get("supports_thinking", False),
+                            "local": False,
+                        })
+                    if models:
+                        break  # Got models from API, don't try other endpoints
+                except Exception:
+                    continue
+
+        # 2. Fall back to / supplement with local registry (for models not in API)
+        for model_id, cfg in MODEL_REGISTRY.items():
+            if model_id in seen_ids:
+                continue
+            seen_ids.add(model_id)
+            models.append({
+                "id": model_id,
+                "provider": cfg.provider,
+                "context_window": cfg.context_window,
+                "input_price": cfg.input_price_per_mtok,
+                "output_price": cfg.output_price_per_mtok,
+                "supports_tools": cfg.supports_tools,
+                "supports_thinking": cfg.supports_thinking,
+                "local": False,
+            })
+
+        # 3. Local Ollama models
+        try:
+            req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
+            resp = urllib.request.urlopen(req, timeout=2)
+            data = _json.loads(resp.read())
+            for m in data.get("models", []):
+                name = m.get("name", "unknown")
+                ollama_id = f"ollama/{name}"
+                if ollama_id in seen_ids:
+                    continue
+                seen_ids.add(ollama_id)
+                size_gb = m.get("size", 0) / (1024**3)
+                models.append({
+                    "id": ollama_id,
+                    "provider": "ollama",
+                    "context_window": 0,
+                    "input_price": 0.0,
+                    "output_price": 0.0,
+                    "supports_tools": False,
+                    "supports_thinking": False,
+                    "local": True,
+                    "size_gb": round(size_gb, 1),
+                })
+        except Exception:
+            pass
+
+        yield make_event("ui.model.list", {
+            "current": current_model,
+            "models": models,
+        })
+
+    def _switch_model(self, model_id: str) -> bool:
+        """Switch the active model. Returns True on success."""
+        from app.agent.models import MODEL_REGISTRY, get_model_config
+
+        # Check if model exists in registry or is an Ollama model
+        cfg = get_model_config(model_id)
+        if cfg.provider == "unknown" and not model_id.startswith("ollama/"):
+            return False
+
+        # Update the backend's model
+        if hasattr(self.agent.backend, "model"):
+            self.agent.backend.model = model_id
+        if hasattr(self.agent.backend, "upstream_model"):
+            self.agent.backend.upstream_model = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+        if hasattr(self.agent.backend, "model_config"):
+            self.agent.backend.model_config = cfg
+
+        # Persist to settings
+        try:
+            from app.config.settings_schema import get_settings
+            import json as _json
+            import os
+            settings_path = os.path.expanduser("~/.prism/settings.json")
+            if os.path.exists(settings_path):
+                with open(settings_path) as f:
+                    data = _json.load(f)
+                data.setdefault("agent", {})["model"] = model_id
+                with open(settings_path, "w") as f:
+                    _json.dump(data, f, indent=4)
+                    f.write("\n")
+        except Exception:
+            pass
+
+        return True
+
     def handle_command(self, command: str) -> Generator[dict, None, None]:
         """Handle slash commands. Yields ui.* events."""
         parts = command.strip().split(maxsplit=1)
@@ -234,6 +359,27 @@ class UIEmitter:
                     for s in sessions[:20]
                 ],
             })
+            return
+
+        if base_cmd == "/model":
+            if arg:
+                # Switch to specified model
+                success = self._switch_model(arg)
+                if success:
+                    yield make_event("ui.card", {
+                        "card_type": "info", "tool_name": "", "elapsed_ms": 0,
+                        "content": f"Switched to **{arg}**",
+                        "data": {},
+                    })
+                else:
+                    yield make_event("ui.card", {
+                        "card_type": "error", "tool_name": "", "elapsed_ms": 0,
+                        "content": f"Unknown model: {arg}",
+                        "data": {"error": f"Model {arg} not found in registry"},
+                    })
+            else:
+                # List available models
+                yield from self._emit_model_list()
             return
 
         # Unknown command
