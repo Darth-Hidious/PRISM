@@ -1,6 +1,6 @@
 import React from "react";
 import { Box, Text } from "ink";
-import { PRIMARY, MUTED, TEXT } from "../theme.js";
+import { TEXT, BORDER_USER } from "../theme.js";
 
 interface Props {
   text: string;
@@ -8,9 +8,17 @@ interface Props {
 
 export function InputCard({ text }: Props) {
   return (
-    <Box flexDirection="column" marginBottom={1}>
-      <Text color={PRIMARY}>you</Text>
-      <Text color={TEXT}>{text}</Text>
+    <Box
+      borderStyle="single"
+      borderLeft
+      borderRight={false}
+      borderTop={false}
+      borderBottom={false}
+      borderColor={BORDER_USER}
+      paddingLeft={2}
+      marginTop={1}
+    >
+      <Text color={TEXT} bold>{text}</Text>
     </Box>
   );
 }

@@ -1,6 +1,6 @@
 import React from "react";
 import { Box, Text } from "ink";
-import { ACCENT_MAGENTA, MUTED } from "../theme.js";
+import { ACCENT, TEXT_MUTED } from "../theme.js";
 import { MarkdownText } from "./MarkdownText.js";
 
 interface Props {
@@ -11,14 +11,20 @@ export function PlanCard({ content }: Props) {
   return (
     <Box
       flexDirection="column"
-      borderStyle="round"
-      borderColor={ACCENT_MAGENTA}
-      paddingX={1}
-      marginBottom={1}
+      borderStyle="single"
+      borderLeft
+      borderRight={false}
+      borderTop={false}
+      borderBottom={false}
+      borderColor={ACCENT}
+      paddingLeft={2}
+      marginTop={1}
     >
-      <Text color={ACCENT_MAGENTA} bold>plan</Text>
-      <Text color={MUTED}>proposed execution steps</Text>
-      <MarkdownText text={content} />
+      <Text color={ACCENT} bold>◆ Plan</Text>
+      <Box marginTop={0}>
+        <MarkdownText text={content} />
+      </Box>
+      <Text color={TEXT_MUTED}>  [y] execute  [n] reject</Text>
     </Box>
   );
 }

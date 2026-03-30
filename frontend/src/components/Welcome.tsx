@@ -1,7 +1,8 @@
 import React from "react";
 import { Box, Text } from "ink";
 import {
-  PRIMARY, MUTED, SECONDARY, SUCCESS, WARNING, ERROR, ACCENT_CYAN, TEXT,
+  PRIMARY, TEXT, TEXT_MUTED, TEXT_DIM, SUCCESS, ERROR, WARNING,
+  SECONDARY, BORDER,
 } from "../theme.js";
 
 interface LLMStatus {
@@ -9,20 +10,8 @@ interface LLMStatus {
   provider: string | null;
 }
 
-interface PluginStatus {
-  count: number;
-  available: boolean;
-  names: string[];
-}
-
-interface CommandTool {
-  name: string;
-  registered: boolean;
-  healthy: boolean | null;
-}
-
 interface CommandStatus {
-  tools: CommandTool[];
+  tools: { name: string; registered: boolean; healthy: boolean | null }[];
   total: number;
   healthy_providers: number;
   total_providers: number;
@@ -35,18 +24,14 @@ interface SkillStatus {
 
 interface AccountStatus {
   signed_in: boolean;
-  user_id: string | null;
   display_name: string | null;
-  org_id: string | null;
   org_name: string | null;
-  project_id: string | null;
-  project_name: string | null;
-  platform_url: string | null;
+  org_id: string | null;
 }
 
 interface Status {
   llm: LLMStatus;
-  plugins: PluginStatus;
+  plugins: { count: number; available: boolean };
   commands: CommandStatus;
   skills: SkillStatus;
   account: AccountStatus;
@@ -58,116 +43,55 @@ interface Props {
   autoApprove: boolean;
 }
 
-function Dot({ ok }: { ok: boolean }) {
-  return <Text color={ok ? SUCCESS : MUTED}>{ok ? "\u25cf" : "\u25cb"}</Text>;
-}
-
-/** Short tool name for display */
-function shortName(name: string): string {
-  const map: Record<string, string> = {
-    search_materials: "search",
-    query_materials_project: "MP",
-    literature_search: "literature",
-    predict_property: "predict",
-    execute_python: "python",
-    web_search: "web",
-  };
-  return map[name] || name;
-}
-
-function CrystalMascot() {
+function Check({ ok, label, detail }: { ok: boolean; label: string; detail?: string }) {
   return (
-    <Box flexDirection="column" marginBottom={1}>
-      <Text color={PRIMARY}>    ⬡ ⬡ ⬡</Text>
-      <Text color={PRIMARY}>  ⬡ ⬢ ⬢ ⬢ ⬡</Text>
-      <Text color={PRIMARY}>  ⬡ ⬢ ⬢ ⬢ ⬡</Text>
-      <Text color={PRIMARY}>    ⬡ ⬡ ⬡</Text>
-    </Box>
+    <Text>
+      <Text color={ok ? SUCCESS : TEXT_DIM}>{ok ? "●" : "○"}</Text>
+      <Text color={TEXT_MUTED}>{" "}{label}</Text>
+      {detail ? <Text color={TEXT_DIM}>{" "}{detail}</Text> : null}
+    </Text>
   );
 }
 
 export function Welcome({ version, status, autoApprove }: Props) {
-  const { llm, plugins, commands, skills, account } = status;
+  const { llm, commands, skills, account } = status;
+  const toolCount = commands.tools.filter((t) => t.registered).length;
 
   return (
-    <Box
-      flexDirection="column"
-      borderStyle="round"
-      borderColor={MUTED}
-      paddingX={1}
-      marginBottom={1}
-    >
-      <CrystalMascot />
-      <Text>
-        <Text color={PRIMARY} bold>PRISM</Text>
-        <Text color={MUTED}>{`  native shell  v${version}`}</Text>
-      </Text>
-      <Text color={TEXT}>Autonomous materials research and compute orchestration.</Text>
-      <Text color={MUTED}>Ask for a task or start with /help, /status, /workflow, /sessions.</Text>
-      <Text> </Text>
+    <Box flexDirection="column" paddingLeft={1} marginBottom={1}>
+      {/* Title — one line, no animation */}
+      <Box>
+        <Text bold color={PRIMARY}>PRISM</Text>
+        <Text color={TEXT_DIM}> v{version}</Text>
+        <Text color={TEXT_DIM}> · </Text>
+        <Text color={TEXT_MUTED}>materials research platform</Text>
+      </Box>
 
-      <Text>
-        <Dot ok={llm.connected} />{" "}
-        <Text color={MUTED}>model</Text>{" "}
-        {llm.connected ? (
-          <Text color={TEXT}>
-            <Text bold>{llm.provider}</Text> ready
-          </Text>
-        ) : (
-          <Text color={ERROR}>not configured</Text>
-        )}
-      </Text>
+      {/* Status checks — compact row */}
+      <Box gap={2} marginTop={0}>
+        <Check ok={llm.connected} label="model" detail={llm.provider ?? undefined} />
+        <Check ok={toolCount > 0} label={`${toolCount} tools`} />
+        <Check ok={skills.count > 0} label={`${skills.count} skills`} />
+        <Check
+          ok={account.signed_in}
+          label="account"
+          detail={account.signed_in ? account.display_name ?? undefined : undefined}
+        />
+      </Box>
 
-      <Text>
-        <Dot ok={commands.tools.some((t) => t.healthy)} />{" "}
-        <Text color={MUTED}>tools</Text>{" "}
-        {commands.tools.length > 0 ? (
-          commands.tools.map((t, i) => (
-            <React.Fragment key={t.name}>
-              <Text color={t.registered ? (t.healthy ? SUCCESS : WARNING) : MUTED}>
-                {shortName(t.name)}
-              </Text>
-              {i < commands.tools.length - 1 && <Text color={MUTED}> · </Text>}
-            </React.Fragment>
-          ))
-        ) : (
-          <Text color={MUTED}>none</Text>
-        )}
-      </Text>
-
-      <Text>
-        <Dot ok={skills.count > 0} /> <Text color={MUTED}>skills</Text>{" "}
-        <Text color={TEXT}>{skills.count}</Text>
-        <Text color={MUTED}>{`  plugins ${plugins.available ? plugins.count : 0}`}</Text>
-      </Text>
-
-      <Text>
-        <Dot ok={account.signed_in} /> <Text color={MUTED}>account</Text>{" "}
-        {account.signed_in ? (
-          <Text color={TEXT}>
-            <Text bold>{account.display_name || account.user_id || "signed in"}</Text>
-            {account.org_name || account.org_id ? (
-              <Text color={MUTED}>{`  ·  ${account.org_name || account.org_id}`}</Text>
-            ) : null}
-            {account.project_name || account.project_id ? (
-              <Text color={MUTED}>{`  ·  ${account.project_name || account.project_id}`}</Text>
-            ) : null}
-          </Text>
-        ) : (
-          <Text color={ERROR}>not signed in</Text>
-        )}
-      </Text>
-
-      <Text color={MUTED}>
-        {commands.healthy_providers}/{commands.total_providers} providers healthy
-        {autoApprove ? "  ·  auto-approve ON" : ""}
-      </Text>
-
+      {/* Contextual hints — only when something needs attention */}
       {!llm.connected ? (
-        <Text color={MUTED}>
-          Configure keys with <Text color={ACCENT_CYAN}>prism setup</Text> or via{" "}
-          <Text color={SECONDARY}>platform.marc27.com</Text>.
-        </Text>
+        <Box marginTop={0}>
+          <Text color={TEXT_MUTED}>
+            {"  run "}
+            <Text color={SECONDARY}>prism login</Text>
+            {" to connect"}
+          </Text>
+        </Box>
+      ) : null}
+
+      {autoApprove ? (
+        <Text color={WARNING}>  △ auto-approve enabled</Text>
       ) : null}
     </Box>
   );

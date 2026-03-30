@@ -52,5 +52,9 @@ export function useBackend(
     [],
   );
 
-  return { ready, events, sendMessage, sendCommand, sendPromptResponse };
+  const sendModelSelect = useCallback((modelId: string) => {
+    clientRef.current?.send("input.model_select", { model_id: modelId });
+  }, []);
+
+  return { ready, events, sendMessage, sendCommand, sendPromptResponse, sendModelSelect };
 }
