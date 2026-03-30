@@ -22,6 +22,7 @@ pub mod validation;
 pub mod graph_validation;
 pub mod nl_query;
 pub mod llm;
+pub mod mapping;
 
 use anyhow::Result;
 use async_trait::async_trait;
