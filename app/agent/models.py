@@ -69,7 +69,7 @@ DEFAULT_MODEL_BY_PROVIDER: dict[str, str] = {
     "google": "gemini-2.5-pro",
     "vertexai": "gemini-2.5-pro",
     "zhipu": "glm-5",
-    "marc27": "claude-sonnet-4-6",
+    "marc27": "claude-sonnet-4-20250514",
     "openrouter": "anthropic/claude-sonnet-4-6",
 }
 
