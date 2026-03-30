@@ -1218,15 +1218,21 @@ fn build_llm_config(
     api_key: Option<&str>,
 ) -> prism_ingest::LlmConfig {
     use prism_ingest::llm::LlmProvider;
-    let provider = match provider.to_lowercase().as_str() {
+    let provider_enum = match provider.to_lowercase().as_str() {
         "openai" | "openai-compatible" | "marc27" | "vllm" | "litellm" => LlmProvider::OpenAi,
         _ => LlmProvider::Ollama,
     };
+    // Default embedding model based on provider
+    let embedding_model = match provider_enum {
+        LlmProvider::Ollama => Some("nomic-embed-text".to_string()),
+        LlmProvider::OpenAi => None, // OpenAI-compatible APIs use the same model or a default
+    };
     prism_ingest::LlmConfig {
-        provider,
+        provider: provider_enum,
         base_url: base_url.into(),
         model: model.into(),
         api_key: api_key.map(str::to_string),
+        embedding_model,
         max_sample_rows: 10,
         timeout_secs: 120,
     }

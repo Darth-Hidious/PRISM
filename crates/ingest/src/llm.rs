@@ -92,6 +92,14 @@ impl LlmClient {
         }
     }
 
+    /// The model to use for embedding — falls back to the generation model if not set.
+    fn embed_model(&self) -> &str {
+        self.config
+            .embedding_model
+            .as_deref()
+            .unwrap_or(&self.config.model)
+    }
+
     fn auth_header(&self) -> Option<String> {
         self.config
             .api_key
@@ -146,7 +154,7 @@ impl LlmClient {
     async fn embed_ollama(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let url = format!("{}/api/embed", self.config.base_url);
         let body = serde_json::json!({
-            "model": self.config.model,
+            "model": self.embed_model(),
             "input": texts,
         });
         let resp = self.post(&url, &body).await?;
@@ -219,7 +227,7 @@ impl LlmClient {
     async fn embed_openai(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let url = format!("{}/v1/embeddings", self.config.base_url);
         let body = serde_json::json!({
-            "model": self.config.model,
+            "model": self.embed_model(),
             "input": texts,
         });
         let resp = self.post(&url, &body).await?;
