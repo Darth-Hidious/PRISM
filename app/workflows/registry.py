@@ -97,7 +97,7 @@ def load_workflow_file(path: Path) -> WorkflowSpec:
     """Load and validate a workflow YAML file."""
     data = _load_yaml(path)
     if data.get("kind", "workflow") != "workflow":
-        raise ValueError(f"{path} is not a workflow manifest")
+        return None  # silently skip non-workflow manifests (e.g. skill_workflow)
 
     name = str(data.get("name") or path.stem)
     command_name = str(data.get("command_name") or name.replace("_", "-"))
@@ -134,6 +134,8 @@ def discover_workflows(project_root: Path | None = None) -> dict[str, WorkflowSp
             except Exception as exc:
                 logger.warning("Failed to load workflow %s: %s", path, exc)
                 continue
+            if spec is None:
+                continue  # non-workflow manifest, silently skipped
             specs[spec.name] = spec
     return specs
 
