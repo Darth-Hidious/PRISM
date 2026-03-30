@@ -1,3 +1,4 @@
+kind: skill_workflow
 name: ingest
 description: >
   Ingest data from a source into the MARC27 Knowledge Plane.
