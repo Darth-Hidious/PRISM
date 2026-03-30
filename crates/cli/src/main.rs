@@ -529,8 +529,16 @@ async fn main() -> Result<()> {
                 with_kafka,
                 broadcast,
             } => {
+                // Load prism.toml config (global + project), CLI flags override
+                let node_config = prism_core::config::NodeConfig::load(Some(&project_root));
+                tracing::debug!(?node_config, "loaded prism.toml config");
+
                 let node_name = name.unwrap_or_else(|| {
-                    sysinfo::System::host_name().unwrap_or_else(|| "prism-node".to_string())
+                    if node_config.node.name != "prism-node" {
+                        node_config.node.name.clone()
+                    } else {
+                        sysinfo::System::host_name().unwrap_or_else(|| "prism-node".to_string())
+                    }
                 });
 
                 // --background: re-exec self as a detached process
@@ -681,10 +689,11 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Wire backend configs based on managed vs external services
-                if external_neo4j.is_some() || service_handles.is_some() {
+                // Wire backend configs — CLI flags > prism.toml > defaults
+                if external_neo4j.is_some() || node_config.services.neo4j_uri.is_some() || service_handles.is_some() {
                     let neo4j_url = external_neo4j
                         .clone()
+                        .or_else(|| node_config.services.neo4j_uri.clone())
                         .unwrap_or_else(|| "http://localhost:7474".into());
                     server_node_state.neo4j = Some(prism_ingest::Neo4jConfig {
                         base_url: neo4j_url,
@@ -693,9 +702,10 @@ async fn main() -> Result<()> {
                         password: "prism-local".into(),
                     });
                 }
-                if external_qdrant.is_some() || service_handles.is_some() {
+                if external_qdrant.is_some() || node_config.services.qdrant_uri.is_some() || service_handles.is_some() {
                     let qdrant_url = external_qdrant
                         .clone()
+                        .or_else(|| node_config.services.qdrant_uri.clone())
                         .unwrap_or_else(|| "http://localhost:6333".into());
                     server_node_state.qdrant = Some(prism_ingest::QdrantConfig {
                         base_url: qdrant_url,
@@ -704,8 +714,29 @@ async fn main() -> Result<()> {
                     });
                 }
 
-                // Wire LLM config for NL query translation (Ollama by default)
-                server_node_state.llm = Some(prism_ingest::LlmConfig::default());
+                // Wire LLM config from prism.toml [indexer] section or defaults
+                {
+                    let api_key = prism_core::config::NodeConfig::resolve_api_key(&node_config.indexer);
+                    let provider = match node_config.indexer.mode.as_str() {
+                        "platform" | "marc27" => prism_ingest::llm::LlmProvider::OpenAi,
+                        "external" => prism_ingest::llm::LlmProvider::OpenAi,
+                        _ => prism_ingest::llm::LlmProvider::Ollama,
+                    };
+                    let base_url = node_config.indexer.uri.clone()
+                        .unwrap_or_else(|| match provider {
+                            prism_ingest::llm::LlmProvider::OpenAi => node_config.platform.url.clone() + "/llm",
+                            prism_ingest::llm::LlmProvider::Ollama => "http://localhost:11434".into(),
+                        });
+                    server_node_state.llm = Some(prism_ingest::LlmConfig {
+                        provider,
+                        base_url,
+                        model: node_config.indexer.model.clone().unwrap_or_else(|| "qwen2.5:7b".into()),
+                        api_key,
+                        embedding_model: node_config.indexer.embedding_model.clone(),
+                        max_sample_rows: 10,
+                        timeout_secs: 120,
+                    });
+                }
 
                 // ── Platform registration (unless --offline) ──
                 let mut daemon_platform_client: Option<PlatformClient> = None;

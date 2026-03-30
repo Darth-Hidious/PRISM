@@ -27,6 +27,7 @@ uuid.workspace = true
 
 prism-client = { path = "../client" }
 prism-compute = { path = "../compute" }
+prism-core = { path = "../core" }
 prism-ingest = { path = "../ingest" }
 prism-mesh = { path = "../mesh" }
 prism-node = { path = "../node" }
