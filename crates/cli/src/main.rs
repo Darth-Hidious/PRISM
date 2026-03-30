@@ -887,7 +887,7 @@ async fn main() -> Result<()> {
             } else {
                 handle_ingest(
                     &path, &llm_cfg, &neo4j_url, &neo4j_user, &neo4j_pass,
-                    &qdrant_url, schema_only,
+                    &qdrant_url, schema_only, mapping.as_deref(),
                 )
                 .await?;
             }
@@ -1248,6 +1248,7 @@ async fn handle_ingest(
     neo4j_pass: &str,
     qdrant_url: &str,
     schema_only: bool,
+    mapping_path: Option<&Path>,
 ) -> Result<()> {
     use prism_ingest::pipeline::{IngestPipeline, PipelineConfig};
     use prism_ingest::{Neo4jConfig, QdrantConfig};
@@ -1258,12 +1259,17 @@ async fn handle_ingest(
 
     println!("Ingesting: {}", path.display());
 
+    let mapping = mapping_path
+        .map(prism_ingest::mapping::OntologyMapping::from_file)
+        .transpose()?;
+
     let config = if schema_only {
         PipelineConfig {
             llm: None,
             neo4j: None,
             qdrant: None,
             max_sample_rows: 10,
+            mapping: None,
         }
     } else {
         PipelineConfig {
@@ -1280,6 +1286,7 @@ async fn handle_ingest(
                 api_key: None,
             }),
             max_sample_rows: 10,
+            mapping,
         }
     };
 
@@ -1369,7 +1376,7 @@ async fn handle_ingest_watch(
         }
         println!("[initial] Ingesting {}", path.display());
         if let Err(e) = handle_ingest(
-            &path, llm_cfg, neo4j_url, neo4j_user, neo4j_pass, qdrant_url, schema_only,
+            &path, llm_cfg, neo4j_url, neo4j_user, neo4j_pass, qdrant_url, schema_only, None,
         )
         .await
         {
@@ -1411,7 +1418,7 @@ async fn handle_ingest_watch(
                 println!("\n[watch] Detected: {}", path.display());
                 if let Err(e) = handle_ingest(
                     &path, llm_cfg, neo4j_url, neo4j_user, neo4j_pass, qdrant_url,
-                    schema_only,
+                    schema_only, None,
                 )
                 .await
                 {

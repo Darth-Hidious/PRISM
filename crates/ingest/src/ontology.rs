@@ -76,7 +76,18 @@ impl LlmOntologyConstructor {
     }
 
     /// Build the extraction prompt from schema + sample rows.
-    fn build_extraction_prompt(schema: &SchemaAnalysis, sample_rows: &[Vec<String>]) -> String {
+    fn build_extraction_prompt(
+        schema: &SchemaAnalysis,
+        sample_rows: &[Vec<String>],
+    ) -> String {
+        Self::build_extraction_prompt_with_mapping(schema, sample_rows, None)
+    }
+
+    fn build_extraction_prompt_with_mapping(
+        schema: &SchemaAnalysis,
+        sample_rows: &[Vec<String>],
+        mapping: Option<&crate::mapping::OntologyMapping>,
+    ) -> String {
         let mut prompt = String::with_capacity(2048);
         prompt.push_str(
             "You are a materials science data analyst. Given a dataset schema and sample rows, \
@@ -118,6 +129,11 @@ impl LlmOntologyConstructor {
                \"relationships\": [{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null}]\n\
              }\n",
         );
+
+        // Append custom mapping rules if provided
+        if let Some(m) = mapping {
+            prompt.push_str(&m.to_prompt_supplement());
+        }
 
         prompt
     }
@@ -257,6 +273,15 @@ impl LlmOntologyConstructor {
         schema: &SchemaAnalysis,
         sample_rows: &[Vec<String>],
     ) -> Result<EntitySet> {
+        self.extract_entities_with_mapping(schema, sample_rows, None).await
+    }
+
+    pub async fn extract_entities_with_mapping(
+        &self,
+        schema: &SchemaAnalysis,
+        sample_rows: &[Vec<String>],
+        mapping: Option<&crate::mapping::OntologyMapping>,
+    ) -> Result<EntitySet> {
         let max_rows = self.config.max_sample_rows;
         let rows = if sample_rows.len() > max_rows {
             &sample_rows[..max_rows]
@@ -270,7 +295,7 @@ impl LlmOntologyConstructor {
             "extracting entities via LLM with samples"
         );
 
-        let prompt = Self::build_extraction_prompt(schema, rows);
+        let prompt = Self::build_extraction_prompt_with_mapping(schema, rows, mapping);
         let response = self.generate(&prompt).await?;
 
         let raw: ExtractionOutput =
