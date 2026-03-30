@@ -111,7 +111,7 @@ impl<'a> KnowledgeClient<'a> {
     /// Equivalent to Python: `client.knowledge.graph_search(term, limit=20)`
     pub async fn graph_search(&self, term: &str, limit: usize) -> Result<Vec<KgEntity>> {
         let encoded = urlencoding::encode(term);
-        let path = format!("/knowledge/search?q={encoded}&limit={limit}");
+        let path = format!("/knowledge/graph/search?q={encoded}&limit={limit}");
         self.platform
             .get(&path)
             .await
@@ -123,7 +123,7 @@ impl<'a> KnowledgeClient<'a> {
     /// Equivalent to Python: `client.knowledge.graph_entity(name, limit=10)`
     pub async fn graph_entity(&self, name: &str, limit: usize) -> Result<KgEntityDetail> {
         let encoded = urlencoding::encode(name);
-        let path = format!("/knowledge/entity/{encoded}?limit={limit}");
+        let path = format!("/knowledge/graph/entity/{encoded}?limit={limit}");
         self.platform
             .get(&path)
             .await
@@ -141,7 +141,7 @@ impl<'a> KnowledgeClient<'a> {
     ) -> Result<Vec<KgPath>> {
         let from_enc = urlencoding::encode(from);
         let to_enc = urlencoding::encode(to);
-        let path = format!("/knowledge/paths?from={from_enc}&to={to_enc}&max_hops={max_hops}");
+        let path = format!("/knowledge/graph/paths?from={from_enc}&to={to_enc}&max_hops={max_hops}");
         self.platform
             .get(&path)
             .await
@@ -153,7 +153,7 @@ impl<'a> KnowledgeClient<'a> {
     /// Equivalent to Python: `client.knowledge.graph_stats()`
     pub async fn graph_stats(&self) -> Result<KgStats> {
         self.platform
-            .get("/knowledge/stats")
+            .get("/knowledge/graph/stats")
             .await
             .context("knowledge graph_stats failed")
     }
@@ -175,7 +175,7 @@ impl<'a> KnowledgeClient<'a> {
             body["corpus_id"] = serde_json::Value::String(cid.to_string());
         }
         self.platform
-            .post("/knowledge/search/semantic", &body)
+            .post("/knowledge/search", &body)
             .await
             .context("knowledge semantic_search failed")
     }
@@ -196,7 +196,7 @@ impl<'a> KnowledgeClient<'a> {
         if let Some(k) = kind {
             params.push(format!("kind={}", urlencoding::encode(k)));
         }
-        let path = format!("/knowledge/corpora?{}", params.join("&"));
+        let path = format!("/knowledge/catalog?{}", params.join("&"));
         self.platform
             .get(&path)
             .await
