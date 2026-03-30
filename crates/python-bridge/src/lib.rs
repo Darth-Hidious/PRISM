@@ -1,7 +1,8 @@
 //! Python worker launch and supervision primitives.
 //!
-//! This crate intentionally starts small: the first job is to make Python an
-//! explicitly supervised worker process rather than the top-level CLI shell.
+//! Makes the Python TAOR runtime an explicitly supervised child process rather
+//! than the top-level CLI shell. Handles subprocess spawning, venv discovery,
+//! environment variable injection, and stdio piping for JSON-RPC communication.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

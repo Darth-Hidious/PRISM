@@ -21,8 +21,7 @@ def run_goal(ctx, goal, agent, provider, model, confirm, accept_all):
     from app.agent.factory import create_backend
     from app.agent.autonomous import run_autonomous_stream
     from app.plugins.bootstrap import build_full_registry
-    from app.cli.tui.cards import render_tool_result, render_cost_line
-    from app.cli.tui.spinner import Spinner
+    from app.backend.tool_meta import render_tool_result, render_cost_line, Spinner
 
     no_mcp = ctx.obj.get("no_mcp", False) if ctx.obj else False
     run_console = Console(highlight=False)

@@ -23,6 +23,7 @@ UI_EVENTS: dict[str, dict[str, type]] = {
     "ui.status":        {"auto_approve": bool, "message_count": int, "has_plan": bool},
     "ui.turn.complete": {},
     "ui.session.list":  {"sessions": list},
+    "ui.model.list":    {"current": str, "models": list},
 }
 
 # Frontend -> Backend events (JSON-RPC requests/notifications)
@@ -32,6 +33,7 @@ INPUT_EVENTS: dict[str, dict[str, type]] = {
     "input.command":          {"command": str},
     "input.prompt_response":  {"prompt_type": str, "response": str},
     "input.load_session":     {"session_id": str},
+    "input.model_select":     {"model_id": str},
 }
 
 

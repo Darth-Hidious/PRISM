@@ -29,6 +29,8 @@ pub struct NodeConfig {
     pub indexer: ModelServiceSection,
     #[serde(default)]
     pub searcher: ModelServiceSection,
+    #[serde(default)]
+    pub calphad: CalphadSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +125,34 @@ pub struct ModelServiceSection {
     #[serde(default)]
     pub port: Option<u16>,
 }
+
+/// Configuration for CALPHAD thermodynamic calculations.
+///
+/// Supports local TDB/THCEA databases and MARC27 cloud CALPHAD service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalphadSection {
+    /// "local" (pycalphad with local TDB files), "platform" (MARC27 cloud), or "disabled"
+    #[serde(default = "default_calphad_mode")]
+    pub mode: String,
+    /// Paths to local TDB/THCEA database files.
+    #[serde(default)]
+    pub databases: Vec<String>,
+    /// Default database to use for calculations.
+    #[serde(default)]
+    pub default_database: Option<String>,
+}
+
+impl Default for CalphadSection {
+    fn default() -> Self {
+        Self {
+            mode: "local".into(),
+            databases: Vec::new(),
+            default_database: None,
+        }
+    }
+}
+
+fn default_calphad_mode() -> String { "local".into() }
 
 // ── Defaults ────────────────────────────────────────────────────────
 

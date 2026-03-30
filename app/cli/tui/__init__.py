@@ -1,1 +1,2 @@
-"""Rich + prompt_toolkit terminal UI for the PRISM REPL."""
+# Rich REPL removed — all rendering now done by Ink TUI frontend.
+# This package is kept as an empty namespace for backward compatibility.

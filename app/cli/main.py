@@ -20,8 +20,6 @@ import click
 from rich.console import Console
 
 from app.config.branding import PRISM_BRAND
-from app.agent.factory import create_backend
-from app.agent.repl import AgentREPL
 
 # ==============================================================================
 # Setup
@@ -40,8 +38,7 @@ console = Console(force_terminal=True, width=120)
 @click.option('--resume', default=None, help='Resume a saved session by SESSION_ID')
 @click.option('--no-mcp', is_flag=True, help='Disable loading tools from external MCP servers')
 @click.option('--dangerously-accept-all', is_flag=True, help='Auto-approve all tool calls (skip consent prompts)')
-@click.option('--classic', is_flag=True, help='Use classic Rich terminal UI')
-def cli(ctx, version, verbose, quiet, mp_api_key, resume, no_mcp, dangerously_accept_all, classic):
+def cli(ctx, version, verbose, quiet, mp_api_key, resume, no_mcp, dangerously_accept_all):
     f"""
 {PRISM_BRAND}
 AI-Native Autonomous Materials Discovery
@@ -130,10 +127,10 @@ Documentation: https://github.com/Darth-Hidious/PRISM
         except Exception:
             pass
 
-        # Try Ink TUI binary (unless --classic or binary not found)
+        # Launch Ink TUI binary
         from app.cli._binary import has_tui_binary, rust_cli_binary_path, tui_binary_path
 
-        if not classic and sys.stdin.isatty() and sys.stdout.isatty() and has_tui_binary():
+        if sys.stdin.isatty() and sys.stdout.isatty() and has_tui_binary():
             binary = tui_binary_path()
             args = [str(binary), "--python", sys.executable]
             rust_cli = rust_cli_binary_path()
@@ -145,24 +142,11 @@ Documentation: https://github.com/Darth-Hidious/PRISM
                 args.extend(["--resume", resume])
             os.execvp(str(binary), args)
 
-        # Launch classic Rich REPL
-        try:
-            backend = create_backend()
-            repl = AgentREPL(backend=backend, enable_mcp=not no_mcp,
-                             auto_approve=dangerously_accept_all)
-            if resume:
-                try:
-                    repl._load_session(resume)
-                    console.print(f"[green]Resumed session: {resume}[/green]")
-                except FileNotFoundError:
-                    console.print(f"[red]Session not found: {resume}[/red]")
-                    return
-            repl.run()
-        except ValueError as e:
-            # No LLM key configured — offer to set one up
-            console.print()
-            console.print(f"[yellow]{e}[/yellow]")
-            console.print("\nRun [cyan]prism setup[/cyan] to configure an LLM provider, or [cyan]prism --help[/cyan] for all commands.")
+        # No TUI binary found
+        console.print()
+        console.print("[yellow]PRISM TUI binary not found.[/yellow]")
+        console.print("Run [cyan]prism update[/cyan] to download the latest TUI binary.")
+        console.print("Or use subcommands directly: [cyan]prism run \"goal\"[/cyan], [cyan]prism search[/cyan], etc.")
 
 
 # ==============================================================================

@@ -1,7 +1,7 @@
 # PRISM Platform Makefile
 # Provides convenient commands for development and execution
 
-.PHONY: help install dev-install format lint test clean run publish check
+.PHONY: help install dev-install format lint test clean run publish check dashboard-build rust-build build
 
 # Default target
 help:
@@ -21,6 +21,11 @@ help:
 	@echo ""
 	@echo "Execution:"
 	@echo "  make run          Run the PRISM CLI"
+	@echo ""
+	@echo "V2 Builds:"
+	@echo "  make dashboard-build  Build the React SPA dashboard"
+	@echo "  make rust-build       Build dashboard + Rust workspace"
+	@echo "  make build            Full build (dashboard + Rust)"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  make clean        Clean up temporary build and cache files"
@@ -54,6 +59,19 @@ test:
 run:
 	@echo "🚀 Starting PRISM CLI..."
 	prism --help
+
+# ── V2 Rust + Dashboard builds ─────────────────────────────────────
+
+dashboard-build:
+	@echo "Building dashboard SPA..."
+	cd dashboard && npm ci && npm run build
+
+rust-build: dashboard-build
+	@echo "Building Rust workspace..."
+	cargo build --workspace
+
+build: rust-build
+	@echo "Full build complete."
 
 # Utility commands
 clean:

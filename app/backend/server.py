@@ -52,6 +52,8 @@ class StdioServer:
             self._handle_prompt_response(params, output)
         elif method == "input.load_session":
             self._handle_load_session(params, msg_id, output)
+        elif method == "input.model_select":
+            self._handle_model_select(params, output)
         else:
             self._send_error(output, msg_id, -32601, f"Unknown method: {method}")
 
@@ -177,6 +179,23 @@ class StdioServer:
             })
         except Exception as e:
             self._send_error(output, msg_id, -32000, str(e))
+
+    def _handle_model_select(self, params: dict, output: TextIO):
+        if not self.emitter:
+            return
+        model_id = params.get("model_id", "")
+        if model_id:
+            success = self.emitter._switch_model(model_id)
+            if success:
+                self._emit(output, {
+                    "jsonrpc": "2.0",
+                    "method": "ui.card",
+                    "params": {
+                        "card_type": "info", "tool_name": "", "elapsed_ms": 0,
+                        "content": f"Switched to **{model_id}**",
+                        "data": {},
+                    },
+                })
 
     def _emit(self, output: TextIO, event: dict):
         output.write(json.dumps(event) + "\n")

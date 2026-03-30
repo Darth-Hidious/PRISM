@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-03-27
+
+### Added — Rust Backbone (15 crates)
+- **prism-cli**: Rust `prism` binary with clap command routing, device-flow auth, workflow discovery, and Python worker supervision.
+- **prism-node**: Rust `prism-node` daemon — WebSocket platform registration, heartbeat, job dispatch, reconnect with backoff.
+- **prism-core**: Node config (`prism.toml` schema), multi-user session management (SQLite), RBAC engine (platform + local roles), append-only audit log (SQLite), tool manifest registry with directory scanning.
+- **prism-client**: Typed MARC27 platform API client — device-code OAuth flow with polling/backoff, token refresh, marketplace browsing, node registration/discovery.
+- **prism-compute**: `ComputeBackend` trait with three targets — `LocalBackend` (Docker/Podman with GPU passthrough), `Marc27Backend` (cloud REST API), `ByocBackend` (SSH/Kubernetes/SLURM interfaces). Thread-safe `JobTracker` with concurrent access. `ComputeRouter` for intelligent backend selection.
+- **prism-ingest**: `OntologyConstructor` trait (pluggable — LLM now, DMMS future). Ollama API integration for entity extraction and embeddings. Neo4j HTTP Transactional Cypher API client. Qdrant REST API client for vector upsert/query/delete. Schema detection, graph construction, embedding generation interfaces.
+- **prism-orch**: `ServiceOrchestrator` trait. Docker orchestration via bollard (image pull, container create/start/stop/remove, port binding, log streaming). Health checker with timeout/retry. Service definitions for Neo4j, Qdrant, Kafka, Spark.
+- **prism-mesh**: Node discovery via mDNS/DNS-SD and platform-mediated cross-org. Pub/sub subscription management. Peer tracking with state machine (Offline/Online). Inter-node protocol types. Federation placeholder.
+- **prism-server**: Axum HTTP/WebSocket server with shared `NodeState`. Router builder, middleware modules (auth, RBAC), handler stubs for node/data/query/tools/mesh/users/audit endpoints.
+- **prism-forge**: Experiment design types — `ForgeSession`, `ForgeInput`. Module structure for comprehension, hypothesis, experiment, evaluation, report, persistence.
+- **prism-ipc**: JSON-RPC 2.0 types (`RpcRequest`, `RpcResponse`, `RpcNotification`, `RpcError`). `IpcServer` spawns TUI as child process with piped stdio channels.
+- **prism-workflows**: YAML workflow engine — filesystem discovery, template interpolation (`{{ args.data }}`), step execution (set, message, http), dry-run mode. Built-in `forge.yaml` embedded in binary.
+- **prism-proto**: Wire types for CLI↔Python (`BackendRequest`/`BackendResponse`), node↔platform (`NodeMessage`/`PlatformMessage`), capabilities (`NodeCapabilities`, `GpuInfo`, `NodeService`).
+- **prism-runtime**: XDG-based path discovery (`PrismPaths`), credential persistence (`PrismCliState`), platform endpoint URL derivation.
+- **prism-python-bridge**: Python subprocess config, command building, async worker spawning with piped stdio.
+
+### Added — Node Security
+- **E2EE**: X25519 Diffie-Hellman key agreement + ChaCha20-Poly1305 AEAD encryption. Random 12-byte nonce per message. Output format: `nonce(12) || ciphertext || tag(16)`.
+- **Ed25519 signing**: Node identity verification via signing keypair.
+- **Key persistence**: Private keys stored as raw 32 bytes with `0600` Unix permissions.
+- **Key rotation**: `prism node key rotate` generates new keypair, zeroizes old material.
+- **SSH identity**: Hardened `prism-node` SSH identity support for BYOC targets.
+
+### Added — Test Suite
+- **355 Rust tests** across all 15 crates (up from 121 scaffold tests).
+- Covers: serde roundtrips for all types, error paths (invalid input, wrong keys, corrupted data), edge cases (empty strings, unicode, very long inputs, None vs Some("")), scale tests (200+ sessions, 500 users, 100 peers, 50 concurrent jobs), file persistence roundtrips, cryptographic property verification (symmetric shared secrets, nonce uniqueness, permission bits).
+- **Zero compiler warnings** across the entire workspace.
+
+### Added — Documentation
+- Crate-level rustdoc (`//!` headers) for all 15 crates with module references and architecture context.
+- `description` field in all 15 `Cargo.toml` files.
+- Rewritten `docs/architecture/rust-backbone.md` with full crate reference, implementation status, and security architecture.
+
+### Changed
+- **README.md**: Full rewrite — now leads with Rust backbone architecture, crate table with test counts, node features, mesh networking. Python layer documented as supervised child process.
+- **Rich REPL dropped**: `--classic` flag removed. Ink TUI is the only frontend.
+- Shared utilities extracted from Rich TUI to `app/backend/tool_meta.py` before deletion.
+
+### Removed
+- `app/cli/tui/app.py`, `cards.py`, `prompt.py`, `spinner.py`, `stream.py`, `status.py`, `theme.py`, `welcome.py` — Rich-only rendering code.
+- `app/agent/repl.py` — shim that re-exported from Rich TUI.
+
+---
+
 ## [2.5.0-beta] - 2026-02-26
 
 ### Added

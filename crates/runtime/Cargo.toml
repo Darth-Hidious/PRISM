@@ -1,5 +1,6 @@
 [package]
 name = "prism-runtime"
+description = "Shared runtime primitives — XDG path discovery, credential storage, and platform endpoint resolution."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

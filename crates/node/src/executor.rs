@@ -64,6 +64,8 @@ pub struct ContainerJobSpec {
     pub timeout_secs: u64,
     pub allow_network: bool,
     pub workspace_dir: PathBuf,
+    /// Memory limit for the container (e.g. "8g", "16g"). If None, uses 75% of system RAM.
+    pub memory_limit: Option<String>,
 }
 
 /// Result of a completed job.
@@ -177,8 +179,14 @@ pub async fn execute_container_job(
         args.push("all".to_string());
     }
 
+    let mem_limit = spec.memory_limit.clone().unwrap_or_else(|| {
+        let sys = sysinfo::System::new_all();
+        let total_gb = sys.total_memory() / 1024 / 1024 / 1024;
+        let limit_gb = (total_gb * 3 / 4).max(2); // 75% of system RAM, minimum 2 GB
+        format!("{limit_gb}g")
+    });
     args.push("--memory".to_string());
-    args.push("8g".to_string());
+    args.push(mem_limit);
 
     let env_vars = sanitize_env_vars(&spec.env_vars)?;
     let prism_env = [

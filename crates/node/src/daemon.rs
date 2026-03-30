@@ -30,6 +30,16 @@ pub struct DaemonOptions {
     pub no_compute: bool,
     pub no_storage: bool,
     pub ssh: Option<SshCapability>,
+    /// Broadcast this node for discovery (mDNS + platform). Without this, the node is private.
+    pub broadcast: bool,
+    /// Platform client for REST heartbeat + deregistration. Set when `--broadcast` is active.
+    pub platform_client: Option<prism_client::PlatformClient>,
+    /// Node ID returned by platform registration. Used for heartbeat + deregistration.
+    pub platform_node_id: Option<String>,
+    /// Path to the RBAC SQLite database for role sync.
+    pub rbac_db_path: Option<PathBuf>,
+    /// Organisation ID for role fetching.
+    pub org_id: Option<String>,
 }
 
 impl Default for DaemonOptions {
@@ -41,6 +51,11 @@ impl Default for DaemonOptions {
             no_compute: false,
             no_storage: false,
             ssh: None,
+            broadcast: false,
+            platform_client: None,
+            platform_node_id: None,
+            rbac_db_path: None,
+            org_id: None,
         }
     }
 }
@@ -160,6 +175,11 @@ pub async fn run_daemon(
     write_pid_file(&pid_path)?;
     let _pid_guard = PidFileGuard(pid_path);
 
+    let platform_client = options.platform_client.clone();
+    let platform_node_id = options.platform_node_id.clone();
+    let rbac_db_path = options.rbac_db_path.clone();
+    let rbac_org_id = options.org_id.clone();
+
     let mut delay_secs: u64 = 1;
 
     loop {
@@ -172,10 +192,23 @@ pub async fn run_daemon(
             &options.name,
             org_id,
             &wire_capabilities,
+            platform_client.as_ref(),
+            platform_node_id.as_deref(),
+            rbac_db_path.as_deref(),
+            rbac_org_id.as_deref(),
         )
         .await
         {
             Ok(ShutdownReason::Graceful) => {
+                // Deregister from platform on clean shutdown.
+                if let (Some(client), Some(nid)) = (&platform_client, &platform_node_id) {
+                    let registry = prism_client::node_registry::NodeRegistryClient::new(client);
+                    if let Err(e) = registry.deregister_node(nid).await {
+                        tracing::warn!(error = %e, "platform deregistration failed (non-fatal)");
+                    } else {
+                        tracing::info!("deregistered from MARC27 platform");
+                    }
+                }
                 tracing::info!("node shut down gracefully");
                 return Ok(());
             }
@@ -231,6 +264,116 @@ enum ShutdownReason {
     TokenExpired,
 }
 
+/// Write data to a file with restricted permissions (0600 on Unix).
+fn write_restricted_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(data)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)?;
+    }
+    Ok(())
+}
+
+/// Fetch managed LLM keys from the platform and write to local state.
+///
+/// Writes to `{state_dir}/llm_keys.json`. Non-fatal — logs warnings on failure.
+async fn sync_llm_keys(
+    client: &prism_client::PlatformClient,
+    org_id: &str,
+    state_dir: &Path,
+) {
+    let keys = match client.fetch_llm_keys(org_id).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::debug!(error = %e, "LLM key sync: platform endpoint unavailable");
+            return;
+        }
+    };
+
+    let keys_path = state_dir.join("llm_keys.json");
+    match serde_json::to_string_pretty(&keys) {
+        Ok(json) => {
+            if let Err(e) = write_restricted_file(&keys_path, json.as_bytes()) {
+                tracing::warn!(error = %e, path = %keys_path.display(), "LLM key sync: failed to write keys file");
+            } else {
+                tracing::info!(count = keys.len(), "LLM key sync complete");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "LLM key sync: failed to serialize keys"),
+    }
+}
+
+/// Sync organisation roles from the platform into the local RBAC database.
+///
+/// Fetches member roles from the platform API and writes them to the local
+/// SQLite RBAC engine. Non-fatal — logs warnings on failure.
+async fn sync_roles_from_platform(
+    client: &prism_client::PlatformClient,
+    org_id: &str,
+    rbac_db_path: &Path,
+) {
+    let members = match client.fetch_org_roles(org_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(error = %e, "role sync: platform endpoint unavailable");
+            return;
+        }
+    };
+
+    let engine = match prism_core::rbac::RbacEngine::new(rbac_db_path) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "role sync: failed to open RBAC database");
+            return;
+        }
+    };
+
+    let mut synced = 0u32;
+    for member in &members {
+        let platform_role = match prism_core::rbac::PlatformRole::from_api_str(&member.role) {
+            Some(r) => r,
+            None => {
+                tracing::debug!(user_id = %member.user_id, role = %member.role, "role sync: unknown platform role, skipping");
+                continue;
+            }
+        };
+        let local_role = platform_role.to_local_role();
+        if let Err(e) = engine.assign_role(&member.user_id, local_role) {
+            tracing::warn!(user_id = %member.user_id, error = %e, "role sync: failed to assign role");
+        } else {
+            synced += 1;
+        }
+    }
+    // Revoke roles for users no longer on the platform
+    let platform_ids: std::collections::HashSet<&str> =
+        members.iter().map(|m| m.user_id.as_str()).collect();
+    let mut revoked = 0u32;
+    if let Ok(local_users) = engine.list_users() {
+        for (uid, _role) in &local_users {
+            if !platform_ids.contains(uid.as_str()) {
+                if let Err(e) = engine.remove_role(uid) {
+                    tracing::warn!(user_id = %uid, error = %e, "role sync: failed to revoke stale role");
+                } else {
+                    revoked += 1;
+                }
+            }
+        }
+    }
+
+    tracing::info!(synced, revoked, total = members.len(), "role sync complete");
+}
+
 async fn connect_and_run(
     endpoints: &PlatformEndpoints,
     paths: &PrismPaths,
@@ -238,6 +381,10 @@ async fn connect_and_run(
     name: &str,
     org_id: Option<Uuid>,
     capabilities: &NodeCapabilities,
+    platform_client: Option<&prism_client::PlatformClient>,
+    platform_node_id: Option<&str>,
+    rbac_db_path: Option<&Path>,
+    rbac_org_id: Option<&str>,
 ) -> Result<ShutdownReason> {
     let url = format!("{}?token={}", endpoints.node_ws, token);
     tracing::info!(url = %endpoints.node_ws, "connecting to platform");
@@ -298,6 +445,20 @@ async fn connect_and_run(
     heartbeat_timer.tick().await;
     let mut shutdown_timer = tokio::time::interval(Duration::from_secs(1));
     shutdown_timer.tick().await;
+    // REST heartbeat to platform (every 60s, independent of WS heartbeat).
+    let mut rest_heartbeat_timer = tokio::time::interval(Duration::from_secs(60));
+    rest_heartbeat_timer.tick().await;
+    // Role sync from platform (every 5 min).
+    let mut role_sync_timer = tokio::time::interval(Duration::from_secs(300));
+    role_sync_timer.tick().await;
+
+    // Initial sync on startup: roles + LLM keys.
+    if let (Some(client), Some(oid)) = (platform_client, rbac_org_id) {
+        if let Some(db_path) = rbac_db_path {
+            sync_roles_from_platform(client, oid, db_path).await;
+        }
+        sync_llm_keys(client, oid, &paths.state_dir).await;
+    }
 
     let mut system = System::new_all();
 
@@ -309,13 +470,36 @@ async fn connect_and_run(
                 let used_mem = system.used_memory() as f64;
                 let total_mem = system.total_memory() as f64;
                 let memory_usage = if total_mem > 0.0 { used_mem / total_mem } else { 0.0 };
+                let total_gpus: u32 = capabilities.gpus.iter().map(|g| g.count).sum();
+                let active = active_jobs.load(Ordering::Relaxed);
+                let gpus_in_use = if total_gpus > 0 { active.min(total_gpus) } else { 0 };
                 let hb = NodeMessage::Heartbeat {
                     cpu_load,
                     memory_usage,
-                    gpus_free: 0,
-                    active_jobs: active_jobs.load(Ordering::Relaxed),
+                    gpus_free: total_gpus.saturating_sub(gpus_in_use),
+                    active_jobs: active,
                 };
                 sink.send(Message::Text(serde_json::to_string(&hb)?.into())).await?;
+            }
+            _ = rest_heartbeat_timer.tick() => {
+                // REST heartbeat complements the WS heartbeat above.
+                // The platform may not support this endpoint yet (see docs/marc27-api-discrepancies.md).
+                // Failures are silently ignored — the WS heartbeat is authoritative.
+                if let (Some(client), Some(nid)) = (platform_client, platform_node_id) {
+                    let active = active_jobs.load(Ordering::Relaxed);
+                    let registry = prism_client::node_registry::NodeRegistryClient::new(client);
+                    if let Err(e) = registry.heartbeat(nid, "online", active).await {
+                        tracing::debug!(error = %e, "REST heartbeat unavailable (WS heartbeat active)");
+                    }
+                }
+            }
+            _ = role_sync_timer.tick() => {
+                if let (Some(client), Some(oid)) = (platform_client, rbac_org_id) {
+                    if let Some(db_path) = rbac_db_path {
+                        sync_roles_from_platform(client, oid, db_path).await;
+                    }
+                    sync_llm_keys(client, oid, &paths.state_dir).await;
+                }
             }
             _ = shutdown_timer.tick() => {
                 if state::shutdown_requested(&paths.state_dir) {
@@ -507,6 +691,7 @@ async fn handle_platform_message(
                     timeout_secs,
                     allow_network: false,
                     workspace_dir: workspace_dir.clone(),
+                    memory_limit: None, // auto-detect from system RAM
                 };
 
                 let execute = executor::execute_container_job(runtime, &spec, |progress, msg| {

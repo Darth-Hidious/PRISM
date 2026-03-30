@@ -2678,6 +2678,8 @@ dependencies = [
  "chrono",
  "clap",
  "prism-client",
+ "prism-compute",
+ "prism-core",
  "prism-ingest",
  "prism-ipc",
  "prism-mesh",
@@ -2696,6 +2698,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2742,17 +2745,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prism-forge"
-version = "2.5.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "prism-ingest"
 version = "2.5.0"
 dependencies = [
@@ -2762,6 +2754,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "tracing",
  "uuid",

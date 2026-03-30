@@ -161,4 +161,149 @@ mod tests {
         clear_shutdown_request(tmp.path());
         assert!(!shutdown_requested(tmp.path()));
     }
+
+    // -- Edge cases ---
+
+    #[test]
+    fn active_jobs_empty_state_dir() {
+        let tmp = TempDir::new().unwrap();
+        let jobs = active_jobs(tmp.path()).unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[test]
+    fn remove_nonexistent_job_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let result = remove_active_job(tmp.path(), Uuid::new_v4()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn multiple_active_jobs() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..5 {
+            register_active_job(
+                tmp.path(),
+                ActiveJobRecord {
+                    job_id: Uuid::new_v4(),
+                    runtime: "docker".into(),
+                    handle: format!("container-{i}"),
+                    workspace_dir: format!("/tmp/job-{i}"),
+                    image: "test:latest".into(),
+                    started_at: Utc::now(),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(active_jobs(tmp.path()).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn register_same_job_id_overwrites() {
+        let tmp = TempDir::new().unwrap();
+        let id = Uuid::new_v4();
+        let rec1 = ActiveJobRecord {
+            job_id: id,
+            runtime: "docker".into(),
+            handle: "old-handle".into(),
+            workspace_dir: "/tmp/old".into(),
+            image: "img:v1".into(),
+            started_at: Utc::now(),
+        };
+        let rec2 = ActiveJobRecord {
+            job_id: id,
+            runtime: "podman".into(),
+            handle: "new-handle".into(),
+            workspace_dir: "/tmp/new".into(),
+            image: "img:v2".into(),
+            started_at: Utc::now(),
+        };
+
+        register_active_job(tmp.path(), rec1).unwrap();
+        register_active_job(tmp.path(), rec2).unwrap();
+
+        let jobs = active_jobs(tmp.path()).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].handle, "new-handle");
+    }
+
+    #[test]
+    fn workspace_paths_are_correct() {
+        let state = Path::new("/var/prism/state");
+        let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+
+        let ws = workspace_dir(state, id);
+        assert!(ws.to_str().unwrap().contains("12345678-1234-1234-1234-123456789abc"));
+
+        let result = result_manifest_path(&ws);
+        assert!(result.ends_with("result.json"));
+
+        let stdout = stdout_log_path(&ws);
+        assert!(stdout.ends_with("stdout.log"));
+
+        let stderr = stderr_log_path(&ws);
+        assert!(stderr.ends_with("stderr.log"));
+
+        let inputs = inputs_path(&ws);
+        assert!(inputs.ends_with("inputs.json"));
+
+        let meta = metadata_path(&ws);
+        assert!(meta.ends_with("metadata.json"));
+    }
+
+    #[test]
+    fn ensure_workspace_creates_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let id = Uuid::new_v4();
+        let ws = ensure_workspace(tmp.path(), id).unwrap();
+        assert!(ws.is_dir());
+    }
+
+    #[test]
+    fn active_job_record_serde_roundtrip() {
+        let record = ActiveJobRecord {
+            job_id: Uuid::new_v4(),
+            runtime: "docker".into(),
+            handle: "prism-job-test".into(),
+            workspace_dir: "/tmp/test".into(),
+            image: "marc27/calphad:v1".into(),
+            started_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: ActiveJobRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.job_id, record.job_id);
+        assert_eq!(parsed.runtime, record.runtime);
+    }
+
+    #[test]
+    fn clear_shutdown_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        // Clearing when no shutdown file exists should not error.
+        clear_shutdown_request(tmp.path());
+        clear_shutdown_request(tmp.path());
+        assert!(!shutdown_requested(tmp.path()));
+    }
+
+    #[test]
+    fn state_persists_across_loads() {
+        let tmp = TempDir::new().unwrap();
+        let id = Uuid::new_v4();
+        register_active_job(
+            tmp.path(),
+            ActiveJobRecord {
+                job_id: id,
+                runtime: "docker".into(),
+                handle: "persistent".into(),
+                workspace_dir: "/tmp/persist".into(),
+                image: "test:latest".into(),
+                started_at: Utc::now(),
+            },
+        )
+        .unwrap();
+
+        // Load again from same directory.
+        let jobs = active_jobs(tmp.path()).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, id);
+    }
 }

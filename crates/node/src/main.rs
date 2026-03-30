@@ -1,3 +1,6 @@
+//! `prism-node` binary — daemon that registers with the MARC27 platform and
+//! executes containerized compute jobs.
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use prism_node::daemon::DaemonOptions;
@@ -126,6 +129,11 @@ async fn main() -> Result<()> {
                     port: ssh_port,
                     user: ssh_user.or_else(default_ssh_user),
                 }),
+                broadcast: false,
+                platform_client: None,
+                platform_node_id: None,
+                rbac_db_path: None,
+                org_id: None,
             };
 
             prism_node::daemon::run_daemon(&endpoints, &paths, options).await?;

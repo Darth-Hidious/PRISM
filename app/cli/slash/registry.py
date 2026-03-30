@@ -25,6 +25,7 @@ REPL_COMMANDS = {
     "/plan": "Plan a goal",
     "/scratchpad": "Execution log",
     "/approve-all": "Skip consent",
+    "/model": "Switch model",
     "/login": "MARC27 account",
 }
 

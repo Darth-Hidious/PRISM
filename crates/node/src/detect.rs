@@ -16,7 +16,7 @@ pub fn probe_local_capabilities() -> NodeCapabilities {
     let mut system = System::new_all();
     system.refresh_all();
 
-    let ram_gb = (system.total_memory() / 1024 / 1024).max(1);
+    let ram_gb = (system.total_memory() / 1024 / 1024 / 1024).max(1);
 
     let disks = Disks::new_with_refreshed_list();
     let disk_bytes: u64 = disks.list().iter().map(|d| d.total_space()).sum();
@@ -151,7 +151,7 @@ fn detect_datasets() -> Vec<DatasetInfo> {
         }
     }
 
-    datasets.sort_by(|a, b| a.name.cmp(&b.name));
+    datasets.sort_by(|a, b| a.path.cmp(&b.path));
     datasets.dedup_by(|a, b| a.path == b.path);
     datasets
 }
@@ -259,16 +259,23 @@ fn detect_models() -> Vec<ModelInfo> {
     let mut models = Vec::new();
     for dir in search_dirs {
         if dir.is_dir() {
-            scan_for_models(&dir, &mut models);
+            scan_for_models(&dir, &mut models, 0);
         }
     }
 
-    models.sort_by(|a, b| a.name.cmp(&b.name));
+    models.sort_by(|a, b| a.path.cmp(&b.path));
     models.dedup_by(|a, b| a.path == b.path);
     models
 }
 
-fn scan_for_models(dir: &Path, out: &mut Vec<ModelInfo>) {
+/// Max depth for model directory recursion (e.g. HuggingFace layout: models/org/model/).
+const MAX_MODEL_SCAN_DEPTH: u32 = 3;
+
+fn scan_for_models(dir: &Path, out: &mut Vec<ModelInfo>, depth: u32) {
+    if depth > MAX_MODEL_SCAN_DEPTH {
+        return;
+    }
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -284,8 +291,7 @@ fn scan_for_models(dir: &Path, out: &mut Vec<ModelInfo>) {
                 }
             }
         } else if path.is_dir() {
-            // Recurse one level for model directories (e.g. HuggingFace layout)
-            scan_for_models(&path, out);
+            scan_for_models(&path, out, depth + 1);
         }
     }
 }
@@ -504,7 +510,151 @@ mod tests {
     #[test]
     fn format_label_maps_extensions() {
         assert_eq!(format_label("pt"), "pytorch");
+        assert_eq!(format_label("pth"), "pytorch");
         assert_eq!(format_label("onnx"), "onnx");
         assert_eq!(format_label("safetensors"), "safetensors");
+        assert_eq!(format_label("h5"), "keras");
+        assert_eq!(format_label("pkl"), "sklearn");
+        assert_eq!(format_label("joblib"), "sklearn");
+        assert_eq!(format_label("xyz"), "xyz"); // unknown passthrough
+    }
+
+    #[test]
+    fn sanitize_name_preserves_valid_chars() {
+        assert_eq!(sanitize_name("model-v2_final.pt"), "model-v2_final.pt");
+    }
+
+    #[test]
+    fn sanitize_name_removes_special_chars() {
+        assert_eq!(sanitize_name("bad name!@#$%"), "badname");
+    }
+
+    #[test]
+    fn sanitize_name_handles_path_traversal() {
+        let result = sanitize_name("../../../etc/passwd");
+        assert!(!result.contains('/'));
+        assert!(!result.contains(".."));
+    }
+
+    #[test]
+    fn sanitize_name_empty_input() {
+        assert_eq!(sanitize_name(""), "");
+    }
+
+    #[test]
+    fn bytes_to_gb_conversion() {
+        assert!((bytes_to_gb(1_073_741_824) - 1.0).abs() < 0.001); // 1 GiB
+        assert!((bytes_to_gb(0) - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn expand_tilde_no_tilde() {
+        assert_eq!(expand_tilde("/absolute/path"), PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn expand_tilde_relative() {
+        assert_eq!(expand_tilde("./relative"), PathBuf::from("./relative"));
+    }
+
+    #[test]
+    fn detect_datasets_in_temp_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("alloys.csv"), "comp,hardness\nNbMoTaW,542\n").unwrap();
+        std::fs::write(data_dir.join("phases.json"), "{}").unwrap();
+        std::fs::write(data_dir.join("readme.txt"), "not a dataset").unwrap();
+
+        let mut datasets = Vec::new();
+        scan_for_datasets(&data_dir, &mut datasets);
+        // Should find csv and json, not txt.
+        assert_eq!(datasets.len(), 2);
+        assert!(datasets.iter().any(|d| d.format.as_deref() == Some("csv")));
+        assert!(datasets.iter().any(|d| d.format.as_deref() == Some("json")));
+    }
+
+    #[test]
+    fn detect_models_in_temp_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("models");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("predictor.pt"), b"fake pytorch model").unwrap();
+        std::fs::write(model_dir.join("notes.txt"), b"not a model").unwrap();
+
+        let mut models = Vec::new();
+        scan_for_models(&model_dir, &mut models, 0);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].format.as_deref(), Some("pytorch"));
+    }
+
+    #[test]
+    fn estimate_entries_csv() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "header\nrow1\nrow2\nrow3\n").unwrap();
+        let count = estimate_entries(tmp.path(), "csv");
+        assert_eq!(count, Some(3)); // 4 lines - 1 header = 3
+    }
+
+    #[test]
+    fn estimate_entries_jsonl() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "{}\n{}\n{}\n").unwrap();
+        let count = estimate_entries(tmp.path(), "jsonl");
+        assert_eq!(count, Some(3));
+    }
+
+    #[test]
+    fn estimate_entries_unknown_format_returns_none() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        assert!(estimate_entries(tmp.path(), "parquet").is_none());
+    }
+
+    #[test]
+    fn detect_services_no_gpus_no_storage() {
+        let services = detect_services(&[], 50, &[]);
+        // Only data_bridge
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].kind, "data_bridge");
+    }
+
+    #[test]
+    fn detect_services_with_gpus_and_storage() {
+        let gpus = vec![GpuInfo { gpu_type: "A100".into(), count: 2, vram_gb: 80 }];
+        let services = detect_services(&gpus, 200, &[]);
+        assert!(services.iter().any(|s| s.kind == "compute"));
+        assert!(services.iter().any(|s| s.kind == "storage"));
+        assert!(services.iter().any(|s| s.kind == "data_bridge"));
+    }
+
+    #[test]
+    fn detect_services_with_models() {
+        let models = vec![ModelInfo {
+            name: "predictor".into(),
+            path: "/models/predictor.pt".into(),
+            format: Some("pytorch".into()),
+            size_gb: Some(0.5),
+        }];
+        let services = detect_services(&[], 50, &models);
+        assert!(services.iter().any(|s| s.kind == "inference" && s.model.as_deref() == Some("predictor")));
+    }
+
+    #[test]
+    fn probe_has_os_and_arch_labels() {
+        let caps = probe_local_capabilities();
+        assert!(caps.labels.contains_key("os"));
+        assert!(caps.labels.contains_key("arch"));
+    }
+
+    #[test]
+    fn probe_default_visibility_is_private() {
+        let caps = probe_local_capabilities();
+        assert_eq!(caps.visibility, "private");
+    }
+
+    #[test]
+    fn probe_no_public_key_by_default() {
+        let caps = probe_local_capabilities();
+        assert!(caps.public_key.is_none());
     }
 }
