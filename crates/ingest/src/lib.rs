@@ -107,6 +107,9 @@ pub struct LlmConfig {
     /// API key for authenticated providers. Not needed for local Ollama.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Separate embedding model (e.g. "nomic-embed-text"). If not set, uses `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
     /// Maximum number of sample rows to include in the extraction prompt.
     #[serde(default = "default_max_sample_rows")]
     pub max_sample_rows: usize,
@@ -125,6 +128,7 @@ impl Default for LlmConfig {
             base_url: "http://localhost:11434".into(),
             model: "qwen2.5:7b".into(),
             api_key: None,
+            embedding_model: None,
             max_sample_rows: 10,
             timeout_secs: 120,
         }
@@ -225,6 +229,7 @@ mod tests {
             base_url: "http://example.com".into(),
             model: "qwen3:9b".into(),
             api_key: None,
+            embedding_model: Some("nomic-embed-text".into()),
             max_sample_rows: 5,
             timeout_secs: 60,
         };
