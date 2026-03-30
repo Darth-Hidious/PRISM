@@ -1,6 +1,9 @@
 import React, { useState } from "react";
-import { Box, Text, useInput, useStdout } from "ink";
-import { WARNING, MUTED, TEXT, ERROR } from "../theme.js";
+import { Box, Text, useInput } from "ink";
+import {
+  WARNING, TEXT, TEXT_MUTED, TEXT_DIM,
+  BG_MENU, ERROR,
+} from "../theme.js";
 
 interface Props {
   toolName: string;
@@ -9,47 +12,35 @@ interface Props {
 }
 
 const OPTIONS = [
-  { key: "y", label: "Allow once" },
-  { key: "a", label: "Allow always" },
+  { key: "y", label: "Allow" },
   { key: "n", label: "Reject" },
+  { key: "a", label: "Always" },
 ] as const;
 
-/** Tool-specific one-line summary for the approval body. */
 function toolSummary(name: string, args: Record<string, any>): string {
-  // Recognise common PRISM tools by name pattern
   if (name.includes("python") || name.includes("execute"))
-    return `$ ${String(args.code ?? args.command ?? "").slice(0, 120)}`;
+    return String(args.code ?? args.command ?? "").split("\n")[0]?.slice(0, 60) ?? "";
   if (name.includes("search") || name.includes("query"))
-    return args.formula ?? args.query ?? args.text ?? "";
-  if (args.command) return `$ ${String(args.command).slice(0, 120)}`;
-  // Fallback: compact key=value summary
+    return String(args.formula ?? args.query ?? args.text ?? "").slice(0, 60);
+  if (args.command) return `$ ${String(args.command).slice(0, 60)}`;
+  if (args.path) return String(args.path);
   const pairs = Object.entries(args)
     .slice(0, 3)
-    .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`);
+    .map(([k, v]) => `${k}=${typeof v === "string" ? v.slice(0, 30) : JSON.stringify(v).slice(0, 30)}`);
   return pairs.join(", ");
 }
 
 export function ApprovalPrompt({ toolName, toolArgs, onResponse }: Props) {
   const [selected, setSelected] = useState(0);
-  const { stdout } = useStdout();
-  const cols = stdout?.columns ?? 80;
 
   useInput((input, key) => {
-    if (key.leftArrow) {
-      setSelected((s) => (s - 1 + OPTIONS.length) % OPTIONS.length);
-    } else if (key.rightArrow) {
-      setSelected((s) => (s + 1) % OPTIONS.length);
-    } else if (key.return) {
-      onResponse(OPTIONS[selected].key);
-    } else if (key.escape) {
-      onResponse("n");
-    } else if (input === "y" || input === "Y") {
-      onResponse("y");
-    } else if (input === "a" || input === "A") {
-      onResponse("a");
-    } else if (input === "n" || input === "N") {
-      onResponse("n");
-    }
+    if (key.leftArrow) setSelected((s) => (s - 1 + OPTIONS.length) % OPTIONS.length);
+    else if (key.rightArrow) setSelected((s) => (s + 1) % OPTIONS.length);
+    else if (key.return) onResponse(OPTIONS[selected].key);
+    else if (key.escape) onResponse("n");
+    else if (input === "y" || input === "Y") onResponse("y");
+    else if (input === "a" || input === "A") onResponse("a");
+    else if (input === "n" || input === "N") onResponse("n");
   });
 
   const summary = toolSummary(toolName, toolArgs);
@@ -57,31 +48,41 @@ export function ApprovalPrompt({ toolName, toolArgs, onResponse }: Props) {
   return (
     <Box
       flexDirection="column"
-      borderStyle="round"
+      borderStyle="single"
+      borderLeft
+      borderRight={false}
+      borderTop={false}
+      borderBottom={false}
       borderColor={WARNING}
-      paddingX={1}
-      width={Math.max(cols, 40)}
+      paddingLeft={2}
+      paddingTop={0}
+      paddingBottom={1}
     >
-      <Text color={WARNING}>approval required</Text>
-      <Text color={TEXT}>
-        <Text bold>{toolName}</Text>
-        {summary ? <Text color={MUTED}>{`  ${summary}`}</Text> : null}
-      </Text>
-      <Text color={ERROR}>This tool can change state or execute commands.</Text>
-      <Box marginTop={1}>
+      {/* Header: △ Permission required */}
+      <Box>
+        <Text color={WARNING}>△ </Text>
+        <Text color={TEXT} bold>{toolName}</Text>
+      </Box>
+
+      {/* Summary of what the tool will do */}
+      {summary ? (
+        <Box paddingLeft={2}>
+          <Text color={TEXT_DIM}>{summary}</Text>
+        </Box>
+      ) : null}
+
+      {/* Action buttons */}
+      <Box marginTop={1} gap={1}>
         {OPTIONS.map((opt, i) => (
-          <React.Fragment key={opt.key}>
-            <Text
-              backgroundColor={i === selected ? WARNING : undefined}
-              color={i === selected ? "#111111" : MUTED}
-            >
-              {" "}{opt.label}{" "}
-            </Text>
-            {i < OPTIONS.length - 1 ? <Text>{"  "}</Text> : null}
-          </React.Fragment>
+          <Text
+            key={opt.key}
+            backgroundColor={i === selected ? WARNING : BG_MENU}
+            color={i === selected ? "#0a0a0a" : TEXT_MUTED}
+          >
+            {` ${opt.label} (${opt.key}) `}
+          </Text>
         ))}
       </Box>
-      <Text color={MUTED}>left/right select  ·  enter confirm  ·  esc reject</Text>
     </Box>
   );
 }

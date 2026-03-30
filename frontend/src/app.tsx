@@ -12,7 +12,7 @@ import { InputCard } from "./components/InputCard.js";
 import { PlanCard } from "./components/PlanCard.js";
 import { ApprovalPrompt } from "./components/ApprovalPrompt.js";
 import { SessionList } from "./components/SessionList.js";
-import { DIM, PRIMARY, MUTED, TEXT, WARNING } from "./theme.js";
+import { ModelSelector } from "./components/ModelSelector.js";
 
 interface HistoryItem {
   id: number;
@@ -28,7 +28,7 @@ interface Props {
 }
 
 export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
-  const { ready, events, sendMessage, sendCommand, sendPromptResponse } =
+  const { ready, events, sendMessage, sendCommand, sendPromptResponse, sendModelSelect } =
     useBackend(pythonPath, backendBin, autoApprove ?? false, resume);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [streamingText, setStreamingText] = useState("");
@@ -37,18 +37,21 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
     toolName: string;
     toolArgs: Record<string, any>;
   } | null>(null);
+  const [modelList, setModelList] = useState<{
+    current: string;
+    models: any[];
+  } | null>(null);
   const nextIdRef = React.useRef(0);
   const lastProcessedRef = React.useRef(0);
   const streamingRef = React.useRef("");
 
-  // Helper to get a unique id and bump the counter
   const takeId = () => {
     const id = nextIdRef.current;
     nextIdRef.current += 1;
     return id;
   };
 
-  // Process ALL events sequentially — never skip events between renders
+  // Process events sequentially
   React.useEffect(() => {
     const start = lastProcessedRef.current;
     const end = events.length;
@@ -111,10 +114,12 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
         case "ui.session.list":
           newItems.push({ id: takeId(), type: "sessions", data: ev.params });
           break;
+        case "ui.model.list":
+          setModelList({ current: ev.params.current, models: ev.params.models });
+          break;
       }
     }
 
-    // Batch all state updates into a single render
     if (newItems.length > 0) {
       setHistory((h) => [...h, ...newItems]);
     }
@@ -151,36 +156,24 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      <Box justifyContent="space-between" marginBottom={1}>
-        <Text>
-          <Text color={PRIMARY} bold>PRISM</Text>
-          <Text color={MUTED}>  coding shell</Text>
-        </Text>
-        <Text color={DIM}>
-          {pendingApproval ? (
-            <Text color={WARNING}>approval pending</Text>
-          ) : spinnerVerb ? (
-            "working"
-          ) : (
-            <Text color={TEXT}>ready</Text>
-          )}
-        </Text>
-      </Box>
-
       <Static items={history}>
-        {(item) => (
-          <HistoryRenderer
-            key={item.id}
-            item={item}
-            sendPromptResponse={sendPromptResponse}
-          />
-        )}
+        {(item) => <HistoryRenderer key={item.id} item={item} />}
       </Static>
 
       {streamingText ? <StreamingText text={streamingText} streaming /> : null}
       {spinnerVerb ? <Spinner verb={spinnerVerb} /> : null}
 
-      {pendingApproval ? (
+      {modelList ? (
+        <ModelSelector
+          current={modelList.current}
+          models={modelList.models}
+          onSelect={(id) => {
+            sendModelSelect(id);
+            setModelList(null);
+          }}
+          onCancel={() => setModelList(null)}
+        />
+      ) : pendingApproval ? (
         <ApprovalPrompt
           toolName={pendingApproval.toolName}
           toolArgs={pendingApproval.toolArgs}
@@ -196,13 +189,7 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
   );
 }
 
-function HistoryRenderer({
-  item,
-  sendPromptResponse,
-}: {
-  item: HistoryItem;
-  sendPromptResponse: (type: string, response: string) => void;
-}) {
+function HistoryRenderer({ item }: { item: HistoryItem }) {
   switch (item.type) {
     case "welcome":
       return (
@@ -246,8 +233,6 @@ function HistoryRenderer({
         />
       );
     case "approval":
-      // Approval is rendered as live interactive element at the bottom,
-      // not in Static history. Show a placeholder in scroll-back.
       return null;
     case "sessions":
       return <SessionList sessions={item.data.sessions} />;
