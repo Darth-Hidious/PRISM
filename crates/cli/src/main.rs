@@ -1450,25 +1450,17 @@ async fn handle_query(
     };
 
     if cypher {
-        // Direct Cypher query
+        // Direct Cypher execution
         let store = Neo4jGraphStore::new(neo4j_config);
-        let stats = store.stats().await?;
-        println!("Graph: {} nodes, {} relationships\n", stats.node_count, stats.relationship_count);
-
-        // Execute the user's Cypher via the graph's neighbor API (limited)
-        // For direct Cypher, we expose a raw query path.
-        println!("Querying: {text}");
-        let result = store.neighbors(text, 2).await?;
-        for entity in &result.entities {
-            println!(
-                "  [{type}] {name} {props}",
-                r#type = entity.entity_type,
-                name = entity.name,
-                props = entity.properties,
-            );
-        }
-        if result.entities.is_empty() {
+        println!("Executing Cypher: {text}\n");
+        let results = store.query_cypher(text, None).await?;
+        if results.is_empty() {
             println!("  (no results)");
+        } else {
+            for (i, row) in results.iter().enumerate() {
+                println!("  {}. {}", i + 1, row);
+            }
+            println!("\n  {} row(s)", results.len());
         }
     } else if semantic {
         // Semantic vector search
