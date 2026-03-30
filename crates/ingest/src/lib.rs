@@ -21,6 +21,7 @@ pub mod connectors;
 pub mod validation;
 pub mod graph_validation;
 pub mod nl_query;
+pub mod llm;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -85,13 +86,27 @@ pub struct EmbeddingBatch {
     pub dimension: Option<usize>,
 }
 
-/// Configuration for connecting to an LLM backend (Ollama or platform API).
+/// Configuration for connecting to an LLM backend.
+///
+/// Supports any provider via two wire formats:
+/// - `Ollama` (default): native `/api/generate` + `/api/embed` endpoints
+/// - `OpenAi`: compatible with OpenAI, Anthropic (via proxy), MARC27, vLLM, LiteLLM
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
-    /// Base URL of the LLM API (e.g. "http://localhost:11434" for Ollama).
+    /// Which API wire format to use.
+    #[serde(default)]
+    pub provider: llm::LlmProvider,
+    /// Base URL of the LLM API.
+    /// - Ollama: "http://localhost:11434"
+    /// - OpenAI: "https://api.openai.com"
+    /// - MARC27: "https://platform.marc27.com/api/v1/llm"
+    /// - vLLM: "http://localhost:8000"
     pub base_url: String,
-    /// Model name to use (e.g. "qwen3.5-9b-prism" or "qwen2.5:7b").
+    /// Model name (e.g. "qwen2.5:7b", "gpt-4o", "claude-sonnet-4-6").
     pub model: String,
+    /// API key for authenticated providers. Not needed for local Ollama.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Maximum number of sample rows to include in the extraction prompt.
     #[serde(default = "default_max_sample_rows")]
     pub max_sample_rows: usize,
@@ -106,8 +121,10 @@ fn default_timeout_secs() -> u64 { 120 }
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            provider: llm::LlmProvider::Ollama,
             base_url: "http://localhost:11434".into(),
             model: "qwen2.5:7b".into(),
+            api_key: None,
             max_sample_rows: 10,
             timeout_secs: 120,
         }
@@ -204,8 +221,10 @@ mod tests {
     #[test]
     fn llm_config_roundtrip() {
         let cfg = LlmConfig {
+            provider: llm::LlmProvider::Ollama,
             base_url: "http://example.com".into(),
             model: "qwen3:9b".into(),
+            api_key: None,
             max_sample_rows: 5,
             timeout_secs: 60,
         };

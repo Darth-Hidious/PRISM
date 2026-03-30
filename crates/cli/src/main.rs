@@ -66,12 +66,18 @@ enum Commands {
     Ingest {
         /// Path to a CSV/Parquet file or directory to watch.
         path: PathBuf,
-        /// Ollama model for entity extraction.
+        /// LLM provider: ollama (default), openai (OpenAI-compatible — works with MARC27, vLLM, etc.)
+        #[arg(long, default_value = "ollama")]
+        llm_provider: String,
+        /// LLM model name (e.g. "qwen2.5:7b", "gpt-4o", "claude-sonnet-4-6").
         #[arg(long, default_value = "qwen2.5:7b")]
         model: String,
-        /// Ollama base URL.
+        /// LLM base URL (e.g. "http://localhost:11434", "https://api.openai.com", "https://platform.marc27.com/api/v1/llm").
         #[arg(long, default_value = "http://localhost:11434")]
-        ollama_url: String,
+        llm_url: String,
+        /// API key for authenticated LLM providers. Also reads from LLM_API_KEY env var.
+        #[arg(long, env = "LLM_API_KEY")]
+        api_key: Option<String>,
         /// Neo4j HTTP endpoint.
         #[arg(long, default_value = "http://localhost:7474")]
         neo4j_url: String,
@@ -119,12 +125,18 @@ enum Commands {
         /// Qdrant HTTP endpoint.
         #[arg(long, default_value = "http://localhost:6333")]
         qdrant_url: String,
-        /// Ollama base URL (for embedding queries).
+        /// LLM provider: ollama (default), openai (OpenAI-compatible — works with MARC27, vLLM, etc.)
+        #[arg(long, default_value = "ollama")]
+        llm_provider: String,
+        /// LLM base URL.
         #[arg(long, default_value = "http://localhost:11434")]
-        ollama_url: String,
-        /// Ollama model.
+        llm_url: String,
+        /// LLM model name.
         #[arg(long, default_value = "qwen2.5:7b")]
         model: String,
+        /// API key for authenticated LLM providers. Also reads from LLM_API_KEY env var.
+        #[arg(long, env = "LLM_API_KEY")]
+        api_key: Option<String>,
         /// Max results to return.
         #[arg(long, default_value = "10")]
         limit: usize,
@@ -853,8 +865,10 @@ async fn main() -> Result<()> {
         },
         Commands::Ingest {
             path,
+            llm_provider,
             model,
-            ollama_url,
+            llm_url,
+            api_key,
             neo4j_url,
             neo4j_user,
             neo4j_pass,
@@ -863,29 +877,17 @@ async fn main() -> Result<()> {
             watch,
             mapping,
         } => {
+            let llm_cfg = build_llm_config(&llm_provider, &llm_url, &model, api_key.as_deref());
             if watch {
                 handle_ingest_watch(
-                    &path,
-                    &model,
-                    &ollama_url,
-                    &neo4j_url,
-                    &neo4j_user,
-                    &neo4j_pass,
-                    &qdrant_url,
-                    schema_only,
-                    mapping.as_deref(),
+                    &path, &llm_cfg, &neo4j_url, &neo4j_user, &neo4j_pass,
+                    &qdrant_url, schema_only, mapping.as_deref(),
                 )
                 .await?;
             } else {
                 handle_ingest(
-                    &path,
-                    &model,
-                    &ollama_url,
-                    &neo4j_url,
-                    &neo4j_user,
-                    &neo4j_pass,
-                    &qdrant_url,
-                    schema_only,
+                    &path, &llm_cfg, &neo4j_url, &neo4j_user, &neo4j_pass,
+                    &qdrant_url, schema_only,
                 )
                 .await?;
             }
@@ -899,25 +901,20 @@ async fn main() -> Result<()> {
             neo4j_user,
             neo4j_pass,
             qdrant_url,
-            ollama_url,
+            llm_provider,
+            llm_url,
             model,
+            api_key,
             limit,
             dashboard_url,
         } => {
+            let llm_cfg = build_llm_config(&llm_provider, &llm_url, &model, api_key.as_deref());
             if federated {
                 handle_federated_query(&text, &dashboard_url).await?;
             } else {
                 handle_query(
-                    &text,
-                    cypher,
-                    semantic,
-                    &neo4j_url,
-                    &neo4j_user,
-                    &neo4j_pass,
-                    &qdrant_url,
-                    &ollama_url,
-                    &model,
-                    limit,
+                    &text, cypher, semantic, &neo4j_url, &neo4j_user, &neo4j_pass,
+                    &qdrant_url, &llm_cfg, limit,
                 )
                 .await?;
             }
@@ -1212,12 +1209,34 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
     Ok(())
 }
 
+// ── LLM config builder ─────────────────────────────────────────────────
+
+fn build_llm_config(
+    provider: &str,
+    base_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> prism_ingest::LlmConfig {
+    use prism_ingest::llm::LlmProvider;
+    let provider = match provider.to_lowercase().as_str() {
+        "openai" | "openai-compatible" | "marc27" | "vllm" | "litellm" => LlmProvider::OpenAi,
+        _ => LlmProvider::Ollama,
+    };
+    prism_ingest::LlmConfig {
+        provider,
+        base_url: base_url.into(),
+        model: model.into(),
+        api_key: api_key.map(str::to_string),
+        max_sample_rows: 10,
+        timeout_secs: 120,
+    }
+}
+
 // ── prism ingest ────────────────────────────────────────────────────────
 
 async fn handle_ingest(
     path: &Path,
-    model: &str,
-    ollama_url: &str,
+    llm_cfg: &prism_ingest::LlmConfig,
     neo4j_url: &str,
     neo4j_user: &str,
     neo4j_pass: &str,
@@ -1225,7 +1244,7 @@ async fn handle_ingest(
     schema_only: bool,
 ) -> Result<()> {
     use prism_ingest::pipeline::{IngestPipeline, PipelineConfig};
-    use prism_ingest::{LlmConfig, Neo4jConfig, QdrantConfig};
+    use prism_ingest::{Neo4jConfig, QdrantConfig};
 
     if !path.exists() {
         bail!("File not found: {}", path.display());
@@ -1242,12 +1261,7 @@ async fn handle_ingest(
         }
     } else {
         PipelineConfig {
-            llm: Some(LlmConfig {
-                base_url: ollama_url.into(),
-                model: model.into(),
-                max_sample_rows: 10,
-                timeout_secs: 120,
-            }),
+            llm: Some(llm_cfg.clone()),
             neo4j: Some(Neo4jConfig {
                 base_url: neo4j_url.into(),
                 database: "neo4j".into(),
@@ -1312,8 +1326,7 @@ async fn handle_ingest(
 #[allow(clippy::too_many_arguments)]
 async fn handle_ingest_watch(
     dir: &Path,
-    model: &str,
-    ollama_url: &str,
+    llm_cfg: &prism_ingest::LlmConfig,
     neo4j_url: &str,
     neo4j_user: &str,
     neo4j_pass: &str,
@@ -1350,7 +1363,7 @@ async fn handle_ingest_watch(
         }
         println!("[initial] Ingesting {}", path.display());
         if let Err(e) = handle_ingest(
-            &path, model, ollama_url, neo4j_url, neo4j_user, neo4j_pass, qdrant_url, schema_only,
+            &path, llm_cfg, neo4j_url, neo4j_user, neo4j_pass, qdrant_url, schema_only,
         )
         .await
         {
@@ -1391,7 +1404,7 @@ async fn handle_ingest_watch(
                 seen.insert(path.clone(), modified);
                 println!("\n[watch] Detected: {}", path.display());
                 if let Err(e) = handle_ingest(
-                    &path, model, ollama_url, neo4j_url, neo4j_user, neo4j_pass, qdrant_url,
+                    &path, llm_cfg, neo4j_url, neo4j_user, neo4j_pass, qdrant_url,
                     schema_only,
                 )
                 .await
@@ -1422,8 +1435,7 @@ async fn handle_query(
     neo4j_user: &str,
     neo4j_pass: &str,
     qdrant_url: &str,
-    ollama_url: &str,
-    model: &str,
+    llm_cfg: &prism_ingest::LlmConfig,
     limit: usize,
 ) -> Result<()> {
     use prism_ingest::embeddings::{QdrantVectorStore, VectorStore};
@@ -1466,32 +1478,13 @@ async fn handle_query(
             api_key: None,
         };
 
-        // Generate embedding for the query text
+        // Generate embedding for the query text via provider-agnostic LlmClient
         println!("Generating query embedding...");
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()?;
-        let resp = client
-            .post(format!("{}/api/embed", ollama_url))
-            .json(&serde_json::json!({
-                "model": model,
-                "input": [text],
-            }))
-            .send()
+        let llm_client = prism_ingest::llm::LlmClient::new(llm_cfg.clone());
+        let query_vec = llm_client
+            .embed_text(text)
             .await
-            .context("failed to call Ollama for query embedding")?;
-
-        #[derive(Deserialize)]
-        struct EmbedResp {
-            embeddings: Vec<Vec<f32>>,
-        }
-
-        let embed: EmbedResp = resp.json().await.context("bad embedding response")?;
-        let query_vec = embed
-            .embeddings
-            .into_iter()
-            .next()
-            .context("no embedding returned")?;
+            .context("failed to generate query embedding")?;
 
         let store = QdrantVectorStore::new(qdrant_config);
         let results = store.query(&query_vec, limit).await?;
