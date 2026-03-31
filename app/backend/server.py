@@ -58,26 +58,50 @@ class StdioServer:
             self._send_error(output, msg_id, -32601, f"Unknown method: {method}")
 
     def _handle_init(self, params: dict, msg_id, output: TextIO):
-        from app.agent.factory import create_backend
-        from app.agent.core import AgentCore
-        from app.plugins.bootstrap import build_full_registry
+        import time
+        import logging
 
-        provider = params.get("provider") or None
-        auto_approve = params.get("auto_approve", False)
+        logger = logging.getLogger(__name__)
+        t0 = time.monotonic()
 
-        backend = create_backend(provider=provider)
-        tools, _, _ = build_full_registry(enable_mcp=True)
-        agent = AgentCore(
-            backend=backend, tools=tools,
-            auto_approve=auto_approve,
-            approval_callback=self._approval_callback,
-        )
+        try:
+            from app.agent.factory import create_backend
+            from app.agent.core import AgentCore
+            from app.plugins.bootstrap import build_full_registry
 
-        from app.backend.ui_emitter import UIEmitter
-        self.emitter = UIEmitter(agent, auto_approve=auto_approve)
+            provider = params.get("provider") or None
+            auto_approve = params.get("auto_approve", False)
 
-        self._send_result(output, msg_id, {"ok": True})
-        self._emit(output, self.emitter.welcome())
+            t1 = time.monotonic()
+            backend = create_backend(provider=provider)
+            logger.debug("create_backend: %.1fms", (time.monotonic() - t1) * 1000)
+
+            t1 = time.monotonic()
+            tools, _, _ = build_full_registry(enable_mcp=True)
+            logger.debug("build_full_registry: %.1fms (%d tools)", (time.monotonic() - t1) * 1000, len(tools.list_tools()))
+
+            agent = AgentCore(
+                backend=backend, tools=tools,
+                auto_approve=auto_approve,
+                approval_callback=self._approval_callback,
+            )
+
+            from app.backend.ui_emitter import UIEmitter
+            self.emitter = UIEmitter(agent, auto_approve=auto_approve)
+
+            logger.info("Init complete: %.1fms", (time.monotonic() - t0) * 1000)
+            self._send_result(output, msg_id, {"ok": True})
+            self._emit(output, self.emitter.welcome())
+
+        except ValueError as exc:
+            logger.error("Init config error: %s", exc)
+            self._send_error(output, msg_id, -32000, f"Configuration error: {exc}")
+        except ImportError as exc:
+            logger.error("Init import error: %s", exc)
+            self._send_error(output, msg_id, -32000, f"Missing dependency: {exc}")
+        except Exception as exc:
+            logger.exception("Init failed")
+            self._send_error(output, msg_id, -32000, f"Initialization failed: {exc}")
 
     def _handle_input(self, params: dict, output: TextIO):
         """Run the UIEmitter generator in a thread, drain events while checking stdin."""

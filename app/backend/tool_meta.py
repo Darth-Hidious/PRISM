@@ -8,12 +8,8 @@ import hashlib
 import json
 import os
 
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
-from rich import box
+# Rich imports deferred to functions that use them (saves ~45ms on backend startup).
+# The constants (TOOL_VERBS, BORDERS, ICONS, detect_result_type) don't need Rich.
 
 
 # ── Theme constants (used across backend + CLI) ────────────────────────
@@ -140,7 +136,8 @@ def format_tokens(n: int) -> str:
 
 
 def make_title(card_type: str, tool_name: str = "",
-               elapsed_ms: float = 0, label: str = "") -> Text:
+               elapsed_ms: float = 0, label: str = ""):
+    from rich.text import Text
     icon = ICONS.get(card_type, "")
     title = Text()
     if icon:
@@ -156,7 +153,7 @@ def make_title(card_type: str, tool_name: str = "",
     return title
 
 
-def render_tool_result(console: Console, tool_name: str, summary: str,
+def render_tool_result(console, tool_name: str, summary: str,
                        elapsed_ms: float, result: dict):
     """Dispatch to the right card renderer based on result shape."""
     result_type = detect_result_type(result)
@@ -173,7 +170,7 @@ def render_tool_result(console: Console, tool_name: str, summary: str,
     _check_large_result(console, result)
 
 
-def render_cost_line(console: Console, usage, turn_cost: float | None = None,
+def render_cost_line(console, usage, turn_cost: float | None = None,
                      session_cost: float = 0.0):
     parts = [
         f"{format_tokens(usage.input_tokens)} in",
@@ -191,7 +188,7 @@ def render_cost_line(console: Console, usage, turn_cost: float | None = None,
 class Spinner:
     """Animated spinner using Rich Status."""
 
-    def __init__(self, console: Console):
+    def __init__(self, console):
         self._console = console
         self._status = None
 
@@ -217,7 +214,17 @@ class Spinner:
 
 # ── Private card renderers ───────────────────────────────────────────────
 
+def _rich():
+    """Lazy-load Rich modules. Called only when Rich rendering is needed."""
+    from rich.text import Text
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich import box
+    return Text, Panel, Table, box
+
+
 def _render_success_card(console, tool_name, summary, elapsed_ms):
+    Text, Panel, _, box = _rich()
     title = make_title("tool", tool_name, elapsed_ms)
     body = Text()
     body.append(f" {ICONS['success']} ", style=f"bold {SUCCESS}")
@@ -227,6 +234,7 @@ def _render_success_card(console, tool_name, summary, elapsed_ms):
 
 
 def _render_error_card(console, tool_name, elapsed_ms, result):
+    Text, Panel, _, box = _rich()
     error_msg = str(result.get("error", "Unknown error"))
     title = make_title("error", tool_name, elapsed_ms, "FAILED")
     body = Text()
@@ -239,6 +247,7 @@ def _render_error_card(console, tool_name, elapsed_ms, result):
 
 
 def _render_metrics_card(console, tool_name, elapsed_ms, result):
+    _, Panel, Table, box = _rich()
     title = make_title("metrics", tool_name, elapsed_ms)
     metrics = result.get("metrics", {})
     algorithm = result.get("algorithm", "")
@@ -256,6 +265,7 @@ def _render_metrics_card(console, tool_name, elapsed_ms, result):
 
 
 def _render_calphad_card(console, tool_name, elapsed_ms, result):
+    Text, Panel, _, box = _rich()
     title = make_title("calphad", tool_name, elapsed_ms)
     body = Text()
     system = result.get("system", "")
@@ -273,6 +283,7 @@ def _render_calphad_card(console, tool_name, elapsed_ms, result):
 
 
 def _render_results_card(console, tool_name, summary, elapsed_ms, result):
+    Text, Panel, Table, box = _rich()
     rows = result.get("results", [])
     total = result.get("count", len(rows))
     title = make_title("results", tool_name, elapsed_ms)
