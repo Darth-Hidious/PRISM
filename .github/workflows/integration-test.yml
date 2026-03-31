@@ -1,0 +1,169 @@
+name: Integration Test
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "app/**"
+      - "frontend/**"
+      - "dashboard/**"
+      - "tests/**"
+      - ".github/workflows/integration-test.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/**"
+      - "app/**"
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-tests:
+    name: Rust Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  frontend-typecheck:
+    name: Frontend TypeScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: cd frontend && bun install --frozen-lockfile
+      - run: cd frontend && npx tsc --noEmit
+
+  dashboard-build:
+    name: Dashboard Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: cd dashboard && npm ci
+      - run: cd dashboard && npm audit --audit-level=high
+      - run: cd dashboard && npx tsc -b --noEmit
+      - run: cd dashboard && npx vite build
+
+  python-tools:
+    name: Python Tool Loading
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[all]" 2>/dev/null || pip install -e . || true
+      - name: Verify tool registry loads
+        run: |
+          python3 -c "
+          import sys; sys.path.insert(0, '.')
+          try:
+              from app.plugins.bootstrap import build_full_registry
+              result = build_full_registry()
+              reg = result[0]
+              tools = reg.list_tools()
+              print(f'Tools loaded: {len(tools)}')
+              assert len(tools) >= 30, f'Expected 30+ tools, got {len(tools)}'
+              print('PASS: Tool registry loads correctly')
+          except Exception as e:
+              print(f'FAIL: {e}')
+              sys.exit(1)
+          "
+
+  ingest-pipeline:
+    name: Ingest Pipeline (with services)
+    runs-on: ubuntu-latest
+    needs: [rust-tests]
+    services:
+      neo4j:
+        image: neo4j:5-community
+        ports:
+          - 7474:7474
+          - 7687:7687
+        env:
+          NEO4J_AUTH: neo4j/prism-local
+        options: >-
+          --health-cmd "curl -f http://localhost:7474 || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      qdrant:
+        image: qdrant/qdrant:v1.12.6
+        ports:
+          - 6333:6333
+          - 6334:6334
+        options: >-
+          --health-cmd "curl -f http://localhost:6333/healthz || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI binary
+        run: cargo build --bin prism
+
+      - name: Create Qdrant collection
+        run: |
+          curl -X PUT http://localhost:6333/collections/prism_embeddings \
+            -H "Content-Type: application/json" \
+            -d '{"vectors": {"size": 768, "distance": "Cosine"}}'
+
+      - name: Test schema-only ingest
+        run: |
+          ./target/debug/prism ingest tests/data/refractory_heas.csv --schema-only 2>&1 | tee /tmp/schema.out
+          grep -q "15 columns, 10 rows" /tmp/schema.out
+
+      - name: Test Cypher query
+        run: |
+          curl -s -u neo4j:prism-local \
+            -H "Content-Type: application/json" \
+            http://localhost:7474/db/neo4j/tx/commit \
+            -d '{"statements": [{"statement": "CREATE (a:Alloy {name: \"TestAlloy\"})-[:CONTAINS {weight: 0.5}]->(e:Element {name: \"Fe\"})"}]}'
+
+          ./target/debug/prism query --cypher "MATCH (a:Alloy) RETURN a.name AS name" 2>&1 | tee /tmp/cypher.out
+          grep -q "TestAlloy" /tmp/cypher.out
+
+      - name: Test graph neighbor query
+        run: |
+          ./target/debug/prism query "TestAlloy" 2>&1 | tee /tmp/graph.out
+          grep -q "Fe" /tmp/graph.out
+
+      - name: Test version flag
+        run: ./target/debug/prism --version 2>&1 | grep "prism 2.5.0"
+
+      - name: Test node probe
+        run: |
+          ./target/debug/prism node probe 2>&1 | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d['cpu_cores'] > 0
+          assert 'python' in d['software']
+          print('PASS: node probe')
+          "
+
+      - name: Test workflow list
+        run: ./target/debug/prism workflow list 2>&1 | grep "forge"
+
+      - name: Test error handling
+        run: |
+          ./target/debug/prism ingest /nonexistent.csv 2>&1 | grep -q "File not found"
+          echo "PASS: missing file error"
+
+          echo "x" > /tmp/bad.txt
+          ./target/debug/prism ingest /tmp/bad.txt 2>&1 | grep -q "Unsupported file format"
+          echo "PASS: unsupported format error"
