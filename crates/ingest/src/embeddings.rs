@@ -66,6 +66,8 @@ struct SearchResponse {
 struct ScoredPoint {
     id: PointId,
     score: f32,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -294,7 +296,17 @@ impl VectorStore for QdrantVectorStore {
         let results: Vec<(String, f32)> = search
             .result
             .into_iter()
-            .map(|sp| (sp.id.to_string_id(), sp.score))
+            .map(|sp| {
+                // Prefer entity name from payload, fall back to point ID
+                let name = sp
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| sp.id.to_string_id());
+                (name, sp.score)
+            })
             .collect();
 
         tracing::debug!(k, results = results.len(), "vector search complete");
