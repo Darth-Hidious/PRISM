@@ -83,8 +83,12 @@ def build_registry(
     c_path = cache_path or DEFAULT_CACHE_PATH
     cache = load_cache(c_path)
 
-    if cache and is_cache_fresh(cache):
+    if cache and cache.get("endpoints"):
+        # Always prefer cache if it has data — re-discover in background later
         endpoints = cache["endpoints"]
+        if not is_cache_fresh(cache) and not skip_network:
+            # Stale cache: schedule background refresh, don't block startup
+            logger.debug("Cache stale, using existing %d providers", len(endpoints))
     elif not skip_network:
         try:
             overrides_data = load_overrides(overrides_path)
@@ -92,16 +96,13 @@ def build_registry(
             endpoints = asyncio.run(discover_providers(fallback_index_urls=fallbacks))
             if endpoints:
                 save_cache(endpoints, c_path)
-            elif cache:
-                logger.warning("Discovery failed, using stale cache")
-                endpoints = cache["endpoints"]
             else:
                 endpoints = []
         except Exception as e:
             logger.error("Discovery error: %s", e)
-            endpoints = cache["endpoints"] if cache else []
+            endpoints = []
     else:
-        endpoints = cache["endpoints"] if cache else []
+        endpoints = []
 
     # --- Layer 2: Bundled overrides ---
     overrides_data = load_overrides(overrides_path)
