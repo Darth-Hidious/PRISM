@@ -1541,40 +1541,41 @@ WORKFLOWS:
   prism workflow list                                  # list available workflows
   prism workflow run <name> --set key=value            # run a workflow
 
-AUTH:
-  prism login                                          # authenticate (device flow)
+AUTH (two paths — decoupled):
+  # For humans:
+  prism login                                          # device flow → JWT (stored in ~/.prism/)
   prism status                                         # show auth + config
 
-OUTPUT FORMATS:
-  Default: human-readable, one result per line
-  --json: JSON array, machine-parseable
+  # For agents (no login needed):
+  export MARC27_API_KEY=m27_your_key_here              # set once, works forever
+  prism query --platform "titanium"                    # just works
+
+OUTPUT:
+  Default: human-readable, one result per line (grep-friendly)
+  --json:  JSON array (pipe to jq/python)
   --platform: route through MARC27 API (211K nodes, 6.5M edges, 208K embeddings)
-  Pipe to grep/jq/awk as needed
 
-EXAMPLES FOR AI AGENTS:
-  # Find materials with high yield strength
-  prism query --platform --semantic "materials high yield strength above 1000 MPa" --json | python3 -c "import sys,json; [print(r['content'][:80]) for r in json.load(sys.stdin)]"
+AGENT SETUP (one line):
+  export MARC27_API_KEY=m27_...                        # that's it. no login, no refresh, no expiry.
 
-  # Check what LLM models are available
-  prism status | grep -A 20 "models"
-
-  # Search for a specific entity and its connections
-  prism query --platform "Ti-6Al-4V" --json
+EXAMPLES:
+  prism query --platform --semantic "creep resistant superalloy" --json | jq '.[].content'
+  prism query --platform "Ti-6Al-4V" | grep MAT
+  prism query --platform --json "fatigue" | python3 -c "import sys,json;[print(e['name']) for e in json.load(sys.stdin)]"
+  prism status | grep nodes
 "#);
 }
 
-/// Query the MARC27 platform API (graph search or semantic search).
-async fn handle_platform_query(text: &str, semantic: bool, json_output: bool, limit: usize) -> Result<()> {
-    // Read credentials from ~/.prism/credentials.json
+/// Resolve platform auth for the human user (prism login → JWT).
+fn resolve_user_auth() -> Result<(String, String)> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let cred_path = format!("{home}/.prism/credentials.json");
     let cred_data = std::fs::read_to_string(&cred_path)
-        .context("Not logged in. Run `prism login` first.")?;
+        .context("Not logged in. Run `prism login`.")?;
     let creds: serde_json::Value = serde_json::from_str(&cred_data)?;
     let raw_url = creds.get("platform_url")
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.marc27.com");
-    // Ensure /api/v1 suffix
     let api_base = if raw_url.ends_with("/api/v1") {
         raw_url.to_string()
     } else {
@@ -1582,15 +1583,50 @@ async fn handle_platform_query(text: &str, semantic: bool, json_output: bool, li
     };
     let token = creds.get("access_token")
         .and_then(|v| v.as_str())
-        .context("No access_token in credentials")?;
+        .context("No access_token. Run `prism login`.")?;
+    Ok((api_base, format!("Bearer {token}")))
+}
+
+/// Auth credentials — either API key (agent) or Bearer token (user).
+enum PlatformAuth {
+    ApiKey(String),    // X-API-Key header
+    Bearer(String),    // Authorization: Bearer header
+}
+
+impl PlatformAuth {
+    fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            PlatformAuth::ApiKey(key) => req.header("X-API-Key", key),
+            PlatformAuth::Bearer(token) => req.header("Authorization", format!("Bearer {token}")),
+        }
+    }
+}
+
+/// Resolve platform auth for agents (MARC27_API_KEY env var → X-API-Key header).
+/// Decoupled from user auth — agents use API keys, users use JWT.
+/// Falls back to user auth if no API key is set (backward compat).
+fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
+    if let Ok(api_key) = std::env::var("MARC27_API_KEY") {
+        let api_base = std::env::var("MARC27_API_URL")
+            .unwrap_or_else(|_| "https://api.marc27.com/api/v1".to_string());
+        return Ok((api_base, PlatformAuth::ApiKey(api_key)));
+    }
+    let (base, token_header) = resolve_user_auth()?;
+    // token_header is "Bearer <token>"
+    let token = token_header.strip_prefix("Bearer ").unwrap_or(&token_header).to_string();
+    Ok((base, PlatformAuth::Bearer(token)))
+}
+
+/// Query the MARC27 platform API (graph search or semantic search).
+async fn handle_platform_query(text: &str, semantic: bool, json_output: bool, limit: usize) -> Result<()> {
+    let (api_base, auth) = resolve_agent_auth()?;
 
     let client = reqwest::Client::new();
 
     if semantic {
         // POST /knowledge/search
-        let resp = client
-            .post(format!("{api_base}/knowledge/search"))
-            .header("Authorization", format!("Bearer {token}"))
+        let resp = auth.apply(client
+            .post(format!("{api_base}/knowledge/search")))
             .json(&serde_json::json!({"query": text, "limit": limit}))
             .send()
             .await?;
@@ -1616,9 +1652,8 @@ async fn handle_platform_query(text: &str, semantic: bool, json_output: bool, li
         }
     } else {
         // GET /knowledge/graph/search
-        let resp = client
-            .get(format!("{api_base}/knowledge/graph/search"))
-            .header("Authorization", format!("Bearer {token}"))
+        let resp = auth.apply(client
+            .get(format!("{api_base}/knowledge/graph/search")))
             .query(&[("q", text), ("limit", &limit.to_string())])
             .send()
             .await?;
