@@ -111,6 +111,12 @@ enum Commands {
         /// Semantic vector search.
         #[arg(long)]
         semantic: bool,
+        /// Use the MARC27 platform API instead of local graph.
+        #[arg(long)]
+        platform: bool,
+        /// Output as JSON (for piping to other tools / agents).
+        #[arg(long)]
+        json: bool,
         /// Query all known mesh peers and merge results.
         #[arg(long)]
         federated: bool,
@@ -145,6 +151,8 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:7327")]
         dashboard_url: String,
     },
+    /// Print available commands for AI agents. Pipe-friendly, grep-friendly.
+    Agent,
     /// Submit a compute job (run a container on local Docker, MARC27 cloud, or BYOC).
     Run {
         /// Container image to run.
@@ -950,6 +958,8 @@ async fn main() -> Result<()> {
             text,
             cypher,
             semantic,
+            platform,
+            json: json_output,
             federated,
             neo4j_url,
             neo4j_user,
@@ -962,16 +972,22 @@ async fn main() -> Result<()> {
             limit,
             dashboard_url,
         } => {
-            let llm_cfg = build_llm_config(&llm_provider, &llm_url, &model, api_key.as_deref());
-            if federated {
+            if platform {
+                // Route through MARC27 platform API
+                handle_platform_query(&text, semantic, json_output, limit).await?;
+            } else if federated {
                 handle_federated_query(&text, &dashboard_url).await?;
             } else {
+                let llm_cfg = build_llm_config(&llm_provider, &llm_url, &model, api_key.as_deref());
                 handle_query(
                     &text, cypher, semantic, &neo4j_url, &neo4j_user, &neo4j_pass,
                     &qdrant_url, &llm_cfg, limit,
                 )
                 .await?;
             }
+        }
+        Commands::Agent => {
+            print_agent_guide();
         }
         Commands::Run {
             image,
@@ -1493,6 +1509,143 @@ fn is_ingestable(path: &Path) -> bool {
 }
 
 // ── prism query ─────────────────────────────────────────────────────────
+
+/// Print a guide for AI agents describing available PRISM commands.
+/// This is the "agent interface" — grep-friendly, no protocol overhead.
+fn print_agent_guide() {
+    println!(r#"PRISM Agent Interface — grep-friendly commands
+==============================================
+
+KNOWLEDGE GRAPH (use --platform to query MARC27 cloud, 211K+ entities):
+  prism query --platform --semantic "creep resistant superalloy"     # semantic search
+  prism query --platform "Inconel 718"                               # graph search
+  prism query --platform --semantic "yield strength titanium" --json # JSON output for piping
+  prism query --platform --json "fatigue life" | grep MAT            # grep for materials only
+  prism status | grep nodes                                          # quick stats
+
+COMPUTE:
+  prism run <image> --backend local                    # run container locally
+  prism run <image> --backend marc27                   # run on MARC27 cloud
+  prism job-status <job-id>                            # check job status
+
+INGEST:
+  prism ingest data.csv                                # ingest CSV into local graph
+  prism ingest paper.pdf                               # extract + ingest PDF
+
+NODE:
+  prism node status                                    # show node capabilities
+  prism node up                                        # register node with platform
+  prism node down                                      # deregister
+
+WORKFLOWS:
+  prism workflow list                                  # list available workflows
+  prism workflow run <name> --set key=value            # run a workflow
+
+AUTH:
+  prism login                                          # authenticate (device flow)
+  prism status                                         # show auth + config
+
+OUTPUT FORMATS:
+  Default: human-readable, one result per line
+  --json: JSON array, machine-parseable
+  --platform: route through MARC27 API (211K nodes, 6.5M edges, 208K embeddings)
+  Pipe to grep/jq/awk as needed
+
+EXAMPLES FOR AI AGENTS:
+  # Find materials with high yield strength
+  prism query --platform --semantic "materials high yield strength above 1000 MPa" --json | python3 -c "import sys,json; [print(r['content'][:80]) for r in json.load(sys.stdin)]"
+
+  # Check what LLM models are available
+  prism status | grep -A 20 "models"
+
+  # Search for a specific entity and its connections
+  prism query --platform "Ti-6Al-4V" --json
+"#);
+}
+
+/// Query the MARC27 platform API (graph search or semantic search).
+async fn handle_platform_query(text: &str, semantic: bool, json_output: bool, limit: usize) -> Result<()> {
+    // Read credentials from ~/.prism/credentials.json
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let cred_path = format!("{home}/.prism/credentials.json");
+    let cred_data = std::fs::read_to_string(&cred_path)
+        .context("Not logged in. Run `prism login` first.")?;
+    let creds: serde_json::Value = serde_json::from_str(&cred_data)?;
+    let raw_url = creds.get("platform_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://api.marc27.com");
+    // Ensure /api/v1 suffix
+    let api_base = if raw_url.ends_with("/api/v1") {
+        raw_url.to_string()
+    } else {
+        format!("{}/api/v1", raw_url.trim_end_matches('/'))
+    };
+    let token = creds.get("access_token")
+        .and_then(|v| v.as_str())
+        .context("No access_token in credentials")?;
+
+    let client = reqwest::Client::new();
+
+    if semantic {
+        // POST /knowledge/search
+        let resp = client
+            .post(format!("{api_base}/knowledge/search"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({"query": text, "limit": limit}))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            bail!("Platform API error: {}", resp.status());
+        }
+
+        let results: Vec<serde_json::Value> = resp.json().await?;
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        } else {
+            println!("Semantic search results ({} matches):\n", results.len());
+            for (i, r) in results.iter().enumerate() {
+                let sim = r.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let content = r.get("content").and_then(|v| v.as_str()).unwrap_or("?");
+                let source = r.get("metadata")
+                    .and_then(|m| m.get("source"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?");
+                println!("  {}. [sim={:.3}] [{}] {}", i + 1, sim, source, &content[..content.len().min(120)]);
+            }
+        }
+    } else {
+        // GET /knowledge/graph/search
+        let resp = client
+            .get(format!("{api_base}/knowledge/graph/search"))
+            .header("Authorization", format!("Bearer {token}"))
+            .query(&[("q", text), ("limit", &limit.to_string())])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            bail!("Platform API error: {}", resp.status());
+        }
+
+        let results: Vec<serde_json::Value> = resp.json().await?;
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        } else {
+            if results.is_empty() {
+                println!("No direct matches. Try --semantic for vector search.");
+            } else {
+                println!("Graph search results ({} matches):\n", results.len());
+                for r in &results {
+                    let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let etype = r.get("entity_type").and_then(|v| v.as_str()).unwrap_or("?");
+                    let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("  [{:5}] {} — {}", etype, name, &label[..label.len().min(80)]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 async fn handle_query(
     text: &str,
