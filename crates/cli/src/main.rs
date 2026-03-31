@@ -464,6 +464,28 @@ async fn main() -> Result<()> {
                 expires_at: credentials.expires_at,
             });
             paths.save_cli_state(&state)?;
+
+            // Sync credentials to ~/.prism/credentials.json for Python SDK
+            if let Some(ref creds) = state.credentials {
+                let sdk_creds = serde_json::json!({
+                    "access_token": creds.access_token,
+                    "refresh_token": creds.refresh_token,
+                    "platform_url": creds.platform_url,
+                    "user_id": creds.user_id,
+                    "org_id": creds.org_id,
+                    "project_id": creds.project_id,
+                });
+                if let Some(home) = std::env::var_os("HOME") {
+                    let sdk_path = std::path::PathBuf::from(home)
+                        .join(".prism")
+                        .join("credentials.json");
+                    if let Ok(json) = serde_json::to_string_pretty(&sdk_creds) {
+                        let _ = std::fs::create_dir_all(sdk_path.parent().unwrap());
+                        let _ = std::fs::write(&sdk_path, json);
+                    }
+                }
+            }
+
             println!("Login complete.");
         }
         Commands::Status => {
@@ -2186,15 +2208,24 @@ async fn handle_run(
     };
 
     println!("Submitting job '{name}' (image: {image}, backend: {backend})...");
-    let job_id = router.submit(&plan).await?;
+
+    // Timeout for submit (Docker may need to pull the image)
+    let job_id = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        router.submit(&plan),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Job submission timed out after 120s (image pull may be slow)"))?
+    ?;
+
     println!("Job submitted: {job_id}");
     println!("Check status:  prism job-status {job_id}");
 
-    // Poll for initial status
+    // Brief poll for initial status
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     match router.status(job_id).await {
         Ok(status) => println!("Status: {:?}", status),
-        Err(e) => println!("Status check failed: {e}"),
+        Err(e) => println!("Status check: {e}"),
     }
 
     Ok(())
