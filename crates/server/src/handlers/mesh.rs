@@ -79,7 +79,10 @@ pub async fn publish_dataset(
 ) -> Result<Json<PublishResponse>, (axum::http::StatusCode, String)> {
     use prism_mesh::subscription::PublishedDataset;
 
-    let mut subs = state.subscriptions.write().unwrap_or_else(|e| e.into_inner());
+    let mut subs = state
+        .subscriptions
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     subs.publish(PublishedDataset {
         name: body.name.clone(),
         schema_version: body.schema_version.clone(),
@@ -108,7 +111,10 @@ pub async fn subscribe_dataset(
         )
     })?;
 
-    let mut subs = state.subscriptions.write().unwrap_or_else(|e| e.into_inner());
+    let mut subs = state
+        .subscriptions
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     subs.subscribe(Subscription {
         dataset_name: body.dataset_name.clone(),
         publisher_node: publisher,
@@ -134,7 +140,10 @@ pub async fn unsubscribe_dataset(
         )
     })?;
 
-    let mut subs = state.subscriptions.write().unwrap_or_else(|e| e.into_inner());
+    let mut subs = state
+        .subscriptions
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     subs.unsubscribe(&body.dataset_name, publisher);
 
     Ok(Json(serde_json::json!({
@@ -180,8 +189,13 @@ pub struct UnsubscribeRequest {
 }
 
 /// GET /api/mesh/subscriptions — list published datasets and active subscriptions.
-pub async fn list_subscriptions(State(state): State<Arc<NodeState>>) -> Json<SubscriptionsResponse> {
-    let subs = state.subscriptions.read().unwrap_or_else(|e| e.into_inner());
+pub async fn list_subscriptions(
+    State(state): State<Arc<NodeState>>,
+) -> Json<SubscriptionsResponse> {
+    let subs = state
+        .subscriptions
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
 
     let published = subs
         .published()

@@ -133,15 +133,11 @@ impl<'a> KnowledgeClient<'a> {
     /// Find shortest paths between two entities.
     ///
     /// Equivalent to Python: `client.knowledge.graph_paths(from, to, max_hops=3)`
-    pub async fn graph_paths(
-        &self,
-        from: &str,
-        to: &str,
-        max_hops: usize,
-    ) -> Result<Vec<KgPath>> {
+    pub async fn graph_paths(&self, from: &str, to: &str, max_hops: usize) -> Result<Vec<KgPath>> {
         let from_enc = urlencoding::encode(from);
         let to_enc = urlencoding::encode(to);
-        let path = format!("/knowledge/graph/paths?from={from_enc}&to={to_enc}&max_hops={max_hops}");
+        let path =
+            format!("/knowledge/graph/paths?from={from_enc}&to={to_enc}&max_hops={max_hops}");
         self.platform
             .get(&path)
             .await

@@ -223,10 +223,9 @@ impl AuditLog {
         let (where_clause, bind_values) = Self::build_where(filter);
         let sql = format!("SELECT COUNT(*) FROM audit_log {where_clause}");
         let mut stmt = self.conn.prepare(&sql)?;
-        let count: u64 = stmt
-            .query_row(rusqlite::params_from_iter(bind_values.iter()), |row| {
-                row.get(0)
-            })?;
+        let count: u64 = stmt.query_row(rusqlite::params_from_iter(bind_values.iter()), |row| {
+            row.get(0)
+        })?;
         Ok(count)
     }
 
@@ -400,8 +399,12 @@ mod tests {
     fn count_queries() {
         let log = AuditLog::in_memory().unwrap();
         for i in 0..5 {
-            log.log(&make_entry("alice", AuditAction::DataQuery, &format!("ds_{i}")))
-                .unwrap();
+            log.log(&make_entry(
+                "alice",
+                AuditAction::DataQuery,
+                &format!("ds_{i}"),
+            ))
+            .unwrap();
         }
         log.log(&make_entry("bob", AuditAction::ToolExecution, "calc"))
             .unwrap();
@@ -427,8 +430,12 @@ mod tests {
     fn limit_respected() {
         let log = AuditLog::in_memory().unwrap();
         for i in 0..10 {
-            log.log(&make_entry("alice", AuditAction::DataIngest, &format!("file_{i}")))
-                .unwrap();
+            log.log(&make_entry(
+                "alice",
+                AuditAction::DataIngest,
+                &format!("file_{i}"),
+            ))
+            .unwrap();
         }
 
         let filter = AuditFilter {
@@ -442,7 +449,11 @@ mod tests {
     #[test]
     fn all_outcomes_roundtrip() {
         let log = AuditLog::in_memory().unwrap();
-        for outcome in [AuditOutcome::Success, AuditOutcome::Failure, AuditOutcome::Denied] {
+        for outcome in [
+            AuditOutcome::Success,
+            AuditOutcome::Failure,
+            AuditOutcome::Denied,
+        ] {
             let mut entry = make_entry("alice", AuditAction::UserLogin, "session");
             entry.outcome = outcome;
             log.log(&entry).unwrap();
@@ -487,10 +498,12 @@ mod tests {
         entry.detail = Some("détails: «données brutes»".into());
         let id = log.log(&entry).unwrap();
 
-        let results = log.query(&AuditFilter {
-            user_id: Some("用户🧪".into()),
-            ..Default::default()
-        }).unwrap();
+        let results = log
+            .query(&AuditFilter {
+                user_id: Some("用户🧪".into()),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
         assert_eq!(results[0].target, "数据集/résumé.csv");
@@ -517,9 +530,16 @@ mod tests {
     #[test]
     fn combined_filters() {
         let log = AuditLog::in_memory().unwrap();
-        log.log(&make_entry("alice", AuditAction::DataQuery, "ds_a")).unwrap();
-        log.log(&make_entry("alice", AuditAction::ToolExecution, "web_search")).unwrap();
-        log.log(&make_entry("bob", AuditAction::DataQuery, "ds_b")).unwrap();
+        log.log(&make_entry("alice", AuditAction::DataQuery, "ds_a"))
+            .unwrap();
+        log.log(&make_entry(
+            "alice",
+            AuditAction::ToolExecution,
+            "web_search",
+        ))
+        .unwrap();
+        log.log(&make_entry("bob", AuditAction::DataQuery, "ds_b"))
+            .unwrap();
 
         let filter = AuditFilter {
             user_id: Some("alice".into()),
@@ -534,10 +554,17 @@ mod tests {
     #[test]
     fn audit_action_display_matches_from_str() {
         let actions = [
-            AuditAction::ToolExecution, AuditAction::DataQuery, AuditAction::DataIngest,
-            AuditAction::DataPublish, AuditAction::ConfigChange, AuditAction::UserLogin,
-            AuditAction::UserLogout, AuditAction::RoleChange, AuditAction::NodeStart,
-            AuditAction::NodeStop, AuditAction::Subscription,
+            AuditAction::ToolExecution,
+            AuditAction::DataQuery,
+            AuditAction::DataIngest,
+            AuditAction::DataPublish,
+            AuditAction::ConfigChange,
+            AuditAction::UserLogin,
+            AuditAction::UserLogout,
+            AuditAction::RoleChange,
+            AuditAction::NodeStart,
+            AuditAction::NodeStop,
+            AuditAction::Subscription,
         ];
         for action in actions {
             let s = action.to_string();

@@ -187,11 +187,13 @@ impl PolicyEngine {
         };
 
         // Collect obligations
-        let obligations =
-            match self.engine.eval_rule("data.prism.policy.obligations".into()) {
-                Ok(val) => val_to_string_set(&val),
-                Err(_) => Vec::new(),
-            };
+        let obligations = match self
+            .engine
+            .eval_rule("data.prism.policy.obligations".into())
+        {
+            Ok(val) => val_to_string_set(&val),
+            Err(_) => Vec::new(),
+        };
 
         // Collect reason
         let reason = match self.engine.eval_rule("data.prism.policy.reason".into()) {
@@ -350,7 +352,11 @@ mod tests {
             context: serde_json::json!({}),
         };
         let decision = engine.evaluate(&input).unwrap();
-        assert!(decision.allowed, "agent should call safe tools: {:?}", decision);
+        assert!(
+            decision.allowed,
+            "agent should call safe tools: {:?}",
+            decision
+        );
     }
 
     #[test]
@@ -364,7 +370,11 @@ mod tests {
             context: serde_json::json!({"mode": "delete"}),
         };
         let decision = engine.evaluate(&input).unwrap();
-        assert!(!decision.allowed, "agent should be denied destructive tool: {:?}", decision);
+        assert!(
+            !decision.allowed,
+            "agent should be denied destructive tool: {:?}",
+            decision
+        );
     }
 
     #[test]

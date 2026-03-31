@@ -23,8 +23,7 @@ pub struct MdnsDiscovery {
 impl MdnsDiscovery {
     /// Create a new mDNS discovery handle.
     pub fn new(_service_name: &str, port: u16) -> Result<Self> {
-        let daemon = ServiceDaemon::new()
-            .context("failed to create mDNS daemon")?;
+        let daemon = ServiceDaemon::new().context("failed to create mDNS daemon")?;
         Ok(Self {
             daemon,
             instance_name: None,
@@ -44,7 +43,7 @@ impl MdnsDiscovery {
             SERVICE_TYPE,
             &instance_name,
             &format!("{instance_name}.local."),
-            "",  // auto-detect IP
+            "", // auto-detect IP
             self.port,
             properties,
         )
@@ -75,7 +74,9 @@ impl MdnsDiscovery {
                 Ok(ServiceEvent::ServiceResolved(info)) => {
                     if let Some(peer) = service_info_to_peer(&info) {
                         // Skip self
-                        if self.instance_name.as_deref() == Some(info.get_fullname().split('.').next().unwrap_or("")) {
+                        if self.instance_name.as_deref()
+                            == Some(info.get_fullname().split('.').next().unwrap_or(""))
+                        {
                             continue;
                         }
                         tracing::debug!(peer_name = %peer.name, peer_id = %peer.node_id, "mDNS: discovered peer");
@@ -99,7 +100,9 @@ impl MdnsDiscovery {
             let _ = self.daemon.unregister(&fullname);
             tracing::info!(service = %fullname, "mDNS: unregistered");
         }
-        self.daemon.shutdown().context("failed to shut down mDNS daemon")?;
+        self.daemon
+            .shutdown()
+            .context("failed to shut down mDNS daemon")?;
         Ok(())
     }
 }

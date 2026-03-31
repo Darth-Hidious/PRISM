@@ -288,11 +288,7 @@ fn write_restricted_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// Fetch managed LLM keys from the platform and write to local state.
 ///
 /// Writes to `{state_dir}/llm_keys.json`. Non-fatal — logs warnings on failure.
-async fn sync_llm_keys(
-    client: &prism_client::PlatformClient,
-    org_id: &str,
-    state_dir: &Path,
-) {
+async fn sync_llm_keys(client: &prism_client::PlatformClient, org_id: &str, state_dir: &Path) {
     let keys = match client.fetch_llm_keys(org_id).await {
         Ok(k) => k,
         Err(e) => {
@@ -374,6 +370,7 @@ async fn sync_roles_from_platform(
     tracing::info!(synced, revoked, total = members.len(), "role sync complete");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run(
     endpoints: &PlatformEndpoints,
     paths: &PrismPaths,
@@ -400,7 +397,7 @@ async fn connect_and_run(
         org_id,
         capabilities: Box::new(capabilities.clone()),
     };
-    sink.send(Message::Text(serde_json::to_string(&register)?.into()))
+    sink.send(Message::Text(serde_json::to_string(&register)?))
         .await?;
 
     tracing::info!("register message sent, waiting for confirmation");
@@ -479,7 +476,7 @@ async fn connect_and_run(
                     gpus_free: total_gpus.saturating_sub(gpus_in_use),
                     active_jobs: active,
                 };
-                sink.send(Message::Text(serde_json::to_string(&hb)?.into())).await?;
+                sink.send(Message::Text(serde_json::to_string(&hb)?)).await?;
             }
             _ = rest_heartbeat_timer.tick() => {
                 // REST heartbeat complements the WS heartbeat above.
@@ -510,7 +507,7 @@ async fn connect_and_run(
                 }
             }
             Some(outgoing) = outgoing_rx.recv() => {
-                sink.send(Message::Text(outgoing.into())).await?;
+                sink.send(Message::Text(outgoing)).await?;
             }
             msg = stream.next() => {
                 match msg {

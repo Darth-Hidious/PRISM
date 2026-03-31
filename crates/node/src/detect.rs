@@ -549,7 +549,10 @@ mod tests {
 
     #[test]
     fn expand_tilde_no_tilde() {
-        assert_eq!(expand_tilde("/absolute/path"), PathBuf::from("/absolute/path"));
+        assert_eq!(
+            expand_tilde("/absolute/path"),
+            PathBuf::from("/absolute/path")
+        );
     }
 
     #[test]
@@ -620,7 +623,11 @@ mod tests {
 
     #[test]
     fn detect_services_with_gpus_and_storage() {
-        let gpus = vec![GpuInfo { gpu_type: "A100".into(), count: 2, vram_gb: 80 }];
+        let gpus = vec![GpuInfo {
+            gpu_type: "A100".into(),
+            count: 2,
+            vram_gb: 80,
+        }];
         let services = detect_services(&gpus, 200, &[]);
         assert!(services.iter().any(|s| s.kind == "compute"));
         assert!(services.iter().any(|s| s.kind == "storage"));
@@ -636,7 +643,9 @@ mod tests {
             size_gb: Some(0.5),
         }];
         let services = detect_services(&[], 50, &models);
-        assert!(services.iter().any(|s| s.kind == "inference" && s.model.as_deref() == Some("predictor")));
+        assert!(services
+            .iter()
+            .any(|s| s.kind == "inference" && s.model.as_deref() == Some("predictor")));
     }
 
     #[test]

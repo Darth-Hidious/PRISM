@@ -82,8 +82,7 @@ pub async fn auth_layer(
                         error: "internal_error",
                         message: "Session validation failed.",
                     };
-                    return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body))
-                        .into_response();
+                    return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
                 }
             },
             Err(e) => {
@@ -99,9 +98,7 @@ pub async fn auth_layer(
 
     // Fallback: no session DB configured — treat token as user_id (localhost-only mode).
     tracing::debug!("session DB not configured, using token as user_id");
-    let user = AuthenticatedUser {
-        user_id: t.clone(),
-    };
+    let user = AuthenticatedUser { user_id: t.clone() };
     req.extensions_mut().insert(SessionToken(t));
     req.extensions_mut().insert(user);
     next.run(req).await
@@ -178,7 +175,10 @@ mod tests {
     #[test]
     fn bearer_takes_priority() {
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", HeaderValue::from_static("Bearer bearer_tok"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer bearer_tok"),
+        );
         headers.insert("x-session-token", HeaderValue::from_static("header_tok"));
         assert_eq!(
             extract_token(&headers, Some("token=query_tok")),

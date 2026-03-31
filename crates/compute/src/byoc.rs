@@ -22,10 +22,7 @@ pub enum ByocTarget {
         port: u16,
     },
     /// Submit to a Kubernetes cluster.
-    Kubernetes {
-        context: String,
-        namespace: String,
-    },
+    Kubernetes { context: String, namespace: String },
     /// Submit to a SLURM scheduler.
     Slurm {
         head_node: String,
@@ -59,10 +56,14 @@ impl ByocBackend {
     fn ssh_cmd(host: &str, user: &str, key_path: &str, port: u16) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("ssh");
         cmd.args([
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "BatchMode=yes",
-            "-i", key_path,
-            "-p", &port.to_string(),
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "BatchMode=yes",
+            "-i",
+            key_path,
+            "-p",
+            &port.to_string(),
             &format!("{user}@{host}"),
         ]);
         cmd
@@ -109,30 +110,31 @@ impl ComputeBackend for ByocBackend {
                     bail!("SSH docker run failed: {stderr}");
                 }
 
-                let container_id = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .to_string();
+                let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 tracing::info!(%job_id, %container_id, "BYOC SSH: container started");
 
                 Ok(job_id)
             }
-            ByocTarget::Kubernetes {
-                context,
-                namespace,
-            } => {
+            ByocTarget::Kubernetes { context, namespace } => {
                 let job_id = Uuid::new_v4();
                 let inputs_json = serde_json::to_string(&plan.inputs)?;
 
                 // kubectl run as a Job
                 let mut cmd = tokio::process::Command::new("kubectl");
                 cmd.args([
-                    "--context", context,
-                    "-n", namespace,
-                    "run", &format!("prism-{job_id}"),
-                    "--image", &plan.image,
+                    "--context",
+                    context,
+                    "-n",
+                    namespace,
+                    "run",
+                    &format!("prism-{job_id}"),
+                    "--image",
+                    &plan.image,
                     "--restart=Never",
-                    "--env", &format!("PRISM_JOB_ID={job_id}"),
-                    "--env", &format!("PRISM_INPUTS={inputs_json}"),
+                    "--env",
+                    &format!("PRISM_JOB_ID={job_id}"),
+                    "--env",
+                    &format!("PRISM_INPUTS={inputs_json}"),
                 ]);
 
                 tracing::info!(
@@ -168,10 +170,7 @@ impl ComputeBackend for ByocBackend {
                     image = plan.image,
                 );
 
-                let ssh_cmd = format!(
-                    "echo '{}' | sbatch",
-                    sbatch_script.replace('\'', "'\\''")
-                );
+                let ssh_cmd = format!("echo '{}' | sbatch", sbatch_script.replace('\'', "'\\''"));
 
                 tracing::info!(
                     %head_node, %user, %partition, %job_id,
@@ -180,12 +179,16 @@ impl ComputeBackend for ByocBackend {
 
                 let mut cmd = tokio::process::Command::new("ssh");
                 cmd.args([
-                    "-o", "BatchMode=yes",
+                    "-o",
+                    "BatchMode=yes",
                     &format!("{user}@{head_node}"),
                     &ssh_cmd,
                 ]);
 
-                let output = cmd.output().await.context("SSH to SLURM head node failed")?;
+                let output = cmd
+                    .output()
+                    .await
+                    .context("SSH to SLURM head node failed")?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     bail!("sbatch submission failed: {stderr}");
@@ -221,23 +224,34 @@ impl ComputeBackend for ByocBackend {
             ByocTarget::Kubernetes { context, namespace } => {
                 let mut cmd = tokio::process::Command::new("kubectl");
                 cmd.args([
-                    "--context", context, "-n", namespace,
-                    "get", "pod", &format!("prism-{job_id}"),
-                    "-o", "jsonpath={.status.phase}",
+                    "--context",
+                    context,
+                    "-n",
+                    namespace,
+                    "get",
+                    "pod",
+                    &format!("prism-{job_id}"),
+                    "-o",
+                    "jsonpath={.status.phase}",
                 ]);
                 let output = cmd.output().await?;
                 let phase = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 match phase.as_str() {
                     "Running" | "Pending" => Ok(JobStatus::Running { progress: 0.0 }),
                     "Succeeded" => Ok(JobStatus::Completed),
-                    "Failed" => Ok(JobStatus::Failed { error: "pod failed".into() }),
+                    "Failed" => Ok(JobStatus::Failed {
+                        error: "pod failed".into(),
+                    }),
                     _ => Ok(JobStatus::Queued),
                 }
             }
-            ByocTarget::Slurm { head_node, user, .. } => {
+            ByocTarget::Slurm {
+                head_node, user, ..
+            } => {
                 let mut cmd = tokio::process::Command::new("ssh");
                 cmd.args([
-                    "-o", "BatchMode=yes",
+                    "-o",
+                    "BatchMode=yes",
                     &format!("{user}@{head_node}"),
                     &format!("squeue --name=prism-{job_id} --noheader -o %T"),
                 ]);
@@ -276,8 +290,12 @@ impl ComputeBackend for ByocBackend {
             ByocTarget::Kubernetes { context, namespace } => {
                 let mut cmd = tokio::process::Command::new("kubectl");
                 cmd.args([
-                    "--context", context, "-n", namespace,
-                    "logs", &format!("prism-{job_id}"),
+                    "--context",
+                    context,
+                    "-n",
+                    namespace,
+                    "logs",
+                    &format!("prism-{job_id}"),
                 ]);
                 let output = cmd.output().await?;
                 let logs = String::from_utf8_lossy(&output.stdout).to_string();
@@ -286,10 +304,13 @@ impl ComputeBackend for ByocBackend {
                     Err(_) => Ok(serde_json::json!({"output": logs})),
                 }
             }
-            ByocTarget::Slurm { head_node, user, .. } => {
+            ByocTarget::Slurm {
+                head_node, user, ..
+            } => {
                 let mut cmd = tokio::process::Command::new("ssh");
                 cmd.args([
-                    "-o", "BatchMode=yes",
+                    "-o",
+                    "BatchMode=yes",
                     &format!("{user}@{head_node}"),
                     &format!("cat /tmp/prism-{job_id}.out"),
                 ]);
@@ -319,16 +340,24 @@ impl ComputeBackend for ByocBackend {
             ByocTarget::Kubernetes { context, namespace } => {
                 let mut cmd = tokio::process::Command::new("kubectl");
                 cmd.args([
-                    "--context", context, "-n", namespace,
-                    "delete", "pod", &format!("prism-{job_id}"),
+                    "--context",
+                    context,
+                    "-n",
+                    namespace,
+                    "delete",
+                    "pod",
+                    &format!("prism-{job_id}"),
                 ]);
                 cmd.output().await.context("kubectl delete failed")?;
                 Ok(())
             }
-            ByocTarget::Slurm { head_node, user, .. } => {
+            ByocTarget::Slurm {
+                head_node, user, ..
+            } => {
                 let mut cmd = tokio::process::Command::new("ssh");
                 cmd.args([
-                    "-o", "BatchMode=yes",
+                    "-o",
+                    "BatchMode=yes",
                     &format!("{user}@{head_node}"),
                     &format!("scancel --name=prism-{job_id}"),
                 ]);
@@ -342,7 +371,6 @@ impl ComputeBackend for ByocBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ExperimentPlan;
 
     #[test]
     fn default_byoc_is_ssh() {
@@ -370,7 +398,12 @@ mod tests {
         };
         let json = serde_json::to_string(&target).unwrap();
         let back: ByocTarget = serde_json::from_str(&json).unwrap();
-        if let ByocTarget::Slurm { head_node, partition, .. } = back {
+        if let ByocTarget::Slurm {
+            head_node,
+            partition,
+            ..
+        } = back
+        {
             assert_eq!(head_node, "hpc.lab.internal");
             assert_eq!(partition, "gpu");
         } else {

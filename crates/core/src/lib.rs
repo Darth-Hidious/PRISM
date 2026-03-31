@@ -8,16 +8,18 @@
 //! - [`audit`]: Append-only audit log (SQLite-backed, required for ESA/defense compliance).
 //! - [`registry`]: Tool manifest discovery and in-memory tool registry.
 
-pub mod config;
-pub mod session;
-pub mod rbac;
 pub mod audit;
+pub mod config;
+pub mod rbac;
 pub mod registry;
+pub mod session;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn core_compiles() {
-        assert!(true);
+        let _ = config::NodeConfig::default();
     }
 }

@@ -39,9 +39,13 @@ impl From<&JobStatus> for TrackedStatus {
     fn from(s: &JobStatus) -> Self {
         match s {
             JobStatus::Queued => TrackedStatus::Queued,
-            JobStatus::Running { progress } => TrackedStatus::Running { progress: *progress },
+            JobStatus::Running { progress } => TrackedStatus::Running {
+                progress: *progress,
+            },
             JobStatus::Completed => TrackedStatus::Completed { duration_secs: 0 },
-            JobStatus::Failed { error } => TrackedStatus::Failed { error: error.clone() },
+            JobStatus::Failed { error } => TrackedStatus::Failed {
+                error: error.clone(),
+            },
             JobStatus::Cancelled => TrackedStatus::Cancelled,
         }
     }
@@ -51,7 +55,9 @@ impl TrackedStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            TrackedStatus::Completed { .. } | TrackedStatus::Failed { .. } | TrackedStatus::Cancelled
+            TrackedStatus::Completed { .. }
+                | TrackedStatus::Failed { .. }
+                | TrackedStatus::Cancelled
         )
     }
 }
@@ -157,7 +163,9 @@ mod tests {
     async fn register_and_get() {
         let tracker = JobTracker::new();
         let id = Uuid::new_v4();
-        tracker.register(id, "test-job", "python:3.11", "local").await;
+        tracker
+            .register(id, "test-job", "python:3.11", "local")
+            .await;
         let record = tracker.get(id).await.unwrap();
         assert_eq!(record.name, "test-job");
         assert!(matches!(record.status, TrackedStatus::Queued));
@@ -173,7 +181,9 @@ mod tests {
             .update_status(id, TrackedStatus::Running { progress: 0.5 })
             .await;
         let record = tracker.get(id).await.unwrap();
-        assert!(matches!(record.status, TrackedStatus::Running { progress } if (progress - 0.5).abs() < f64::EPSILON));
+        assert!(
+            matches!(record.status, TrackedStatus::Running { progress } if (progress - 0.5).abs() < f64::EPSILON)
+        );
     }
 
     #[tokio::test]
@@ -203,9 +213,7 @@ mod tests {
         tracker.register(id, "j", "i", "local").await;
         assert_eq!(tracker.active_count().await, 1);
 
-        tracker
-            .update_status(id, TrackedStatus::Cancelled)
-            .await;
+        tracker.update_status(id, TrackedStatus::Cancelled).await;
         assert_eq!(tracker.active_count().await, 0);
     }
 
@@ -225,7 +233,10 @@ mod tests {
         let updated = tracker
             .update_status(unknown, TrackedStatus::Completed { duration_secs: 5 })
             .await;
-        assert!(!updated, "update_status should return false for unknown job");
+        assert!(
+            !updated,
+            "update_status should return false for unknown job"
+        );
     }
 
     #[tokio::test]
@@ -253,7 +264,9 @@ mod tests {
 
         tracker.register(id_active, "active", "img", "local").await;
         tracker.register(id_done, "done", "img", "local").await;
-        tracker.register(id_cancelled, "cancelled", "img", "local").await;
+        tracker
+            .register(id_cancelled, "cancelled", "img", "local")
+            .await;
 
         tracker
             .update_status(id_done, TrackedStatus::Completed { duration_secs: 10 })
@@ -294,7 +307,10 @@ mod tests {
         assert!(!TrackedStatus::Queued.is_terminal());
         assert!(!TrackedStatus::Running { progress: 0.5 }.is_terminal());
         assert!(TrackedStatus::Completed { duration_secs: 0 }.is_terminal());
-        assert!(TrackedStatus::Failed { error: "boom".into() }.is_terminal());
+        assert!(TrackedStatus::Failed {
+            error: "boom".into()
+        }
+        .is_terminal());
         assert!(TrackedStatus::Cancelled.is_terminal());
     }
 
@@ -306,12 +322,19 @@ mod tests {
         assert!(matches!(queued, TrackedStatus::Queued));
 
         let running = TrackedStatus::from(&JobStatus::Running { progress: 0.42 });
-        assert!(matches!(running, TrackedStatus::Running { progress } if (progress - 0.42).abs() < f64::EPSILON));
+        assert!(
+            matches!(running, TrackedStatus::Running { progress } if (progress - 0.42).abs() < f64::EPSILON)
+        );
 
         let completed = TrackedStatus::from(&JobStatus::Completed);
-        assert!(matches!(completed, TrackedStatus::Completed { duration_secs: 0 }));
+        assert!(matches!(
+            completed,
+            TrackedStatus::Completed { duration_secs: 0 }
+        ));
 
-        let failed = TrackedStatus::from(&JobStatus::Failed { error: "disk full".into() });
+        let failed = TrackedStatus::from(&JobStatus::Failed {
+            error: "disk full".into(),
+        });
         assert!(matches!(failed, TrackedStatus::Failed { ref error } if error == "disk full"));
 
         let cancelled = TrackedStatus::from(&JobStatus::Cancelled);
@@ -342,7 +365,9 @@ mod tests {
             TrackedStatus::Queued,
             TrackedStatus::Running { progress: 0.33 },
             TrackedStatus::Completed { duration_secs: 120 },
-            TrackedStatus::Failed { error: "oom".into() },
+            TrackedStatus::Failed {
+                error: "oom".into(),
+            },
             TrackedStatus::Cancelled,
         ];
 

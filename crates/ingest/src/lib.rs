@@ -12,17 +12,17 @@
 //! implementation and is designed so that a future DMMS (Differentiable Manifold
 //! Materials Science) engine can slot in behind the same interface.
 
-pub mod pipeline;
-pub mod schema;
-pub mod ontology;
-pub mod graph;
-pub mod embeddings;
 pub mod connectors;
-pub mod validation;
+pub mod embeddings;
+pub mod graph;
 pub mod graph_validation;
-pub mod nl_query;
 pub mod llm;
 pub mod mapping;
+pub mod nl_query;
+pub mod ontology;
+pub mod pipeline;
+pub mod schema;
+pub mod validation;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -32,7 +32,11 @@ use serde::{Deserialize, Serialize};
 #[async_trait]
 pub trait OntologyConstructor: Send + Sync {
     async fn analyze_schema(&self, source: &DataSource) -> Result<SchemaAnalysis>;
-    async fn extract_entities(&self, source: &DataSource, schema: &SchemaAnalysis) -> Result<EntitySet>;
+    async fn extract_entities(
+        &self,
+        source: &DataSource,
+        schema: &SchemaAnalysis,
+    ) -> Result<EntitySet>;
     async fn build_graph(&self, entities: &EntitySet) -> Result<GraphUpdate>;
     async fn generate_embeddings(&self, entities: &EntitySet) -> Result<EmbeddingBatch>;
 }
@@ -119,8 +123,12 @@ pub struct LlmConfig {
     pub timeout_secs: u64,
 }
 
-fn default_max_sample_rows() -> usize { 10 }
-fn default_timeout_secs() -> u64 { 120 }
+fn default_max_sample_rows() -> usize {
+    10
+}
+fn default_timeout_secs() -> u64 {
+    120
+}
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -150,7 +158,9 @@ pub struct Neo4jConfig {
     pub password: String,
 }
 
-fn default_neo4j_db() -> String { "neo4j".into() }
+fn default_neo4j_db() -> String {
+    "neo4j".into()
+}
 
 impl Default for Neo4jConfig {
     fn default() -> Self {
@@ -176,7 +186,9 @@ pub struct QdrantConfig {
     pub api_key: Option<String>,
 }
 
-fn default_qdrant_collection() -> String { "prism_embeddings".into() }
+fn default_qdrant_collection() -> String {
+    "prism_embeddings".into()
+}
 
 impl Default for QdrantConfig {
     fn default() -> Self {

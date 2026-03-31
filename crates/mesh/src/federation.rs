@@ -84,8 +84,7 @@ impl FederatedQuery {
             })
             .collect();
 
-        let results: Vec<Vec<serde_json::Value>> =
-            futures_util::future::join_all(futures).await;
+        let results: Vec<Vec<serde_json::Value>> = futures_util::future::join_all(futures).await;
         Ok(results.into_iter().flatten().collect())
     }
 }

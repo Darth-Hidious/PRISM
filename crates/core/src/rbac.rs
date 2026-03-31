@@ -193,8 +193,10 @@ impl RbacEngine {
 
     /// Remove a user's local role assignment.
     pub fn remove_role(&self, user_id: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM user_roles WHERE user_id = ?1", params![user_id])?;
+        self.conn.execute(
+            "DELETE FROM user_roles WHERE user_id = ?1",
+            params![user_id],
+        )?;
         tracing::info!(user_id, "role removed");
         Ok(())
     }
@@ -449,14 +451,20 @@ mod tests {
     fn many_users_scale() {
         let e = engine();
         for i in 0..500 {
-            e.assign_role(&format!("user-{i}"), LocalRole::Viewer).unwrap();
+            e.assign_role(&format!("user-{i}"), LocalRole::Viewer)
+                .unwrap();
         }
         assert_eq!(e.list_users().unwrap().len(), 500);
     }
 
     #[test]
     fn role_serde_roundtrip() {
-        for role in [LocalRole::NodeAdmin, LocalRole::Engineer, LocalRole::Analyst, LocalRole::Viewer] {
+        for role in [
+            LocalRole::NodeAdmin,
+            LocalRole::Engineer,
+            LocalRole::Analyst,
+            LocalRole::Viewer,
+        ] {
             let json = serde_json::to_string(&role).unwrap();
             let parsed: LocalRole = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, role);
@@ -466,9 +474,14 @@ mod tests {
     #[test]
     fn permission_serde_roundtrip() {
         for perm in [
-            Permission::ManageNode, Permission::ManageUsers, Permission::ExecuteTools,
-            Permission::PublishData, Permission::IngestData, Permission::QueryData,
-            Permission::ViewDashboard, Permission::ViewAudit,
+            Permission::ManageNode,
+            Permission::ManageUsers,
+            Permission::ExecuteTools,
+            Permission::PublishData,
+            Permission::IngestData,
+            Permission::QueryData,
+            Permission::ViewDashboard,
+            Permission::ViewAudit,
         ] {
             let json = serde_json::to_string(&perm).unwrap();
             let parsed: Permission = serde_json::from_str(&json).unwrap();
@@ -478,7 +491,12 @@ mod tests {
 
     #[test]
     fn platform_role_serde_roundtrip() {
-        for role in [PlatformRole::Owner, PlatformRole::Admin, PlatformRole::Member, PlatformRole::Viewer] {
+        for role in [
+            PlatformRole::Owner,
+            PlatformRole::Admin,
+            PlatformRole::Member,
+            PlatformRole::Viewer,
+        ] {
             let json = serde_json::to_string(&role).unwrap();
             let parsed: PlatformRole = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, role);
@@ -487,10 +505,22 @@ mod tests {
 
     #[test]
     fn platform_role_from_api_str() {
-        assert_eq!(PlatformRole::from_api_str("owner"), Some(PlatformRole::Owner));
-        assert_eq!(PlatformRole::from_api_str("admin"), Some(PlatformRole::Admin));
-        assert_eq!(PlatformRole::from_api_str("member"), Some(PlatformRole::Member));
-        assert_eq!(PlatformRole::from_api_str("viewer"), Some(PlatformRole::Viewer));
+        assert_eq!(
+            PlatformRole::from_api_str("owner"),
+            Some(PlatformRole::Owner)
+        );
+        assert_eq!(
+            PlatformRole::from_api_str("admin"),
+            Some(PlatformRole::Admin)
+        );
+        assert_eq!(
+            PlatformRole::from_api_str("member"),
+            Some(PlatformRole::Member)
+        );
+        assert_eq!(
+            PlatformRole::from_api_str("viewer"),
+            Some(PlatformRole::Viewer)
+        );
         assert_eq!(PlatformRole::from_api_str("superadmin"), None);
         assert_eq!(PlatformRole::from_api_str(""), None);
     }

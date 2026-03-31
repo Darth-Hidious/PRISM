@@ -159,10 +159,8 @@ impl LlmClient {
         });
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad Ollama embed response")?;
-        let embeddings: Vec<Vec<f32>> = serde_json::from_value(
-            data["embeddings"].clone(),
-        )
-        .context("failed to parse Ollama embeddings")?;
+        let embeddings: Vec<Vec<f32>> = serde_json::from_value(data["embeddings"].clone())
+            .context("failed to parse Ollama embeddings")?;
         Ok(embeddings)
     }
 
@@ -183,7 +181,8 @@ impl LlmClient {
     // ── OpenAI-compatible ──────────────────────────────────────────
 
     async fn generate_openai(&self, prompt: &str) -> Result<String> {
-        self.chat_openai("You are a helpful assistant.", prompt).await
+        self.chat_openai("You are a helpful assistant.", prompt)
+            .await
     }
 
     async fn generate_openai_json(&self, prompt: &str) -> Result<String> {
@@ -237,8 +236,8 @@ impl LlmClient {
             .context("expected data array in embeddings response")?;
         let mut embeddings = Vec::with_capacity(arr.len());
         for item in arr {
-            let vec: Vec<f32> =
-                serde_json::from_value(item["embedding"].clone()).context("bad embedding vector")?;
+            let vec: Vec<f32> = serde_json::from_value(item["embedding"].clone())
+                .context("bad embedding vector")?;
             embeddings.push(vec);
         }
         Ok(embeddings)

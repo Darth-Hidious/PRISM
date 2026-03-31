@@ -136,9 +136,7 @@ impl Neo4jGraphStore {
     /// Build a MERGE Cypher statement for an entity node.
     fn entity_merge_cypher(entity: &Entity) -> CypherStatement {
         let label = sanitize_label(&entity.entity_type);
-        let cypher = format!(
-            "MERGE (n:{label} {{name: $name}}) SET n += $props RETURN n.name"
-        );
+        let cypher = format!("MERGE (n:{label} {{name: $name}}) SET n += $props RETURN n.name");
         CypherStatement {
             statement: cypher,
             parameters: Some(serde_json::json!({
@@ -257,7 +255,13 @@ pub struct GraphSchemaInfo {
 /// Only allows alphanumeric + underscore.
 fn sanitize_label(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -304,10 +308,7 @@ impl GraphStore for Neo4jGraphStore {
         );
 
         let resp = self
-            .execute_one(
-                &cypher,
-                Some(serde_json::json!({ "name": entity_name })),
-            )
+            .execute_one(&cypher, Some(serde_json::json!({ "name": entity_name })))
             .await?;
 
         let mut entities = Vec::new();

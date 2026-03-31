@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServiceConfig {
     pub neo4j: Neo4jConfig,
     pub vector_db: VectorDbConfig,
@@ -24,16 +24,6 @@ pub struct VectorDbConfig {
 pub struct KafkaConfig {
     pub image: String,
     pub port: u16,
-}
-
-impl Default for ServiceConfig {
-    fn default() -> Self {
-        Self {
-            neo4j: Neo4jConfig::default(),
-            vector_db: VectorDbConfig::default(),
-            kafka: None, // Kafka is optional — only needed for federated/air-gapped mode
-        }
-    }
 }
 
 impl Default for Neo4jConfig {

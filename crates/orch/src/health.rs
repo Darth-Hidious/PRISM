@@ -86,7 +86,8 @@ impl HealthChecker {
             };
 
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
             if stream.write_all(request.as_bytes()).await.is_err() {
                 return false;
             }

@@ -10,10 +10,10 @@
 //! configuration. Job lifecycle is tracked by [`JobTracker`].
 
 pub mod backend;
-pub mod local;
-pub mod marc27;
 pub mod byoc;
 pub mod job;
+pub mod local;
+pub mod marc27;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -60,7 +60,9 @@ mod tests {
         let status = JobStatus::Running { progress: 0.75 };
         let json = serde_json::to_string(&status).unwrap();
         let parsed: JobStatus = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, JobStatus::Running { progress } if (progress - 0.75).abs() < f64::EPSILON));
+        assert!(
+            matches!(parsed, JobStatus::Running { progress } if (progress - 0.75).abs() < f64::EPSILON)
+        );
     }
 
     #[test]
@@ -137,7 +139,9 @@ mod tests {
             JobStatus::Queued,
             JobStatus::Running { progress: 0.5 },
             JobStatus::Completed,
-            JobStatus::Failed { error: "oom killed".into() },
+            JobStatus::Failed {
+                error: "oom killed".into(),
+            },
             JobStatus::Cancelled,
         ];
 
@@ -173,7 +177,9 @@ mod tests {
         let status = JobStatus::Running { progress: 1.0 };
         let json = serde_json::to_string(&status).unwrap();
         let parsed: JobStatus = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, JobStatus::Running { progress } if (progress - 1.0).abs() < f64::EPSILON));
+        assert!(
+            matches!(parsed, JobStatus::Running { progress } if (progress - 1.0).abs() < f64::EPSILON)
+        );
     }
 
     #[test]

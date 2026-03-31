@@ -6,12 +6,12 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing;
 
 use crate::{
-    DataSource, EmbeddingBatch, Entity, EntitySet, GraphUpdate, LlmConfig,
-    OntologyConstructor, Relationship, SchemaAnalysis,
+    DataSource, EmbeddingBatch, Entity, EntitySet, GraphUpdate, LlmConfig, OntologyConstructor,
+    Relationship, SchemaAnalysis,
 };
 
 /// LLM-based ontology constructor — works with any provider via [`crate::llm::LlmClient`].
@@ -76,10 +76,7 @@ impl LlmOntologyConstructor {
     }
 
     /// Build the extraction prompt from schema + sample rows.
-    fn build_extraction_prompt(
-        schema: &SchemaAnalysis,
-        sample_rows: &[Vec<String>],
-    ) -> String {
+    fn build_extraction_prompt(schema: &SchemaAnalysis, sample_rows: &[Vec<String>]) -> String {
         Self::build_extraction_prompt_with_mapping(schema, sample_rows, None)
     }
 
@@ -188,7 +185,10 @@ impl OntologyConstructor for LlmOntologyConstructor {
     ) -> Result<EntitySet> {
         // In a real pipeline, sample rows come from the DataFrame via the connector.
         // For now we pass an empty sample — callers should use extract_entities_with_samples.
-        tracing::info!(columns = schema.columns.len(), "extracting entities via LLM");
+        tracing::info!(
+            columns = schema.columns.len(),
+            "extracting entities via LLM"
+        );
 
         let prompt = Self::build_extraction_prompt(schema, &[]);
         let response = self.generate(&prompt).await?;
@@ -247,11 +247,7 @@ impl OntologyConstructor for LlmOntologyConstructor {
             });
         }
 
-        let texts: Vec<String> = entities
-            .entities
-            .iter()
-            .map(Self::entity_to_text)
-            .collect();
+        let texts: Vec<String> = entities.entities.iter().map(Self::entity_to_text).collect();
         let ids: Vec<String> = entities.entities.iter().map(|e| e.name.clone()).collect();
 
         tracing::info!(count = texts.len(), "generating embeddings via Ollama");
@@ -273,7 +269,8 @@ impl LlmOntologyConstructor {
         schema: &SchemaAnalysis,
         sample_rows: &[Vec<String>],
     ) -> Result<EntitySet> {
-        self.extract_entities_with_mapping(schema, sample_rows, None).await
+        self.extract_entities_with_mapping(schema, sample_rows, None)
+            .await
     }
 
     pub async fn extract_entities_with_mapping(

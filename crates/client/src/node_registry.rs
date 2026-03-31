@@ -75,12 +75,7 @@ impl<'a> NodeRegistryClient<'a> {
     }
 
     /// Send a heartbeat for a registered node.
-    pub async fn heartbeat(
-        &self,
-        node_id: &str,
-        status: &str,
-        active_jobs: u32,
-    ) -> Result<()> {
+    pub async fn heartbeat(&self, node_id: &str, status: &str, active_jobs: u32) -> Result<()> {
         let path = format!("/nodes/{node_id}/heartbeat");
         debug!(%path, %status, active_jobs, "heartbeat");
         let _: serde_json::Value = self

@@ -366,7 +366,11 @@ impl VectorStore for QdrantVectorStore {
         let info: CollectionInfoResponse =
             resp.json().await.context("bad collection info response")?;
 
-        Ok(info.result.points_count.or(info.result.vectors_count).unwrap_or(0))
+        Ok(info
+            .result
+            .points_count
+            .or(info.result.vectors_count)
+            .unwrap_or(0))
     }
 }
 
@@ -495,7 +499,9 @@ mod tests {
             api_key: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
-        assert!(!json.contains("\"api_key\""),
-            "api_key=None should be omitted from JSON, got: {json}");
+        assert!(
+            !json.contains("\"api_key\""),
+            "api_key=None should be omitted from JSON, got: {json}"
+        );
     }
 }

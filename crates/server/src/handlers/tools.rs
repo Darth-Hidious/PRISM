@@ -46,7 +46,10 @@ pub struct ErrorResponse {
 
 /// GET /api/tools — list available tools from the registry.
 pub async fn list_tools(State(state): State<Arc<NodeState>>) -> Json<Vec<ToolInfo>> {
-    let registry = state.tool_registry.read().unwrap_or_else(|e| e.into_inner());
+    let registry = state
+        .tool_registry
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let tools = registry
         .list()
         .iter()
@@ -84,7 +87,10 @@ pub async fn run_tool(
     user: Option<Extension<AuthenticatedUser>>,
     Path(name): Path<String>,
 ) -> Result<Json<RunResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let registry = state.tool_registry.read().unwrap_or_else(|e| e.into_inner());
+    let registry = state
+        .tool_registry
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     if registry.get(&name).is_none() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -94,7 +100,10 @@ pub async fn run_tool(
         ));
     }
 
-    let user_id = user.as_ref().map(|u| u.user_id.as_str()).unwrap_or("anonymous");
+    let user_id = user
+        .as_ref()
+        .map(|u| u.user_id.as_str())
+        .unwrap_or("anonymous");
     state.audit_and_broadcast(&prism_core::audit::AuditEntry {
         id: 0,
         timestamp: chrono::Utc::now(),
@@ -109,6 +118,8 @@ pub async fn run_tool(
     // Full execution is handled by the TAOR agent loop.
     Ok(Json(RunResponse {
         status: "accepted",
-        message: format!("Tool '{name}' execution queued. Use `prism run` for interactive execution."),
+        message: format!(
+            "Tool '{name}' execution queued. Use `prism run` for interactive execution."
+        ),
     }))
 }

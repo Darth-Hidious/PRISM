@@ -26,8 +26,7 @@ mod tests {
 
     #[test]
     fn client_with_token() {
-        let client = PlatformClient::new("https://api.marc27.com/api/v1")
-            .with_token("test-token");
+        let client = PlatformClient::new("https://api.marc27.com/api/v1").with_token("test-token");
         // Just verifying it compiles and doesn't panic.
         assert_eq!(client.base_url(), "https://api.marc27.com/api/v1");
     }

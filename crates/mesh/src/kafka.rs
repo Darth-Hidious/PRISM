@@ -56,8 +56,7 @@ impl MeshKafkaProducer {
     /// Publish a mesh message to the appropriate topic.
     pub async fn publish(&self, msg: &MeshMessage) -> Result<()> {
         let topic = self.topic_for(msg);
-        let payload = serde_json::to_string(msg)
-            .context("failed to serialize mesh message")?;
+        let payload = serde_json::to_string(msg).context("failed to serialize mesh message")?;
 
         debug!(%topic, "publishing mesh message");
         self.producer

@@ -233,7 +233,10 @@ mod tests {
         let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
 
         let ws = workspace_dir(state, id);
-        assert!(ws.to_str().unwrap().contains("12345678-1234-1234-1234-123456789abc"));
+        assert!(ws
+            .to_str()
+            .unwrap()
+            .contains("12345678-1234-1234-1234-123456789abc"));
 
         let result = result_manifest_path(&ws);
         assert!(result.ends_with("result.json"));

@@ -123,19 +123,34 @@ mod tests {
 
     #[test]
     fn parse_port_from_bolt_uri() {
-        assert_eq!(ExternalConnector::parse_port("bolt://localhost:7687", 7687), 7687);
-        assert_eq!(ExternalConnector::parse_port("bolt://db.internal:7700", 7687), 7700);
+        assert_eq!(
+            ExternalConnector::parse_port("bolt://localhost:7687", 7687),
+            7687
+        );
+        assert_eq!(
+            ExternalConnector::parse_port("bolt://db.internal:7700", 7687),
+            7700
+        );
     }
 
     #[test]
     fn parse_port_from_http_uri() {
-        assert_eq!(ExternalConnector::parse_port("http://10.0.0.5:6333", 6333), 6333);
-        assert_eq!(ExternalConnector::parse_port("http://qdrant:6400/", 6333), 6400);
+        assert_eq!(
+            ExternalConnector::parse_port("http://10.0.0.5:6333", 6333),
+            6333
+        );
+        assert_eq!(
+            ExternalConnector::parse_port("http://qdrant:6400/", 6333),
+            6400
+        );
     }
 
     #[test]
     fn parse_port_bare_host() {
-        assert_eq!(ExternalConnector::parse_port("kafka-broker:9092", 9092), 9092);
+        assert_eq!(
+            ExternalConnector::parse_port("kafka-broker:9092", 9092),
+            9092
+        );
     }
 
     #[test]

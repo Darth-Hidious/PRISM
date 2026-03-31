@@ -26,13 +26,19 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
     // HandleErrorLayer maps buffer/rate-limit errors → 429 so axum's Infallible requirement is met.
     let session_rate = ServiceBuilder::new()
         .layer(HandleErrorLayer::new(|_: tower::BoxError| async {
-            (StatusCode::TOO_MANY_REQUESTS, "Too many requests — try again shortly.")
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests — try again shortly.",
+            )
         }))
         .buffer(64)
         .rate_limit(10, std::time::Duration::from_secs(1));
     let api_rate = ServiceBuilder::new()
         .layer(HandleErrorLayer::new(|_: tower::BoxError| async {
-            (StatusCode::TOO_MANY_REQUESTS, "Too many requests — try again shortly.")
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests — try again shortly.",
+            )
         }))
         .buffer(256)
         .rate_limit(100, std::time::Duration::from_secs(1));
@@ -117,8 +123,8 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
         )));
 
     // ── Session management (auth required, no permission gate) ──────
-    let session_routes = Router::new()
-        .route("/api/sessions", delete(handlers::sessions::destroy_session));
+    let session_routes =
+        Router::new().route("/api/sessions", delete(handlers::sessions::destroy_session));
 
     // ── Authenticated API (all permission-gated routes) ─────────────
     let authenticated_api = Router::new()
@@ -192,7 +198,10 @@ async fn serve_dashboard(uri: Uri) -> Response {
             .parse()
             .unwrap(),
     );
-    headers.insert("Referrer-Policy", "strict-origin-when-cross-origin".parse().unwrap());
+    headers.insert(
+        "Referrer-Policy",
+        "strict-origin-when-cross-origin".parse().unwrap(),
+    );
 
     builder
 }
