@@ -27,7 +27,8 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "prism")]
-#[command(about = "Rust control-plane backbone for PRISM")]
+#[command(about = "PRISM — AI-native materials discovery platform")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[arg(long, global = true, default_value = "python3")]
     python: PathBuf,
