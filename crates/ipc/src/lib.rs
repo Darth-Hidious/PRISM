@@ -6,12 +6,12 @@
 //!
 //! Wire types: [`RpcRequest`], [`RpcResponse`], [`RpcNotification`], [`RpcError`].
 
-pub mod server;
 pub mod methods;
+pub mod server;
 pub mod types;
 
 pub use server::IpcServer;
-pub use types::{RpcRequest, RpcResponse, RpcNotification, RpcError};
+pub use types::{RpcError, RpcNotification, RpcRequest, RpcResponse};
 
 #[cfg(test)]
 mod tests {
@@ -147,10 +147,7 @@ mod tests {
             let resp = RpcResponse::err(Some(1), code, message.into());
             let json = serde_json::to_string(&resp).unwrap();
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-            assert_eq!(
-                v["error"]["code"], code,
-                "code mismatch for {message}"
-            );
+            assert_eq!(v["error"]["code"], code, "code mismatch for {message}");
             assert_eq!(
                 v["error"]["message"], message,
                 "message mismatch for code {code}"

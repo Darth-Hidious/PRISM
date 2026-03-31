@@ -152,24 +152,54 @@ impl Default for CalphadSection {
     }
 }
 
-fn default_calphad_mode() -> String { "local".into() }
+fn default_calphad_mode() -> String {
+    "local".into()
+}
 
 // ── Defaults ────────────────────────────────────────────────────────
 
-fn default_node_name() -> String { hostname().unwrap_or_else(|| "prism-node".into()) }
-fn default_port() -> u16 { 7327 }
-fn default_data_dir() -> String { "/var/prism/data".into() }
-fn default_managed() -> String { "managed".into() }
-fn default_platform_url() -> String { "https://platform.marc27.com".into() }
-fn default_discovery() -> Vec<String> { vec!["mdns".into(), "platform".into()] }
-fn default_mesh_port() -> u16 { 7328 }
-fn default_engine() -> String { "llm".into() }
-fn default_llm_provider() -> String { "platform".into() }
-fn default_session_timeout() -> String { "24h".into() }
-fn default_true() -> bool { true }
-fn default_platform_mode() -> String { "platform".into() }
-fn default_context_length() -> usize { 4096 }
-fn default_gpu_layers() -> u32 { 99 }
+fn default_node_name() -> String {
+    hostname().unwrap_or_else(|| "prism-node".into())
+}
+fn default_port() -> u16 {
+    7327
+}
+fn default_data_dir() -> String {
+    "/var/prism/data".into()
+}
+fn default_managed() -> String {
+    "managed".into()
+}
+fn default_platform_url() -> String {
+    "https://platform.marc27.com".into()
+}
+fn default_discovery() -> Vec<String> {
+    vec!["mdns".into(), "platform".into()]
+}
+fn default_mesh_port() -> u16 {
+    7328
+}
+fn default_engine() -> String {
+    "llm".into()
+}
+fn default_llm_provider() -> String {
+    "platform".into()
+}
+fn default_session_timeout() -> String {
+    "24h".into()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_platform_mode() -> String {
+    "platform".into()
+}
+fn default_context_length() -> usize {
+    4096
+}
+fn default_gpu_layers() -> u32 {
+    99
+}
 
 fn hostname() -> Option<String> {
     std::process::Command::new("hostname")
@@ -189,31 +219,59 @@ impl Default for NodeConfig {
 
 impl Default for NodeSection {
     fn default() -> Self {
-        Self { name: default_node_name(), port: default_port(), data_dir: default_data_dir() }
+        Self {
+            name: default_node_name(),
+            port: default_port(),
+            data_dir: default_data_dir(),
+        }
     }
 }
 
 impl Default for ServicesSection {
     fn default() -> Self {
-        Self { mode: default_managed(), neo4j_uri: None, qdrant_uri: None, kafka_uri: None }
+        Self {
+            mode: default_managed(),
+            neo4j_uri: None,
+            qdrant_uri: None,
+            kafka_uri: None,
+        }
     }
 }
 
 impl Default for PlatformSection {
-    fn default() -> Self { Self { url: default_platform_url() } }
+    fn default() -> Self {
+        Self {
+            url: default_platform_url(),
+        }
+    }
 }
 
 impl Default for MeshSection {
-    fn default() -> Self { Self { discovery: default_discovery(), publish_port: default_mesh_port() } }
+    fn default() -> Self {
+        Self {
+            discovery: default_discovery(),
+            publish_port: default_mesh_port(),
+        }
+    }
 }
 
 impl Default for OntologySection {
-    fn default() -> Self { Self { engine: default_engine(), llm_provider: default_llm_provider(), mapping_file: None } }
+    fn default() -> Self {
+        Self {
+            engine: default_engine(),
+            llm_provider: default_llm_provider(),
+            mapping_file: None,
+        }
+    }
 }
 
 impl Default for AuthSection {
     fn default() -> Self {
-        Self { session_timeout: default_session_timeout(), require_platform_auth: true, allow_local_users: true }
+        Self {
+            session_timeout: default_session_timeout(),
+            require_platform_auth: true,
+            allow_local_users: true,
+        }
     }
 }
 
@@ -371,12 +429,24 @@ api_key_env = "ANTHROPIC_API_KEY"
 "#;
         let config: NodeConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.services.mode, "external");
-        assert_eq!(config.services.neo4j_uri.as_deref(), Some("bolt://db.internal:7687"));
-        assert_eq!(config.indexer.model.as_deref(), Some("marc27/prism-indexer-9b-Q4_K_XL.gguf"));
+        assert_eq!(
+            config.services.neo4j_uri.as_deref(),
+            Some("bolt://db.internal:7687")
+        );
+        assert_eq!(
+            config.indexer.model.as_deref(),
+            Some("marc27/prism-indexer-9b-Q4_K_XL.gguf")
+        );
         assert_eq!(config.indexer.port, Some(8100));
         assert_eq!(config.searcher.mode, "platform");
-        assert_eq!(config.searcher.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
-        assert_eq!(config.ontology.mapping_file.as_deref(), Some("mappings/materials.yaml"));
+        assert_eq!(
+            config.searcher.api_key_env.as_deref(),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert_eq!(
+            config.ontology.mapping_file.as_deref(),
+            Some("mappings/materials.yaml")
+        );
     }
 
     #[test]
@@ -385,7 +455,10 @@ api_key_env = "ANTHROPIC_API_KEY"
             api_key: Some("direct-key".into()),
             ..Default::default()
         };
-        assert_eq!(NodeConfig::resolve_api_key(&section), Some("direct-key".into()));
+        assert_eq!(
+            NodeConfig::resolve_api_key(&section),
+            Some("direct-key".into())
+        );
     }
 
     #[test]
@@ -395,6 +468,9 @@ api_key_env = "ANTHROPIC_API_KEY"
             ..Default::default()
         };
         // Empty key falls through to env var check
-        assert_eq!(NodeConfig::resolve_api_key(&section), std::env::var("LLM_API_KEY").ok().filter(|k| !k.is_empty()));
+        assert_eq!(
+            NodeConfig::resolve_api_key(&section),
+            std::env::var("LLM_API_KEY").ok().filter(|k| !k.is_empty())
+        );
     }
 }

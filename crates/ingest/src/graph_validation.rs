@@ -53,8 +53,7 @@ const VALID_REL_TYPES: &[&str] = &[
 
 /// Known valid entity types.
 const VALID_ENTITY_TYPES: &[&str] = &[
-    "Alloy", "Element", "Property", "Process", "Phase",
-    "Paper", "Author", "Dataset", "Material",
+    "Alloy", "Element", "Property", "Process", "Phase", "Paper", "Author", "Dataset", "Material",
 ];
 
 /// Validate an EntitySet for structural integrity.
@@ -62,11 +61,7 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
     let mut issues = Vec::new();
 
     // Build entity name lookup
-    let entity_names: HashSet<&str> = entities
-        .entities
-        .iter()
-        .map(|e| e.name.as_str())
-        .collect();
+    let entity_names: HashSet<&str> = entities.entities.iter().map(|e| e.name.as_str()).collect();
 
     // Check 1: Empty graph
     if entities.entities.is_empty() {
@@ -197,10 +192,7 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
             issues.push(GraphIssue {
                 severity: GraphSeverity::Info,
                 category: "missing_order".into(),
-                message: format!(
-                    "PROCESSED_BY {} → {} has no order",
-                    r.from, r.to
-                ),
+                message: format!("PROCESSED_BY {} → {} has no order", r.from, r.to),
             });
         }
     }
@@ -226,9 +218,7 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
         }
     }
 
-    let has_errors = issues
-        .iter()
-        .any(|i| i.severity == GraphSeverity::Error);
+    let has_errors = issues.iter().any(|i| i.severity == GraphSeverity::Error);
 
     GraphValidationReport {
         entity_count: entities.entities.len(),
@@ -288,7 +278,10 @@ mod tests {
         };
         let report = validate_graph(&es);
         assert!(report.passed);
-        assert!(report.issues.iter().all(|i| i.severity != GraphSeverity::Error));
+        assert!(report
+            .issues
+            .iter()
+            .all(|i| i.severity != GraphSeverity::Error));
     }
 
     #[test]
@@ -316,10 +309,7 @@ mod tests {
     #[test]
     fn detects_duplicate_entities() {
         let es = EntitySet {
-            entities: vec![
-                make_entity("Element", "Fe"),
-                make_entity("Element", "Fe"),
-            ],
+            entities: vec![make_entity("Element", "Fe"), make_entity("Element", "Fe")],
             relationships: vec![],
         };
         let report = validate_graph(&es);
@@ -329,10 +319,7 @@ mod tests {
     #[test]
     fn detects_unknown_relationship_type() {
         let es = EntitySet {
-            entities: vec![
-                make_entity("Alloy", "A"),
-                make_entity("Alloy", "B"),
-            ],
+            entities: vec![make_entity("Alloy", "A"), make_entity("Alloy", "B")],
             relationships: vec![make_rel("A", "MAGIC_LINK", "B")],
         };
         let report = validate_graph(&es);
@@ -342,10 +329,7 @@ mod tests {
     #[test]
     fn detects_weight_out_of_range() {
         let es = EntitySet {
-            entities: vec![
-                make_entity("Alloy", "X"),
-                make_entity("Element", "Y"),
-            ],
+            entities: vec![make_entity("Alloy", "X"), make_entity("Element", "Y")],
             relationships: vec![Relationship {
                 from: "X".into(),
                 rel_type: "CONTAINS".into(),

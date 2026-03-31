@@ -360,17 +360,13 @@ async fn handle_semantic_query(
 fn service_unavailable(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse {
-            error: msg.into(),
-        }),
+        Json(ErrorResponse { error: msg.into() }),
     )
 }
 
 fn internal_error(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: msg.into(),
-        }),
+        Json(ErrorResponse { error: msg.into() }),
     )
 }

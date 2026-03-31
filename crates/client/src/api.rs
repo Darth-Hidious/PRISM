@@ -81,9 +81,7 @@ impl PlatformClient {
                 .context("invalid characters in access token")?;
             headers.insert(AUTHORIZATION, val);
         }
-        headers
-            .try_reserve(0)
-            .ok(); // no-op, keeps borrow checker happy
+        headers.try_reserve(0).ok(); // no-op, keeps borrow checker happy
         Ok(headers)
     }
 
@@ -110,11 +108,7 @@ impl PlatformClient {
     }
 
     /// Perform an authenticated POST request with a JSON body and deserialise the response.
-    pub async fn post<B: Serialize, T: DeserializeOwned>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<T> {
+    pub async fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
         let url = format!("{}{path}", self.base_url);
         debug!(%url, "POST");
 

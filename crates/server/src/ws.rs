@@ -58,12 +58,18 @@ pub async fn ws_upgrade(
                         .into_response();
                 }
                 Err(_) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "Session validation failed.")
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Session validation failed.",
+                    )
                         .into_response();
                 }
             },
             Err(_) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Session service unavailable.")
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Session service unavailable.",
+                )
                     .into_response();
             }
         }
@@ -72,9 +78,14 @@ pub async fn ws_upgrade(
     };
 
     // Enforce connection concurrency limit
-    let current = state.ws_connections.load(std::sync::atomic::Ordering::Relaxed);
+    let current = state
+        .ws_connections
+        .load(std::sync::atomic::Ordering::Relaxed);
     if current >= MAX_WS_CONNECTIONS {
-        return (StatusCode::SERVICE_UNAVAILABLE, "Too many WebSocket connections.")
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many WebSocket connections.",
+        )
             .into_response();
     }
     state

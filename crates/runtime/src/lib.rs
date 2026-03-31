@@ -89,20 +89,11 @@ impl std::fmt::Debug for StoredCredentials {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PrismCliState {
     pub credentials: Option<StoredCredentials>,
     #[serde(default)]
     pub preferred_python: Option<String>,
-}
-
-impl Default for PrismCliState {
-    fn default() -> Self {
-        Self {
-            credentials: None,
-            preferred_python: None,
-        }
-    }
 }
 
 impl PrismPaths {

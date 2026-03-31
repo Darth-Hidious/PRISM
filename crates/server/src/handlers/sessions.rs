@@ -54,18 +54,16 @@ pub async fn create_session(
         ));
     };
 
-    let mgr =
-        prism_core::session::SessionManager::new(db_path, chrono::Duration::hours(24)).map_err(
-            |e| {
-                tracing::error!(error = %e, "failed to open session database");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "Internal server error.".into(),
-                    }),
-                )
-            },
-        )?;
+    let mgr = prism_core::session::SessionManager::new(db_path, chrono::Duration::hours(24))
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to open session database");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error.".into(),
+                }),
+            )
+        })?;
 
     let session = mgr
         .create_session(
@@ -124,18 +122,16 @@ pub async fn destroy_session(
         ));
     };
 
-    let mgr =
-        prism_core::session::SessionManager::new(db_path, chrono::Duration::hours(24)).map_err(
-            |e| {
-                tracing::error!(error = %e, "failed to open session database");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "Internal server error.".into(),
-                    }),
-                )
-            },
-        )?;
+    let mgr = prism_core::session::SessionManager::new(db_path, chrono::Duration::hours(24))
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to open session database");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error.".into(),
+                }),
+            )
+        })?;
 
     mgr.destroy_session(&session_id).map_err(|e| {
         tracing::error!(error = %e, "failed to destroy session");

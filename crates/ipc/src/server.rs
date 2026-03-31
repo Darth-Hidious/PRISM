@@ -83,20 +83,29 @@ impl IpcServer {
     pub async fn send_request(&self, request: &RpcRequest) -> Result<()> {
         let json = serde_json::to_string(request)?;
         debug!(method = %request.method, "→ TUI");
-        self.tx.send(json).await.map_err(|e| anyhow::anyhow!("IPC send failed: {e}"))
+        self.tx
+            .send(json)
+            .await
+            .map_err(|e| anyhow::anyhow!("IPC send failed: {e}"))
     }
 
     /// Send a JSON-RPC notification (no response expected) to the TUI.
     pub async fn send_notification(&self, notification: &RpcNotification) -> Result<()> {
         let json = serde_json::to_string(notification)?;
         debug!(method = %notification.method, "→ TUI (notification)");
-        self.tx.send(json).await.map_err(|e| anyhow::anyhow!("IPC send failed: {e}"))
+        self.tx
+            .send(json)
+            .await
+            .map_err(|e| anyhow::anyhow!("IPC send failed: {e}"))
     }
 
     /// Send a JSON-RPC response to the TUI.
     pub async fn send_response(&self, response: &RpcResponse) -> Result<()> {
         let json = serde_json::to_string(response)?;
-        self.tx.send(json).await.map_err(|e| anyhow::anyhow!("IPC send failed: {e}"))
+        self.tx
+            .send(json)
+            .await
+            .map_err(|e| anyhow::anyhow!("IPC send failed: {e}"))
     }
 
     /// Receive the next JSON-RPC message from the TUI.
@@ -119,13 +128,10 @@ impl IpcServer {
         info!("Sent ipc.hello to TUI, waiting for response...");
 
         // Wait for response (with timeout)
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.recv(),
-        )
-        .await
-        .context("TUI did not respond to ipc.hello within 10s")?
-        .context("TUI process exited before responding")?;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), self.recv())
+            .await
+            .context("TUI did not respond to ipc.hello within 10s")?
+            .context("TUI process exited before responding")?;
 
         // Parse — could be a response or a request
         if let Ok(resp) = serde_json::from_str::<RpcResponse>(&response) {

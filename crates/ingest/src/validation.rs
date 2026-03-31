@@ -47,7 +47,11 @@ pub fn validate(df: &DataFrame) -> ValidationReport {
 
     // 2. Duplicate column names
     {
-        let names: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let mut seen = std::collections::HashSet::new();
         for name in &names {
             if !seen.insert(name.clone()) {
@@ -133,8 +137,10 @@ mod tests {
         let df = DataFrame::empty();
         let report = validate(&df);
         assert!(!report.passed);
-        assert!(report.issues.iter().any(|i| i.severity == Severity::Error
-            && i.message.contains("empty")));
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.severity == Severity::Error && i.message.contains("empty")));
     }
 
     #[test]
@@ -151,12 +157,20 @@ mod tests {
 
     #[test]
     fn high_null_column_warns() {
-        let s = Series::new("mostly_null".into(), &[Option::<i32>::None, None, Some(1), None]);
+        let s = Series::new(
+            "mostly_null".into(),
+            &[Option::<i32>::None, None, Some(1), None],
+        );
         let df = DataFrame::new(vec![s.into()]).unwrap();
         let report = validate(&df);
         // 75% nulls > 50% threshold
-        assert!(report.issues.iter().any(|i| i.severity == Severity::Warning
-            && i.column.as_deref() == Some("mostly_null")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.severity == Severity::Warning
+                    && i.column.as_deref() == Some("mostly_null"))
+        );
     }
 
     #[test]
@@ -168,10 +182,15 @@ mod tests {
         .unwrap();
         let report = validate(&df);
         assert!(report.passed); // Info doesn't fail
-        assert!(report.issues.iter().any(|i| i.severity == Severity::Info
-            && i.column.as_deref() == Some("constant")));
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.severity == Severity::Info && i.column.as_deref() == Some("constant")));
         // varying column should NOT appear as zero-variance
-        assert!(!report.issues.iter().any(|i| i.column.as_deref() == Some("varying")));
+        assert!(!report
+            .issues
+            .iter()
+            .any(|i| i.column.as_deref() == Some("varying")));
     }
 
     #[test]
@@ -180,6 +199,9 @@ mod tests {
         let df = DataFrame::new(vec![s.into()]).unwrap();
         let report = validate(&df);
         // 50% is not >50%, so no warning
-        assert!(!report.issues.iter().any(|i| i.severity == Severity::Warning));
+        assert!(!report
+            .issues
+            .iter()
+            .any(|i| i.severity == Severity::Warning));
     }
 }

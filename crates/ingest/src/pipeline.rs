@@ -103,9 +103,7 @@ impl IngestPipeline {
         match ext.as_str() {
             "csv" | "tsv" => self.ingest_csv(path).await,
             "parquet" | "pq" => self.ingest_parquet(path).await,
-            _ => bail!(
-                "Unsupported file format: '.{ext}'. Supported: csv, tsv, parquet"
-            ),
+            _ => bail!("Unsupported file format: '.{ext}'. Supported: csv, tsv, parquet"),
         }
     }
 
@@ -202,33 +200,34 @@ impl IngestPipeline {
         };
 
         // Step 5: Qdrant embedding generation + upsert (if configured and entities exist)
-        let embeddings = if let (Some(ref llm_config), Some(ref qdrant_config), Some(ref entity_set)) =
-            (&self.config.llm, &self.config.qdrant, &entities)
-        {
-            let constructor = LlmOntologyConstructor::new(llm_config.clone());
-            match constructor.generate_embeddings(entity_set).await {
-                Ok(batch) if !batch.vectors.is_empty() => {
-                    let vector_store = QdrantVectorStore::new(qdrant_config.clone());
-                    match vector_store.upsert(&batch).await {
-                        Ok(count) => {
-                            tracing::info!(count, "vectors stored in Qdrant");
-                            Some(batch)
-                        }
-                        Err(e) => {
-                            tracing::error!("Qdrant upsert failed: {e}");
-                            Some(batch) // still return embeddings even if store failed
+        let embeddings =
+            if let (Some(ref llm_config), Some(ref qdrant_config), Some(ref entity_set)) =
+                (&self.config.llm, &self.config.qdrant, &entities)
+            {
+                let constructor = LlmOntologyConstructor::new(llm_config.clone());
+                match constructor.generate_embeddings(entity_set).await {
+                    Ok(batch) if !batch.vectors.is_empty() => {
+                        let vector_store = QdrantVectorStore::new(qdrant_config.clone());
+                        match vector_store.upsert(&batch).await {
+                            Ok(count) => {
+                                tracing::info!(count, "vectors stored in Qdrant");
+                                Some(batch)
+                            }
+                            Err(e) => {
+                                tracing::error!("Qdrant upsert failed: {e}");
+                                Some(batch) // still return embeddings even if store failed
+                            }
                         }
                     }
+                    Ok(batch) => Some(batch),
+                    Err(e) => {
+                        tracing::error!("embedding generation failed: {e}");
+                        None
+                    }
                 }
-                Ok(batch) => Some(batch),
-                Err(e) => {
-                    tracing::error!("embedding generation failed: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         Ok(IngestResult {
             source,
@@ -309,9 +308,18 @@ mod tests {
     #[test]
     fn ingest_result_with_none_fields_serializes_cleanly() {
         let result = IngestResult {
-            source: DataSource { path: "/tmp/test.csv".into(), format: "csv".into() },
-            schema: SchemaAnalysis { columns: vec!["a".into()], detected_types: vec!["int".into()] },
-            validation: crate::validation::ValidationReport { issues: vec![], passed: true },
+            source: DataSource {
+                path: "/tmp/test.csv".into(),
+                format: "csv".into(),
+            },
+            schema: SchemaAnalysis {
+                columns: vec!["a".into()],
+                detected_types: vec!["int".into()],
+            },
+            validation: crate::validation::ValidationReport {
+                issues: vec![],
+                passed: true,
+            },
             row_count: 10,
             column_count: 1,
             entities: None,

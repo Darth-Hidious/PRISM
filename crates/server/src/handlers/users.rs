@@ -98,7 +98,11 @@ pub async fn create_user(
             }),
         ));
     }
-    if !body.user_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@') {
+    if !body
+        .user_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@')
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -160,17 +164,15 @@ pub async fn create_user(
         )
     })?;
 
-    engine
-        .assign_role(&body.user_id, role)
-        .map_err(|e| {
-            tracing::error!(error = %e, user_id = %body.user_id, "failed to assign role");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Internal server error.".into(),
-                }),
-            )
-        })?;
+    engine.assign_role(&body.user_id, role).map_err(|e| {
+        tracing::error!(error = %e, user_id = %body.user_id, "failed to assign role");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Internal server error.".into(),
+            }),
+        )
+    })?;
 
     Ok(Json(CreateUserResponse {
         status: "created",

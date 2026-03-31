@@ -91,10 +91,7 @@ impl ComputeBackend for LocalBackend {
             bail!("{} run failed: {err}", self.runtime);
         }
 
-        self.active
-            .write()
-            .await
-            .insert(job_id, container_name);
+        self.active.write().await.insert(job_id, container_name);
 
         tracing::info!(%job_id, image = %plan.image, "local compute job submitted");
         Ok(job_id)
@@ -246,7 +243,10 @@ mod tests {
         assert_ne!(id_a, id_b);
         let name_a = LocalBackend::container_name(id_a);
         let name_b = LocalBackend::container_name(id_b);
-        assert_ne!(name_a, name_b, "container names for different UUIDs must differ");
+        assert_ne!(
+            name_a, name_b,
+            "container names for different UUIDs must differ"
+        );
     }
 
     #[test]
@@ -269,7 +269,10 @@ mod tests {
         let name = LocalBackend::container_name(id);
         // The simple form contains no hyphens inside the UUID portion.
         let suffix = name.strip_prefix("prism-compute-").unwrap();
-        assert!(!suffix.contains('-'), "UUID suffix should use simple (no-hyphen) format");
+        assert!(
+            !suffix.contains('-'),
+            "UUID suffix should use simple (no-hyphen) format"
+        );
     }
 
     #[test]

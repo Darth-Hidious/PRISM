@@ -136,13 +136,11 @@ mod tests {
     #[test]
     fn health_report_summary() {
         let report = HealthReport {
-            services: vec![
-                ServiceHealth {
-                    name: "neo4j".into(),
-                    status: "healthy".into(),
-                    port: 7687,
-                },
-            ],
+            services: vec![ServiceHealth {
+                name: "neo4j".into(),
+                status: "healthy".into(),
+                port: 7687,
+            }],
         };
         assert_eq!(report.summary(), "neo4j:7687 (healthy)");
     }

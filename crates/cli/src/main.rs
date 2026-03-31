@@ -12,6 +12,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use prism_client::api::PlatformClient;
+use prism_client::auth::{DeviceCodeResponse, TokenResponse};
+use prism_client::DeviceFlowAuth;
 use prism_proto::NodeCapabilities;
 use prism_python_bridge::PythonWorkerConfig;
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
@@ -19,10 +22,6 @@ use prism_workflows::{
     discover_workflows, execute_workflow, find_workflow, parse_workflow_command_args,
     WorkflowRunResult, WorkflowSpec,
 };
-use prism_client::api::PlatformClient;
-use prism_client::auth::{DeviceCodeResponse, TokenResponse};
-use prism_client::DeviceFlowAuth;
-use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -200,6 +199,7 @@ enum WorkflowCommands {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum NodeCommands {
     /// Start the node daemon — register with the platform and wait for jobs.
     Up {
@@ -376,8 +376,8 @@ async fn main() -> Result<()> {
             state.preferred_python = Some(python.display().to_string());
             if state.credentials.is_none() {
                 let credentials = run_device_login(&endpoints).await?;
-                let platform = PlatformClient::new(&endpoints.api_base)
-                    .with_token(&credentials.access_token);
+                let platform =
+                    PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
                 let profile = platform.fetch_current_user().await.ok();
                 let selected = select_project(
                     &platform,
@@ -400,8 +400,8 @@ async fn main() -> Result<()> {
                 });
                 paths.save_cli_state(&state)?;
             } else if let Some(creds) = state.credentials.as_mut() {
-                let platform = PlatformClient::new(&endpoints.api_base)
-                    .with_token(&creds.access_token);
+                let platform =
+                    PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
                 if creds.user_id.is_none() || creds.display_name.is_none() {
                     if let Ok(profile) = platform.fetch_current_user().await {
                         creds.user_id = Some(profile.id);
@@ -414,11 +414,7 @@ async fn main() -> Result<()> {
                         .as_ref()
                         .is_some_and(|project_id| Some(project_id) != creds.project_id.as_ref())
                 {
-                    let selected = select_project(
-                        &platform,
-                        creds.display_name.as_deref(),
-                    )
-                    .await?;
+                    let selected = select_project(&platform, creds.display_name.as_deref()).await?;
                     creds.org_id = selected.org_id;
                     creds.org_name = selected.org_name;
                     creds.project_id = selected.project_id;
@@ -448,8 +444,8 @@ async fn main() -> Result<()> {
         Commands::Login => {
             let mut state = paths.load_cli_state()?;
             let credentials = run_device_login(&endpoints).await?;
-            let platform = PlatformClient::new(&endpoints.api_base)
-                .with_token(&credentials.access_token);
+            let platform =
+                PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
             let profile = platform.fetch_current_user().await.ok();
             let selected = select_project(
                 &platform,
@@ -594,12 +590,24 @@ async fn main() -> Result<()> {
                     if !model_paths.is_empty() {
                         cmd.args(["--model-paths", &model_paths.join(",")]);
                     }
-                    if no_compute { cmd.arg("--no-compute"); }
-                    if no_storage { cmd.arg("--no-storage"); }
-                    if offline { cmd.arg("--offline"); }
-                    if no_services { cmd.arg("--no-services"); }
-                    if with_kafka { cmd.arg("--with-kafka"); }
-                    if broadcast { cmd.arg("--broadcast"); }
+                    if no_compute {
+                        cmd.arg("--no-compute");
+                    }
+                    if no_storage {
+                        cmd.arg("--no-storage");
+                    }
+                    if offline {
+                        cmd.arg("--offline");
+                    }
+                    if no_services {
+                        cmd.arg("--no-services");
+                    }
+                    if with_kafka {
+                        cmd.arg("--with-kafka");
+                    }
+                    if broadcast {
+                        cmd.arg("--broadcast");
+                    }
                     cmd.args(["--dashboard-port", &dashboard_port.to_string()]);
                     if let Some(ref host) = ssh_host {
                         cmd.args(["--ssh-host", host]);
@@ -608,9 +616,15 @@ async fn main() -> Result<()> {
                             cmd.args(["--ssh-user", user]);
                         }
                     }
-                    if let Some(ref m) = serve { cmd.args(["--serve", m]); }
-                    if let Some(ref uri) = external_neo4j { cmd.args(["--external-neo4j", uri]); }
-                    if let Some(ref uri) = external_qdrant { cmd.args(["--external-qdrant", uri]); }
+                    if let Some(ref m) = serve {
+                        cmd.args(["--serve", m]);
+                    }
+                    if let Some(ref uri) = external_neo4j {
+                        cmd.args(["--external-neo4j", uri]);
+                    }
+                    if let Some(ref uri) = external_qdrant {
+                        cmd.args(["--external-qdrant", uri]);
+                    }
 
                     cmd.stdout(log_file.try_clone()?)
                         .stderr(log_file)
@@ -669,7 +683,9 @@ async fn main() -> Result<()> {
                 let mut service_handles = None;
                 if !no_services && external_neo4j.is_none() {
                     println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
-                    if offline { println!("  (OFFLINE MODE)"); }
+                    if offline {
+                        println!("  (OFFLINE MODE)");
+                    }
                     println!("  Node: {node_name}\n");
                     println!("  Starting services...");
 
@@ -678,7 +694,8 @@ async fn main() -> Result<()> {
                             use prism_orch::ServiceOrchestrator;
                             let mut svc_config = prism_orch::ServiceConfig::default();
                             if with_kafka {
-                                svc_config.kafka = Some(prism_orch::services::KafkaConfig::default());
+                                svc_config.kafka =
+                                    Some(prism_orch::services::KafkaConfig::default());
                             }
 
                             match orch.start_all(&svc_config).await {
@@ -691,7 +708,9 @@ async fn main() -> Result<()> {
                                 }
                                 Err(e) => {
                                     eprintln!("  Warning: Failed to start managed services: {e}");
-                                    eprintln!("  (Is Docker running? Continuing without containers.)");
+                                    eprintln!(
+                                        "  (Is Docker running? Continuing without containers.)"
+                                    );
                                 }
                             }
                         }
@@ -721,7 +740,10 @@ async fn main() -> Result<()> {
                 }
 
                 // Wire backend configs — CLI flags > prism.toml > defaults
-                if external_neo4j.is_some() || node_config.services.neo4j_uri.is_some() || service_handles.is_some() {
+                if external_neo4j.is_some()
+                    || node_config.services.neo4j_uri.is_some()
+                    || service_handles.is_some()
+                {
                     let neo4j_url = external_neo4j
                         .clone()
                         .or_else(|| node_config.services.neo4j_uri.clone())
@@ -733,7 +755,10 @@ async fn main() -> Result<()> {
                         password: "prism-local".into(),
                     });
                 }
-                if external_qdrant.is_some() || node_config.services.qdrant_uri.is_some() || service_handles.is_some() {
+                if external_qdrant.is_some()
+                    || node_config.services.qdrant_uri.is_some()
+                    || service_handles.is_some()
+                {
                     let qdrant_url = external_qdrant
                         .clone()
                         .or_else(|| node_config.services.qdrant_uri.clone())
@@ -747,21 +772,34 @@ async fn main() -> Result<()> {
 
                 // Wire LLM config from prism.toml [indexer] section or defaults
                 {
-                    let api_key = prism_core::config::NodeConfig::resolve_api_key(&node_config.indexer);
+                    let api_key =
+                        prism_core::config::NodeConfig::resolve_api_key(&node_config.indexer);
                     let provider = match node_config.indexer.mode.as_str() {
                         "platform" | "marc27" => prism_ingest::llm::LlmProvider::OpenAi,
                         "external" => prism_ingest::llm::LlmProvider::OpenAi,
                         _ => prism_ingest::llm::LlmProvider::Ollama,
                     };
-                    let base_url = node_config.indexer.uri.clone()
-                        .unwrap_or_else(|| match provider {
-                            prism_ingest::llm::LlmProvider::OpenAi => node_config.platform.url.clone() + "/llm",
-                            prism_ingest::llm::LlmProvider::Ollama => "http://localhost:11434".into(),
-                        });
+                    let base_url =
+                        node_config
+                            .indexer
+                            .uri
+                            .clone()
+                            .unwrap_or_else(|| match provider {
+                                prism_ingest::llm::LlmProvider::OpenAi => {
+                                    node_config.platform.url.clone() + "/llm"
+                                }
+                                prism_ingest::llm::LlmProvider::Ollama => {
+                                    "http://localhost:11434".into()
+                                }
+                            });
                     server_node_state.llm = Some(prism_ingest::LlmConfig {
                         provider,
                         base_url,
-                        model: node_config.indexer.model.clone().unwrap_or_else(|| "qwen2.5:7b".into()),
+                        model: node_config
+                            .indexer
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| "qwen2.5:7b".into()),
                         api_key,
                         embedding_model: node_config.indexer.embedding_model.clone(),
                         max_sample_rows: 10,
@@ -780,7 +818,8 @@ async fn main() -> Result<()> {
                         daemon_org_id = creds.org_id.clone();
                         let platform = PlatformClient::new(&endpoints.api_base)
                             .with_token(&creds.access_token);
-                        let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
+                        let registry =
+                            prism_client::node_registry::NodeRegistryClient::new(&platform);
                         let caps = serde_json::json!({
                             "compute": !no_compute,
                             "storage": !no_storage,
@@ -788,7 +827,10 @@ async fn main() -> Result<()> {
                         });
                         match registry.register_node(&node_name, &caps).await {
                             Ok(reg) => {
-                                println!("  \u{2713} Registered with platform (node_id: {})", reg.node_id);
+                                println!(
+                                    "  \u{2713} Registered with platform (node_id: {})",
+                                    reg.node_id
+                                );
                                 daemon_platform_node_id = Some(reg.node_id);
                                 server_node_state.platform_client = Some(platform.clone());
                                 daemon_platform_client = Some(platform);
@@ -807,18 +849,25 @@ async fn main() -> Result<()> {
                 let server_state = std::sync::Arc::new(server_node_state);
                 if let Some(ref handles) = service_handles {
                     server_state.update_services(
-                        handles.services.iter().map(|h| prism_server::ServiceEntry {
-                            name: h.name.clone(),
-                            port: h.port,
-                            healthy: h.healthy,
-                        }).collect(),
+                        handles
+                            .services
+                            .iter()
+                            .map(|h| prism_server::ServiceEntry {
+                                name: h.name.clone(),
+                                port: h.port,
+                                healthy: h.healthy,
+                            })
+                            .collect(),
                     );
                 }
                 let (_addr, _server_handle) =
                     prism_server::start_server(server_state.clone(), dashboard_port)
                         .await
                         .context("Failed to start dashboard server")?;
-                println!("  \u{2713} {:<12} http://localhost:{}", "Dashboard", dashboard_port);
+                println!(
+                    "  \u{2713} {:<12} http://localhost:{}",
+                    "Dashboard", dashboard_port
+                );
                 println!();
 
                 // ── V1: Run the platform daemon (heartbeat, job dispatch) ──
@@ -867,7 +916,8 @@ async fn main() -> Result<()> {
                 }
 
                 // Run daemon until Ctrl+C — on shutdown, stop Docker containers
-                let result = prism_node::daemon::run_daemon(&endpoints, &paths, daemon_options).await;
+                let result =
+                    prism_node::daemon::run_daemon(&endpoints, &paths, daemon_options).await;
 
                 // Stop mesh
                 mesh_cancel.cancel();
@@ -942,14 +992,26 @@ async fn main() -> Result<()> {
             let llm_cfg = build_llm_config(&llm_provider, &llm_url, &model, api_key.as_deref());
             if watch {
                 handle_ingest_watch(
-                    &path, &llm_cfg, &neo4j_url, &neo4j_user, &neo4j_pass,
-                    &qdrant_url, schema_only, mapping.as_deref(),
+                    &path,
+                    &llm_cfg,
+                    &neo4j_url,
+                    &neo4j_user,
+                    &neo4j_pass,
+                    &qdrant_url,
+                    schema_only,
+                    mapping.as_deref(),
                 )
                 .await?;
             } else {
                 handle_ingest(
-                    &path, &llm_cfg, &neo4j_url, &neo4j_user, &neo4j_pass,
-                    &qdrant_url, schema_only, mapping.as_deref(),
+                    &path,
+                    &llm_cfg,
+                    &neo4j_url,
+                    &neo4j_user,
+                    &neo4j_pass,
+                    &qdrant_url,
+                    schema_only,
+                    mapping.as_deref(),
                 )
                 .await?;
             }
@@ -980,8 +1042,15 @@ async fn main() -> Result<()> {
             } else {
                 let llm_cfg = build_llm_config(&llm_provider, &llm_url, &model, api_key.as_deref());
                 handle_query(
-                    &text, cypher, semantic, &neo4j_url, &neo4j_user, &neo4j_pass,
-                    &qdrant_url, &llm_cfg, limit,
+                    &text,
+                    cypher,
+                    semantic,
+                    &neo4j_url,
+                    &neo4j_user,
+                    &neo4j_pass,
+                    &qdrant_url,
+                    &llm_cfg,
+                    limit,
                 )
                 .await?;
             }
@@ -1105,7 +1174,10 @@ fn render_workflow_result(spec: &WorkflowSpec, result: &WorkflowRunResult) {
 async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
     match command {
         MeshCommands::Discover { timeout } => {
-            println!("Discovering PRISM nodes on local network ({}s timeout)...", timeout);
+            println!(
+                "Discovering PRISM nodes on local network ({}s timeout)...",
+                timeout
+            );
             let config = prism_mesh::MeshConfig {
                 node_name: "discovery-probe".into(),
                 publish_port: 0,
@@ -1118,7 +1190,10 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
             if peers.is_empty() {
                 println!("No peers found.");
             } else {
-                println!("{:<36}  {:<20}  {:<22}  Capabilities", "ID", "Name", "Address");
+                println!(
+                    "{:<36}  {:<20}  {:<22}  Capabilities",
+                    "ID", "Name", "Address"
+                );
                 println!("{}", "-".repeat(90));
                 for p in &peers {
                     println!(
@@ -1147,7 +1222,10 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
                 return Ok(());
             }
 
-            println!("Mesh: online (node {})", status["node_id"].as_str().unwrap_or("?"));
+            println!(
+                "Mesh: online (node {})",
+                status["node_id"].as_str().unwrap_or("?")
+            );
             let peers = status["peers"].as_array();
             match peers {
                 Some(list) if !list.is_empty() => {
@@ -1183,9 +1261,15 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
                 .await
                 .with_context(|| format!("Failed to reach node at {dashboard_url}"))?;
             if resp.status().is_success() {
-                println!("Dataset '{name}' published. Other nodes can subscribe via mesh discovery.");
+                println!(
+                    "Dataset '{name}' published. Other nodes can subscribe via mesh discovery."
+                );
             } else {
-                bail!("Node returned error: {} — {}", resp.status(), resp.text().await.unwrap_or_default());
+                bail!(
+                    "Node returned error: {} — {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                );
             }
         }
         MeshCommands::Subscribe {
@@ -1208,7 +1292,11 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
             if resp.status().is_success() {
                 println!("Subscribed to '{dataset_name}'. Updates will sync automatically.");
             } else {
-                bail!("Node returned error: {} — {}", resp.status(), resp.text().await.unwrap_or_default());
+                bail!(
+                    "Node returned error: {} — {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                );
             }
         }
         MeshCommands::Unsubscribe {
@@ -1231,7 +1319,11 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
             if resp.status().is_success() {
                 println!("Unsubscribed from '{dataset_name}'.");
             } else {
-                bail!("Node returned error: {} — {}", resp.status(), resp.text().await.unwrap_or_default());
+                bail!(
+                    "Node returned error: {} — {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                );
             }
         }
         MeshCommands::Subscriptions { dashboard_url } => {
@@ -1310,6 +1402,7 @@ fn build_llm_config(
 
 // ── prism ingest ────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ingest(
     path: &Path,
     llm_cfg: &prism_ingest::LlmConfig,
@@ -1364,14 +1457,14 @@ async fn handle_ingest(
     let result = pipeline.ingest_file(path).await?;
 
     println!();
-    println!("  Schema: {} columns, {} rows", result.column_count, result.row_count);
+    println!(
+        "  Schema: {} columns, {} rows",
+        result.column_count, result.row_count
+    );
     println!("  Columns: {}", result.schema.columns.join(", "));
 
     if !result.validation.passed {
-        println!(
-            "  Warnings: {} issues",
-            result.validation.issues.len()
-        );
+        println!("  Warnings: {} issues", result.validation.issues.len());
     }
 
     if let Some(ref entities) = result.entities {
@@ -1421,13 +1514,13 @@ async fn handle_ingest_watch(
     use std::time::{Duration, SystemTime};
 
     if !dir.is_dir() {
-        bail!(
-            "Watch mode requires a directory, got: {}",
-            dir.display()
-        );
+        bail!("Watch mode requires a directory, got: {}", dir.display());
     }
 
-    println!("Watching {} for CSV/Parquet files (Ctrl+C to stop)...\n", dir.display());
+    println!(
+        "Watching {} for CSV/Parquet files (Ctrl+C to stop)...\n",
+        dir.display()
+    );
 
     // Track file modification times to detect changes
     let mut seen: HashMap<PathBuf, SystemTime> = HashMap::new();
@@ -1446,7 +1539,14 @@ async fn handle_ingest_watch(
         }
         println!("[initial] Ingesting {}", path.display());
         if let Err(e) = handle_ingest(
-            &path, llm_cfg, neo4j_url, neo4j_user, neo4j_pass, qdrant_url, schema_only, None,
+            &path,
+            llm_cfg,
+            neo4j_url,
+            neo4j_user,
+            neo4j_pass,
+            qdrant_url,
+            schema_only,
+            None,
         )
         .await
         {
@@ -1487,8 +1587,14 @@ async fn handle_ingest_watch(
                 seen.insert(path.clone(), modified);
                 println!("\n[watch] Detected: {}", path.display());
                 if let Err(e) = handle_ingest(
-                    &path, llm_cfg, neo4j_url, neo4j_user, neo4j_pass, qdrant_url,
-                    schema_only, None,
+                    &path,
+                    llm_cfg,
+                    neo4j_url,
+                    neo4j_user,
+                    neo4j_pass,
+                    qdrant_url,
+                    schema_only,
+                    None,
                 )
                 .await
                 {
@@ -1513,7 +1619,8 @@ fn is_ingestable(path: &Path) -> bool {
 /// Print a guide for AI agents describing available PRISM commands.
 /// This is the "agent interface" — grep-friendly, no protocol overhead.
 fn print_agent_guide() {
-    println!(r#"PRISM Agent Interface — grep-friendly commands
+    println!(
+        r#"PRISM Agent Interface — grep-friendly commands
 ==============================================
 
 KNOWLEDGE GRAPH (use --platform to query MARC27 cloud, 211K+ entities):
@@ -1563,17 +1670,19 @@ EXAMPLES:
   prism query --platform "Ti-6Al-4V" | grep MAT
   prism query --platform --json "fatigue" | python3 -c "import sys,json;[print(e['name']) for e in json.load(sys.stdin)]"
   prism status | grep nodes
-"#);
+"#
+    );
 }
 
 /// Resolve platform auth for the human user (prism login → JWT).
 fn resolve_user_auth() -> Result<(String, String)> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let cred_path = format!("{home}/.prism/credentials.json");
-    let cred_data = std::fs::read_to_string(&cred_path)
-        .context("Not logged in. Run `prism login`.")?;
+    let cred_data =
+        std::fs::read_to_string(&cred_path).context("Not logged in. Run `prism login`.")?;
     let creds: serde_json::Value = serde_json::from_str(&cred_data)?;
-    let raw_url = creds.get("platform_url")
+    let raw_url = creds
+        .get("platform_url")
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.marc27.com");
     let api_base = if raw_url.ends_with("/api/v1") {
@@ -1581,7 +1690,8 @@ fn resolve_user_auth() -> Result<(String, String)> {
     } else {
         format!("{}/api/v1", raw_url.trim_end_matches('/'))
     };
-    let token = creds.get("access_token")
+    let token = creds
+        .get("access_token")
         .and_then(|v| v.as_str())
         .context("No access_token. Run `prism login`.")?;
     Ok((api_base, format!("Bearer {token}")))
@@ -1589,8 +1699,8 @@ fn resolve_user_auth() -> Result<(String, String)> {
 
 /// Auth credentials — either API key (agent) or Bearer token (user).
 enum PlatformAuth {
-    ApiKey(String),    // X-API-Key header
-    Bearer(String),    // Authorization: Bearer header
+    ApiKey(String), // X-API-Key header
+    Bearer(String), // Authorization: Bearer header
 }
 
 impl PlatformAuth {
@@ -1613,20 +1723,28 @@ fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
     }
     let (base, token_header) = resolve_user_auth()?;
     // token_header is "Bearer <token>"
-    let token = token_header.strip_prefix("Bearer ").unwrap_or(&token_header).to_string();
+    let token = token_header
+        .strip_prefix("Bearer ")
+        .unwrap_or(&token_header)
+        .to_string();
     Ok((base, PlatformAuth::Bearer(token)))
 }
 
 /// Query the MARC27 platform API (graph search or semantic search).
-async fn handle_platform_query(text: &str, semantic: bool, json_output: bool, limit: usize) -> Result<()> {
+async fn handle_platform_query(
+    text: &str,
+    semantic: bool,
+    json_output: bool,
+    limit: usize,
+) -> Result<()> {
     let (api_base, auth) = resolve_agent_auth()?;
 
     let client = reqwest::Client::new();
 
     if semantic {
         // POST /knowledge/search
-        let resp = auth.apply(client
-            .post(format!("{api_base}/knowledge/search")))
+        let resp = auth
+            .apply(client.post(format!("{api_base}/knowledge/search")))
             .json(&serde_json::json!({"query": text, "limit": limit}))
             .send()
             .await?;
@@ -1643,17 +1761,24 @@ async fn handle_platform_query(text: &str, semantic: bool, json_output: bool, li
             for (i, r) in results.iter().enumerate() {
                 let sim = r.get("similarity").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let content = r.get("content").and_then(|v| v.as_str()).unwrap_or("?");
-                let source = r.get("metadata")
+                let source = r
+                    .get("metadata")
                     .and_then(|m| m.get("source"))
                     .and_then(|s| s.as_str())
                     .unwrap_or("?");
-                println!("  {}. [sim={:.3}] [{}] {}", i + 1, sim, source, &content[..content.len().min(120)]);
+                println!(
+                    "  {}. [sim={:.3}] [{}] {}",
+                    i + 1,
+                    sim,
+                    source,
+                    &content[..content.len().min(120)]
+                );
             }
         }
     } else {
         // GET /knowledge/graph/search
-        let resp = auth.apply(client
-            .get(format!("{api_base}/knowledge/graph/search")))
+        let resp = auth
+            .apply(client.get(format!("{api_base}/knowledge/graph/search")))
             .query(&[("q", text), ("limit", &limit.to_string())])
             .send()
             .await?;
@@ -1665,23 +1790,27 @@ async fn handle_platform_query(text: &str, semantic: bool, json_output: bool, li
         let results: Vec<serde_json::Value> = resp.json().await?;
         if json_output {
             println!("{}", serde_json::to_string_pretty(&results)?);
+        } else if results.is_empty() {
+            println!("No direct matches. Try --semantic for vector search.");
         } else {
-            if results.is_empty() {
-                println!("No direct matches. Try --semantic for vector search.");
-            } else {
-                println!("Graph search results ({} matches):\n", results.len());
-                for r in &results {
-                    let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let etype = r.get("entity_type").and_then(|v| v.as_str()).unwrap_or("?");
-                    let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("");
-                    println!("  [{:5}] {} — {}", etype, name, &label[..label.len().min(80)]);
-                }
+            println!("Graph search results ({} matches):\n", results.len());
+            for r in &results {
+                let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let etype = r.get("entity_type").and_then(|v| v.as_str()).unwrap_or("?");
+                let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                println!(
+                    "  [{:5}] {} — {}",
+                    etype,
+                    name,
+                    &label[..label.len().min(80)]
+                );
             }
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_query(
     text: &str,
     cypher: bool,
@@ -1756,7 +1885,7 @@ async fn handle_query(
             println!("  Found {} connected entities:\n", result.entities.len());
             for entity in &result.entities {
                 let props_str = if entity.properties.is_object()
-                    && entity.properties.as_object().map_or(true, |o| o.is_empty())
+                    && entity.properties.as_object().is_none_or(|o| o.is_empty())
                 {
                     String::new()
                 } else {
@@ -1839,15 +1968,11 @@ async fn select_project(
     if let Some(project_id) = env_project_override() {
         match platform.get_project(&project_id).await {
             Ok(project) => {
-                let org_name = platform
-                    .list_orgs()
-                    .await
-                    .ok()
-                    .and_then(|orgs| {
-                        orgs.into_iter()
-                            .find(|org| org.id == project.org_id)
-                            .map(|org| org.name)
-                    });
+                let org_name = platform.list_orgs().await.ok().and_then(|orgs| {
+                    orgs.into_iter()
+                        .find(|org| org.id == project.org_id)
+                        .map(|org| org.name)
+                });
                 println!(
                     "Using project from MARC27_PROJECT_ID: {} ({})",
                     project.name, project.id
@@ -1927,8 +2052,6 @@ fn env_project_override() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-
-
 fn default_project_name(display_name: Option<&str>) -> String {
     match display_name
         .map(str::trim)
@@ -1983,12 +2106,9 @@ async fn refresh_access_token(
     creds: &StoredCredentials,
 ) -> Result<StoredCredentials> {
     let platform = PlatformClient::new(&endpoints.api_base);
-    let refreshed = DeviceFlowAuth::refresh_token(
-        platform.inner(),
-        &endpoints.api_base,
-        &creds.refresh_token,
-    )
-    .await?;
+    let refreshed =
+        DeviceFlowAuth::refresh_token(platform.inner(), &endpoints.api_base, &creds.refresh_token)
+            .await?;
 
     let mut new_creds = creds.clone();
     new_creds.access_token = refreshed.access_token;
@@ -1999,7 +2119,6 @@ async fn refresh_access_token(
 
     Ok(new_creds)
 }
-
 
 fn launch_tui(
     paths: &PrismPaths,
@@ -2388,8 +2507,7 @@ async fn handle_run(
     let router = match backend {
         "marc27" | "platform" => {
             // Read token from credentials
-            let token = std::env::var("MARC27_API_TOKEN")
-                .unwrap_or_else(|_| "".to_string());
+            let token = std::env::var("MARC27_API_TOKEN").unwrap_or_else(|_| "".to_string());
             ComputeRouter::with_marc27(platform_url, &token)
         }
         _ => ComputeRouter::local_only(),
@@ -2398,13 +2516,11 @@ async fn handle_run(
     println!("Submitting job '{name}' (image: {image}, backend: {backend})...");
 
     // Timeout for submit (Docker may need to pull the image)
-    let job_id = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        router.submit(&plan),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Job submission timed out after 120s (image pull may be slow)"))?
-    ?;
+    let job_id = tokio::time::timeout(std::time::Duration::from_secs(120), router.submit(&plan))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Job submission timed out after 120s (image pull may be slow)")
+        })??;
 
     println!("Job submitted: {job_id}");
     println!("Check status:  prism job-status {job_id}");
@@ -2486,7 +2602,12 @@ mod tests {
     fn cli_parses_ingest_command() {
         let cli = Cli::try_parse_from(["prism", "ingest", "/tmp/data.csv"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Ingest { path, schema_only, model, .. } => {
+            Commands::Ingest {
+                path,
+                schema_only,
+                model,
+                ..
+            } => {
                 assert_eq!(path, PathBuf::from("/tmp/data.csv"));
                 assert!(!schema_only);
                 assert_eq!(model, "qwen2.5:7b");
@@ -2497,11 +2618,12 @@ mod tests {
 
     #[test]
     fn cli_parses_ingest_schema_only() {
-        let cli = Cli::try_parse_from([
-            "prism", "ingest", "--schema-only", "/tmp/data.parquet",
-        ]).unwrap();
+        let cli =
+            Cli::try_parse_from(["prism", "ingest", "--schema-only", "/tmp/data.parquet"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Ingest { path, schema_only, .. } => {
+            Commands::Ingest {
+                path, schema_only, ..
+            } => {
                 assert_eq!(path, PathBuf::from("/tmp/data.parquet"));
                 assert!(schema_only);
             }
@@ -2511,11 +2633,15 @@ mod tests {
 
     #[test]
     fn cli_parses_query_command() {
-        let cli = Cli::try_parse_from([
-            "prism", "query", "NbMoTaW alloys",
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["prism", "query", "NbMoTaW alloys"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Query { text, cypher, semantic, limit, .. } => {
+            Commands::Query {
+                text,
+                cypher,
+                semantic,
+                limit,
+                ..
+            } => {
                 assert_eq!(text, "NbMoTaW alloys");
                 assert!(!cypher);
                 assert!(!semantic);
@@ -2528,10 +2654,21 @@ mod tests {
     #[test]
     fn cli_parses_query_semantic() {
         let cli = Cli::try_parse_from([
-            "prism", "query", "--semantic", "--limit", "5", "similar to Ti-6Al-4V",
-        ]).unwrap();
+            "prism",
+            "query",
+            "--semantic",
+            "--limit",
+            "5",
+            "similar to Ti-6Al-4V",
+        ])
+        .unwrap();
         match cli.command.unwrap() {
-            Commands::Query { text, semantic, limit, .. } => {
+            Commands::Query {
+                text,
+                semantic,
+                limit,
+                ..
+            } => {
                 assert_eq!(text, "similar to Ti-6Al-4V");
                 assert!(semantic);
                 assert_eq!(limit, 5);

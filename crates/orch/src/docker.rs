@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions,
-    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+    StartContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{HostConfig, PortBinding};
@@ -126,7 +126,7 @@ impl DockerOrchestrator {
             env: Some(env),
             labels: Some(labels),
             host_config: Some(host_config),
-            volumes: volumes,
+            volumes,
             ..Default::default()
         };
 
@@ -291,10 +291,7 @@ impl DockerOrchestrator {
     /// Stop and remove a container by ID.
     async fn stop_container(&self, container_id: &str) -> Result<()> {
         self.docker
-            .stop_container(
-                container_id,
-                Some(StopContainerOptions { t: 10 }),
-            )
+            .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
             .await
             .ok(); // Ignore if already stopped
 
@@ -377,10 +374,7 @@ impl DockerOrchestrator {
             ..Default::default()
         };
         let containers = self.docker.list_containers(Some(opts)).await?;
-        Ok(containers
-            .into_iter()
-            .filter_map(|c| c.id)
-            .collect())
+        Ok(containers.into_iter().filter_map(|c| c.id).collect())
     }
 }
 

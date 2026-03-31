@@ -71,7 +71,7 @@ impl ComputeBackend for Marc27Backend {
 
         let resp = self
             .client
-            .post(&self.url("/jobs"))
+            .post(self.url("/jobs"))
             .header("Authorization", self.auth_header())
             .json(&body)
             .send()
@@ -92,7 +92,7 @@ impl ComputeBackend for Marc27Backend {
     async fn status(&self, job_id: Uuid) -> Result<JobStatus> {
         let resp = self
             .client
-            .get(&self.url(&format!("/jobs/{job_id}/status")))
+            .get(self.url(&format!("/jobs/{job_id}/status")))
             .header("Authorization", self.auth_header())
             .send()
             .await
@@ -123,7 +123,7 @@ impl ComputeBackend for Marc27Backend {
     async fn results(&self, job_id: Uuid) -> Result<serde_json::Value> {
         let resp = self
             .client
-            .get(&self.url(&format!("/jobs/{job_id}/results")))
+            .get(self.url(&format!("/jobs/{job_id}/results")))
             .header("Authorization", self.auth_header())
             .send()
             .await
@@ -140,7 +140,7 @@ impl ComputeBackend for Marc27Backend {
     async fn cancel(&self, job_id: Uuid) -> Result<()> {
         let resp = self
             .client
-            .post(&self.url(&format!("/jobs/{job_id}/cancel")))
+            .post(self.url(&format!("/jobs/{job_id}/cancel")))
             .header("Authorization", self.auth_header())
             .send()
             .await
@@ -219,7 +219,9 @@ mod tests {
     fn marc27_backend_stores_correct_base_url_and_token() {
         let backend = Marc27Backend::new("https://custom.host.example.com", "tok-abc-123");
         // Verify via public surface (url() and auth_header()).
-        assert!(backend.url("/x").starts_with("https://custom.host.example.com"));
+        assert!(backend
+            .url("/x")
+            .starts_with("https://custom.host.example.com"));
         assert!(backend.auth_header().ends_with("tok-abc-123"));
     }
 

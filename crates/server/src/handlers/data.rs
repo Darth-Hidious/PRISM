@@ -35,7 +35,10 @@ pub async fn list_sources(State(state): State<Arc<NodeState>>) -> Json<Vec<DataS
         if let Ok(stats) = store.stats().await {
             return Json(vec![DataSource {
                 id: "neo4j".into(),
-                name: format!("Knowledge Graph ({} nodes, {} rels)", stats.node_count, stats.relationship_count),
+                name: format!(
+                    "Knowledge Graph ({} nodes, {} rels)",
+                    stats.node_count, stats.relationship_count
+                ),
                 kind: "graph".into(),
             }]);
         }
@@ -50,6 +53,8 @@ pub async fn ingest(Json(body): Json<IngestRequest>) -> Json<IngestResponse> {
     let source = body.source.unwrap_or_else(|| "(none)".into());
     Json(IngestResponse {
         status: "accepted",
-        message: format!("Ingest queued for source: {source}. Use `prism ingest <file>` for full pipeline."),
+        message: format!(
+            "Ingest queued for source: {source}. Use `prism ingest <file>` for full pipeline."
+        ),
     })
 }

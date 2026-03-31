@@ -108,7 +108,8 @@ impl ToolRegistry {
 
     /// Register a pre-built entry (e.g. from a remote source).
     pub fn register(&mut self, entry: ToolEntry) {
-        self.tools.retain(|t| t.manifest.name != entry.manifest.name);
+        self.tools
+            .retain(|t| t.manifest.name != entry.manifest.name);
         self.tools.push(entry);
     }
 
@@ -123,9 +124,17 @@ impl ToolRegistry {
     }
 
     /// Find a specific command within a named tool.
-    pub fn find_command(&self, tool_name: &str, command_name: &str) -> Option<(&ToolEntry, &ToolCommand)> {
+    pub fn find_command(
+        &self,
+        tool_name: &str,
+        command_name: &str,
+    ) -> Option<(&ToolEntry, &ToolCommand)> {
         let entry = self.get(tool_name)?;
-        let cmd = entry.manifest.commands.iter().find(|c| c.name == command_name)?;
+        let cmd = entry
+            .manifest
+            .commands
+            .iter()
+            .find(|c| c.name == command_name)?;
         Some((entry, cmd))
     }
 

@@ -419,7 +419,7 @@ mod tests {
         let job_id = Uuid::new_v4();
         let msg = NodeMessage::JobComplete {
             job_id,
-            output: serde_json::json!({"energy": -3.14}),
+            output: serde_json::json!({"energy": -3.1}),
             output_path: Some("/results/job.hdf5".into()),
             duration_secs: 120,
         };

@@ -136,10 +136,8 @@ impl SessionManager {
 
     /// Destroy every session belonging to `user_id` (logout everywhere).
     pub fn destroy_user_sessions(&self, user_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM sessions WHERE user_id = ?1",
-            params![user_id],
-        )?;
+        self.conn
+            .execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
         Ok(())
     }
 
@@ -437,7 +435,9 @@ mod tests {
         let session_id;
         {
             let mgr = SessionManager::new(path, Duration::hours(1)).unwrap();
-            let s = mgr.create_session("persist-user", Some("Bob"), None).unwrap();
+            let s = mgr
+                .create_session("persist-user", Some("Bob"), None)
+                .unwrap();
             session_id = s.id;
         }
         // Re-open from disk.
@@ -451,7 +451,8 @@ mod tests {
     fn many_sessions_scale() {
         let mgr = manager(Duration::hours(1));
         for i in 0..200 {
-            mgr.create_session(&format!("user-{i}"), None, None).unwrap();
+            mgr.create_session(&format!("user-{i}"), None, None)
+                .unwrap();
         }
         let active = mgr.active_sessions().unwrap();
         assert_eq!(active.len(), 200);

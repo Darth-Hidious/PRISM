@@ -125,7 +125,8 @@ fn parse_response(response: &str) -> Result<TranslationResult> {
 
     Ok(TranslationResult {
         cypher,
-        explanation: explanation.unwrap_or_else(|| "Query translated from natural language.".into()),
+        explanation: explanation
+            .unwrap_or_else(|| "Query translated from natural language.".into()),
     })
 }
 
@@ -135,7 +136,8 @@ mod tests {
 
     #[test]
     fn parse_well_formatted_response() {
-        let resp = "CYPHER: MATCH (a:Alloy) RETURN a.name LIMIT 10\nEXPLANATION: Returns all alloy names.";
+        let resp =
+            "CYPHER: MATCH (a:Alloy) RETURN a.name LIMIT 10\nEXPLANATION: Returns all alloy names.";
         let result = parse_response(resp).unwrap();
         assert!(result.cypher.starts_with("MATCH"));
         assert!(result.explanation.contains("alloy"));

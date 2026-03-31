@@ -396,6 +396,7 @@ fn write_logs(workspace_dir: &Path, stdout: &[u8], stderr: &[u8]) -> Result<()> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_manifest(
     workspace_dir: &Path,
     job_id: Uuid,

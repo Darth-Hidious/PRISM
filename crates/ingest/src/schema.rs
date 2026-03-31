@@ -22,10 +22,14 @@ impl SchemaDetector {
     fn dtype_to_string(dtype: &DataType) -> String {
         match dtype {
             DataType::Boolean => "boolean".into(),
-            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
-            | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                "integer".into()
-            }
+            DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64 => "integer".into(),
             DataType::Float32 | DataType::Float64 => "float".into(),
             DataType::String => "string".into(),
             DataType::Date => "date".into(),
@@ -36,12 +40,12 @@ impl SchemaDetector {
 
     /// Produce a SchemaAnalysis (column names + detected type strings) from a DataFrame.
     pub fn detect(df: &DataFrame) -> Result<SchemaAnalysis> {
-        let columns: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
-        let detected_types: Vec<String> = df
-            .dtypes()
+        let columns: Vec<String> = df
+            .get_column_names()
             .iter()
-            .map(|dt| Self::dtype_to_string(dt))
+            .map(|s| s.to_string())
             .collect();
+        let detected_types: Vec<String> = df.dtypes().iter().map(Self::dtype_to_string).collect();
 
         Ok(SchemaAnalysis {
             columns,
@@ -110,8 +114,14 @@ mod tests {
         let df = sample_df();
         let schema = SchemaDetector::detect(&df).unwrap();
 
-        assert_eq!(schema.columns, vec!["material", "density", "melting_point", "is_metal"]);
-        assert_eq!(schema.detected_types, vec!["string", "float", "integer", "boolean"]);
+        assert_eq!(
+            schema.columns,
+            vec!["material", "density", "melting_point", "is_metal"]
+        );
+        assert_eq!(
+            schema.detected_types,
+            vec!["string", "float", "integer", "boolean"]
+        );
     }
 
     #[test]

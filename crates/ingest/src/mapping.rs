@@ -210,7 +210,9 @@ entity_rules:
     #[test]
     fn expand_alias() {
         let mut mapping = OntologyMapping::default();
-        mapping.aliases.insert("BCC".into(), "Body-Centered Cubic".into());
+        mapping
+            .aliases
+            .insert("BCC".into(), "Body-Centered Cubic".into());
         assert_eq!(mapping.expand_alias("BCC"), "Body-Centered Cubic");
         assert_eq!(mapping.expand_alias("FCC"), "FCC"); // no alias = passthrough
     }

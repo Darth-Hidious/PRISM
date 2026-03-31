@@ -33,22 +33,12 @@ pub struct Subscription {
 /// Operates in two modes:
 /// - **In-memory** (`new()`) — no persistence, good for tests.
 /// - **SQLite-backed** (`open()`) — survives restarts, used in production.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SubscriptionManager {
     published: Vec<PublishedDataset>,
     subscriptions: Vec<Subscription>,
     /// Wrapped in Mutex so SubscriptionManager is Send (rusqlite::Connection is !Send).
     db: Option<Mutex<Connection>>,
-}
-
-impl Default for SubscriptionManager {
-    fn default() -> Self {
-        Self {
-            published: Vec::new(),
-            subscriptions: Vec::new(),
-            db: None,
-        }
-    }
 }
 
 impl Clone for SubscriptionManager {
@@ -142,7 +132,8 @@ impl SubscriptionManager {
 
     /// Register a dataset as published by this node.
     pub fn publish(&mut self, dataset: PublishedDataset) {
-        if let Some(ref db) = self.db { let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref db) = self.db {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             let subs_json = serde_json::to_string(&dataset.subscribers).unwrap_or_default();
             conn.execute(
                 "INSERT OR REPLACE INTO published (name, schema_version, subscribers) VALUES (?1, ?2, ?3)",
@@ -155,16 +146,21 @@ impl SubscriptionManager {
 
     /// Remove a published dataset by name.
     pub fn unpublish(&mut self, name: &str) {
-        if let Some(ref db) = self.db { let conn = db.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute("DELETE FROM published WHERE name = ?1", rusqlite::params![name])
-                .ok();
+        if let Some(ref db) = self.db {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "DELETE FROM published WHERE name = ?1",
+                rusqlite::params![name],
+            )
+            .ok();
         }
         self.published.retain(|d| d.name != name);
     }
 
     /// Track a subscription to a remote dataset.
     pub fn subscribe(&mut self, sub: Subscription) {
-        if let Some(ref db) = self.db { let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref db) = self.db {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT OR REPLACE INTO subscriptions (dataset_name, publisher_node, subscribed_at) VALUES (?1, ?2, ?3)",
                 rusqlite::params![
@@ -180,7 +176,8 @@ impl SubscriptionManager {
 
     /// Remove a subscription by dataset name and publisher node.
     pub fn unsubscribe(&mut self, dataset_name: &str, publisher: Uuid) {
-        if let Some(ref db) = self.db { let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref db) = self.db {
+            let conn = db.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "DELETE FROM subscriptions WHERE dataset_name = ?1 AND publisher_node = ?2",
                 rusqlite::params![dataset_name, publisher.to_string()],

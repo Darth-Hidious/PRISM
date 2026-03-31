@@ -12,9 +12,9 @@
 //! All routes are role-gated via the [`middleware`] layer. The server also hosts
 //! the embedded web dashboard SPA (future).
 
-pub mod router;
-pub mod middleware;
 pub mod handlers;
+pub mod middleware;
+pub mod router;
 pub mod ws;
 
 use std::net::SocketAddr;
@@ -127,10 +127,7 @@ impl NodeState {
     }
 
     /// Write an audit entry AND broadcast it to WebSocket clients.
-    pub fn audit_and_broadcast(
-        &self,
-        entry: &prism_core::audit::AuditEntry,
-    ) {
+    pub fn audit_and_broadcast(&self, entry: &prism_core::audit::AuditEntry) {
         // Write to SQLite
         if let Some(ref db_path) = self.audit_db_path {
             if let Ok(log) = prism_core::audit::AuditLog::new(db_path) {
@@ -208,9 +205,11 @@ mod tests {
     fn node_state_update_services() {
         let state = NodeState::new("test-node".into());
         assert!(state.services.lock().unwrap().is_empty());
-        state.update_services(vec![
-            ServiceEntry { name: "neo4j".into(), port: 7687, healthy: true },
-        ]);
+        state.update_services(vec![ServiceEntry {
+            name: "neo4j".into(),
+            port: 7687,
+            healthy: true,
+        }]);
         assert_eq!(state.services.lock().unwrap().len(), 1);
     }
 

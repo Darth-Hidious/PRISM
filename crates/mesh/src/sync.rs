@@ -94,9 +94,9 @@ pub async fn run_sync_handler(
                 // Check if we're subscribed to this dataset from this node
                 let is_subscribed = {
                     let subs = subscriptions.read().unwrap_or_else(|e| e.into_inner());
-                    subs.subscriptions().iter().any(|s| {
-                        s.dataset_name == dataset_name && s.publisher_node == node_id
-                    })
+                    subs.subscriptions()
+                        .iter()
+                        .any(|s| s.dataset_name == dataset_name && s.publisher_node == node_id)
                 };
 
                 if !is_subscribed {
@@ -207,11 +207,7 @@ async fn sync_dataset_from_peer(
         "mode": "cypher",
     });
 
-    let resp = client
-        .post(&query_url)
-        .json(&body)
-        .send()
-        .await?;
+    let resp = client.post(&query_url).json(&body).send().await?;
 
     if !resp.status().is_success() {
         anyhow::bail!(
@@ -222,10 +218,7 @@ async fn sync_dataset_from_peer(
     }
 
     let data: serde_json::Value = resp.json().await?;
-    let result_count = data["results"]
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
+    let result_count = data["results"].as_array().map(|a| a.len()).unwrap_or(0);
 
     if result_count == 0 {
         debug!(dataset = %dataset_name, "no data returned from peer");

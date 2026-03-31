@@ -6,10 +6,10 @@
 use anyhow::Result;
 use uuid::Uuid;
 
+use crate::byoc::{ByocBackend, ByocTarget};
 use crate::job::JobTracker;
 use crate::local::LocalBackend;
 use crate::marc27::Marc27Backend;
-use crate::byoc::{ByocBackend, ByocTarget};
 use crate::{ComputeBackend, ExperimentPlan, JobStatus};
 
 /// Which backend to use for a given job.
@@ -78,28 +78,40 @@ impl ComputeRouter {
 
         match &self.default_backend {
             BackendKind::Local => &self.local,
-            BackendKind::Marc27 { .. } => {
-                self.marc27.as_ref().map(|m| m as &dyn ComputeBackend).unwrap_or(&self.local)
-            }
-            BackendKind::Byoc(_) => {
-                self.byoc.as_ref().map(|b| b as &dyn ComputeBackend).unwrap_or(&self.local)
-            }
+            BackendKind::Marc27 { .. } => self
+                .marc27
+                .as_ref()
+                .map(|m| m as &dyn ComputeBackend)
+                .unwrap_or(&self.local),
+            BackendKind::Byoc(_) => self
+                .byoc
+                .as_ref()
+                .map(|b| b as &dyn ComputeBackend)
+                .unwrap_or(&self.local),
         }
     }
 
     fn backend_name(&self, plan: &ExperimentPlan) -> &str {
-        if plan.image.contains("marc27") || plan.image.contains("platform") {
-            if self.marc27.is_some() {
-                return "marc27";
-            }
+        if (plan.image.contains("marc27") || plan.image.contains("platform"))
+            && self.marc27.is_some()
+        {
+            return "marc27";
         }
         match &self.default_backend {
             BackendKind::Local => "local",
             BackendKind::Marc27 { .. } => {
-                if self.marc27.is_some() { "marc27" } else { "local" }
+                if self.marc27.is_some() {
+                    "marc27"
+                } else {
+                    "local"
+                }
             }
             BackendKind::Byoc(_) => {
-                if self.byoc.is_some() { "byoc" } else { "local" }
+                if self.byoc.is_some() {
+                    "byoc"
+                } else {
+                    "local"
+                }
             }
         }
     }
@@ -124,12 +136,16 @@ impl ComputeRouter {
         // Check tracker first for backend routing.
         if let Some(record) = self.tracker.get(job_id).await {
             let backend: &dyn ComputeBackend = match record.backend.as_str() {
-                "marc27" => {
-                    self.marc27.as_ref().map(|m| m as &dyn ComputeBackend).unwrap_or(&self.local)
-                }
-                "byoc" => {
-                    self.byoc.as_ref().map(|b| b as &dyn ComputeBackend).unwrap_or(&self.local)
-                }
+                "marc27" => self
+                    .marc27
+                    .as_ref()
+                    .map(|m| m as &dyn ComputeBackend)
+                    .unwrap_or(&self.local),
+                "byoc" => self
+                    .byoc
+                    .as_ref()
+                    .map(|b| b as &dyn ComputeBackend)
+                    .unwrap_or(&self.local),
                 _ => &self.local,
             };
             return backend.status(job_id).await;
@@ -143,12 +159,16 @@ impl ComputeRouter {
     pub async fn results(&self, job_id: Uuid) -> Result<serde_json::Value> {
         if let Some(record) = self.tracker.get(job_id).await {
             let backend: &dyn ComputeBackend = match record.backend.as_str() {
-                "marc27" => {
-                    self.marc27.as_ref().map(|m| m as &dyn ComputeBackend).unwrap_or(&self.local)
-                }
-                "byoc" => {
-                    self.byoc.as_ref().map(|b| b as &dyn ComputeBackend).unwrap_or(&self.local)
-                }
+                "marc27" => self
+                    .marc27
+                    .as_ref()
+                    .map(|m| m as &dyn ComputeBackend)
+                    .unwrap_or(&self.local),
+                "byoc" => self
+                    .byoc
+                    .as_ref()
+                    .map(|b| b as &dyn ComputeBackend)
+                    .unwrap_or(&self.local),
                 _ => &self.local,
             };
             return backend.results(job_id).await;
@@ -160,12 +180,16 @@ impl ComputeRouter {
     pub async fn cancel(&self, job_id: Uuid) -> Result<()> {
         if let Some(record) = self.tracker.get(job_id).await {
             let backend: &dyn ComputeBackend = match record.backend.as_str() {
-                "marc27" => {
-                    self.marc27.as_ref().map(|m| m as &dyn ComputeBackend).unwrap_or(&self.local)
-                }
-                "byoc" => {
-                    self.byoc.as_ref().map(|b| b as &dyn ComputeBackend).unwrap_or(&self.local)
-                }
+                "marc27" => self
+                    .marc27
+                    .as_ref()
+                    .map(|m| m as &dyn ComputeBackend)
+                    .unwrap_or(&self.local),
+                "byoc" => self
+                    .byoc
+                    .as_ref()
+                    .map(|b| b as &dyn ComputeBackend)
+                    .unwrap_or(&self.local),
                 _ => &self.local,
             };
             backend.cancel(job_id).await?;

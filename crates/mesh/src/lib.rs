@@ -83,9 +83,7 @@ impl MeshHandle {
     /// Snapshot of currently known peers.
     pub fn peers(&self) -> Vec<PeerNode> {
         match self {
-            MeshHandle::Online { peers, .. } => {
-                peers.read().expect("peers lock poisoned").clone()
-            }
+            MeshHandle::Online { peers, .. } => peers.read().expect("peers lock poisoned").clone(),
             MeshHandle::Offline => Vec::new(),
         }
     }
@@ -110,9 +108,7 @@ impl MeshHandle {
     /// Number of currently known peers.
     pub fn peer_count(&self) -> usize {
         match self {
-            MeshHandle::Online { peers, .. } => {
-                peers.read().expect("peers lock poisoned").len()
-            }
+            MeshHandle::Online { peers, .. } => peers.read().expect("peers lock poisoned").len(),
             MeshHandle::Offline => 0,
         }
     }
