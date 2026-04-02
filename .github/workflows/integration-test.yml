@@ -99,23 +99,11 @@ jobs:
           - 7687:7687
         env:
           NEO4J_AUTH: neo4j/prism-local
-        options: >-
-          --health-cmd "wget -q --spider http://localhost:7474 || exit 1"
-          --health-interval 10s
-          --health-timeout 10s
-          --health-retries 15
-          --health-start-period 15s
       qdrant:
         image: qdrant/qdrant:v1.12.6
         ports:
           - 6333:6333
           - 6334:6334
-        options: >-
-          --health-cmd "wget -q --spider http://localhost:6333/healthz || exit 1"
-          --health-interval 10s
-          --health-timeout 10s
-          --health-retries 15
-          --health-start-period 10s
 
     steps:
       - uses: actions/checkout@v4
@@ -123,6 +111,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev
       - name: Create dashboard dist placeholder (rust-embed needs it)
         run: mkdir -p dashboard/dist && echo '<html><body>placeholder</body></html>' > dashboard/dist/index.html
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Waiting for Neo4j..."
+          for i in $(seq 1 30); do curl -sf http://localhost:7474 > /dev/null 2>&1 && break || sleep 3; done
+          curl -sf http://localhost:7474 > /dev/null && echo "Neo4j ready" || echo "Neo4j not ready (continuing anyway)"
+          echo "Waiting for Qdrant..."
+          for i in $(seq 1 30); do curl -sf http://localhost:6333/healthz > /dev/null 2>&1 && break || sleep 3; done
+          curl -sf http://localhost:6333/healthz > /dev/null && echo "Qdrant ready" || echo "Qdrant not ready (continuing anyway)"
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
