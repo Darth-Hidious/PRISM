@@ -108,30 +108,58 @@ class TranscriptStore:
         return self.budget.should_compact(self.turn_count) and not self._compacted
 
     def compact(self, keep_last: int = 6) -> str | None:
-        """Compact older entries into a summary, keeping last N entries.
+        """Compact older entries into a structured summary, keeping last N.
 
-        Returns the summary text if compaction happened, None otherwise.
+        Produces a summary with: scope, tools used, recent requests,
+        pending work (inferred), key files, timeline. Designed so the
+        agent can resume without losing context.
         """
         if len(self.entries) <= keep_last:
             return None
 
-        # Split into old and recent
         old = self.entries[:-keep_last]
         recent = self.entries[-keep_last:]
 
-        # Build summary of old entries
-        tool_calls = [e for e in old if e.tool_name]
+        # Gather data from old entries
         user_msgs = [e for e in old if e.role == 'user']
+        assistant_msgs = [e for e in old if e.role == 'assistant']
+        tool_calls = [e for e in old if e.tool_name]
+        all_text = " ".join(e.content for e in old if e.content)
 
+        # Build structured summary
         summary_parts = []
-        if user_msgs:
-            summary_parts.append(
-                f"Previous topics: {', '.join(e.content[:50] for e in user_msgs[-3:])}"
-            )
+
+        # Scope
+        summary_parts.append(
+            f"Conversation summary ({len(old)} messages compacted: "
+            f"{len(user_msgs)} user, {len(assistant_msgs)} assistant, "
+            f"{len(tool_calls)} tool calls)"
+        )
+
+        # Tools used (deduplicated, preserving order)
         if tool_calls:
             tool_names = list(dict.fromkeys(e.tool_name for e in tool_calls if e.tool_name))
             summary_parts.append(f"Tools used: {', '.join(tool_names)}")
-        summary_parts.append(f"({len(old)} entries compacted)")
+
+        # Recent user requests (last 3)
+        if user_msgs:
+            recent_topics = [e.content[:80].replace('\n', ' ') for e in user_msgs[-3:]]
+            summary_parts.append(f"Recent requests: {' | '.join(recent_topics)}")
+
+        # Pending work (infer from keywords)
+        pending = _extract_pending_work(all_text)
+        if pending:
+            summary_parts.append(f"Pending work: {'; '.join(pending)}")
+
+        # Key files (extract paths mentioned)
+        files = _extract_key_files(all_text)
+        if files:
+            summary_parts.append(f"Key files: {', '.join(files)}")
+
+        # Current state (last assistant message)
+        if assistant_msgs:
+            last = assistant_msgs[-1].content[:150].replace('\n', ' ')
+            summary_parts.append(f"Last response: {last}")
 
         summary = "\n".join(summary_parts)
 
@@ -191,3 +219,51 @@ class SessionSnapshot:
     cost_events: tuple[CostEvent, ...]
     total_input_tokens: int
     total_output_tokens: int
+
+
+# ── Compaction helpers ──────────────────────────────────────────────
+
+_PENDING_KEYWORDS = {"todo", "next", "pending", "follow up", "remaining", "need to", "should", "will"}
+_FILE_EXTENSIONS = {".rs", ".py", ".ts", ".tsx", ".js", ".json", ".yaml", ".yml", ".toml", ".md", ".csv"}
+
+
+def _extract_pending_work(text: str, limit: int = 3) -> list[str]:
+    """Infer pending work items from conversation text."""
+    import re
+    results = []
+    # Match lines that START with a pending keyword or contain TODO/FIXME
+    pattern = re.compile(
+        r'(?:^|\.\s+)((?:todo|next|pending|remaining|need to|should|will)\b.{10,80})',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for match in pattern.finditer(text):
+        clean = match.group(1).strip().rstrip(".")
+        if clean and clean not in results:
+            results.append(clean)
+            if len(results) >= limit:
+                break
+    return results
+
+
+def _extract_key_files(text: str, limit: int = 8) -> list[str]:
+    """Extract file paths mentioned in conversation text."""
+    seen = set()
+    results = []
+    for word in text.split():
+        # Must contain a path separator and a known extension
+        if "/" not in word:
+            continue
+        # Clean up surrounding punctuation
+        clean = word.strip("\"'`,;:()[]{}").rstrip(".")
+        ext = "." + clean.rsplit(".", 1)[-1] if "." in clean else ""
+        if ext in _FILE_EXTENSIONS and clean not in seen:
+            # Normalize home dir
+            if clean.startswith("/Users/"):
+                parts = clean.split("/")
+                if len(parts) > 3:
+                    clean = "~/" + "/".join(parts[3:])
+            seen.add(clean)
+            results.append(clean)
+            if len(results) >= limit:
+                break
+    return results
