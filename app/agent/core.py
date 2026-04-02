@@ -77,10 +77,13 @@ class AgentCore:
         self._recent_calls: list = []
 
         # New in v2: hooks, permissions, transcript, cost
+        from app.agent.permissions import PermissionMode
         self.hooks = build_default_hooks()
         self.permissions = ToolPermissionContext.default()
+        self.permission_mode = PermissionMode.WORKSPACE_WRITE
         if auto_approve:
             self.permissions = ToolPermissionContext.accept_all()
+            self.permission_mode = PermissionMode.FULL_ACCESS
         self.transcript = TranscriptStore(budget=TurnBudget(
             max_turns=self.max_iterations,
             compact_after_turns=max(self.max_iterations - 5, 15),
