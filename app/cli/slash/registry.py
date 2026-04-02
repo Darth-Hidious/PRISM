@@ -1,42 +1,84 @@
 """Unified command & flag registry for the PRISM REPL and CLI.
 
-Add new slash commands and CLI flags HERE — both the TUI app and cli.py
-import from this single file.
+Slash commands bridge to three systems:
+1. REPL-internal commands (/help, /clear, /status)
+2. Rust CLI commands (/node, /mesh, /ingest, /query)
+3. YAML workflows (/forge, or any workflow in ~/.prism/workflows/)
 """
 
 # ── Slash commands (REPL) ────────────────────────────────────────────
-# Each entry: "/command" -> description shown in /help.
-# Handler implementations live in handlers.py.
 
 REPL_COMMANDS = {
+    # Session
     "/exit": "Exit",
     "/quit": "Exit",
-    "/clear": "Clear conversation",
-    "/help": "Show commands",
-    "/history": "Message count",
-    "/tools": "List tools",
-    "/skills": "List skills",
-    "/status": "Platform status",
-    "/mcp": "MCP servers",
+    "/clear": "Clear conversation (requires confirmation)",
     "/save": "Save session",
-    "/export": "Export to CSV",
-    "/sessions": "List sessions",
-    "/load": "Load session",
-    "/plan": "Plan a goal",
-    "/scratchpad": "Execution log",
-    "/approve-all": "Skip consent",
-    "/model": "Switch model",
-    "/login": "MARC27 account",
+    "/sessions": "List saved sessions",
+    "/load": "Load session by ID",
+    "/compact": "Compress conversation context",
+    "/export": "Export results to CSV",
+
+    # Agent control
+    "/help": "Show all commands",
+    "/status": "Platform status, model, usage, cost",
+    "/cost": "Show token usage and estimated cost",
+    "/model": "Show or switch LLM model",
+    "/permissions": "Show or switch permission mode",
+    "/approve-all": "Auto-approve all tool calls",
+    "/tools": "List available tools",
+    "/skills": "List available skills",
+    "/plan": "Plan a multi-step goal",
+    "/scratchpad": "Show execution log",
+
+    # Platform
+    "/login": "MARC27 account login",
+    "/mcp": "MCP server status",
+    "/report": "Report a bug (files GitHub issue + MARC27 ticket)",
+
+    # Rust CLI bridge — these shell out to `prism <command>`
+    "/node": "Node commands (status, up, down, logs, probe)",
+    "/mesh": "Mesh commands (discover, peers, publish, subscribe)",
+    "/ingest": "Ingest a data file",
+    "/query": "Query the knowledge graph",
+    "/run": "Submit a compute job",
+    "/workflow": "Run a YAML workflow",
+
+    # History
+    "/history": "Message count",
 }
 
 # Aliases map to canonical command names above.
 COMMAND_ALIASES = {
     "/skill": "/skills",
+    "/q": "/query",
+    "/n": "/node",
+    "/m": "/mesh",
+    "/s": "/status",
+    "/h": "/help",
+    "/c": "/compact",
 }
 
+# ── Workflow commands (auto-discovered) ──────────────────────────────
+# These are populated at startup from ~/.prism/workflows/ and builtins.
+# Each becomes a /command in the REPL: /forge, /analyze-hea, etc.
+
+WORKFLOW_COMMANDS: dict[str, str] = {}  # populated by _discover_workflows()
+
+
+def discover_workflow_commands():
+    """Scan for YAML workflows and register as slash commands."""
+    try:
+        from app.workflows.registry import discover_workflows
+        specs = discover_workflows()
+        for name, spec in specs.items():
+            cmd = f"/{spec.command_name}"
+            WORKFLOW_COMMANDS[cmd] = spec.description
+    except Exception:
+        pass
+
+
 # ── CLI flags (click options) ────────────────────────────────────────
-# Metadata for flags used across `prism`, `prism run`, `prism serve`.
-# cli.py reads these; keep flag names, types, and help text here.
 
 CLI_FLAGS = {
     "dangerously_accept_all": {
@@ -64,7 +106,7 @@ CLI_FLAGS = {
         "flag": "--provider",
         "type": "str",
         "default": None,
-        "help": "LLM provider (anthropic/openai/openrouter)",
+        "help": "LLM provider (anthropic/openai/openrouter/marc27)",
     },
     "model": {
         "flag": "--model",
@@ -72,10 +114,23 @@ CLI_FLAGS = {
         "default": None,
         "help": "Model name override",
     },
+    "permission_mode": {
+        "flag": "--permission-mode",
+        "type": "str",
+        "default": None,
+        "help": "Permission mode: read-only, workspace-write, full-access",
+    },
+}
+
+# ── Permission modes ────────────────────────────────────────────────
+
+PERMISSION_MODES = {
+    "read-only": "Search, read, query tools only — no file writes or code execution",
+    "workspace-write": "File editing, data export, code execution — no destructive ops",
+    "full-access": "All tools including destructive operations — use with caution",
 }
 
 # ── Agent modes ──────────────────────────────────────────────────────
-# Modes shown in the status line below the prompt.
 
 AGENT_MODES = {
     "normal": "Default conversational mode",
