@@ -1,0 +1,88 @@
+name: Issue Triage
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  triage:
+    name: Auto-Triage
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Categorize and label issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Write untrusted input to files — never interpolate directly
+          printf '%s' "$ISSUE_TITLE" > /tmp/title.txt
+          printf '%s' "$ISSUE_BODY" > /tmp/body.txt
+
+          # Keyword-based categorization (no LLM, runs in <1s)
+          CATEGORY="question"
+          if grep -qiE 'error|fail|crash|panic|broken|traceback|exit code' /tmp/body.txt; then
+            CATEGORY="bug"
+          fi
+          if grep -qiE 'install|pip|cargo|curl.*install|dependency|build.*fail|pyscal|pyiron|compile' /tmp/body.txt; then
+            CATEGORY="install"
+          fi
+          if grep -qiE 'feature|request|add support|would be nice|suggestion' /tmp/title.txt; then
+            CATEGORY="feature"
+          fi
+          if grep -qiE 'doc|readme|typo|documentation' /tmp/title.txt; then
+            CATEGORY="docs"
+          fi
+
+          echo "Category: $CATEGORY"
+
+          # Label
+          gh issue edit "$ISSUE_NUM" --repo "$REPO" --add-label "$CATEGORY" --add-label "needs-fix" || true
+
+          # Rename vague titles (< 3 words)
+          WORD_COUNT=$(wc -w < /tmp/title.txt | tr -d ' ')
+          if [ "$WORD_COUNT" -lt 3 ]; then
+            ERROR_LINE=$(grep -oiE '(error|fail|cannot|not found|missing|fatal|panic).*' /tmp/body.txt | head -1 | cut -c1-80)
+            if [ -n "$ERROR_LINE" ]; then
+              gh issue edit "$ISSUE_NUM" --repo "$REPO" --title "${CATEGORY}: ${ERROR_LINE}" || true
+            fi
+          fi
+
+          # Triage comment
+          COMMENT="**Auto-triage:** Categorized as \`${CATEGORY}\`."
+
+          if [ "$CATEGORY" = "install" ]; then
+            COMMENT="$COMMENT
+
+          **Quick fix to try:**
+          \`\`\`bash
+          curl -fsSL https://prism.marc27.com/install.sh | bash -s -- --upgrade
+          \`\`\`
+          If that fails, install without simulation deps:
+          \`\`\`bash
+          pip install 'prism-platform[all] @ git+https://github.com/Darth-Hidious/PRISM.git'
+          \`\`\`"
+          fi
+
+          if [ "$CATEGORY" = "bug" ]; then
+            COMMENT="$COMMENT
+
+          **Please share:**
+          - OS and Python version (\`python3 --version\`)
+          - PRISM version (\`prism --version\`)
+          - Full error output"
+          fi
+
+          COMMENT="$COMMENT
+
+          _Triaged by PRISM Bot. A maintainer will review shortly._"
+
+          gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "$COMMENT" || true
