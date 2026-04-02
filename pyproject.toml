@@ -80,7 +80,10 @@ reports = [
     "weasyprint>=60.0",
 ]
 all = [
-    "prism-platform[ml,calphad,simulation,data,reports]",
+    "prism-platform[ml,calphad,data,reports]",
+]
+full = [
+    "prism-platform[all,simulation]",
 ]
 dev = [
     "pytest>=7.4.3",
