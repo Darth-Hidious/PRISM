@@ -1,6 +1,5 @@
 """Execution registry — frozen, scored dispatch for tools and commands.
 
-Inspired by claw-code's MirroredCommand/MirroredTool pattern:
 - Immutable registry assembled once at session start
 - Token-based routing scores prompts against tool metadata
 - Case-insensitive lookup, deterministic scoring
