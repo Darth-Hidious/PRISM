@@ -98,20 +98,22 @@ jobs:
         env:
           NEO4J_AUTH: neo4j/prism-local
         options: >-
-          --health-cmd "curl -f http://localhost:7474 || exit 1"
+          --health-cmd "wget -q --spider http://localhost:7474 || exit 1"
           --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
+          --health-timeout 10s
+          --health-retries 15
+          --health-start-period 15s
       qdrant:
         image: qdrant/qdrant:v1.12.6
         ports:
           - 6333:6333
           - 6334:6334
         options: >-
-          --health-cmd "curl -f http://localhost:6333/healthz || exit 1"
+          --health-cmd "wget -q --spider http://localhost:6333/healthz || exit 1"
           --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
+          --health-timeout 10s
+          --health-retries 15
+          --health-start-period 10s
 
     steps:
       - uses: actions/checkout@v4
