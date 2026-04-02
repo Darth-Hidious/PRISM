@@ -9,7 +9,7 @@ import os
 from typing import Optional
 
 from app.agent.scratchpad import Scratchpad
-from app.cli.slash.registry import REPL_COMMANDS, COMMAND_ALIASES
+from app.cli.slash.registry import REPL_COMMANDS, COMMAND_ALIASES, WORKFLOW_COMMANDS
 from app.backend.tool_meta import WARNING, SUCCESS, DIM
 
 
@@ -77,10 +77,29 @@ def handle_command(app, cmd: str) -> bool:
         handle_status(app)
     elif base_cmd == "/login":
         handle_login(app)
+    elif base_cmd == "/compact":
+        handle_compact(app)
+    elif base_cmd == "/cost":
+        handle_cost(app)
+    elif base_cmd == "/permissions":
+        handle_permissions(app, arg if arg else None)
+    elif base_cmd == "/report":
+        handle_report(app, arg if arg else None)
+    elif base_cmd == "/model":
+        handle_model(app, arg if arg else None)
+    elif base_cmd in ("/node", "/mesh", "/ingest", "/query", "/run", "/workflow"):
+        handle_rust_bridge(app, base_cmd, arg)
+    elif base_cmd in WORKFLOW_COMMANDS:
+        handle_workflow_bridge(app, base_cmd, arg)
     else:
-        app.console.print(
-            f"[dim]Unknown: {base_cmd}  \u2014  /help for commands[/dim]"
-        )
+        # Check if it's a dynamically registered workflow
+        from app.cli.slash.registry import WORKFLOW_COMMANDS
+        if base_cmd in WORKFLOW_COMMANDS:
+            handle_workflow_bridge(app, base_cmd, arg)
+        else:
+            app.console.print(
+                f"[dim]Unknown: {base_cmd}  \u2014  /help for commands[/dim]"
+            )
     return False
 
 
@@ -89,9 +108,18 @@ def handle_command(app, cmd: str) -> bool:
 def handle_help(app):
     app.console.print()
     for name, desc in REPL_COMMANDS.items():
-        if name == "/quit":
+        if name in ("/quit", "/history"):
             continue
         app.console.print(f"  [bold]{name:<16}[/bold] [dim]{desc}[/dim]")
+
+    # Show workflow commands
+    from app.cli.slash.registry import discover_workflow_commands
+    discover_workflow_commands()
+    if WORKFLOW_COMMANDS:
+        app.console.print()
+        app.console.print("  [bold]Workflows:[/bold]")
+        for name, desc in WORKFLOW_COMMANDS.items():
+            app.console.print(f"  [bold]{name:<16}[/bold] [dim]{desc[:55]}[/dim]")
     app.console.print()
 
 
@@ -382,3 +410,197 @@ def handle_load(app, session_id: str):
         app.console.print(f"[red]Not found: {session_id}[/red]")
     except Exception as e:
         app.console.print(f"[red]Error: {e}[/red]")
+
+
+# ── New handlers (v2.6) ─────────────────────────────────────────────
+
+def handle_compact(app):
+    """Trigger manual conversation compaction."""
+    if hasattr(app.agent, 'transcript'):
+        summary = app.agent.transcript.compact(keep_last=6)
+        if summary:
+            app.console.print(f"[dim]Compacted. Summary:[/dim]")
+            for line in summary.split("\n"):
+                app.console.print(f"  [dim]{line}[/dim]")
+        else:
+            app.console.print("[dim]Nothing to compact (conversation too short).[/dim]")
+    else:
+        # Fallback: clear old history keeping last 6 messages
+        if len(app.agent.history) > 6:
+            kept = app.agent.history[-6:]
+            app.agent.history.clear()
+            app.agent.history.extend(kept)
+            app.console.print(f"[dim]Compacted to {len(kept)} messages.[/dim]")
+        else:
+            app.console.print("[dim]Nothing to compact.[/dim]")
+
+
+def handle_cost(app):
+    """Show token usage and cost."""
+    usage = app.agent._total_usage
+    cost = app.agent._calculate_cost(usage)
+    model = getattr(app.agent.backend, 'model', 'unknown')
+
+    app.console.print()
+    app.console.print(f"  [bold]Model:[/bold]   {model}")
+    app.console.print(f"  [bold]Input:[/bold]   {usage.input_tokens:,} tokens")
+    app.console.print(f"  [bold]Output:[/bold]  {usage.output_tokens:,} tokens")
+    if usage.cache_read_tokens:
+        app.console.print(f"  [bold]Cache:[/bold]   {usage.cache_read_tokens:,} tokens (read)")
+    app.console.print(f"  [bold]Cost:[/bold]    ${cost:.4f}")
+
+    if hasattr(app.agent, 'cost') and app.agent.cost.events:
+        app.console.print(f"\n  [dim]{len(app.agent.cost.events)} cost events recorded[/dim]")
+
+    if hasattr(app.agent, 'transcript'):
+        app.console.print(f"  [dim]{app.agent.transcript.turn_count} turns[/dim]")
+    app.console.print()
+
+
+def handle_permissions(app, mode: Optional[str] = None):
+    """Show or switch permission mode."""
+    from app.cli.slash.registry import PERMISSION_MODES
+    from app.agent.permissions import ToolPermissionContext
+
+    if mode is None:
+        # Show current mode
+        current = "full-access" if app.agent.auto_approve else "workspace-write"
+        if hasattr(app.agent, 'permissions'):
+            ctx = app.agent.permissions
+            if ctx.deny_names or ctx.deny_prefixes:
+                current = "read-only"
+            elif ctx == ToolPermissionContext.accept_all():
+                current = "full-access"
+
+        app.console.print()
+        for name, desc in PERMISSION_MODES.items():
+            marker = "[green]\u25cf[/green]" if name == current else "[dim]\u25cb[/dim]"
+            app.console.print(f"  {marker} [bold]{name:<18}[/bold] [dim]{desc}[/dim]")
+        app.console.print(f"\n  [dim]Switch: /permissions <mode>[/dim]")
+        app.console.print()
+        return
+
+    mode = mode.lower().strip()
+    if mode not in PERMISSION_MODES:
+        app.console.print(f"[red]Unknown mode: {mode}[/red]")
+        app.console.print(f"[dim]Options: {', '.join(PERMISSION_MODES.keys())}[/dim]")
+        return
+
+    if mode == "read-only":
+        app.agent.auto_approve = False
+        app.agent.permissions = ToolPermissionContext.default().with_deny(
+            prefixes=("execute_", "write_", "export_", "import_", "compute_submit"),
+        )
+        app.console.print("[dim]Read-only mode. Search, read, and query only.[/dim]")
+    elif mode == "workspace-write":
+        app.agent.auto_approve = False
+        app.agent.permissions = ToolPermissionContext.default()
+        app.console.print("[dim]Workspace-write mode. Approval required for risky tools.[/dim]")
+    elif mode == "full-access":
+        app.agent.auto_approve = True
+        app.agent.permissions = ToolPermissionContext.accept_all()
+        app.console.print("[yellow]Full-access mode. All tools auto-approved.[/yellow]")
+
+
+def handle_model(app, model_name: Optional[str] = None):
+    """Show or switch model."""
+    current = getattr(app.agent.backend, 'model', 'unknown')
+
+    if model_name is None:
+        app.console.print(f"\n  [bold]Current model:[/bold] {current}")
+        app.console.print(f"  [dim]Switch: /model <name>[/dim]")
+        app.console.print(f"  [dim]Examples: claude-sonnet-4-20250514, gpt-4o, qwen2.5:7b[/dim]")
+        app.console.print()
+        return
+
+    # Try to switch — backend must support it
+    if hasattr(app.agent.backend, 'model'):
+        app.agent.backend.model = model_name
+        app.console.print(f"[dim]Switched to: {model_name}[/dim]")
+    else:
+        app.console.print(f"[dim]Backend doesn't support model switching.[/dim]")
+
+
+def handle_report(app, description: Optional[str] = None):
+    """File a bug report from the REPL."""
+    if not description:
+        app.console.print("[dim]Usage: /report <description of the issue>[/dim]")
+        return
+
+    app.console.print("[dim]Filing report...[/dim]")
+    import subprocess
+    result = subprocess.run(
+        ["prism", "report", description, "--no-github"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode == 0:
+        app.console.print(f"[dim]{result.stdout.strip()}[/dim]")
+    else:
+        app.console.print(f"[red]Report failed: {result.stderr.strip()}[/red]")
+
+
+def handle_rust_bridge(app, cmd: str, arg: str):
+    """Bridge slash commands to Rust CLI commands.
+
+    /node status   → prism node status
+    /mesh discover → prism mesh discover
+    /query "..."   → prism query "..."
+    /ingest f.csv  → prism ingest f.csv
+    """
+    import subprocess
+
+    # Map /command to prism subcommand
+    prism_cmd = cmd.lstrip("/")
+    full_cmd = ["prism", prism_cmd]
+    if arg:
+        full_cmd.extend(arg.split())
+
+    app.console.print(f"[dim]$ {' '.join(full_cmd)}[/dim]")
+
+    try:
+        result = subprocess.run(
+            full_cmd, capture_output=True, text=True, timeout=30,
+        )
+        if result.stdout.strip():
+            app.console.print(result.stdout.strip())
+        if result.stderr.strip() and result.returncode != 0:
+            app.console.print(f"[red]{result.stderr.strip()}[/red]")
+    except FileNotFoundError:
+        app.console.print("[red]prism binary not found. Is it in your PATH?[/red]")
+    except subprocess.TimeoutExpired:
+        app.console.print("[yellow]Command timed out after 30s.[/yellow]")
+
+
+def handle_workflow_bridge(app, cmd: str, arg: str):
+    """Bridge slash commands to YAML workflows.
+
+    /forge --paper arxiv:123 → prism workflow run forge --set paper=arxiv:123
+    """
+    import subprocess
+
+    workflow_name = cmd.lstrip("/")
+    full_cmd = ["prism", "workflow", "run", workflow_name]
+    if arg:
+        # Convert simple args to --set key=value format
+        for part in arg.split():
+            if "=" in part:
+                full_cmd.extend(["--set", part])
+            elif part.startswith("--"):
+                full_cmd.append(part)
+            else:
+                full_cmd.extend(["--set", f"input={part}"])
+
+    app.console.print(f"[dim]$ {' '.join(full_cmd)}[/dim]")
+
+    try:
+        result = subprocess.run(
+            full_cmd, capture_output=True, text=True, timeout=60,
+        )
+        if result.stdout.strip():
+            app.console.print(result.stdout.strip())
+        if result.stderr.strip() and result.returncode != 0:
+            app.console.print(f"[red]{result.stderr.strip()}[/red]")
+    except FileNotFoundError:
+        app.console.print("[red]prism binary not found.[/red]")
+    except subprocess.TimeoutExpired:
+        app.console.print("[yellow]Workflow timed out after 60s.[/yellow]")
