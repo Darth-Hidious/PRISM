@@ -1,6 +1,5 @@
 """Transcript management — rolling window with lazy compaction.
 
-Inspired by claw-code's TranscriptStore pattern:
 - Bounded conversation history (not unlimited)
 - Lazy compaction — only triggered when exceeding threshold
 - Turn budget enforcement (max turns + max tokens)

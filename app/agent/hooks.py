@@ -1,6 +1,5 @@
 """Pre/post tool execution hooks — extensibility without modifying the core loop.
 
-Inspired by claw-code's PreToolUse/PostToolUse pattern:
 - Hooks fire before and after every tool call
 - Can block execution (pre-hook returns abort=True)
 - Cost hooks fire observationally (never block)

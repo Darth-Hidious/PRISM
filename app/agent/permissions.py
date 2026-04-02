@@ -1,4 +1,4 @@
-"""Immutable tool permission context — inspired by claw-code's pattern.
+"""Immutable tool permission context.
 
 A frozen dataclass that captures the permission state for a session.
 Thread-safe, hashable, can be passed around without mutation concerns.
