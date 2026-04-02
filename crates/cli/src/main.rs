@@ -179,6 +179,17 @@ enum Commands {
         #[command(subcommand)]
         command: MeshCommands,
     },
+    /// Report a bug or issue — captures system context and files it automatically.
+    Report {
+        /// Description of what went wrong.
+        description: String,
+        /// Attach a log file or error output.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+        /// Don't open a GitHub issue (only send to MARC27 platform).
+        #[arg(long)]
+        no_github: bool,
+    },
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -1072,6 +1083,13 @@ async fn main() -> Result<()> {
         }
         Commands::Mesh { command } => {
             handle_mesh_command(command).await?;
+        }
+        Commands::Report {
+            description,
+            log_file,
+            no_github,
+        } => {
+            handle_report(&paths, &endpoints, &description, log_file.as_deref(), no_github).await?;
         }
         Commands::External(args) => {
             if try_run_workflow_alias(&project_root, &args).await? {
@@ -2552,6 +2570,159 @@ async fn handle_job_status(job_id_str: &str) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// ── prism report ───────────────────────────────────────────────────────
+
+async fn handle_report(
+    paths: &prism_runtime::PrismPaths,
+    endpoints: &prism_runtime::PlatformEndpoints,
+    description: &str,
+    log_file: Option<&Path>,
+    no_github: bool,
+) -> Result<()> {
+    println!("Collecting system context...\n");
+
+    // 1. Gather system context
+    let version = env!("CARGO_PKG_VERSION");
+    let caps = prism_node::detect::probe_local_capabilities_async().await;
+    let os_info = format!(
+        "{} ({})",
+        caps.software.join(", "),
+        std::env::consts::ARCH,
+    );
+    let python_version = std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+
+    // Read log file if provided
+    let log_content = if let Some(path) = log_file {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| {
+                if s.len() > 5000 {
+                    format!("...(truncated)...\n{}", &s[s.len() - 5000..])
+                } else {
+                    s
+                }
+            })
+    } else {
+        None
+    };
+
+    // Read credentials for platform submission
+    let state = paths.load_cli_state()?;
+    let creds = state.credentials.as_ref();
+    let user_name = creds
+        .and_then(|c| c.display_name.as_deref())
+        .unwrap_or("anonymous");
+    let user_id = creds.and_then(|c| c.user_id.as_deref()).unwrap_or("");
+    let project_id = creds.and_then(|c| c.project_id.as_deref()).unwrap_or("");
+
+    // 2. Build the report body
+    let mut body = format!(
+        "## Bug Report\n\n\
+         **Description:** {description}\n\n\
+         **Reporter:** {user_name}\n\n\
+         ## System Info\n\n\
+         | | |\n|---|---|\n\
+         | PRISM | v{version} |\n\
+         | Python | {python_version} |\n\
+         | OS | {os_info} |\n\
+         | CPU | {} cores |\n\
+         | RAM | {} GB |\n\
+         | Docker | {} |\n",
+        caps.cpu_cores,
+        caps.ram_gb / 1024, // MB to GB
+        if caps.docker { "yes" } else { "no" },
+    );
+
+    if let Some(ref log) = log_content {
+        body.push_str(&format!(
+            "\n## Error Output\n\n```\n{}\n```\n",
+            log
+        ));
+    }
+
+    // 3. File GitHub issue (unless --no-github)
+    if !no_github {
+        print!("Filing GitHub issue... ");
+        let gh_result = tokio::process::Command::new("gh")
+            .args([
+                "issue", "create",
+                "--repo", "Darth-Hidious/PRISM",
+                "--title", &format!("bug report: {}", &description[..description.len().min(60)]),
+                "--body", &body,
+                "--label", "bug",
+            ])
+            .output()
+            .await;
+
+        match gh_result {
+            Ok(output) if output.status.success() => {
+                let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                println!("done → {url}");
+            }
+            Ok(output) => {
+                let err = String::from_utf8_lossy(&output.stderr);
+                println!("failed ({err})");
+                println!("  (Is `gh` CLI installed and authenticated?)");
+            }
+            Err(e) => {
+                println!("failed ({e})");
+                println!("  Install GitHub CLI: https://cli.github.com");
+            }
+        }
+    }
+
+    // 4. Send to MARC27 platform
+    if let Some(ref c) = creds {
+        if !c.access_token.is_empty() {
+            print!("Sending to MARC27 platform... ");
+            let platform_body = serde_json::json!({
+                "type": "bug_report",
+                "description": description,
+                "prism_version": version,
+                "python_version": python_version,
+                "os": os_info,
+                "cpu_cores": caps.cpu_cores,
+                "ram_gb": caps.ram_gb / 1024,
+                "docker": caps.docker,
+                "log": log_content,
+                "user_id": user_id,
+                "project_id": project_id,
+            });
+
+            let url = format!("{}/api/v1/support/tickets", endpoints.api_base);
+            let resp = reqwest::Client::new()
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", c.access_token))
+                .json(&platform_body)
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let data: serde_json::Value = r.json().await.unwrap_or_default();
+                    let ticket_id = data["ticket_id"].as_str().unwrap_or("unknown");
+                    println!("done → ticket {ticket_id}");
+                    println!("\n  View on dashboard: {}/dashboard/support", endpoints.api_base.replace("/api/v1", ""));
+                }
+                Ok(r) => {
+                    println!("failed (HTTP {})", r.status());
+                }
+                Err(e) => {
+                    println!("failed ({e})");
+                }
+            }
+        }
+    }
+
+    println!("\nReport submitted. We'll follow up on GitHub and your MARC27 dashboard.");
     Ok(())
 }
 
