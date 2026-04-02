@@ -1,0 +1,92 @@
+name: Issue Agent
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  triage-and-fix:
+    name: Triage & Auto-Fix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev
+
+      - name: Create dashboard dist placeholder
+        run: mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Write issue context to file
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+        run: |
+          cat > /tmp/issue-context.json << CTXEOF
+          {
+            "number": "$ISSUE_NUMBER",
+            "author": "$ISSUE_AUTHOR",
+            "url": "$ISSUE_URL"
+          }
+          CTXEOF
+          # Write title and body to separate files to avoid injection
+          printf '%s' "$ISSUE_TITLE" > /tmp/issue-title.txt
+          printf '%s' "$ISSUE_BODY" > /tmp/issue-body.txt
+
+      - name: Run Issue Agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUM=$(jq -r .number /tmp/issue-context.json)
+          ISSUE_AUTHOR=$(jq -r .author /tmp/issue-context.json)
+
+          claude -p "You are the PRISM Issue Agent. A new GitHub issue #${ISSUE_NUM} was filed by ${ISSUE_AUTHOR}.
+
+          Read the issue title from /tmp/issue-title.txt and body from /tmp/issue-body.txt.
+
+          Your tasks:
+          1. Categorize: bug, install, feature, docs, or question
+          2. Rename the issue title if vague — use: gh issue edit ${ISSUE_NUM} --title 'descriptive title'
+          3. Add a label: gh issue edit ${ISSUE_NUM} --add-label 'bug' (or install/feature/docs/question)
+          4. Analyze the error from the issue body
+          5. If it's a bug or install issue, attempt a fix:
+             - Create branch: git checkout -b fix/issue-${ISSUE_NUM}
+             - Make changes, run cargo check --workspace
+             - Commit, push, open PR with: gh pr create --title 'fix: ... (#${ISSUE_NUM})' --body '...'
+          6. Comment on the issue:
+             - Your root cause analysis
+             - What you fixed
+             - Ask: 'Could you try again and let us know if this resolves your issue?'
+             Use: gh issue comment ${ISSUE_NUM} --body '...'
+
+          Important:
+          - Read /tmp/issue-body.txt for the full error output
+          - Check pyproject.toml for dependency issues
+          - Check install.sh for installer bugs
+          - Run cargo clippy --workspace -- -D warnings before committing
+          - NEVER put untrusted content in shell commands" \
+            --allowedTools "Bash,Read,Write,Edit,Glob,Grep" \
+            --max-turns 30
+
+      - name: Notify
+        if: always()
+        env:
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+        run: echo "Issue agent completed for $ISSUE_URL"
