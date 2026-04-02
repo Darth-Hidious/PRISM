@@ -6,7 +6,7 @@ set -e
 
 REPO="https://github.com/Darth-Hidious/PRISM.git"
 PACKAGE="prism-platform"
-GIT_PACKAGE="$PACKAGE[all] @ git+$REPO"
+GIT_PACKAGE="$PACKAGE[all] @ git+$REPO"  # [all] excludes simulation (C++ deps); use [full] for everything
 MIN_PYTHON="3.11"
 CURRENT_VERSION="2.5.0"
 RELEASE_TAG="v2.5.0"
@@ -32,7 +32,7 @@ printf '  \033[1;36m⬡ PRISM\033[0m v%s \033[2m— Materials Discovery Platform
 
 # ── Check if already installed & handle upgrade ──────────────────────
 if command -v prism >/dev/null 2>&1; then
-    INSTALLED_VERSION=$(prism --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+    INSTALLED_VERSION=$(prism --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "2.5.0b0")
     if [ "$UPGRADE" -eq 0 ]; then
         ok "Found:" "PRISM v$INSTALLED_VERSION already installed"
         if [ "$INSTALLED_VERSION" != "$CURRENT_VERSION" ]; then
@@ -296,7 +296,9 @@ esac
 
 if [ "$INSTALL_OK" -eq 0 ]; then
     printf '\n'
-    err "PRISM installation failed. Try manually:\n  pip install \"$GIT_PACKAGE\"\n  Or see: https://github.com/Darth-Hidious/PRISM#quick-start"
+    err "PRISM installation failed. Try manually:"
+    err "  pip install \"$GIT_PACKAGE\""
+    err "  Or see: https://github.com/Darth-Hidious/PRISM#quick-start"
 fi
 
 # ── Download TUI binary ─────────────────────────────────────────
