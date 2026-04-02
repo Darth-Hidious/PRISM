@@ -1089,7 +1089,14 @@ async fn main() -> Result<()> {
             log_file,
             no_github,
         } => {
-            handle_report(&paths, &endpoints, &description, log_file.as_deref(), no_github).await?;
+            handle_report(
+                &paths,
+                &endpoints,
+                &description,
+                log_file.as_deref(),
+                no_github,
+            )
+            .await?;
         }
         Commands::External(args) => {
             if try_run_workflow_alias(&project_root, &args).await? {
@@ -2587,11 +2594,7 @@ async fn handle_report(
     // 1. Gather system context
     let version = env!("CARGO_PKG_VERSION");
     let caps = prism_node::detect::probe_local_capabilities_async().await;
-    let os_info = format!(
-        "{} ({})",
-        caps.software.join(", "),
-        std::env::consts::ARCH,
-    );
+    let os_info = format!("{} ({})", caps.software.join(", "), std::env::consts::ARCH,);
     let python_version = std::process::Command::new("python3")
         .arg("--version")
         .output()
@@ -2601,15 +2604,13 @@ async fn handle_report(
 
     // Read log file if provided
     let log_content = if let Some(path) = log_file {
-        std::fs::read_to_string(path)
-            .ok()
-            .map(|s| {
-                if s.len() > 5000 {
-                    format!("...(truncated)...\n{}", &s[s.len() - 5000..])
-                } else {
-                    s
-                }
-            })
+        std::fs::read_to_string(path).ok().map(|s| {
+            if s.len() > 5000 {
+                format!("...(truncated)...\n{}", &s[s.len() - 5000..])
+            } else {
+                s
+            }
+        })
     } else {
         None
     };
@@ -2642,10 +2643,7 @@ async fn handle_report(
     );
 
     if let Some(ref log) = log_content {
-        body.push_str(&format!(
-            "\n## Error Output\n\n```\n{}\n```\n",
-            log
-        ));
+        body.push_str(&format!("\n## Error Output\n\n```\n{}\n```\n", log));
     }
 
     // 3. File GitHub issue (unless --no-github)
@@ -2653,11 +2651,16 @@ async fn handle_report(
         print!("Filing GitHub issue... ");
         let gh_result = tokio::process::Command::new("gh")
             .args([
-                "issue", "create",
-                "--repo", "Darth-Hidious/PRISM",
-                "--title", &format!("bug report: {}", &description[..description.len().min(60)]),
-                "--body", &body,
-                "--label", "bug",
+                "issue",
+                "create",
+                "--repo",
+                "Darth-Hidious/PRISM",
+                "--title",
+                &format!("bug report: {}", &description[..description.len().min(60)]),
+                "--body",
+                &body,
+                "--label",
+                "bug",
             ])
             .output()
             .await;
@@ -2680,7 +2683,7 @@ async fn handle_report(
     }
 
     // 4. Send to MARC27 platform
-    if let Some(ref c) = creds {
+    if let Some(c) = creds {
         if !c.access_token.is_empty() {
             print!("Sending to MARC27 platform... ");
             let platform_body = serde_json::json!({
@@ -2710,7 +2713,10 @@ async fn handle_report(
                     let data: serde_json::Value = r.json().await.unwrap_or_default();
                     let ticket_id = data["ticket_id"].as_str().unwrap_or("unknown");
                     println!("done → ticket {ticket_id}");
-                    println!("\n  View on dashboard: {}/dashboard/support", endpoints.api_base.replace("/api/v1", ""));
+                    println!(
+                        "\n  View on dashboard: {}/dashboard/support",
+                        endpoints.api_base.replace("/api/v1", "")
+                    );
                 }
                 Ok(r) => {
                     println!("failed (HTTP {})", r.status());
