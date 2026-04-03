@@ -34,6 +34,7 @@ prism-node = { path = "../node" }
 prism-orch = { path = "../orch" }
 prism-ipc = { path = "../ipc" }
 prism-proto = { path = "../proto" }
+prism-agent = { path = "../agent" }
 prism-python-bridge = { path = "../python-bridge" }
 prism-runtime = { path = "../runtime" }
 prism-server = { path = "../server" }

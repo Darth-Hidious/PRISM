@@ -2671,12 +2671,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism-agent"
+version = "2.5.0"
+dependencies = [
+ "anyhow",
+ "prism-ingest",
+ "prism-python-bridge",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "prism-cli"
 version = "2.5.0"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "prism-agent",
  "prism-client",
  "prism-compute",
  "prism-core",
@@ -2867,6 +2881,7 @@ name = "prism-python-bridge"
 version = "2.5.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
