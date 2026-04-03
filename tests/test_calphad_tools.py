@@ -34,14 +34,16 @@ class TestCreateCalphadTools:
 class TestGuardedTools:
     """Calculation tools return error when pycalphad is missing."""
 
-    def test_phase_diagram_guard(self):
+    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    def test_phase_diagram_guard(self, mock_check):
         result = _calculate_phase_diagram(
             database_name="test", components=["Al", "Ni"]
         )
         assert "error" in result
         assert "pycalphad" in result["error"]
 
-    def test_equilibrium_guard(self):
+    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    def test_equilibrium_guard(self, mock_check):
         result = _calculate_equilibrium(
             database_name="test",
             components=["Al", "Ni"],
@@ -49,7 +51,8 @@ class TestGuardedTools:
         )
         assert "error" in result
 
-    def test_gibbs_energy_guard(self):
+    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    def test_gibbs_energy_guard(self, mock_check):
         result = _calculate_gibbs_energy(
             database_name="test",
             components=["Al", "Ni"],
@@ -58,7 +61,8 @@ class TestGuardedTools:
         )
         assert "error" in result
 
-    def test_list_phases_guard(self):
+    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    def test_list_phases_guard(self, mock_check):
         result = _list_phases(database_name="test")
         assert "error" in result
 

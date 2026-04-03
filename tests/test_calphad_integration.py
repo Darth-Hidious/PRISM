@@ -16,13 +16,15 @@ from app.simulation.calphad_bridge import (
 
 
 class TestCalphadAvailabilityIntegration:
-    def test_check_returns_false(self):
+    @patch("builtins.__import__", side_effect=ImportError)
+    def test_check_returns_false(self, mock_import):
         """pycalphad is not installed in test environment."""
         assert check_calphad_available() is False
 
 
 class TestBootstrapWithoutPycalphad:
-    def test_build_full_registry_works(self):
+    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    def test_build_full_registry_works(self, mock_check):
         """build_full_registry() works without pycalphad (graceful skip)."""
         from app.plugins.bootstrap import build_full_registry
 

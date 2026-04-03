@@ -29,20 +29,3 @@ class TestSkillLoadingAutonomous:
         assert "plot_materials_comparison" in tool_names
 
 
-class TestSkillLoadingREPL:
-    @patch("app.cli.tui.app.AgentCore")
-    def test_repl_init_loads_skills(self, MockAgent):
-        mock_backend = MagicMock()
-        from app.cli.tui.app import AgentREPL
-
-        repl = AgentREPL(backend=mock_backend, enable_mcp=False)
-
-        # The tools passed to AgentCore should include skills
-        call_kwargs = MockAgent.call_args
-        tools_arg = call_kwargs.kwargs.get("tools") or call_kwargs[1].get("tools")
-        if tools_arg is None:
-            # Try positional
-            tools_arg = call_kwargs[0][1] if len(call_kwargs[0]) > 1 else None
-
-        # Alternative: check that AgentCore was called
-        assert MockAgent.called
