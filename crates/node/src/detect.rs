@@ -18,10 +18,27 @@ pub fn probe_local_capabilities() -> NodeCapabilities {
 
     let ram_gb = (system.total_memory() / 1024 / 1024 / 1024).max(1);
 
+    // Deduplicate disks by mount point — APFS volumes share physical disk
+    // and would otherwise be double-counted.
     let disks = Disks::new_with_refreshed_list();
-    let disk_bytes: u64 = disks.list().iter().map(|d| d.total_space()).sum();
+    let mut seen_mounts = std::collections::HashSet::new();
+    let mut disk_bytes: u64 = 0;
+    let mut avail_bytes: u64 = 0;
+    for d in disks.list() {
+        let mount = d.mount_point().to_string_lossy().to_string();
+        // On macOS, only count the root volume ("/") or "/System/Volumes/Data"
+        // to avoid APFS double-counting. On Linux, count all unique mounts.
+        // On macOS with APFS, "/" and "/System/Volumes/Data" share the same
+        // physical disk. Only count "/" to avoid double-counting.
+        if cfg!(target_os = "macos") && mount != "/" {
+            continue;
+        }
+        if seen_mounts.insert(mount) {
+            disk_bytes += d.total_space();
+            avail_bytes += d.available_space();
+        }
+    }
     let disk_gb = (disk_bytes / 1024 / 1024 / 1024).max(1);
-    let avail_bytes: u64 = disks.list().iter().map(|d| d.available_space()).sum();
     let storage_available_gb = (avail_bytes / 1024 / 1024 / 1024) as u32;
 
     let labels = BTreeMap::from([
@@ -74,16 +91,32 @@ fn detect_gpus() -> Vec<GpuInfo> {
 fn detect_software() -> Vec<String> {
     let mut software = Vec::new();
     let probes = [
+        // Container runtimes
         ("docker", "docker"),
         ("podman", "podman"),
         ("apptainer", "apptainer"),
         ("singularity", "singularity"),
+        // Schedulers
         ("slurm", "sbatch"),
         ("pbs", "qsub"),
+        // Simulation codes
         ("lammps", "lmp"),
         ("vasp", "vasp_std"),
+        ("quantum-espresso", "pw.x"),
+        // Languages
         ("python", "python3"),
+        ("rust", "rustc"),
+        ("julia", "julia"),
+        // LLM inference engines
+        ("llama.cpp", "llama-server"),
+        ("llama-cli", "llama-cli"),
         ("ollama", "ollama"),
+        ("vllm", "vllm"),
+        ("tgi", "text-generation-launcher"),
+        ("mlx", "mlx_lm.server"),
+        // Data tools
+        ("jupyter", "jupyter"),
+        ("dvc", "dvc"),
     ];
 
     for (label, executable) in probes {
@@ -373,51 +406,87 @@ fn detect_services(
     services
 }
 
-/// Detect Ollama and running models (async — requires network).
+/// Detect running LLM inference engines (async — probes local endpoints).
 async fn detect_ollama() -> Vec<NodeService> {
     let mut services = Vec::new();
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
-        .ok();
-
-    let Some(client) = client else {
-        return services;
+    {
+        Ok(c) => c,
+        Err(_) => return services,
     };
 
-    let Ok(resp) = client.get("http://localhost:11434/api/tags").send().await else {
-        return services;
-    };
-
-    let Ok(data) = resp.json::<serde_json::Value>().await else {
-        return services;
-    };
-
-    if let Some(models) = data.get("models").and_then(|m| m.as_array()) {
-        for model in models {
-            let name = model
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("unknown");
-            services.push(NodeService {
-                kind: "llm".to_string(),
-                name: format!("Ollama: {name}"),
-                status: "ready".to_string(),
-                endpoint: Some("http://localhost:11434".to_string()),
-                model: Some(name.to_string()),
-            });
+    // Probe Ollama (localhost:11434)
+    if let Ok(resp) = client.get("http://localhost:11434/api/tags").send().await {
+        if let Ok(data) = resp.json::<serde_json::Value>().await {
+            if let Some(models) = data.get("models").and_then(|m| m.as_array()) {
+                for model in models {
+                    let name = model
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown");
+                    services.push(NodeService {
+                        kind: "llm".to_string(),
+                        name: format!("Ollama: {name}"),
+                        status: "ready".to_string(),
+                        endpoint: Some("http://localhost:11434".to_string()),
+                        model: Some(name.to_string()),
+                    });
+                }
+            }
         }
     }
 
-    if services.is_empty() {
-        // Ollama is running but no models loaded
-        services.push(NodeService {
-            kind: "llm".to_string(),
-            name: "Ollama".to_string(),
-            status: "unavailable".to_string(),
-            endpoint: Some("http://localhost:11434".to_string()),
-            model: None,
-        });
+    // Probe llama.cpp server (localhost:8080)
+    if let Ok(resp) = client.get("http://localhost:8080/v1/models").send().await {
+        if let Ok(data) = resp.json::<serde_json::Value>().await {
+            if let Some(models) = data.get("data").and_then(|d| d.as_array()) {
+                for model in models {
+                    let name = model
+                        .get("id")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown");
+                    services.push(NodeService {
+                        kind: "llm".to_string(),
+                        name: format!("llama.cpp: {name}"),
+                        status: "ready".to_string(),
+                        endpoint: Some("http://localhost:8080".to_string()),
+                        model: Some(name.to_string()),
+                    });
+                }
+            } else {
+                // llama.cpp is running but /v1/models didn't return expected format
+                services.push(NodeService {
+                    kind: "llm".to_string(),
+                    name: "llama.cpp".to_string(),
+                    status: "ready".to_string(),
+                    endpoint: Some("http://localhost:8080".to_string()),
+                    model: None,
+                });
+            }
+        }
+    }
+
+    // Probe vLLM (localhost:8000)
+    if let Ok(resp) = client.get("http://localhost:8000/v1/models").send().await {
+        if let Ok(data) = resp.json::<serde_json::Value>().await {
+            if let Some(models) = data.get("data").and_then(|d| d.as_array()) {
+                for model in models {
+                    let name = model
+                        .get("id")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown");
+                    services.push(NodeService {
+                        kind: "llm".to_string(),
+                        name: format!("vLLM: {name}"),
+                        status: "ready".to_string(),
+                        endpoint: Some("http://localhost:8000".to_string()),
+                        model: Some(name.to_string()),
+                    });
+                }
+            }
+        }
     }
 
     services
