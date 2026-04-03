@@ -66,13 +66,13 @@ where
         let tool_calls = match &response.message.tool_calls {
             Some(calls) if !calls.is_empty() => calls.clone(),
             _ => {
-                emit(AgentEvent::Cost {
-                    input_tokens: total_input,
-                    output_tokens: total_output,
-                    turn_cost: 0.0,
-                    session_cost: 0.0,
+                emit(AgentEvent::TurnComplete {
+                    text: None,
+                    has_more: false,
+                    usage: None,
+                    total_usage: None,
+                    estimated_cost: None,
                 });
-                emit(AgentEvent::TurnComplete);
                 return Ok(());
             }
         };
@@ -82,7 +82,7 @@ where
             let tool_name = &tc.function.name;
             let call_id = &tc.id;
 
-            emit(AgentEvent::ToolStart {
+            emit(AgentEvent::ToolCallStart {
                 tool_name: tool_name.clone(),
                 call_id: call_id.clone(),
             });
@@ -107,10 +107,11 @@ where
                 Err(e) => (format!("Tool error: {e}"), true),
             };
 
-            emit(AgentEvent::ToolResult {
-                tool_name: tool_name.clone(),
+            emit(AgentEvent::ToolCallResult {
                 call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
                 content: content.clone(),
+                summary: None,
                 elapsed_ms,
                 is_error,
             });
@@ -129,7 +130,13 @@ where
     emit(AgentEvent::TextDelta {
         text: "\n\n[Agent reached maximum iterations]".to_string(),
     });
-    emit(AgentEvent::TurnComplete);
+    emit(AgentEvent::TurnComplete {
+        text: None,
+        has_more: false,
+        usage: None,
+        total_usage: None,
+        estimated_cost: None,
+    });
     Ok(())
 }
 
