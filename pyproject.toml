@@ -32,7 +32,6 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "click>=8.0.0",
     "rich>=12.0.0",
     "PyYAML>=6.0.0",
     "optimade[http-client]>=1.2.0",
@@ -48,7 +47,6 @@ dependencies = [
     "matplotlib>=3.7.0",
     "joblib>=1.3.0",
     "fastmcp>=3.0.0",
-    "prompt_toolkit>=3.0.0",
     "httpx>=0.24.0",
 ]
 
@@ -94,16 +92,13 @@ dev = [
     "flake8>=6.1.0",
 ]
 
-[project.scripts]
-prism = "app.cli.bootstrap:main"
-
 [project.urls]
 Homepage = "https://github.com/Darth-Hidious/PRISM"
 Repository = "https://github.com/Darth-Hidious/PRISM"
 "Bug Reports" = "https://github.com/Darth-Hidious/PRISM/issues"
 
 [tool.setuptools]
-packages = ["app", "app.config", "app.db", "app.agent", "app.agent.backends", "app.backend", "app.tools", "app.tools.data_collectors", "app.commands", "app.tools.ml", "app.tools.simulation", "app.tools.skills", "app.plugins", "app.tools.validation", "app.cli", "app.cli.tui", "app.cli.slash", "app.tools.search_engine", "app.tools.search_engine.cache", "app.tools.search_engine.providers", "app.tools.search_engine.resilience", "app.workflows", "app.workflows.builtin"]
+packages = ["app", "app.config", "app.db", "app.tools", "app.tools.data_collectors", "app.tools.ml", "app.tools.simulation", "app.tools.skills", "app.plugins", "app.tools.validation", "app.tools.search_engine", "app.tools.search_engine.cache", "app.tools.search_engine.providers", "app.tools.search_engine.resilience", "app.workflows", "app.workflows.builtin"]
 include-package-data = true
 
 [tool.setuptools.package-data]

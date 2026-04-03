@@ -8,13 +8,6 @@ def test_plugin_registry_has_provider_registry():
     assert hasattr(reg, "provider_registry")
 
 
-def test_plugin_registry_has_agent_registry():
-    from app.plugins.registry import PluginRegistry
-
-    reg = PluginRegistry()
-    assert hasattr(reg, "agent_registry")
-
-
 def test_plugin_can_register_provider():
     from app.plugins.registry import PluginRegistry
     from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
@@ -30,10 +23,3 @@ def test_plugin_can_register_provider():
     assert "fake" in {p.id for p in reg.provider_registry.get_all()}
 
 
-def test_plugin_can_register_agent_config():
-    from app.plugins.registry import PluginRegistry
-    from app.agent.agent_registry import AgentConfig
-
-    reg = PluginRegistry()
-    reg.agent_registry.register(AgentConfig(id="test", name="Test"))
-    assert reg.agent_registry.get("test") is not None

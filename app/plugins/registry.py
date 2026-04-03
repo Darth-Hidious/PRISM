@@ -6,7 +6,6 @@ from app.tools.skills.base import SkillRegistry
 from app.tools.data_collectors.base_collector import CollectorRegistry
 from app.tools.ml.algorithm_registry import AlgorithmRegistry
 from app.tools.search_engine.providers.registry import ProviderRegistry
-from app.agent.agent_registry import AgentRegistry
 
 
 @dataclass
@@ -18,7 +17,6 @@ class PluginRegistry:
     collector_registry: CollectorRegistry = field(default_factory=CollectorRegistry)
     algorithm_registry: AlgorithmRegistry = field(default_factory=AlgorithmRegistry)
     provider_registry: ProviderRegistry = field(default_factory=ProviderRegistry)
-    agent_registry: AgentRegistry = field(default_factory=AgentRegistry)
 
     # Tracks which plugins have been loaded (name -> module path)
     _loaded: dict = field(default_factory=dict, repr=False)

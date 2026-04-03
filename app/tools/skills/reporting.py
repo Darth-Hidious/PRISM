@@ -195,12 +195,15 @@ def _generate_report(**kwargs) -> dict:
 
     # Methodology (scratchpad)
     if scratchpad_entries:
-        from app.agent.scratchpad import Scratchpad
-        pad = Scratchpad.from_dict(scratchpad_entries) if isinstance(scratchpad_entries, list) else scratchpad_entries
-        lines.append(pad.to_markdown() if hasattr(pad, "to_markdown") else "## Methodology\n\n*No actions recorded.*")
+        # scratchpad_entries can be a list of dicts or an object with .entries
+        pad = scratchpad_entries
+        if hasattr(pad, "to_markdown"):
+            lines.append(pad.to_markdown())
+        else:
+            lines.append("## Methodology\n\n*No actions recorded.*")
         lines.append("")
         html_sections.append("<h2>Methodology</h2><ol>")
-        entries = pad.entries if hasattr(pad, "entries") else scratchpad_entries
+        entries = pad.entries if hasattr(pad, "entries") else (scratchpad_entries if isinstance(scratchpad_entries, list) else [])
         for e in entries:
             if isinstance(e, dict):
                 html_sections.append(f"<li><strong>{e.get('step_type', '')}</strong> ({e.get('tool_name', '')}) — {e.get('summary', '')}</li>")
