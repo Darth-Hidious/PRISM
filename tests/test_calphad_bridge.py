@@ -22,8 +22,8 @@ class TestCheckCalphadAvailable:
         result = check_calphad_available()
         assert isinstance(result, bool)
 
-    def test_returns_false_when_missing(self):
-        # pycalphad is not installed in our test environment
+    @patch("builtins.__import__", side_effect=ImportError)
+    def test_returns_false_when_missing(self, mock_import):
         assert check_calphad_available() is False
 
 

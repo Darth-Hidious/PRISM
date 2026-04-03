@@ -76,6 +76,7 @@ Steps:
    git checkout -b fix/issue-${issue_num}
 4. Make the code changes.
 5. Verify:
+   make test
    cargo check --workspace
    cargo clippy --workspace -- -D warnings
    cargo fmt --all --check

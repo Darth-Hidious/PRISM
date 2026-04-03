@@ -39,17 +39,17 @@ class TestSkillsInToolRegistry:
 
 class TestSystemPrompts:
     def test_default_prompt_mentions_skills(self):
-        from app.agent.core import DEFAULT_SYSTEM_PROMPT
+        from app.agent.prompts import INTERACTIVE_SYSTEM_PROMPT
 
-        assert "materials_discovery" in DEFAULT_SYSTEM_PROMPT
-        assert "acquire_materials" in DEFAULT_SYSTEM_PROMPT
-        assert "skills" in DEFAULT_SYSTEM_PROMPT.lower()
+        assert "materials_discovery" in INTERACTIVE_SYSTEM_PROMPT
+        assert "acquire_materials" in INTERACTIVE_SYSTEM_PROMPT
+        assert "skills" in INTERACTIVE_SYSTEM_PROMPT.lower()
 
     def test_autonomous_prompt_mentions_skills(self):
-        from app.agent.autonomous import AUTONOMOUS_SYSTEM_PROMPT
+        from app.agent.prompts import AUTONOMOUS_SYSTEM_PROMPT
 
         assert "materials_discovery" in AUTONOMOUS_SYSTEM_PROMPT
-        assert "Skills" in AUTONOMOUS_SYSTEM_PROMPT
+        assert "skills" in AUTONOMOUS_SYSTEM_PROMPT.lower()
 
 
 # ---- Test: MCP server includes skills ----

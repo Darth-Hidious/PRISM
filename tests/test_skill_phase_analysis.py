@@ -19,7 +19,8 @@ class TestPhaseAnalysisSkill:
         assert "database_name" in schema["required"]
         assert "components" in schema["required"]
 
-    def test_error_when_pycalphad_missing(self):
+    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    def test_error_when_pycalphad_missing(self, mock_check):
         result = _analyze_phases(
             database_name="test",
             components=["Al", "Ni"],
