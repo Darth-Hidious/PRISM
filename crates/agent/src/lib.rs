@@ -5,3 +5,5 @@ pub mod protocol;
 pub mod system_prompt;
 pub mod transcript;
 pub mod permissions;
+pub mod hooks;
+pub mod scratchpad;
