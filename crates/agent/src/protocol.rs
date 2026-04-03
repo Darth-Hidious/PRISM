@@ -103,7 +103,7 @@ fn emit_agent_event(event: AgentEvent) {
         }
         AgentEvent::ToolApprovalRequest {
             tool_name,
-            call_id,
+            call_id: _,
             tool_args,
         } => {
             // Frontend expects "ui.prompt" with UiPrompt schema
@@ -450,14 +450,10 @@ pub async fn run_server(
                     &mut |event| {
                         // Persist assistant text and tool results as they flow through
                         match &event {
-                            AgentEvent::TurnComplete { text, .. } => {
-                                if let Some(t) = text {
-                                    if !t.is_empty() {
-                                        session_store.append_message(
-                                            "assistant", t, "", "", None,
-                                        );
-                                    }
-                                }
+                            AgentEvent::TurnComplete { text: Some(t), .. } if !t.is_empty() => {
+                                session_store.append_message(
+                                    "assistant", t, "", "", None,
+                                );
                             }
                             AgentEvent::ToolCallResult {
                                 call_id,

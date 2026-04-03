@@ -97,7 +97,7 @@ fn summarize_tool_result(tool_name: &str, content: &str, is_error: bool) -> Stri
 ///    e. Emit text deltas
 ///    f. If no tool calls → compact if needed, emit TurnComplete, return
 ///    g. For each tool call → hooks, permissions, approval, execute, doom-loop,
-///       large-result handling, scratchpad, transcript, emit result
+///    large-result handling, scratchpad, transcript, emit result
 /// 3. If max_iterations reached → emit warning + TurnComplete
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
