@@ -541,7 +541,9 @@ async fn main() -> Result<()> {
                 env: Default::default(),
             };
             let mut handle = server.spawn().await?;
-            let tools = handle.list_tools().await?;
+            let resp = handle.list_tools().await?;
+            // Response is {"tools": [...]}, extract the array
+            let tools = resp.get("tools").unwrap_or(&resp);
             if let Some(arr) = tools.as_array() {
                 for tool in arr {
                     let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
