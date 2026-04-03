@@ -26,6 +26,32 @@ from app.tools.base import ToolRegistry
 MAX_TOOL_RESULT_CHARS = 30_000
 
 
+def _validate_tool_input(tool, args: dict) -> str | None:
+    """Validate tool args against the tool's input_schema. Returns error string or None."""
+    schema = getattr(tool, 'input_schema', None)
+    if not schema or not isinstance(schema, dict):
+        return None
+    props = schema.get('properties', {})
+    required = schema.get('required', [])
+    for field in required:
+        if field not in args:
+            return f"missing required field '{field}'"
+    for key, val in args.items():
+        if key.startswith('_'):
+            continue  # internal fields
+        if key in props:
+            expected_type = props[key].get('type', '')
+            if expected_type == 'string' and not isinstance(val, str):
+                return f"'{key}' must be a string, got {type(val).__name__}"
+            if expected_type == 'integer' and not isinstance(val, int):
+                return f"'{key}' must be an integer, got {type(val).__name__}"
+            if expected_type == 'number' and not isinstance(val, (int, float)):
+                return f"'{key}' must be a number, got {type(val).__name__}"
+            if expected_type == 'array' and not isinstance(val, list):
+                return f"'{key}' must be an array, got {type(val).__name__}"
+    return None
+
+
 def _load_system_prompt(settings_path: str = "") -> str:
     if settings_path:
         p = Path(settings_path).expanduser()
@@ -142,6 +168,11 @@ class AgentCore:
                         return {"skipped": f"Tool {tool_name} was not approved by user."}
                 else:
                     return {"skipped": f"Tool {tool_name} requires approval but no callback set."}
+
+        # Step 3.5: Validate inputs against schema
+        validation_error = _validate_tool_input(tool, effective_args)
+        if validation_error:
+            return {"error": f"Invalid input for {tool_name}: {validation_error}"}
 
         # Step 4: Execute
         try:

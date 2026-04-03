@@ -94,10 +94,8 @@ dev = [
     "flake8>=6.1.0",
 ]
 
-# No Python entry point — the Rust binary IS the CLI.
-# Python is invoked by the Rust binary via prism-python-bridge.
-# [project.scripts]
-# prism = "app.cli.bootstrap:main"  # REMOVED — conflicts with Rust binary
+[project.scripts]
+prism = "app.cli.bootstrap:main"
 
 [project.urls]
 Homepage = "https://github.com/Darth-Hidious/PRISM"
