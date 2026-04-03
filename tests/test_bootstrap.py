@@ -50,7 +50,8 @@ class TestBuildFullRegistry:
         # Should work without MCP
         assert len(registry.list_tools()) > 0
 
-    def test_works_without_pycalphad(self):
+    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    def test_works_without_pycalphad(self, mock_check):
         """build_full_registry() succeeds even when pycalphad is not installed."""
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         # CALPHAD tools should not be present (pycalphad not installed)

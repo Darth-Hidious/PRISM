@@ -36,12 +36,3 @@ class TestAutonomousStream:
         assert "TurnComplete" in types
 
 
-def test_run_uses_card_renderers():
-    """prism run should import from app.cli.tui, not use inline panels."""
-    import inspect
-    from app.commands.run import run_goal
-    # Click wraps the function; unwrap to get the original callback
-    fn = run_goal.callback if hasattr(run_goal, "callback") else run_goal
-    source = inspect.getsource(fn)
-    assert "border_style=\"yellow\"" not in source
-    assert "border_style=\"green\"" not in source

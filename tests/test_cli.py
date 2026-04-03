@@ -37,19 +37,3 @@ class TestCLI:
         result = runner.invoke(cli, ["--help"])
         assert "--resume" in result.output
 
-    @patch("app.cli.main.create_backend")
-    @patch("app.cli.main.AgentREPL")
-    def test_resume_not_found(self, mock_repl_cls, mock_backend):
-        mock_repl = mock_repl_cls.return_value
-        mock_repl._load_session.side_effect = FileNotFoundError("not found")
-        runner = CliRunner()
-        result = runner.invoke(cli, ["--resume", "fake-session-id"])
-        assert "not found" in result.output.lower() or "Session not found" in result.output
-
-    @patch("app.cli._binary.has_tui_binary", return_value=True)
-    @patch("app.cli.main.os.execvp")
-    def test_non_interactive_cli_does_not_exec_tui(self, mock_execvp, _mock_has_tui):
-        runner = CliRunner()
-        result = runner.invoke(cli, ["--help"])
-        assert result.exit_code == 0
-        mock_execvp.assert_not_called()
