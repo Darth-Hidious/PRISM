@@ -16,7 +16,7 @@ use prism_client::api::PlatformClient;
 use prism_client::auth::{DeviceCodeResponse, TokenResponse};
 use prism_client::DeviceFlowAuth;
 use prism_proto::NodeCapabilities;
-use prism_python_bridge::ToolServer;
+use prism_python_bridge::{ensure_venv, ToolServer};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
     discover_workflows, execute_workflow, find_workflow, parse_workflow_command_args,
@@ -371,10 +371,19 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let python = cli.python.clone();
     let project_root = cli.project_root.clone();
     let endpoints = PlatformEndpoints::from_env();
     let paths = PrismPaths::discover()?;
+
+    // Resolve Python: if user passed an explicit --python, honour it;
+    // otherwise manage a venv under ~/.prism/venv/ automatically.
+    let python = if cli.python != PathBuf::from("python3") {
+        cli.python.clone()
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let prism_dir = PathBuf::from(&home).join(".prism");
+        ensure_venv(&prism_dir, &project_root).await?
+    };
 
     match cli.command.unwrap_or(Commands::Setup) {
         Commands::Setup => {
