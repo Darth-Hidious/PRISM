@@ -50,6 +50,13 @@ enum Commands {
         #[command(subcommand)]
         command: WorkflowCommands,
     },
+    /// Start the agent backend (JSON-RPC server for TUI frontend).
+    Backend {
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        #[arg(long, default_value = "python3")]
+        python: PathBuf,
+    },
     /// List available Python tools.
     Tools,
     /// PRISM node lifecycle commands.
@@ -533,6 +540,44 @@ async fn main() -> Result<()> {
         }
         Commands::Workflow { command } => {
             handle_workflow_command(command, &project_root).await?;
+        }
+        Commands::Backend {
+            project_root: backend_pr,
+            python: backend_py,
+        } => {
+            use prism_ingest::LlmConfig;
+            use prism_ingest::llm::LlmProvider;
+
+            // Resolve LLM config from env vars or stored credentials
+            let api_key = std::env::var("LLM_API_KEY")
+                .or_else(|_| std::env::var("MARC27_TOKEN"))
+                .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .or_else(|_| {
+                    paths.load_cli_state().ok()
+                        .and_then(|s| s.credentials)
+                        .map(|c| c.access_token)
+                        .ok_or(std::env::VarError::NotPresent)
+                })
+                .ok();
+
+            let llm_config = LlmConfig {
+                provider: LlmProvider::OpenAi,
+                base_url: std::env::var("LLM_BASE_URL")
+                    .unwrap_or_else(|_| "https://platform.marc27.com/api/v1/llm".to_string()),
+                model: std::env::var("LLM_MODEL")
+                    .unwrap_or_else(|_| "claude-sonnet-4-6".to_string()),
+                api_key,
+                ..Default::default()
+            };
+
+            let tool_server = prism_python_bridge::ToolServer {
+                python_bin: backend_py,
+                project_root: backend_pr,
+                env: Default::default(),
+            };
+
+            prism_agent::protocol::run_server(llm_config, tool_server).await?;
         }
         Commands::Tools => {
             let server = ToolServer {
