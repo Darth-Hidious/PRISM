@@ -17,6 +17,7 @@ use crate::hooks::build_default_hooks;
 use crate::permissions::ToolPermissionContext;
 use crate::prompts::SYSTEM_PROMPT;
 use crate::scratchpad::Scratchpad;
+use crate::session::SessionStore;
 use crate::transcript::TranscriptStore;
 use crate::types::{AgentConfig, AgentEvent};
 
@@ -132,8 +133,16 @@ fn emit_agent_event(event: AgentEvent) {
 
 // ── Command handlers ──────────────────────────────────────────────
 
-fn handle_command(command: &str) -> bool {
-    match command.trim() {
+/// Handle built-in slash commands.  Returns `true` if the command was handled.
+fn handle_command(
+    command: &str,
+    session_store: &mut SessionStore,
+    history: &mut Vec<ChatMessage>,
+    llm_config: &mut LlmConfig,
+) -> bool {
+    let trimmed = command.trim();
+
+    match trimmed {
         "/tools" => {
             emit_notification(
                 "ui.text.delta",
@@ -143,15 +152,127 @@ fn handle_command(command: &str) -> bool {
             true
         }
         "/clear" => {
+            history.clear();
             emit_notification("ui.clear", serde_json::json!({}));
             emit_notification("ui.turn.complete", serde_json::json!({}));
             true
         }
         "/help" => {
+            let help_text = "\
+Commands:
+  /tools                       — List available tools
+  /clear                       — Clear conversation history
+  /sessions                    — List saved sessions
+  /session resume [id|latest]  — Resume a session
+  /session fork [name]         — Fork current session
+  /model [id]                  — Show or switch LLM model
+  /help                        — Show this help";
+            emit_notification(
+                "ui.text.delta",
+                serde_json::json!({ "text": help_text }),
+            );
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            true
+        }
+        "/sessions" => {
+            let sessions = session_store.list_sessions(20);
+            if sessions.is_empty() {
+                emit_notification(
+                    "ui.text.delta",
+                    serde_json::json!({ "text": "No saved sessions." }),
+                );
+            } else {
+                let mut lines = vec!["Sessions:".to_string()];
+                for s in &sessions {
+                    let latest_marker = if s.is_latest { " (latest)" } else { "" };
+                    lines.push(format!(
+                        "  {} — {} turns, model: {}, {:.1}KB{}",
+                        s.session_id, s.turn_count, s.model, s.size_kb, latest_marker
+                    ));
+                }
+                emit_notification(
+                    "ui.text.delta",
+                    serde_json::json!({ "text": lines.join("\n") }),
+                );
+            }
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            true
+        }
+        "/model" => {
+            emit_notification(
+                "ui.text.delta",
+                serde_json::json!({ "text": format!("Current model: {}", llm_config.model) }),
+            );
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            true
+        }
+        _ if trimmed.starts_with("/model ") => {
+            let new_model = trimmed.strip_prefix("/model ").unwrap().trim();
+            if new_model.is_empty() {
+                emit_notification(
+                    "ui.text.delta",
+                    serde_json::json!({ "text": format!("Current model: {}", llm_config.model) }),
+                );
+            } else {
+                let old = &llm_config.model;
+                emit_notification(
+                    "ui.text.delta",
+                    serde_json::json!({ "text": format!("Model switched: {} → {}", old, new_model) }),
+                );
+                llm_config.model = new_model.to_string();
+            }
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            true
+        }
+        _ if trimmed.starts_with("/session resume") => {
+            let rest = trimmed
+                .strip_prefix("/session resume")
+                .unwrap()
+                .trim();
+            let reference = if rest.is_empty() { "latest" } else { rest };
+            match session_store.resume_session(reference) {
+                Some((sid, messages)) => {
+                    // Repopulate history from session messages
+                    history.clear();
+                    for msg in &messages {
+                        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        if !role.is_empty() && !content.is_empty() {
+                            history.push(ChatMessage {
+                                role: role.to_string(),
+                                content: Some(content.to_string()),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                        }
+                    }
+                    emit_notification(
+                        "ui.text.delta",
+                        serde_json::json!({
+                            "text": format!("Resumed session {} ({} messages)", sid, messages.len())
+                        }),
+                    );
+                }
+                None => {
+                    emit_notification(
+                        "ui.text.delta",
+                        serde_json::json!({ "text": format!("Session not found: {}", reference) }),
+                    );
+                }
+            }
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            true
+        }
+        _ if trimmed.starts_with("/session fork") => {
+            let name = trimmed
+                .strip_prefix("/session fork")
+                .unwrap()
+                .trim();
+            let new_id = session_store.fork_session(name);
             emit_notification(
                 "ui.text.delta",
                 serde_json::json!({
-                    "text": "Available commands:\n  /tools  - list tools\n  /clear  - clear history\n  /help   - show this help"
+                    "text": format!("Forked to new session: {}", new_id)
                 }),
             );
             emit_notification("ui.turn.complete", serde_json::json!({}));
@@ -165,10 +286,10 @@ fn handle_command(command: &str) -> bool {
 
 /// Run the JSON-RPC stdio server. Blocks until stdin is closed.
 pub async fn run_server(
-    llm_config: LlmConfig,
+    mut llm_config: LlmConfig,
     tool_server_config: ToolServer,
 ) -> Result<()> {
-    let llm = LlmClient::new(llm_config);
+    let llm = LlmClient::new(llm_config.clone());
 
     tracing::info!("spawning python tool server");
     let mut tool_server: ToolServerHandle = tool_server_config
@@ -194,6 +315,11 @@ pub async fn run_server(
     let hooks = build_default_hooks();
     let permissions = ToolPermissionContext::default();
     let mut scratchpad = Scratchpad::new();
+
+    // Session persistence
+    let mut session_store = SessionStore::new(None);
+    let session_id = session_store.new_session(&llm_config.model);
+    tracing::info!(session_id = %session_id, "started new session");
 
     // Read JSON-RPC lines from stdin
     let stdin = io::stdin();
@@ -226,14 +352,48 @@ pub async fn run_server(
 
         match method {
             "init" => {
+                // Check if init requests session resume
+                let resume_ref = params
+                    .get("resume")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let mut welcome = serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "tool_count": tools.len(),
+                    "session_id": session_store.current_id().unwrap_or(""),
+                });
+
+                if !resume_ref.is_empty() {
+                    if let Some((sid, messages)) = session_store.resume_session(resume_ref) {
+                        // Repopulate history from resumed session
+                        history.clear();
+                        for msg in &messages {
+                            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                            let content =
+                                msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            if !role.is_empty() && !content.is_empty() {
+                                history.push(ChatMessage {
+                                    role: role.to_string(),
+                                    content: Some(content.to_string()),
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                });
+                            }
+                        }
+                        welcome["resumed"] = serde_json::json!(true);
+                        welcome["session_id"] = serde_json::json!(sid);
+                        welcome["resumed_messages"] = serde_json::json!(messages.len());
+                        tracing::info!(
+                            session_id = %sid,
+                            messages = messages.len(),
+                            "resumed session"
+                        );
+                    }
+                }
+
                 emit_response(id, serde_json::json!({ "status": "ok" }));
-                emit_notification(
-                    "ui.welcome",
-                    serde_json::json!({
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "tool_count": tools.len(),
-                    }),
-                );
+                emit_notification("ui.welcome", welcome);
             }
 
             "input.message" => {
@@ -249,7 +409,10 @@ pub async fn run_server(
 
                 emit_response(id, serde_json::json!({ "status": "ok" }));
 
-                if let Err(e) = agent_loop::run_turn(
+                // Persist user message
+                session_store.append_message("user", text, "", "", None);
+
+                match agent_loop::run_turn(
                     &llm,
                     &mut tool_server,
                     &mut history,
@@ -260,16 +423,48 @@ pub async fn run_server(
                     &hooks,
                     &permissions,
                     &mut scratchpad,
-                    &mut emit_agent_event,
+                    &mut |event| {
+                        // Persist assistant text and tool results as they flow through
+                        match &event {
+                            AgentEvent::TurnComplete { text, .. } => {
+                                if let Some(t) = text {
+                                    if !t.is_empty() {
+                                        session_store.append_message(
+                                            "assistant", t, "", "", None,
+                                        );
+                                    }
+                                }
+                            }
+                            AgentEvent::ToolCallResult {
+                                call_id,
+                                tool_name,
+                                content,
+                                ..
+                            } => {
+                                session_store.append_message(
+                                    "tool",
+                                    content,
+                                    tool_name,
+                                    call_id,
+                                    None,
+                                );
+                            }
+                            _ => {}
+                        }
+                        emit_agent_event(event);
+                    },
                 )
                 .await
                 {
-                    tracing::error!(error = %e, "agent turn failed");
-                    emit_notification(
-                        "ui.text.delta",
-                        serde_json::json!({ "text": format!("Error: {e}") }),
-                    );
-                    emit_notification("ui.turn.complete", serde_json::json!({}));
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "agent turn failed");
+                        emit_notification(
+                            "ui.text.delta",
+                            serde_json::json!({ "text": format!("Error: {e}") }),
+                        );
+                        emit_notification("ui.turn.complete", serde_json::json!({}));
+                    }
                 }
             }
 
@@ -282,8 +477,9 @@ pub async fn run_server(
                 emit_response(id.clone(), serde_json::json!({ "status": "ok" }));
 
                 // If not a known command, treat as agent message
-                if !handle_command(command) {
+                if !handle_command(command, &mut session_store, &mut history, &mut llm_config) {
                     let text = command.trim_start_matches('/');
+                    session_store.append_message("user", text, "", "", None);
                     if let Err(e) = agent_loop::run_turn(
                         &llm,
                         &mut tool_server,
