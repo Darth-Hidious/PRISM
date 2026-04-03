@@ -1,0 +1,14 @@
+[package]
+name = "prism-agent"
+version = "2.5.0"
+edition = "2021"
+
+[dependencies]
+prism-ingest = { path = "../ingest" }
+prism-python-bridge = { path = "../python-bridge" }
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "io-std", "macros", "rt-multi-thread", "sync"] }
+tracing.workspace = true
