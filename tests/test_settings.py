@@ -225,22 +225,3 @@ class TestCaching:
         s1 = get_settings()
         s2 = reload_settings()
         assert s1 is not s2
-
-
-# ---------- Integration: factory reads settings ----------
-
-
-class TestFactoryIntegration:
-    def test_factory_reads_model_from_settings(self, tmp_path, monkeypatch):
-        """create_backend() should pick up model from settings.json."""
-        path = tmp_path / "settings.json"
-        path.write_text(json.dumps({"agent": {"model": "claude-opus-4-6"}}))
-        monkeypatch.setattr("app.config.settings_schema.GLOBAL_SETTINGS_PATH", path)
-        monkeypatch.setattr("app.config.settings_schema._find_project_settings", lambda: None)
-        monkeypatch.setattr("app.config.settings_schema._cached", None)
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-
-        from app.agent.factory import create_backend
-        backend = create_backend()
-        # The backend should have received model from settings
-        assert backend.model == "claude-opus-4-6"

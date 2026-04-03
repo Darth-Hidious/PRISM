@@ -94,14 +94,6 @@ def _make_typed_handler(tool: Tool):
 
 def _register_resources(mcp):
     """Register MCP resources for PRISM data."""
-    from app.agent.memory import SessionMemory
-
-    @mcp.resource("prism://sessions")
-    def list_sessions() -> str:
-        """List saved PRISM sessions."""
-        memory = SessionMemory()
-        sessions = memory.list_sessions()
-        return json.dumps(sessions, default=str)
 
     @mcp.resource("prism://tools")
     def list_tools_resource() -> str:
@@ -249,7 +241,7 @@ def generate_claude_desktop_config() -> dict:
         "mcpServers": {
             "prism": {
                 "command": sys.executable,
-                "args": ["-m", "app.cli", "serve"],
+                "args": ["-m", "app.mcp_server"],
             }
         }
     }

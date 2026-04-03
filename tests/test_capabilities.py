@@ -99,14 +99,3 @@ class TestCapabilitiesToolRegistered:
         result = tool.execute()
         assert "search_providers" in result
         assert "calphad" in result
-
-
-class TestSystemPromptInjection:
-    """Test that capabilities get injected into the system prompt."""
-
-    def test_inject_capabilities(self):
-        from app.agent.core import AgentCore
-        result = AgentCore._inject_capabilities("Base prompt here.")
-        assert "Base prompt here." in result
-        assert "AVAILABLE RESOURCES" in result
-        assert "Feature backend:" in result

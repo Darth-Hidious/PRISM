@@ -6,7 +6,17 @@ from vertexai.generative_models import GenerativeModel
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
-from app.agent.models import get_default_model
+# Default models per provider (previously in app.agent.models, now deleted)
+_DEFAULT_MODELS = {
+    "openai": "gpt-4o",
+    "anthropic": "claude-sonnet-4-20250514",
+    "google": "gemini-2.0-flash",
+    "openrouter": "anthropic/claude-sonnet-4-20250514",
+}
+
+
+def _get_default_model(provider: str) -> str:
+    return _DEFAULT_MODELS.get(provider, "gpt-4o")
 
 # Load the .env file from the app directory
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -21,7 +31,7 @@ class LLMService(ABC):
 class OpenAIService(LLMService):
     def __init__(self, model: str = None):
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = model or os.getenv("LLM_MODEL") or get_default_model("openai")
+        self.model = model or os.getenv("LLM_MODEL") or _get_default_model("openai")
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.chat.completions.create(
@@ -34,7 +44,7 @@ class VertexAIService(LLMService):
     def __init__(self, model: str = None):
         project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
         vertexai.init(project=project_id)
-        model_name = model or os.getenv("LLM_MODEL") or get_default_model("google")
+        model_name = model or os.getenv("LLM_MODEL") or _get_default_model("google")
         self.model = GenerativeModel(model_name)
 
     def get_completion(self, prompt: str, stream: bool = False):
@@ -43,7 +53,7 @@ class VertexAIService(LLMService):
 class AnthropicService(LLMService):
     def __init__(self, model: str = None):
         self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        self.model = model or os.getenv("LLM_MODEL") or get_default_model("anthropic")
+        self.model = model or os.getenv("LLM_MODEL") or _get_default_model("anthropic")
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.messages.create(
@@ -62,7 +72,7 @@ class OpenRouterService(LLMService):
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
         # Accept any model - OpenRouter supports many models
-        self.model = model or os.getenv("LLM_MODEL") or get_default_model("openrouter")
+        self.model = model or os.getenv("LLM_MODEL") or _get_default_model("openrouter")
 
     def get_completion(self, prompt: str, stream: bool = False):
         return self.client.chat.completions.create(
