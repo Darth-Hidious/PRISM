@@ -59,7 +59,7 @@ fn emit_agent_event(event: AgentEvent) {
         AgentEvent::TextDelta { text } => {
             emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
         }
-        AgentEvent::ToolStart {
+        AgentEvent::ToolCallStart {
             tool_name,
             call_id,
         } => {
@@ -71,10 +71,11 @@ fn emit_agent_event(event: AgentEvent) {
                 }),
             );
         }
-        AgentEvent::ToolResult {
-            tool_name,
+        AgentEvent::ToolCallResult {
             call_id,
+            tool_name,
             content,
+            summary,
             elapsed_ms,
             is_error,
         } => {
@@ -84,12 +85,13 @@ fn emit_agent_event(event: AgentEvent) {
                     "tool_name": tool_name,
                     "call_id": call_id,
                     "content": content,
+                    "summary": summary,
                     "elapsed_ms": elapsed_ms,
                     "is_error": is_error,
                 }),
             );
         }
-        AgentEvent::ApprovalRequired {
+        AgentEvent::ToolApprovalRequest {
             tool_name,
             call_id,
             tool_args,
@@ -103,24 +105,23 @@ fn emit_agent_event(event: AgentEvent) {
                 }),
             );
         }
-        AgentEvent::Cost {
-            input_tokens,
-            output_tokens,
-            turn_cost,
-            session_cost,
+        AgentEvent::TurnComplete {
+            text,
+            has_more,
+            usage,
+            total_usage,
+            estimated_cost,
         } => {
             emit_notification(
-                "ui.cost",
+                "ui.turn.complete",
                 serde_json::json!({
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "turn_cost": turn_cost,
-                    "session_cost": session_cost,
+                    "text": text,
+                    "has_more": has_more,
+                    "usage": usage,
+                    "total_usage": total_usage,
+                    "estimated_cost": estimated_cost,
                 }),
             );
-        }
-        AgentEvent::TurnComplete => {
-            emit_notification("ui.turn.complete", serde_json::json!({}));
         }
     }
 }
