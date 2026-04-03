@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! YAML workflow engine for PRISM.
 //!
 //! Discovers workflow definitions from `~/.prism/workflows/` and promotes them

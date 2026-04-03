@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! JSON-RPC 2.0 IPC layer for PRISM.
 //!
 //! Bridges the Rust CLI process and the Ink TUI frontend over stdin/stdout.

@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! Core domain logic for a PRISM node.
 //!
 //! This crate is the shared foundation that every other crate depends on:

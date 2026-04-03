@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! PRISM node runtime — the `prism-node` daemon binary.
 //!
 //! Turns any machine into a MARC27 compute node. Capabilities:

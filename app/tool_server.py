@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
 """Tool execution server — stdin/stdout JSON-line protocol.
 
 Run as: python3 -m app.tool_server

@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! Shared runtime primitives for PRISM Rust binaries.
 //!
 //! Provides [`PrismPaths`] (XDG-based directory discovery), [`PrismCliState`]

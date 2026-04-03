@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! Compute backend abstraction for PRISM experiment execution.
 //!
 //! Defines the [`ComputeBackend`] trait and routes jobs to one of three targets:
