@@ -179,7 +179,7 @@ def handle_status(app):
 
     tool_count = len(app.agent.tools.list_tools())
     try:
-        from app.skills.registry import load_builtin_skills
+        from app.tools.skills.registry import load_builtin_skills
         skill_count = len(load_builtin_skills().list_skills())
     except Exception:
         skill_count = 0
@@ -277,7 +277,7 @@ def handle_login(app):
 
 def handle_skill(app, name: Optional[str] = None):
     try:
-        from app.skills.registry import load_builtin_skills
+        from app.tools.skills.registry import load_builtin_skills
         skills = load_builtin_skills()
     except Exception:
         app.console.print("[dim]No skills available.[/dim]")
@@ -311,7 +311,7 @@ def handle_skill(app, name: Optional[str] = None):
 def handle_plan(app, goal: str):
     prompt = f"The user wants to accomplish: {goal}\n\nAvailable PRISM skills:\n"
     try:
-        from app.skills.registry import load_builtin_skills
+        from app.tools.skills.registry import load_builtin_skills
         for skill in load_builtin_skills().list_skills():
             prompt += f"- {skill.name}: {skill.description}\n"
     except Exception:

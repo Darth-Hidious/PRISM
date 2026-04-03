@@ -1,8 +1,8 @@
 """Tests for data normalizer and store."""
 import pytest
 import tempfile
-from app.data.normalizer import normalize_records
-from app.data.store import DataStore
+from app.tools.data_collectors.normalizer import normalize_records
+from app.tools.data_collectors.store import DataStore
 
 
 class TestNormalizer:

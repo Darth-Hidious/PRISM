@@ -2,7 +2,7 @@
 import sys
 import pytest
 from unittest.mock import patch, MagicMock
-from app.data.omat24_collector import OMAT24Collector
+from app.tools.data_collectors.omat24_collector import OMAT24Collector
 
 
 SAMPLE_ROWS = [
@@ -107,7 +107,7 @@ class TestOMAT24Collector:
         sys.modules["datasets"] = None  # type: ignore[assignment]
         try:
             # Re-import the collector module so it picks up the blocked import
-            import app.data.omat24_collector as omat_mod
+            import app.tools.data_collectors.omat24_collector as omat_mod
             importlib.reload(omat_mod)
             c = omat_mod.OMAT24Collector()
             results = c.collect(elements=["W"])
@@ -118,7 +118,7 @@ class TestOMAT24Collector:
             else:
                 sys.modules.pop("datasets", None)
             # Reload again to restore normal behavior
-            import app.data.omat24_collector as omat_mod
+            import app.tools.data_collectors.omat24_collector as omat_mod
             importlib.reload(omat_mod)
 
     def test_parse_row(self):

@@ -1,7 +1,7 @@
 """Tests for LiteratureCollector."""
 import pytest
 from unittest.mock import patch, MagicMock
-from app.data.literature_collector import LiteratureCollector
+from app.tools.data_collectors.literature_collector import LiteratureCollector
 
 
 ARXIV_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -66,7 +66,7 @@ class TestLiteratureCollector:
         c = LiteratureCollector()
         assert c.collect(query="") == []
 
-    @patch("app.data.literature_collector.requests")
+    @patch("app.tools.data_collectors.literature_collector.requests")
     def test_collect_arxiv_only(self, mock_requests):
         mock_requests.get.return_value = _mock_arxiv_response()
         c = LiteratureCollector()
@@ -77,7 +77,7 @@ class TestLiteratureCollector:
         assert results[0]["authors"] == ["Alice Smith", "Bob Jones"]
         assert results[0]["type"] == "paper"
 
-    @patch("app.data.literature_collector.requests")
+    @patch("app.tools.data_collectors.literature_collector.requests")
     def test_collect_s2_only(self, mock_requests):
         mock_requests.get.return_value = _mock_s2_response()
         c = LiteratureCollector()
@@ -87,7 +87,7 @@ class TestLiteratureCollector:
         assert results[0]["title"] == "Tungsten Alloy Properties"
         assert results[0]["citations"] == 15
 
-    @patch("app.data.literature_collector.requests")
+    @patch("app.tools.data_collectors.literature_collector.requests")
     def test_collect_both_sources(self, mock_requests):
         # First call: arxiv, second call: S2
         mock_requests.get.side_effect = [_mock_arxiv_response(), _mock_s2_response()]
@@ -95,21 +95,21 @@ class TestLiteratureCollector:
         results = c.collect(query="tungsten alloy", max_results=20)
         assert len(results) == 3  # 2 arxiv + 1 S2
 
-    @patch("app.data.literature_collector.requests")
+    @patch("app.tools.data_collectors.literature_collector.requests")
     def test_collect_max_results_limits(self, mock_requests):
         mock_requests.get.side_effect = [_mock_arxiv_response(), _mock_s2_response()]
         c = LiteratureCollector()
         results = c.collect(query="tungsten alloy", max_results=2)
         assert len(results) == 2
 
-    @patch("app.data.literature_collector.requests")
+    @patch("app.tools.data_collectors.literature_collector.requests")
     def test_collect_arxiv_error(self, mock_requests):
         mock_requests.get.side_effect = Exception("Network error")
         c = LiteratureCollector()
         results = c.collect(query="test", sources=["arxiv"])
         assert results == []
 
-    @patch("app.data.literature_collector.requests")
+    @patch("app.tools.data_collectors.literature_collector.requests")
     def test_collect_s2_error(self, mock_requests):
         mock_requests.get.side_effect = Exception("Network error")
         c = LiteratureCollector()
@@ -129,7 +129,7 @@ class TestLiteratureCollector:
         results = c._parse_arxiv_xml(empty_xml)
         assert results == []
 
-    @patch("app.data.literature_collector.requests")
+    @patch("app.tools.data_collectors.literature_collector.requests")
     def test_search_s2_empty_data(self, mock_requests):
         resp = MagicMock()
         resp.json.return_value = {"data": []}
@@ -139,7 +139,7 @@ class TestLiteratureCollector:
         results = c._search_s2("test", 10)
         assert results == []
 
-    @patch("app.data.literature_collector.requests")
+    @patch("app.tools.data_collectors.literature_collector.requests")
     def test_search_s2_missing_authors(self, mock_requests):
         resp = MagicMock()
         resp.json.return_value = {

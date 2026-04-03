@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.skills.phase_analysis import PHASE_ANALYSIS_SKILL, _analyze_phases
+from app.tools.skills.phase_analysis import PHASE_ANALYSIS_SKILL, _analyze_phases
 
 
 class TestPhaseAnalysisSkill:
@@ -19,7 +19,7 @@ class TestPhaseAnalysisSkill:
         assert "database_name" in schema["required"]
         assert "components" in schema["required"]
 
-    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
     def test_error_when_pycalphad_missing(self, mock_check):
         result = _analyze_phases(
             database_name="test",
@@ -28,8 +28,8 @@ class TestPhaseAnalysisSkill:
         assert "error" in result
         assert "pycalphad" in result["error"]
 
-    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=True)
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=True)
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_analyze_with_mocked_bridge(self, mock_bridge_fn, mock_available):
         mock_bridge = MagicMock()
         mock_bridge.databases.get_phases.return_value = ["FCC_A1", "BCC_A2", "LIQUID"]
@@ -55,8 +55,8 @@ class TestPhaseAnalysisSkill:
         assert "stable_phases" in result
         assert "FCC_A1" in result["stable_phases"]
 
-    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=True)
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=True)
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_database_not_found(self, mock_bridge_fn, mock_available):
         mock_bridge = MagicMock()
         mock_bridge.databases.get_phases.return_value = None

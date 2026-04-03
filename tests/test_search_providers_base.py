@@ -2,7 +2,7 @@ import pytest
 
 
 def test_provider_capabilities():
-    from app.search.providers.base import ProviderCapabilities
+    from app.tools.search_engine.providers.base import ProviderCapabilities
     cap = ProviderCapabilities(
         filterable_fields={"elements", "formula"},
         returned_properties={"formula", "space_group"},
@@ -11,8 +11,8 @@ def test_provider_capabilities():
 
 
 def test_provider_capabilities_can_handle():
-    from app.search.providers.base import ProviderCapabilities
-    from app.search.query import MaterialSearchQuery, PropertyRange
+    from app.tools.search_engine.providers.base import ProviderCapabilities
+    from app.tools.search_engine.query import MaterialSearchQuery, PropertyRange
     cap = ProviderCapabilities(
         filterable_fields={"elements", "formula", "nelements"},
         returned_properties={"formula"},
@@ -25,8 +25,8 @@ def test_provider_capabilities_can_handle():
 
 def test_build_registry_returns_providers(tmp_path):
     """build_registry returns working providers from cache + overrides."""
-    from app.search.providers.registry import build_registry
-    from app.search.providers.discovery import save_cache
+    from app.tools.search_engine.providers.registry import build_registry
+    from app.tools.search_engine.providers.discovery import save_cache
 
     endpoints = [
         {"id": "mp", "name": "MP", "base_url": "https://optimade.materialsproject.org", "parent": "mp"},
@@ -65,7 +65,7 @@ def test_marketplace_mp_native_has_auth():
 
 def test_provider_endpoint_model():
     """ProviderEndpoint Pydantic model validates correctly."""
-    from app.search.providers.endpoint import ProviderEndpoint
+    from app.tools.search_engine.providers.endpoint import ProviderEndpoint
     ep = ProviderEndpoint(
         id="test", name="Test Provider", base_url="https://test.org",
         tier=2, enabled=True,

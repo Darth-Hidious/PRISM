@@ -2,14 +2,14 @@
 import tempfile
 import pytest
 import numpy as np
-from app.ml.predictor import Predictor
-from app.ml.registry import ModelRegistry
+from app.tools.ml.predictor import Predictor
+from app.tools.ml.registry import ModelRegistry
 
 
 class TestPredictor:
     def _train_and_save_model(self, tmpdir):
         from sklearn.ensemble import RandomForestRegressor
-        from app.ml.features import composition_features
+        from app.tools.ml.features import composition_features
         # Train with same feature count as composition_features produces
         n_features = len(composition_features("Si"))
         model = RandomForestRegressor(n_estimators=5, random_state=42)

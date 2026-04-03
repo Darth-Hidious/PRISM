@@ -2,7 +2,7 @@
 import sys
 import pytest
 from unittest.mock import patch, MagicMock
-from app.data.collector import OPTIMADECollector
+from app.tools.data_collectors.collector import OPTIMADECollector
 
 
 class TestOPTIMADECollector:

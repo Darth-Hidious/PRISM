@@ -94,10 +94,10 @@ def build_full_registry(
 
     # Simulation tools (optional — pyiron may not be installed)
     try:
-        from app.simulation.bridge import check_pyiron_available
+        from app.tools.simulation.bridge import check_pyiron_available
 
         if check_pyiron_available():
-            from app.tools.simulation import create_simulation_tools
+            from app.tools.sim_tools import create_simulation_tools
 
             create_simulation_tools(registry)
     except Exception:
@@ -105,7 +105,7 @@ def build_full_registry(
 
     # CALPHAD tools (optional — pycalphad may not be installed)
     try:
-        from app.simulation.calphad_bridge import check_calphad_available
+        from app.tools.simulation.calphad_bridge import check_calphad_available
 
         if check_calphad_available():
             from app.tools.calphad import create_calphad_tools
@@ -116,14 +116,14 @@ def build_full_registry(
 
     # Built-in skills → tools
     try:
-        from app.skills.registry import load_builtin_skills
+        from app.tools.skills.registry import load_builtin_skills
 
         load_builtin_skills().register_all_as_tools(registry)
     except Exception:
         pass
 
     # Search provider registry (3-layer: discovery + overrides + catalog)
-    from app.search.providers.registry import ProviderRegistry, build_registry
+    from app.tools.search_engine.providers.registry import ProviderRegistry, build_registry
     try:
         provider_reg = build_registry()
     except Exception:
@@ -135,9 +135,9 @@ def build_full_registry(
     # Plugins (entry points + local — can register into ANY sub-registry)
     if enable_plugins:
         try:
-            from app.data.base_collector import CollectorRegistry
-            from app.ml.algorithm_registry import get_default_registry
-            from app.skills.base import SkillRegistry
+            from app.tools.data_collectors.base_collector import CollectorRegistry
+            from app.tools.ml.algorithm_registry import get_default_registry
+            from app.tools.skills.base import SkillRegistry
             from app.plugins.registry import PluginRegistry
             from app.plugins.loader import discover_all_plugins
 

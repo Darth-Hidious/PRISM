@@ -4,7 +4,7 @@ from unittest.mock import patch, MagicMock, PropertyMock
 import numpy as np
 
 from app.tools.base import ToolRegistry
-from app.tools.simulation import create_simulation_tools
+from app.tools.sim_tools import create_simulation_tools
 
 
 # ---------------------------------------------------------------------------
@@ -60,14 +60,14 @@ class TestToolRegistration:
 # ---------------------------------------------------------------------------
 
 class TestPyironGuard:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=False)
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=False)
     def test_create_structure_guard(self, _m):
         reg = _make_registry()
         result = reg.get("create_structure").execute(element="Fe")
         assert "error" in result
         assert "pyiron_atomistics" in result["error"]
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=False)
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=False)
     def test_run_simulation_guard(self, _m):
         reg = _make_registry()
         result = reg.get("run_simulation").execute(structure_id="x")
@@ -79,8 +79,8 @@ class TestPyironGuard:
 # ---------------------------------------------------------------------------
 
 class TestCreateStructure:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_basic(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -93,8 +93,8 @@ class TestCreateStructure:
         assert result["structure_id"] == "struct_abc"
         assert result["n_atoms"] == 4
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_with_supercell(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -112,8 +112,8 @@ class TestCreateStructure:
 
 
 class TestModifyStructure:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_supercell(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -128,8 +128,8 @@ class TestModifyStructure:
         assert result["structure_id"] == "struct_new"
         assert result["operation"] == "supercell"
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_not_found(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -139,8 +139,8 @@ class TestModifyStructure:
         result = reg.get("modify_structure").execute(structure_id="bad_id", operation="supercell")
         assert "error" in result
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_unknown_operation(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -155,8 +155,8 @@ class TestModifyStructure:
 
 
 class TestGetStructureInfo:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_basic(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -168,8 +168,8 @@ class TestGetStructureInfo:
         assert result["n_atoms"] == 4
         assert result["volume"] == 23.64
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_not_found(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -181,8 +181,8 @@ class TestGetStructureInfo:
 
 
 class TestListPotentials:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_basic(self, mock_bridge_fn, _avail):
         import pandas as pd
         bridge = MagicMock()
@@ -209,8 +209,8 @@ class TestListPotentials:
 # ---------------------------------------------------------------------------
 
 class TestRunSimulation:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_lammps(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -228,8 +228,8 @@ class TestRunSimulation:
         assert result["job_id"] == "job_123"
         assert result["code"] == "lammps"
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_unsupported_code(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -244,8 +244,8 @@ class TestRunSimulation:
 
 
 class TestGetJobStatus:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_basic(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -258,8 +258,8 @@ class TestGetJobStatus:
         result = reg.get("get_job_status").execute(job_id="job_1")
         assert result["status"] == "finished"
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_not_found(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -271,8 +271,8 @@ class TestGetJobStatus:
 
 
 class TestGetJobResults:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_finished_job(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -291,8 +291,8 @@ class TestGetJobResults:
         assert result["energy_tot"] == -3.75
         assert result["volume"] == 23.6
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_not_finished(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -307,8 +307,8 @@ class TestGetJobResults:
 
 
 class TestListJobs:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_empty(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -319,8 +319,8 @@ class TestListJobs:
         assert result["jobs"] == []
         assert result["count"] == 0
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_with_filter(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -336,8 +336,8 @@ class TestListJobs:
 
 
 class TestDeleteJob:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_without_confirm(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -347,8 +347,8 @@ class TestDeleteJob:
         assert "error" in result
         assert "confirm" in result["error"]
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_with_confirm(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -364,8 +364,8 @@ class TestDeleteJob:
 # ---------------------------------------------------------------------------
 
 class TestSubmitHPCJob:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_basic(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -387,8 +387,8 @@ class TestSubmitHPCJob:
 
 
 class TestCheckHPCQueue:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_fallback(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -404,8 +404,8 @@ class TestCheckHPCQueue:
 
 
 class TestRunConvergenceTest:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_basic(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -425,8 +425,8 @@ class TestRunConvergenceTest:
 
 
 class TestRunWorkflow:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_elastic(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -447,8 +447,8 @@ class TestRunWorkflow:
         assert result["job_id"] == "wf_1"
         assert result["workflow_type"] == "elastic_constants"
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_unknown_workflow(self, mock_bridge_fn, _avail):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge

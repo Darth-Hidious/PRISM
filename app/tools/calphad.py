@@ -13,7 +13,7 @@ from app.tools.base import Tool, ToolRegistry
 
 def _guard():
     """Return an error dict if pycalphad is unavailable, else None."""
-    from app.simulation.calphad_bridge import check_calphad_available, _calphad_missing_error
+    from app.tools.simulation.calphad_bridge import check_calphad_available, _calphad_missing_error
     if not check_calphad_available():
         return _calphad_missing_error()
     return None
@@ -28,7 +28,7 @@ def _calculate_phase_diagram(**kwargs) -> dict:
     if err:
         return err
     try:
-        from app.simulation.calphad_bridge import get_calphad_bridge
+        from app.tools.simulation.calphad_bridge import get_calphad_bridge
         bridge = get_calphad_bridge()
 
         database_name = kwargs["database_name"]
@@ -53,7 +53,7 @@ def _calculate_equilibrium(**kwargs) -> dict:
     if err:
         return err
     try:
-        from app.simulation.calphad_bridge import get_calphad_bridge
+        from app.tools.simulation.calphad_bridge import get_calphad_bridge
         bridge = get_calphad_bridge()
 
         database_name = kwargs["database_name"]
@@ -76,7 +76,7 @@ def _calculate_gibbs_energy(**kwargs) -> dict:
     if err:
         return err
     try:
-        from app.simulation.calphad_bridge import get_calphad_bridge
+        from app.tools.simulation.calphad_bridge import get_calphad_bridge
         bridge = get_calphad_bridge()
 
         database_name = kwargs["database_name"]
@@ -103,7 +103,7 @@ def _calculate_gibbs_energy(**kwargs) -> dict:
 def _list_databases(**kwargs) -> dict:
     """List available TDB files. No pycalphad needed."""
     try:
-        from app.simulation.calphad_bridge import get_calphad_bridge
+        from app.tools.simulation.calphad_bridge import get_calphad_bridge
         bridge = get_calphad_bridge()
         databases = bridge.databases.list_databases()
         return {"databases": databases, "count": len(databases)}
@@ -116,7 +116,7 @@ def _list_phases(**kwargs) -> dict:
     if err:
         return err
     try:
-        from app.simulation.calphad_bridge import get_calphad_bridge
+        from app.tools.simulation.calphad_bridge import get_calphad_bridge
         bridge = get_calphad_bridge()
 
         database_name = kwargs["database_name"]
@@ -134,7 +134,7 @@ def _list_phases(**kwargs) -> dict:
 def _import_database(**kwargs) -> dict:
     """Import a user TDB file. No pycalphad needed."""
     try:
-        from app.simulation.calphad_bridge import get_calphad_bridge
+        from app.tools.simulation.calphad_bridge import get_calphad_bridge
         bridge = get_calphad_bridge()
 
         source_path = kwargs["source_path"]

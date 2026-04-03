@@ -17,10 +17,10 @@ def model():
 def train(prop, algorithm, dataset):
     """Train ML models on collected data."""
     console = Console()
-    from app.data.store import DataStore
-    from app.ml.features import composition_features, get_feature_backend
-    from app.ml.trainer import train_model
-    from app.ml.registry import ModelRegistry
+    from app.tools.data_collectors.store import DataStore
+    from app.tools.ml.features import composition_features, get_feature_backend
+    from app.tools.ml.trainer import train_model
+    from app.tools.ml.registry import ModelRegistry
     import numpy as np
 
     store = DataStore()
@@ -87,9 +87,9 @@ def train(prop, algorithm, dataset):
 def status():
     """List available trained models, pre-trained GNNs, and feature backend."""
     console = Console()
-    from app.ml.registry import ModelRegistry
-    from app.ml.pretrained import list_pretrained_models
-    from app.ml.features import get_feature_backend
+    from app.tools.ml.registry import ModelRegistry
+    from app.tools.ml.pretrained import list_pretrained_models
+    from app.tools.ml.features import get_feature_backend
 
     console.print(f"[bold]Feature backend:[/bold] {get_feature_backend()}")
     console.print()
@@ -137,10 +137,10 @@ def status():
 
     # CALPHAD thermodynamic models
     console.print()
-    from app.simulation.calphad_bridge import check_calphad_available
+    from app.tools.simulation.calphad_bridge import check_calphad_available
     if check_calphad_available():
         console.print("[green]CALPHAD (pycalphad):[/green] installed")
-        from app.simulation.calphad_bridge import get_calphad_bridge
+        from app.tools.simulation.calphad_bridge import get_calphad_bridge
         bridge = get_calphad_bridge()
         databases = bridge.databases.list_databases()
         console.print(f"  TDB databases: {len(databases)}")
@@ -163,7 +163,7 @@ def calphad_status():
     """Show pycalphad status and available TDB databases."""
     console = Console()
 
-    from app.simulation.calphad_bridge import check_calphad_available
+    from app.tools.simulation.calphad_bridge import check_calphad_available
     console.print("[bold]CALPHAD Thermodynamic Models[/bold]")
     if not check_calphad_available():
         console.print("  pycalphad: [yellow]not installed[/yellow]")
@@ -171,7 +171,7 @@ def calphad_status():
         return
 
     console.print("  pycalphad: [green]installed[/green]")
-    from app.simulation.calphad_bridge import get_calphad_bridge
+    from app.tools.simulation.calphad_bridge import get_calphad_bridge
     bridge = get_calphad_bridge()
     databases = bridge.databases.list_databases()
     console.print(f"  TDB databases: [cyan]{len(databases)}[/cyan]")
@@ -184,7 +184,7 @@ def calphad_databases():
     """List available TDB thermodynamic database files."""
     console = Console()
 
-    from app.simulation.calphad_bridge import get_calphad_bridge
+    from app.tools.simulation.calphad_bridge import get_calphad_bridge
     bridge = get_calphad_bridge()
     databases = bridge.databases.list_databases()
 
@@ -209,7 +209,7 @@ def calphad_import(tdb_path, name):
     """Import a TDB thermodynamic database file."""
     console = Console()
 
-    from app.simulation.calphad_bridge import get_calphad_bridge
+    from app.tools.simulation.calphad_bridge import get_calphad_bridge
     bridge = get_calphad_bridge()
     result = bridge.databases.import_database(tdb_path, name)
     if "error" in result:

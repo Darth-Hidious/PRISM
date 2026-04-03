@@ -6,7 +6,7 @@ import pytest
 
 
 def test_parse_optimade_providers_response():
-    from app.search.providers.refresh import parse_providers_response
+    from app.tools.search_engine.providers.refresh import parse_providers_response
     response = {
         "data": [
             {
@@ -37,7 +37,7 @@ def test_parse_optimade_providers_response():
 
 def test_parse_providers_response_skips_meta_entries():
     """Meta entries like exmpl, optimade, optimake should be filtered out."""
-    from app.search.providers.refresh import parse_providers_response
+    from app.tools.search_engine.providers.refresh import parse_providers_response
     response = {
         "data": [
             {"id": "exmpl", "attributes": {"name": "Example", "base_url": "https://example.com"}},
@@ -51,7 +51,7 @@ def test_parse_providers_response_skips_meta_entries():
 
 
 def test_merge_registries_adds_new():
-    from app.search.providers.refresh import merge_registries
+    from app.tools.search_engine.providers.refresh import merge_registries
     existing = [{"id": "mp", "name": "MP", "tier": 1}]
     discovered = [
         {"id": "mp", "name": "MP Updated", "base_url": "https://mp.org"},
@@ -64,7 +64,7 @@ def test_merge_registries_adds_new():
 
 
 def test_merge_registries_updates_url():
-    from app.search.providers.refresh import merge_registries
+    from app.tools.search_engine.providers.refresh import merge_registries
     existing = [{"id": "nmd", "name": "NOMAD", "base_url": "https://old.url"}]
     discovered = [{"id": "nmd", "name": "NOMAD", "base_url": "https://new.url"}]
     merged, changes = merge_registries(existing, discovered)
@@ -74,7 +74,7 @@ def test_merge_registries_updates_url():
 
 
 def test_merge_registries_activates_namespace():
-    from app.search.providers.refresh import merge_registries
+    from app.tools.search_engine.providers.refresh import merge_registries
     existing = [{"id": "ccdc", "name": "CCDC", "status": "namespace_reserved", "base_url": None}]
     discovered = [{"id": "ccdc", "name": "CCDC", "base_url": "https://ccdc.example.com/optimade"}]
     merged, changes = merge_registries(existing, discovered)
@@ -84,7 +84,7 @@ def test_merge_registries_activates_namespace():
 
 
 def test_merge_registries_preserves_local_overrides():
-    from app.search.providers.refresh import merge_registries
+    from app.tools.search_engine.providers.refresh import merge_registries
     existing = [{"id": "mp", "name": "MP", "tier": 1, "enabled": False, "_user_override": True}]
     discovered = [{"id": "mp", "name": "MP", "base_url": "https://mp.org"}]
     merged, _ = merge_registries(existing, discovered)

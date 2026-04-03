@@ -2,8 +2,8 @@
 import tempfile
 import pytest
 import numpy as np
-from app.ml.trainer import train_model, AVAILABLE_ALGORITHMS
-from app.ml.registry import ModelRegistry
+from app.tools.ml.trainer import train_model, AVAILABLE_ALGORITHMS
+from app.tools.ml.registry import ModelRegistry
 
 
 class TestTrainer:

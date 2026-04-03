@@ -5,8 +5,8 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 from app.tools.data import _import_dataset
 
-# _import_dataset imports DataStore inside, at "app.data.store.DataStore"
-MOCK_STORE = "app.data.store.DataStore"
+# _import_dataset imports DataStore inside, at "app.tools.data_collectors.store.DataStore"
+MOCK_STORE = "app.tools.data_collectors.store.DataStore"
 
 
 class TestImportDataset:

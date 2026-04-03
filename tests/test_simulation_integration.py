@@ -2,7 +2,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 from app.tools.base import ToolRegistry
-from app.tools.simulation import create_simulation_tools
+from app.tools.sim_tools import create_simulation_tools
 
 
 def _mock_atoms(formula="Al4", n=4):
@@ -24,8 +24,8 @@ def _mock_atoms(formula="Al4", n=4):
 class TestEndToEndPipeline:
     """Mocked end-to-end: create structure → run LAMMPS minimization → get results."""
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_create_simulate_get_results(self, mock_bridge_fn, _avail):
         # --- setup bridge mock ---
         bridge = MagicMock()
@@ -93,8 +93,8 @@ class TestEndToEndPipeline:
         assert result3["energy_tot"] == -14.97
         assert result3["volume"] == 66.1
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_create_modify_get_info(self, mock_bridge_fn, _avail):
         """Test structure creation → modification → info retrieval chain."""
         bridge = MagicMock()

@@ -4,7 +4,7 @@ from app.tools.base import Tool, ToolRegistry
 
 def _literature_search(**kwargs) -> dict:
     """Search scientific literature on arXiv and Semantic Scholar."""
-    from app.data.literature_collector import LiteratureCollector
+    from app.tools.data_collectors.literature_collector import LiteratureCollector
     collector = LiteratureCollector()
     results = collector.collect(**kwargs)
     return {
@@ -16,7 +16,7 @@ def _literature_search(**kwargs) -> dict:
 
 def _patent_search(**kwargs) -> dict:
     """Search patents via Lens.org."""
-    from app.data.patent_collector import PatentCollector
+    from app.tools.data_collectors.patent_collector import PatentCollector
     collector = PatentCollector()
     results = collector.collect(**kwargs)
     return {

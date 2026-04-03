@@ -6,9 +6,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from app.search import SearchEngine, MaterialSearchQuery, PropertyRange
-from app.search.providers.registry import ProviderRegistry, build_registry
-from app.search.providers.discovery import discover_providers, save_cache, load_overrides
+from app.tools.search_engine import SearchEngine, MaterialSearchQuery, PropertyRange
+from app.tools.search_engine.providers.registry import ProviderRegistry, build_registry
+from app.tools.search_engine.providers.discovery import discover_providers, save_cache, load_overrides
 
 
 @click.command()
@@ -76,7 +76,7 @@ def search(elements, formula, nelements, providers, limit, band_gap_min, band_ga
     )
 
     # Show query info
-    from app.search.translator import QueryTranslator
+    from app.tools.search_engine.translator import QueryTranslator
     optimade_filter = QueryTranslator.to_optimade(query)
     if optimade_filter:
         console.print(Panel(f"[bold]Filter:[/bold] [cyan]{optimade_filter}[/cyan]", title="Search Query", border_style="blue"))

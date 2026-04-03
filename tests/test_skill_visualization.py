@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from app.skills.visualization import VISUALIZE_SKILL, _visualize_dataset
+from app.tools.skills.visualization import VISUALIZE_SKILL, _visualize_dataset
 
 
 @pytest.fixture
@@ -14,7 +14,7 @@ def mock_prefs(monkeypatch, tmp_path):
 
     prefs = UserPreferences(output_dir=str(tmp_path / "plots"))
     monkeypatch.setattr(
-        "app.skills.visualization.UserPreferences.load", lambda: prefs
+        "app.tools.skills.visualization.UserPreferences.load", lambda: prefs
     )
     return prefs
 
@@ -40,7 +40,7 @@ class TestVisualizeSkill:
 
     @patch("app.tools.visualization._plot_materials_comparison")
     @patch("app.tools.visualization._plot_property_distribution")
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_visualize_distributions(
         self, mock_load, mock_dist, mock_comp, mock_prefs, sample_df
     ):
@@ -54,14 +54,14 @@ class TestVisualizeSkill:
         assert len(result["plots"]) > 0
         assert "band_gap" in result["columns_plotted"]
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_dataset_not_found(self, mock_load, mock_prefs):
         mock_load.side_effect = FileNotFoundError()
 
         result = _visualize_dataset(dataset_name="nonexistent")
         assert "error" in result
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_no_numeric_columns(self, mock_load, mock_prefs):
         df = pd.DataFrame({"formula": ["Fe2O3"], "source_id": ["a"]})
         mock_load.return_value = df
@@ -70,7 +70,7 @@ class TestVisualizeSkill:
         assert "error" in result
 
     @patch("app.tools.visualization._plot_property_distribution")
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_specific_properties(self, mock_load, mock_dist, mock_prefs, sample_df):
         mock_load.return_value = sample_df
         mock_dist.return_value = {"success": True, "path": "test.png"}

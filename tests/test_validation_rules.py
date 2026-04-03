@@ -3,7 +3,7 @@
 import pandas as pd
 import numpy as np
 
-from app.validation.rules import (
+from app.tools.validation.rules import (
     detect_outliers,
     check_physical_constraints,
     score_completeness,

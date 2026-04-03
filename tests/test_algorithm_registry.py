@@ -1,6 +1,6 @@
 """Tests for AlgorithmRegistry."""
 import pytest
-from app.ml.algorithm_registry import AlgorithmRegistry, get_default_registry
+from app.tools.ml.algorithm_registry import AlgorithmRegistry, get_default_registry
 
 
 class TestAlgorithmRegistry:

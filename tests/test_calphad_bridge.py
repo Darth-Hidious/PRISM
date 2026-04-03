@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.simulation.calphad_bridge import (
+from app.tools.simulation.calphad_bridge import (
     CalphadBridge,
     DatabaseStore,
     _calphad_missing_error,
@@ -248,7 +248,7 @@ class TestCalphadBridge:
 
 class TestGetCalphadBridge:
     def test_returns_singleton(self):
-        import app.simulation.calphad_bridge as mod
+        import app.tools.simulation.calphad_bridge as mod
 
         # Reset singleton
         mod._bridge = None

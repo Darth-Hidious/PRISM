@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from app.simulation.calphad_bridge import (
+from app.tools.simulation.calphad_bridge import (
     CalphadBridge,
     DatabaseStore,
     check_calphad_available,
@@ -23,7 +23,7 @@ class TestCalphadAvailabilityIntegration:
 
 
 class TestBootstrapWithoutPycalphad:
-    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
     def test_build_full_registry_works(self, mock_check):
         """build_full_registry() works without pycalphad (graceful skip)."""
         from app.plugins.bootstrap import build_full_registry
@@ -74,7 +74,7 @@ class TestCalphadToolsWithMockedBridge:
     """Test tools return correct structure with mocked bridge."""
 
     @patch("app.tools.calphad._guard", return_value=None)
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_phase_diagram_structure(self, mock_bridge_fn, mock_guard):
         mock_bridge = MagicMock()
         mock_bridge.calculate_phase_diagram.return_value = {
@@ -96,7 +96,7 @@ class TestCalphadToolsWithMockedBridge:
         assert len(result["data_points"]) == 1
 
     @patch("app.tools.calphad._guard", return_value=None)
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_equilibrium_structure(self, mock_bridge_fn, mock_guard):
         mock_bridge = MagicMock()
         mock_bridge.calculate_equilibrium.return_value = {
@@ -121,8 +121,8 @@ class TestCalphadToolsWithMockedBridge:
 
 
 class TestAnalyzePhasesIntegration:
-    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=True)
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=True)
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_end_to_end(self, mock_bridge_fn, mock_available):
         mock_bridge = MagicMock()
         mock_bridge.databases.get_phases.return_value = [
@@ -139,7 +139,7 @@ class TestAnalyzePhasesIntegration:
         }
         mock_bridge_fn.return_value = mock_bridge
 
-        from app.skills.phase_analysis import _analyze_phases
+        from app.tools.skills.phase_analysis import _analyze_phases
 
         result = _analyze_phases(
             database_name="sgte",
@@ -157,7 +157,7 @@ class TestAnalyzePhasesIntegration:
 
 
 class TestSimulationPlanRouting:
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_phase_stability_routes_to_calphad(self, mock_load):
         import pandas as pd
         from app.config.preferences import UserPreferences
@@ -165,10 +165,10 @@ class TestSimulationPlanRouting:
         mock_load.return_value = pd.DataFrame({"formula": ["W2Rh"]})
 
         with patch(
-            "app.skills.simulation_plan.UserPreferences.load",
+            "app.tools.skills.simulation_plan.UserPreferences.load",
             return_value=UserPreferences(compute_budget="local"),
         ):
-            from app.skills.simulation_plan import _plan_simulations
+            from app.tools.skills.simulation_plan import _plan_simulations
 
             result = _plan_simulations(
                 dataset_name="test",
@@ -177,7 +177,7 @@ class TestSimulationPlanRouting:
             assert result["jobs"][0]["method"] == "calphad"
             assert "code" not in result["jobs"][0]
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_dft_backward_compatible(self, mock_load):
         import pandas as pd
         from app.config.preferences import UserPreferences
@@ -185,10 +185,10 @@ class TestSimulationPlanRouting:
         mock_load.return_value = pd.DataFrame({"formula": ["W2Rh"]})
 
         with patch(
-            "app.skills.simulation_plan.UserPreferences.load",
+            "app.tools.skills.simulation_plan.UserPreferences.load",
             return_value=UserPreferences(compute_budget="local"),
         ):
-            from app.skills.simulation_plan import _plan_simulations
+            from app.tools.skills.simulation_plan import _plan_simulations
 
             result = _plan_simulations(
                 dataset_name="test",

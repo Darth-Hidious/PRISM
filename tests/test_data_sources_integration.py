@@ -6,7 +6,7 @@ from unittest.mock import patch, MagicMock
 
 class TestGetDefaultCollectorRegistry:
     def test_returns_registry_with_builtin_collectors(self):
-        from app.data.base_collector import get_default_collector_registry
+        from app.tools.data_collectors.base_collector import get_default_collector_registry
         reg = get_default_collector_registry()
         names = [c.name for c in reg.list_collectors()]
         # OPTIMADE and MP should always register (they have no import guards)
@@ -14,7 +14,7 @@ class TestGetDefaultCollectorRegistry:
         assert "mp" in names
 
     def test_includes_new_collectors(self):
-        from app.data.base_collector import get_default_collector_registry
+        from app.tools.data_collectors.base_collector import get_default_collector_registry
         reg = get_default_collector_registry()
         names = [c.name for c in reg.list_collectors()]
         assert "omat24" in names
@@ -22,7 +22,7 @@ class TestGetDefaultCollectorRegistry:
         assert "patents" in names
 
     def test_at_least_five_collectors(self):
-        from app.data.base_collector import get_default_collector_registry
+        from app.tools.data_collectors.base_collector import get_default_collector_registry
         reg = get_default_collector_registry()
         assert len(reg.list_collectors()) >= 5
 
@@ -55,7 +55,7 @@ class TestOMAT24Integration:
              "pbc": None, "natoms": 2},
         ])
         with patch.dict(sys.modules, {"datasets": mock_mod}):
-            from app.data.omat24_collector import OMAT24Collector
+            from app.tools.data_collectors.omat24_collector import OMAT24Collector
             c = OMAT24Collector()
             results = c.collect(elements=["W"], max_results=10)
             assert len(results) == 1
@@ -63,7 +63,7 @@ class TestOMAT24Integration:
 
 
 class TestLiteratureIntegration:
-    @patch("app.data.literature_collector.requests")
+    @patch("app.tools.data_collectors.literature_collector.requests")
     def test_combined_results(self, mock_requests):
         arxiv_resp = MagicMock()
         arxiv_resp.text = """<?xml version="1.0"?>
@@ -90,7 +90,7 @@ class TestLiteratureIntegration:
 
         mock_requests.get.side_effect = [arxiv_resp, s2_resp]
 
-        from app.data.literature_collector import LiteratureCollector
+        from app.tools.data_collectors.literature_collector import LiteratureCollector
         c = LiteratureCollector()
         results = c.collect(query="tungsten alloy", max_results=20)
         assert len(results) == 2
@@ -99,7 +99,7 @@ class TestLiteratureIntegration:
 
 
 class TestPatentIntegration:
-    @patch("app.data.patent_collector.requests")
+    @patch("app.tools.data_collectors.patent_collector.requests")
     @patch.dict("os.environ", {"LENS_API_TOKEN": "test-token"})
     def test_parsed_results(self, mock_requests):
         resp = MagicMock()
@@ -119,7 +119,7 @@ class TestPatentIntegration:
         resp.raise_for_status = MagicMock()
         mock_requests.post.return_value = resp
 
-        from app.data.patent_collector import PatentCollector
+        from app.tools.data_collectors.patent_collector import PatentCollector
         c = PatentCollector()
         results = c.collect(query="alloy", max_results=10)
         assert len(results) == 1
@@ -128,8 +128,8 @@ class TestPatentIntegration:
 
 
 class TestAcquisitionSkillWithNewSources:
-    @patch("app.data.normalizer.normalize_records")
-    @patch("app.data.store.DataStore")
+    @patch("app.tools.data_collectors.normalizer.normalize_records")
+    @patch("app.tools.data_collectors.store.DataStore")
     def test_omat24_source(self, MockStore, mock_normalize):
         import pandas as pd
         mock_mod = MagicMock()
@@ -145,7 +145,7 @@ class TestAcquisitionSkillWithNewSources:
         mock_store_inst.save = MagicMock()
 
         with patch.dict(sys.modules, {"datasets": mock_mod}):
-            from app.skills.acquisition import _acquire_materials
+            from app.tools.skills.acquisition import _acquire_materials
             result = _acquire_materials(
                 elements=["W", "Rh"],
                 sources=["omat24"],
@@ -158,28 +158,28 @@ class TestAcquisitionSkillWithNewSources:
 
 class TestSupportedParams:
     def test_optimade_supported_params(self):
-        from app.data.collector import OPTIMADECollector
+        from app.tools.data_collectors.collector import OPTIMADECollector
         c = OPTIMADECollector()
         assert "filter_string" in c.supported_params()
         assert "max_per_provider" in c.supported_params()
 
     def test_mp_supported_params(self):
-        from app.data.collector import MPCollector
+        from app.tools.data_collectors.collector import MPCollector
         c = MPCollector()
         assert "formula" in c.supported_params()
         assert "elements" in c.supported_params()
 
     def test_omat24_supported_params(self):
-        from app.data.omat24_collector import OMAT24Collector
+        from app.tools.data_collectors.omat24_collector import OMAT24Collector
         c = OMAT24Collector()
         assert "elements" in c.supported_params()
 
     def test_literature_supported_params(self):
-        from app.data.literature_collector import LiteratureCollector
+        from app.tools.data_collectors.literature_collector import LiteratureCollector
         c = LiteratureCollector()
         assert "query" in c.supported_params()
 
     def test_patents_supported_params(self):
-        from app.data.patent_collector import PatentCollector
+        from app.tools.data_collectors.patent_collector import PatentCollector
         c = PatentCollector()
         assert "query" in c.supported_params()

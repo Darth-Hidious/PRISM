@@ -46,7 +46,7 @@ def _make_links_response(children):
 # ------------------------------------------------------------------
 
 def test_parse_index_response_extracts_providers():
-    from app.search.providers.discovery import parse_index_response
+    from app.tools.search_engine.providers.discovery import parse_index_response
     resp = _make_providers_response([
         ("mp", "Materials Project", "https://index.mp.org"),
         ("cod", "COD", "https://index.cod.org"),
@@ -58,7 +58,7 @@ def test_parse_index_response_extracts_providers():
 
 
 def test_parse_index_response_skips_meta():
-    from app.search.providers.discovery import parse_index_response
+    from app.tools.search_engine.providers.discovery import parse_index_response
     resp = _make_providers_response([
         ("exmpl", "Example", "https://example.com"),
         ("optimade", "OPTIMADE", "https://optimade.org"),
@@ -70,7 +70,7 @@ def test_parse_index_response_skips_meta():
 
 
 def test_parse_index_response_skips_null_url():
-    from app.search.providers.discovery import parse_index_response
+    from app.tools.search_engine.providers.discovery import parse_index_response
     resp = {
         "data": [
             {"id": "aiida", "attributes": {"name": "AiiDA", "base_url": None, "link_type": "external"}},
@@ -85,7 +85,7 @@ def test_parse_index_response_skips_null_url():
 # ------------------------------------------------------------------
 
 def test_parse_links_response_extracts_children():
-    from app.search.providers.discovery import parse_links_response
+    from app.tools.search_engine.providers.discovery import parse_links_response
     resp = _make_links_response([
         ("pbe", "Alexandria PBE", "https://alexandria.rub.de/pbe"),
         ("pbesol", "Alexandria PBEsol", "https://alexandria.rub.de/pbesol"),
@@ -104,7 +104,7 @@ def test_parse_links_response_ignores_non_child():
             {"id": "db1", "attributes": {"name": "DB1", "base_url": "https://db1.org", "link_type": "child"}},
         ]
     }
-    from app.search.providers.discovery import parse_links_response
+    from app.tools.search_engine.providers.discovery import parse_links_response
     children = parse_links_response(resp)
     assert len(children) == 1
     assert children[0]["id"] == "db1"
@@ -115,7 +115,7 @@ def test_parse_links_response_ignores_non_child():
 # ------------------------------------------------------------------
 
 def test_save_and_load_cache(tmp_path):
-    from app.search.providers.discovery import save_cache, load_cache
+    from app.tools.search_engine.providers.discovery import save_cache, load_cache
     endpoints = [{"id": "mp", "name": "MP", "base_url": "https://mp.org"}]
     cache_path = tmp_path / "cache.json"
     save_cache(endpoints, path=cache_path)
@@ -126,12 +126,12 @@ def test_save_and_load_cache(tmp_path):
 
 
 def test_load_cache_returns_none_if_missing(tmp_path):
-    from app.search.providers.discovery import load_cache
+    from app.tools.search_engine.providers.discovery import load_cache
     assert load_cache(path=tmp_path / "nope.json") is None
 
 
 def test_is_cache_fresh():
-    from app.search.providers.discovery import is_cache_fresh
+    from app.tools.search_engine.providers.discovery import is_cache_fresh
     fresh = {"cached_at": time.time()}
     assert is_cache_fresh(fresh) is True
     stale = {"cached_at": time.time() - 86400 * 10}

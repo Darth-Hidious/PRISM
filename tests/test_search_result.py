@@ -1,12 +1,12 @@
 def test_property_value_creation():
-    from app.search.result import PropertyValue
+    from app.tools.search_engine.result import PropertyValue
     pv = PropertyValue(value=2.2, source="optimade:mp", method="DFT-PBE", unit="eV")
     assert pv.value == 2.2
     assert pv.source == "optimade:mp"
 
 
 def test_material_creation():
-    from app.search.result import Material
+    from app.tools.search_engine.result import Material
     m = Material(
         id="mp-1234",
         formula="Fe2O3",
@@ -19,7 +19,7 @@ def test_material_creation():
 
 
 def test_material_extra_properties():
-    from app.search.result import Material, PropertyValue
+    from app.tools.search_engine.result import Material, PropertyValue
     m = Material(
         id="mp-1234", formula="Fe2O3", elements=["Fe", "O"],
         n_elements=2, sources=["mp"],
@@ -33,7 +33,7 @@ def test_material_extra_properties():
 
 
 def test_provider_query_log():
-    from app.search.result import ProviderQueryLog
+    from app.tools.search_engine.result import ProviderQueryLog
     log = ProviderQueryLog(
         provider_id="mp", provider_name="Materials Project",
         endpoint_url="https://optimade.materialsproject.org/v1/structures",
@@ -46,8 +46,8 @@ def test_provider_query_log():
 
 
 def test_search_result():
-    from app.search.result import SearchResult, Material, ProviderQueryLog
-    from app.search.query import MaterialSearchQuery
+    from app.tools.search_engine.result import SearchResult, Material, ProviderQueryLog
+    from app.tools.search_engine.query import MaterialSearchQuery
     r = SearchResult(
         materials=[],
         total_count=0,

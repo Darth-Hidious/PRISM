@@ -1,8 +1,8 @@
 from unittest.mock import patch, MagicMock
 import pytest
 
-from app.search.query import MaterialSearchQuery, PropertyRange
-from app.search.providers.endpoint import ProviderEndpoint, AuthConfig, BehaviorConfig, CapabilitiesConfig
+from app.tools.search_engine.query import MaterialSearchQuery, PropertyRange
+from app.tools.search_engine.providers.endpoint import ProviderEndpoint, AuthConfig, BehaviorConfig, CapabilitiesConfig
 
 
 def _make_mp_endpoint():
@@ -20,14 +20,14 @@ def _make_mp_endpoint():
 
 
 def test_mp_provider_creates():
-    from app.search.providers.materials_project import MaterialsProjectProvider
+    from app.tools.search_engine.providers.materials_project import MaterialsProjectProvider
     ep = _make_mp_endpoint()
     p = MaterialsProjectProvider(endpoint=ep)
     assert p.id == "mp_native"
 
 
 def test_mp_provider_parse_doc():
-    from app.search.providers.materials_project import MaterialsProjectProvider
+    from app.tools.search_engine.providers.materials_project import MaterialsProjectProvider
     ep = _make_mp_endpoint()
     p = MaterialsProjectProvider(endpoint=ep)
     doc = {
@@ -48,7 +48,7 @@ def test_mp_provider_parse_doc():
 
 
 def test_mp_provider_skips_without_api_key():
-    from app.search.providers.materials_project import MaterialsProjectProvider
+    from app.tools.search_engine.providers.materials_project import MaterialsProjectProvider
     ep = _make_mp_endpoint()
     p = MaterialsProjectProvider(endpoint=ep)
     with patch.dict("os.environ", {}, clear=True):

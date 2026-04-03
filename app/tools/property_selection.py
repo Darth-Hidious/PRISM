@@ -9,7 +9,7 @@ def _list_predictable_properties(**kwargs) -> dict:
     if not dataset_name:
         return {"error": "dataset_name is required"}
 
-    from app.data.store import DataStore
+    from app.tools.data_collectors.store import DataStore
 
     store = DataStore()
     try:
@@ -46,7 +46,7 @@ def _list_predictable_properties(**kwargs) -> dict:
 
     # Check existing models
     try:
-        from app.ml.registry import ModelRegistry
+        from app.tools.ml.registry import ModelRegistry
 
         registry = ModelRegistry()
         models = registry.list_models()

@@ -9,7 +9,7 @@ from app.tools.visualization import _plot_correlation_matrix
 
 
 class TestPlotCorrelationMatrix:
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_generates_plot(self, mock_load, tmp_path):
         df = pd.DataFrame({
             "band_gap": [1.0, 2.0, 3.0, 4.0, 5.0],
@@ -25,7 +25,7 @@ class TestPlotCorrelationMatrix:
         assert result["n_properties"] == 3
         assert (tmp_path / "corr.png").exists()
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_insufficient_columns(self, mock_load):
         df = pd.DataFrame({
             "formula": ["A", "B", "C"],
@@ -38,7 +38,7 @@ class TestPlotCorrelationMatrix:
         assert "error" in result
         assert "at least 2" in result["error"]
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_returns_top_correlations(self, mock_load, tmp_path):
         df = pd.DataFrame({
             "a": [1.0, 2.0, 3.0, 4.0],
@@ -55,7 +55,7 @@ class TestPlotCorrelationMatrix:
         top = result["top_correlations"][0]
         assert abs(top["correlation"]) > 0.9
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_with_column_filter(self, mock_load, tmp_path):
         df = pd.DataFrame({
             "a": [1.0, 2.0, 3.0],

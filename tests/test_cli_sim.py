@@ -11,14 +11,14 @@ def runner():
 
 
 class TestSimStatus:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=False)
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=False)
     def test_no_pyiron(self, _m, runner):
         result = runner.invoke(cli, ["sim", "status"])
         assert result.exit_code == 0
         assert "not installed" in result.output
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_with_pyiron(self, mock_bridge_fn, _avail, runner):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -33,14 +33,14 @@ class TestSimStatus:
 
 
 class TestSimJobs:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=False)
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=False)
     def test_no_pyiron(self, _m, runner):
         result = runner.invoke(cli, ["sim", "jobs"])
         assert result.exit_code == 0
         assert "not installed" in result.output
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.get_bridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.get_bridge")
     def test_empty_jobs(self, mock_bridge_fn, _avail, runner):
         bridge = MagicMock()
         mock_bridge_fn.return_value = bridge
@@ -52,14 +52,14 @@ class TestSimJobs:
 
 
 class TestSimInit:
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=False)
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=False)
     def test_no_pyiron(self, _m, runner):
         result = runner.invoke(cli, ["sim", "init"])
         assert result.exit_code == 0
         assert "not installed" in result.output
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.simulation.bridge.PyironBridge")
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.PyironBridge")
     def test_init_success(self, MockBridge, _avail, runner):
         mock_bridge = MagicMock()
         MockBridge.return_value = mock_bridge

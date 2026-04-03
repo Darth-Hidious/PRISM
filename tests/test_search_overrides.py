@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 def test_overrides_file_is_valid_json():
-    path = Path(__file__).parent.parent / "app" / "search" / "providers" / "provider_overrides.json"
+    path = Path(__file__).parent.parent / "app" / "tools" / "search_engine" / "providers" / "provider_overrides.json"
     data = json.loads(path.read_text())
     assert "overrides" in data
     assert "defaults" in data
@@ -13,7 +13,7 @@ def test_overrides_file_is_valid_json():
 
 def test_overrides_have_no_base_url_for_optimade_providers():
     """OPTIMADE providers get their base_url from discovery, not overrides."""
-    path = Path(__file__).parent.parent / "app" / "search" / "providers" / "provider_overrides.json"
+    path = Path(__file__).parent.parent / "app" / "tools" / "search_engine" / "providers" / "provider_overrides.json"
     data = json.loads(path.read_text())
     for pid, override in data["overrides"].items():
         api_type = override.get("api_type", "optimade")
@@ -24,7 +24,7 @@ def test_overrides_have_no_base_url_for_optimade_providers():
 def test_layer2_overrides_are_optimade_only():
     """Layer 2 overrides should only contain OPTIMADE providers.
     Native/auth-gated providers belong in Layer 3 (catalog.json)."""
-    path = Path(__file__).parent.parent / "app" / "search" / "providers" / "provider_overrides.json"
+    path = Path(__file__).parent.parent / "app" / "tools" / "search_engine" / "providers" / "provider_overrides.json"
     data = json.loads(path.read_text())
     for pid, override in data["overrides"].items():
         api_type = override.get("api_type", "optimade")
@@ -41,7 +41,7 @@ def test_marketplace_native_providers_have_base_url():
 
 
 def test_apply_overrides_merges_fields():
-    from app.search.providers.discovery import apply_overrides
+    from app.tools.search_engine.providers.discovery import apply_overrides
     discovered = [
         {"id": "mp", "name": "Materials Project", "base_url": "https://mp.org"},
         {"id": "cod", "name": "COD", "base_url": "https://cod.org"},
@@ -61,7 +61,7 @@ def test_apply_overrides_merges_fields():
 
 def test_apply_overrides_adds_native_providers():
     """Native API entries in overrides are injected even if not discovered."""
-    from app.search.providers.discovery import apply_overrides
+    from app.tools.search_engine.providers.discovery import apply_overrides
     discovered = [{"id": "mp", "name": "MP", "base_url": "https://mp.org"}]
     overrides = {
         "mp_native": {
