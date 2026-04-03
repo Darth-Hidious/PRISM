@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from app.skills.selection import SELECT_SKILL, _select_materials
+from app.tools.skills.selection import SELECT_SKILL, _select_materials
 
 
 @pytest.fixture
@@ -27,8 +27,8 @@ class TestSelectSkill:
         tool = SELECT_SKILL.to_tool()
         assert tool.name == "select_materials"
 
-    @patch("app.data.store.DataStore.save")
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.save")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_select_with_criteria(self, mock_load, mock_save, sample_df):
         mock_load.return_value = sample_df
         mock_save.return_value = "/tmp/test.parquet"
@@ -41,8 +41,8 @@ class TestSelectSkill:
         assert result["selected_count"] <= 5
         assert result["dataset_name"] == "test_data_selected"
 
-    @patch("app.data.store.DataStore.save")
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.save")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_select_sort_and_top_n(self, mock_load, mock_save, sample_df):
         mock_load.return_value = sample_df
         mock_save.return_value = "/tmp/test.parquet"
@@ -55,14 +55,14 @@ class TestSelectSkill:
 
         assert result["selected_count"] == 2
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_dataset_not_found(self, mock_load):
         mock_load.side_effect = FileNotFoundError()
 
         result = _select_materials(dataset_name="nonexistent")
         assert "error" in result
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_no_matches(self, mock_load, sample_df):
         mock_load.return_value = sample_df
 
@@ -72,8 +72,8 @@ class TestSelectSkill:
         )
         assert "error" in result
 
-    @patch("app.data.store.DataStore.save")
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.save")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_custom_output_name(self, mock_load, mock_save, sample_df):
         mock_load.return_value = sample_df
         mock_save.return_value = "/tmp/test.parquet"

@@ -32,7 +32,7 @@ class TestCreateSearchTools:
 
 
 class TestLiteratureSearchFunc:
-    @patch("app.data.literature_collector.LiteratureCollector.collect")
+    @patch("app.tools.data_collectors.literature_collector.LiteratureCollector.collect")
     def test_returns_results(self, mock_collect):
         mock_collect.return_value = [
             {"source": "arxiv", "title": "Paper 1"},
@@ -43,7 +43,7 @@ class TestLiteratureSearchFunc:
         assert result["query"] == "tungsten alloy"
         assert len(result["results"]) == 2
 
-    @patch("app.data.literature_collector.LiteratureCollector.collect")
+    @patch("app.tools.data_collectors.literature_collector.LiteratureCollector.collect")
     def test_empty_results(self, mock_collect):
         mock_collect.return_value = []
         result = _literature_search(query="")
@@ -52,7 +52,7 @@ class TestLiteratureSearchFunc:
 
 
 class TestPatentSearchFunc:
-    @patch("app.data.patent_collector.PatentCollector.collect")
+    @patch("app.tools.data_collectors.patent_collector.PatentCollector.collect")
     def test_returns_results(self, mock_collect):
         mock_collect.return_value = [
             {"source": "lens_patents", "title": "Patent 1"},
@@ -61,7 +61,7 @@ class TestPatentSearchFunc:
         assert result["count"] == 1
         assert result["query"] == "alloy coating"
 
-    @patch("app.data.patent_collector.PatentCollector.collect")
+    @patch("app.tools.data_collectors.patent_collector.PatentCollector.collect")
     def test_no_token_empty(self, mock_collect):
         mock_collect.return_value = []
         result = _patent_search(query="alloy")

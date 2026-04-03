@@ -1,7 +1,7 @@
 """Tests for ML visualization."""
 import pytest
 import numpy as np
-from app.ml.viz import plot_parity, plot_feature_importance
+from app.tools.ml.viz import plot_parity, plot_feature_importance
 
 
 class TestMLViz:

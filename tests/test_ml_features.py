@@ -6,21 +6,21 @@ class TestCompositionFeaturesBasic:
     """Test the built-in fallback feature backend."""
 
     def test_simple_element(self):
-        from app.ml.features import _composition_features_basic
+        from app.tools.ml.features import _composition_features_basic
         features = _composition_features_basic("Fe")
         assert features["n_elements"] == 1
         assert features["avg_atomic_mass"] == 55.85
         assert features["std_atomic_mass"] == 0.0
 
     def test_binary_compound(self):
-        from app.ml.features import _composition_features_basic
+        from app.tools.ml.features import _composition_features_basic
         features = _composition_features_basic("Fe2O3")
         assert features["n_elements"] == 2
         assert features["total_atoms_in_formula"] == 5.0
         assert features["range_atomic_mass"] > 0
 
     def test_unknown_element_partial(self):
-        from app.ml.features import _composition_features_basic
+        from app.tools.ml.features import _composition_features_basic
         # Xe is not in ELEMENT_DATA
         features = _composition_features_basic("Xe")
         assert features.get("n_elements") == 1
@@ -28,11 +28,11 @@ class TestCompositionFeaturesBasic:
         assert "avg_atomic_mass" not in features
 
     def test_empty_formula(self):
-        from app.ml.features import _composition_features_basic
+        from app.tools.ml.features import _composition_features_basic
         assert _composition_features_basic("") == {}
 
     def test_feature_count(self):
-        from app.ml.features import _composition_features_basic
+        from app.tools.ml.features import _composition_features_basic
         features = _composition_features_basic("SiO2")
         # n_elements + total_atoms + 4 props * 5 stats = 22
         assert len(features) == 22
@@ -42,21 +42,21 @@ class TestCompositionFeaturesDispatch:
     """Test the auto-dispatch between matminer and basic."""
 
     def test_composition_features_returns_dict(self):
-        from app.ml.features import composition_features
+        from app.tools.ml.features import composition_features
         features = composition_features("Fe2O3")
         assert isinstance(features, dict)
         assert len(features) > 0
         assert "n_elements" in features
 
     def test_get_feature_backend(self):
-        from app.ml.features import get_feature_backend
+        from app.tools.ml.features import get_feature_backend
         backend = get_feature_backend()
         assert backend in ("matminer", "basic")
 
     def test_matminer_features_more_than_basic(self):
         """If matminer is available, should produce more features."""
-        from app.ml.features import get_feature_backend, composition_features
-        from app.ml.features import _composition_features_basic
+        from app.tools.ml.features import get_feature_backend, composition_features
+        from app.tools.ml.features import _composition_features_basic
         features = composition_features("Fe2O3")
         basic = _composition_features_basic("Fe2O3")
         if get_feature_backend() == "matminer":
@@ -66,7 +66,7 @@ class TestCompositionFeaturesDispatch:
 
     def test_fallback_on_bad_formula(self):
         """Even with matminer, bad formula should return something or empty."""
-        from app.ml.features import composition_features
+        from app.tools.ml.features import composition_features
         # This is a weird formula — matminer might fail, fallback should handle
         result = composition_features("XYZ123NotReal")
         # Should return dict (possibly empty)
@@ -75,21 +75,21 @@ class TestCompositionFeaturesDispatch:
 
 class TestParseFormula:
     def test_simple(self):
-        from app.ml.features import _parse_formula
+        from app.tools.ml.features import _parse_formula
         assert _parse_formula("Fe2O3") == {"Fe": 2.0, "O": 3.0}
 
     def test_single_element(self):
-        from app.ml.features import _parse_formula
+        from app.tools.ml.features import _parse_formula
         assert _parse_formula("Si") == {"Si": 1.0}
 
     def test_no_count(self):
-        from app.ml.features import _parse_formula
+        from app.tools.ml.features import _parse_formula
         assert _parse_formula("NaCl") == {"Na": 1.0, "Cl": 1.0}
 
 
 class TestPretrainedModels:
     def test_list_pretrained(self):
-        from app.ml.pretrained import list_pretrained_models
+        from app.tools.ml.pretrained import list_pretrained_models
         models = list_pretrained_models()
         assert len(models) >= 3
         names = [m["name"] for m in models]
@@ -98,18 +98,18 @@ class TestPretrainedModels:
         assert "megnet-bandgap" in names
 
     def test_unknown_model(self):
-        from app.ml.pretrained import predict_with_pretrained
+        from app.tools.ml.pretrained import predict_with_pretrained
         result = predict_with_pretrained("nonexistent-model")
         assert "error" in result
 
     def test_no_structure(self):
-        from app.ml.pretrained import predict_with_pretrained
+        from app.tools.ml.pretrained import predict_with_pretrained
         result = predict_with_pretrained("m3gnet-eform")
         assert "error" in result
         assert "structure" in result["error"].lower()
 
     def test_bad_structure_data(self):
-        from app.ml.pretrained import predict_with_pretrained
+        from app.tools.ml.pretrained import predict_with_pretrained
         result = predict_with_pretrained(
             "m3gnet-eform",
             structure_data={"lattice": None, "species": None, "coords": None},
@@ -119,7 +119,7 @@ class TestPretrainedModels:
 
 class TestAlgorithmRegistry:
     def test_default_has_sklearn(self):
-        from app.ml.algorithm_registry import get_default_registry
+        from app.tools.ml.algorithm_registry import get_default_registry
         reg = get_default_registry()
         algos = reg.list_algorithms()
         names = [a["name"] for a in algos]
@@ -128,7 +128,7 @@ class TestAlgorithmRegistry:
         assert "linear" in names
 
     def test_pretrained_flag(self):
-        from app.ml.algorithm_registry import get_default_registry
+        from app.tools.ml.algorithm_registry import get_default_registry
         reg = get_default_registry()
         algos = reg.list_algorithms()
         for a in algos:

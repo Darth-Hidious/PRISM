@@ -34,7 +34,7 @@ class TestCreateCalphadTools:
 class TestGuardedTools:
     """Calculation tools return error when pycalphad is missing."""
 
-    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
     def test_phase_diagram_guard(self, mock_check):
         result = _calculate_phase_diagram(
             database_name="test", components=["Al", "Ni"]
@@ -42,7 +42,7 @@ class TestGuardedTools:
         assert "error" in result
         assert "pycalphad" in result["error"]
 
-    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
     def test_equilibrium_guard(self, mock_check):
         result = _calculate_equilibrium(
             database_name="test",
@@ -51,7 +51,7 @@ class TestGuardedTools:
         )
         assert "error" in result
 
-    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
     def test_gibbs_energy_guard(self, mock_check):
         result = _calculate_gibbs_energy(
             database_name="test",
@@ -61,7 +61,7 @@ class TestGuardedTools:
         )
         assert "error" in result
 
-    @patch("app.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
     def test_list_phases_guard(self, mock_check):
         result = _list_phases(database_name="test")
         assert "error" in result
@@ -70,7 +70,7 @@ class TestGuardedTools:
 class TestUnguardedTools:
     """Database management tools work without pycalphad."""
 
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_list_databases_works(self, mock_bridge_fn):
         mock_bridge = MagicMock()
         mock_bridge.databases.list_databases.return_value = []
@@ -80,7 +80,7 @@ class TestUnguardedTools:
         assert result["count"] == 0
         assert result["databases"] == []
 
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_import_database_works(self, mock_bridge_fn, tmp_path):
         tdb_file = tmp_path / "test.tdb"
         tdb_file.write_text("$ test")
@@ -101,7 +101,7 @@ class TestCalculateToolsWithMock:
     """Test calculate tools with mocked bridge."""
 
     @patch("app.tools.calphad._guard", return_value=None)
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_phase_diagram(self, mock_bridge_fn, mock_guard):
         mock_bridge = MagicMock()
         mock_bridge.calculate_phase_diagram.return_value = {
@@ -120,7 +120,7 @@ class TestCalculateToolsWithMock:
         assert result["database"] == "test"
 
     @patch("app.tools.calphad._guard", return_value=None)
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_equilibrium(self, mock_bridge_fn, mock_guard):
         mock_bridge = MagicMock()
         mock_bridge.calculate_equilibrium.return_value = {
@@ -140,7 +140,7 @@ class TestCalculateToolsWithMock:
         assert "phases_present" in result
 
     @patch("app.tools.calphad._guard", return_value=None)
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_gibbs_energy(self, mock_bridge_fn, mock_guard):
         mock_bridge = MagicMock()
         mock_bridge.calculate_gibbs_energy.return_value = {
@@ -161,7 +161,7 @@ class TestCalculateToolsWithMock:
         assert "gibbs_energies" in result
 
     @patch("app.tools.calphad._guard", return_value=None)
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_list_phases(self, mock_bridge_fn, mock_guard):
         mock_bridge = MagicMock()
         mock_bridge.databases.get_phases.return_value = ["FCC_A1", "BCC_A2", "LIQUID"]
@@ -172,7 +172,7 @@ class TestCalculateToolsWithMock:
         assert "FCC_A1" in result["phases"]
 
     @patch("app.tools.calphad._guard", return_value=None)
-    @patch("app.simulation.calphad_bridge.get_calphad_bridge")
+    @patch("app.tools.simulation.calphad_bridge.get_calphad_bridge")
     def test_list_phases_not_found(self, mock_bridge_fn, mock_guard):
         mock_bridge = MagicMock()
         mock_bridge.databases.get_phases.return_value = None

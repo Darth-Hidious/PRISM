@@ -45,9 +45,9 @@ def data():
 def collect(elements, formula, providers, limit, name):
     """Collect materials data from federated OPTIMADE search and save as a dataset."""
     console = Console()
-    from app.search import SearchEngine, MaterialSearchQuery
-    from app.search.providers.registry import build_registry
-    from app.data.store import DataStore
+    from app.tools.search_engine import SearchEngine, MaterialSearchQuery
+    from app.tools.search_engine.providers.registry import build_registry
+    from app.tools.data_collectors.store import DataStore
 
     if not elements and not formula:
         console.print("[red]Provide --elements or --formula[/red]")
@@ -112,7 +112,7 @@ def import_cmd(file_path, name, file_format):
 def status():
     """Show available datasets and their metadata."""
     console = Console()
-    from app.data.store import DataStore
+    from app.tools.data_collectors.store import DataStore
     store = DataStore()
     datasets = store.list_datasets()
     if not datasets:

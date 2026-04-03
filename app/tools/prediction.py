@@ -8,7 +8,7 @@ def _predict_property(**kwargs) -> dict:
     algorithm = kwargs.get("algorithm", "random_forest")
 
     try:
-        from app.ml.predictor import Predictor
+        from app.tools.ml.predictor import Predictor
         predictor = Predictor()
         return predictor.predict(formula, property_name, algorithm)
     except Exception as e:
@@ -21,7 +21,7 @@ def _predict_structure(**kwargs) -> dict:
     structure_data = kwargs.get("structure")
 
     try:
-        from app.ml.pretrained import predict_with_pretrained
+        from app.tools.ml.pretrained import predict_with_pretrained
         return predict_with_pretrained(
             model_name=model_name,
             structure_data=structure_data,
@@ -32,14 +32,14 @@ def _predict_structure(**kwargs) -> dict:
 
 def _list_models(**kwargs) -> dict:
     try:
-        from app.ml.registry import ModelRegistry
+        from app.tools.ml.registry import ModelRegistry
         registry = ModelRegistry()
         trained = registry.list_models()
 
-        from app.ml.pretrained import list_pretrained_models
+        from app.tools.ml.pretrained import list_pretrained_models
         pretrained = list_pretrained_models()
 
-        from app.ml.features import get_feature_backend
+        from app.tools.ml.features import get_feature_backend
         backend = get_feature_backend()
 
         return {

@@ -1,6 +1,6 @@
 """Tests for DataCollector ABC and CollectorRegistry."""
 import pytest
-from app.data.base_collector import DataCollector, CollectorRegistry
+from app.tools.data_collectors.base_collector import DataCollector, CollectorRegistry
 
 
 class FakeCollector(DataCollector):

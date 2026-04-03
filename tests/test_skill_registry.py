@@ -1,6 +1,6 @@
 """Tests for the built-in skill registry."""
 
-from app.skills.registry import load_builtin_skills
+from app.tools.skills.registry import load_builtin_skills
 from app.tools.base import ToolRegistry
 
 

@@ -10,8 +10,8 @@ from app.tools.base import Tool, ToolRegistry
 def _search_materials(**kwargs) -> dict:
     """Search materials via the PRISM federated search engine."""
     import asyncio
-    from app.search import SearchEngine, MaterialSearchQuery, PropertyRange
-    from app.search.providers.registry import build_registry
+    from app.tools.search_engine import SearchEngine, MaterialSearchQuery, PropertyRange
+    from app.tools.search_engine.providers.registry import build_registry
 
     try:
         elements = kwargs.get("elements")
@@ -96,7 +96,7 @@ def _import_dataset(**kwargs) -> dict:
     """Import a local file (CSV, JSON, Parquet) into the PRISM DataStore."""
     import pandas as pd
     from pathlib import Path
-    from app.data.store import DataStore
+    from app.tools.data_collectors.store import DataStore
 
     file_path = kwargs["file_path"]
     dataset_name = kwargs.get("dataset_name")

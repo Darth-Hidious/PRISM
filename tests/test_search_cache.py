@@ -1,5 +1,5 @@
-from app.search.query import MaterialSearchQuery
-from app.search.result import Material, SearchResult
+from app.tools.search_engine.query import MaterialSearchQuery
+from app.tools.search_engine.result import Material, SearchResult
 
 
 def _make_result(formula="Fe2O3", count=1):
@@ -12,7 +12,7 @@ def _make_result(formula="Fe2O3", count=1):
 
 
 def test_cache_put_get():
-    from app.search.cache.engine import SearchCache
+    from app.tools.search_engine.cache.engine import SearchCache
     cache = SearchCache()
     q = MaterialSearchQuery(elements=["Fe", "O"])
     r = _make_result()
@@ -23,14 +23,14 @@ def test_cache_put_get():
 
 
 def test_cache_miss():
-    from app.search.cache.engine import SearchCache
+    from app.tools.search_engine.cache.engine import SearchCache
     cache = SearchCache()
     q = MaterialSearchQuery(elements=["Si"])
     assert cache.get(q) is None
 
 
 def test_cache_material_index():
-    from app.search.cache.engine import SearchCache
+    from app.tools.search_engine.cache.engine import SearchCache
     cache = SearchCache()
     q = MaterialSearchQuery(elements=["Fe", "O"])
     cache.put(q, _make_result())
@@ -40,7 +40,7 @@ def test_cache_material_index():
 
 
 def test_cache_get_all_materials():
-    from app.search.cache.engine import SearchCache
+    from app.tools.search_engine.cache.engine import SearchCache
     cache = SearchCache()
     cache.put(MaterialSearchQuery(elements=["Fe"]), _make_result("Fe2O3"))
     cache.put(MaterialSearchQuery(elements=["Si"]), _make_result("SiO2"))
@@ -49,7 +49,7 @@ def test_cache_get_all_materials():
 
 
 def test_cache_stats():
-    from app.search.cache.engine import SearchCache
+    from app.tools.search_engine.cache.engine import SearchCache
     cache = SearchCache()
     cache.put(MaterialSearchQuery(elements=["Fe"]), _make_result())
     s = cache.stats()
@@ -58,7 +58,7 @@ def test_cache_stats():
 
 
 def test_cache_clear():
-    from app.search.cache.engine import SearchCache
+    from app.tools.search_engine.cache.engine import SearchCache
     cache = SearchCache()
     cache.put(MaterialSearchQuery(elements=["Fe"]), _make_result())
     cache.clear()
@@ -66,7 +66,7 @@ def test_cache_clear():
 
 
 def test_cache_disk_persist(tmp_path):
-    from app.search.cache.engine import SearchCache
+    from app.tools.search_engine.cache.engine import SearchCache
     cache = SearchCache(disk_dir=tmp_path)
     q = MaterialSearchQuery(elements=["Fe", "O"])
     cache.put(q, _make_result())

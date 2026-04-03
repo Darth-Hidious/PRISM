@@ -63,7 +63,7 @@ class TestPluginIntegration:
         """A plugin can register a custom data collector."""
         plugin_file = tmp_path / "collector_plugin.py"
         plugin_file.write_text(
-            "from app.data.base_collector import DataCollector\n"
+            "from app.tools.data_collectors.base_collector import DataCollector\n"
             "class MyCollector(DataCollector):\n"
             "    name = 'my_source'\n"
             "    def collect(self, **kwargs):\n"

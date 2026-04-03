@@ -1,6 +1,6 @@
 """Tests for feature engineering."""
 import pytest
-from app.ml.features import composition_features
+from app.tools.ml.features import composition_features
 
 
 class TestCompositionFeatures:

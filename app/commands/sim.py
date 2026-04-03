@@ -14,13 +14,13 @@ def sim_status():
     """Show pyiron configuration, available codes, and job counts."""
     console = Console(force_terminal=True, width=120)
 
-    from app.simulation.bridge import check_pyiron_available
+    from app.tools.simulation.bridge import check_pyiron_available
     if not check_pyiron_available():
         console.print("[yellow]pyiron_atomistics is not installed.[/yellow]")
         console.print("Install with: [cyan]pip install prism-platform[simulation][/cyan]")
         return
 
-    from app.simulation.bridge import get_bridge
+    from app.tools.simulation.bridge import get_bridge
     bridge = get_bridge()
 
     console.print("[bold cyan]Pyiron Simulation Status[/bold cyan]")
@@ -52,12 +52,12 @@ def sim_jobs(status):
     """List recent simulation jobs."""
     console = Console(force_terminal=True, width=120)
 
-    from app.simulation.bridge import check_pyiron_available
+    from app.tools.simulation.bridge import check_pyiron_available
     if not check_pyiron_available():
         console.print("[yellow]pyiron_atomistics is not installed.[/yellow]")
         return
 
-    from app.simulation.bridge import get_bridge
+    from app.tools.simulation.bridge import get_bridge
     bridge = get_bridge()
     summaries = bridge.jobs.to_summary_list()
     if status:
@@ -83,13 +83,13 @@ def sim_init(name):
     """Initialize a pyiron project directory."""
     console = Console(force_terminal=True, width=120)
 
-    from app.simulation.bridge import check_pyiron_available
+    from app.tools.simulation.bridge import check_pyiron_available
     if not check_pyiron_available():
         console.print("[yellow]pyiron_atomistics is not installed.[/yellow]")
         console.print("Install with: [cyan]pip install prism-platform[simulation][/cyan]")
         return
 
-    from app.simulation.bridge import PyironBridge
+    from app.tools.simulation.bridge import PyironBridge
     bridge = PyironBridge(project_name=name)
     try:
         pr = bridge.get_project()

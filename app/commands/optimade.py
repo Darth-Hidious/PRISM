@@ -3,7 +3,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from app.search.providers.registry import build_registry
+from app.tools.search_engine.providers.registry import build_registry
 
 
 @click.group()

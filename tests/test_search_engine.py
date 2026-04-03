@@ -4,10 +4,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.search.cache.engine import SearchCache
-from app.search.query import MaterialSearchQuery, PropertyRange
-from app.search.resilience.circuit_breaker import HealthManager
-from app.search.result import Material, PropertyValue
+from app.tools.search_engine.cache.engine import SearchCache
+from app.tools.search_engine.query import MaterialSearchQuery, PropertyRange
+from app.tools.search_engine.resilience.circuit_breaker import HealthManager
+from app.tools.search_engine.result import Material, PropertyValue
 
 
 def _mock_material(pid="mp", formula="Fe2O3"):
@@ -20,7 +20,7 @@ def _mock_material(pid="mp", formula="Fe2O3"):
 
 def _isolated_engine(registry):
     """Create a SearchEngine with no disk persistence (fully isolated)."""
-    from app.search.engine import SearchEngine
+    from app.tools.search_engine.engine import SearchEngine
     return SearchEngine(
         registry=registry,
         cache=SearchCache(disk_dir=None),
@@ -29,13 +29,13 @@ def _isolated_engine(registry):
 
 
 def test_engine_creates():
-    from app.search.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.registry import ProviderRegistry
     engine = _isolated_engine(ProviderRegistry())
     assert engine is not None
 
 
 def test_engine_search_empty_registry():
-    from app.search.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.registry import ProviderRegistry
     engine = _isolated_engine(ProviderRegistry())
     q = MaterialSearchQuery(elements=["Fe"])
     result = asyncio.run(engine.search(q))
@@ -44,8 +44,8 @@ def test_engine_search_empty_registry():
 
 
 def test_engine_search_with_mock_provider():
-    from app.search.providers.registry import ProviderRegistry
-    from app.search.providers.base import Provider, ProviderCapabilities
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
 
     class MockProvider(Provider):
         id = "mock"
@@ -66,8 +66,8 @@ def test_engine_search_with_mock_provider():
 
 
 def test_engine_search_provider_failure_graceful():
-    from app.search.providers.registry import ProviderRegistry
-    from app.search.providers.base import Provider, ProviderCapabilities
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
 
     class FailProvider(Provider):
         id = "fail"
@@ -97,8 +97,8 @@ def test_engine_search_provider_failure_graceful():
 
 
 def test_engine_caches_result():
-    from app.search.providers.registry import ProviderRegistry
-    from app.search.providers.base import Provider, ProviderCapabilities
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
 
     call_count = 0
     class CountingProvider(Provider):
@@ -121,8 +121,8 @@ def test_engine_caches_result():
 
 
 def test_engine_audit_trail_has_url():
-    from app.search.providers.registry import ProviderRegistry
-    from app.search.providers.base import Provider, ProviderCapabilities
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
 
     class MockProvider(Provider):
         id = "mock"

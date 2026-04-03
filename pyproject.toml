@@ -103,7 +103,7 @@ Repository = "https://github.com/Darth-Hidious/PRISM"
 "Bug Reports" = "https://github.com/Darth-Hidious/PRISM/issues"
 
 [tool.setuptools]
-packages = ["app", "app.config", "app.db", "app.agent", "app.agent.backends", "app.backend", "app.tools", "app.data", "app.commands", "app.ml", "app.simulation", "app.skills", "app.plugins", "app.validation", "app.cli", "app.cli.tui", "app.cli.slash", "app.search", "app.search.cache", "app.search.providers", "app.search.resilience", "app.workflows", "app.workflows.builtin"]
+packages = ["app", "app.config", "app.db", "app.agent", "app.agent.backends", "app.backend", "app.tools", "app.tools.data_collectors", "app.commands", "app.tools.ml", "app.tools.simulation", "app.tools.skills", "app.plugins", "app.tools.validation", "app.cli", "app.cli.tui", "app.cli.slash", "app.tools.search_engine", "app.tools.search_engine.cache", "app.tools.search_engine.providers", "app.tools.search_engine.resilience", "app.workflows", "app.workflows.builtin"]
 include-package-data = true
 
 [tool.setuptools.package-data]

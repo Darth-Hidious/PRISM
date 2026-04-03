@@ -17,7 +17,7 @@ def test_plugin_registry_has_agent_registry():
 
 def test_plugin_can_register_provider():
     from app.plugins.registry import PluginRegistry
-    from app.search.providers.base import Provider, ProviderCapabilities
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
 
     class FakeProvider(Provider):
         id = "fake"

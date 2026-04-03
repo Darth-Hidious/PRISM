@@ -140,7 +140,7 @@ def detect_skills() -> dict:
     Returns {"count": int, "names": list[str]}.
     """
     try:
-        from app.skills.registry import load_builtin_skills
+        from app.tools.skills.registry import load_builtin_skills
         registry = load_builtin_skills()
         skills = registry.list_skills()
         # list_skills() may return Skill objects — extract names as strings

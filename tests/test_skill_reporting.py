@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from app.skills.reporting import REPORT_SKILL, _generate_report
+from app.tools.skills.reporting import REPORT_SKILL, _generate_report
 
 
 @pytest.fixture
@@ -17,7 +17,7 @@ def mock_prefs(monkeypatch, tmp_path):
         output_dir=str(tmp_path / "output"), report_format="markdown"
     )
     monkeypatch.setattr(
-        "app.skills.reporting.UserPreferences.load", lambda: prefs
+        "app.tools.skills.reporting.UserPreferences.load", lambda: prefs
     )
     return prefs
 
@@ -40,7 +40,7 @@ class TestReportSkill:
         tool = REPORT_SKILL.to_tool()
         assert tool.name == "generate_report"
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_generate_markdown(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 
@@ -56,7 +56,7 @@ class TestReportSkill:
         assert "ML Predictions" in content
         assert "band_gap" in content
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_data_preview_table(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 
@@ -73,7 +73,7 @@ class TestReportSkill:
         content = Path(result["report_path"]).read_text()
         assert "Empty Report" in content
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_custom_output_path(self, mock_load, mock_prefs, sample_df, tmp_path):
         mock_load.return_value = sample_df
         out = str(tmp_path / "custom_report.md")
@@ -83,7 +83,7 @@ class TestReportSkill:
         assert result["report_path"] == out
         assert Path(out).exists()
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_custom_title(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 
@@ -92,7 +92,7 @@ class TestReportSkill:
         content = Path(result["report_path"]).read_text()
         assert "My Custom Title" in content
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_html_output(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 
@@ -106,7 +106,7 @@ class TestReportSkill:
         assert "Dataset Summary" in content
         assert "Fe2O3" in content
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_correlation_section(self, mock_load, mock_prefs):
         """Datasets with 2+ numeric columns get a correlation section."""
         df = pd.DataFrame({
@@ -121,7 +121,7 @@ class TestReportSkill:
         content = Path(result["report_path"]).read_text()
         assert "Correlation Matrix" in content
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_figure_captions(self, mock_load, mock_prefs, sample_df, tmp_path):
         """Plot references include figure captions."""
         mock_load.return_value = sample_df
@@ -136,7 +136,7 @@ class TestReportSkill:
         assert "Figure 1:" in content
         assert "auto-generated plot" in content
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_validation_summary(self, mock_load, mock_prefs, sample_df):
         """Validation results are included when provided."""
         mock_load.return_value = sample_df
@@ -154,7 +154,7 @@ class TestReportSkill:
         assert "Data Quality" in content
         assert "1" in content  # total findings
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_html_validation_summary(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 

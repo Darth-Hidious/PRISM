@@ -63,7 +63,7 @@ def _plot_correlation_matrix(**kwargs) -> dict:
     columns = kwargs.get("columns")
     output_path = kwargs.get("output_path")
 
-    from app.data.store import DataStore
+    from app.tools.data_collectors.store import DataStore
 
     store = DataStore()
     try:

@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from app.skills.simulation_plan import SIM_PLAN_SKILL, _plan_simulations
+from app.tools.skills.simulation_plan import SIM_PLAN_SKILL, _plan_simulations
 
 
 @pytest.fixture
@@ -14,7 +14,7 @@ def mock_prefs(monkeypatch):
 
     prefs = UserPreferences(compute_budget="local", hpc_queue="default", hpc_cores=4)
     monkeypatch.setattr(
-        "app.skills.simulation_plan.UserPreferences.load", lambda: prefs
+        "app.tools.skills.simulation_plan.UserPreferences.load", lambda: prefs
     )
     return prefs
 
@@ -35,7 +35,7 @@ class TestSimPlanSkill:
         tool = SIM_PLAN_SKILL.to_tool()
         assert tool.name == "plan_simulations"
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_plan_local(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 
@@ -46,7 +46,7 @@ class TestSimPlanSkill:
         assert all(j["status"] == "planned" for j in result["jobs"])
         assert "hpc" not in result["jobs"][0]
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_plan_hpc(self, mock_load, mock_prefs, sample_df):
         mock_prefs.compute_budget = "hpc"
         mock_prefs.hpc_queue = "gpu"
@@ -61,14 +61,14 @@ class TestSimPlanSkill:
         assert result["jobs"][0]["hpc"]["queue"] == "gpu"
         assert result["jobs"][0]["hpc"]["cores"] == 32
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_max_jobs(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 
         result = _plan_simulations(dataset_name="test_data", max_jobs=2)
         assert result["planned_jobs"] == 2
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_multiple_sim_types(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 
@@ -79,14 +79,14 @@ class TestSimPlanSkill:
         # 3 materials * 2 sim types
         assert result["planned_jobs"] == 6
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_dataset_not_found(self, mock_load, mock_prefs):
         mock_load.side_effect = FileNotFoundError()
 
         result = _plan_simulations(dataset_name="nonexistent")
         assert "error" in result
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_no_formula_column(self, mock_load, mock_prefs):
         df = pd.DataFrame({"value": [1.0]})
         mock_load.return_value = df
@@ -94,7 +94,7 @@ class TestSimPlanSkill:
         result = _plan_simulations(dataset_name="no_formula")
         assert "error" in result
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_plan_calphad_method(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 
@@ -111,7 +111,7 @@ class TestSimPlanSkill:
             assert job["database_name"] == "sgte"
             assert "code" not in job
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_plan_auto_routes_phase_stability(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 
@@ -123,7 +123,7 @@ class TestSimPlanSkill:
         for job in result["jobs"]:
             assert job["method"] == "calphad"
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_plan_auto_routes_dft(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 
@@ -136,7 +136,7 @@ class TestSimPlanSkill:
             assert job["method"] == "dft"
             assert job["code"] == "lammps"
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_plan_mixed_methods(self, mock_load, mock_prefs, sample_df):
         mock_load.return_value = sample_df
 

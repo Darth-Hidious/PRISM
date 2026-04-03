@@ -116,21 +116,21 @@ def _register_resources(mcp):
     @mcp.resource("prism://datasets")
     def list_datasets() -> str:
         """List collected materials datasets."""
-        from app.data.store import DataStore
+        from app.tools.data_collectors.store import DataStore
         store = DataStore()
         return json.dumps(store.list_datasets(), default=str)
 
     @mcp.resource("prism://models")
     def list_trained_models() -> str:
         """List trained ML models and their metrics."""
-        from app.ml.registry import ModelRegistry
+        from app.tools.ml.registry import ModelRegistry
         registry = ModelRegistry()
         return json.dumps(registry.list_models(), default=str)
 
     @mcp.resource("prism://datasets/{name}")
     def get_dataset(name: str) -> str:
         """Get a specific dataset's metadata and preview."""
-        from app.data.store import DataStore
+        from app.tools.data_collectors.store import DataStore
         store = DataStore()
         df = store.load(name)
         return json.dumps(
@@ -153,7 +153,7 @@ def _register_resources(mcp):
     def list_skills_resource() -> str:
         """List available PRISM skills with their steps."""
         try:
-            from app.skills.registry import load_builtin_skills
+            from app.tools.skills.registry import load_builtin_skills
             skills = load_builtin_skills()
             data = []
             for s in skills.list_skills():
@@ -171,36 +171,36 @@ def _register_resources(mcp):
             return json.dumps([])
 
     # --- CALPHAD resources (only when pycalphad is available) ----------------
-    from app.simulation.calphad_bridge import check_calphad_available
+    from app.tools.simulation.calphad_bridge import check_calphad_available
     if check_calphad_available():
         @mcp.resource("prism://calphad/databases")
         def list_calphad_databases() -> str:
             """List available thermodynamic TDB databases."""
-            from app.simulation.calphad_bridge import get_calphad_bridge
+            from app.tools.simulation.calphad_bridge import get_calphad_bridge
             bridge = get_calphad_bridge()
             return json.dumps(bridge.databases.list_databases(), default=str)
 
     # --- Simulation resources (only when pyiron is available) ----------------
-    from app.simulation.bridge import check_pyiron_available
+    from app.tools.simulation.bridge import check_pyiron_available
     if check_pyiron_available():
         @mcp.resource("prism://simulations/structures")
         def list_structures() -> str:
             """List stored atomistic structures."""
-            from app.simulation.bridge import get_bridge
+            from app.tools.simulation.bridge import get_bridge
             bridge = get_bridge()
             return json.dumps(bridge.structures.to_summary_list(), default=str)
 
         @mcp.resource("prism://simulations/jobs")
         def list_sim_jobs() -> str:
             """List simulation jobs."""
-            from app.simulation.bridge import get_bridge
+            from app.tools.simulation.bridge import get_bridge
             bridge = get_bridge()
             return json.dumps(bridge.jobs.to_summary_list(), default=str)
 
         @mcp.resource("prism://simulations/jobs/{job_id}")
         def get_sim_job(job_id: str) -> str:
             """Get details of a specific simulation job."""
-            from app.simulation.bridge import get_bridge
+            from app.tools.simulation.bridge import get_bridge
             bridge = get_bridge()
             job = bridge.jobs.get(job_id)
             if job is None:

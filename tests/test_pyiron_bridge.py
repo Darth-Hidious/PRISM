@@ -2,7 +2,7 @@
 import json
 import pytest
 from unittest.mock import patch, MagicMock
-from app.simulation.bridge import (
+from app.tools.simulation.bridge import (
     check_pyiron_available,
     _pyiron_missing_error,
     StructureStore,
@@ -107,9 +107,9 @@ class TestPyironBridge:
         assert bridge._project is None
         assert bridge._project_name == "test_proj"
 
-    @patch("app.simulation.bridge.check_pyiron_available", return_value=True)
+    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
     def test_get_project_lazy(self, _mock):
-        with patch("app.simulation.bridge.PyironBridge.get_project") as mock_get:
+        with patch("app.tools.simulation.bridge.PyironBridge.get_project") as mock_get:
             mock_get.return_value = MagicMock()
             bridge = PyironBridge()
             pr = bridge.get_project()
@@ -157,7 +157,7 @@ class TestPyironBridge:
 class TestGetBridge:
     def test_returns_singleton(self):
         # Reset singleton
-        import app.simulation.bridge as mod
+        import app.tools.simulation.bridge as mod
         mod._bridge = None
         b1 = get_bridge()
         b2 = get_bridge()

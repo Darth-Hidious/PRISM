@@ -21,7 +21,7 @@ def discover_capabilities(**kwargs) -> dict:
 
     # 1. Search providers
     try:
-        from app.search.providers.registry import build_registry
+        from app.tools.search_engine.providers.registry import build_registry
         provider_reg = build_registry(skip_network=True)
         providers = provider_reg.get_all()
         caps["search_providers"] = [
@@ -33,7 +33,7 @@ def discover_capabilities(**kwargs) -> dict:
 
     # 2. Datasets
     try:
-        from app.data.store import DataStore
+        from app.tools.data_collectors.store import DataStore
         store = DataStore()
         datasets = store.list_datasets()
         caps["datasets"] = [
@@ -45,7 +45,7 @@ def discover_capabilities(**kwargs) -> dict:
 
     # 3. Trained ML models
     try:
-        from app.ml.registry import ModelRegistry
+        from app.tools.ml.registry import ModelRegistry
         registry = ModelRegistry()
         models = registry.list_models()
         caps["trained_models"] = [
@@ -58,7 +58,7 @@ def discover_capabilities(**kwargs) -> dict:
 
     # 4. Pre-trained GNNs
     try:
-        from app.ml.pretrained import list_pretrained_models
+        from app.tools.ml.pretrained import list_pretrained_models
         caps["pretrained_models"] = [
             {"name": m["name"], "property": m["property"], "installed": m["installed"]}
             for m in list_pretrained_models()
@@ -68,17 +68,17 @@ def discover_capabilities(**kwargs) -> dict:
 
     # 5. Feature backend
     try:
-        from app.ml.features import get_feature_backend
+        from app.tools.ml.features import get_feature_backend
         caps["feature_backend"] = get_feature_backend()
     except Exception:
         caps["feature_backend"] = "unknown"
 
     # 6. CALPHAD databases
     try:
-        from app.simulation.calphad_bridge import check_calphad_available
+        from app.tools.simulation.calphad_bridge import check_calphad_available
         caps["calphad"] = {"available": check_calphad_available(), "databases": []}
         if caps["calphad"]["available"]:
-            from app.simulation.calphad_bridge import get_calphad_bridge
+            from app.tools.simulation.calphad_bridge import get_calphad_bridge
             bridge = get_calphad_bridge()
             caps["calphad"]["databases"] = [
                 {"name": db["name"], "size_kb": db["size_kb"]}
@@ -89,10 +89,10 @@ def discover_capabilities(**kwargs) -> dict:
 
     # 7. Simulation (pyiron)
     try:
-        from app.simulation.bridge import check_pyiron_available
+        from app.tools.simulation.bridge import check_pyiron_available
         caps["simulation"] = {"available": check_pyiron_available()}
         if caps["simulation"]["available"]:
-            from app.simulation.bridge import get_bridge
+            from app.tools.simulation.bridge import get_bridge
             bridge = get_bridge()
             caps["simulation"]["structures"] = len(bridge.structures.to_summary_list())
             caps["simulation"]["jobs"] = len(bridge.jobs.to_summary_list())

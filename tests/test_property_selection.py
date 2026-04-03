@@ -9,7 +9,7 @@ from app.tools.property_selection import _list_predictable_properties
 
 
 class TestListPredictableProperties:
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_with_numeric_columns(self, mock_load):
         df = pd.DataFrame({
             "formula": ["Fe2O3", "Al2O3", "SiO2"],
@@ -27,7 +27,7 @@ class TestListPredictableProperties:
         assert "band_gap" in props
         assert "density" in props
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_no_numeric_columns(self, mock_load):
         df = pd.DataFrame({
             "formula": ["Fe2O3", "Al2O3"],
@@ -39,7 +39,7 @@ class TestListPredictableProperties:
 
         assert result["predictable_properties"] == []
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_excludes_metadata_columns(self, mock_load):
         df = pd.DataFrame({
             "formula": ["Fe2O3"],
@@ -56,7 +56,7 @@ class TestListPredictableProperties:
         assert "source_id" not in props
         assert "material_id" not in props
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_shows_already_predicted(self, mock_load):
         df = pd.DataFrame({
             "formula": ["Fe2O3"],

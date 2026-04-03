@@ -12,9 +12,9 @@ from rich.table import Table
 def predict(formula, prop, algorithm, all_properties):
     """Predict material properties from chemical formula."""
     console = Console()
-    from app.ml.predictor import Predictor
-    from app.ml.registry import ModelRegistry
-    from app.ml.features import get_feature_backend
+    from app.tools.ml.predictor import Predictor
+    from app.tools.ml.registry import ModelRegistry
+    from app.tools.ml.features import get_feature_backend
 
     predictor = Predictor()
     registry = ModelRegistry()

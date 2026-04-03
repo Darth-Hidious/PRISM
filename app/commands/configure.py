@@ -141,7 +141,7 @@ def configure(anthropic_key, openai_key, openrouter_key, mp_api_key, labs_key,
 def _show_config(console: Console, env_path: Path):
     """Display current configuration."""
     from app.config.preferences import UserPreferences
-    from app.ml.features import get_feature_backend
+    from app.tools.ml.features import get_feature_backend
 
     console.print("[bold]PRISM Configuration[/bold]")
     console.print()

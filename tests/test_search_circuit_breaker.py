@@ -2,14 +2,14 @@ import time
 
 
 def test_health_starts_closed():
-    from app.search.resilience.circuit_breaker import ProviderHealth
+    from app.tools.search_engine.resilience.circuit_breaker import ProviderHealth
     h = ProviderHealth(provider_id="mp")
     assert h.circuit_state == "closed"
     assert h.should_query() is True
 
 
 def test_circuit_opens_after_failures():
-    from app.search.resilience.circuit_breaker import ProviderHealth
+    from app.tools.search_engine.resilience.circuit_breaker import ProviderHealth
     h = ProviderHealth(provider_id="aflow")
     h.record_failure()
     h.record_failure()
@@ -20,7 +20,7 @@ def test_circuit_opens_after_failures():
 
 
 def test_circuit_half_open_after_cooldown():
-    from app.search.resilience.circuit_breaker import ProviderHealth
+    from app.tools.search_engine.resilience.circuit_breaker import ProviderHealth
     h = ProviderHealth(provider_id="aflow")
     for _ in range(3):
         h.record_failure()
@@ -32,7 +32,7 @@ def test_circuit_half_open_after_cooldown():
 
 
 def test_success_closes_circuit():
-    from app.search.resilience.circuit_breaker import ProviderHealth
+    from app.tools.search_engine.resilience.circuit_breaker import ProviderHealth
     h = ProviderHealth(provider_id="aflow")
     for _ in range(3):
         h.record_failure()
@@ -44,7 +44,7 @@ def test_success_closes_circuit():
 
 
 def test_avg_latency_tracking():
-    from app.search.resilience.circuit_breaker import ProviderHealth
+    from app.tools.search_engine.resilience.circuit_breaker import ProviderHealth
     h = ProviderHealth(provider_id="mp")
     h.record_success(100.0)
     h.record_success(200.0)
@@ -52,7 +52,7 @@ def test_avg_latency_tracking():
 
 
 def test_health_manager_load_save(tmp_path):
-    from app.search.resilience.circuit_breaker import HealthManager
+    from app.tools.search_engine.resilience.circuit_breaker import HealthManager
     mgr = HealthManager(persist_path=tmp_path / "health.json")
     mgr.get("mp").record_success(100.0)
     mgr.get("aflow").record_failure()

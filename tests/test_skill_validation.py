@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from app.skills.validation import VALIDATE_SKILL, _validate_dataset
+from app.tools.skills.validation import VALIDATE_SKILL, _validate_dataset
 
 
 class TestValidateSkill:
@@ -20,7 +20,7 @@ class TestValidateSkill:
         assert "dataset_name" in schema["properties"]
         assert "dataset_name" in schema["required"]
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_validate_with_mock_datastore(self, mock_load):
         df = pd.DataFrame({
             "band_gap": [1.0, 2.0, -0.5],
@@ -39,7 +39,7 @@ class TestValidateSkill:
         result = _validate_dataset(dataset_name="nonexistent_12345")
         assert "error" in result
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_end_to_end_clean_data(self, mock_load):
         df = pd.DataFrame({
             "band_gap": [1.0, 2.0, 3.0],

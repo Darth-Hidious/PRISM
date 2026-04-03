@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.skills.prediction import PREDICT_SKILL, _predict_properties
+from app.tools.skills.prediction import PREDICT_SKILL, _predict_properties
 
 
 @pytest.fixture
@@ -15,7 +15,7 @@ def mock_prefs(monkeypatch):
 
     prefs = UserPreferences(default_algorithm="random_forest")
     monkeypatch.setattr(
-        "app.skills.prediction.UserPreferences.load", lambda: prefs
+        "app.tools.skills.prediction.UserPreferences.load", lambda: prefs
     )
     return prefs
 
@@ -39,9 +39,9 @@ class TestPredictSkill:
         tool = PREDICT_SKILL.to_tool()
         assert tool.name == "predict_properties"
 
-    @patch("app.ml.registry.ModelRegistry.load_model")
-    @patch("app.data.store.DataStore.save")
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.ml.registry.ModelRegistry.load_model")
+    @patch("app.tools.data_collectors.store.DataStore.save")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_predict_with_existing_model(
         self, mock_load, mock_save, mock_load_model, mock_prefs, sample_df
     ):
@@ -60,7 +60,7 @@ class TestPredictSkill:
         assert "band_gap" in result["predictions"]
         assert result["rows"] == 6
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_dataset_not_found(self, mock_load, mock_prefs):
         mock_load.side_effect = FileNotFoundError()
 
@@ -68,8 +68,8 @@ class TestPredictSkill:
         assert "error" in result
         assert "not found" in result["error"]
 
-    @patch("app.ml.registry.ModelRegistry.load_model")
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.ml.registry.ModelRegistry.load_model")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_no_numeric_columns(self, mock_load, mock_load_model, mock_prefs):
         df = pd.DataFrame(
             {"formula": ["Fe2O3"], "source_id": ["a"], "provider": ["mp"]}
@@ -79,11 +79,11 @@ class TestPredictSkill:
         result = _predict_properties(dataset_name="text_only")
         assert "error" in result
 
-    @patch("app.ml.trainer.train_model")
-    @patch("app.ml.registry.ModelRegistry.save_model")
-    @patch("app.ml.registry.ModelRegistry.load_model")
-    @patch("app.data.store.DataStore.save")
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.ml.trainer.train_model")
+    @patch("app.tools.ml.registry.ModelRegistry.save_model")
+    @patch("app.tools.ml.registry.ModelRegistry.load_model")
+    @patch("app.tools.data_collectors.store.DataStore.save")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_train_if_missing(
         self, mock_load, mock_save, mock_load_model, mock_save_model,
         mock_train, mock_prefs, sample_df
@@ -111,7 +111,7 @@ class TestPredictSkill:
         mock_train.assert_called_once()
         mock_save_model.assert_called_once()
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_no_formula_column(self, mock_load, mock_prefs):
         df = pd.DataFrame({"value": [1.0, 2.0], "source_id": ["a", "b"]})
         mock_load.return_value = df

@@ -29,7 +29,7 @@ class TestSkillsInToolRegistry:
         assert "plan_simulations" in names
 
     def test_all_10_skills_registered(self):
-        from app.skills.registry import load_builtin_skills
+        from app.tools.skills.registry import load_builtin_skills
 
         reg = load_builtin_skills()
         assert len(reg.list_skills()) == 10
@@ -64,7 +64,7 @@ except ImportError:
 @pytest.mark.skipif(not _HAS_FASTMCP, reason="fastmcp not installed")
 class TestMCPSkills:
     def test_build_registry_includes_skills(self):
-        with patch("app.simulation.bridge.check_pyiron_available", return_value=False):
+        with patch("app.tools.simulation.bridge.check_pyiron_available", return_value=False):
             from app.mcp_server import _build_registry
 
             registry = _build_registry()
@@ -76,10 +76,10 @@ class TestMCPSkills:
 # ---- Test: End-to-end discovery pipeline (mocked) ----
 
 class TestNorthStarPipeline:
-    @patch("app.skills.reporting._generate_report")
-    @patch("app.skills.visualization._visualize_dataset")
-    @patch("app.skills.prediction._predict_properties")
-    @patch("app.skills.acquisition._acquire_materials")
+    @patch("app.tools.skills.reporting._generate_report")
+    @patch("app.tools.skills.visualization._visualize_dataset")
+    @patch("app.tools.skills.prediction._predict_properties")
+    @patch("app.tools.skills.acquisition._acquire_materials")
     def test_w_rh_discovery(
         self, mock_acquire, mock_predict, mock_viz, mock_report
     ):
@@ -116,7 +116,7 @@ class TestNorthStarPipeline:
             "format": "markdown",
         }
 
-        from app.skills.discovery import _materials_discovery
+        from app.tools.skills.discovery import _materials_discovery
 
         result = _materials_discovery(
             elements=["W", "Rh"],
@@ -143,8 +143,8 @@ class TestNorthStarPipeline:
         report = result["results"]["report"]
         assert report["format"] == "markdown"
 
-    @patch("app.data.store.DataStore.save")
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.save")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_selection_after_discovery(self, mock_load, mock_save):
         """After discovery, select top candidates."""
         df = pd.DataFrame(
@@ -157,7 +157,7 @@ class TestNorthStarPipeline:
         mock_load.return_value = df
         mock_save.return_value = "/tmp/test.parquet"
 
-        from app.skills.selection import _select_materials
+        from app.tools.skills.selection import _select_materials
 
         result = _select_materials(
             dataset_name="w_rh_discovery",
@@ -169,7 +169,7 @@ class TestNorthStarPipeline:
         assert result["selected_count"] <= 3
         assert result["dataset_name"] == "w_rh_discovery_selected"
 
-    @patch("app.data.store.DataStore.load")
+    @patch("app.tools.data_collectors.store.DataStore.load")
     def test_simulation_plan_for_candidates(self, mock_load):
         """Plan simulations for selected candidates."""
         df = pd.DataFrame(
@@ -181,10 +181,10 @@ class TestNorthStarPipeline:
         mock_load.return_value = df
 
         from app.config.preferences import UserPreferences
-        from app.skills.simulation_plan import _plan_simulations
+        from app.tools.skills.simulation_plan import _plan_simulations
 
         with patch(
-            "app.skills.simulation_plan.UserPreferences.load",
+            "app.tools.skills.simulation_plan.UserPreferences.load",
             return_value=UserPreferences(compute_budget="local"),
         ):
             result = _plan_simulations(

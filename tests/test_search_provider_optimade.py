@@ -1,8 +1,8 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from app.search.query import MaterialSearchQuery
-from app.search.providers.endpoint import ProviderEndpoint, AuthConfig, BehaviorConfig, CapabilitiesConfig
+from app.tools.search_engine.query import MaterialSearchQuery
+from app.tools.search_engine.providers.endpoint import ProviderEndpoint, AuthConfig, BehaviorConfig, CapabilitiesConfig
 
 
 def _make_endpoint(pid="mp", url="https://optimade.materialsproject.org"):
@@ -17,14 +17,14 @@ def _make_endpoint(pid="mp", url="https://optimade.materialsproject.org"):
 
 
 def test_optimade_provider_creates():
-    from app.search.providers.optimade import OptimadeProvider
+    from app.tools.search_engine.providers.optimade import OptimadeProvider
     ep = _make_endpoint()
     p = OptimadeProvider(endpoint=ep)
     assert p.id == "mp"
 
 
 def test_optimade_parse_response():
-    from app.search.providers.optimade import OptimadeProvider
+    from app.tools.search_engine.providers.optimade import OptimadeProvider
     ep = _make_endpoint()
     p = OptimadeProvider(endpoint=ep)
 
@@ -48,7 +48,7 @@ def test_optimade_parse_response():
 
 
 def test_optimade_parse_entry_missing_fields():
-    from app.search.providers.optimade import OptimadeProvider
+    from app.tools.search_engine.providers.optimade import OptimadeProvider
     ep = _make_endpoint()
     p = OptimadeProvider(endpoint=ep)
     entry = {
@@ -65,7 +65,7 @@ def test_optimade_parse_entry_missing_fields():
 
 
 def test_optimade_parse_provider_specific_fields():
-    from app.search.providers.optimade import OptimadeProvider
+    from app.tools.search_engine.providers.optimade import OptimadeProvider
     ep = _make_endpoint(pid="oqmd")
     p = OptimadeProvider(endpoint=ep)
     entry = {

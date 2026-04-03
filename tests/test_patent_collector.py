@@ -1,7 +1,7 @@
 """Tests for PatentCollector."""
 import pytest
 from unittest.mock import patch, MagicMock
-from app.data.patent_collector import PatentCollector
+from app.tools.data_collectors.patent_collector import PatentCollector
 
 
 LENS_RESPONSE = {
@@ -60,7 +60,7 @@ class TestPatentCollector:
         c = PatentCollector()
         assert c.collect(query="alloy") == []
 
-    @patch("app.data.patent_collector.requests")
+    @patch("app.tools.data_collectors.patent_collector.requests")
     @patch.dict("os.environ", {"LENS_API_TOKEN": "test-token"})
     def test_collect_success(self, mock_requests):
         mock_requests.post.return_value = _mock_lens_response()
@@ -75,7 +75,7 @@ class TestPatentCollector:
         assert results[0]["jurisdiction"] == "US"
         assert results[0]["type"] == "patent"
 
-    @patch("app.data.patent_collector.requests")
+    @patch("app.tools.data_collectors.patent_collector.requests")
     @patch.dict("os.environ", {"LENS_API_TOKEN": "test-token"})
     def test_collect_second_patent(self, mock_requests):
         mock_requests.post.return_value = _mock_lens_response()
@@ -85,7 +85,7 @@ class TestPatentCollector:
         assert results[1]["applicants"] == []  # applicant was None
         assert results[1]["jurisdiction"] == "EP"
 
-    @patch("app.data.patent_collector.requests")
+    @patch("app.tools.data_collectors.patent_collector.requests")
     @patch.dict("os.environ", {"LENS_API_TOKEN": "test-token"})
     def test_collect_api_error(self, mock_requests):
         mock_requests.post.side_effect = Exception("API error")
@@ -93,7 +93,7 @@ class TestPatentCollector:
         results = c.collect(query="alloy")
         assert results == []
 
-    @patch("app.data.patent_collector.requests")
+    @patch("app.tools.data_collectors.patent_collector.requests")
     @patch.dict("os.environ", {"LENS_API_TOKEN": "test-token"})
     def test_collect_empty_data(self, mock_requests):
         resp = MagicMock()
@@ -104,7 +104,7 @@ class TestPatentCollector:
         results = c.collect(query="alloy")
         assert results == []
 
-    @patch("app.data.patent_collector.requests")
+    @patch("app.tools.data_collectors.patent_collector.requests")
     @patch.dict("os.environ", {"LENS_API_TOKEN": "test-token"})
     def test_collect_max_results_caps_at_50(self, mock_requests):
         mock_requests.post.return_value = _mock_lens_response()
@@ -114,7 +114,7 @@ class TestPatentCollector:
         body = call_args[1]["json"]
         assert body["size"] == 50  # capped
 
-    @patch("app.data.patent_collector.requests")
+    @patch("app.tools.data_collectors.patent_collector.requests")
     @patch.dict("os.environ", {"LENS_API_TOKEN": "test-token"})
     def test_collect_request_headers(self, mock_requests):
         mock_requests.post.return_value = _mock_lens_response()

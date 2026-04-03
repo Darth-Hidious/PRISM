@@ -1,5 +1,5 @@
 """Tests for cross-provider material fusion — merge, dedup, conflict resolution."""
-from app.search.result import Material, PropertyValue
+from app.tools.search_engine.result import Material, PropertyValue
 
 
 def _mat(pid, formula="Fe2O3", sg="R-3c", band_gap=None, extra=None):
@@ -14,7 +14,7 @@ def _mat(pid, formula="Fe2O3", sg="R-3c", band_gap=None, extra=None):
 
 
 def test_fusion_merges_same_material():
-    from app.search.fusion import fuse_materials
+    from app.tools.search_engine.fusion import fuse_materials
     m1 = _mat("mp", band_gap=2.2)
     m2 = _mat("aflow", band_gap=None, extra={
         "_aflow_bulk_modulus": PropertyValue(value=220, source="optimade:aflow", unit="GPa"),
@@ -29,7 +29,7 @@ def test_fusion_merges_same_material():
 
 
 def test_fusion_keeps_different_materials_separate():
-    from app.search.fusion import fuse_materials
+    from app.tools.search_engine.fusion import fuse_materials
     m1 = _mat("mp", formula="Fe2O3", sg="R-3c")
     m2 = _mat("mp", formula="SiO2", sg="P3_221")
     m2.elements = ["O", "Si"]
@@ -39,7 +39,7 @@ def test_fusion_keeps_different_materials_separate():
 
 
 def test_fusion_handles_conflicting_values():
-    from app.search.fusion import fuse_materials
+    from app.tools.search_engine.fusion import fuse_materials
     m1 = _mat("mp", band_gap=2.2)
     m2 = _mat("aflow", band_gap=2.0)
     fused = fuse_materials([m1, m2])
@@ -51,5 +51,5 @@ def test_fusion_handles_conflicting_values():
 
 
 def test_fusion_empty_input():
-    from app.search.fusion import fuse_materials
+    from app.tools.search_engine.fusion import fuse_materials
     assert fuse_materials([]) == []

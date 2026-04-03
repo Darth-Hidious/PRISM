@@ -1,7 +1,7 @@
 """Tests for Skill base classes."""
 
 import pytest
-from app.skills.base import Skill, SkillRegistry, SkillStep
+from app.tools.skills.base import Skill, SkillRegistry, SkillStep
 from app.tools.base import ToolRegistry
 
 
