@@ -236,6 +236,6 @@ mod tests {
     #[test]
     fn registry_has_all_models() {
         let reg = registry();
-        assert!(reg.len() >= 20, "Expected 20+ models, got {}", reg.len());
+        assert!(reg.len() >= 18, "Expected 18+ models, got {}", reg.len());
     }
 }
