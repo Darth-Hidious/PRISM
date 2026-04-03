@@ -11,6 +11,9 @@ use std::process::Stdio;
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 
+pub mod tool_server;
+pub use tool_server::{ToolServer, ToolServerHandle};
+
 #[derive(Debug, thiserror::Error)]
 pub enum PythonBridgeError {
     #[error("failed to spawn python worker: {0}")]
