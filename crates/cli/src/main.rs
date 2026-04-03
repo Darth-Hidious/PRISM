@@ -170,6 +170,27 @@ enum Commands {
         /// MARC27 platform API URL (for marc27 backend).
         #[arg(long, default_value = "https://platform.marc27.com/api/v1")]
         platform_url: String,
+        /// BYOC SSH target: user@host (enables SSH backend).
+        #[arg(long)]
+        ssh: Option<String>,
+        /// SSH key path for BYOC SSH.
+        #[arg(long, default_value = "~/.ssh/id_ed25519")]
+        ssh_key: String,
+        /// SSH port (default 22).
+        #[arg(long, default_value_t = 22)]
+        ssh_port: u16,
+        /// Kubernetes context for BYOC K8s.
+        #[arg(long)]
+        k8s_context: Option<String>,
+        /// Kubernetes namespace (default: "default").
+        #[arg(long, default_value = "default")]
+        k8s_namespace: String,
+        /// SLURM head node (user@host) for BYOC SLURM.
+        #[arg(long)]
+        slurm: Option<String>,
+        /// SLURM partition.
+        #[arg(long, default_value = "default")]
+        slurm_partition: String,
     },
     /// Check status of a compute job.
     JobStatus {
@@ -1148,8 +1169,29 @@ async fn main() -> Result<()> {
             input,
             backend,
             platform_url,
+            ssh,
+            ssh_key,
+            ssh_port,
+            k8s_context,
+            k8s_namespace,
+            slurm,
+            slurm_partition,
         } => {
-            handle_run(&name, &image, &input, &backend, &platform_url).await?;
+            handle_run(
+                &name,
+                &image,
+                &input,
+                &backend,
+                &platform_url,
+                ssh.as_deref(),
+                &ssh_key,
+                ssh_port,
+                k8s_context.as_deref(),
+                &k8s_namespace,
+                slurm.as_deref(),
+                &slurm_partition,
+            )
+            .await?;
         }
         Commands::JobStatus { job_id } => {
             handle_job_status(&job_id).await?;
@@ -2588,14 +2630,23 @@ async fn handle_federated_query(query: &str, dashboard_url: &str) -> Result<()> 
 
 // ── prism run ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_run(
     name: &str,
     image: &str,
     inputs: &[String],
     backend: &str,
     platform_url: &str,
+    ssh: Option<&str>,
+    ssh_key: &str,
+    ssh_port: u16,
+    k8s_context: Option<&str>,
+    k8s_namespace: &str,
+    slurm: Option<&str>,
+    slurm_partition: &str,
 ) -> Result<()> {
     use prism_compute::backend::ComputeRouter;
+    use prism_compute::byoc::ByocTarget;
     use prism_compute::ExperimentPlan;
 
     // Parse key=value inputs into JSON
@@ -2612,13 +2663,49 @@ async fn handle_run(
         inputs: serde_json::Value::Object(input_map),
     };
 
-    let router = match backend {
-        "marc27" | "platform" => {
-            // Read token from credentials
-            let token = std::env::var("MARC27_API_TOKEN").unwrap_or_else(|_| "".to_string());
-            ComputeRouter::with_marc27(platform_url, &token)
+    let router = if let Some(ssh_target) = ssh {
+        // Parse user@host — default user is "root" if no '@' present
+        let (user, host) = if let Some((u, h)) = ssh_target.split_once('@') {
+            (u.to_string(), h.to_string())
+        } else {
+            ("root".to_string(), ssh_target.to_string())
+        };
+        let target = ByocTarget::Ssh {
+            host,
+            user,
+            key_path: ssh_key.to_string(),
+            port: ssh_port,
+        };
+        ComputeRouter::local_only().with_byoc(target)
+    } else if let Some(ctx) = k8s_context {
+        let target = ByocTarget::Kubernetes {
+            context: ctx.to_string(),
+            namespace: k8s_namespace.to_string(),
+        };
+        ComputeRouter::local_only().with_byoc(target)
+    } else if let Some(slurm_host) = slurm {
+        // Parse user@host for SLURM head node
+        let (user, head_node) = if let Some((u, h)) = slurm_host.split_once('@') {
+            (u.to_string(), h.to_string())
+        } else {
+            ("root".to_string(), slurm_host.to_string())
+        };
+        let target = ByocTarget::Slurm {
+            head_node,
+            user,
+            partition: slurm_partition.to_string(),
+        };
+        ComputeRouter::local_only().with_byoc(target)
+    } else {
+        match backend {
+            "marc27" | "platform" => {
+                // Read token from credentials
+                let token =
+                    std::env::var("MARC27_API_TOKEN").unwrap_or_else(|_| "".to_string());
+                ComputeRouter::with_marc27(platform_url, &token)
+            }
+            _ => ComputeRouter::local_only(),
         }
-        _ => ComputeRouter::local_only(),
     };
 
     println!("Submitting job '{name}' (image: {image}, backend: {backend})...");

@@ -55,8 +55,9 @@ impl ComputeRouter {
         }
     }
 
-    /// Add a BYOC backend.
+    /// Add a BYOC backend and make it the default.
     pub fn with_byoc(mut self, target: ByocTarget) -> Self {
+        self.default_backend = BackendKind::Byoc(target.clone());
         self.byoc = Some(ByocBackend::new(target));
         self
     }
