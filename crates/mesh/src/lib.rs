@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! PRISM mesh networking — node discovery, data pub/sub, and federated queries.
 //!
 //! Two discovery mechanisms:

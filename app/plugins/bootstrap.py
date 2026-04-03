@@ -116,6 +116,16 @@ def build_full_registry(
         except Exception:
             pass
 
+    # Custom tools from ~/.prism/tools/*.py
+    try:
+        from app.tools.custom_loader import discover_custom_tools
+
+        custom_names = discover_custom_tools(registry)
+        if custom_names:
+            logger.info("Loaded %d custom tools: %s", len(custom_names), ", ".join(custom_names))
+    except Exception:
+        pass
+
     # External MCP servers
     if enable_mcp:
         try:

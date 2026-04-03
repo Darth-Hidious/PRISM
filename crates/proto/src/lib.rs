@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! Typed protocol contracts for the PRISM backbone.
 //!
 //! Centralizes the wire types shared between:

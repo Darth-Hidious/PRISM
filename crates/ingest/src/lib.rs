@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! Data ingestion and ontology pipeline for PRISM nodes.
 //!
 //! Converts raw data (CSV, Parquet, databases) into structured, queryable

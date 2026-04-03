@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! Embedded Axum HTTP/WebSocket server for PRISM nodes.
 //!
 //! Exposes a REST API and WebSocket endpoint for:
