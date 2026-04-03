@@ -13,7 +13,7 @@ use prism_python_bridge::tool_server::{ToolServer, ToolServerHandle};
 use serde_json::Value;
 
 use crate::agent_loop;
-use crate::system_prompt::SYSTEM_PROMPT;
+use crate::prompts::SYSTEM_PROMPT;
 use crate::types::{AgentConfig, AgentEvent};
 
 // ── Emit helpers ──────────────────────────────────────────────────

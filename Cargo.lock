@@ -2675,10 +2675,14 @@ name = "prism-agent"
 version = "2.5.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "directories",
  "prism-ingest",
  "prism-python-bridge",
+ "regex",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
