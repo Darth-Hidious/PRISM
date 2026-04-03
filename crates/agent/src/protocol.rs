@@ -13,7 +13,11 @@ use prism_python_bridge::tool_server::{ToolServer, ToolServerHandle};
 use serde_json::Value;
 
 use crate::agent_loop;
+use crate::hooks::build_default_hooks;
+use crate::permissions::ToolPermissionContext;
 use crate::prompts::SYSTEM_PROMPT;
+use crate::scratchpad::Scratchpad;
+use crate::transcript::TranscriptStore;
 use crate::types::{AgentConfig, AgentEvent};
 
 // ── Emit helpers ──────────────────────────────────────────────────
@@ -186,6 +190,10 @@ pub async fn run_server(
     };
 
     let mut history: Vec<ChatMessage> = Vec::new();
+    let mut transcript = TranscriptStore::new(None);
+    let hooks = build_default_hooks();
+    let permissions = ToolPermissionContext::default();
+    let mut scratchpad = Scratchpad::new();
 
     // Read JSON-RPC lines from stdin
     let stdin = io::stdin();
@@ -248,7 +256,11 @@ pub async fn run_server(
                     &tools,
                     &config,
                     text,
-                    emit_agent_event,
+                    &mut transcript,
+                    &hooks,
+                    &permissions,
+                    &mut scratchpad,
+                    &mut emit_agent_event,
                 )
                 .await
                 {
@@ -279,7 +291,11 @@ pub async fn run_server(
                         &tools,
                         &config,
                         text,
-                        emit_agent_event,
+                        &mut transcript,
+                        &hooks,
+                        &permissions,
+                        &mut scratchpad,
+                        &mut emit_agent_event,
                     )
                     .await
                     {
