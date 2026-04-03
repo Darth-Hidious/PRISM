@@ -93,23 +93,21 @@ pub struct EmbeddingBatch {
 
 /// Configuration for connecting to an LLM backend.
 ///
-/// Supports any provider via two wire formats:
-/// - `Ollama` (default): native `/api/generate` + `/api/embed` endpoints
-/// - `OpenAi`: compatible with OpenAI, Anthropic (via proxy), MARC27, vLLM, LiteLLM
+/// Uses the OpenAI-compatible API (`/v1/chat/completions`, `/v1/embeddings`)
+/// which is supported by: llama.cpp server, Ollama, vLLM, LiteLLM, OpenAI,
+/// Anthropic (via proxy), and MARC27 platform.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
-    /// Which API wire format to use.
-    #[serde(default)]
-    pub provider: llm::LlmProvider,
     /// Base URL of the LLM API.
-    /// - Ollama: "http://localhost:11434"
+    /// - llama.cpp: "http://localhost:8080" (default)
+    /// - Ollama: "http://localhost:11434/v1"
     /// - OpenAI: "https://api.openai.com"
     /// - MARC27: "https://platform.marc27.com/api/v1/llm"
     /// - vLLM: "http://localhost:8000"
     pub base_url: String,
-    /// Model name (e.g. "qwen2.5:7b", "gpt-4o", "claude-sonnet-4-6").
+    /// Model name (e.g. "gemma-3-27b", "gpt-4o", "claude-sonnet-4-6").
     pub model: String,
-    /// API key for authenticated providers. Not needed for local Ollama.
+    /// API key for authenticated providers. Not needed for local llama.cpp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// Separate embedding model (e.g. "nomic-embed-text"). If not set, uses `model`.
@@ -133,9 +131,8 @@ fn default_timeout_secs() -> u64 {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            provider: llm::LlmProvider::Ollama,
-            base_url: "http://localhost:11434".into(),
-            model: "qwen2.5:7b".into(),
+            base_url: "http://localhost:8080".into(),
+            model: "gemma-3-27b".into(),
             api_key: None,
             embedding_model: None,
             max_sample_rows: 10,
@@ -238,9 +235,8 @@ mod tests {
     #[test]
     fn llm_config_roundtrip() {
         let cfg = LlmConfig {
-            provider: llm::LlmProvider::Ollama,
             base_url: "http://example.com".into(),
-            model: "qwen3:9b".into(),
+            model: "gemma-3-27b".into(),
             api_key: None,
             embedding_model: Some("nomic-embed-text".into()),
             max_sample_rows: 5,
