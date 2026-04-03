@@ -192,6 +192,11 @@ enum Commands {
         #[arg(long)]
         no_github: bool,
     },
+    /// Browse and install tools and workflows from the MARC27 marketplace.
+    Marketplace {
+        #[command(subcommand)]
+        command: MarketplaceCommands,
+    },
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -360,6 +365,28 @@ enum MeshCommands {
         /// Dashboard URL of the running node.
         #[arg(long, default_value = "http://127.0.0.1:7327")]
         dashboard_url: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MarketplaceCommands {
+    /// Search the MARC27 marketplace for tools and workflows.
+    Search {
+        /// Search query.
+        query: Option<String>,
+    },
+    /// Install a tool or workflow from the marketplace.
+    Install {
+        /// Name of the tool or workflow to install.
+        name: String,
+        /// Install as workflow (YAML) instead of tool (Python).
+        #[arg(long)]
+        workflow: bool,
+    },
+    /// Show details about a marketplace item.
+    Info {
+        /// Name of the tool or workflow.
+        name: String,
     },
 }
 
@@ -1143,6 +1170,72 @@ async fn main() -> Result<()> {
                 no_github,
             )
             .await?;
+        }
+        Commands::Marketplace { command } => {
+            use prism_client::marketplace::MarketplaceClient;
+
+            let state = paths.load_cli_state()?;
+            let token = state.credentials.as_ref().map(|c| c.access_token.clone());
+            let platform = if let Some(t) = &token {
+                PlatformClient::new(&endpoints.api_base).with_token(t)
+            } else {
+                PlatformClient::new(&endpoints.api_base)
+            };
+            let marketplace = MarketplaceClient::new(&platform);
+
+            match command {
+                MarketplaceCommands::Search { query } => {
+                    let tools = marketplace.list_tools(query.as_deref()).await?;
+                    if tools.is_empty() {
+                        println!("No results found.");
+                    } else {
+                        println!("Marketplace tools:\n");
+                        for t in &tools {
+                            println!("  {:<30} {} (by {})", t.name, t.description, t.author);
+                            if t.install_count > 0 {
+                                println!("  {:<30} {} installs", "", t.install_count);
+                            }
+                        }
+                        println!(
+                            "\n{} tools found. Install with: prism marketplace install <name>",
+                            tools.len()
+                        );
+                    }
+                }
+                MarketplaceCommands::Install { name, workflow } => {
+                    let url = marketplace.install_url(&name).await?;
+                    let client = reqwest::Client::new();
+                    let resp = client.get(&url).send().await?;
+                    let content = resp.text().await?;
+
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let dest = if workflow {
+                        let dir = PathBuf::from(&home).join(".prism/workflows");
+                        std::fs::create_dir_all(&dir)?;
+                        dir.join(format!("{name}.yaml"))
+                    } else {
+                        let dir = PathBuf::from(&home).join(".prism/tools");
+                        std::fs::create_dir_all(&dir)?;
+                        dir.join(format!("{name}.py"))
+                    };
+
+                    std::fs::write(&dest, &content)?;
+                    let kind = if workflow { "workflow" } else { "tool" };
+                    println!("Installed {kind} '{name}' to {}", dest.display());
+                    println!("It will be auto-discovered on next prism run.");
+                }
+                MarketplaceCommands::Info { name } => {
+                    let tool = marketplace.get_tool(&name).await?;
+                    println!("Name:        {}", tool.name);
+                    println!("Version:     {}", tool.version);
+                    println!("Author:      {}", tool.author);
+                    println!("Description: {}", tool.description);
+                    println!("Installs:    {}", tool.install_count);
+                    if let Some(url) = &tool.download_url {
+                        println!("URL:         {url}");
+                    }
+                }
+            }
         }
         Commands::External(args) => {
             if try_run_workflow_alias(&project_root, &args).await? {
