@@ -41,6 +41,9 @@ pub struct MeshConfig {
     pub node_name: String,
     pub publish_port: u16,
     pub discovery: Vec<DiscoveryMethod>,
+    /// Optional Kafka broker addresses for mesh pub/sub (e.g., "localhost:9092").
+    #[serde(default)]
+    pub kafka_brokers: Option<String>,
 }
 
 // ── Peer tracking ──────────────────────────────────────────────────
@@ -103,6 +106,14 @@ impl MeshHandle {
                 .write()
                 .expect("peers lock poisoned")
                 .retain(|p| p.node_id != target);
+        }
+    }
+
+    /// Shared handle to the peer list (for passing to sync handler, etc.).
+    pub fn peers_shared(&self) -> Option<Arc<RwLock<Vec<PeerNode>>>> {
+        match self {
+            MeshHandle::Online { peers, .. } => Some(Arc::clone(peers)),
+            MeshHandle::Offline => None,
         }
     }
 
@@ -249,6 +260,7 @@ mod tests {
             node_name: "test-node".into(),
             publish_port: 9100,
             discovery: vec![DiscoveryMethod::Mdns],
+            kafka_brokers: None,
         }
     }
 
@@ -363,6 +375,7 @@ mod tests {
                     token: "tok-abc123".into(),
                 },
             ],
+            kafka_brokers: Some("localhost:9092".into()),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: MeshConfig = serde_json::from_str(&json).unwrap();

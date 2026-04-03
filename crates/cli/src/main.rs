@@ -300,6 +300,10 @@ enum NodeCommands {
         /// Also start Kafka (for mesh/pub-sub, off by default in dev).
         #[arg(long)]
         with_kafka: bool,
+        /// Kafka broker addresses for mesh pub/sub (e.g., "localhost:9092").
+        /// If omitted and --with-kafka is set, defaults to "localhost:9092".
+        #[arg(long)]
+        kafka_brokers: Option<String>,
         /// Broadcast this node on the local network (mDNS) and register for platform discovery.
         /// Without this flag, the node runs privately — it can discover peers but won't be found.
         #[arg(long)]
@@ -667,6 +671,7 @@ async fn main() -> Result<()> {
                 external_neo4j,
                 external_qdrant,
                 with_kafka,
+                kafka_brokers,
                 broadcast,
             } => {
                 // Load prism.toml config (global + project), CLI flags override
@@ -717,6 +722,9 @@ async fn main() -> Result<()> {
                     }
                     if with_kafka {
                         cmd.arg("--with-kafka");
+                    }
+                    if let Some(ref brokers) = kafka_brokers {
+                        cmd.args(["--kafka-brokers", brokers]);
                     }
                     if broadcast {
                         cmd.arg("--broadcast");
@@ -996,12 +1004,26 @@ async fn main() -> Result<()> {
 
                 // ── Start mesh networking (mDNS discovery + optional broadcast) ──
                 let mesh_cancel = tokio_util::sync::CancellationToken::new();
+                // Resolve Kafka brokers: explicit flag > implicit from --with-kafka
+                let resolved_kafka_brokers = kafka_brokers
+                    .clone()
+                    .or_else(|| {
+                        if with_kafka {
+                            Some("localhost:9092".to_string())
+                        } else {
+                            None
+                        }
+                    });
+
                 let mesh_config = prism_mesh::MeshConfig {
                     node_name: daemon_options.name.clone(),
                     publish_port: dashboard_port,
                     discovery: vec![prism_mesh::DiscoveryMethod::Mdns],
+                    kafka_brokers: resolved_kafka_brokers.clone(),
                 };
                 let mesh_handle = prism_mesh::init_mesh(mesh_config)?;
+                let mesh_node_id = mesh_handle.node_id();
+                let mesh_peers_shared = mesh_handle.peers_shared();
                 let mesh_task = prism_mesh::start_mesh(
                     mesh_handle,
                     prism_mesh::MeshStartOptions {
@@ -1018,6 +1040,79 @@ async fn main() -> Result<()> {
                     println!("  \u{2713} Mesh: broadcasting (mDNS + platform discovery)");
                 } else {
                     println!("  \u{2713} Mesh: passive discovery (use --broadcast to advertise)");
+                }
+
+                // ── Kafka pub/sub + sync handler (if brokers configured) ──
+                let _kafka_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+                if let Some(ref brokers) = resolved_kafka_brokers {
+                    let kafka_cfg = prism_mesh::kafka::KafkaConfig {
+                        brokers: brokers.clone(),
+                        topic_prefix: "prism.mesh".into(),
+                        group_id: format!(
+                            "prism-{}",
+                            mesh_node_id.map(|id| id.to_string()).unwrap_or_else(|| "unknown".into())
+                        ),
+                    };
+
+                    match prism_mesh::kafka::MeshKafkaConsumer::new(&kafka_cfg) {
+                        Ok(consumer) => {
+                            let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+                            // Use shared state extracted from mesh handle before it was moved
+                            let peers_arc = mesh_peers_shared
+                                .clone()
+                                .unwrap_or_else(|| std::sync::Arc::new(std::sync::RwLock::new(Vec::new())));
+                            let our_node_id = mesh_node_id.unwrap_or_else(uuid::Uuid::nil);
+                            let subscriptions = std::sync::Arc::new(std::sync::RwLock::new(
+                                prism_mesh::subscription::SubscriptionManager::new(),
+                            ));
+
+                            // Build sync config from Neo4j settings if available
+                            let sync_config = server_state.neo4j.as_ref().map(|neo4j| {
+                                prism_mesh::sync::SyncConfig {
+                                    neo4j_url: neo4j.base_url.clone(),
+                                    neo4j_user: neo4j.username.clone(),
+                                    neo4j_pass: neo4j.password.clone(),
+                                }
+                            });
+
+                            // Spawn consumer loop
+                            tokio::spawn(async move {
+                                if let Err(e) = consumer.run(tx).await {
+                                    tracing::error!(error = %e, "Kafka consumer loop exited with error");
+                                }
+                            });
+
+                            // Spawn sync handler
+                            tokio::spawn(async move {
+                                prism_mesh::sync::run_sync_handler(
+                                    rx,
+                                    peers_arc,
+                                    subscriptions,
+                                    our_node_id,
+                                    sync_config,
+                                )
+                                .await;
+                            });
+
+                            println!("  \u{2713} Kafka: pub/sub active ({brokers})");
+                        }
+                        Err(e) => {
+                            eprintln!("  Warning: Kafka consumer failed to start: {e}");
+                            eprintln!("  (Mesh will work via mDNS only, without Kafka pub/sub.)");
+                        }
+                    }
+
+                    match prism_mesh::kafka::MeshKafkaProducer::new(&kafka_cfg) {
+                        Ok(_producer) => {
+                            // Producer is available for publishing mesh messages.
+                            // It will be wired into the subscription manager in a future PR.
+                            tracing::info!("Kafka producer ready");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Kafka producer failed to initialize");
+                        }
+                    }
                 }
 
                 // Run daemon until Ctrl+C — on shutdown, stop Docker containers
@@ -1392,6 +1487,7 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
                 node_name: "discovery-probe".into(),
                 publish_port: 0,
                 discovery: vec![prism_mesh::DiscoveryMethod::Mdns],
+                kafka_brokers: None,
             };
             let handle = prism_mesh::init_mesh(config)?;
             // mDNS discovery is async — wait for the timeout period.
