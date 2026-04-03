@@ -49,8 +49,7 @@ pub async fn ensure_venv(
         .map_err(PythonBridgeError::Spawn)?;
 
     if !status.success() {
-        return Err(PythonBridgeError::Spawn(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(PythonBridgeError::Spawn(std::io::Error::other(
             "python -m venv failed",
         )));
     }
@@ -58,21 +57,19 @@ pub async fn ensure_venv(
     // 3. Install PRISM tools into the venv.
     eprintln!("[prism] Installing PRISM tools into venv…");
     let pip = venv_dir.join("bin/pip");
-    let install_spec = format!(
-        "prism-platform[all] @ git+https://github.com/Darth-Hidious/PRISM.git"
-    );
+    let install_spec =
+        "prism-platform[all] @ git+https://github.com/Darth-Hidious/PRISM.git".to_string();
     let pip_status = Command::new(&pip)
         .args(["install", &install_spec])
         .current_dir(project_root)
-        .stderr(std::process::Stdio::inherit()) // let pip output show on stderr
+        .stderr(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::null())
         .status()
         .await
         .map_err(PythonBridgeError::Spawn)?;
 
     if !pip_status.success() {
-        return Err(PythonBridgeError::Spawn(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(PythonBridgeError::Spawn(std::io::Error::other(
             "pip install prism-platform failed",
         )));
     }
