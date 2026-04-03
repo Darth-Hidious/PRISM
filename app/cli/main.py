@@ -231,5 +231,62 @@ cli.add_command(configure_cmd, "configure")
 from app.commands.workflow import register_workflow_commands
 register_workflow_commands(cli)
 
+
+# ── Fallback commands for when Rust binary is not installed ──────────
+# These provide basic functionality via Python so `prism login` etc.
+# work even without the Rust binary. The Rust binary is the real CLI.
+
+@cli.command()
+@click.pass_context
+def login(ctx):
+    """Authenticate with MARC27 platform (fallback — install Rust binary for full CLI)."""
+    try:
+        from marc27 import PlatformClient
+        client = PlatformClient()
+        click.echo("Starting MARC27 device login...")
+        client.login(open_browser=True)
+        click.echo("Login complete.")
+    except ImportError:
+        click.echo("marc27-sdk not installed. Run: pip install marc27-sdk")
+    except Exception as e:
+        click.echo(f"Login failed: {e}")
+
+
+@cli.command()
+def status():
+    """Show PRISM status (fallback — install Rust binary for full CLI)."""
+    from app import __version__
+    click.echo(f"PRISM v{__version__} (Python CLI — Rust binary not installed)")
+    click.echo()
+    click.echo("For full CLI (node, mesh, ingest, query), install the Rust binary:")
+    click.echo("  cargo install --path crates/cli")
+    click.echo("  # or download from GitHub releases")
+
+
+@cli.command()
+@click.argument('args', nargs=-1)
+def node(args):
+    """Node commands (requires Rust binary)."""
+    click.echo("Error: 'prism node' requires the Rust binary.")
+    click.echo("Install with: cargo install --path crates/cli")
+    click.echo("Or download from: https://github.com/Darth-Hidious/PRISM/releases")
+
+
+@cli.command()
+@click.argument('text', nargs=-1)
+def query(text):
+    """Query the knowledge graph (requires Rust binary)."""
+    click.echo("Error: 'prism query' requires the Rust binary.")
+    click.echo("Install with: cargo install --path crates/cli")
+
+
+@cli.command()
+@click.argument('path', type=click.Path())
+def ingest(path):
+    """Ingest data (requires Rust binary)."""
+    click.echo("Error: 'prism ingest' requires the Rust binary.")
+    click.echo("Install with: cargo install --path crates/cli")
+
+
 if __name__ == "__main__":
     cli()
