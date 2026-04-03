@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn llm_config_defaults() {
         let cfg = LlmConfig::default();
-        assert_eq!(cfg.base_url, "http://localhost:11434");
+        assert_eq!(cfg.base_url, "http://localhost:8080");
         assert_eq!(cfg.max_sample_rows, 10);
     }
 
