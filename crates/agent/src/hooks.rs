@@ -13,37 +13,18 @@ use tracing::{info, warn};
 // ── Result types ────────────────────────────────────────────────────
 
 /// Result of a pre-hook execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HookResult {
     pub abort: bool,
     pub reason: String,
     pub modified_inputs: Option<Value>,
 }
 
-impl Default for HookResult {
-    fn default() -> Self {
-        Self {
-            abort: false,
-            reason: String::new(),
-            modified_inputs: None,
-        }
-    }
-}
-
 /// Result of a post-hook execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PostHookResult {
     pub modified_result: Option<Value>,
     pub log_message: String,
-}
-
-impl Default for PostHookResult {
-    fn default() -> Self {
-        Self {
-            modified_result: None,
-            log_message: String::new(),
-        }
-    }
 }
 
 // ── Hook and callback types ─────────────────────────────────────────

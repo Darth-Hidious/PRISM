@@ -384,7 +384,7 @@ async fn main() -> Result<()> {
 
     // Resolve Python: if user passed an explicit --python, honour it;
     // otherwise manage a venv under ~/.prism/venv/ automatically.
-    let python = if cli.python != PathBuf::from("python3") {
+    let python = if cli.python.as_os_str() != "python3" {
         cli.python.clone()
     } else {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
