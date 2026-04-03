@@ -25,6 +25,59 @@ pub enum LlmProvider {
     OpenAi,
 }
 
+/// A message in the conversation history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallResponse {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug)]
+pub struct ChatResponse {
+    pub message: ChatMessage,
+    pub usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageInfo {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
 /// Unified LLM client — dispatches to the right wire format based on provider.
 pub struct LlmClient {
     client: reqwest::Client,
@@ -57,6 +110,55 @@ impl LlmClient {
             }
             LlmProvider::OpenAi => self.chat_openai(system, user).await,
         }
+    }
+
+    /// Chat with tool-calling support (OpenAI-compatible API).
+    /// Sends full message history + tool definitions, returns response
+    /// which may contain tool_calls.
+    pub async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<ChatResponse> {
+        let url = format!("{}/v1/chat/completions", self.config.base_url);
+
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 4096,
+        });
+
+        if !tools.is_empty() {
+            body["tools"] = serde_json::to_value(tools)?;
+        }
+
+        let resp = self.post(&url, &body).await?;
+        let data: serde_json::Value = resp.json().await
+            .context("bad OpenAI chat response")?;
+
+        let choice = &data["choices"][0];
+        let msg_val = &choice["message"];
+
+        let tool_calls: Option<Vec<ToolCallResponse>> = msg_val
+            .get("tool_calls")
+            .and_then(|tc| serde_json::from_value(tc.clone()).ok());
+
+        let content = msg_val["content"].as_str().map(|s| s.to_string());
+
+        let usage = data.get("usage").and_then(|u| {
+            serde_json::from_value::<UsageInfo>(u.clone()).ok()
+        });
+
+        Ok(ChatResponse {
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content,
+                tool_calls,
+                tool_call_id: None,
+            },
+            usage,
+        })
     }
 
     /// Generate text and parse as JSON. Ollama supports `format: "json"`,
