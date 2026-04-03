@@ -1,435 +1,82 @@
-#!/bin/sh
-# PRISM One-Command Installer v2.5
+#!/usr/bin/env bash
+set -euo pipefail
+
+# PRISM installer — downloads the Rust CLI binary.
 # Usage: curl -fsSL https://prism.marc27.com/install.sh | bash
-#        curl -fsSL https://prism.marc27.com/install.sh | bash -s -- --upgrade
-set -e
 
-REPO="https://github.com/Darth-Hidious/PRISM.git"
-PACKAGE="prism-platform"
-GIT_PACKAGE="$PACKAGE[all] @ git+$REPO"  # [all] excludes simulation (C++ deps); use [full] for everything
-MIN_PYTHON="3.11"
-CURRENT_VERSION="2.5.0"
-RELEASE_TAG="v2.5.0"
-GITHUB_RELEASE="https://github.com/Darth-Hidious/PRISM/releases/download/$RELEASE_TAG"
+VERSION="${PRISM_VERSION:-latest}"
+INSTALL_DIR="${PRISM_INSTALL_DIR:-$HOME/.prism/bin}"
+REPO="Darth-Hidious/PRISM"
 
-# ── Parse flags ──────────────────────────────────────────────────────
-UPGRADE=0
-for arg in "$@"; do
-    case "$arg" in
-        --upgrade|-u) UPGRADE=1 ;;
-    esac
-done
-
-# ── Helpers ──────────────────────────────────────────────────────────
-info()  { printf '  \033[2m→\033[0m %s %s\n' "$1" "$2"; }
-ok()    { printf '  \033[1;32m✓\033[0m %s %s\n' "$1" "$2"; }
-warn()  { printf '  \033[1;33m!\033[0m %s %s\n' "$1" "$2"; }
-err()   { printf '  \033[1;31m✗\033[0m %s\n' "$1" >&2; exit 1; }
-
-# ── Banner ───────────────────────────────────────────────────────────
-printf '\n'
-printf '  \033[1;36m⬡ PRISM\033[0m v%s \033[2m— Materials Discovery Platform\033[0m\n\n' "$CURRENT_VERSION"
-
-# ── Check if already installed & handle upgrade ──────────────────────
-if command -v prism >/dev/null 2>&1; then
-    INSTALLED_VERSION=$(prism --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "2.5.0b0")
-    if [ "$UPGRADE" -eq 0 ]; then
-        ok "Found:" "PRISM v$INSTALLED_VERSION already installed"
-        if [ "$INSTALLED_VERSION" != "$CURRENT_VERSION" ]; then
-            warn "Update:" "v$CURRENT_VERSION available (you have v$INSTALLED_VERSION)"
-            info "Run:" "curl -fsSL https://prism.marc27.com/install.sh | bash -s -- --upgrade"
-        else
-            ok "Up to date!" ""
-        fi
-        printf '\n'
-        info "Run:" "prism"
-        info "Help:" "prism --help"
-        printf '\n'
-        exit 0
-    else
-        info "Upgrading:" "v$INSTALLED_VERSION → v$CURRENT_VERSION"
-    fi
-fi
-
-# ── Ensure ~/.local/bin is on PATH (used by pip --user, pipx, uv) ──
-case ":$PATH:" in
-    *":$HOME/.local/bin:"*) ;;
-    *) export PATH="$HOME/.local/bin:$PATH" ;;
-esac
-
-# ── Detect OS ────────────────────────────────────────────────────────
-OS="$(uname -s)"
+# --- Detect platform ---
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
+
 case "$OS" in
-    Darwin) info "OS:" "macOS ($ARCH)" ;;
-    Linux)  info "OS:" "Linux ($ARCH)" ;;
-    *)      err "Unsupported OS: $OS. PRISM supports macOS and Linux." ;;
+    linux)  PLATFORM="linux" ;;
+    darwin) PLATFORM="macos" ;;
+    *)      echo "Error: Unsupported OS: $OS" >&2; exit 1 ;;
 esac
 
-# ── Find Python >= 3.11 ─────────────────────────────────────────────
-find_python() {
-    for cmd in python3.13 python3.12 python3.11 python3 python; do
-        if command -v "$cmd" >/dev/null 2>&1; then
-            ver=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || true)
-            if [ -n "$ver" ]; then
-                major=$(echo "$ver" | cut -d. -f1)
-                minor=$(echo "$ver" | cut -d. -f2)
-                if [ "$major" -ge 3 ] && [ "$minor" -ge 11 ]; then
-                    echo "$cmd"
-                    return 0
-                fi
-            fi
-        fi
-    done
-    return 1
-}
-
-PYTHON=""
-PYTHON=$(find_python) || true
-
-# ── Find or install an installer (uv > pipx) ────────────────────────
-INSTALLER=""
-
-# Step 1: Check for uv already installed
-if command -v uv >/dev/null 2>&1; then
-    INSTALLER="uv"
-    ok "Found:" "uv ($(uv --version 2>/dev/null || echo 'installed'))"
-
-# Step 2: Check for pipx already installed
-elif command -v pipx >/dev/null 2>&1; then
-    INSTALLER="pipx"
-    ok "Found:" "pipx ($(pipx --version 2>/dev/null || echo 'installed'))"
-
-# Step 3: Neither found — try to install one
-else
-    info "Setup:" "Need pipx or uv to install PRISM..."
-
-    # Strategy A: Try pip (from the target Python) to install pipx
-    if [ -n "$PYTHON" ] && $PYTHON -m pip --version >/dev/null 2>&1; then
-        info "Trying:" "pipx via $PYTHON -m pip..."
-        _pip_log="$(mktemp 2>/dev/null || echo "/tmp/prism-pip.$$.log")"
-        PIPX_INSTALLED=0
-        if $PYTHON -m pip install --user pipx >"$_pip_log" 2>&1; then
-            PIPX_INSTALLED=1
-        elif $PYTHON -m pip install --break-system-packages --user pipx >"$_pip_log" 2>&1; then
-            PIPX_INSTALLED=1
-        elif $PYTHON -m pip install pipx >"$_pip_log" 2>&1; then
-            PIPX_INSTALLED=1
-        fi
-        rm -f "$_pip_log"
-        if [ "$PIPX_INSTALLED" -eq 1 ]; then
-            $PYTHON -m pipx ensurepath >/dev/null 2>&1 || true
-            if command -v pipx >/dev/null 2>&1; then
-                INSTALLER="pipx"
-                ok "Installed:" "pipx"
-            else
-                INSTALLER="pipx-module"
-                ok "Installed:" "pipx (via $PYTHON -m pipx)"
-            fi
-        fi
-    fi
-
-    # Strategy B: Try ensurepip + pip to install pipx
-    if [ -z "$INSTALLER" ] && [ -n "$PYTHON" ]; then
-        if $PYTHON -m ensurepip --upgrade >/dev/null 2>&1 || $PYTHON -m ensurepip >/dev/null 2>&1; then
-            info "Trying:" "pipx via ensurepip..."
-            if $PYTHON -m pip install --user pipx >/dev/null 2>&1 || \
-               $PYTHON -m pip install --break-system-packages --user pipx >/dev/null 2>&1; then
-                $PYTHON -m pipx ensurepath >/dev/null 2>&1 || true
-                if command -v pipx >/dev/null 2>&1; then
-                    INSTALLER="pipx"
-                    ok "Installed:" "pipx (via ensurepip)"
-                else
-                    INSTALLER="pipx-module"
-                    ok "Installed:" "pipx (via $PYTHON -m pipx)"
-                fi
-            fi
-        fi
-    fi
-
-    # Strategy C: Try any available pip3/pip on the system to install pipx
-    if [ -z "$INSTALLER" ]; then
-        for pipcmd in pip3 pip; do
-            if command -v "$pipcmd" >/dev/null 2>&1; then
-                info "Trying:" "pipx via $pipcmd..."
-                if $pipcmd install --user pipx >/dev/null 2>&1 || \
-                   $pipcmd install --break-system-packages --user pipx >/dev/null 2>&1 || \
-                   $pipcmd install pipx >/dev/null 2>&1; then
-                    # Run ensurepath if possible
-                    pipx ensurepath >/dev/null 2>&1 || \
-                      $pipcmd show pipx >/dev/null 2>&1 && \
-                      python3 -m pipx ensurepath >/dev/null 2>&1 || true
-                    if command -v pipx >/dev/null 2>&1; then
-                        INSTALLER="pipx"
-                        ok "Installed:" "pipx (via $pipcmd)"
-                        break
-                    fi
-                fi
-            fi
-        done
-    fi
-
-    # Strategy D: Auto-install uv (no pip needed at all)
-    if [ -z "$INSTALLER" ]; then
-        info "Trying:" "auto-installing uv (no pip needed)..."
-        if command -v curl >/dev/null 2>&1; then
-            if curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh >/dev/null 2>&1; then
-                # Source uv's env to update PATH
-                if [ -f "$HOME/.local/bin/env" ]; then
-                    . "$HOME/.local/bin/env" 2>/dev/null || true
-                fi
-                # Also check cargo bin in case uv installed there
-                case ":$PATH:" in
-                    *":$HOME/.cargo/bin:"*) ;;
-                    *) export PATH="$HOME/.cargo/bin:$PATH" ;;
-                esac
-                if command -v uv >/dev/null 2>&1; then
-                    INSTALLER="uv"
-                    ok "Installed:" "uv"
-                fi
-            fi
-        elif command -v wget >/dev/null 2>&1; then
-            if wget -qO- https://astral.sh/uv/install.sh 2>/dev/null | sh >/dev/null 2>&1; then
-                if [ -f "$HOME/.local/bin/env" ]; then
-                    . "$HOME/.local/bin/env" 2>/dev/null || true
-                fi
-                case ":$PATH:" in
-                    *":$HOME/.cargo/bin:"*) ;;
-                    *) export PATH="$HOME/.cargo/bin:$PATH" ;;
-                esac
-                if command -v uv >/dev/null 2>&1; then
-                    INSTALLER="uv"
-                    ok "Installed:" "uv"
-                fi
-            fi
-        fi
-    fi
-
-    # All strategies exhausted
-    if [ -z "$INSTALLER" ]; then
-        printf '\n'
-        warn "Could not install pipx or uv automatically."
-        warn ""  ""
-        warn "Manual options:"
-        warn "  1." "Install uv:   curl -LsSf https://astral.sh/uv/install.sh | sh"
-        warn "  2." "Install pip:  sudo apt install python3-pip  (Debian/Ubuntu)"
-        warn "    " "              sudo dnf install python3-pip  (Fedora)"
-        warn "    " "              sudo pacman -S python-pip     (Arch)"
-        warn "  3." "Install pipx: https://pipx.pypa.io/stable/installation/"
-        printf '\n'
-        err "No installer available. See suggestions above, then re-run this script."
-    fi
-fi
-
-# ── If using uv, it can provide Python — check/upgrade our Python ───
-if [ "$INSTALLER" = "uv" ] && [ -z "$PYTHON" ]; then
-    info "Python:" "No Python >= $MIN_PYTHON found, using uv to get one..."
-    if uv python install 3.12 >/dev/null 2>&1; then
-        # After uv installs Python, find it
-        PYTHON=$(find_python) || true
-        if [ -n "$PYTHON" ]; then
-            ok "Python:" "$($PYTHON --version) (installed by uv)"
-        else
-            # uv will handle Python selection internally
-            ok "Python:" "uv will manage Python version"
-        fi
-    fi
-fi
-
-# ── Final Python check ──────────────────────────────────────────────
-if [ -z "$PYTHON" ] && [ "$INSTALLER" != "uv" ]; then
-    printf '\n'
-    warn "Python >= $MIN_PYTHON is required but not found."
-    warn "Install:" "sudo apt install python3.12  (Debian/Ubuntu)"
-    warn "     or:" "brew install python@3.12     (macOS)"
-    warn "     or:" "Install uv, which can fetch Python automatically:"
-    warn "        " "curl -LsSf https://astral.sh/uv/install.sh | sh"
-    printf '\n'
-    err "Python >= $MIN_PYTHON is required. See suggestions above."
-fi
-
-if [ -n "$PYTHON" ]; then
-    PYTHON_PATH="$(command -v "$PYTHON")"
-    ok "Python:" "$($PYTHON --version) ($PYTHON_PATH)"
-fi
-
-# ── Install PRISM ────────────────────────────────────────────────────
-printf '\n'
-if [ "$UPGRADE" -eq 1 ]; then
-    info "Upgrading" "PRISM..."
-else
-    info "Installing" "PRISM..."
-fi
-
-INSTALL_OK=0
-case "$INSTALLER" in
-    uv)
-        UV_ARGS=""
-        if [ -n "$PYTHON" ]; then
-            PYTHON_PATH="$(command -v "$PYTHON")"
-            UV_ARGS="--python $PYTHON_PATH"
-        fi
-        if [ "$UPGRADE" -eq 1 ]; then
-            # Force reinstall for upgrade
-            uv tool install $UV_ARGS --force "$GIT_PACKAGE" && INSTALL_OK=1
-        else
-            uv tool install $UV_ARGS "$GIT_PACKAGE" && INSTALL_OK=1
-        fi
-        ;;
-    pipx)
-        PYTHON_PATH="$(command -v "$PYTHON")"
-        if [ "$UPGRADE" -eq 1 ]; then
-            pipx install --python "$PYTHON_PATH" --force "$GIT_PACKAGE" && INSTALL_OK=1
-        else
-            pipx install --python "$PYTHON_PATH" "$GIT_PACKAGE" && INSTALL_OK=1
-        fi
-        ;;
-    pipx-module)
-        PYTHON_PATH="$(command -v "$PYTHON")"
-        if [ "$UPGRADE" -eq 1 ]; then
-            $PYTHON -m pipx install --python "$PYTHON_PATH" --force "$GIT_PACKAGE" && INSTALL_OK=1
-        else
-            $PYTHON -m pipx install --python "$PYTHON_PATH" "$GIT_PACKAGE" && INSTALL_OK=1
-        fi
-        ;;
+case "$ARCH" in
+    x86_64|amd64)   ARCH="x86_64" ;;
+    aarch64|arm64)   ARCH="aarch64" ;;
+    *)               echo "Error: Unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
 
-if [ "$INSTALL_OK" -eq 0 ]; then
-    printf '\n'
-    err "PRISM installation failed. Try manually:"
-    err "  pip install \"$GIT_PACKAGE\""
-    err "  Or see: https://github.com/Darth-Hidious/PRISM#quick-start"
+ARCHIVE="prism-${PLATFORM}-${ARCH}.tar.gz"
+
+# --- Resolve version ---
+if [ "$VERSION" = "latest" ]; then
+    echo "Fetching latest release..."
+    VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+        | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+    if [ -z "$VERSION" ]; then
+        echo "Error: Failed to fetch latest version from GitHub" >&2
+        exit 1
+    fi
 fi
 
-# ── Download TUI binary ─────────────────────────────────────────
-TUI_BIN_DIR="$HOME/.prism/bin"
-TUI_BIN_NAME=""
-case "$OS" in
-    Darwin)
-        case "$ARCH" in
-            arm64)  TUI_BIN_NAME="prism-tui-darwin-arm64" ;;
-            x86_64) TUI_BIN_NAME="prism-tui-darwin-x64" ;;
-        esac
-        ;;
-    Linux)
-        case "$ARCH" in
-            x86_64)  TUI_BIN_NAME="prism-tui-linux-x64" ;;
-            aarch64) TUI_BIN_NAME="prism-tui-linux-arm64" ;;
-        esac
-        ;;
+echo "Installing PRISM ${VERSION} for ${PLATFORM}-${ARCH}..."
+
+# --- Download and extract ---
+URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+echo "Downloading ${URL}..."
+if ! curl -fSL "$URL" -o "${TMPDIR}/${ARCHIVE}"; then
+    echo "Error: Download failed. Check that ${VERSION} has a release for ${PLATFORM}-${ARCH}." >&2
+    exit 1
+fi
+
+echo "Extracting to ${INSTALL_DIR}..."
+mkdir -p "$INSTALL_DIR"
+tar -xzf "${TMPDIR}/${ARCHIVE}" -C "$INSTALL_DIR"
+chmod +x "${INSTALL_DIR}/prism" 2>/dev/null || true
+chmod +x "${INSTALL_DIR}/prism-node" 2>/dev/null || true
+
+# --- Add to PATH ---
+SHELL_NAME="$(basename "${SHELL:-bash}")"
+case "$SHELL_NAME" in
+    zsh)  RC_FILE="$HOME/.zshrc" ;;
+    fish) RC_FILE="$HOME/.config/fish/config.fish" ;;
+    *)    RC_FILE="$HOME/.bashrc" ;;
 esac
 
-if [ -n "$TUI_BIN_NAME" ]; then
-    # Get the latest release tag (including pre-releases) from GitHub API
-    TUI_TAG=$(curl -fsSL "https://api.github.com/repos/Darth-Hidious/PRISM/releases" 2>/dev/null \
-        | grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-    if [ -z "$TUI_TAG" ]; then
-        TUI_TAG="v2.5.0b1.0.3"  # fallback
-    fi
-    TUI_URL="https://github.com/Darth-Hidious/PRISM/releases/download/$TUI_TAG/$TUI_BIN_NAME"
-    info "TUI:" "Downloading Ink frontend binary ($TUI_TAG)..."
-    mkdir -p "$TUI_BIN_DIR"
-    if curl -fsSL -L "$TUI_URL" -o "$TUI_BIN_DIR/prism-tui" 2>/dev/null; then
-        chmod +x "$TUI_BIN_DIR/prism-tui"
-        ok "TUI:" "Ink frontend installed ($TUI_BIN_NAME)"
+if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
+    if [ "$SHELL_NAME" = "fish" ]; then
+        echo "fish_add_path $INSTALL_DIR" >> "$RC_FILE"
     else
-        warn "TUI:" "Binary not available for $OS/$ARCH (Rich UI will be used)"
+        echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$RC_FILE"
     fi
-else
-    warn "TUI:" "No pre-built binary for $OS/$ARCH (Rich UI will be used)"
+    echo "Added ${INSTALL_DIR} to PATH in ${RC_FILE}"
+    echo "Run: source ${RC_FILE}  (or open a new terminal)"
 fi
 
-# ── Verify ───────────────────────────────────────────────────────────
-printf '\n'
-
-# Re-check PATH one more time
-case ":$PATH:" in
-    *":$HOME/.local/bin:"*) ;;
-    *) export PATH="$HOME/.local/bin:$PATH" ;;
-esac
-
-if command -v prism >/dev/null 2>&1; then
-    FINAL_VERSION=$(prism --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "$CURRENT_VERSION")
-    if [ "$UPGRADE" -eq 1 ]; then
-        ok "Upgraded!" "PRISM v$FINAL_VERSION"
-    else
-        ok "Installed!" "PRISM v$FINAL_VERSION"
-    fi
-    printf '\n'
-    printf '\n'
-    ok "Run" "'prism' to start"
-    info "Help:" "prism --help"
-    printf '\n'
-
-    # Warn if user's login shell won't see the binary
-    SHELL_RC=""
-    case "${SHELL:-}" in
-        */bash) SHELL_RC="~/.bashrc" ;;
-        */zsh)  SHELL_RC="~/.zshrc" ;;
-        */fish) SHELL_RC="~/.config/fish/config.fish" ;;
-    esac
-    # Check if ~/.local/bin is already in login shell PATH
-    if [ -n "$SHELL_RC" ] && ! grep -q '\.local/bin' "$HOME/$(basename "$SHELL_RC" | sed 's/^~//')" 2>/dev/null; then
-        warn "Note:" "You may need to restart your shell or run:"
-        warn "     " "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-    fi
-else
-    warn "Installed" "but 'prism' is not on your PATH yet."
-    printf '\n'
-    warn "Fix:" "Add ~/.local/bin to your PATH, then restart your shell:"
-    warn "    " "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
-    warn "    " "  source ~/.bashrc"
-    printf '\n'
-    warn "Or run directly:"
-    if [ "$INSTALLER" = "uv" ]; then
-        warn "    " "  uv tool run prism"
-    elif [ "$INSTALLER" = "pipx-module" ]; then
-        warn "    " "  $PYTHON -m pipx run $PACKAGE"
-    else
-        warn "    " "  pipx run $PACKAGE"
-    fi
-    printf '\n'
-fi
-
-# ── Install Rust backbone (prebuilt binary) ──────────────────────────
-printf '\n'
-info "Installing" "Rust control-plane binary..."
-
-ARCH=$(uname -m)
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-
-BINARY_NAME=""
-case "$OS-$ARCH" in
-    darwin-arm64)   BINARY_NAME="prism-darwin-arm64.tar.gz" ;;
-    darwin-x86_64)  BINARY_NAME="prism-darwin-x86_64.tar.gz" ;;
-    linux-x86_64)   BINARY_NAME="prism-linux-x86_64.tar.gz" ;;
-    linux-aarch64)  BINARY_NAME="prism-linux-arm64.tar.gz" ;;
-esac
-
-if [ -n "$BINARY_NAME" ]; then
-    INSTALL_DIR="$HOME/.local/bin"
-    mkdir -p "$INSTALL_DIR"
-    TMP_DIR=$(mktemp -d)
-
-    if curl -fsSL "$GITHUB_RELEASE/$BINARY_NAME" -o "$TMP_DIR/$BINARY_NAME" 2>/dev/null; then
-        tar xzf "$TMP_DIR/$BINARY_NAME" -C "$TMP_DIR"
-        mv "$TMP_DIR/prism" "$INSTALL_DIR/prism" 2>/dev/null && chmod +x "$INSTALL_DIR/prism"
-        mv "$TMP_DIR/prism-node" "$INSTALL_DIR/prism-node" 2>/dev/null && chmod +x "$INSTALL_DIR/prism-node"
-        ok "Installed" "prism + prism-node to $INSTALL_DIR"
-    else
-        warn "Skipped" "prebuilt binary download failed (build from source with: cargo build --release)"
-    fi
-
-    rm -rf "$TMP_DIR"
-else
-    warn "Skipped" "no prebuilt binary for $OS/$ARCH (build from source with: cargo build --release)"
-fi
-
-# ── Final instructions ───────────────────────────────────────────────
-printf '\n'
-printf '  \033[1;36m⬡ PRISM\033[0m installed successfully!\n\n'
-printf '  \033[1mQuick start:\033[0m\n'
-printf '    prism login     \033[2m# authenticate with MARC27 platform\033[0m\n'
-printf '    prism status    \033[2m# verify connection\033[0m\n'
-printf '    prism           \033[2m# start interactive agent\033[0m\n'
-printf '\n'
+echo ""
+echo "PRISM ${VERSION} installed successfully!"
+echo ""
+echo "  prism login     Authenticate with MARC27"
+echo "  prism --help    See all commands"
+echo ""
