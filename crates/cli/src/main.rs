@@ -546,7 +546,6 @@ async fn main() -> Result<()> {
             python: backend_py,
         } => {
             use prism_ingest::LlmConfig;
-            use prism_ingest::llm::LlmProvider;
 
             // Resolve LLM config from env vars or stored credentials
             let api_key = std::env::var("LLM_API_KEY")
@@ -562,7 +561,6 @@ async fn main() -> Result<()> {
                 .ok();
 
             let llm_config = LlmConfig {
-                provider: LlmProvider::OpenAi,
                 base_url: std::env::var("LLM_BASE_URL")
                     .unwrap_or_else(|_| "https://platform.marc27.com/api/v1/llm".to_string()),
                 model: std::env::var("LLM_MODEL")
@@ -841,32 +839,24 @@ async fn main() -> Result<()> {
                 {
                     let api_key =
                         prism_core::config::NodeConfig::resolve_api_key(&node_config.indexer);
-                    let provider = match node_config.indexer.mode.as_str() {
-                        "platform" | "marc27" => prism_ingest::llm::LlmProvider::OpenAi,
-                        "external" => prism_ingest::llm::LlmProvider::OpenAi,
-                        _ => prism_ingest::llm::LlmProvider::Ollama,
-                    };
                     let base_url =
                         node_config
                             .indexer
                             .uri
                             .clone()
-                            .unwrap_or_else(|| match provider {
-                                prism_ingest::llm::LlmProvider::OpenAi => {
+                            .unwrap_or_else(|| match node_config.indexer.mode.as_str() {
+                                "platform" | "marc27" | "external" => {
                                     node_config.platform.url.clone() + "/llm"
                                 }
-                                prism_ingest::llm::LlmProvider::Ollama => {
-                                    "http://localhost:11434".into()
-                                }
+                                _ => "http://localhost:8080".into(), // llama.cpp default
                             });
                     server_node_state.llm = Some(prism_ingest::LlmConfig {
-                        provider,
                         base_url,
                         model: node_config
                             .indexer
                             .model
                             .clone()
-                            .unwrap_or_else(|| "qwen2.5:7b".into()),
+                            .unwrap_or_else(|| "gemma-3-27b".into()),
                         api_key,
                         embedding_model: node_config.indexer.embedding_model.clone(),
                         max_sample_rows: 10,
@@ -1459,27 +1449,17 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
 // ── LLM config builder ─────────────────────────────────────────────────
 
 fn build_llm_config(
-    provider: &str,
+    _provider: &str,
     base_url: &str,
     model: &str,
     api_key: Option<&str>,
 ) -> prism_ingest::LlmConfig {
-    use prism_ingest::llm::LlmProvider;
-    let provider_enum = match provider.to_lowercase().as_str() {
-        "openai" | "openai-compatible" | "marc27" | "vllm" | "litellm" => LlmProvider::OpenAi,
-        _ => LlmProvider::Ollama,
-    };
-    // Default embedding model based on provider
-    let embedding_model = match provider_enum {
-        LlmProvider::Ollama => Some("nomic-embed-text".to_string()),
-        LlmProvider::OpenAi => None, // OpenAI-compatible APIs use the same model or a default
-    };
+    // All providers use the OpenAI-compatible API now
     prism_ingest::LlmConfig {
-        provider: provider_enum,
         base_url: base_url.into(),
         model: model.into(),
         api_key: api_key.map(str::to_string),
-        embedding_model,
+        embedding_model: None,
         max_sample_rows: 10,
         timeout_secs: 120,
     }
