@@ -13,6 +13,7 @@ from app.agent.events import (
     ToolApprovalRequest,
 )
 from app.backend.protocol import make_event
+from app.backend.stream_buffer import MarkdownStreamBuffer
 from app.backend.tool_meta import detect_result_type, TOOL_VERBS
 from app.backend.status import build_status
 
@@ -55,6 +56,7 @@ class UIEmitter:
         plan_buffer = ""
         in_plan = False
         tool_start_time = None
+        stream_buf = MarkdownStreamBuffer()
 
         for event in self.agent.process_stream(user_input):
             if isinstance(event, TextDelta):
@@ -97,11 +99,14 @@ class UIEmitter:
                         plan_buffer += event.text
                     continue
 
-                # Normal text streaming
-                yield make_event("ui.text.delta", {"text": event.text})
+                # Normal text streaming — buffered at safe markdown boundaries
+                for chunk in stream_buf.push(event.text):
+                    yield make_event("ui.text.delta", {"text": chunk})
 
             elif isinstance(event, ToolCallStart):
-                # Flush any accumulated text before the tool starts
+                # Flush buffer + accumulated text before the tool starts
+                for chunk in stream_buf.flush():
+                    yield make_event("ui.text.delta", {"text": chunk})
                 if accumulated_text.strip():
                     yield make_event("ui.text.flush", {"text": accumulated_text})
                     accumulated_text = ""
