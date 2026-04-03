@@ -58,7 +58,9 @@ fn emit_error(code: i64, message: &str, id: Value) {
     }));
 }
 
-/// Map an [`AgentEvent`] to the appropriate `ui.*` JSON-RPC notification.
+/// Map an [`AgentEvent`] to the `ui.*` JSON-RPC notifications that the Ink
+/// frontend expects.  Event names and schemas MUST match
+/// `frontend/src/bridge/types.ts` → `UI_EVENT_MAP`.
 fn emit_agent_event(event: AgentEvent) {
     match event {
         AgentEvent::TextDelta { text } => {
@@ -68,11 +70,14 @@ fn emit_agent_event(event: AgentEvent) {
             tool_name,
             call_id,
         } => {
+            // Flush any buffered text before a tool starts
+            emit_notification("ui.text.flush", serde_json::json!({ "text": "" }));
             emit_notification(
                 "ui.tool.start",
                 serde_json::json!({
                     "tool_name": tool_name,
                     "call_id": call_id,
+                    "verb": format!("Running {tool_name}"),
                 }),
             );
         }
@@ -80,19 +85,19 @@ fn emit_agent_event(event: AgentEvent) {
             call_id,
             tool_name,
             content,
-            summary,
+            summary: _,
             elapsed_ms,
             is_error,
         } => {
+            // Frontend expects "ui.card" with UiCard schema
             emit_notification(
-                "ui.tool.result",
+                "ui.card",
                 serde_json::json!({
+                    "card_type": if is_error { "error" } else { "results" },
                     "tool_name": tool_name,
-                    "call_id": call_id,
-                    "content": content,
-                    "summary": summary,
                     "elapsed_ms": elapsed_ms,
-                    "is_error": is_error,
+                    "content": content,
+                    "data": { "call_id": call_id },
                 }),
             );
         }
@@ -101,32 +106,40 @@ fn emit_agent_event(event: AgentEvent) {
             call_id,
             tool_args,
         } => {
+            // Frontend expects "ui.prompt" with UiPrompt schema
             emit_notification(
-                "ui.approval.required",
+                "ui.prompt",
                 serde_json::json!({
+                    "prompt_type": "approval",
+                    "message": format!("Allow {}?", tool_name),
+                    "choices": ["y", "n", "a"],
                     "tool_name": tool_name,
-                    "call_id": call_id,
                     "tool_args": tool_args,
                 }),
             );
         }
         AgentEvent::TurnComplete {
-            text,
-            has_more,
+            text: _,
+            has_more: _,
             usage,
-            total_usage,
+            total_usage: _,
             estimated_cost,
         } => {
+            // Emit ui.cost before ui.turn.complete (frontend expects both)
+            let (input_tokens, output_tokens) = usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens))
+                .unwrap_or((0, 0));
             emit_notification(
-                "ui.turn.complete",
+                "ui.cost",
                 serde_json::json!({
-                    "text": text,
-                    "has_more": has_more,
-                    "usage": usage,
-                    "total_usage": total_usage,
-                    "estimated_cost": estimated_cost,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "turn_cost": estimated_cost.unwrap_or(0.0),
+                    "session_cost": estimated_cost.unwrap_or(0.0),
                 }),
             );
+            emit_notification("ui.turn.complete", serde_json::json!({}));
         }
     }
 }
@@ -153,7 +166,10 @@ fn handle_command(
         }
         "/clear" => {
             history.clear();
-            emit_notification("ui.clear", serde_json::json!({}));
+            emit_notification(
+                "ui.text.delta",
+                serde_json::json!({ "text": "Conversation cleared." }),
+            );
             emit_notification("ui.turn.complete", serde_json::json!({}));
             true
         }
@@ -394,6 +410,14 @@ pub async fn run_server(
 
                 emit_response(id, serde_json::json!({ "status": "ok" }));
                 emit_notification("ui.welcome", welcome);
+                emit_notification(
+                    "ui.status",
+                    serde_json::json!({
+                        "auto_approve": config.auto_approve,
+                        "message_count": 0,
+                        "has_plan": false,
+                    }),
+                );
             }
 
             "input.message" => {
