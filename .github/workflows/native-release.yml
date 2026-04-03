@@ -36,6 +36,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install system deps (Linux — rdkafka needs libcurl)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev
+
+      - name: Create dashboard dist placeholder
+        run: mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           target: ${{ matrix.rust_target }}
