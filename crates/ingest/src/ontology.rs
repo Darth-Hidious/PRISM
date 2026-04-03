@@ -375,9 +375,9 @@ mod tests {
     }
 
     #[test]
-    fn default_config_points_to_ollama() {
+    fn default_config_points_to_llama_cpp() {
         let cfg = LlmConfig::default();
-        assert!(cfg.base_url.contains("11434"));
+        assert!(cfg.base_url.contains("8080"), "default should be llama.cpp port 8080");
     }
 
     #[test]
