@@ -16,7 +16,7 @@ use prism_client::api::PlatformClient;
 use prism_client::auth::{DeviceCodeResponse, TokenResponse};
 use prism_client::DeviceFlowAuth;
 use prism_proto::NodeCapabilities;
-use prism_python_bridge::PythonWorkerConfig;
+use prism_python_bridge::ToolServer;
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
     discover_workflows, execute_workflow, find_workflow, parse_workflow_command_args,
@@ -50,13 +50,8 @@ enum Commands {
         #[command(subcommand)]
         command: WorkflowCommands,
     },
-    /// Start the Python backend worker under Rust supervision.
-    Backend {
-        #[arg(long, default_value = ".")]
-        project_root: PathBuf,
-        #[arg(long, default_value = "python3")]
-        python: PathBuf,
-    },
+    /// List available Python tools.
+    Tools,
     /// PRISM node lifecycle commands.
     Node {
         #[command(subcommand)]
@@ -530,20 +525,25 @@ async fn main() -> Result<()> {
         Commands::Workflow { command } => {
             handle_workflow_command(command, &project_root).await?;
         }
-        Commands::Backend {
-            project_root,
-            python,
-        } => {
-            let mut config = PythonWorkerConfig::backend(project_root);
-            let state = paths.load_cli_state()?;
-            config.python_bin = python;
-            config
-                .env
-                .insert("PYTHONUNBUFFERED".to_string(), "1".to_string());
-            apply_cli_state_env(&mut config.env, state.credentials.as_ref());
-            let mut child = config.stdio_command().spawn()?;
-            let status = child.wait().await?;
-            std::process::exit(status.code().unwrap_or(1));
+        Commands::Tools => {
+            let server = ToolServer {
+                python_bin: python.clone(),
+                project_root: project_root.clone(),
+                env: Default::default(),
+            };
+            let mut handle = server.spawn().await?;
+            let tools = handle.list_tools().await?;
+            if let Some(arr) = tools.as_array() {
+                for tool in arr {
+                    let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("  {:<30} {}", name, desc);
+                }
+                println!("\n{} tools available", arr.len());
+            } else {
+                println!("{}", serde_json::to_string_pretty(&tools)?);
+            }
+            handle.shutdown().await?;
         }
         Commands::Node { command } => match command {
             NodeCommands::Up {
@@ -1102,7 +1102,11 @@ async fn main() -> Result<()> {
             if try_run_workflow_alias(&project_root, &args).await? {
                 return Ok(());
             }
-            proxy_python_cli(&python, &project_root, &args).await?;
+            // Python CLI has been removed. Show help for unknown commands.
+            let cmd = args.first().map(|s| s.as_str()).unwrap_or("?");
+            eprintln!("Unknown command: {cmd}");
+            eprintln!("Run 'prism --help' for available commands.");
+            std::process::exit(1);
         }
     }
 
@@ -1929,19 +1933,6 @@ async fn handle_query(
     Ok(())
 }
 
-async fn proxy_python_cli(python: &Path, project_root: &Path, args: &[String]) -> Result<()> {
-    let mut cmd = tokio::process::Command::new(python);
-    cmd.arg("-m")
-        .arg("app.cli.main")
-        .args(args)
-        .current_dir(project_root)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .env("PRISM_DISABLE_RUST_BOOTSTRAP", "1");
-    let status = cmd.spawn()?.wait().await?;
-    std::process::exit(status.code().unwrap_or(1));
-}
 
 async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredentials> {
     let platform = PlatformClient::new(&endpoints.api_base);
@@ -2218,43 +2209,6 @@ fn discover_tui_binary(paths: &PrismPaths) -> Option<PathBuf> {
     }
 
     None
-}
-
-fn apply_cli_state_env(
-    env_map: &mut std::collections::BTreeMap<String, String>,
-    credentials: Option<&StoredCredentials>,
-) {
-    if let Some(creds) = credentials {
-        env_map.insert("MARC27_TOKEN".to_string(), creds.access_token.clone());
-        env_map.insert(
-            "MARC27_PLATFORM_URL".to_string(),
-            creds.platform_url.clone(),
-        );
-        if let Some(project_id) = &creds.project_id {
-            env_map.insert("MARC27_PROJECT_ID".to_string(), project_id.clone());
-        }
-        if let Some(user_id) = &creds.user_id {
-            env_map.insert("PRISM_ACCOUNT_USER_ID".to_string(), user_id.clone());
-        }
-        if let Some(display_name) = &creds.display_name {
-            env_map.insert(
-                "PRISM_ACCOUNT_DISPLAY_NAME".to_string(),
-                display_name.clone(),
-            );
-        }
-        if let Some(org_id) = &creds.org_id {
-            env_map.insert("PRISM_ACCOUNT_ORG_ID".to_string(), org_id.clone());
-        }
-        if let Some(org_name) = &creds.org_name {
-            env_map.insert("PRISM_ACCOUNT_ORG_NAME".to_string(), org_name.clone());
-        }
-        if let Some(project_name) = &creds.project_name {
-            env_map.insert(
-                "PRISM_ACCOUNT_PROJECT_NAME".to_string(),
-                project_name.clone(),
-            );
-        }
-    }
 }
 
 fn apply_process_env(cmd: &mut std::process::Command, credentials: Option<&StoredCredentials>) {
