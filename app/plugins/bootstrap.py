@@ -116,6 +116,17 @@ def build_full_registry(
         except Exception:
             pass
 
+    # Spark data processing tools (optional — pyspark may not be installed)
+    try:
+        from app.tools.spark import _check_spark_available
+
+        if _check_spark_available():
+            from app.tools.spark import create_spark_tools
+
+            create_spark_tools(registry)
+    except Exception:
+        pass
+
     # Custom tools from ~/.prism/tools/*.py
     try:
         from app.tools.custom_loader import discover_custom_tools

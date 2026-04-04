@@ -79,17 +79,30 @@ pub async fn publish_dataset(
 ) -> Result<Json<PublishResponse>, (axum::http::StatusCode, String)> {
     use prism_mesh::subscription::PublishedDataset;
 
-    let mut subs = state
-        .subscriptions
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
-    subs.publish(PublishedDataset {
-        name: body.name.clone(),
-        schema_version: body.schema_version.clone(),
-        subscribers: vec![],
-    });
+    {
+        let mut subs = state
+            .subscriptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        subs.publish(PublishedDataset {
+            name: body.name.clone(),
+            schema_version: body.schema_version.clone(),
+            subscribers: vec![],
+        });
+    }
 
-    // TODO: announce via Kafka when producer is available on NodeState
+    // Broadcast via Kafka so other nodes discover this dataset
+    if let (Some(producer), Some(&node_id)) = (state.kafka_producer.get(), state.node_id.get()) {
+        let msg = prism_mesh::protocol::MeshMessage::DataPublish {
+            node_id,
+            dataset_name: body.name.clone(),
+            schema_version: body.schema_version.clone(),
+            update_frequency: "on-demand".to_string(),
+        };
+        if let Err(e) = producer.publish(&msg).await {
+            tracing::warn!(error = %e, "failed to announce dataset via Kafka");
+        }
+    }
 
     Ok(Json(PublishResponse {
         name: body.name,
@@ -111,15 +124,28 @@ pub async fn subscribe_dataset(
         )
     })?;
 
-    let mut subs = state
-        .subscriptions
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
-    subs.subscribe(Subscription {
-        dataset_name: body.dataset_name.clone(),
-        publisher_node: publisher,
-        subscribed_at: chrono::Utc::now(),
-    });
+    {
+        let mut subs = state
+            .subscriptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        subs.subscribe(Subscription {
+            dataset_name: body.dataset_name.clone(),
+            publisher_node: publisher,
+            subscribed_at: chrono::Utc::now(),
+        });
+    }
+
+    // Notify the publisher node via Kafka that we subscribed
+    if let (Some(producer), Some(&node_id)) = (state.kafka_producer.get(), state.node_id.get()) {
+        let msg = prism_mesh::protocol::MeshMessage::DataSubscribe {
+            subscriber_id: node_id,
+            dataset_name: body.dataset_name.clone(),
+        };
+        if let Err(e) = producer.publish(&msg).await {
+            tracing::warn!(error = %e, "failed to announce subscription via Kafka");
+        }
+    }
 
     Ok(Json(SubscribeResponse {
         dataset_name: body.dataset_name,
@@ -140,11 +166,24 @@ pub async fn unsubscribe_dataset(
         )
     })?;
 
-    let mut subs = state
-        .subscriptions
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
-    subs.unsubscribe(&body.dataset_name, publisher);
+    {
+        let mut subs = state
+            .subscriptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        subs.unsubscribe(&body.dataset_name, publisher);
+    }
+
+    // Notify peers via Kafka that we unsubscribed
+    if let (Some(producer), Some(&node_id)) = (state.kafka_producer.get(), state.node_id.get()) {
+        let msg = prism_mesh::protocol::MeshMessage::DataUnsubscribe {
+            subscriber_id: node_id,
+            dataset_name: body.dataset_name.clone(),
+        };
+        if let Err(e) = producer.publish(&msg).await {
+            tracing::warn!(error = %e, "failed to announce unsubscription via Kafka");
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "dataset_name": body.dataset_name,

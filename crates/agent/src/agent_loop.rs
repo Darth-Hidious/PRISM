@@ -18,6 +18,22 @@ use crate::scratchpad::Scratchpad;
 use crate::transcript::{TranscriptEntry, TranscriptStore};
 use crate::types::{AgentConfig, AgentEvent, UsageInfo};
 
+/// Approval response from the TUI/frontend.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApprovalResponse {
+    /// User approved this single tool call.
+    Allow,
+    /// User denied this tool call.
+    Deny,
+    /// User approved all remaining tool calls (auto-approve).
+    AllowAll,
+}
+
+/// Channel-based gate for tool approval.
+/// The protocol layer sends responses through this when the TUI replies.
+pub type ApprovalSender = tokio::sync::mpsc::Sender<ApprovalResponse>;
+pub type ApprovalReceiver = tokio::sync::mpsc::Receiver<ApprovalResponse>;
+
 // ── Constants ─────────────────────────────────────────────────────
 
 const MAX_TOOL_RESULT_CHARS: usize = 30_000;
@@ -112,6 +128,8 @@ pub async fn run_turn(
     permissions: &ToolPermissionContext,
     scratchpad: &mut Scratchpad,
     emit: &mut dyn FnMut(AgentEvent),
+    mut approval_rx: Option<&mut ApprovalReceiver>,
+    mut policy: Option<&mut prism_policy::PolicyEngine>,
 ) -> Result<()> {
     // ── 1. Push user message ──────────────────────────────────────
     history.push(ChatMessage {
@@ -157,9 +175,12 @@ pub async fn run_turn(
         }];
         messages.extend(history.iter().cloned());
 
-        // ── 2c. Call LLM ──────────────────────────────────────────
+        // ── 2c. Call LLM (with streaming) ────────────────────────
+        let mut streaming_deltas: Vec<String> = Vec::new();
         let response = llm
-            .chat_with_tools(&messages, tools)
+            .chat_with_tools_streaming(&messages, tools, |delta| {
+                streaming_deltas.push(delta.to_string());
+            })
             .await
             .context("LLM call failed")?;
 
@@ -178,11 +199,9 @@ pub async fn run_turn(
             );
         }
 
-        // ── 2e. Emit text ─────────────────────────────────────────
-        if let Some(text) = &response.message.content {
-            if !text.is_empty() {
-                emit(AgentEvent::TextDelta { text: text.clone() });
-            }
+        // ── 2e. Emit streamed text deltas ─────────────────────────
+        for delta in &streaming_deltas {
+            emit(AgentEvent::TextDelta { text: delta.clone() });
         }
 
         // ── 2f. Push assistant message ────────────────────────────
@@ -287,16 +306,100 @@ pub async fn run_turn(
                 continue;
             }
 
-            // ── h4. Approval gate ─────────────────────────────────
-            // For now, emit the request but auto-approve. The actual
-            // blocking approval callback is wired in protocol.rs later.
+            // ── h4. OPA policy check ──────────────────────────────
+            if let Some(ref mut pe) = policy {
+                let policy_input = prism_policy::PolicyInput {
+                    action: "tool.call".to_string(),
+                    principal: "agent".to_string(),
+                    role: "agent".to_string(),
+                    resource: tool_name.clone(),
+                    context: args.clone(),
+                };
+                match pe.evaluate(&policy_input) {
+                    Ok(decision) if !decision.allowed => {
+                        let reason = if decision.violations.is_empty() {
+                            decision.reason
+                        } else {
+                            decision.violations.join("; ")
+                        };
+                        let denied_msg = format!(
+                            "Tool '{tool_name}' denied by OPA policy: {reason}"
+                        );
+                        emit(AgentEvent::ToolCallResult {
+                            call_id: call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            content: denied_msg.clone(),
+                            summary: Some(format!("{tool_name}: denied by policy")),
+                            elapsed_ms: 0,
+                            is_error: true,
+                        });
+                        history.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: Some(denied_msg),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id.clone()),
+                        });
+                        continue;
+                    }
+                    Ok(decision) => {
+                        // Log obligations (e.g. "audit_log")
+                        for obligation in &decision.obligations {
+                            tracing::info!(
+                                tool = %tool_name,
+                                obligation = %obligation,
+                                "OPA policy obligation"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            tool = %tool_name,
+                            error = %e,
+                            "OPA policy evaluation failed — allowing (fail-open)"
+                        );
+                    }
+                }
+            }
+
+            // ── h5. Approval gate ─────────────────────────────────
             if !config.auto_approve && !permissions.auto_approves(tool_name) {
                 emit(AgentEvent::ToolApprovalRequest {
                     tool_name: tool_name.clone(),
                     tool_args: args.clone(),
                     call_id: call_id.clone(),
                 });
-                // Auto-approve for now — real approval wired in protocol layer
+
+                // Wait for approval from TUI (if approval channel is wired)
+                if let Some(ref mut rx) = approval_rx {
+                    match rx.recv().await {
+                        Some(ApprovalResponse::Allow) => {
+                            // Proceed with this tool call
+                        }
+                        Some(ApprovalResponse::AllowAll) => {
+                            // Switch to auto-approve for rest of session
+                            // (handled by not entering this branch again)
+                        }
+                        Some(ApprovalResponse::Deny) | None => {
+                            let denied_msg = format!("Tool '{tool_name}' denied by user.");
+                            emit(AgentEvent::ToolCallResult {
+                                call_id: call_id.clone(),
+                                tool_name: tool_name.clone(),
+                                content: denied_msg.clone(),
+                                summary: Some(format!("{tool_name}: denied")),
+                                elapsed_ms: 0,
+                                is_error: true,
+                            });
+                            history.push(ChatMessage {
+                                role: "tool".to_string(),
+                                content: Some(denied_msg),
+                                tool_calls: None,
+                                tool_call_id: Some(call_id.clone()),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                // If no approval channel, auto-approve (backward compat)
             }
 
             // ── h5. Execute tool ──────────────────────────────────

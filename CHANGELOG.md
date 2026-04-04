@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-04-04
+
+### Added — Rust Agent (prism-agent crate)
+- **TAOR agent loop**: Think-Act-Observe-Repeat loop in pure Rust with hooks, permissions, doom loop detection, compaction, and scratchpad logging.
+- **10 agent modules**: types, models, transcript, permissions, hooks, scratchpad, session, prompts, agent_loop, protocol — faithfully ported from deleted Python agent.
+- **80+ agent tests** covering all modules.
+
+### Added — Infrastructure
+- **Kafka outbound wired**: `MeshKafkaProducer` stored in `NodeState`, announce/goodbye lifecycle on node up/down, pub/sub in mesh handlers.
+- **Spark data processing**: Docker-orchestrated Spark service config + 3 PySpark Python tools for distributed ETL.
+- **Federated queries**: Cross-mesh search across connected nodes.
+- **BYOC compute wired**: SSH, Kubernetes, and SLURM backends available from CLI.
+
+### Added — Ecosystem
+- **Custom tool plugins**: Users can add `.py` tools to `~/.prism/tools/` with auto-discovery.
+- **Marketplace CLI**: `prism marketplace search/install/info` for tools and workflows.
+
+### Changed
+- **Python relegated to tools-only**: 48 tools served via `app/tool_server.py` (JSON stdio). Python agent loop, backend server, and CLI deleted.
+- **License split**: MIT for Python tools, MARC27 Source-Available for Rust crates and frontend.
+- **install.sh rewritten**: 82 lines, installs Rust binary only (no Python in critical path).
+- **APFS disk dedup fix**: Correct disk detection accounting for APFS deduplication; detect llama.cpp, vLLM, Quill Engine, Jupyter.
+
+### Test Suite
+- **494 Rust tests** across 16 crates (up from 355).
+- **551 Python tests** across 48 tools.
+
+---
+
 ## [2.5.0] - 2026-03-27
 
 ### Added — Rust Backbone (15 crates)

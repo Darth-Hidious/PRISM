@@ -304,6 +304,9 @@ enum NodeCommands {
         /// If omitted and --with-kafka is set, defaults to "localhost:9092".
         #[arg(long)]
         kafka_brokers: Option<String>,
+        /// Also start Spark master (for large-scale data processing, off by default in dev).
+        #[arg(long)]
+        with_spark: bool,
         /// Broadcast this node on the local network (mDNS) and register for platform discovery.
         /// Without this flag, the node runs privately — it can discover peers but won't be found.
         #[arg(long)]
@@ -672,6 +675,7 @@ async fn main() -> Result<()> {
                 external_qdrant,
                 with_kafka,
                 kafka_brokers,
+                with_spark,
                 broadcast,
             } => {
                 // Load prism.toml config (global + project), CLI flags override
@@ -725,6 +729,9 @@ async fn main() -> Result<()> {
                     }
                     if let Some(ref brokers) = kafka_brokers {
                         cmd.args(["--kafka-brokers", brokers]);
+                    }
+                    if with_spark {
+                        cmd.arg("--with-spark");
                     }
                     if broadcast {
                         cmd.arg("--broadcast");
@@ -817,6 +824,10 @@ async fn main() -> Result<()> {
                             if with_kafka {
                                 svc_config.kafka =
                                     Some(prism_orch::services::KafkaConfig::default());
+                            }
+                            if with_spark {
+                                svc_config.spark =
+                                    Some(prism_orch::services::SparkConfig::default());
                             }
 
                             match orch.start_all(&svc_config).await {
@@ -1036,6 +1047,11 @@ async fn main() -> Result<()> {
                     },
                     mesh_cancel.clone(),
                 );
+                // Initialize federated query client for cross-mesh searches
+                let _ = server_state.federation.set(
+                    prism_mesh::federation::FederatedQuery::default()
+                );
+
                 if broadcast {
                     println!("  \u{2713} Mesh: broadcasting (mDNS + platform discovery)");
                 } else {
@@ -1104,10 +1120,32 @@ async fn main() -> Result<()> {
                     }
 
                     match prism_mesh::kafka::MeshKafkaProducer::new(&kafka_cfg) {
-                        Ok(_producer) => {
-                            // Producer is available for publishing mesh messages.
-                            // It will be wired into the subscription manager in a future PR.
-                            tracing::info!("Kafka producer ready");
+                        Ok(producer) => {
+                            let producer = std::sync::Arc::new(producer);
+                            // Store producer in server state so mesh handlers can publish
+                            let _ = server_state.kafka_producer.set(producer.clone());
+                            if let Some(nid) = mesh_node_id {
+                                let _ = server_state.node_id.set(nid);
+                            }
+                            tracing::info!("Kafka producer ready and wired to mesh handlers");
+
+                            // Announce this node on the mesh via Kafka
+                            if let Some(nid) = mesh_node_id {
+                                let announce_producer = producer.clone();
+                                let node_name = daemon_options.name.clone();
+                                tokio::spawn(async move {
+                                    let msg = prism_mesh::protocol::MeshMessage::Announce {
+                                        node_id: nid,
+                                        name: node_name,
+                                        address: "127.0.0.1".to_string(),
+                                        port: dashboard_port,
+                                        capabilities: vec![],
+                                    };
+                                    if let Err(e) = announce_producer.publish(&msg).await {
+                                        tracing::warn!(error = %e, "failed to announce node via Kafka");
+                                    }
+                                });
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "Kafka producer failed to initialize");
@@ -1118,6 +1156,14 @@ async fn main() -> Result<()> {
                 // Run daemon until Ctrl+C — on shutdown, stop Docker containers
                 let result =
                     prism_node::daemon::run_daemon(&endpoints, &paths, daemon_options).await;
+
+                // Send Goodbye via Kafka before shutting down
+                if let (Some(producer), Some(&nid)) = (server_state.kafka_producer.get(), server_state.node_id.get()) {
+                    let msg = prism_mesh::protocol::MeshMessage::Goodbye { node_id: nid };
+                    if let Err(e) = producer.publish(&msg).await {
+                        tracing::warn!(error = %e, "failed to send goodbye via Kafka");
+                    }
+                }
 
                 // Stop mesh
                 mesh_cancel.cancel();

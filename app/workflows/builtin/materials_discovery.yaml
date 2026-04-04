@@ -1,0 +1,155 @@
+kind: skill_workflow
+name: materials_discovery
+description: >
+  End-to-end materials discovery workflow. Searches databases for materials
+  matching criteria, fills property gaps using ML predictions or lookups,
+  ingests results into the knowledge graph, and performs domain analysis.
+  The agent follows these steps autonomously — each step uses available tools.
+version: "1.0.0"
+author: MARC27
+
+inputs:
+  - name: query
+    type: string
+    description: >
+      Natural language description of what to find.
+      Examples: "titanium alloys with band gap > 1.5 eV",
+      "high-entropy alloys with low formation energy",
+      "perovskites for solar cells"
+    required: true
+  - name: elements
+    type: list
+    description: Elements to include (e.g. [Ti, Al, V])
+    required: false
+  - name: target_properties
+    type: list
+    description: >
+      Properties to ensure are filled. The agent will predict or look up
+      any missing values. Examples: [band_gap, formation_energy, bulk_modulus]
+    default: [band_gap, formation_energy]
+  - name: limit
+    type: integer
+    description: Maximum number of materials to retrieve
+    default: 20
+  - name: fill_method
+    type: string
+    description: "How to fill gaps: predict (ML), lookup (API), or both"
+    default: "both"
+
+steps:
+  - name: search
+    skill: search_materials
+    description: >
+      Search OPTIMADE federated databases for materials matching the query.
+      Use elements, formula, property ranges from the user's query.
+      Return a table of materials with available properties.
+    inputs:
+      query: "$query"
+      elements: "$elements"
+      limit: "$limit"
+    outputs:
+      materials: "$materials"
+      count: "$count"
+    llm_can_modify_inputs: true
+
+  - name: identify_gaps
+    skill: llm_analyze
+    description: >
+      Examine the search results table and identify which target_properties
+      are missing for each material. Create a list of (material, property)
+      pairs that need to be filled.
+    inputs:
+      materials: "$materials"
+      target_properties: "$target_properties"
+    outputs:
+      gaps: "$gaps"
+      gap_count: "$gap_count"
+
+  - name: fill_gaps
+    skill: predict_property
+    description: >
+      For each gap, try to fill it:
+      1. First try lookup: query_materials_project for the material
+      2. If not found, try predict: predict_property with the formula
+      3. If structure available, try predict_structure with GNN models
+      4. Mark confidence for each filled value (lookup=high, predict=medium)
+      Iterate through all gaps. Use list_models to check available models.
+    inputs:
+      gaps: "$gaps"
+      materials: "$materials"
+      fill_method: "$fill_method"
+    outputs:
+      filled_materials: "$filled_materials"
+      fill_report: "$fill_report"
+    llm_can_modify_inputs: true
+
+  - name: present_results
+    skill: export_results_csv
+    description: >
+      Show the user the filled table. Export to CSV.
+      Highlight which values were predicted vs looked up vs original.
+      Include confidence scores.
+    inputs:
+      materials: "$filled_materials"
+    outputs:
+      csv_path: "$csv_path"
+
+  - name: ingest_knowledge
+    skill: knowledge_ingest
+    description: >
+      Ingest the discovered materials into the local Neo4j knowledge graph.
+      Create entities for each material with all properties.
+      Create relationships between materials, elements, and properties.
+      Tag with provenance (source database, prediction method, confidence).
+    inputs:
+      materials: "$filled_materials"
+      fill_report: "$fill_report"
+    outputs:
+      entities_created: "$entities_created"
+
+  - name: create_dataset
+    skill: import_dataset
+    description: >
+      Save the results as a named PRISM dataset for future analysis.
+      The dataset can be used for ML training, visualization, or further queries.
+    inputs:
+      data: "$filled_materials"
+      name: "discovery-$query"
+    outputs:
+      dataset_id: "$dataset_id"
+
+  - name: domain_analysis
+    skill: llm_analyze
+    description: >
+      As a materials scientist, analyze the results:
+      1. Identify trends and patterns in the data
+      2. Suggest promising compositions for further investigation
+      3. If CALPHAD tools available, run phase diagram analysis
+      4. If simulation tools available, suggest DFT calculations
+      5. Create visualizations (property distributions, correlations)
+      Adapt analysis to the user's domain (alloys, ceramics, polymers, etc.)
+    inputs:
+      materials: "$filled_materials"
+      query: "$query"
+    outputs:
+      analysis: "$analysis"
+      recommendations: "$recommendations"
+
+  - name: report
+    skill: llm_report
+    description: >
+      Generate a structured report summarizing:
+      - Search parameters and results count
+      - Property gaps found and how they were filled
+      - Key findings from domain analysis
+      - Recommendations for next steps
+      - Links to created dataset and knowledge graph entities
+    inputs:
+      materials: "$filled_materials"
+      fill_report: "$fill_report"
+      analysis: "$analysis"
+      recommendations: "$recommendations"
+      dataset_id: "$dataset_id"
+      entities_created: "$entities_created"
+
+on_fail: stabilize

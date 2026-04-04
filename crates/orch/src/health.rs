@@ -67,6 +67,10 @@ impl HealthChecker {
                 // Kafka doesn't have HTTP — TCP connect on broker port is sufficient
                 true
             }
+            "spark" => {
+                // Spark master has a web UI — TCP connect on master port is sufficient
+                true
+            }
             _ => true,
         }
     }
@@ -159,6 +163,13 @@ impl HealthMonitor {
                         "kafka" => {
                             if let Some(ref kfg) = config.kafka {
                                 orch.start_kafka_public(kfg).await
+                            } else {
+                                continue;
+                            }
+                        }
+                        "spark" => {
+                            if let Some(ref sfg) = config.spark {
+                                orch.start_spark_public(sfg).await
                             } else {
                                 continue;
                             }

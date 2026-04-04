@@ -288,6 +288,55 @@ impl DockerOrchestrator {
         })
     }
 
+    /// Start Spark master (standalone mode) and return a ServiceHandle.
+    async fn start_spark(&self, config: &crate::services::SparkConfig) -> Result<ServiceHandle> {
+        self.ensure_image(&config.image).await?;
+
+        let env = vec![
+            "SPARK_MODE=master".to_string(),
+            "SPARK_MASTER_HOST=0.0.0.0".to_string(),
+            format!("SPARK_MASTER_PORT={}", config.master_port),
+            format!("SPARK_MASTER_WEBUI_PORT={}", config.ui_port),
+        ];
+
+        let mut port_bindings = HashMap::new();
+        // Master RPC port
+        port_bindings.insert(
+            format!("{}/tcp", config.master_port),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some(config.master_port.to_string()),
+            }]),
+        );
+        // Web UI
+        port_bindings.insert(
+            format!("{}/tcp", config.ui_port),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some(config.ui_port.to_string()),
+            }]),
+        );
+
+        let container_id = self
+            .run_container("spark-master", &config.image, env, port_bindings, None)
+            .await?;
+
+        Ok(ServiceHandle {
+            name: "spark".to_string(),
+            container_id: Some(container_id),
+            port: config.master_port,
+            healthy: false,
+        })
+    }
+
+    /// Restart Spark (public, used by health monitor).
+    pub async fn start_spark_public(
+        &self,
+        config: &crate::services::SparkConfig,
+    ) -> Result<ServiceHandle> {
+        self.start_spark(config).await
+    }
+
     /// Stop and remove a container by ID.
     async fn stop_container(&self, container_id: &str) -> Result<()> {
         self.docker
@@ -398,6 +447,13 @@ impl ServiceOrchestrator for DockerOrchestrator {
             info!("Starting Kafka (KRaft)...");
             let kafka = self.start_kafka(kafka_cfg).await?;
             services.push(kafka);
+        }
+
+        // Spark — optional
+        if let Some(ref spark_cfg) = config.spark {
+            info!("Starting Spark master...");
+            let spark = self.start_spark(spark_cfg).await?;
+            services.push(spark);
         }
 
         // Wait for services to become healthy

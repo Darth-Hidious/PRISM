@@ -183,7 +183,69 @@ pub async fn run_sync_handler(
                 }
             }
 
-            // Ping/Pong, QueryForward/QueryResult handled elsewhere
+            // ── Query forwarding (federated search) ──────────
+            MeshMessage::QueryForward {
+                query_id,
+                query,
+                origin_node,
+            } => {
+                if origin_node == our_node_id {
+                    continue;
+                }
+                debug!(
+                    query_id = %query_id,
+                    origin = %origin_node,
+                    "received forwarded query from peer"
+                );
+                // Execute locally and respond — requires Neo4j
+                if let Some(ref cfg) = sync_config {
+                    let neo4j_url = format!("{}/db/neo4j/tx/commit", cfg.neo4j_url);
+                    let neo4j_body = serde_json::json!({
+                        "statements": [{
+                            "statement": query,
+                        }]
+                    });
+                    match client
+                        .post(&neo4j_url)
+                        .basic_auth(&cfg.neo4j_user, Some(&cfg.neo4j_pass))
+                        .json(&neo4j_body)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => {
+                            let results = resp.json::<serde_json::Value>().await.unwrap_or_default();
+                            debug!(
+                                query_id = %query_id,
+                                "forwarded query executed, results ready"
+                            );
+                            // Note: QueryResult would be published back via Kafka
+                            // if we had access to the producer here. For now, log it.
+                            info!(
+                                query_id = %query_id,
+                                "query result available (direct REST federation preferred)"
+                            );
+                            let _ = results; // consumed by direct REST federation
+                        }
+                        Err(e) => {
+                            warn!(
+                                query_id = %query_id,
+                                error = %e,
+                                "failed to execute forwarded query"
+                            );
+                        }
+                    }
+                }
+            }
+
+            MeshMessage::QueryResult { query_id, results } => {
+                debug!(
+                    query_id = %query_id,
+                    result_count = results.as_array().map(|a| a.len()).unwrap_or(0),
+                    "received query result from peer"
+                );
+                // Direct REST federation handles this — Kafka path is for async results
+            }
+
             _ => {
                 debug!("unhandled mesh message type");
             }
