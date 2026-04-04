@@ -100,7 +100,8 @@ impl CostTracker {
     pub fn record(&mut self, label: impl Into<String>, input_tokens: u64, output_tokens: u64) {
         self.total_input += input_tokens;
         self.total_output += output_tokens;
-        self.events.push(CostEvent::new(label, input_tokens, output_tokens));
+        self.events
+            .push(CostEvent::new(label, input_tokens, output_tokens));
     }
 
     /// Total tokens consumed.
@@ -224,7 +225,8 @@ impl TranscriptStore {
         let user_msgs: Vec<&TranscriptEntry> = old.iter().filter(|e| e.role == "user").collect();
         let assistant_msgs: Vec<&TranscriptEntry> =
             old.iter().filter(|e| e.role == "assistant").collect();
-        let tool_calls: Vec<&TranscriptEntry> = old.iter().filter(|e| e.tool_name.is_some()).collect();
+        let tool_calls: Vec<&TranscriptEntry> =
+            old.iter().filter(|e| e.tool_name.is_some()).collect();
         let all_text: String = old
             .iter()
             .filter(|e| !e.content.is_empty())
@@ -311,7 +313,8 @@ impl TranscriptStore {
     /// Check if the turn/token budget is exceeded.
     #[must_use]
     pub fn budget_exhausted(&self) -> bool {
-        self.budget.exhausted(self.turn_count, self.cost.total_input)
+        self.budget
+            .exhausted(self.turn_count, self.cost.total_input)
     }
 
     /// Return a warning message if approaching budget limits.
@@ -424,7 +427,12 @@ pub fn extract_key_files(text: &str, limit: usize) -> Vec<String> {
             continue;
         }
         let clean = word
-            .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'))
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\'' | '`' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+            })
             .trim_end_matches('.');
 
         if let Some(dot_pos) = clean.rfind('.') {
@@ -534,13 +542,10 @@ mod tests {
         let mut store = TranscriptStore::new(None);
         for i in 0..10 {
             store.append(TranscriptEntry::new("user", format!("question {i}")));
-            store.append(
-                TranscriptEntry::new("assistant", format!("answer {i}"))
-            );
+            store.append(TranscriptEntry::new("assistant", format!("answer {i}")));
         }
         store.append(
-            TranscriptEntry::new("tool", "search result")
-                .with_tool_name("search_materials"),
+            TranscriptEntry::new("tool", "search result").with_tool_name("search_materials"),
         );
 
         let summary = store.compact(4);
@@ -551,7 +556,9 @@ mod tests {
         assert!(summary.contains("assistant"));
         // First entry should be the compacted system message
         assert_eq!(store.entries[0].role, "system");
-        assert!(store.entries[0].content.contains("[Conversation context compacted]"));
+        assert!(store.entries[0]
+            .content
+            .contains("[Conversation context compacted]"));
         // Should have system + 4 recent entries
         assert_eq!(store.entries.len(), 5);
         assert!(store.compacted);

@@ -49,10 +49,7 @@ fn uuid_hex8() -> String {
     format!("{:08x}", (ts ^ (ts >> 32)) & 0xFFFF_FFFF)
 }
 
-fn process_large_result(
-    content: &str,
-    result_store: &mut HashMap<String, String>,
-) -> String {
+fn process_large_result(content: &str, result_store: &mut HashMap<String, String>) -> String {
     if content.len() <= MAX_TOOL_RESULT_CHARS {
         return content.to_string();
     }
@@ -81,7 +78,11 @@ fn check_doom_loop(recent: &VecDeque<String>, sig: &str) -> bool {
 
 fn summarize_tool_result(tool_name: &str, content: &str, is_error: bool) -> String {
     if is_error {
-        let preview = if content.len() > 60 { &content[..60] } else { content };
+        let preview = if content.len() > 60 {
+            &content[..60]
+        } else {
+            content
+        };
         return format!("{tool_name}: error — {preview}");
     }
     // Try to parse as JSON for richer summaries
@@ -192,16 +193,14 @@ pub async fn run_turn(
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             };
-            transcript.record_cost(
-                "llm_turn",
-                usage.prompt_tokens,
-                usage.completion_tokens,
-            );
+            transcript.record_cost("llm_turn", usage.prompt_tokens, usage.completion_tokens);
         }
 
         // ── 2e. Emit streamed text deltas ─────────────────────────
         for delta in &streaming_deltas {
-            emit(AgentEvent::TextDelta { text: delta.clone() });
+            emit(AgentEvent::TextDelta {
+                text: delta.clone(),
+            });
         }
 
         // ── 2f. Push assistant message ────────────────────────────
@@ -255,8 +254,7 @@ pub async fn run_turn(
             let tool_name = &tc.function.name;
             let call_id = &tc.id;
 
-            let args: Value =
-                serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+            let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
 
             // ── h1. Emit ToolCallStart ────────────────────────────
             emit(AgentEvent::ToolCallStart {
@@ -287,8 +285,7 @@ pub async fn run_turn(
 
             // ── h3. Check permissions ─────────────────────────────
             if permissions.blocks(tool_name) {
-                let error_msg =
-                    format!("Tool '{tool_name}' is blocked by permission policy.");
+                let error_msg = format!("Tool '{tool_name}' is blocked by permission policy.");
                 emit(AgentEvent::ToolCallResult {
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
@@ -322,9 +319,8 @@ pub async fn run_turn(
                         } else {
                             decision.violations.join("; ")
                         };
-                        let denied_msg = format!(
-                            "Tool '{tool_name}' denied by OPA policy: {reason}"
-                        );
+                        let denied_msg =
+                            format!("Tool '{tool_name}' denied by OPA policy: {reason}");
                         emit(AgentEvent::ToolCallResult {
                             call_id: call_id.clone(),
                             tool_name: tool_name.clone(),
@@ -423,12 +419,7 @@ pub async fn run_turn(
             // ── h6. Fire post-hooks ───────────────────────────────
             let result_value: Value = serde_json::from_str(&raw_content)
                 .unwrap_or_else(|_| Value::String(raw_content.clone()));
-            let post_result = hooks.fire_after(
-                tool_name,
-                &args,
-                &result_value,
-                elapsed_ms as f64,
-            );
+            let post_result = hooks.fire_after(tool_name, &args, &result_value, elapsed_ms as f64);
             let content_after_hooks = if post_result != result_value {
                 serde_json::to_string(&post_result).unwrap_or(raw_content.clone())
             } else {
@@ -502,10 +493,8 @@ pub async fn run_turn(
             });
 
             // ── h13. Append to transcript ─────────────────────────
-            transcript.append(
-                TranscriptEntry::new("tool", &content)
-                    .with_tool_name(tool_name.as_str()),
-            );
+            transcript
+                .append(TranscriptEntry::new("tool", &content).with_tool_name(tool_name.as_str()));
         }
 
         // ── 2i. Loop back ─────────────────────────────────────────

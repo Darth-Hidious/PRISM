@@ -213,7 +213,8 @@ pub async fn run_sync_handler(
                         .await
                     {
                         Ok(resp) => {
-                            let results = resp.json::<serde_json::Value>().await.unwrap_or_default();
+                            let results =
+                                resp.json::<serde_json::Value>().await.unwrap_or_default();
                             debug!(
                                 query_id = %query_id,
                                 "forwarded query executed, results ready"

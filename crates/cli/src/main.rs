@@ -608,7 +608,9 @@ async fn main() -> Result<()> {
                 .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .or_else(|_| {
-                    paths.load_cli_state().ok()
+                    paths
+                        .load_cli_state()
+                        .ok()
                         .and_then(|s| s.credentials)
                         .map(|c| c.access_token)
                         .ok_or(std::env::VarError::NotPresent)
@@ -645,7 +647,10 @@ async fn main() -> Result<()> {
             if let Some(arr) = tools.as_array() {
                 for tool in arr {
                     let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    let desc = tool
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     println!("  {:<30} {}", name, desc);
                 }
                 println!("\n{} tools available", arr.len());
@@ -906,17 +911,14 @@ async fn main() -> Result<()> {
                 {
                     let api_key =
                         prism_core::config::NodeConfig::resolve_api_key(&node_config.indexer);
-                    let base_url =
-                        node_config
-                            .indexer
-                            .uri
-                            .clone()
-                            .unwrap_or_else(|| match node_config.indexer.mode.as_str() {
-                                "platform" | "marc27" | "external" => {
-                                    node_config.platform.url.clone() + "/llm"
-                                }
-                                _ => "http://localhost:8080".into(), // llama.cpp default
-                            });
+                    let base_url = node_config.indexer.uri.clone().unwrap_or_else(|| {
+                        match node_config.indexer.mode.as_str() {
+                            "platform" | "marc27" | "external" => {
+                                node_config.platform.url.clone() + "/llm"
+                            }
+                            _ => "http://localhost:8080".into(), // llama.cpp default
+                        }
+                    });
                     server_node_state.llm = Some(prism_ingest::LlmConfig {
                         base_url,
                         model: node_config
@@ -1016,15 +1018,13 @@ async fn main() -> Result<()> {
                 // ── Start mesh networking (mDNS discovery + optional broadcast) ──
                 let mesh_cancel = tokio_util::sync::CancellationToken::new();
                 // Resolve Kafka brokers: explicit flag > implicit from --with-kafka
-                let resolved_kafka_brokers = kafka_brokers
-                    .clone()
-                    .or_else(|| {
-                        if with_kafka {
-                            Some("localhost:9092".to_string())
-                        } else {
-                            None
-                        }
-                    });
+                let resolved_kafka_brokers = kafka_brokers.clone().or_else(|| {
+                    if with_kafka {
+                        Some("localhost:9092".to_string())
+                    } else {
+                        None
+                    }
+                });
 
                 let mesh_config = prism_mesh::MeshConfig {
                     node_name: daemon_options.name.clone(),
@@ -1048,9 +1048,9 @@ async fn main() -> Result<()> {
                     mesh_cancel.clone(),
                 );
                 // Initialize federated query client for cross-mesh searches
-                let _ = server_state.federation.set(
-                    prism_mesh::federation::FederatedQuery::default()
-                );
+                let _ = server_state
+                    .federation
+                    .set(prism_mesh::federation::FederatedQuery::default());
 
                 if broadcast {
                     println!("  \u{2713} Mesh: broadcasting (mDNS + platform discovery)");
@@ -1066,7 +1066,9 @@ async fn main() -> Result<()> {
                         topic_prefix: "prism.mesh".into(),
                         group_id: format!(
                             "prism-{}",
-                            mesh_node_id.map(|id| id.to_string()).unwrap_or_else(|| "unknown".into())
+                            mesh_node_id
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "unknown".into())
                         ),
                     };
 
@@ -1075,9 +1077,9 @@ async fn main() -> Result<()> {
                             let (tx, rx) = tokio::sync::mpsc::channel(256);
 
                             // Use shared state extracted from mesh handle before it was moved
-                            let peers_arc = mesh_peers_shared
-                                .clone()
-                                .unwrap_or_else(|| std::sync::Arc::new(std::sync::RwLock::new(Vec::new())));
+                            let peers_arc = mesh_peers_shared.clone().unwrap_or_else(|| {
+                                std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
+                            });
                             let our_node_id = mesh_node_id.unwrap_or_else(uuid::Uuid::nil);
                             let subscriptions = std::sync::Arc::new(std::sync::RwLock::new(
                                 prism_mesh::subscription::SubscriptionManager::new(),
@@ -1158,7 +1160,10 @@ async fn main() -> Result<()> {
                     prism_node::daemon::run_daemon(&endpoints, &paths, daemon_options).await;
 
                 // Send Goodbye via Kafka before shutting down
-                if let (Some(producer), Some(&nid)) = (server_state.kafka_producer.get(), server_state.node_id.get()) {
+                if let (Some(producer), Some(&nid)) = (
+                    server_state.kafka_producer.get(),
+                    server_state.node_id.get(),
+                ) {
                     let msg = prism_mesh::protocol::MeshMessage::Goodbye { node_id: nid };
                     if let Err(e) = producer.publish(&msg).await {
                         tracing::warn!(error = %e, "failed to send goodbye via Kafka");
@@ -2246,7 +2251,6 @@ async fn handle_query(
     Ok(())
 }
 
-
 async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredentials> {
     let platform = PlatformClient::new(&endpoints.api_base);
     let http = platform.inner().clone();
@@ -2842,8 +2846,7 @@ async fn handle_run(
         match backend {
             "marc27" | "platform" => {
                 // Read token from credentials
-                let token =
-                    std::env::var("MARC27_API_TOKEN").unwrap_or_else(|_| "".to_string());
+                let token = std::env::var("MARC27_API_TOKEN").unwrap_or_else(|_| "".to_string());
                 ComputeRouter::with_marc27(platform_url, &token)
             }
             _ => ComputeRouter::local_only(),

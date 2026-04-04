@@ -421,10 +421,7 @@ async fn handle_federated_query(
 }
 
 /// Query mesh peers and return their results (or None if no peers/federation).
-async fn query_mesh_peers(
-    state: &NodeState,
-    query: &str,
-) -> Option<Vec<serde_json::Value>> {
+async fn query_mesh_peers(state: &NodeState, query: &str) -> Option<Vec<serde_json::Value>> {
     let peers = {
         let mesh = state.mesh.read().unwrap_or_else(|e| e.into_inner());
         mesh.peers()

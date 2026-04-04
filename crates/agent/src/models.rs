@@ -56,30 +56,140 @@ fn registry() -> &'static HashMap<&'static str, ModelConfig> {
         }
 
         // --- Anthropic ---
-        reg!("claude-opus-4-6",           "anthropic", 200_000, 128_000, 32_768, 5.00, 25.00, cache=true, think=true);
-        reg!("claude-sonnet-4-6",         "anthropic", 200_000,  64_000, 16_384, 3.00, 15.00, cache=true, think=true);
-        reg!("claude-sonnet-4-20250514",  "anthropic", 200_000,  64_000, 16_384, 3.00, 15.00, cache=true, think=true);
-        reg!("claude-sonnet-4-20250318",  "anthropic", 200_000,  64_000, 16_384, 3.00, 15.00, cache=true, think=true);
-        reg!("claude-haiku-4-5-20251001", "anthropic", 200_000,  64_000,  8_192, 1.00,  5.00, cache=true);
+        reg!(
+            "claude-opus-4-6",
+            "anthropic",
+            200_000,
+            128_000,
+            32_768,
+            5.00,
+            25.00,
+            cache = true,
+            think = true
+        );
+        reg!(
+            "claude-sonnet-4-6",
+            "anthropic",
+            200_000,
+            64_000,
+            16_384,
+            3.00,
+            15.00,
+            cache = true,
+            think = true
+        );
+        reg!(
+            "claude-sonnet-4-20250514",
+            "anthropic",
+            200_000,
+            64_000,
+            16_384,
+            3.00,
+            15.00,
+            cache = true,
+            think = true
+        );
+        reg!(
+            "claude-sonnet-4-20250318",
+            "anthropic",
+            200_000,
+            64_000,
+            16_384,
+            3.00,
+            15.00,
+            cache = true,
+            think = true
+        );
+        reg!(
+            "claude-haiku-4-5-20251001",
+            "anthropic",
+            200_000,
+            64_000,
+            8_192,
+            1.00,
+            5.00,
+            cache = true
+        );
 
         // --- OpenAI ---
-        reg!("gpt-4o",      "openai", 128_000,   16_384,  8_192, 2.50, 10.00);
-        reg!("gpt-4o-mini",  "openai", 128_000,   16_384,  4_096, 0.15,  0.60);
-        reg!("gpt-4.1",     "openai", 1_000_000,  32_768, 16_384, 2.00,  8.00);
-        reg!("gpt-4.1-mini", "openai", 1_000_000,  32_768,  8_192, 0.40,  1.60);
-        reg!("gpt-5",       "openai", 400_000,  128_000, 16_384, 1.25, 10.00, think=true);
-        reg!("o3",           "openai", 200_000,  100_000, 16_384, 2.00,  8.00, think=true);
-        reg!("o3-mini",      "openai", 200_000,  100_000,  8_192, 1.10,  4.40, think=true);
+        reg!("gpt-4o", "openai", 128_000, 16_384, 8_192, 2.50, 10.00);
+        reg!("gpt-4o-mini", "openai", 128_000, 16_384, 4_096, 0.15, 0.60);
+        reg!("gpt-4.1", "openai", 1_000_000, 32_768, 16_384, 2.00, 8.00);
+        reg!(
+            "gpt-4.1-mini",
+            "openai",
+            1_000_000,
+            32_768,
+            8_192,
+            0.40,
+            1.60
+        );
+        reg!(
+            "gpt-5",
+            "openai",
+            400_000,
+            128_000,
+            16_384,
+            1.25,
+            10.00,
+            think = true
+        );
+        reg!(
+            "o3",
+            "openai",
+            200_000,
+            100_000,
+            16_384,
+            2.00,
+            8.00,
+            think = true
+        );
+        reg!(
+            "o3-mini",
+            "openai",
+            200_000,
+            100_000,
+            8_192,
+            1.10,
+            4.40,
+            think = true
+        );
 
         // --- Google ---
-        reg!("gemini-2.5-pro",   "google", 1_000_000, 65_536, 16_384, 1.25, 10.00, think=true);
-        reg!("gemini-2.5-flash", "google", 1_000_000, 65_536,  8_192, 0.30,  2.50);
-        reg!("gemini-3.1-pro",   "google", 1_000_000, 65_536, 16_384, 2.00, 12.00, think=true);
+        reg!(
+            "gemini-2.5-pro",
+            "google",
+            1_000_000,
+            65_536,
+            16_384,
+            1.25,
+            10.00,
+            think = true
+        );
+        reg!(
+            "gemini-2.5-flash",
+            "google",
+            1_000_000,
+            65_536,
+            8_192,
+            0.30,
+            2.50
+        );
+        reg!(
+            "gemini-3.1-pro",
+            "google",
+            1_000_000,
+            65_536,
+            16_384,
+            2.00,
+            12.00,
+            think = true
+        );
 
         // --- Zhipu ---
-        reg!("glm-5",       "zhipu", 200_000, 128_000, 16_384, 1.00, 3.20);
-        reg!("glm-4.7",     "zhipu", 128_000,  16_384,  8_192, 0.38, 1.70);
-        reg!("glm-4.5-air", "zhipu", 128_000,  16_384,  4_096, 0.10, 0.50);
+        reg!("glm-5", "zhipu", 200_000, 128_000, 16_384, 1.00, 3.20);
+        reg!("glm-4.7", "zhipu", 128_000, 16_384, 8_192, 0.38, 1.70);
+        reg!("glm-4.5-air", "zhipu", 128_000, 16_384, 4_096, 0.10, 0.50);
 
         m
     })

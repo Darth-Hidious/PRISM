@@ -176,7 +176,12 @@ mod tests {
     #[test]
     fn to_json_roundtrip() {
         let mut pad = Scratchpad::new();
-        pad.log("tool_call", Some("fetch"), "fetched data", Some(json!({"url": "http://x"})));
+        pad.log(
+            "tool_call",
+            Some("fetch"),
+            "fetched data",
+            Some(json!({"url": "http://x"})),
+        );
         let json_vec = pad.to_json();
         assert_eq!(json_vec.len(), 1);
         assert_eq!(json_vec[0]["step_type"], "tool_call");

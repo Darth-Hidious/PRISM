@@ -65,9 +65,7 @@ impl ToolServerHandle {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push('\n');
 
-        self.stdin
-            .write_all(line.as_bytes())
-            .await?;
+        self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.flush().await?;
 
         let mut response_line = String::new();
@@ -90,11 +88,7 @@ impl ToolServerHandle {
     }
 
     /// Call a named tool with the given arguments.
-    pub async fn call_tool(
-        &mut self,
-        name: &str,
-        args: Value,
-    ) -> Result<Value, PythonBridgeError> {
+    pub async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value, PythonBridgeError> {
         let req = serde_json::json!({
             "method": "call_tool",
             "tool": name,
