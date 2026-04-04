@@ -1,3 +1,4 @@
+#![allow(clippy::await_holding_lock)]
 //! Integration tests for mesh data flow.
 //!
 //! These tests simulate the message passing between nodes WITHOUT requiring
@@ -98,8 +99,10 @@ async fn sync_handler_ignores_own_announce() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let peer_list = peers.read().unwrap();
-    assert!(peer_list.is_empty(), "should not add ourselves as a peer");
+    {
+        let peer_list = peers.read().unwrap();
+        assert!(peer_list.is_empty(), "should not add ourselves as a peer");
+    }
 
     drop(tx);
     handle.await.unwrap();
@@ -170,13 +173,15 @@ async fn sync_handler_data_subscribe_adds_subscriber() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let mgr = subs.read().unwrap();
-    let published = mgr.published();
-    assert_eq!(published.len(), 1);
-    assert!(
-        published[0].subscribers.contains(&subscriber_id),
-        "subscriber should be tracked"
-    );
+    {
+        let mgr = subs.read().unwrap();
+        let published = mgr.published();
+        assert_eq!(published.len(), 1);
+        assert!(
+            published[0].subscribers.contains(&subscriber_id),
+            "subscriber should be tracked"
+        );
+    }
 
     drop(tx);
     handle.await.unwrap();
@@ -213,11 +218,13 @@ async fn sync_handler_data_unsubscribe_removes_subscriber() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let mgr = subs.read().unwrap();
-    assert!(
-        mgr.published()[0].subscribers.is_empty(),
-        "subscriber should be removed"
-    );
+    {
+        let mgr = subs.read().unwrap();
+        assert!(
+            mgr.published()[0].subscribers.is_empty(),
+            "subscriber should be removed"
+        );
+    }
 
     drop(tx);
     handle.await.unwrap();
