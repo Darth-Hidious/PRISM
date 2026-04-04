@@ -128,11 +128,9 @@ async fn sync_handler_goodbye_removes_peer() {
 
     assert_eq!(peers.read().unwrap().len(), 1);
 
-    tx.send(MeshMessage::Goodbye {
-        node_id: remote_id,
-    })
-    .await
-    .unwrap();
+    tx.send(MeshMessage::Goodbye { node_id: remote_id })
+        .await
+        .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -329,11 +327,9 @@ async fn sync_handler_full_lifecycle() {
     }
 
     // Step 4: Remote node says goodbye
-    tx.send(MeshMessage::Goodbye {
-        node_id: remote_id,
-    })
-    .await
-    .unwrap();
+    tx.send(MeshMessage::Goodbye { node_id: remote_id })
+        .await
+        .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     assert!(peers.read().unwrap().is_empty());
 

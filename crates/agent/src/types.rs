@@ -16,10 +16,7 @@ pub struct UsageInfo {
 impl UsageInfo {
     #[must_use]
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_tokens
-            + self.cache_read_tokens
+        self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
     }
 }
 
@@ -150,8 +147,16 @@ mod tests {
 
     #[test]
     fn usage_add() {
-        let a = UsageInfo { input_tokens: 10, output_tokens: 5, ..Default::default() };
-        let b = UsageInfo { input_tokens: 20, output_tokens: 3, ..Default::default() };
+        let a = UsageInfo {
+            input_tokens: 10,
+            output_tokens: 5,
+            ..Default::default()
+        };
+        let b = UsageInfo {
+            input_tokens: 20,
+            output_tokens: 3,
+            ..Default::default()
+        };
         let c = a + b;
         assert_eq!(c.input_tokens, 30);
         assert_eq!(c.output_tokens, 8);
@@ -159,8 +164,16 @@ mod tests {
 
     #[test]
     fn usage_add_assign() {
-        let mut a = UsageInfo { input_tokens: 10, output_tokens: 5, ..Default::default() };
-        a += UsageInfo { input_tokens: 20, output_tokens: 3, ..Default::default() };
+        let mut a = UsageInfo {
+            input_tokens: 10,
+            output_tokens: 5,
+            ..Default::default()
+        };
+        a += UsageInfo {
+            input_tokens: 20,
+            output_tokens: 3,
+            ..Default::default()
+        };
         assert_eq!(a.input_tokens, 30);
         assert_eq!(a.output_tokens, 8);
     }
@@ -183,7 +196,9 @@ mod tests {
 
     #[test]
     fn agent_event_serializes_tagged() {
-        let ev = AgentEvent::TextDelta { text: "hello".into() };
+        let ev = AgentEvent::TextDelta {
+            text: "hello".into(),
+        };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "TextDelta");
         assert_eq!(json["text"], "hello");

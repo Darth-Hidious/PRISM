@@ -93,10 +93,7 @@ impl HookRegistry {
                     match result {
                         Ok(hr) => {
                             if hr.abort {
-                                info!(
-                                    "Hook '{}' aborted {}: {}",
-                                    hook.name, tool_name, hr.reason
-                                );
+                                info!("Hook '{}' aborted {}: {}", hook.name, tool_name, hr.reason);
                                 return hr;
                             }
                         }
@@ -129,10 +126,7 @@ impl HookRegistry {
                     match outcome {
                         Ok(post_result) => {
                             if !post_result.log_message.is_empty() {
-                                info!(
-                                    "Post-hook '{}': {}",
-                                    hook.name, post_result.log_message
-                                );
+                                info!("Post-hook '{}': {}", hook.name, post_result.log_message);
                             }
                             if let Some(modified) = post_result.modified_result {
                                 current = modified;
@@ -154,10 +148,9 @@ impl HookRegistry {
 /// Pre-hook on ALL tools. Scans arg values for destructive keywords.
 /// If found, aborts with a reason string.
 pub fn safety_hook() -> Hook {
-    let destructive: HashSet<&str> =
-        ["delete", "drop", "remove", "destroy", "truncate", "reset"]
-            .into_iter()
-            .collect();
+    let destructive: HashSet<&str> = ["delete", "drop", "remove", "destroy", "truncate", "reset"]
+        .into_iter()
+        .collect();
 
     Hook {
         name: "safety_guard".into(),
@@ -194,12 +187,12 @@ pub fn cost_hook() -> Hook {
     Hook {
         name: "cost_tracker".into(),
         before: None,
-        after: Some(Box::new(
-            |tool_name, _inputs, _result, elapsed_ms| PostHookResult {
+        after: Some(Box::new(|tool_name, _inputs, _result, elapsed_ms| {
+            PostHookResult {
                 modified_result: None,
                 log_message: format!("{}: {:.0}ms", tool_name, elapsed_ms),
-            },
-        )),
+            }
+        })),
         tool_filter: None,
     }
 }
@@ -209,22 +202,17 @@ pub fn audit_hook() -> Hook {
     Hook {
         name: "audit_log".into(),
         before: None,
-        after: Some(Box::new(
-            |tool_name, _inputs, result, elapsed_ms| {
-                let status = if result.get("error").is_some() {
-                    "ERROR"
-                } else {
-                    "OK"
-                };
-                PostHookResult {
-                    modified_result: None,
-                    log_message: format!(
-                        "[AUDIT] {} {} ({:.0}ms)",
-                        tool_name, status, elapsed_ms
-                    ),
-                }
-            },
-        )),
+        after: Some(Box::new(|tool_name, _inputs, result, elapsed_ms| {
+            let status = if result.get("error").is_some() {
+                "ERROR"
+            } else {
+                "OK"
+            };
+            PostHookResult {
+                modified_result: None,
+                log_message: format!("[AUDIT] {} {} ({:.0}ms)", tool_name, status, elapsed_ms),
+            }
+        })),
         tool_filter: None,
     }
 }

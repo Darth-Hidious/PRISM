@@ -273,52 +273,52 @@ impl LlmClient {
                 }
                 if let Some(data) = line.strip_prefix("data: ") {
                     if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
-                    // Extract text delta
-                    if let Some(delta) = chunk
-                        .pointer("/choices/0/delta/content")
-                        .and_then(|c| c.as_str())
-                    {
-                        if !delta.is_empty() {
-                            on_delta(delta);
-                            full_content.push_str(delta);
-                        }
-                    }
-
-                    // Extract streaming tool calls
-                    if let Some(tcs) = chunk
-                        .pointer("/choices/0/delta/tool_calls")
-                        .and_then(|t| t.as_array())
-                    {
-                        for tc in tcs {
-                            let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
-                            let entry = tool_calls_map.entry(idx).or_insert_with(|| {
-                                let id = tc
-                                    .get("id")
-                                    .and_then(|i| i.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let name = tc
-                                    .pointer("/function/name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                (id, name, String::new())
-                            });
-                            // Append argument chunks
-                            if let Some(args_chunk) = tc
-                                .pointer("/function/arguments")
-                                .and_then(|a| a.as_str())
-                            {
-                                entry.2.push_str(args_chunk);
+                        // Extract text delta
+                        if let Some(delta) = chunk
+                            .pointer("/choices/0/delta/content")
+                            .and_then(|c| c.as_str())
+                        {
+                            if !delta.is_empty() {
+                                on_delta(delta);
+                                full_content.push_str(delta);
                             }
                         }
-                    }
 
-                    // Extract usage from final chunk
-                    if let Some(u) = chunk.get("usage") {
-                        usage_info = serde_json::from_value::<UsageInfo>(u.clone()).ok();
+                        // Extract streaming tool calls
+                        if let Some(tcs) = chunk
+                            .pointer("/choices/0/delta/tool_calls")
+                            .and_then(|t| t.as_array())
+                        {
+                            for tc in tcs {
+                                let idx =
+                                    tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                                let entry = tool_calls_map.entry(idx).or_insert_with(|| {
+                                    let id = tc
+                                        .get("id")
+                                        .and_then(|i| i.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let name = tc
+                                        .pointer("/function/name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    (id, name, String::new())
+                                });
+                                // Append argument chunks
+                                if let Some(args_chunk) =
+                                    tc.pointer("/function/arguments").and_then(|a| a.as_str())
+                                {
+                                    entry.2.push_str(args_chunk);
+                                }
+                            }
+                        }
+
+                        // Extract usage from final chunk
+                        if let Some(u) = chunk.get("usage") {
+                            usage_info = serde_json::from_value::<UsageInfo>(u.clone()).ok();
+                        }
                     }
-                }
                 }
             }
         }

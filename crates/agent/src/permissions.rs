@@ -247,11 +247,23 @@ mod tests {
 
     #[test]
     fn tool_permission_lookup() {
-        assert_eq!(get_tool_permission("search_materials"), PermissionMode::ReadOnly);
-        assert_eq!(get_tool_permission("write_file"), PermissionMode::WorkspaceWrite);
-        assert_eq!(get_tool_permission("compute_submit"), PermissionMode::FullAccess);
+        assert_eq!(
+            get_tool_permission("search_materials"),
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            get_tool_permission("write_file"),
+            PermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            get_tool_permission("compute_submit"),
+            PermissionMode::FullAccess
+        );
         // Unknown tool defaults to WorkspaceWrite
-        assert_eq!(get_tool_permission("unknown_tool"), PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            get_tool_permission("unknown_tool"),
+            PermissionMode::WorkspaceWrite
+        );
     }
 
     #[test]
@@ -263,8 +275,7 @@ mod tests {
 
     #[test]
     fn context_blocks_by_name() {
-        let ctx = ToolPermissionContext::default()
-            .with_deny(&["execute_python".to_string()], &[]);
+        let ctx = ToolPermissionContext::default().with_deny(&["execute_python".to_string()], &[]);
         assert!(ctx.blocks("execute_python"));
         assert!(ctx.blocks("Execute_Python")); // case-insensitive
         assert!(!ctx.blocks("read_file"));
@@ -272,8 +283,7 @@ mod tests {
 
     #[test]
     fn context_blocks_by_prefix() {
-        let ctx = ToolPermissionContext::default()
-            .with_deny(&[], &["compute_".to_string()]);
+        let ctx = ToolPermissionContext::default().with_deny(&[], &["compute_".to_string()]);
         assert!(ctx.blocks("compute_submit"));
         assert!(ctx.blocks("compute_cancel"));
         assert!(!ctx.blocks("search_materials"));
@@ -297,16 +307,16 @@ mod tests {
 
     #[test]
     fn context_with_auto_approve() {
-        let ctx = ToolPermissionContext::default()
-            .with_auto_approve(&["execute_python".to_string()]);
+        let ctx =
+            ToolPermissionContext::default().with_auto_approve(&["execute_python".to_string()]);
         assert!(ctx.auto_approves("execute_python"));
         assert!(ctx.auto_approves("search_materials")); // still approved
     }
 
     #[test]
     fn context_deny_overrides_auto_approve() {
-        let ctx = ToolPermissionContext::default()
-            .with_deny(&["search_materials".to_string()], &[]);
+        let ctx =
+            ToolPermissionContext::default().with_deny(&["search_materials".to_string()], &[]);
         // blocked even though it's in auto_approve
         assert!(ctx.blocks("search_materials"));
     }

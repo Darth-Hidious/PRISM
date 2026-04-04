@@ -66,10 +66,7 @@ fn emit_agent_event(event: AgentEvent) {
         AgentEvent::TextDelta { text } => {
             emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
         }
-        AgentEvent::ToolCallStart {
-            tool_name,
-            call_id,
-        } => {
+        AgentEvent::ToolCallStart { tool_name, call_id } => {
             // Flush any buffered text before a tool starts
             emit_notification("ui.text.flush", serde_json::json!({ "text": "" }));
             emit_notification(
@@ -183,10 +180,7 @@ Commands:
   /session fork [name]         — Fork current session
   /model [id]                  — Show or switch LLM model
   /help                        — Show this help";
-            emit_notification(
-                "ui.text.delta",
-                serde_json::json!({ "text": help_text }),
-            );
+            emit_notification("ui.text.delta", serde_json::json!({ "text": help_text }));
             emit_notification("ui.turn.complete", serde_json::json!({}));
             true
         }
@@ -241,10 +235,7 @@ Commands:
             true
         }
         _ if trimmed.starts_with("/session resume") => {
-            let rest = trimmed
-                .strip_prefix("/session resume")
-                .unwrap()
-                .trim();
+            let rest = trimmed.strip_prefix("/session resume").unwrap().trim();
             let reference = if rest.is_empty() { "latest" } else { rest };
             match session_store.resume_session(reference) {
                 Some((sid, messages)) => {
@@ -280,10 +271,7 @@ Commands:
             true
         }
         _ if trimmed.starts_with("/session fork") => {
-            let name = trimmed
-                .strip_prefix("/session fork")
-                .unwrap()
-                .trim();
+            let name = trimmed.strip_prefix("/session fork").unwrap().trim();
             let new_id = session_store.fork_session(name);
             emit_notification(
                 "ui.text.delta",
@@ -301,10 +289,7 @@ Commands:
 // ── Main server loop ──────────────────────────────────────────────
 
 /// Run the JSON-RPC stdio server. Blocks until stdin is closed.
-pub async fn run_server(
-    mut llm_config: LlmConfig,
-    tool_server_config: ToolServer,
-) -> Result<()> {
+pub async fn run_server(mut llm_config: LlmConfig, tool_server_config: ToolServer) -> Result<()> {
     let llm = LlmClient::new(llm_config.clone());
 
     tracing::info!("spawning python tool server");
@@ -337,7 +322,8 @@ pub async fn run_server(
     let session_id = session_store.new_session(&llm_config.model);
 
     // Approval channel — protocol sends responses, agent loop receives
-    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel::<agent_loop::ApprovalResponse>(1);
+    let (approval_tx, mut approval_rx) =
+        tokio::sync::mpsc::channel::<agent_loop::ApprovalResponse>(1);
 
     // OPA policy engine — loads built-in + user/project policies
     let mut policy_engine = match prism_policy::PolicyEngine::with_discovery(None) {
@@ -374,20 +360,14 @@ pub async fn run_server(
             }
         };
 
-        let method = request
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
+        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
         match method {
             "init" => {
                 // Check if init requests session resume
-                let resume_ref = params
-                    .get("resume")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let resume_ref = params.get("resume").and_then(|v| v.as_str()).unwrap_or("");
 
                 let mut welcome = serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
@@ -401,8 +381,7 @@ pub async fn run_server(
                         history.clear();
                         for msg in &messages {
                             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                            let content =
-                                msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
                             if !role.is_empty() && !content.is_empty() {
                                 history.push(ChatMessage {
                                     role: role.to_string(),
@@ -436,10 +415,7 @@ pub async fn run_server(
             }
 
             "input.message" => {
-                let text = params
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                let text = params.get("text").and_then(|t| t.as_str()).unwrap_or("");
 
                 if text.is_empty() {
                     emit_error(-32602, "Missing params.text", id);
@@ -466,9 +442,7 @@ pub async fn run_server(
                         // Persist assistant text and tool results as they flow through
                         match &event {
                             AgentEvent::TurnComplete { text: Some(t), .. } if !t.is_empty() => {
-                                session_store.append_message(
-                                    "assistant", t, "", "", None,
-                                );
+                                session_store.append_message("assistant", t, "", "", None);
                             }
                             AgentEvent::ToolCallResult {
                                 call_id,
@@ -476,13 +450,8 @@ pub async fn run_server(
                                 content,
                                 ..
                             } => {
-                                session_store.append_message(
-                                    "tool",
-                                    content,
-                                    tool_name,
-                                    call_id,
-                                    None,
-                                );
+                                session_store
+                                    .append_message("tool", content, tool_name, call_id, None);
                             }
                             _ => {}
                         }
@@ -506,10 +475,7 @@ pub async fn run_server(
             }
 
             "input.command" => {
-                let command = params
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
+                let command = params.get("command").and_then(|c| c.as_str()).unwrap_or("");
 
                 emit_response(id.clone(), serde_json::json!({ "status": "ok" }));
 
