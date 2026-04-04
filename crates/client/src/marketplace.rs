@@ -4,12 +4,15 @@ use tracing::debug;
 
 use crate::api::PlatformClient;
 
-/// A tool listing from the MARC27 marketplace.
+/// A resource listing from the MARC27 marketplace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplaceTool {
     pub name: String,
+    #[serde(default)]
     pub version: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub author: String,
     #[serde(default)]
     pub download_url: Option<String>,
@@ -28,34 +31,34 @@ impl<'a> MarketplaceClient<'a> {
         Self { platform }
     }
 
-    /// List marketplace tools, optionally filtered by a search query.
+    /// Search marketplace resources, optionally filtered by a query.
     pub async fn list_tools(&self, query: Option<&str>) -> Result<Vec<MarketplaceTool>> {
         let path = match query {
             Some(q) => {
                 let encoded = urlencoding(q);
-                format!("/marketplace/tools?q={encoded}")
+                format!("/marketplace/search?q={encoded}")
             }
-            None => "/marketplace/tools".to_string(),
+            None => "/marketplace/resources".to_string(),
         };
-        debug!(%path, "listing marketplace tools");
+        debug!(%path, "listing marketplace resources");
         self.platform.get(&path).await
     }
 
-    /// Get a single tool by name.
+    /// Get a single resource by name.
     pub async fn get_tool(&self, name: &str) -> Result<MarketplaceTool> {
-        let path = format!("/marketplace/tools/{name}");
-        debug!(%path, "fetching marketplace tool");
+        let path = format!("/marketplace/resources/{name}");
+        debug!(%path, "fetching marketplace resource");
         self.platform.get(&path).await
     }
 
-    /// Get the install URL for a tool (used by `prism plugin install`).
+    /// Get the install URL for a resource (used by `prism marketplace install`).
     pub async fn install_url(&self, name: &str) -> Result<String> {
         #[derive(Deserialize)]
         struct InstallInfo {
             url: String,
         }
 
-        let path = format!("/marketplace/tools/{name}/install");
+        let path = format!("/marketplace/resources/{name}/install");
         debug!(%path, "fetching install URL");
         let info: InstallInfo = self
             .platform
