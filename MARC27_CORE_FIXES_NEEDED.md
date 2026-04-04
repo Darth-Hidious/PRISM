@@ -88,6 +88,20 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 
 ---
 
+### 10. Provision API keys on `prism login`
+
+**What:** When a user authenticates via `prism login`, the platform should issue managed API keys for third-party services (Materials Project, Lens.org, etc.) so users don't need to configure them manually.
+
+**Flow:**
+1. User runs `prism login` → device-flow OAuth
+2. Platform returns JWT + managed keys: `{ "mp_api_key": "...", "lens_token": "...", ... }`
+3. PRISM stores them alongside the auth token at `~/.prism/credentials.json`
+4. Tools read from env vars or credentials — no user configuration needed
+
+**Impact:** Currently `MP_API_KEY` must be set manually. Most users won't bother, so Materials Project lookup tools are dead by default. Provisioning keys on login makes all tools work out of the box.
+
+---
+
 ## SDK Fixes (already applied locally, needs merge)
 
 These are in `/Users/siddharthakovid/Downloads/marc27-sdk/`:

@@ -21,8 +21,9 @@ pub mod ws;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
+use uuid::Uuid;
 
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -88,6 +89,12 @@ pub struct NodeState {
     pub ws_broadcast: broadcast::Sender<String>,
     /// Current number of active WebSocket connections (used to enforce concurrency limit).
     pub ws_connections: AtomicUsize,
+    /// Kafka producer for publishing mesh messages to other nodes (set once after init).
+    pub kafka_producer: OnceLock<Arc<prism_mesh::kafka::MeshKafkaProducer>>,
+    /// This node's unique ID on the mesh (set once after mesh init).
+    pub node_id: OnceLock<Uuid>,
+    /// Federated query client for dispatching queries to mesh peers.
+    pub federation: OnceLock<prism_mesh::federation::FederatedQuery>,
 }
 
 /// A running service tracked by the server.
@@ -116,6 +123,9 @@ impl NodeState {
             platform_client: None,
             ws_broadcast,
             ws_connections: AtomicUsize::new(0),
+            kafka_producer: OnceLock::new(),
+            node_id: OnceLock::new(),
+            federation: OnceLock::new(),
         }
     }
 

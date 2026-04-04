@@ -5,6 +5,7 @@ pub struct ServiceConfig {
     pub neo4j: Neo4jConfig,
     pub vector_db: VectorDbConfig,
     pub kafka: Option<KafkaConfig>,
+    pub spark: Option<SparkConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +51,23 @@ impl Default for KafkaConfig {
         Self {
             image: "apache/kafka:3.9".to_string(),
             port: 9092,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SparkConfig {
+    pub image: String,
+    pub master_port: u16,
+    pub ui_port: u16,
+}
+
+impl Default for SparkConfig {
+    fn default() -> Self {
+        Self {
+            image: "bitnami/spark:3.5".to_string(),
+            master_port: 7077,
+            ui_port: 8088,
         }
     }
 }

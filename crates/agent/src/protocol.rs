@@ -335,6 +335,21 @@ pub async fn run_server(
     // Session persistence
     let mut session_store = SessionStore::new(None);
     let session_id = session_store.new_session(&llm_config.model);
+
+    // Approval channel — protocol sends responses, agent loop receives
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel::<agent_loop::ApprovalResponse>(1);
+
+    // OPA policy engine — loads built-in + user/project policies
+    let mut policy_engine = match prism_policy::PolicyEngine::with_discovery(None) {
+        Ok(pe) => {
+            tracing::info!(policies = pe.policy_count(), "OPA policy engine loaded");
+            Some(pe)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "OPA policy engine failed to load — running without policies");
+            None
+        }
+    };
     tracing::info!(session_id = %session_id, "started new session");
 
     // Read JSON-RPC lines from stdin
@@ -473,6 +488,8 @@ pub async fn run_server(
                         }
                         emit_agent_event(event);
                     },
+                    Some(&mut approval_rx),
+                    policy_engine.as_mut(),
                 )
                 .await
                 {
@@ -512,6 +529,8 @@ pub async fn run_server(
                         &permissions,
                         &mut scratchpad,
                         &mut emit_agent_event,
+                        Some(&mut approval_rx),
+                        policy_engine.as_mut(),
                     )
                     .await
                     {
@@ -526,7 +545,16 @@ pub async fn run_server(
             }
 
             "input.prompt_response" => {
-                // TODO: approval flow — forward response to pending approval queue
+                let response_str = params
+                    .get("response")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("n");
+                let approval = match response_str {
+                    "y" | "yes" | "allow" => agent_loop::ApprovalResponse::Allow,
+                    "a" | "all" | "always" => agent_loop::ApprovalResponse::AllowAll,
+                    _ => agent_loop::ApprovalResponse::Deny,
+                };
+                let _ = approval_tx.try_send(approval);
                 emit_response(id, serde_json::json!({ "status": "ok" }));
             }
 

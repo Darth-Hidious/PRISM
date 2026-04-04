@@ -19,11 +19,14 @@ use crate::NodeState;
 #[derive(Deserialize)]
 pub struct QueryRequest {
     pub query: String,
-    /// "nl" (default), "cypher", "graph", or "semantic".
+    /// "nl" (default), "cypher", "graph", "semantic", or "federated".
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// When true, also fan out the query to mesh peers and merge results.
+    #[serde(default)]
+    pub federated: bool,
 }
 
 fn default_mode() -> String {
@@ -83,20 +86,31 @@ pub async fn execute_query(
         .map(|u| u.user_id.as_str())
         .unwrap_or("anonymous");
 
-    match body.mode.as_str() {
+    let mut result = match body.mode.as_str() {
         "nl" => handle_nl_query(&state, &body, user_id).await,
         "cypher" => handle_cypher_query(&state, &body, user_id).await,
         "graph" | "neighbors" => handle_graph_query(&state, &body, user_id).await,
         "semantic" => handle_semantic_query(&state, &body, user_id).await,
+        "federated" => handle_federated_query(&state, &body, user_id).await,
         other => Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: format!(
-                    "Unknown query mode: '{other}'. Use 'nl', 'cypher', 'graph', or 'semantic'."
+                    "Unknown query mode: '{other}'. Use 'nl', 'cypher', 'graph', 'semantic', or 'federated'."
                 ),
             }),
         )),
+    }?;
+
+    // If federated=true on any mode, also query peers and merge results
+    if body.federated && body.mode != "federated" {
+        if let Some(peer_results) = query_mesh_peers(&state, &body.query).await {
+            result.results.extend(peer_results);
+            result.count = result.results.len() as u64;
+        }
     }
+
+    Ok(result)
 }
 
 /// Natural language query: LLM translates to Cypher, then executes.
@@ -355,6 +369,87 @@ async fn handle_semantic_query(
         mode: "semantic".into(),
         translation: None,
     }))
+}
+
+/// Federated query: fan out to all mesh peers and merge results.
+async fn handle_federated_query(
+    state: &NodeState,
+    body: &QueryRequest,
+    user_id: &str,
+) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let peers = {
+        let mesh = state.mesh.read().unwrap_or_else(|e| e.into_inner());
+        mesh.peers()
+    };
+
+    if peers.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "No mesh peers available for federated query.".into(),
+            }),
+        ));
+    }
+
+    let federation = state.federation.get().cloned().unwrap_or_default();
+    let results = federation
+        .query_peers(&peers, &body.query)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "federated query failed");
+            internal_error("Federated query execution failed.")
+        })?;
+
+    let count = results.len() as u64;
+
+    state.audit_and_broadcast(&prism_core::audit::AuditEntry {
+        id: 0,
+        timestamp: chrono::Utc::now(),
+        user_id: user_id.to_string(),
+        action: prism_core::audit::AuditAction::DataQuery,
+        target: "federated".into(),
+        detail: Some(format!("results={count}, peers={}", peers.len())),
+        outcome: prism_core::audit::AuditOutcome::Success,
+    });
+
+    Ok(Json(QueryResponse {
+        results,
+        count,
+        mode: "federated".into(),
+        translation: None,
+    }))
+}
+
+/// Query mesh peers and return their results (or None if no peers/federation).
+async fn query_mesh_peers(
+    state: &NodeState,
+    query: &str,
+) -> Option<Vec<serde_json::Value>> {
+    let peers = {
+        let mesh = state.mesh.read().unwrap_or_else(|e| e.into_inner());
+        mesh.peers()
+    };
+
+    if peers.is_empty() {
+        return None;
+    }
+
+    let federation = state.federation.get().cloned().unwrap_or_default();
+    match federation.query_peers(&peers, query).await {
+        Ok(results) if !results.is_empty() => {
+            tracing::info!(
+                peer_count = peers.len(),
+                results = results.len(),
+                "merged federated peer results"
+            );
+            Some(results)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "federated peer query failed — returning local results only");
+            None
+        }
+    }
 }
 
 fn service_unavailable(msg: &str) -> (StatusCode, Json<ErrorResponse>) {

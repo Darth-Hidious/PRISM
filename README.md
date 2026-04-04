@@ -8,7 +8,7 @@
   <em>MARC27</em>
 </p>
 <p align="center">
-  <code>v2.5.0</code> &nbsp;|&nbsp; <code>15 Rust crates</code> &nbsp;|&nbsp; <code>411 tests</code> &nbsp;|&nbsp; <code>47 tools</code>
+  <code>v2.6.0</code> &nbsp;|&nbsp; <code>16 Rust crates</code> &nbsp;|&nbsp; <code>494 Rust tests + 551 Python tests</code> &nbsp;|&nbsp; <code>49 tools</code>
 </p>
 
 <p align="center">
@@ -76,12 +76,19 @@ PRISM compiles to two Rust binaries backed by a Python intelligence layer:
 │  Managed Services (Docker containers or external)             │
 │  ├── Neo4j ············· knowledge graph                      │
 │  ├── Qdrant ············ vector embeddings                    │
-│  └── Kafka ············· mesh data sync (optional)            │
+│  ├── Kafka ············· mesh data sync (optional)            │
+│  └── Spark ············· large-scale ETL (optional)           │
 │                                                               │
-│  Python TAOR Runtime (Think-Act-Observe-Repeat)               │
-│  ├── 47 tools ·········· search, predict, simulate, visualize │
-│  ├── 10 skills ········· multi-step workflows                 │
-│  └── LLM backends ······ MARC27, Anthropic, OpenAI, Ollama    │
+│  Rust Agent (TAOR — Think-Act-Observe-Repeat)                 │
+│  ├── prism-agent ······· agent loop, sessions, permissions    │
+│  ├── OPA policy ········ every tool call checked via Rego     │
+│  ├── SSE streaming ····· real-time token display              │
+│  └── Approval flow ····· allow/deny/allow-all per tool call   │
+│                                                               │
+│  Python Tools (49 tools via JSON stdio)                       │
+│  ├── 49 tools ·········· search, predict, simulate, visualize │
+│  ├── Spark ETL ········· large-scale data processing          │
+│  └── Custom plugins ···· drop .py in ~/.prism/tools/          │
 │                                                               │
 │  Rendering                                                    │
 │  ├── Ink TUI ··········· TypeScript/React terminal UI         │
@@ -141,20 +148,22 @@ CSV/Parquet → Schema Detection → LLM Entity Extraction → Neo4j Graph → Q
 
 Supports any LLM provider: MARC27 managed, Ollama (local), OpenAI, vLLM, LiteLLM.
 
-### 47 Python Tools
+### 49 Tools
 
 | Category | Tools | Status |
 |----------|-------|--------|
-| Materials search (17 OPTIMADE providers) | search_materials, query_materials_project | Working |
+| Materials search (20+ OPTIMADE providers) | search_materials, query_materials_project | Working |
 | Web browsing | web_read, web_search | Working |
 | ML prediction | predict_property, predict_structure, list_models | Working |
 | CALPHAD thermodynamics | phase diagrams, equilibrium, Gibbs energy | Requires pycalphad |
 | Visualization | scatter, histogram, correlation matrix | Working |
-| Code execution | execute_python (sandboxed, approval-gated) | Working |
+| Code execution | execute_python (sandboxed, OPA-gated) | Working |
 | Data I/O | import, export, read_file, write_file | Working |
+| Spark ETL | spark_submit_job, spark_batch_transform, spark_status | Requires pyspark |
 | MARC27 Knowledge Graph | graph search, entity lookup, paths, semantic search | Requires `prism login` |
 | MARC27 Compute | GPU job submission, cost estimation | Requires `prism login` |
 | Literature/Patent search | arXiv, Semantic Scholar, Lens.org | Working |
+| Custom plugins | any .py in ~/.prism/tools/ auto-discovered | Working |
 
 ### Security
 
@@ -205,10 +214,10 @@ CLI flags always override config file values.
 ## Testing
 
 ```bash
-cargo test --workspace          # 411 Rust tests
-cargo check --workspace         # Type check
+cargo test --workspace          # 494 Rust tests
+cargo clippy --workspace        # Lint
+python3 -m pytest tests/ -q     # 551 Python tests
 cd frontend && npx tsc --noEmit # TypeScript check
-cd dashboard && npx vite build  # Dashboard build
 ```
 
 ## License
@@ -217,8 +226,8 @@ PRISM uses a **dual license**:
 
 | Component | License |
 |-----------|---------|
-| Rust crates, CLI, config, data layer, tools, search, frontend, tests, docs | [MIT](LICENSE-MIT) |
-| Agent core, skills, ML, simulation, validation, plugins | [MARC27 Source-Available](LICENSE-MARC27) |
+| Python tools (`app/tools/`), tool server, config, plugins, tests | [MIT](LICENSE-MIT) |
+| Rust crates, frontend, install, CI, agent, workflows | [MARC27 Source-Available](LICENSE-MARC27) |
 
 See [LICENSE](LICENSE) for details. Commercial licensing: team@marc27.com
 

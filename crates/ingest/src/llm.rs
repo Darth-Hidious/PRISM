@@ -210,6 +210,158 @@ impl LlmClient {
         Ok(embeddings)
     }
 
+    /// Chat with tool-calling support and SSE streaming.
+    /// Calls `on_delta` for each text chunk as it arrives.
+    /// Returns the final assembled response (same as `chat_with_tools`).
+    pub async fn chat_with_tools_streaming(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        mut on_delta: impl FnMut(&str),
+    ) -> Result<ChatResponse> {
+        let url = format!("{}/v1/chat/completions", self.config.base_url);
+
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 4096,
+            "stream": true,
+        });
+
+        if !tools.is_empty() {
+            body["tools"] = serde_json::to_value(tools)?;
+        }
+
+        let mut req = self.client.post(&url).json(&body);
+        if let Some(auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("LLM streaming request to {url} failed"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            bail!("LLM returned HTTP {status}: {text}");
+        }
+
+        // Parse SSE stream
+        let mut full_content = String::new();
+        let mut tool_calls_map: std::collections::HashMap<u32, (String, String, String)> =
+            std::collections::HashMap::new(); // index -> (id, name, args)
+        let mut usage_info: Option<UsageInfo> = None;
+
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut sse_buffer = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.context("error reading SSE chunk")?;
+            sse_buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            // Process complete SSE lines from the buffer
+            while let Some(newline_pos) = sse_buffer.find('\n') {
+                let line = sse_buffer[..newline_pos].trim().to_string();
+                sse_buffer = sse_buffer[newline_pos + 1..].to_string();
+
+                if line.is_empty() || line == "data: [DONE]" {
+                    continue;
+                }
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
+                    // Extract text delta
+                    if let Some(delta) = chunk
+                        .pointer("/choices/0/delta/content")
+                        .and_then(|c| c.as_str())
+                    {
+                        if !delta.is_empty() {
+                            on_delta(delta);
+                            full_content.push_str(delta);
+                        }
+                    }
+
+                    // Extract streaming tool calls
+                    if let Some(tcs) = chunk
+                        .pointer("/choices/0/delta/tool_calls")
+                        .and_then(|t| t.as_array())
+                    {
+                        for tc in tcs {
+                            let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                            let entry = tool_calls_map.entry(idx).or_insert_with(|| {
+                                let id = tc
+                                    .get("id")
+                                    .and_then(|i| i.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name = tc
+                                    .pointer("/function/name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                (id, name, String::new())
+                            });
+                            // Append argument chunks
+                            if let Some(args_chunk) = tc
+                                .pointer("/function/arguments")
+                                .and_then(|a| a.as_str())
+                            {
+                                entry.2.push_str(args_chunk);
+                            }
+                        }
+                    }
+
+                    // Extract usage from final chunk
+                    if let Some(u) = chunk.get("usage") {
+                        usage_info = serde_json::from_value::<UsageInfo>(u.clone()).ok();
+                    }
+                }
+                }
+            }
+        }
+
+        // Assemble tool calls
+        let tool_calls = if tool_calls_map.is_empty() {
+            None
+        } else {
+            let mut calls: Vec<(u32, ToolCallResponse)> = tool_calls_map
+                .into_iter()
+                .map(|(idx, (id, name, args))| {
+                    (
+                        idx,
+                        ToolCallResponse {
+                            id,
+                            call_type: "function".to_string(),
+                            function: FunctionCall {
+                                name,
+                                arguments: args,
+                            },
+                        },
+                    )
+                })
+                .collect();
+            calls.sort_by_key(|(idx, _)| *idx);
+            Some(calls.into_iter().map(|(_, tc)| tc).collect())
+        };
+
+        Ok(ChatResponse {
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: if full_content.is_empty() {
+                    None
+                } else {
+                    Some(full_content)
+                },
+                tool_calls,
+                tool_call_id: None,
+            },
+            usage: usage_info,
+        })
+    }
+
     /// Health check — verify the LLM backend is reachable.
     pub async fn health_check(&self) -> Result<()> {
         let url = format!("{}/v1/models", self.config.base_url);

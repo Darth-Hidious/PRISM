@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 prism-ingest = { path = "../ingest" }
+prism-policy = { path = "../policy" }
 prism-python-bridge = { path = "../python-bridge" }
 
 regex = "1"
