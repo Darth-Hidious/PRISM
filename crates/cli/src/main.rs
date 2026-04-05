@@ -240,6 +240,20 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         max_hours: u32,
     },
+    /// Publish a model, dataset, or workflow to a remote registry.
+    Publish {
+        /// Path to the artifact (model checkpoint, dataset directory, workflow YAML).
+        path: String,
+        /// Target: "huggingface", "marc27", or a custom registry URL.
+        #[arg(long, default_value = "marc27")]
+        to: String,
+        /// Repository name on the target (e.g., "username/my-model").
+        #[arg(long)]
+        repo: Option<String>,
+        /// Make the published artifact private.
+        #[arg(long)]
+        private: bool,
+    },
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -1521,6 +1535,91 @@ async fn main() -> Result<()> {
                 println!("Check status: prism job-status {job_id}");
             } else {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
+            }
+        }
+        Commands::Publish {
+            path,
+            to,
+            repo,
+            private,
+        } => {
+            let artifact_path = std::path::Path::new(&path);
+            if !artifact_path.exists() {
+                anyhow::bail!("Path not found: {path}");
+            }
+
+            match to.as_str() {
+                "huggingface" | "hf" => {
+                    let repo_name = repo.unwrap_or_else(|| {
+                        artifact_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("my-model")
+                            .to_string()
+                    });
+                    println!("Publishing to HuggingFace: {repo_name}");
+                    let visibility = if private { "--private" } else { "" };
+                    let status = std::process::Command::new("hf")
+                        .args(["repo", "create", &repo_name, "--type", "model", visibility])
+                        .status();
+                    match status {
+                        Ok(s) if s.success() => {
+                            println!("Repository created. Uploading...");
+                            let upload = std::process::Command::new("hf")
+                                .args(["upload", &repo_name, &path])
+                                .status();
+                            match upload {
+                                Ok(s) if s.success() => {
+                                    println!("Published: https://huggingface.co/{repo_name}");
+                                }
+                                _ => {
+                                    eprintln!("Upload failed. Try: hf upload {repo_name} {path}");
+                                }
+                            }
+                        }
+                        _ => {
+                            eprintln!(
+                                "HuggingFace CLI (hf) not found or failed. Install: pip install huggingface_hub"
+                            );
+                            eprintln!("Then: hf login && prism publish {path} --to hf");
+                        }
+                    }
+                }
+                "marc27" | "platform" => {
+                    let state = paths.load_cli_state()?;
+                    let token = state
+                        .credentials
+                        .as_ref()
+                        .map(|c| c.access_token.clone())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Not logged in. Run `prism login` first.")
+                        })?;
+                    let platform = PlatformClient::new(&endpoints.api_base).with_token(&token);
+
+                    println!("Publishing to MARC27 marketplace...");
+                    let name = repo.unwrap_or_else(|| {
+                        artifact_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("artifact")
+                            .to_string()
+                    });
+                    let resp: serde_json::Value = platform
+                        .post(
+                            "/marketplace",
+                            &serde_json::json!({
+                                "name": name,
+                                "path": path,
+                                "private": private,
+                            }),
+                        )
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                }
+                other => {
+                    eprintln!("Unknown target: {other}. Use 'huggingface' or 'marc27'.");
+                    std::process::exit(1);
+                }
             }
         }
         Commands::External(args) => {
