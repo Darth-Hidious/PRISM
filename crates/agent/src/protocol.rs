@@ -290,7 +290,8 @@ Commands:
 
 /// Run the JSON-RPC stdio server. Blocks until stdin is closed.
 pub async fn run_server(mut llm_config: LlmConfig, tool_server_config: ToolServer) -> Result<()> {
-    let llm = LlmClient::new(llm_config.clone());
+    // LlmClient is rebuilt per-turn so /model switches take effect.
+    let _verify_config = LlmClient::new(llm_config.clone());
 
     tracing::info!("spawning python tool server");
     let mut tool_server: ToolServerHandle = tool_server_config
@@ -427,6 +428,9 @@ pub async fn run_server(mut llm_config: LlmConfig, tool_server_config: ToolServe
                 // Persist user message
                 session_store.append_message("user", text, "", "", None);
 
+                // Rebuild LLM client in case model was switched via /model
+                let llm = LlmClient::new(llm_config.clone());
+
                 match agent_loop::run_turn(
                     &llm,
                     &mut tool_server,
@@ -483,6 +487,7 @@ pub async fn run_server(mut llm_config: LlmConfig, tool_server_config: ToolServe
                 if !handle_command(command, &mut session_store, &mut history, &mut llm_config) {
                     let text = command.trim_start_matches('/');
                     session_store.append_message("user", text, "", "", None);
+                    let llm = LlmClient::new(llm_config.clone());
                     if let Err(e) = agent_loop::run_turn(
                         &llm,
                         &mut tool_server,
