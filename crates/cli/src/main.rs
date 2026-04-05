@@ -218,6 +218,28 @@ enum Commands {
         #[command(subcommand)]
         command: MarketplaceCommands,
     },
+    /// Query the MARC27 Research Language Model (RLM) for materials science research.
+    Research {
+        /// Research question or query.
+        query: String,
+        /// Output as JSON (for piping to other tools / agents).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deploy a model or service to the MARC27 compute platform.
+    Deploy {
+        /// Docker image to deploy (e.g., "marc27/mace:latest").
+        image: String,
+        /// GPU type (e.g., "A100", "H100").
+        #[arg(long, default_value = "A100")]
+        gpu: String,
+        /// Number of GPUs.
+        #[arg(long, default_value_t = 1)]
+        gpu_count: u32,
+        /// Max runtime in hours.
+        #[arg(long, default_value_t = 1)]
+        max_hours: u32,
+    },
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -1425,6 +1447,80 @@ async fn main() -> Result<()> {
                         println!("URL:         {url}");
                     }
                 }
+            }
+        }
+        Commands::Research { query, json } => {
+            let state = paths.load_cli_state()?;
+            let token = state
+                .credentials
+                .as_ref()
+                .map(|c| c.access_token.clone())
+                .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `prism login` first."))?;
+            let platform = PlatformClient::new(&endpoints.api_base).with_token(&token);
+
+            let resp: serde_json::Value = platform
+                .post(
+                    "/knowledge/research/query",
+                    &serde_json::json!({ "query": query, "stream": false }),
+                )
+                .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                if let Some(answer) = resp.get("answer").and_then(|a| a.as_str()) {
+                    println!("{answer}");
+                }
+                if let Some(sources) = resp.get("sources").and_then(|s| s.as_array()) {
+                    if !sources.is_empty() {
+                        println!("\nSources:");
+                        for src in sources {
+                            if let Some(title) = src.get("title").and_then(|t| t.as_str()) {
+                                let url = src.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                                println!("  - {title} {url}");
+                            }
+                        }
+                    }
+                }
+                if resp.get("answer").is_none() {
+                    // Raw response if no structured answer
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                }
+            }
+        }
+        Commands::Deploy {
+            image,
+            gpu,
+            gpu_count,
+            max_hours,
+        } => {
+            let state = paths.load_cli_state()?;
+            let token = state
+                .credentials
+                .as_ref()
+                .map(|c| c.access_token.clone())
+                .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `prism login` first."))?;
+            let platform = PlatformClient::new(&endpoints.api_base).with_token(&token);
+
+            println!("Deploying {image} on {gpu_count}x {gpu} (max {max_hours}h)...");
+
+            let resp: serde_json::Value = platform
+                .post(
+                    "/compute/submit",
+                    &serde_json::json!({
+                        "image": image,
+                        "gpu_type": gpu,
+                        "gpu_count": gpu_count,
+                        "max_runtime_hours": max_hours,
+                    }),
+                )
+                .await?;
+
+            if let Some(job_id) = resp.get("job_id").and_then(|j| j.as_str()) {
+                println!("Job submitted: {job_id}");
+                println!("Check status: prism job-status {job_id}");
+            } else {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
             }
         }
         Commands::External(args) => {
