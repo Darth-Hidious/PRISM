@@ -26,6 +26,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub auth: AuthSection,
     #[serde(default)]
+    pub llm: LlmSection,
+    #[serde(default)]
     pub indexer: ModelServiceSection,
     #[serde(default)]
     pub searcher: ModelServiceSection,
@@ -92,6 +94,86 @@ pub struct AuthSection {
     pub require_platform_auth: bool,
     #[serde(default = "default_true")]
     pub allow_local_users: bool,
+}
+
+/// Unified LLM configuration — used by ingest, query, agent, and all tools.
+///
+/// One config, propagated everywhere. CLI flags override config values.
+/// Set once with `prism configure --llm-*`, then every command uses it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmSection {
+    /// Provider hint: "llamacpp" (default), "ollama", "openai", "marc27", "anthropic".
+    /// All providers use OpenAI-compatible API — this just sets sensible defaults.
+    #[serde(default = "default_llm_kind")]
+    pub provider: String,
+    /// LLM base URL (e.g. "http://localhost:8080" for llama.cpp).
+    #[serde(default = "default_llm_url")]
+    pub url: String,
+    /// Generation model name (e.g. "gemma-4-E4B-it", "claude-sonnet-4-6").
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Embedding model (separate from generation). If None, uses `model`.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    /// API key for authenticated providers (OpenAI, Anthropic, MARC27).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Environment variable name for API key (alternative to inline).
+    #[serde(default = "default_api_key_env")]
+    pub api_key_env: String,
+    /// Request timeout in seconds.
+    #[serde(default = "default_llm_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl Default for LlmSection {
+    fn default() -> Self {
+        Self {
+            provider: default_llm_kind(),
+            url: default_llm_url(),
+            model: None,
+            embedding_model: None,
+            api_key: None,
+            api_key_env: default_api_key_env(),
+            timeout_secs: default_llm_timeout(),
+        }
+    }
+}
+
+fn default_llm_kind() -> String {
+    "llamacpp".into()
+}
+fn default_llm_url() -> String {
+    "http://localhost:8080".into()
+}
+fn default_api_key_env() -> String {
+    "LLM_API_KEY".into()
+}
+fn default_llm_timeout() -> u64 {
+    120
+}
+
+impl LlmSection {
+    /// Resolve the model name — returns a helpful error if not configured.
+    pub fn resolve_model(&self) -> Result<String> {
+        self.model.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No LLM model configured. Set one with:\n  \
+                 prism configure --model <name>\n\
+                 Or pass --model explicitly for this command.\n\
+                 Example: prism configure --model gemma-4-E4B-it --url http://localhost:8080"
+            )
+        })
+    }
+
+    /// Resolve the API key: inline value wins, then env var, then None.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        self.api_key
+            .as_ref()
+            .filter(|k| !k.is_empty())
+            .cloned()
+            .or_else(|| std::env::var(&self.api_key_env).ok())
+    }
 }
 
 /// Configuration for a managed LLM service (Indexer or Searcher).

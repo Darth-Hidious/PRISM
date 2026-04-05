@@ -135,6 +135,11 @@ models/*.meta.json
 data/*.parquet
 data/*.csv
 data/*.meta.json
+# Runtime data directories (Viking, vector DBs, etc.)
+data/_system/
+data/vectordb/
+data/viking/
+.openviking.pid
 
 # Tests (not shipped)
 tests/
