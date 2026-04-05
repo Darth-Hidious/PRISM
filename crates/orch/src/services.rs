@@ -49,7 +49,7 @@ impl Default for VectorDbConfig {
 impl Default for KafkaConfig {
     fn default() -> Self {
         Self {
-            image: "apache/kafka:3.9".to_string(),
+            image: "apache/kafka:latest".to_string(),
             port: 9092,
         }
     }

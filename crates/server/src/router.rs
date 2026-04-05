@@ -50,6 +50,12 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
         .route(
             "/api/sessions",
             post(handlers::sessions::create_session).layer(session_rate),
+        )
+        // Mesh discovery endpoints are public — other nodes need to query peers
+        .route("/api/mesh/nodes", get(handlers::mesh::list_nodes))
+        .route(
+            "/api/mesh/subscriptions",
+            get(handlers::mesh::list_subscriptions),
         );
 
     // ── Auth layer stack (applied to all non-public API routes) ─────
@@ -61,11 +67,6 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
     let read_routes = Router::new()
         .route("/api/v1/node", get(handlers::node::get_node_info))
         .route("/api/data/sources", get(handlers::data::list_sources))
-        .route("/api/mesh/nodes", get(handlers::mesh::list_nodes))
-        .route(
-            "/api/mesh/subscriptions",
-            get(handlers::mesh::list_subscriptions),
-        )
         .route("/api/tools", get(handlers::tools::list_tools))
         .layer(middleware::from_fn(require_permission(
             Permission::ViewDashboard,
