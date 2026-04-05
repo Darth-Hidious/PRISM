@@ -68,15 +68,12 @@ enum Commands {
     Ingest {
         /// Path to a CSV/Parquet file or directory to watch.
         path: PathBuf,
-        /// LLM provider: ollama (default), openai (OpenAI-compatible — works with MARC27, vLLM, etc.)
-        #[arg(long, default_value = "ollama")]
-        llm_provider: String,
-        /// LLM model name (e.g. "qwen2.5:7b", "gpt-4o", "claude-sonnet-4-6").
-        #[arg(long, default_value = "qwen2.5:7b")]
-        model: String,
-        /// LLM base URL (e.g. "http://localhost:11434", "https://api.openai.com", "https://platform.marc27.com/api/v1/llm").
-        #[arg(long, default_value = "http://localhost:11434")]
-        llm_url: String,
+        /// Override LLM model (otherwise uses prism.toml or `prism configure`).
+        #[arg(long)]
+        model: Option<String>,
+        /// Override LLM base URL (otherwise uses prism.toml, default http://localhost:8080).
+        #[arg(long)]
+        llm_url: Option<String>,
         /// API key for authenticated LLM providers. Also reads from LLM_API_KEY env var.
         #[arg(long, env = "LLM_API_KEY")]
         api_key: Option<String>,
@@ -133,15 +130,12 @@ enum Commands {
         /// Qdrant HTTP endpoint.
         #[arg(long, default_value = "http://localhost:6333")]
         qdrant_url: String,
-        /// LLM provider: ollama (default), openai (OpenAI-compatible — works with MARC27, vLLM, etc.)
-        #[arg(long, default_value = "ollama")]
-        llm_provider: String,
-        /// LLM base URL.
-        #[arg(long, default_value = "http://localhost:11434")]
-        llm_url: String,
-        /// LLM model name.
-        #[arg(long, default_value = "qwen2.5:7b")]
-        model: String,
+        /// Override LLM base URL (otherwise uses prism.toml).
+        #[arg(long)]
+        llm_url: Option<String>,
+        /// Override LLM model (otherwise uses prism.toml).
+        #[arg(long)]
+        model: Option<String>,
         /// API key for authenticated LLM providers. Also reads from LLM_API_KEY env var.
         #[arg(long, env = "LLM_API_KEY")]
         api_key: Option<String>,
@@ -253,6 +247,24 @@ enum Commands {
         /// Make the published artifact private.
         #[arg(long)]
         private: bool,
+    },
+    /// Configure PRISM settings — writes to ~/.prism/prism.toml.
+    Configure {
+        /// LLM provider hint: "llamacpp", "ollama", "openai", "marc27", "anthropic".
+        #[arg(long)]
+        llm_provider: Option<String>,
+        /// LLM base URL (e.g. "http://localhost:8080" for llama.cpp).
+        #[arg(long)]
+        url: Option<String>,
+        /// Generation model name (e.g. "gemma-4-E4B-it").
+        #[arg(long)]
+        model: Option<String>,
+        /// Embedding model name (e.g. "nomic-embed-text").
+        #[arg(long)]
+        embedding_model: Option<String>,
+        /// Show current config without modifying.
+        #[arg(long)]
+        show: bool,
     },
     #[command(external_subcommand)]
     External(Vec<String>),
@@ -638,27 +650,34 @@ async fn main() -> Result<()> {
         } => {
             use prism_ingest::LlmConfig;
 
-            // Resolve LLM config from env vars or stored credentials
+            // Load from prism.toml [llm] section, env vars as overrides
+            let node_config = prism_core::config::NodeConfig::load(Some(&backend_pr));
+            let cfg_llm = &node_config.llm;
+
             let api_key = std::env::var("LLM_API_KEY")
                 .or_else(|_| std::env::var("MARC27_TOKEN"))
                 .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
-                .or_else(|_| {
+                .ok()
+                .or_else(|| cfg_llm.resolve_api_key())
+                .or_else(|| {
                     paths
                         .load_cli_state()
                         .ok()
                         .and_then(|s| s.credentials)
                         .map(|c| c.access_token)
-                        .ok_or(std::env::VarError::NotPresent)
-                })
-                .ok();
+                });
 
             let llm_config = LlmConfig {
-                base_url: std::env::var("LLM_BASE_URL")
-                    .unwrap_or_else(|_| "https://platform.marc27.com/api/v1/llm".to_string()),
-                model: std::env::var("LLM_MODEL")
-                    .unwrap_or_else(|_| "claude-sonnet-4-6".to_string()),
+                base_url: std::env::var("LLM_BASE_URL").unwrap_or_else(|_| cfg_llm.url.clone()),
+                model: std::env::var("LLM_MODEL").unwrap_or_else(|_| {
+                    cfg_llm
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+                }),
                 api_key,
+                embedding_model: cfg_llm.embedding_model.clone(),
                 ..Default::default()
             };
 
@@ -1266,7 +1285,6 @@ async fn main() -> Result<()> {
         },
         Commands::Ingest {
             path,
-            llm_provider,
             model,
             llm_url,
             api_key,
@@ -1278,7 +1296,12 @@ async fn main() -> Result<()> {
             watch,
             mapping,
         } => {
-            let llm_cfg = build_llm_config(&llm_provider, &llm_url, &model, api_key.as_deref());
+            let llm_cfg = build_llm_config(
+                &project_root,
+                llm_url.as_deref(),
+                model.as_deref(),
+                api_key.as_deref(),
+            )?;
             if watch {
                 handle_ingest_watch(
                     &path,
@@ -1316,7 +1339,6 @@ async fn main() -> Result<()> {
             neo4j_user,
             neo4j_pass,
             qdrant_url,
-            llm_provider,
             llm_url,
             model,
             api_key,
@@ -1329,7 +1351,12 @@ async fn main() -> Result<()> {
             } else if federated {
                 handle_federated_query(&text, &dashboard_url).await?;
             } else {
-                let llm_cfg = build_llm_config(&llm_provider, &llm_url, &model, api_key.as_deref());
+                let llm_cfg = build_llm_config(
+                    &project_root,
+                    llm_url.as_deref(),
+                    model.as_deref(),
+                    api_key.as_deref(),
+                )?;
                 handle_query(
                     &text,
                     cypher,
@@ -1621,6 +1648,15 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+        Commands::Configure {
+            llm_provider,
+            url,
+            model,
+            embedding_model,
+            show,
+        } => {
+            handle_configure(llm_provider, url, model, embedding_model, show)?;
         }
         Commands::External(args) => {
             if try_run_workflow_alias(&project_root, &args).await? {
@@ -1927,21 +1963,127 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
 
 // ── LLM config builder ─────────────────────────────────────────────────
 
-fn build_llm_config(
-    _provider: &str,
-    base_url: &str,
-    model: &str,
-    api_key: Option<&str>,
-) -> prism_ingest::LlmConfig {
-    // All providers use the OpenAI-compatible API now
-    prism_ingest::LlmConfig {
-        base_url: base_url.into(),
-        model: model.into(),
-        api_key: api_key.map(str::to_string),
-        embedding_model: None,
-        max_sample_rows: 10,
-        timeout_secs: 120,
+/// Handle `prism configure` — read/write LLM config in ~/.prism/prism.toml.
+fn handle_configure(
+    provider: Option<String>,
+    url: Option<String>,
+    model: Option<String>,
+    embedding_model: Option<String>,
+    show: bool,
+) -> Result<()> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME env var not set"))?;
+    let config_dir = std::path::PathBuf::from(home).join(".prism");
+    let config_path = config_dir.join("prism.toml");
+
+    // Load current config (or defaults)
+    let mut node_config = if config_path.exists() {
+        prism_core::config::NodeConfig::from_file(&config_path).unwrap_or_default()
+    } else {
+        prism_core::config::NodeConfig::default()
+    };
+
+    if show {
+        let llm = &node_config.llm;
+        println!("LLM configuration (from {})", config_path.display());
+        println!("  provider:        {}", llm.provider);
+        println!("  url:             {}", llm.url);
+        println!(
+            "  model:           {}",
+            llm.model.as_deref().unwrap_or("(not set)")
+        );
+        println!(
+            "  embedding_model: {}",
+            llm.embedding_model.as_deref().unwrap_or("(uses model)")
+        );
+        println!("  api_key_env:     {}", llm.api_key_env);
+        println!("  timeout_secs:    {}", llm.timeout_secs);
+        if let Some(key) = llm.resolve_api_key() {
+            let masked = if key.len() > 8 {
+                format!("{}…{}", &key[..4], &key[key.len() - 4..])
+            } else {
+                "***".to_string()
+            };
+            println!("  api_key:         {masked} (resolved)");
+        } else {
+            println!("  api_key:         (none)");
+        }
+        return Ok(());
     }
+
+    // Apply updates
+    let mut changed = false;
+    if let Some(p) = provider {
+        node_config.llm.provider = p;
+        changed = true;
+    }
+    if let Some(u) = url {
+        node_config.llm.url = u;
+        changed = true;
+    }
+    if let Some(m) = model {
+        node_config.llm.model = Some(m);
+        changed = true;
+    }
+    if let Some(e) = embedding_model {
+        node_config.llm.embedding_model = Some(e);
+        changed = true;
+    }
+
+    if !changed {
+        eprintln!(
+            "No changes specified. Use --url, --model, --embedding-model, or --llm-provider."
+        );
+        eprintln!("Run `prism configure --show` to see current config.");
+        return Ok(());
+    }
+
+    // Write back
+    std::fs::create_dir_all(&config_dir)?;
+    let toml_str = toml::to_string_pretty(&node_config)?;
+    std::fs::write(&config_path, toml_str)?;
+
+    println!("Wrote config to {}", config_path.display());
+    println!("LLM URL:   {}", node_config.llm.url);
+    if let Some(m) = &node_config.llm.model {
+        println!("LLM Model: {m}");
+    }
+    Ok(())
+}
+
+/// Build LlmConfig from prism.toml with optional CLI overrides.
+///
+/// Precedence: CLI flags > prism.toml ([llm] section) > built-in defaults.
+/// Returns a helpful error if no model is configured anywhere.
+fn build_llm_config(
+    project_root: &Path,
+    url_override: Option<&str>,
+    model_override: Option<&str>,
+    api_key_override: Option<&str>,
+) -> Result<prism_ingest::LlmConfig> {
+    let node_config = prism_core::config::NodeConfig::load(Some(project_root));
+    let llm = &node_config.llm;
+
+    let base_url = url_override
+        .map(str::to_string)
+        .unwrap_or_else(|| llm.url.clone());
+
+    let model = match model_override {
+        Some(m) => m.to_string(),
+        None => llm.resolve_model()?,
+    };
+
+    let api_key = api_key_override
+        .map(str::to_string)
+        .or_else(|| llm.resolve_api_key());
+
+    Ok(prism_ingest::LlmConfig {
+        base_url,
+        model,
+        api_key,
+        embedding_model: llm.embedding_model.clone(),
+        max_sample_rows: 10,
+        timeout_secs: llm.timeout_secs,
+    })
 }
 
 // ── prism ingest ────────────────────────────────────────────────────────
@@ -3299,7 +3441,8 @@ mod tests {
             } => {
                 assert_eq!(path, PathBuf::from("/tmp/data.csv"));
                 assert!(!schema_only);
-                assert_eq!(model, "qwen2.5:7b");
+                // Model is now None by default (reads from config)
+                assert_eq!(model, None);
             }
             _ => panic!("expected Ingest command"),
         }
