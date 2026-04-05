@@ -39,7 +39,7 @@ class TestMCPServer:
                 return [str(r.uri) for r in resources]
 
         uris = asyncio.run(run())
-        assert any("sessions" in u for u in uris)
+        # Sessions moved to Rust agent — MCP server exposes tools + datasets
         assert any("tools" in u for u in uris)
 
     def test_tool_schema_has_descriptions(self):
