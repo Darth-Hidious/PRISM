@@ -1020,7 +1020,7 @@ async fn main() -> Result<()> {
                 // Resolve Kafka brokers: explicit flag > implicit from --with-kafka
                 let resolved_kafka_brokers = kafka_brokers.clone().or_else(|| {
                     if with_kafka {
-                        Some("localhost:9092".to_string())
+                        Some("127.0.0.1:9092".to_string())
                     } else {
                         None
                     }
@@ -1035,6 +1035,8 @@ async fn main() -> Result<()> {
                 let mesh_handle = prism_mesh::init_mesh(mesh_config)?;
                 let mesh_node_id = mesh_handle.node_id();
                 let mesh_peers_shared = mesh_handle.peers_shared();
+                // Update server state so REST API reports mesh as online
+                *server_state.mesh.write().unwrap_or_else(|e| e.into_inner()) = mesh_handle.clone();
                 let mesh_task = prism_mesh::start_mesh(
                     mesh_handle,
                     prism_mesh::MeshStartOptions {

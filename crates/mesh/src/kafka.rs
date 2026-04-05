@@ -24,7 +24,7 @@ pub struct KafkaConfig {
 impl Default for KafkaConfig {
     fn default() -> Self {
         Self {
-            brokers: "localhost:9092".into(),
+            brokers: "127.0.0.1:9092".into(),
             topic_prefix: "prism.mesh".into(),
             group_id: "prism-node".into(),
         }

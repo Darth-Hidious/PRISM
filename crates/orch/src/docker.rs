@@ -249,22 +249,27 @@ impl DockerOrchestrator {
         self.ensure_image(&config.image).await?;
 
         let env = vec![
-            // KRaft mode — no Zookeeper needed
+            // Apache Kafka KRaft mode — no Zookeeper
             "KAFKA_NODE_ID=1".to_string(),
             "KAFKA_PROCESS_ROLES=broker,controller".to_string(),
-            "KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093".to_string(),
+            "KAFKA_CONTROLLER_QUORUM_VOTERS=1@127.0.0.1:9093".to_string(),
             format!(
                 "KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:{},CONTROLLER://0.0.0.0:9093",
                 config.port
             ),
             format!(
-                "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:{}",
+                "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:{}",
                 config.port
             ),
             "KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER".to_string(),
             "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
                 .to_string(),
-            "CLUSTER_ID=prism-local-cluster-001".to_string(),
+            // Single-broker: set replication factors to 1
+            "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1".to_string(),
+            "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1".to_string(),
+            "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1".to_string(),
+            // CLUSTER_ID must be a valid base64 string for KRaft
+            "CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk".to_string(),
         ];
 
         let mut port_bindings = HashMap::new();
