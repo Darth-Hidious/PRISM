@@ -80,7 +80,7 @@ pub struct NodeState {
     /// Mesh handle for peer discovery.
     pub mesh: RwLock<prism_mesh::MeshHandle>,
     /// Subscription manager for pub/sub.
-    pub subscriptions: RwLock<prism_mesh::subscription::SubscriptionManager>,
+    pub subscriptions: Arc<RwLock<prism_mesh::subscription::SubscriptionManager>>,
     /// LLM config for NL→Cypher query translation (Ollama or compatible).
     pub llm: Option<prism_ingest::LlmConfig>,
     /// Platform API client (set when node is registered with MARC27 platform).
@@ -118,7 +118,9 @@ impl NodeState {
             session_db_path: None,
             tool_registry: RwLock::new(prism_core::registry::ToolRegistry::new()),
             mesh: RwLock::new(prism_mesh::MeshHandle::Offline),
-            subscriptions: RwLock::new(prism_mesh::subscription::SubscriptionManager::new()),
+            subscriptions: Arc::new(RwLock::new(
+                prism_mesh::subscription::SubscriptionManager::new(),
+            )),
             llm: None,
             platform_client: None,
             ws_broadcast,

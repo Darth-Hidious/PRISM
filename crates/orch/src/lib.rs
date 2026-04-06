@@ -82,12 +82,12 @@ mod tests {
     #[test]
     fn default_config_is_sane() {
         let cfg = ServiceConfig::default();
-        assert_eq!(cfg.neo4j.bolt_port, 7687);
-        assert_eq!(cfg.neo4j.http_port, 7474);
-        assert_eq!(cfg.vector_db.port, 6333);
+        assert_eq!(cfg.neo4j.as_ref().unwrap().bolt_port, 7687);
+        assert_eq!(cfg.neo4j.as_ref().unwrap().http_port, 7474);
+        assert_eq!(cfg.vector_db.as_ref().unwrap().port, 6333);
         assert!(cfg.kafka.is_none());
-        assert!(cfg.neo4j.image.contains("neo4j"));
-        assert!(cfg.vector_db.image.contains("qdrant"));
+        assert!(cfg.neo4j.as_ref().unwrap().image.contains("neo4j"));
+        assert!(cfg.vector_db.as_ref().unwrap().image.contains("qdrant"));
     }
 
     #[test]

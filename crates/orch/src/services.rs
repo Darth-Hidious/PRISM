@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
-    pub neo4j: Neo4jConfig,
-    pub vector_db: VectorDbConfig,
+    pub neo4j: Option<Neo4jConfig>,
+    pub vector_db: Option<VectorDbConfig>,
     pub kafka: Option<KafkaConfig>,
     pub spark: Option<SparkConfig>,
 }
@@ -65,9 +65,21 @@ pub struct SparkConfig {
 impl Default for SparkConfig {
     fn default() -> Self {
         Self {
-            image: "bitnami/spark:3.5".to_string(),
+            // Bitnami retired the old Spark tags; use the official Spark image line.
+            image: "spark:3.5.8-scala2.12-java17-ubuntu".to_string(),
             master_port: 7077,
             ui_port: 8088,
+        }
+    }
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            neo4j: Some(Neo4jConfig::default()),
+            vector_db: Some(VectorDbConfig::default()),
+            kafka: None,
+            spark: None,
         }
     }
 }
