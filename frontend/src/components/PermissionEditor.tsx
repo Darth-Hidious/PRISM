@@ -40,6 +40,7 @@ interface Props {
   fullAccess: PermissionTool[];
   allowOverrides: string[];
   denyOverrides: string[];
+  notice?: string;
   onCommand: (command: string) => void;
   onClose: () => void;
 }
@@ -77,6 +78,7 @@ export function PermissionEditor({
   fullAccess,
   allowOverrides,
   denyOverrides,
+  notice,
   onCommand,
   onClose,
 }: Props) {
@@ -207,6 +209,11 @@ export function PermissionEditor({
           deny: {denyOverrides.length > 0 ? denyOverrides.join(", ") : "(none)"}
         </Text>
       </Box>
+      {notice ? (
+        <Box marginTop={1}>
+          <Text color={SUCCESS}>{notice}</Text>
+        </Box>
+      ) : null}
     </Box>
   );
 

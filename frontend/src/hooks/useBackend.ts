@@ -40,8 +40,11 @@ export function useBackend(
     clientRef.current?.send("input.message", { text });
   }, []);
 
-  const sendCommand = useCallback((command: string) => {
-    clientRef.current?.send("input.command", { command });
+  const sendCommand = useCallback((command: string, options?: { silent?: boolean }) => {
+    clientRef.current?.send("input.command", {
+      command,
+      silent: !!options?.silent,
+    });
   }, []);
 
   const sendPromptResponse = useCallback(

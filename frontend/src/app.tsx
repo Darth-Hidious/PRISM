@@ -79,6 +79,7 @@ interface ActivePermissions {
   fullAccess: PermissionTool[];
   allowOverrides: string[];
   denyOverrides: string[];
+  notice?: string;
 }
 
 function toTurnCommandView(view: ActiveView): TurnCommandView {
@@ -397,6 +398,7 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
             denyOverrides: Array.isArray(ev.params.deny_overrides)
               ? ev.params.deny_overrides.map(String)
               : [],
+            notice: ev.params.notice ? String(ev.params.notice) : undefined,
           });
           setActiveView(null);
           if (localDraft?.input?.kind === "command") {
@@ -539,7 +541,8 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
           fullAccess={activePermissions.fullAccess}
           allowOverrides={activePermissions.allowOverrides}
           denyOverrides={activePermissions.denyOverrides}
-          onCommand={(command) => dispatchInput(command)}
+          notice={activePermissions.notice}
+          onCommand={(command) => sendCommand(command, { silent: true })}
           onClose={() => setActivePermissions(null)}
         />
       ) : activeSessionPicker ? (
