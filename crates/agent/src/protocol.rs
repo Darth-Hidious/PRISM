@@ -3,6 +3,7 @@
 //! Reads JSON-RPC requests from stdin, dispatches them, and emits
 //! `ui.*` notifications on stdout. Stdout is the protocol channel
 //! so all logging MUST go through `tracing`, never `println!`.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -1633,7 +1634,7 @@ fn project_api_history(history: &[ChatMessage]) -> &[ChatMessage] {
 fn estimate_token_count(text: &str) -> usize {
     let chars = text.chars().count();
     let words = text.split_whitespace().count();
-    std::cmp::max(words, (chars + 3) / 4)
+    std::cmp::max(words, chars.div_ceil(4))
 }
 
 fn preview_text(text: &str, max_chars: usize) -> String {
@@ -4426,6 +4427,7 @@ fn spawn_agent_turn(
 // ── Command handlers ──────────────────────────────────────────────
 
 /// Handle built-in slash commands. Returns `true` if the command was handled.
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     command: &str,
     silent: bool,

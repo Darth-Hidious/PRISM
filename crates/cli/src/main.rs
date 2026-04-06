@@ -1621,7 +1621,7 @@ async fn main() -> Result<()> {
                     anyhow!("`prism ingest --watch` requires a path or directory.")
                 })?;
                 handle_ingest_watch(
-                    &path,
+                    path,
                     &project_root,
                     model.as_deref(),
                     llm_url.as_deref(),
@@ -1642,7 +1642,7 @@ async fn main() -> Result<()> {
                     anyhow!("`prism ingest` requires a file or directory unless `--status` is set.")
                 })?;
                 handle_ingest(
-                    &path,
+                    path,
                     &project_root,
                     model.as_deref(),
                     llm_url.as_deref(),
@@ -2702,6 +2702,7 @@ async fn submit_platform_ingest_chunk(
     Ok(response.json().await?)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_local_ingest_file(
     path: &Path,
     project_root: &Path,
@@ -3946,7 +3947,7 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
                 print_models_summary(&models);
             }
         }
-        ModelsCommands::Info { model_id, json } => {
+        ModelsCommands::Info { model_id, json: _ } => {
             let model = models
                 .into_iter()
                 .find(|model| {
@@ -3956,11 +3957,7 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
                 })
                 .ok_or_else(|| anyhow!("Model not found in project catalog: {model_id}"))?;
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&model)?);
-            } else {
-                println!("{}", serde_json::to_string_pretty(&model)?);
-            }
+            println!("{}", serde_json::to_string_pretty(&model)?)
         }
     }
 

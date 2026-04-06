@@ -1821,6 +1821,7 @@ mod tests {
         assert_eq!(endpoint, "https://node.example.com:9001");
     }
 
+    #[allow(clippy::type_complexity)]
     fn spawn_stub_http_server(
         max_requests: usize,
         responder: Arc<dyn Fn(&str) -> (u16, String, &'static str) + Send + Sync>,
