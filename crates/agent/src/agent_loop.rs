@@ -215,26 +215,32 @@ fn summarize_tool_result(
                                     .unwrap_or("deployment");
                                 return format!("{tool_name}: {deployment_id} ({status})");
                             }
-                            if let Some(healthy) =
-                                parsed_stdout.get("healthy").and_then(|value| value.as_bool())
+                            if let Some(healthy) = parsed_stdout
+                                .get("healthy")
+                                .and_then(|value| value.as_bool())
                             {
                                 return format!("{tool_name}: healthy={healthy}");
                             }
                         }
                         "discourse" => {
-                            if let Some(items) =
-                                parsed_stdout.get("specs").and_then(|value| value.as_array())
+                            if let Some(items) = parsed_stdout
+                                .get("specs")
+                                .and_then(|value| value.as_array())
                             {
                                 return format!("{tool_name}: {} specs", items.len());
                             }
-                            if let Some(events) =
-                                parsed_stdout.get("events").and_then(|value| value.as_array())
+                            if let Some(events) = parsed_stdout
+                                .get("events")
+                                .and_then(|value| value.as_array())
                             {
                                 let instance_id = parsed_stdout
                                     .get("instance_id")
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("instance");
-                                return format!("{tool_name}: {instance_id} ({} events)", events.len());
+                                return format!(
+                                    "{tool_name}: {instance_id} ({} events)",
+                                    events.len()
+                                );
                             }
                             if let Some(status) =
                                 parsed_stdout.get("status").and_then(|value| value.as_str())
@@ -245,8 +251,9 @@ fn summarize_tool_result(
                                     .unwrap_or("instance");
                                 return format!("{tool_name}: {instance_id} ({status})");
                             }
-                            if let Some(turns) =
-                                parsed_stdout.get("turns").and_then(|value| value.as_array())
+                            if let Some(turns) = parsed_stdout
+                                .get("turns")
+                                .and_then(|value| value.as_array())
                             {
                                 return format!("{tool_name}: {} turns", turns.len());
                             }
@@ -574,7 +581,9 @@ pub async fn run_turn(
                     tool_args: args.clone(),
                     call_id: call_id.clone(),
                     tool_description: tool_meta.map(|tool| tool.description.clone()),
-                    requires_approval: tool_meta.map(|tool| tool.requires_approval).unwrap_or(false),
+                    requires_approval: tool_meta
+                        .map(|tool| tool.requires_approval)
+                        .unwrap_or(false),
                     permission_mode: tool_meta
                         .map(|tool| tool.permission_mode.as_str().to_string())
                         .unwrap_or_else(|| "workspace-write".to_string()),
@@ -626,10 +635,13 @@ pub async fn run_turn(
                     &args,
                     policy.as_deref_mut(),
                 )
-                    .await
-                    .map(|value| serde_json::json!({ "result": value }))
+                .await
+                .map(|value| serde_json::json!({ "result": value }))
             } else {
-                tool_server.call_tool(tool_name, args.clone()).await.map_err(Into::into)
+                tool_server
+                    .call_tool(tool_name, args.clone())
+                    .await
+                    .map_err(Into::into)
             };
             let elapsed_ms = start.elapsed().as_millis() as u64;
 

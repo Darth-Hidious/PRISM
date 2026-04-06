@@ -2027,7 +2027,12 @@ fn format_tool_entry(tool_name: &str, tools: &ToolCatalog) -> String {
                 }
             }
 
-            format!("{} · {}\n  {}", tool.name, meta.join(" · "), tool.description)
+            format!(
+                "{} · {}\n  {}",
+                tool.name,
+                meta.join(" · "),
+                tool.description
+            )
         }
         None => tool_name.to_string(),
     }

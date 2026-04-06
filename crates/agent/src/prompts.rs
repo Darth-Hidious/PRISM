@@ -180,7 +180,10 @@ pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> S
         );
     }
 
-    if tools.iter().any(|tool| tool.source.as_deref() == Some("mcp")) {
+    if tools
+        .iter()
+        .any(|tool| tool.source.as_deref() == Some("mcp"))
+    {
         bullets.push(
             "Some loaded tools come from external MCP servers. Treat them as remote capabilities: inspect their descriptions carefully, prefer read-only discovery first, and expect approval before mutation or execution."
                 .to_string(),
