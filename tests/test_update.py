@@ -1,13 +1,14 @@
 """Tests for the version update checker."""
 
 import json
+import tarfile
 import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from app.update import check_for_updates, _read_cache, _write_cache, CACHE_PATH
+from app.update import check_for_updates, _read_cache, _write_cache, CACHE_PATH, download_tui_binary
 
 
 @pytest.fixture(autouse=True)
@@ -92,3 +93,65 @@ def test_check_updates_false_skips_check():
 
     prefs.check_updates = False
     assert prefs.check_updates is False
+
+
+def test_download_tui_binary_prefers_direct_release_asset(clean_cache, monkeypatch):
+    """When a standalone prism-tui asset exists, download it directly."""
+    monkeypatch.setattr("app.update._tui_binary_name", lambda: "prism-tui-darwin-arm64")
+    monkeypatch.setattr("app.update._platform_archive_name", lambda: "prism-macos-aarch64.tar.gz")
+    monkeypatch.setattr(
+        "app.update._latest_release_metadata",
+        lambda: {
+            "tag_name": "v9.9.9",
+            "assets": [
+                {
+                    "name": "prism-tui-darwin-arm64",
+                    "browser_download_url": "https://example.test/prism-tui-darwin-arm64",
+                }
+            ],
+        },
+    )
+
+    def fake_urlretrieve(url, dest):
+        Path(dest).write_bytes(b"direct-binary")
+        return dest, None
+
+    monkeypatch.setattr("urllib.request.urlretrieve", fake_urlretrieve)
+
+    path = download_tui_binary()
+    assert path is not None
+    assert Path(path).read_bytes() == b"direct-binary"
+
+
+def test_download_tui_binary_falls_back_to_archive(clean_cache, monkeypatch):
+    """If the standalone asset is absent, extract prism-tui from the platform archive."""
+    monkeypatch.setattr("app.update._tui_binary_name", lambda: "prism-tui-linux-x64")
+    monkeypatch.setattr("app.update._platform_archive_name", lambda: "prism-linux-x86_64.tar.gz")
+    monkeypatch.setattr(
+        "app.update._latest_release_metadata",
+        lambda: {
+            "tag_name": "v9.9.9",
+            "assets": [
+                {
+                    "name": "prism-linux-x86_64.tar.gz",
+                    "browser_download_url": "https://example.test/prism-linux-x86_64.tar.gz",
+                }
+            ],
+        },
+    )
+
+    def fake_urlretrieve(url, dest):
+        if url.endswith(".tar.gz"):
+            with tarfile.open(dest, "w:gz") as archive:
+                payload = clean_cache.parent / "prism-tui"
+                payload.write_bytes(b"archive-binary")
+                archive.add(payload, arcname="prism-tui")
+        else:
+            raise RuntimeError("direct asset should not be used in archive fallback test")
+        return dest, None
+
+    monkeypatch.setattr("urllib.request.urlretrieve", fake_urlretrieve)
+
+    path = download_tui_binary()
+    assert path is not None
+    assert Path(path).read_bytes() == b"archive-binary"
