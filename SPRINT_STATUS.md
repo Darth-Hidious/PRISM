@@ -86,11 +86,6 @@ From `MARC27_SUPPORT_API_SPEC.md`:
 ### S5.3 ASE Tool (MEDIUM)
 - Structure manipulation, calculators, optimization, NEB for transition states
 
-### S5.4 Jupyter Notebook Tool (HIGH)
-- **Need:** `app/tools/notebook.py` using `jupyter_client`
-- Read .ipynb cells, write/modify cells, execute cells, read output (including plots)
-- Agent calls it like any other tool
-
 ### S5.5 MACE / CHGNet (MARKETPLACE — not PRISM)
 - These are marketplace products on MARC27 platform
 - PRISM just needs the "install from marketplace" flow to work
