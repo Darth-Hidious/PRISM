@@ -84,12 +84,14 @@ pub enum AgentEvent {
     ToolCallStart {
         tool_name: String,
         call_id: String,
+        preview: Option<String>,
     },
     ToolCallResult {
         call_id: String,
         tool_name: String,
         content: String,
         summary: Option<String>,
+        preview: Option<String>,
         elapsed_ms: u64,
         is_error: bool,
     },
@@ -97,6 +99,9 @@ pub enum AgentEvent {
         tool_name: String,
         tool_args: serde_json::Value,
         call_id: String,
+        tool_description: Option<String>,
+        requires_approval: bool,
+        permission_mode: String,
     },
     TurnComplete {
         text: Option<String>,

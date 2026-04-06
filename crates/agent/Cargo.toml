@@ -7,15 +7,19 @@ edition = "2021"
 prism-ingest = { path = "../ingest" }
 prism-policy = { path = "../policy" }
 prism-python-bridge = { path = "../python-bridge" }
+prism-client = { path = "../client" }
+prism-runtime = { path = "../runtime" }
+prism-workflows = { path = "../workflows" }
 
 regex = "1"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-util", "io-std", "macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["io-util", "io-std", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
 chrono.workspace = true
 directories.workspace = true
+shlex = "1"
 
 [dev-dependencies]
 tempfile = "3"
