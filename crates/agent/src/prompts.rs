@@ -124,6 +124,20 @@ pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> S
         );
     }
 
+    if has_any_tools(&tool_names, &["run_submit", "run"]) {
+        bullets.push(
+            "Use `run_submit` for one-off compute jobs across local, MARC27, or BYOC backends instead of hand-building `run` argv or shell wrappers."
+                .to_string(),
+        );
+    }
+
+    if has_any_tools(&tool_names, &["publish_artifact", "publish"]) {
+        bullets.push(
+            "Use `publish_artifact` for structured model, dataset, or workflow publishing instead of manually assembling `publish` arguments."
+                .to_string(),
+        );
+    }
+
     if has_any_tools(&tool_names, &["ingest_file", "ingest_watch", "ingest"]) {
         bullets.push(
             "Treat ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless the user explicitly asks for low-level control."

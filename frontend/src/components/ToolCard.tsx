@@ -99,6 +99,55 @@ function renderStructuredCommandData(data: Record<string, any>) {
     }
   }
 
+  if (root === "run" && parsed && typeof parsed === "object") {
+    const jobId = String(parsed?.job_id ?? "?");
+    const status =
+      typeof parsed?.initial_status === "string"
+        ? parsed.initial_status
+        : parsed?.initial_status && typeof parsed.initial_status === "object"
+          ? Object.keys(parsed.initial_status)[0] ?? "status"
+          : parsed?.status_error
+            ? `status unavailable`
+            : "";
+    const lines = [
+      `job: ${jobId}`,
+      parsed?.name ? `name: ${parsed.name}` : "",
+      parsed?.backend ? `backend: ${parsed.backend}` : "",
+      status ? `status: ${status}` : "",
+      parsed?.image ? `image: ${parsed.image}` : "",
+    ].filter(Boolean);
+    return (
+      <Box marginTop={1} flexDirection="column">
+        {lines.map((line, index) => (
+          <Text key={`${jobId}-${index}`} color={TEXT_MUTED}>
+            {line}
+          </Text>
+        ))}
+      </Box>
+    );
+  }
+
+  if (root === "publish" && parsed && typeof parsed === "object") {
+    const lines = [
+      parsed?.target ? `target: ${parsed.target}` : "",
+      parsed?.repo ? `repo: ${parsed.repo}` : "",
+      parsed?.private !== undefined ? `private: ${parsed.private}` : "",
+      parsed?.published_url ? `url: ${parsed.published_url}` : "",
+      parsed?.path ? `path: ${parsed.path}` : "",
+    ].filter(Boolean);
+    if (lines.length) {
+      return (
+        <Box marginTop={1} flexDirection="column">
+          {lines.map((line, index) => (
+            <Text key={`${line}-${index}`} color={TEXT_MUTED}>
+              {line}
+            </Text>
+          ))}
+        </Box>
+      );
+    }
+  }
+
   if (root === "discourse" && parsed && typeof parsed === "object") {
     if (Array.isArray(parsed?.specs)) {
       const specs = parsed.specs;

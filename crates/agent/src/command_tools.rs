@@ -62,6 +62,8 @@ enum CommandToolKind {
     MeshPublish,
     MeshSubscribe,
     MeshUnsubscribe,
+    RunSubmit,
+    PublishArtifact,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -365,6 +367,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         requires_approval: true,
     },
     CommandToolSpec {
+        name: "run_submit",
+        root: "run",
+        aliases: &[],
+        kind: CommandToolKind::RunSubmit,
+        description: "Submit a compute job with typed fields instead of manually assembling `prism run` arguments. Use this for local, MARC27, or BYOC execution backends.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
         name: "research",
         root: "research",
         aliases: &["prism_research"],
@@ -541,6 +552,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &["prism_publish"],
         kind: CommandToolKind::RootArgs,
         description: "Run `prism publish ...` for PRISM publishing flows. Pass structured argv tokens in `args`.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "publish_artifact",
+        root: "publish",
+        aliases: &[],
+        kind: CommandToolKind::PublishArtifact,
+        description: "Publish a model, dataset, or workflow artifact with typed fields instead of manual CLI argv assembly.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -989,6 +1009,91 @@ fn deploy_create_schema() -> Value {
     })
 }
 
+fn run_submit_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "image": {
+                "type": "string",
+                "description": "Container image to run."
+            },
+            "name": {
+                "type": "string",
+                "description": "Optional job name."
+            },
+            "backend": {
+                "type": "string",
+                "description": "Execution backend: `local`, `marc27`, or `byoc`."
+            },
+            "platform_url": {
+                "type": "string",
+                "description": "Override the MARC27 platform API URL when using the `marc27` backend."
+            },
+            "inputs": {
+                "type": "object",
+                "description": "Key-value input bindings passed as repeated `--input key=value` flags.",
+                "additionalProperties": { "type": "string" }
+            },
+            "ssh": {
+                "type": "string",
+                "description": "BYOC SSH target such as `user@host`."
+            },
+            "ssh_key": {
+                "type": "string",
+                "description": "SSH private-key path for BYOC SSH."
+            },
+            "ssh_port": {
+                "type": "integer",
+                "description": "SSH port for BYOC SSH."
+            },
+            "k8s_context": {
+                "type": "string",
+                "description": "Kubernetes context for BYOC K8s."
+            },
+            "k8s_namespace": {
+                "type": "string",
+                "description": "Kubernetes namespace for BYOC K8s."
+            },
+            "slurm": {
+                "type": "string",
+                "description": "SLURM head node target such as `user@host`."
+            },
+            "slurm_partition": {
+                "type": "string",
+                "description": "SLURM partition name."
+            }
+        },
+        "required": ["image"],
+        "additionalProperties": false
+    })
+}
+
+fn publish_artifact_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Local path to the artifact to publish."
+            },
+            "to": {
+                "type": "string",
+                "description": "Target registry, such as `marc27`, `huggingface`, or a custom URL."
+            },
+            "repo": {
+                "type": "string",
+                "description": "Target repository name, such as `username/my-model`."
+            },
+            "private": {
+                "type": "boolean",
+                "description": "Publish the artifact privately when the target supports it."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    })
+}
+
 fn discourse_create_schema() -> Value {
     json!({
         "type": "object",
@@ -1175,6 +1280,7 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::DeployStop => {
             deploy_id_schema("deployment_id", "Deployment UUID to stop.")
         }
+        CommandToolKind::RunSubmit => run_submit_schema(),
         CommandToolKind::DiscourseList => empty_schema(),
         CommandToolKind::DiscourseCreate => discourse_create_schema(),
         CommandToolKind::DiscourseShow => {
@@ -1188,6 +1294,7 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
             "instance_id",
             "UUID of the discourse instance whose stored turns should be fetched.",
         ),
+        CommandToolKind::PublishArtifact => publish_artifact_schema(),
         CommandToolKind::NodeProbe | CommandToolKind::NodeStatus => empty_schema(),
         CommandToolKind::NodeLogs => node_logs_schema(),
         CommandToolKind::MeshDiscover => mesh_discover_schema(),
@@ -1743,6 +1850,59 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 "--json".to_string(),
             ],
         }),
+        CommandToolKind::RunSubmit => {
+            let mut args = Vec::new();
+            if let Some(name) = optional_string(input, "name") {
+                args.push("--name".to_string());
+                args.push(name);
+            }
+            if let Some(backend) = optional_string(input, "backend") {
+                args.push("--backend".to_string());
+                args.push(backend);
+            }
+            if let Some(platform_url) = optional_string(input, "platform_url") {
+                args.push("--platform-url".to_string());
+                args.push(platform_url);
+            }
+            for (key, value) in parse_string_map(input, "inputs")? {
+                args.push("--input".to_string());
+                args.push(format!("{key}={value}"));
+            }
+            if let Some(ssh) = optional_string(input, "ssh") {
+                args.push("--ssh".to_string());
+                args.push(ssh);
+            }
+            if let Some(ssh_key) = optional_string(input, "ssh_key") {
+                args.push("--ssh-key".to_string());
+                args.push(ssh_key);
+            }
+            if let Some(ssh_port) = optional_usize(input, "ssh_port") {
+                args.push("--ssh-port".to_string());
+                args.push(ssh_port.to_string());
+            }
+            if let Some(k8s_context) = optional_string(input, "k8s_context") {
+                args.push("--k8s-context".to_string());
+                args.push(k8s_context);
+            }
+            if let Some(k8s_namespace) = optional_string(input, "k8s_namespace") {
+                args.push("--k8s-namespace".to_string());
+                args.push(k8s_namespace);
+            }
+            if let Some(slurm) = optional_string(input, "slurm") {
+                args.push("--slurm".to_string());
+                args.push(slurm);
+            }
+            if let Some(slurm_partition) = optional_string(input, "slurm_partition") {
+                args.push("--slurm-partition".to_string());
+                args.push(slurm_partition);
+            }
+            args.push(required_string(input, "image")?);
+            args.push("--json".to_string());
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
         CommandToolKind::DiscourseList => Ok(CommandExecution::Cli {
             root: spec.root,
             args: vec!["list".to_string(), "--json".to_string()],
@@ -1795,6 +1955,25 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 "--json".to_string(),
             ],
         }),
+        CommandToolKind::PublishArtifact => {
+            let mut args = vec![required_string(input, "path")?];
+            if let Some(target) = optional_string(input, "to") {
+                args.push("--to".to_string());
+                args.push(target);
+            }
+            if let Some(repo) = optional_string(input, "repo") {
+                args.push("--repo".to_string());
+                args.push(repo);
+            }
+            if optional_bool(input, "private") {
+                args.push("--private".to_string());
+            }
+            args.push("--json".to_string());
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
         CommandToolKind::NodeProbe => Ok(CommandExecution::Cli {
             root: spec.root,
             args: vec!["probe".to_string()],
@@ -2287,6 +2466,46 @@ mod tests {
         assert_eq!(
             preview,
             "prism discourse run abc-123 --param alloy=IN718 --json"
+        );
+    }
+
+    #[test]
+    fn renders_typed_run_preview() {
+        let preview = command_tool_preview(
+            "run_submit",
+            &json!({
+                "image": "ghcr.io/acme/model:latest",
+                "name": "trial",
+                "backend": "marc27",
+                "inputs": {
+                    "alloy": "IN718"
+                }
+            }),
+        )
+        .expect("run preview should render");
+
+        assert_eq!(
+            preview,
+            "prism run --name trial --backend marc27 --input alloy=IN718 ghcr.io/acme/model:latest --json"
+        );
+    }
+
+    #[test]
+    fn renders_typed_publish_preview() {
+        let preview = command_tool_preview(
+            "publish_artifact",
+            &json!({
+                "path": "models/mace.ckpt",
+                "to": "marc27",
+                "repo": "team/mace",
+                "private": true
+            }),
+        )
+        .expect("publish preview should render");
+
+        assert_eq!(
+            preview,
+            "prism publish models/mace.ckpt --to marc27 --repo team/mace --private --json"
         );
     }
 }
