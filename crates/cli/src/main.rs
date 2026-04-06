@@ -2719,7 +2719,6 @@ async fn run_local_ingest_file(
     use prism_ingest::pipeline::{IngestPipeline, PipelineConfig};
     use prism_ingest::{Neo4jConfig, QdrantConfig};
 
-    let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
     let mapping = mapping_path
         .map(prism_ingest::mapping::OntologyMapping::from_file)
         .transpose()?;
@@ -2733,6 +2732,7 @@ async fn run_local_ingest_file(
             mapping: None,
         }
     } else {
+        let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
         PipelineConfig {
             llm: Some(llm_cfg),
             neo4j: Some(Neo4jConfig {
