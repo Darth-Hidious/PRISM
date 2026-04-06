@@ -2,6 +2,8 @@
 
 import json
 import shutil
+import tarfile
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -138,6 +140,22 @@ def _tui_binary_name() -> Optional[str]:
     return None
 
 
+def _platform_archive_name() -> Optional[str]:
+    """Return the platform-specific release archive name, or None."""
+    import platform
+
+    system = platform.system()
+    machine = platform.machine()
+    if system == "Darwin":
+        return "prism-macos-aarch64.tar.gz" if machine == "arm64" else "prism-macos-x86_64.tar.gz"
+    elif system == "Linux":
+        if machine == "x86_64":
+            return "prism-linux-x86_64.tar.gz"
+        elif machine == "aarch64":
+            return "prism-linux-aarch64.tar.gz"
+    return None
+
+
 def _latest_release_tag() -> Optional[str]:
     """Get the latest release tag from GitHub (including pre-releases)."""
     import urllib.request
@@ -154,6 +172,22 @@ def _latest_release_tag() -> Optional[str]:
     return None
 
 
+def _latest_release_metadata() -> Optional[dict]:
+    """Get the latest release payload from GitHub (including pre-releases)."""
+    import urllib.request
+
+    url = "https://api.github.com/repos/Darth-Hidious/PRISM/releases"
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        if data and isinstance(data, list):
+            return data[0]
+    except Exception:
+        pass
+    return None
+
+
 def download_tui_binary() -> Optional[str]:
     """Download the latest TUI binary for this platform.
 
@@ -162,19 +196,50 @@ def download_tui_binary() -> Optional[str]:
     import urllib.request
 
     bin_name = _tui_binary_name()
+    archive_name = _platform_archive_name()
     if not bin_name:
         return None
 
-    tag = _latest_release_tag() or "v2.5.0"
-    url = f"https://github.com/Darth-Hidious/PRISM/releases/download/{tag}/{bin_name}"
     dest_dir = PRISM_DIR / "bin"
     dest = dest_dir / "prism-tui"
 
     try:
+        release = _latest_release_metadata()
+        tag = (release or {}).get("tag_name") or _latest_release_tag() or "v2.5.0"
+        assets = {
+            asset.get("name"): asset.get("browser_download_url")
+            for asset in (release or {}).get("assets", [])
+            if asset.get("name") and asset.get("browser_download_url")
+        }
+        direct_url = assets.get(bin_name) or f"https://github.com/Darth-Hidious/PRISM/releases/download/{tag}/{bin_name}"
+        archive_url = (
+            assets.get(archive_name)
+            if archive_name
+            else None
+        ) or (f"https://github.com/Darth-Hidious/PRISM/releases/download/{tag}/{archive_name}" if archive_name else None)
+
         dest_dir.mkdir(parents=True, exist_ok=True)
-        urllib.request.urlretrieve(url, str(dest))
-        dest.chmod(0o755)
-        return str(dest)
+        try:
+            urllib.request.urlretrieve(direct_url, str(dest))
+            dest.chmod(0o755)
+            return str(dest)
+        except Exception:
+            if not archive_url:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = Path(tmpdir) / archive_name
+            urllib.request.urlretrieve(archive_url, str(archive_path))
+            with tarfile.open(archive_path, "r:gz") as archive:
+                member = next((item for item in archive.getmembers() if Path(item.name).name == "prism-tui"), None)
+                if member is None:
+                    return None
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    return None
+                dest.write_bytes(extracted.read())
+            dest.chmod(0o755)
+            return str(dest)
     except Exception:
         return None
 

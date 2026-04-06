@@ -55,6 +55,7 @@ mkdir -p "$INSTALL_DIR"
 tar -xzf "${TMPDIR}/${ARCHIVE}" -C "$INSTALL_DIR"
 chmod +x "${INSTALL_DIR}/prism" 2>/dev/null || true
 chmod +x "${INSTALL_DIR}/prism-node" 2>/dev/null || true
+chmod +x "${INSTALL_DIR}/prism-tui" 2>/dev/null || true
 
 # --- Add to PATH ---
 SHELL_NAME="$(basename "${SHELL:-bash}")"

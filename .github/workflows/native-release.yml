@@ -43,16 +43,23 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev
 
-      - name: Create dashboard dist placeholder
-        run: mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           target: ${{ matrix.rust_target }}
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - uses: oven-sh/setup-bun@v2
+
+      - name: Install dashboard deps
+        run: cd dashboard && npm ci
+
+      - name: Build dashboard bundle
+        run: cd dashboard && npm run build
 
       - name: Install frontend deps
         run: cd frontend && bun install --frozen-lockfile
@@ -81,8 +88,15 @@ jobs:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.tui_binary }}
+          path: dist/${{ matrix.tui_binary }}
+
       - name: Publish release assets
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.archive }}
+          files: |
+            ${{ matrix.archive }}
+            dist/${{ matrix.tui_binary }}
