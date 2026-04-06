@@ -1683,12 +1683,18 @@ async fn main() -> Result<()> {
             } else if federated {
                 handle_federated_query(&text, &dashboard_url, &paths).await?;
             } else {
-                let llm_cfg = build_llm_config(
-                    &project_root,
-                    llm_url.as_deref(),
-                    model.as_deref(),
-                    api_key.as_deref(),
-                )?;
+                // LLM config is only needed for NL and semantic queries
+                // (not --cypher which hits Neo4j directly)
+                let llm_cfg = if !cypher {
+                    Some(build_llm_config(
+                        &project_root,
+                        llm_url.as_deref(),
+                        model.as_deref(),
+                        api_key.as_deref(),
+                    )?)
+                } else {
+                    None
+                };
                 handle_query(
                     &text,
                     cypher,
@@ -1697,7 +1703,7 @@ async fn main() -> Result<()> {
                     &neo4j_user,
                     &neo4j_pass,
                     &qdrant_url,
-                    &llm_cfg,
+                    llm_cfg.as_ref(),
                     limit,
                 )
                 .await?;
@@ -4420,7 +4426,7 @@ async fn handle_query(
     neo4j_user: &str,
     neo4j_pass: &str,
     qdrant_url: &str,
-    llm_cfg: &prism_ingest::LlmConfig,
+    llm_cfg: Option<&prism_ingest::LlmConfig>,
     limit: usize,
 ) -> Result<()> {
     use prism_ingest::embeddings::{QdrantVectorStore, VectorStore};
@@ -4456,6 +4462,9 @@ async fn handle_query(
         };
 
         // Generate embedding for the query text via provider-agnostic LlmClient
+        let llm_cfg = llm_cfg.ok_or_else(|| {
+            anyhow!("--semantic queries require an LLM for embeddings. Run: prism configure --model <name>")
+        })?;
         println!("Generating query embedding...");
         let llm_client = prism_ingest::llm::LlmClient::new(llm_cfg.clone());
         let query_vec = llm_client
