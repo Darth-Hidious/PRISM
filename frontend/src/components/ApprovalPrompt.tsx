@@ -8,13 +8,17 @@ import {
 interface Props {
   toolName: string;
   toolArgs: Record<string, any>;
+  toolDescription?: string;
+  requiresApproval?: boolean;
+  permissionMode?: string;
   onResponse: (response: string) => void;
 }
 
 const OPTIONS = [
-  { key: "y", label: "Allow" },
+  { key: "y", label: "Allow Once" },
   { key: "n", label: "Reject" },
-  { key: "a", label: "Always" },
+  { key: "a", label: "Allow Session" },
+  { key: "b", label: "Block Session" },
 ] as const;
 
 function toolSummary(name: string, args: Record<string, any>): string {
@@ -30,7 +34,14 @@ function toolSummary(name: string, args: Record<string, any>): string {
   return pairs.join(", ");
 }
 
-export function ApprovalPrompt({ toolName, toolArgs, onResponse }: Props) {
+export function ApprovalPrompt({
+  toolName,
+  toolArgs,
+  toolDescription,
+  requiresApproval,
+  permissionMode,
+  onResponse,
+}: Props) {
   const [selected, setSelected] = useState(0);
 
   useInput((input, key) => {
@@ -40,10 +51,15 @@ export function ApprovalPrompt({ toolName, toolArgs, onResponse }: Props) {
     else if (key.escape) onResponse("n");
     else if (input === "y" || input === "Y") onResponse("y");
     else if (input === "a" || input === "A") onResponse("a");
+    else if (input === "b" || input === "B") onResponse("b");
     else if (input === "n" || input === "N") onResponse("n");
   });
 
   const summary = toolSummary(toolName, toolArgs);
+  const description = toolDescription?.trim();
+  const meta = [permissionMode, requiresApproval ? "approval required" : undefined]
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <Box
@@ -71,7 +87,20 @@ export function ApprovalPrompt({ toolName, toolArgs, onResponse }: Props) {
         </Box>
       ) : null}
 
-      {/* Action buttons */}
+      {meta ? (
+        <Box paddingLeft={2}>
+          <Text color={TEXT_MUTED}>{meta}</Text>
+        </Box>
+      ) : null}
+
+      {description ? (
+        <Box paddingLeft={2} marginTop={summary || meta ? 0 : 0}>
+          <Text color={TEXT_MUTED}>{description}</Text>
+        </Box>
+      ) : null}
+
+      {/* Action buttons. Session-scoped choices update the backend override
+          state so later tool calls reflect the user's decision. */}
       <Box marginTop={1} gap={1}>
         {OPTIONS.map((opt, i) => (
           <Text

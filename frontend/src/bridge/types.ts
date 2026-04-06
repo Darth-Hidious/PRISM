@@ -13,6 +13,7 @@ export interface UiToolStart {
   tool_name: string;
   call_id: string;
   verb: string;
+  preview?: string;
 }
 
 export interface UiCard {
@@ -36,25 +37,58 @@ export interface UiPrompt {
   choices: any[];
   tool_name: string;
   tool_args: Record<string, any>;
+  tool_description?: string;
+  requires_approval?: boolean;
+  permission_mode?: string;
 }
 
 export interface UiWelcome {
   version: string;
-  status: Record<string, any>;
-  auto_approve: boolean;
+  status?: Record<string, any>;
+  auto_approve?: boolean;
+  tool_count?: number;
+  session_id?: string;
+  resumed?: boolean;
+  resumed_messages?: number;
 }
 
 export interface UiStatus {
   auto_approve: boolean;
   message_count: number;
   has_plan: boolean;
+  session_mode: string;
+  plan_status?: string;
 }
 
 export interface UiTurnComplete {
 }
 
 export interface UiSessionList {
-  sessions: any[];
+  sessions: Array<{
+    session_id: string;
+    created_at: number;
+    turn_count: number;
+    model: string;
+    size_kb: number;
+    is_latest: boolean;
+  }>;
+}
+
+export interface UiView {
+  view_type: string;
+  title: string;
+  body?: string;
+  tone: string;
+  tabs?: UiViewTab[];
+  selected_tab?: string;
+  footer?: string;
+}
+
+export interface UiViewTab {
+  id: string;
+  title: string;
+  body: string;
+  tone?: string;
 }
 
 export interface Init {
@@ -74,13 +108,14 @@ export interface InputCommand {
 export interface InputPromptResponse {
   prompt_type?: string;
   response?: string;
+  tool_name?: string;
 }
 
 export interface InputLoadSession {
   session_id?: string;
 }
 
-export type UIEvent = UiTextDelta | UiTextFlush | UiToolStart | UiCard | UiCost | UiPrompt | UiWelcome | UiStatus | UiTurnComplete | UiSessionList;
+export type UIEvent = UiTextDelta | UiTextFlush | UiToolStart | UiCard | UiCost | UiPrompt | UiWelcome | UiStatus | UiTurnComplete | UiSessionList | UiView;
 export type InputEvent = Init | InputMessage | InputCommand | InputPromptResponse | InputLoadSession;
 
 export const UI_EVENT_MAP: Record<string, string> = {
@@ -94,5 +129,5 @@ export const UI_EVENT_MAP: Record<string, string> = {
   "ui.status": "UiStatus",
   "ui.turn.complete": "UiTurnComplete",
   "ui.session.list": "UiSessionList",
+  "ui.view": "UiView",
 };
-
