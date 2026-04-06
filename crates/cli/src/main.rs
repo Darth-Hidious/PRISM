@@ -1683,9 +1683,9 @@ async fn main() -> Result<()> {
             } else if federated {
                 handle_federated_query(&text, &dashboard_url, &paths).await?;
             } else {
-                // LLM config is only needed for NL and semantic queries
-                // (not --cypher which hits Neo4j directly)
-                let llm_cfg = if !cypher {
+                // LLM config only needed for --semantic (embedding generation).
+                // --cypher and NL neighbor queries hit Neo4j directly.
+                let llm_cfg = if semantic {
                     Some(build_llm_config(
                         &project_root,
                         llm_url.as_deref(),
@@ -1693,7 +1693,13 @@ async fn main() -> Result<()> {
                         api_key.as_deref(),
                     )?)
                 } else {
-                    None
+                    build_llm_config(
+                        &project_root,
+                        llm_url.as_deref(),
+                        model.as_deref(),
+                        api_key.as_deref(),
+                    )
+                    .ok()
                 };
                 handle_query(
                     &text,
