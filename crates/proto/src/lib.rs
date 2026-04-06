@@ -175,6 +175,19 @@ pub enum NodeMessage {
         job_id: Uuid,
         lines: Vec<String>,
     },
+    DeploymentReady {
+        deployment_id: Uuid,
+        endpoint_url: String,
+    },
+    DeploymentHealthUpdate {
+        deployment_id: Uuid,
+        healthy: bool,
+        message: Option<String>,
+    },
+    DeploymentStopped {
+        deployment_id: Uuid,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -195,6 +208,17 @@ pub enum PlatformMessage {
     },
     CancelJob {
         job_id: Uuid,
+    },
+    DeployModel {
+        deployment_id: Uuid,
+        image: String,
+        #[serde(default)]
+        env_vars: BTreeMap<String, String>,
+        gpu_type: Option<String>,
+        deploy_config: serde_json::Value,
+    },
+    StopDeployment {
+        deployment_id: Uuid,
     },
     Ping,
     Error {
@@ -250,6 +274,31 @@ mod tests {
         let json = serde_json::to_string(&message).unwrap();
         let parsed: NodeMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, message);
+    }
+
+    #[test]
+    fn deployment_messages_round_trip() {
+        let ready = NodeMessage::DeploymentReady {
+            deployment_id: Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
+            endpoint_url: "http://192.168.1.50:9001".to_string(),
+        };
+        let ready_json = serde_json::to_string(&ready).unwrap();
+        let ready_back: NodeMessage = serde_json::from_str(&ready_json).unwrap();
+        assert_eq!(ready_back, ready);
+
+        let deploy = PlatformMessage::DeployModel {
+            deployment_id: Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap(),
+            image: "hf://sentence-transformers/paraphrase-MiniLM-L3-v2".to_string(),
+            env_vars: BTreeMap::from([("MODEL_NAME".to_string(), "mini".to_string())]),
+            gpu_type: Some("A100-80GB".to_string()),
+            deploy_config: serde_json::json!({
+                "port": 9001,
+                "health_path": "/health",
+            }),
+        };
+        let deploy_json = serde_json::to_string(&deploy).unwrap();
+        let deploy_back: PlatformMessage = serde_json::from_str(&deploy_json).unwrap();
+        assert_eq!(deploy_back, deploy);
     }
 
     // ── New edge-case tests ─────────────────────────────────────────

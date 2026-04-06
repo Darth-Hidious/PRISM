@@ -86,6 +86,37 @@ struct RunningJobHandle {
 
 type RunningJobs = Arc<Mutex<HashMap<Uuid, RunningJobHandle>>>;
 
+#[derive(Debug, Clone)]
+enum DeploymentBackend {
+    Runtime {
+        runtime_url: String,
+    },
+    Container {
+        runtime: ContainerRuntime,
+        handle: String,
+    },
+}
+
+#[derive(Debug)]
+struct RunningDeploymentHandle {
+    backend: DeploymentBackend,
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+type RunningDeployments = Arc<Mutex<HashMap<Uuid, RunningDeploymentHandle>>>;
+
+#[derive(Debug, Clone)]
+struct DeploymentLaunchConfig {
+    port: u16,
+    health_path: String,
+    startup_timeout_secs: u64,
+    framework: String,
+    command: Option<Vec<String>>,
+    endpoint_url: Option<String>,
+    public_base_url: Option<String>,
+    public_host: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct SignedServiceClaim<'a> {
     version: u8,
@@ -170,6 +201,7 @@ pub async fn run_daemon(
 
     state::clear_shutdown_request(&paths.state_dir);
     cleanup_orphaned_jobs(&paths.state_dir).await?;
+    cleanup_orphaned_deployments(&paths.state_dir).await?;
 
     let pid_path = pid_file_path(paths);
     write_pid_file(&pid_path)?;
@@ -437,6 +469,7 @@ async fn connect_and_run(
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<String>(128);
     let active_jobs = Arc::new(AtomicU32::new(0));
     let running_jobs: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+    let running_deployments: RunningDeployments = Arc::new(Mutex::new(HashMap::new()));
 
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
     heartbeat_timer.tick().await;
@@ -502,6 +535,7 @@ async fn connect_and_run(
                 if state::shutdown_requested(&paths.state_dir) {
                     tracing::info!("shutdown request detected");
                     request_stop_all_jobs(&running_jobs).await;
+                    request_stop_all_deployments(&running_deployments).await;
                     sink.send(Message::Close(None)).await.ok();
                     return Ok(ShutdownReason::Graceful);
                 }
@@ -518,6 +552,7 @@ async fn connect_and_run(
                             &outgoing_tx,
                             &active_jobs,
                             &running_jobs,
+                            &running_deployments,
                         ).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -536,6 +571,7 @@ async fn connect_and_run(
                 tracing::info!("Ctrl-C received, shutting down");
                 state::write_shutdown_request(&paths.state_dir).ok();
                 request_stop_all_jobs(&running_jobs).await;
+                request_stop_all_deployments(&running_deployments).await;
                 sink.send(Message::Close(None)).await.ok();
                 return Ok(ShutdownReason::Graceful);
             }
@@ -549,6 +585,7 @@ async fn handle_platform_message(
     outgoing_tx: &mpsc::Sender<String>,
     active_jobs: &Arc<AtomicU32>,
     running_jobs: &RunningJobs,
+    running_deployments: &RunningDeployments,
 ) {
     let msg: PlatformMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -760,6 +797,59 @@ async fn handle_platform_message(
                 jobs.fetch_sub(1, Ordering::Relaxed);
             });
         }
+        PlatformMessage::DeployModel {
+            deployment_id,
+            image,
+            env_vars,
+            gpu_type,
+            deploy_config,
+        } => {
+            tracing::info!(%deployment_id, image = %image, "received deployment request");
+            if let Err(error) = start_deployment(
+                paths,
+                deployment_id,
+                image,
+                env_vars,
+                gpu_type,
+                deploy_config,
+                outgoing_tx,
+                running_deployments,
+            )
+            .await
+            {
+                tracing::error!(%deployment_id, error = %error, "deployment start failed");
+                send_msg(
+                    outgoing_tx,
+                    &NodeMessage::DeploymentStopped {
+                        deployment_id,
+                        reason: error.to_string(),
+                    },
+                )
+                .await;
+            }
+        }
+        PlatformMessage::StopDeployment { deployment_id } => {
+            tracing::info!(%deployment_id, "deployment stop requested");
+            if let Err(error) = stop_deployment(
+                paths,
+                deployment_id,
+                "user_request",
+                outgoing_tx,
+                running_deployments,
+            )
+            .await
+            {
+                tracing::warn!(%deployment_id, error = %error, "deployment stop failed");
+                send_msg(
+                    outgoing_tx,
+                    &NodeMessage::DeploymentStopped {
+                        deployment_id,
+                        reason: format!("stop_failed: {error}"),
+                    },
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -767,6 +857,524 @@ async fn send_msg(tx: &mpsc::Sender<String>, msg: &NodeMessage) {
     if let Ok(json) = serde_json::to_string(msg) {
         tx.send(json).await.ok();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_deployment(
+    paths: &PrismPaths,
+    deployment_id: Uuid,
+    image: String,
+    env_vars: std::collections::BTreeMap<String, String>,
+    gpu_type: Option<String>,
+    deploy_config: serde_json::Value,
+    outgoing_tx: &mpsc::Sender<String>,
+    running_deployments: &RunningDeployments,
+) -> Result<()> {
+    let config = parse_deployment_launch_config(&deploy_config);
+    let endpoint_url = resolve_public_endpoint_url(config.port, &config);
+    let local_health_url = format!("http://127.0.0.1:{}{}", config.port, config.health_path);
+
+    let backend = if looks_like_weights_source(&image) {
+        let runtime_url = deployment_runtime_url();
+        start_runtime_deployment(
+            &runtime_url,
+            deployment_id,
+            &image,
+            &env_vars,
+            gpu_type.is_some(),
+            &config,
+        )
+        .await?;
+        DeploymentBackend::Runtime { runtime_url }
+    } else {
+        let runtime = executor::resolve_container_runtime(
+            std::env::var("PRISM_NODE_CONTAINER_RUNTIME")
+                .ok()
+                .as_deref(),
+        )
+        .context("no supported container runtime available for deployment")?;
+        let handle = executor::start_container_deployment(
+            runtime,
+            &executor::ContainerDeploymentSpec {
+                deployment_id,
+                image: image.clone(),
+                env_vars: env_vars.clone(),
+                gpu_type: gpu_type.clone(),
+                port: config.port,
+                command: config.command.clone(),
+                memory_limit: None,
+            },
+        )
+        .await?;
+        DeploymentBackend::Container { runtime, handle }
+    };
+
+    let (backend_kind, handle, runtime_url) = describe_backend_for_state(&backend, deployment_id);
+    state::register_active_deployment(
+        &paths.state_dir,
+        state::ActiveDeploymentRecord {
+            deployment_id,
+            backend: backend_kind,
+            handle,
+            runtime_url,
+            endpoint_url: endpoint_url.clone(),
+            local_health_url: local_health_url.clone(),
+            started_at: chrono::Utc::now(),
+        },
+    )?;
+
+    // Wait for local readiness before telling the platform the service is usable.
+    if let Err(error) = wait_for_deployment_ready(
+        &backend,
+        deployment_id,
+        &local_health_url,
+        config.startup_timeout_secs,
+    )
+    .await
+    {
+        stop_deployment_backend(&backend, deployment_id).await.ok();
+        state::remove_active_deployment(&paths.state_dir, deployment_id).ok();
+        return Err(error);
+    }
+
+    send_msg(
+        outgoing_tx,
+        &NodeMessage::DeploymentReady {
+            deployment_id,
+            endpoint_url: endpoint_url.clone(),
+        },
+    )
+    .await;
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    running_deployments.lock().await.insert(
+        deployment_id,
+        RunningDeploymentHandle {
+            backend: backend.clone(),
+            stop_tx: Some(stop_tx),
+        },
+    );
+    spawn_deployment_monitor(
+        paths.state_dir.clone(),
+        deployment_id,
+        backend,
+        local_health_url,
+        outgoing_tx.clone(),
+        running_deployments.clone(),
+        stop_rx,
+    );
+
+    Ok(())
+}
+
+async fn stop_deployment(
+    paths: &PrismPaths,
+    deployment_id: Uuid,
+    reason: &str,
+    outgoing_tx: &mpsc::Sender<String>,
+    running_deployments: &RunningDeployments,
+) -> Result<()> {
+    let running = {
+        let mut deployments = running_deployments.lock().await;
+        deployments.remove(&deployment_id)
+    };
+
+    let record = state::remove_active_deployment(&paths.state_dir, deployment_id)?;
+    let backend = match (running, record.as_ref()) {
+        (Some(mut handle), _) => {
+            if let Some(stop_tx) = handle.stop_tx.take() {
+                let _ = stop_tx.send(());
+            }
+            Some(handle.backend)
+        }
+        (None, Some(record)) => Some(backend_from_record(record)?),
+        (None, None) => None,
+    };
+
+    if let Some(backend) = backend {
+        stop_deployment_backend(&backend, deployment_id).await?;
+    }
+
+    send_msg(
+        outgoing_tx,
+        &NodeMessage::DeploymentStopped {
+            deployment_id,
+            reason: reason.to_string(),
+        },
+    )
+    .await;
+    Ok(())
+}
+
+fn spawn_deployment_monitor(
+    state_dir: PathBuf,
+    deployment_id: Uuid,
+    backend: DeploymentBackend,
+    local_health_url: String,
+    outgoing_tx: mpsc::Sender<String>,
+    running_deployments: RunningDeployments,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%deployment_id, error = %error, "failed to build deployment monitor client");
+                return;
+            }
+        };
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                _ = interval.tick() => {
+                    match deployment_backend_status(&backend, deployment_id).await {
+                        Ok((true, _)) => {
+                            let healthy = http_health_ok(&client, &local_health_url).await;
+                            let message = if healthy {
+                                None
+                            } else {
+                                Some(format!("health check failed for {local_health_url}"))
+                            };
+                            send_msg(
+                                &outgoing_tx,
+                                &NodeMessage::DeploymentHealthUpdate {
+                                    deployment_id,
+                                    healthy,
+                                    message,
+                                },
+                            ).await;
+                        }
+                        Ok((false, reason)) => {
+                            running_deployments.lock().await.remove(&deployment_id);
+                            state::remove_active_deployment(&state_dir, deployment_id).ok();
+                            send_msg(
+                                &outgoing_tx,
+                                &NodeMessage::DeploymentStopped {
+                                    deployment_id,
+                                    reason: reason.unwrap_or_else(|| "stopped".to_string()),
+                                },
+                            ).await;
+                            break;
+                        }
+                        Err(error) => {
+                            running_deployments.lock().await.remove(&deployment_id);
+                            state::remove_active_deployment(&state_dir, deployment_id).ok();
+                            send_msg(
+                                &outgoing_tx,
+                                &NodeMessage::DeploymentStopped {
+                                    deployment_id,
+                                    reason: format!("monitor_failed: {error}"),
+                                },
+                            ).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn parse_deployment_launch_config(value: &serde_json::Value) -> DeploymentLaunchConfig {
+    let port = value
+        .get("port")
+        .and_then(|item| item.as_u64())
+        .and_then(|item| u16::try_from(item).ok())
+        .unwrap_or(8080);
+    let health_path = value
+        .get("health_path")
+        .and_then(|item| item.as_str())
+        .map(normalize_health_path)
+        .unwrap_or_else(|| "/health".to_string());
+    let startup_timeout_secs = value
+        .get("startup_timeout_secs")
+        .and_then(|item| item.as_u64())
+        .or_else(|| value.get("startup_timeout").and_then(|item| item.as_u64()))
+        .unwrap_or(120);
+    let framework = value
+        .get("framework")
+        .and_then(|item| item.as_str())
+        .unwrap_or("auto")
+        .to_string();
+    let command = value.get("command").and_then(parse_command_override);
+    DeploymentLaunchConfig {
+        port,
+        health_path,
+        startup_timeout_secs,
+        framework,
+        command,
+        endpoint_url: value
+            .get("endpoint_url")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string()),
+        public_base_url: value
+            .get("public_base_url")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string()),
+        public_host: value
+            .get("public_host")
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string()),
+    }
+}
+
+fn parse_command_override(value: &serde_json::Value) -> Option<Vec<String>> {
+    if let Some(array) = value.as_array() {
+        let command = array
+            .iter()
+            .filter_map(|item| item.as_str().map(|item| item.to_string()))
+            .collect::<Vec<_>>();
+        if command.is_empty() {
+            None
+        } else {
+            Some(command)
+        }
+    } else {
+        value.as_str().map(|item| vec![item.to_string()])
+    }
+}
+
+fn normalize_health_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn looks_like_weights_source(image: &str) -> bool {
+    image.starts_with("hf://")
+        || image.starts_with("r2://")
+        || image.starts_with("http://")
+        || image.starts_with("https://")
+        || image.starts_with('/')
+        || Path::new(image).exists()
+}
+
+fn deployment_runtime_url() -> String {
+    std::env::var("PRISM_RUNTIME_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string())
+}
+
+fn resolve_public_endpoint_url(port: u16, config: &DeploymentLaunchConfig) -> String {
+    if let Some(endpoint_url) = &config.endpoint_url {
+        return endpoint_url.clone();
+    }
+
+    if let Some(base) = config
+        .public_base_url
+        .clone()
+        .or_else(|| std::env::var("PRISM_NODE_PUBLIC_BASE_URL").ok())
+    {
+        let trimmed = base.trim_end_matches('/').to_string();
+        if let Ok(mut url) = reqwest::Url::parse(&trimmed) {
+            if url.port().is_none() {
+                let _ = url.set_port(Some(port));
+            }
+            return url.to_string().trim_end_matches('/').to_string();
+        }
+        return format!("{trimmed}:{port}");
+    }
+
+    let host = config
+        .public_host
+        .clone()
+        .or_else(|| std::env::var("PRISM_NODE_PUBLIC_HOST").ok())
+        .or_else(detect_local_ip)
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    format!("http://{host}:{port}")
+}
+
+fn detect_local_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+fn describe_backend_for_state(
+    backend: &DeploymentBackend,
+    deployment_id: Uuid,
+) -> (String, String, Option<String>) {
+    match backend {
+        DeploymentBackend::Runtime { runtime_url } => (
+            "runtime".to_string(),
+            deployment_id.to_string(),
+            Some(runtime_url.clone()),
+        ),
+        DeploymentBackend::Container { runtime, handle } => {
+            (runtime.as_str().to_string(), handle.clone(), None)
+        }
+    }
+}
+
+fn backend_from_record(record: &state::ActiveDeploymentRecord) -> Result<DeploymentBackend> {
+    if record.backend == "runtime" {
+        return Ok(DeploymentBackend::Runtime {
+            runtime_url: record
+                .runtime_url
+                .clone()
+                .unwrap_or_else(deployment_runtime_url),
+        });
+    }
+
+    let runtime = executor::resolve_container_runtime(Some(&record.backend))
+        .with_context(|| format!("unsupported deployment backend {}", record.backend))?;
+    Ok(DeploymentBackend::Container {
+        runtime,
+        handle: record.handle.clone(),
+    })
+}
+
+async fn start_runtime_deployment(
+    runtime_url: &str,
+    deployment_id: Uuid,
+    image: &str,
+    env_vars: &std::collections::BTreeMap<String, String>,
+    gpu: bool,
+    config: &DeploymentLaunchConfig,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()?;
+    client
+        .post(format!("{}/deploy", runtime_url.trim_end_matches('/')))
+        .json(&serde_json::json!({
+            "deployment_id": deployment_id.to_string(),
+            "weights_source": image,
+            "framework": config.framework.clone(),
+            "port": config.port,
+            "health_path": config.health_path.clone(),
+            "gpu": gpu,
+            "env": env_vars,
+            "command": config.command.clone(),
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+async fn stop_deployment_backend(backend: &DeploymentBackend, deployment_id: Uuid) -> Result<()> {
+    match backend {
+        DeploymentBackend::Runtime { runtime_url } => {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()?;
+            let response = client
+                .delete(format!(
+                    "{}/deploy/{}",
+                    runtime_url.trim_end_matches('/'),
+                    deployment_id
+                ))
+                .send()
+                .await?;
+            if !response.status().is_success()
+                && response.status() != reqwest::StatusCode::NOT_FOUND
+            {
+                response.error_for_status()?;
+            }
+            Ok(())
+        }
+        DeploymentBackend::Container { runtime, handle } => {
+            executor::stop_container_handle(*runtime, handle).await;
+            Ok(())
+        }
+    }
+}
+
+async fn deployment_backend_status(
+    backend: &DeploymentBackend,
+    deployment_id: Uuid,
+) -> Result<(bool, Option<String>)> {
+    match backend {
+        DeploymentBackend::Runtime { runtime_url } => {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()?;
+            let response = client
+                .get(format!(
+                    "{}/deploy/{}",
+                    runtime_url.trim_end_matches('/'),
+                    deployment_id
+                ))
+                .send()
+                .await?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok((false, Some("deployment_not_found".to_string())));
+            }
+            let response = response.error_for_status()?;
+            let value: serde_json::Value = response.json().await?;
+            let status = value
+                .get("status")
+                .and_then(|item| item.as_str())
+                .unwrap_or("unknown");
+            let exit_code = value.get("exit_code").and_then(|item| item.as_i64());
+            let running = matches!(status, "starting" | "running");
+            let reason = if running {
+                None
+            } else {
+                Some(match exit_code {
+                    Some(code) => format!("runtime_stopped:{status}:exit_code={code}"),
+                    None => format!("runtime_stopped:{status}"),
+                })
+            };
+            Ok((running, reason))
+        }
+        DeploymentBackend::Container { runtime, handle } => {
+            let (status, exit_code) = executor::inspect_container_handle(*runtime, handle).await?;
+            let running = matches!(status.as_str(), "running" | "created" | "restarting");
+            let reason = if running {
+                None
+            } else {
+                Some(format!("container_stopped:{status}:exit_code={exit_code}"))
+            };
+            Ok((running, reason))
+        }
+    }
+}
+
+async fn wait_for_deployment_ready(
+    backend: &DeploymentBackend,
+    deployment_id: Uuid,
+    local_health_url: &str,
+    timeout_secs: u64,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs.max(5));
+
+    loop {
+        if http_health_ok(&client, local_health_url).await {
+            return Ok(());
+        }
+
+        let (running, reason) = deployment_backend_status(backend, deployment_id).await?;
+        if !running {
+            bail!(
+                "{}",
+                reason.unwrap_or_else(|| "deployment stopped before becoming healthy".to_string())
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("deployment did not become healthy within {timeout_secs}s");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn http_health_ok(client: &reqwest::Client, url: &str) -> bool {
+    client
+        .get(url)
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
 }
 
 async fn request_stop_all_jobs(running_jobs: &RunningJobs) {
@@ -780,6 +1388,16 @@ async fn request_stop_all_jobs(running_jobs: &RunningJobs) {
         );
         if let Some(cancel_tx) = handle.cancel_tx.take() {
             let _ = cancel_tx.send(());
+        }
+    }
+}
+
+async fn request_stop_all_deployments(running_deployments: &RunningDeployments) {
+    let mut deployments = running_deployments.lock().await;
+    for (deployment_id, handle) in deployments.iter_mut() {
+        tracing::info!(%deployment_id, "requesting deployment shutdown");
+        if let Some(stop_tx) = handle.stop_tx.take() {
+            let _ = stop_tx.send(());
         }
     }
 }
@@ -827,6 +1445,23 @@ async fn cleanup_orphaned_jobs(state_dir: &Path) -> Result<()> {
         );
         executor::cleanup_orphaned_job(&record.runtime, &record.handle).await;
         state::remove_active_job(state_dir, record.job_id).ok();
+    }
+    Ok(())
+}
+
+async fn cleanup_orphaned_deployments(state_dir: &Path) -> Result<()> {
+    for record in state::active_deployments(state_dir)? {
+        tracing::warn!(
+            deployment_id = %record.deployment_id,
+            backend = %record.backend,
+            handle = %record.handle,
+            "cleaning up orphaned deployment from previous node session"
+        );
+        let backend = backend_from_record(&record)?;
+        stop_deployment_backend(&backend, record.deployment_id)
+            .await
+            .ok();
+        state::remove_active_deployment(state_dir, record.deployment_id).ok();
     }
     Ok(())
 }
@@ -994,6 +1629,9 @@ fn advertise_ssh_service(
 mod tests {
     use super::*;
     use base64::Engine;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -1142,5 +1780,184 @@ mod tests {
             .unwrap();
         let signature = caps.labels.get("ssh.claim_signature").unwrap();
         crate::crypto::verify_signature(&signing_public, &claim_payload, signature).unwrap();
+    }
+
+    #[test]
+    fn deployment_config_parses_optional_fields() {
+        let config = parse_deployment_launch_config(&serde_json::json!({
+            "port": 9001,
+            "health_path": "ready",
+            "startup_timeout_secs": 45,
+            "framework": "vllm",
+            "command": ["python", "serve.py"],
+            "public_host": "node.example.com",
+        }));
+
+        assert_eq!(config.port, 9001);
+        assert_eq!(config.health_path, "/ready");
+        assert_eq!(config.startup_timeout_secs, 45);
+        assert_eq!(config.framework, "vllm");
+        assert_eq!(
+            config.command,
+            Some(vec!["python".to_string(), "serve.py".to_string()])
+        );
+        assert_eq!(config.public_host.as_deref(), Some("node.example.com"));
+    }
+
+    #[test]
+    fn public_endpoint_url_uses_explicit_base_url_port() {
+        let config = DeploymentLaunchConfig {
+            port: 9001,
+            health_path: "/health".to_string(),
+            startup_timeout_secs: 120,
+            framework: "auto".to_string(),
+            command: None,
+            endpoint_url: None,
+            public_base_url: Some("https://node.example.com".to_string()),
+            public_host: None,
+        };
+
+        let endpoint = resolve_public_endpoint_url(9001, &config);
+        assert_eq!(endpoint, "https://node.example.com:9001");
+    }
+
+    fn spawn_stub_http_server(
+        max_requests: usize,
+        responder: Arc<dyn Fn(&str) -> (u16, String, &'static str) + Send + Sync>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..max_requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 8192];
+                let read = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let (status, body, content_type) = responder(&request);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_deployment_emits_ready_and_stopped() {
+        let deployment_id = Uuid::parse_str("00000000-0000-4000-8000-000000000321").unwrap();
+        let (health_base, health_server) = spawn_stub_http_server(
+            1,
+            Arc::new(|request| {
+                assert!(request.starts_with("GET /health "));
+                (200, "ok".to_string(), "text/plain")
+            }),
+        );
+        let health_port = reqwest::Url::parse(&health_base).unwrap().port().unwrap();
+        let runtime_requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let runtime_requests_clone = runtime_requests.clone();
+        let (runtime_url, runtime_server) = spawn_stub_http_server(
+            2,
+            Arc::new(move |request| {
+                runtime_requests_clone
+                    .lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap_or("").to_string());
+                if request.starts_with("POST /deploy ") {
+                    (
+                        200,
+                        serde_json::json!({
+                            "deployment_id": deployment_id.to_string(),
+                            "status": "starting",
+                            "port": health_port,
+                            "pid": 20,
+                        })
+                        .to_string(),
+                        "application/json",
+                    )
+                } else {
+                    assert!(request.starts_with(&format!("DELETE /deploy/{} ", deployment_id)));
+                    (
+                        200,
+                        serde_json::json!({
+                            "deployment_id": deployment_id.to_string(),
+                            "status": "stopped",
+                        })
+                        .to_string(),
+                        "application/json",
+                    )
+                }
+            }),
+        );
+
+        std::env::set_var("PRISM_RUNTIME_URL", runtime_url);
+        let tmp = TempDir::new().unwrap();
+        let paths = PrismPaths {
+            config_dir: tmp.path().join("config"),
+            cache_dir: tmp.path().join("cache"),
+            data_dir: tmp.path().join("data"),
+            state_dir: tmp.path().join("state"),
+        };
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let running_deployments: RunningDeployments = Arc::new(Mutex::new(HashMap::new()));
+
+        start_deployment(
+            &paths,
+            deployment_id,
+            "hf://sentence-transformers/paraphrase-MiniLM-L3-v2".to_string(),
+            std::collections::BTreeMap::new(),
+            Some("A100-80GB".to_string()),
+            serde_json::json!({
+                "port": health_port,
+                "health_path": "/health",
+                "public_host": "node.example.com",
+            }),
+            &tx,
+            &running_deployments,
+        )
+        .await
+        .unwrap();
+
+        let ready: NodeMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert!(matches!(
+            ready,
+            NodeMessage::DeploymentReady {
+                deployment_id: id,
+                endpoint_url,
+            } if id == deployment_id && endpoint_url == format!("http://node.example.com:{health_port}")
+        ));
+
+        stop_deployment(
+            &paths,
+            deployment_id,
+            "user_request",
+            &tx,
+            &running_deployments,
+        )
+        .await
+        .unwrap();
+
+        let stopped: NodeMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert!(matches!(
+            stopped,
+            NodeMessage::DeploymentStopped {
+                deployment_id: id,
+                reason,
+            } if id == deployment_id && reason == "user_request"
+        ));
+        assert!(state::active_deployments(&paths.state_dir)
+            .unwrap()
+            .is_empty());
+
+        health_server.join().unwrap();
+        runtime_server.join().unwrap();
+        std::env::remove_var("PRISM_RUNTIME_URL");
+
+        let requests = runtime_requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("POST /deploy "));
+        assert!(requests[1].starts_with("DELETE /deploy/"));
     }
 }
