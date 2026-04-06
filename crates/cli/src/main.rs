@@ -11,6 +11,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use prism_client::api::PlatformClient;
 use prism_client::auth::{DeviceCodeResponse, TokenResponse};
@@ -66,8 +67,11 @@ enum Commands {
     },
     /// Ingest a data file into the knowledge graph.
     Ingest {
-        /// Path to a CSV/Parquet file or directory to watch.
-        path: PathBuf,
+        /// Path to a file or directory to ingest. Omit with `--status`.
+        path: Option<PathBuf>,
+        /// Corpus slug to associate with the ingested data.
+        #[arg(long)]
+        corpus: Option<String>,
         /// Override LLM model (otherwise uses prism.toml or `prism configure`).
         #[arg(long)]
         model: Option<String>,
@@ -92,9 +96,18 @@ enum Commands {
         /// Skip LLM extraction (schema detection only).
         #[arg(long)]
         schema_only: bool,
+        /// Show current ingest/job status instead of ingesting a path.
+        #[arg(long)]
+        status: bool,
         /// Watch a directory for new/modified files and ingest continuously.
         #[arg(long)]
         watch: bool,
+        /// Runtime URL for local PDF extraction.
+        #[arg(long, default_value = "http://127.0.0.1:8090")]
+        runtime_url: String,
+        /// Output JSON instead of human-readable progress.
+        #[arg(long)]
+        json: bool,
         /// Path to a YAML ontology mapping file (custom entity/relationship rules).
         #[arg(long)]
         mapping: Option<PathBuf>,
@@ -1059,37 +1072,42 @@ async fn main() -> Result<()> {
                         || svc_config.spark.is_some();
 
                     if wants_managed_services {
-                    println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
-                    if offline {
-                        println!("  (OFFLINE MODE)");
-                    }
-                    println!("  Node: {node_name}\n");
-                    println!("  Starting services...");
+                        println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
+                        if offline {
+                            println!("  (OFFLINE MODE)");
+                        }
+                        println!("  Node: {node_name}\n");
+                        println!("  Starting services...");
 
-                    match prism_orch::DockerOrchestrator::new() {
-                        Ok(orch) => {
-                            use prism_orch::ServiceOrchestrator;
-                            match orch.start_all(&svc_config).await {
-                                Ok(handles) => {
-                                    for h in &handles.services {
-                                        let mark = if h.healthy { "\u{2713}" } else { "~" };
-                                        println!("  {mark} {:<12} localhost:{}", h.name, h.port);
+                        match prism_orch::DockerOrchestrator::new() {
+                            Ok(orch) => {
+                                use prism_orch::ServiceOrchestrator;
+                                match orch.start_all(&svc_config).await {
+                                    Ok(handles) => {
+                                        for h in &handles.services {
+                                            let mark = if h.healthy { "\u{2713}" } else { "~" };
+                                            println!(
+                                                "  {mark} {:<12} localhost:{}",
+                                                h.name, h.port
+                                            );
+                                        }
+                                        service_handles = Some(handles);
                                     }
-                                    service_handles = Some(handles);
-                                }
-                                Err(e) => {
-                                    eprintln!("  Warning: Failed to start managed services: {e}");
-                                    eprintln!(
-                                        "  (Is Docker running? Continuing without containers.)"
-                                    );
+                                    Err(e) => {
+                                        eprintln!(
+                                            "  Warning: Failed to start managed services: {e}"
+                                        );
+                                        eprintln!(
+                                            "  (Is Docker running? Continuing without containers.)"
+                                        );
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                eprintln!("  Warning: Docker not available: {e}");
+                                eprintln!("  (Continuing without managed services.)");
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("  Warning: Docker not available: {e}");
-                            eprintln!("  (Continuing without managed services.)");
-                        }
-                    }
                     }
                 }
 
@@ -1127,7 +1145,10 @@ async fn main() -> Result<()> {
                     handles.services.iter().any(|handle| handle.name == "neo4j")
                 });
                 let managed_qdrant_running = service_handles.as_ref().is_some_and(|handles| {
-                    handles.services.iter().any(|handle| handle.name == "qdrant")
+                    handles
+                        .services
+                        .iter()
+                        .any(|handle| handle.name == "qdrant")
                 });
 
                 if external_neo4j.is_some()
@@ -1481,6 +1502,7 @@ async fn main() -> Result<()> {
         },
         Commands::Ingest {
             path,
+            corpus,
             model,
             llm_url,
             api_key,
@@ -1489,36 +1511,53 @@ async fn main() -> Result<()> {
             neo4j_pass,
             qdrant_url,
             schema_only,
+            status,
             watch,
+            runtime_url,
+            json,
             mapping,
         } => {
-            let llm_cfg = build_llm_config(
-                &project_root,
-                llm_url.as_deref(),
-                model.as_deref(),
-                api_key.as_deref(),
-            )?;
-            if watch {
+            if status {
+                handle_ingest_status(corpus.as_deref(), json).await?;
+            } else if watch {
+                let path = path.as_deref().ok_or_else(|| {
+                    anyhow!("`prism ingest --watch` requires a path or directory.")
+                })?;
                 handle_ingest_watch(
                     &path,
-                    &llm_cfg,
+                    &project_root,
+                    model.as_deref(),
+                    llm_url.as_deref(),
+                    api_key.as_deref(),
                     &neo4j_url,
                     &neo4j_user,
                     &neo4j_pass,
                     &qdrant_url,
                     schema_only,
+                    &runtime_url,
+                    corpus.as_deref(),
+                    json,
                     mapping.as_deref(),
                 )
                 .await?;
             } else {
+                let path = path.as_deref().ok_or_else(|| {
+                    anyhow!("`prism ingest` requires a file or directory unless `--status` is set.")
+                })?;
                 handle_ingest(
                     &path,
-                    &llm_cfg,
+                    &project_root,
+                    model.as_deref(),
+                    llm_url.as_deref(),
+                    api_key.as_deref(),
                     &neo4j_url,
                     &neo4j_user,
                     &neo4j_pass,
                     &qdrant_url,
                     schema_only,
+                    &runtime_url,
+                    corpus.as_deref(),
+                    json,
                     mapping.as_deref(),
                 )
                 .await?;
@@ -2269,26 +2308,235 @@ fn build_llm_config(
 
 // ── prism ingest ────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_ingest(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestBackend {
+    LocalTabular,
+    PlatformText,
+}
+
+fn ingest_backend(path: &Path) -> Option<IngestBackend> {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "csv" | "tsv" | "parquet" | "pq" => Some(IngestBackend::LocalTabular),
+        "pdf" | "json" | "jsonl" | "owl" | "cif" | "txt" | "md" => {
+            Some(IngestBackend::PlatformText)
+        }
+        _ => None,
+    }
+}
+
+fn ingest_format(path: &Path) -> String {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("unknown")
+        .to_ascii_lowercase()
+}
+
+fn collect_ingest_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    if root.is_file() {
+        return Ok(vec![root.to_path_buf()]);
+    }
+    if !root.is_dir() {
+        bail!("File or directory not found: {}", root.display());
+    }
+
+    // Recurse explicitly so `prism ingest ./data` works without forcing users
+    // to shell out through `find`/`rg` just to hand PRISM a batch of files.
+    let mut stack = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("failed to read directory {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if is_ingestable(&path) {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+fn split_text_for_platform_ingest(text: &str) -> Vec<String> {
+    const MAX_CHARS: usize = 48_000;
+    const SPLIT_WINDOW: usize = 2_000;
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    // The platform extractor truncates around 60K chars, so PRISM keeps each
+    // chunk below that ceiling and prefers paragraph/newline boundaries.
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+
+    while start < chars.len() {
+        let mut end = (start + MAX_CHARS).min(chars.len());
+        if end < chars.len() {
+            let window_start = end.saturating_sub(SPLIT_WINDOW);
+            let window: String = chars[window_start..end].iter().collect();
+            if let Some(split_idx) = window.rfind("\n\n").or_else(|| window.rfind('\n')) {
+                let split_chars = window[..split_idx].chars().count();
+                if split_chars > 0 {
+                    end = window_start + split_chars;
+                }
+            }
+        }
+
+        let chunk: String = chars[start..end].iter().collect();
+        let chunk = chunk.trim();
+        if !chunk.is_empty() {
+            chunks.push(chunk.to_string());
+        }
+
+        start = end;
+        while start < chars.len() && chars[start].is_whitespace() {
+            start += 1;
+        }
+    }
+
+    chunks
+}
+
+async fn extract_pdf_text_with_runtime(
+    runtime_url: &str,
     path: &Path,
-    llm_cfg: &prism_ingest::LlmConfig,
+) -> Result<serde_json::Value> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read PDF {}", path.display()))?;
+    let request = serde_json::json!({
+        "model": "pymupdf",
+        "input": {
+            "type": "pdf",
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        },
+        "options": {
+            "output_format": "json",
+            "extract_tables": true,
+            "extract_figures": false,
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()?;
+
+    let response = client
+        .post(format!("{}/run", runtime_url.trim_end_matches('/')))
+        .json(&request)
+        .send()
+        .await
+        .with_context(|| format!("runtime PDF extraction failed for {}", path.display()))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("runtime /run failed ({status}): {body}");
+    }
+
+    let value: serde_json::Value = response.json().await?;
+    Ok(value)
+}
+
+async fn extract_platform_ingest_text(
+    path: &Path,
+    runtime_url: &str,
+) -> Result<(String, Option<u64>, Option<String>)> {
+    match ingest_backend(path) {
+        Some(IngestBackend::PlatformText) if ingest_format(path) == "pdf" => {
+            let response = extract_pdf_text_with_runtime(runtime_url, path).await?;
+            let output = response
+                .get("output")
+                .ok_or_else(|| anyhow!("runtime response missing `output`"))?;
+            let text = output
+                .get("text")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("runtime PDF extraction returned no text"))?
+                .to_string();
+            let pages = output.get("pages").and_then(|value| value.as_u64());
+            let warning = output
+                .get("warning")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+            Ok((text, pages, warning))
+        }
+        Some(IngestBackend::PlatformText) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read text source {}", path.display()))?;
+            Ok((text, None, None))
+        }
+        _ => bail!("Unsupported platform ingest format: {}", path.display()),
+    }
+}
+
+async fn submit_platform_ingest_chunk(
+    chunk: &str,
+    corpus: Option<&str>,
+    model: Option<&str>,
+) -> Result<serde_json::Value> {
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
+
+    let mut body = serde_json::json!({
+        "source": { "type": "query", "query": chunk },
+        "mode": "full",
+    });
+    if let Some(corpus) = corpus {
+        body["corpus_slug"] = serde_json::Value::String(corpus.to_string());
+    }
+    if let Some(model) = model {
+        body["llm_model"] = serde_json::Value::String(model.to_string());
+    }
+
+    let response = auth
+        .apply(client.post(format!("{api_base}/knowledge/ingest-job")))
+        .json(&body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("platform ingest job submission failed ({status}): {body}");
+    }
+
+    Ok(response.json().await?)
+}
+
+async fn run_local_ingest_file(
+    path: &Path,
+    project_root: &Path,
+    model: Option<&str>,
+    llm_url: Option<&str>,
+    api_key: Option<&str>,
     neo4j_url: &str,
     neo4j_user: &str,
     neo4j_pass: &str,
     qdrant_url: &str,
     schema_only: bool,
     mapping_path: Option<&Path>,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     use prism_ingest::pipeline::{IngestPipeline, PipelineConfig};
     use prism_ingest::{Neo4jConfig, QdrantConfig};
 
-    if !path.exists() {
-        bail!("File not found: {}", path.display());
-    }
-
-    println!("Ingesting: {}", path.display());
-
+    let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
     let mapping = mapping_path
         .map(prism_ingest::mapping::OntologyMapping::from_file)
         .transpose()?;
@@ -2303,7 +2551,7 @@ async fn handle_ingest(
         }
     } else {
         PipelineConfig {
-            llm: Some(llm_cfg.clone()),
+            llm: Some(llm_cfg),
             neo4j: Some(Neo4jConfig {
                 base_url: neo4j_url.into(),
                 database: "neo4j".into(),
@@ -2323,59 +2571,423 @@ async fn handle_ingest(
     let pipeline = IngestPipeline::with_config(config);
     let result = pipeline.ingest_file(path).await?;
 
-    println!();
-    println!(
-        "  Schema: {} columns, {} rows",
-        result.column_count, result.row_count
-    );
-    println!("  Columns: {}", result.schema.columns.join(", "));
+    Ok(serde_json::json!({
+        "backend": "local_tabular",
+        "path": path.display().to_string(),
+        "format": ingest_format(path),
+        "schema_only": schema_only,
+        "result": result,
+    }))
+}
 
-    if !result.validation.passed {
-        println!("  Warnings: {} issues", result.validation.issues.len());
+async fn run_platform_ingest_file(
+    path: &Path,
+    runtime_url: &str,
+    corpus: Option<&str>,
+    model: Option<&str>,
+    schema_only: bool,
+    mapping_path: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let (text, pages, warning) = extract_platform_ingest_text(path, runtime_url).await?;
+    let chunks = split_text_for_platform_ingest(&text);
+
+    if chunks.is_empty() {
+        bail!("No ingestable text found in {}", path.display());
     }
 
-    if let Some(ref entities) = result.entities {
-        println!(
-            "  Entities: {} extracted, {} relationships",
-            entities.entities.len(),
-            entities.relationships.len()
+    if mapping_path.is_some() {
+        eprintln!(
+            "Warning: --mapping is only applied to the local tabular ingest pipeline and is ignored for {}.",
+            path.display()
         );
     }
 
-    if let Some(ref graph) = result.graph {
-        println!(
-            "  Graph: {} nodes, {} edges written to Neo4j",
-            graph.nodes_created, graph.edges_created
-        );
+    let mut jobs = Vec::new();
+    if !schema_only {
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut job = submit_platform_ingest_chunk(chunk, corpus, model).await?;
+            if let Some(obj) = job.as_object_mut() {
+                obj.insert("chunk_index".to_string(), serde_json::json!(index));
+                obj.insert(
+                    "chunk_chars".to_string(),
+                    serde_json::json!(chunk.chars().count()),
+                );
+            }
+            jobs.push(job);
+        }
     }
 
-    if let Some(ref embeddings) = result.embeddings {
-        println!(
-            "  Embeddings: {} vectors (dim={})",
-            embeddings.vectors.len(),
-            embeddings.dimension.unwrap_or(0)
-        );
-    }
+    Ok(serde_json::json!({
+        "backend": "platform_text",
+        "path": path.display().to_string(),
+        "format": ingest_format(path),
+        "corpus": corpus,
+        "schema_only": schema_only,
+        "pages": pages,
+        "chars": text.chars().count(),
+        "chunk_count": chunks.len(),
+        "jobs": jobs,
+        "warning": warning,
+    }))
+}
 
-    if schema_only {
-        println!("  (schema-only mode — LLM/graph/vector steps skipped)");
+fn print_ingest_summary(summary: &serde_json::Value) {
+    let backend = value_string(summary, &["backend"]).unwrap_or("ingest");
+    let path = value_string(summary, &["path"]).unwrap_or("?");
+
+    println!("Ingesting: {path}");
+
+    match backend {
+        "local_tabular" => {
+            let result = summary.get("result").unwrap_or(summary);
+            let column_count = result
+                .get("column_count")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let row_count = result
+                .get("row_count")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            println!("  Schema: {column_count} columns, {row_count} rows");
+            if let Some(columns) = result
+                .get("schema")
+                .and_then(|value| value.get("columns"))
+                .and_then(|value| value.as_array())
+            {
+                let column_names = columns
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  Columns: {column_names}");
+            }
+            let warning_count = result
+                .get("validation")
+                .and_then(|value| value.get("issues"))
+                .and_then(|value| value.as_array())
+                .map(|value| value.len())
+                .unwrap_or(0);
+            if warning_count > 0 {
+                println!("  Warnings: {warning_count} issues");
+            }
+            if let Some(entities) = result
+                .get("entities")
+                .and_then(|value| value.get("entities"))
+                .and_then(|value| value.as_array())
+            {
+                let relationships = result
+                    .get("entities")
+                    .and_then(|value| value.get("relationships"))
+                    .and_then(|value| value.as_array())
+                    .map(|value| value.len())
+                    .unwrap_or(0);
+                println!(
+                    "  Entities: {} extracted, {} relationships",
+                    entities.len(),
+                    relationships
+                );
+            }
+            if let Some(graph) = result.get("graph") {
+                let nodes = graph
+                    .get("nodes_created")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                let edges = graph
+                    .get("edges_created")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                println!("  Graph: {nodes} nodes, {edges} edges written to Neo4j");
+            }
+            if let Some(embeddings) = result.get("embeddings") {
+                let count = embeddings
+                    .get("vectors")
+                    .and_then(|value| value.as_array())
+                    .map(|value| value.len())
+                    .unwrap_or(0);
+                let dimension = embeddings
+                    .get("dimension")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                println!("  Embeddings: {count} vectors (dim={dimension})");
+            }
+            if summary
+                .get("schema_only")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                println!("  (schema-only mode — LLM/graph/vector steps skipped)");
+            }
+        }
+        "platform_text" => {
+            let chars = summary
+                .get("chars")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let chunk_count = summary
+                .get("chunk_count")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            println!("  Text: {chars} chars prepared across {chunk_count} chunk(s)");
+            if let Some(pages) = summary.get("pages").and_then(|value| value.as_u64()) {
+                println!("  Pages: {pages}");
+            }
+            if let Some(corpus) = summary.get("corpus").and_then(|value| value.as_str()) {
+                println!("  Corpus: {corpus}");
+            }
+            if let Some(warning) = summary.get("warning").and_then(|value| value.as_str()) {
+                println!("  Warning: {warning}");
+            }
+            if summary
+                .get("schema_only")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                println!("  (schema-only mode — extracted text was prepared but not submitted)");
+            } else if let Some(jobs) = summary.get("jobs").and_then(|value| value.as_array()) {
+                for job in jobs {
+                    let chunk_index = job
+                        .get("chunk_index")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let job_id = value_string(job, &["job_id"]).unwrap_or("?");
+                    let status = value_string(job, &["status"]).unwrap_or("submitted");
+                    println!("  Chunk {chunk_index}: job {job_id} [{status}]");
+                }
+            }
+        }
+        _ => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(summary).unwrap_or_default()
+            );
+        }
     }
 
     println!("\n  Done.");
+}
+
+async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> {
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+
+    let graph_stats: serde_json::Value = auth
+        .apply(client.get(format!("{api_base}/knowledge/graph/stats")))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let embedding_stats: serde_json::Value = auth
+        .apply(client.get(format!("{api_base}/knowledge/embeddings/stats")))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let jobs: serde_json::Value = auth
+        .apply(client.get(format!("{api_base}/knowledge/ingest-jobs")))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let mut summary = serde_json::json!({
+        "graph": graph_stats,
+        "embeddings": embedding_stats,
+        "jobs": jobs,
+    });
+
+    if let Some(corpus) = corpus {
+        let catalog: serde_json::Value = auth
+            .apply(client.get(format!("{api_base}/knowledge/catalog")))
+            .query(&[("limit", "200")])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let matches = value_array(&catalog, &[])
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| {
+                let query = corpus.to_ascii_lowercase();
+                [
+                    value_string(item, &["slug"]),
+                    value_string(item, &["name"]),
+                    value_string(item, &["description"]),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|value| value.to_ascii_lowercase().contains(&query))
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(obj) = summary.as_object_mut() {
+            obj.insert(
+                "corpus".to_string(),
+                serde_json::Value::String(corpus.to_string()),
+            );
+            obj.insert(
+                "catalog_matches".to_string(),
+                serde_json::Value::Array(matches),
+            );
+        }
+    }
+
+    Ok(summary)
+}
+
+async fn handle_ingest_status(corpus: Option<&str>, json_output: bool) -> Result<()> {
+    let summary = fetch_ingest_status(corpus).await?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    let graph = summary.get("graph").unwrap_or(&serde_json::Value::Null);
+    let embeddings = summary
+        .get("embeddings")
+        .unwrap_or(&serde_json::Value::Null);
+    println!("Ingest status:");
+    println!(
+        "  Graph: {} nodes, {} edges",
+        graph
+            .get("nodes")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        graph
+            .get("edges")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    );
+    println!(
+        "  Embeddings: {}",
+        embeddings
+            .get("embeddings")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    );
+
+    if let Some(corpus) = corpus {
+        let matches = summary
+            .get("catalog_matches")
+            .and_then(|value| value.as_array())
+            .map(|value| value.len())
+            .unwrap_or(0);
+        println!("  Corpus filter: {corpus} ({matches} catalog matches)");
+    }
+
+    if let Some(jobs) = summary.get("jobs").and_then(|value| value.as_array()) {
+        println!("  Active jobs: {}", jobs.len());
+    }
+
     Ok(())
 }
 
-/// Watch a directory for new/modified CSV/Parquet files and ingest them.
 #[allow(clippy::too_many_arguments)]
-async fn handle_ingest_watch(
-    dir: &Path,
-    llm_cfg: &prism_ingest::LlmConfig,
+async fn handle_ingest(
+    path: &Path,
+    project_root: &Path,
+    model: Option<&str>,
+    llm_url: Option<&str>,
+    api_key: Option<&str>,
     neo4j_url: &str,
     neo4j_user: &str,
     neo4j_pass: &str,
     qdrant_url: &str,
     schema_only: bool,
-    _mapping: Option<&Path>,
+    runtime_url: &str,
+    corpus: Option<&str>,
+    json_output: bool,
+    mapping_path: Option<&Path>,
+) -> Result<()> {
+    let ingest_targets = collect_ingest_paths(path)?;
+    if ingest_targets.is_empty() {
+        bail!("No ingestable files found under {}", path.display());
+    }
+
+    let mut summaries = Vec::new();
+    for target in ingest_targets {
+        let summary = match ingest_backend(&target) {
+            Some(IngestBackend::LocalTabular) => {
+                run_local_ingest_file(
+                    &target,
+                    project_root,
+                    model,
+                    llm_url,
+                    api_key,
+                    neo4j_url,
+                    neo4j_user,
+                    neo4j_pass,
+                    qdrant_url,
+                    schema_only,
+                    mapping_path,
+                )
+                .await?
+            }
+            Some(IngestBackend::PlatformText) => {
+                run_platform_ingest_file(
+                    &target,
+                    runtime_url,
+                    corpus,
+                    model,
+                    schema_only,
+                    mapping_path,
+                )
+                .await?
+            }
+            None => bail!(
+                "Unsupported ingest format for {}. Supported: csv, tsv, parquet, pq, pdf, json, jsonl, owl, cif, txt, md",
+                target.display()
+            ),
+        };
+        summaries.push(summary);
+    }
+
+    if json_output {
+        let payload = if summaries.len() == 1 {
+            summaries.into_iter().next().unwrap_or_default()
+        } else {
+            serde_json::Value::Array(summaries)
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        for (index, summary) in summaries.iter().enumerate() {
+            if index > 0 {
+                println!();
+            }
+            print_ingest_summary(summary);
+        }
+    }
+
+    Ok(())
+}
+
+/// Watch a directory for new/modified ingestable files and ingest them.
+#[allow(clippy::too_many_arguments)]
+async fn handle_ingest_watch(
+    dir: &Path,
+    project_root: &Path,
+    model: Option<&str>,
+    llm_url: Option<&str>,
+    api_key: Option<&str>,
+    neo4j_url: &str,
+    neo4j_user: &str,
+    neo4j_pass: &str,
+    qdrant_url: &str,
+    schema_only: bool,
+    runtime_url: &str,
+    corpus: Option<&str>,
+    json_output: bool,
+    mapping: Option<&Path>,
 ) -> Result<()> {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
@@ -2385,7 +2997,7 @@ async fn handle_ingest_watch(
     }
 
     println!(
-        "Watching {} for CSV/Parquet files (Ctrl+C to stop)...\n",
+        "Watching {} for ingestable files (Ctrl+C to stop)...\n",
         dir.display()
     );
 
@@ -2404,20 +3016,26 @@ async fn handle_ingest_watch(
                 seen.insert(path.clone(), modified);
             }
         }
-        println!("[initial] Ingesting {}", path.display());
-        if let Err(e) = handle_ingest(
+        match handle_ingest(
             &path,
-            llm_cfg,
+            project_root,
+            model,
+            llm_url,
+            api_key,
             neo4j_url,
             neo4j_user,
             neo4j_pass,
             qdrant_url,
             schema_only,
-            None,
+            runtime_url,
+            corpus,
+            json_output,
+            mapping,
         )
         .await
         {
-            eprintln!("  Error: {e}");
+            Ok(()) => {}
+            Err(e) => eprintln!("  Error: {e}"),
         }
     }
 
@@ -2452,20 +3070,26 @@ async fn handle_ingest_watch(
 
             if is_new {
                 seen.insert(path.clone(), modified);
-                println!("\n[watch] Detected: {}", path.display());
-                if let Err(e) = handle_ingest(
+                match handle_ingest(
                     &path,
-                    llm_cfg,
+                    project_root,
+                    model,
+                    llm_url,
+                    api_key,
                     neo4j_url,
                     neo4j_user,
                     neo4j_pass,
                     qdrant_url,
                     schema_only,
-                    None,
+                    runtime_url,
+                    corpus,
+                    json_output,
+                    mapping,
                 )
                 .await
                 {
-                    eprintln!("  Error: {e}");
+                    Ok(()) => {}
+                    Err(e) => eprintln!("  Error: {e}"),
                 }
             }
         }
@@ -2474,11 +3098,7 @@ async fn handle_ingest_watch(
 
 /// Check if a file has an ingestable extension.
 fn is_ingestable(path: &Path) -> bool {
-    path.is_file()
-        && matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("csv" | "tsv" | "parquet" | "pq")
-        )
+    path.is_file() && ingest_backend(path).is_some()
 }
 
 // ── prism query ─────────────────────────────────────────────────────────
@@ -2507,7 +3127,8 @@ COMPUTE:
 
 INGEST:
   prism ingest data.csv                                # ingest CSV into local graph
-  prism ingest paper.pdf                               # extract + ingest PDF
+  prism ingest paper.pdf --corpus nasa-propulsion      # extract local PDF text, then submit one ingest flow
+  prism ingest --status --corpus nasa-propulsion       # inspect ingest-related graph/vector/job state
 
 NODE:
   prism node status                                    # show node capabilities
@@ -2625,7 +3246,9 @@ fn resolve_active_project_id(paths: &PrismPaths) -> Result<String> {
         .credentials
         .as_ref()
         .and_then(|creds| creds.project_id.clone())
-        .ok_or_else(|| anyhow!("No active project selected. Run `prism login` or set MARC27_PROJECT_ID."))
+        .ok_or_else(|| {
+            anyhow!("No active project selected. Run `prism login` or set MARC27_PROJECT_ID.")
+        })
 }
 
 fn parse_string_map_arg(
@@ -2697,9 +3320,9 @@ fn normalize_deploy_target(target: &str, node_id: Option<&str>) -> Result<&'stat
         }
         "runpod" => Ok("runpod"),
         "lambda" => Ok("lambda"),
-        other => bail!(
-            "unsupported deploy target `{other}`. Use one of: local, mesh, runpod, lambda."
-        ),
+        other => {
+            bail!("unsupported deploy target `{other}`. Use one of: local, mesh, runpod, lambda.")
+        }
     }
 }
 
@@ -2766,17 +3389,12 @@ fn print_models_summary(models: &[serde_json::Value]) {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "?".to_string());
         let input_price = format_price(model.get("input_price").and_then(|value| value.as_f64()));
-        let output_price =
-            format_price(model.get("output_price").and_then(|value| value.as_f64()));
+        let output_price = format_price(model.get("output_price").and_then(|value| value.as_f64()));
 
         println!("  {model_id}  [{provider}]  {status}");
         println!(
             "  {:<36} {}  ctx={}  in={}  out={}",
-            "",
-            display_name,
-            context_window,
-            input_price,
-            output_price
+            "", display_name, context_window, input_price, output_price
         );
     }
 }
@@ -3019,7 +3637,8 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
             if let Some(status) = status.as_deref() {
                 request = request.query(&[("status", status)]);
             }
-            let response: serde_json::Value = request.send().await?.error_for_status()?.json().await?;
+            let response: serde_json::Value =
+                request.send().await?.error_for_status()?.json().await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -3070,9 +3689,7 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
         }
         DeployCommands::Health { id, json } => {
             let response: serde_json::Value = auth
-                .apply(client.get(format!(
-                    "{api_base}/compute/deployments/{id}/health"
-                )))
+                .apply(client.get(format!("{api_base}/compute/deployments/{id}/health")))
                 .send()
                 .await?
                 .error_for_status()?
@@ -3098,9 +3715,7 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
         .build()?;
 
     let response: serde_json::Value = auth
-        .apply(client.get(format!(
-            "{api_base}/projects/{project_id}/llm/models"
-        )))
+        .apply(client.get(format!("{api_base}/projects/{project_id}/llm/models")))
         .send()
         .await?
         .error_for_status()?
@@ -3182,8 +3797,9 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
             slug,
             json,
         } => {
-            let yaml = std::fs::read_to_string(&yaml_file)
-                .with_context(|| format!("failed to read discourse YAML {}", yaml_file.display()))?;
+            let yaml = std::fs::read_to_string(&yaml_file).with_context(|| {
+                format!("failed to read discourse YAML {}", yaml_file.display())
+            })?;
             let slug = slug.unwrap_or_else(|| {
                 yaml_file
                     .file_stem()
@@ -3264,12 +3880,17 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
 
             if json {
                 let mut payload = serde_json::Map::new();
-                payload.insert("events".to_string(), serde_json::Value::Array(events.clone()));
-                if let Some(instance_id) = events
-                    .iter()
-                    .find_map(|event| value_string(event, &["instance_id"]).map(|value| value.to_string()))
-                {
-                    payload.insert("instance_id".to_string(), serde_json::Value::String(instance_id));
+                payload.insert(
+                    "events".to_string(),
+                    serde_json::Value::Array(events.clone()),
+                );
+                if let Some(instance_id) = events.iter().find_map(|event| {
+                    value_string(event, &["instance_id"]).map(|value| value.to_string())
+                }) {
+                    payload.insert(
+                        "instance_id".to_string(),
+                        serde_json::Value::String(instance_id),
+                    );
                 }
                 if let Some(complete) = events
                     .iter()
@@ -3353,7 +3974,9 @@ fn parse_research_response_body(body: &str) -> Result<serde_json::Value> {
                     sources = Some(serde_json::Value::Array(found.clone()));
                 }
             }
-            if complete.is_none() && obj.get("step").and_then(|value| value.as_str()) == Some("complete") {
+            if complete.is_none()
+                && obj.get("step").and_then(|value| value.as_str()) == Some("complete")
+            {
                 complete = Some(event.clone());
             }
         }
@@ -3490,10 +4113,9 @@ async fn create_dashboard_session(
         .credentials
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `prism login` first."))?;
-    let user_id = creds
-        .user_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("Stored credentials are missing user_id. Run `prism login` again."))?;
+    let user_id = creds.user_id.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("Stored credentials are missing user_id. Run `prism login` again.")
+    })?;
 
     // The local CLI is the node operator on this machine, so it should be able
     // to manage its own dashboard routes without a separate bootstrap dance.
@@ -4219,7 +4841,11 @@ async fn handle_federated_query(
         if let Some(session_token) = peer_session {
             peer_req = peer_req.header("X-Session-Token", session_token);
         }
-        match peer_req.timeout(std::time::Duration::from_secs(10)).send().await {
+        match peer_req
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
             Ok(r) => {
                 let data: serde_json::Value = r.json().await.unwrap_or_default();
                 let count = data["count"].as_u64().unwrap_or(0);
@@ -4563,7 +5189,7 @@ mod tests {
                 model,
                 ..
             } => {
-                assert_eq!(path, PathBuf::from("/tmp/data.csv"));
+                assert_eq!(path, Some(PathBuf::from("/tmp/data.csv")));
                 assert!(!schema_only);
                 // Model is now None by default (reads from config)
                 assert_eq!(model, None);
@@ -4580,11 +5206,64 @@ mod tests {
             Commands::Ingest {
                 path, schema_only, ..
             } => {
-                assert_eq!(path, PathBuf::from("/tmp/data.parquet"));
+                assert_eq!(path, Some(PathBuf::from("/tmp/data.parquet")));
                 assert!(schema_only);
             }
             _ => panic!("expected Ingest command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_ingest_status_without_path() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "ingest",
+            "--status",
+            "--corpus",
+            "nasa-propulsion",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Ingest {
+                path,
+                status,
+                corpus,
+                json,
+                ..
+            } => {
+                assert_eq!(path, None);
+                assert!(status);
+                assert_eq!(corpus.as_deref(), Some("nasa-propulsion"));
+                assert!(json);
+            }
+            _ => panic!("expected Ingest command"),
+        }
+    }
+
+    #[test]
+    fn ingest_backend_detects_platform_text_files() {
+        assert_eq!(
+            ingest_backend(Path::new("/tmp/paper.pdf")),
+            Some(IngestBackend::PlatformText)
+        );
+        assert_eq!(
+            ingest_backend(Path::new("/tmp/graph.jsonl")),
+            Some(IngestBackend::PlatformText)
+        );
+        assert_eq!(
+            ingest_backend(Path::new("/tmp/table.parquet")),
+            Some(IngestBackend::LocalTabular)
+        );
+        assert_eq!(ingest_backend(Path::new("/tmp/image.png")), None);
+    }
+
+    #[test]
+    fn split_text_for_platform_ingest_creates_bounded_chunks() {
+        let text = format!("{}\n\n{}", "A".repeat(30_000), "B".repeat(30_000));
+        let chunks = split_text_for_platform_ingest(&text);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 48_000));
     }
 
     #[test]
@@ -4728,8 +5407,7 @@ data: {\"step\":\"complete\",\"total_turns\":2}\n",
 
     #[test]
     fn cli_parses_models_list_command() {
-        let cli =
-            Cli::try_parse_from(["prism", "models", "list", "--provider", "google"]).unwrap();
+        let cli = Cli::try_parse_from(["prism", "models", "list", "--provider", "google"]).unwrap();
         match cli.command.unwrap() {
             Commands::Models {
                 command: ModelsCommands::List { provider, json },

@@ -1,6 +1,8 @@
 import React from "react";
 import { Box, Text } from "ink";
 import { PRIMARY, TEXT_DIM, TEXT_MUTED, WARNING } from "../theme.js";
+import { Byline } from "./chrome/Byline.js";
+import { KeyboardShortcutHint } from "./chrome/KeyboardShortcutHint.js";
 
 interface Props {
   autoApprove: boolean;
@@ -51,20 +53,30 @@ export function StatusLine({
       : "idle";
 
   return (
-    <Box gap={2} flexWrap="wrap">
-      <Text color={PRIMARY} bold>prism</Text>
-      {sessionLabel ? <Text color={TEXT_DIM}>{`session:${sessionLabel}`}</Text> : null}
-      <Text color={TEXT_DIM}>{`${messageCount} msgs`}</Text>
-      {toolCount !== undefined ? <Text color={TEXT_DIM}>{`${toolCount} tools`}</Text> : null}
-      {sessionMode ? <Text color={TEXT_DIM}>{`mode:${sessionMode}`}</Text> : null}
-      {planLabel ? <Text color={TEXT_MUTED}>{planLabel}</Text> : null}
-      {resumed ? <Text color={TEXT_MUTED}>resumed</Text> : null}
-      <Text color={approvalPending ? WARNING : TEXT_MUTED}>{activityLabel}</Text>
-      {activeViewTitle ? (
-        <Text color={TEXT_DIM}>{`view:${activeViewTitle.toLowerCase()}`}</Text>
-      ) : null}
-      {autoApprove ? <Text color={WARNING}>auto-approve</Text> : null}
-      <Text color={TEXT_DIM}>/ commands</Text>
+    <Box flexDirection="column" marginTop={1}>
+      <Text color={TEXT_DIM}>
+        <Byline>
+          <Text color={PRIMARY} bold>
+            prism
+          </Text>
+          {sessionLabel ? <Text>{`session:${sessionLabel}`}</Text> : null}
+          <Text>{`${messageCount} msgs`}</Text>
+          {toolCount !== undefined ? <Text>{`${toolCount} tools`}</Text> : null}
+          {sessionMode ? <Text>{`mode:${sessionMode}`}</Text> : null}
+          {planLabel ? <Text color={TEXT_MUTED}>{planLabel}</Text> : null}
+          {resumed ? <Text color={TEXT_MUTED}>resumed</Text> : null}
+          <Text color={approvalPending ? WARNING : TEXT_MUTED}>{activityLabel}</Text>
+          {activeViewTitle ? <Text>{`view:${activeViewTitle.toLowerCase()}`}</Text> : null}
+          {autoApprove ? <Text color={WARNING}>auto-approve</Text> : null}
+        </Byline>
+      </Text>
+      <Text color={TEXT_DIM}>
+        <Byline>
+          <KeyboardShortcutHint shortcut="enter" action="send" />
+          <KeyboardShortcutHint shortcut="/" action="command" />
+          <KeyboardShortcutHint shortcut="ctrl+c" action="exit" />
+        </Byline>
+      </Text>
     </Box>
   );
 }

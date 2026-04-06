@@ -1,9 +1,10 @@
 import React from "react";
 import { Box, Text } from "ink";
 import {
-  PRIMARY, TEXT, TEXT_MUTED, TEXT_DIM, SUCCESS, ERROR, WARNING,
-  SECONDARY, BORDER,
+  PRIMARY, TEXT_MUTED, TEXT_DIM, SUCCESS, WARNING, SECONDARY,
 } from "../theme.js";
+import { Byline } from "./chrome/Byline.js";
+import { Divider } from "./chrome/Divider.js";
 
 interface LLMStatus {
   connected: boolean;
@@ -76,12 +77,14 @@ export function Welcome({
 
   return (
     <Box flexDirection="column" paddingLeft={1} marginBottom={1}>
-      <Box>
-        <Text bold color={PRIMARY}>PRISM</Text>
-        <Text color={TEXT_DIM}> v{version}</Text>
-        <Text color={TEXT_DIM}> · </Text>
-        <Text color={TEXT_MUTED}>materials research platform</Text>
-      </Box>
+      <Text bold color={PRIMARY}>PRISM</Text>
+      <Text color={TEXT_DIM}>
+        <Byline>
+          <Text>{`v${version}`}</Text>
+          <Text color={TEXT_MUTED}>materials research platform</Text>
+        </Byline>
+      </Text>
+      <Divider color={TEXT_DIM} padding={2} />
 
       <Box gap={2} marginTop={0}>
         {llm ? (

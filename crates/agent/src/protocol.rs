@@ -13,16 +13,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use prism_ingest::llm::{ChatMessage, LlmClient};
-use prism_ingest::LlmConfig;
 use prism_client::api::{OrgInfo, PlatformClient, ProjectInfo};
 use prism_client::{auth::DeviceCodeResponse, auth::TokenResponse, DeviceFlowAuth};
+use prism_ingest::llm::{ChatMessage, LlmClient};
+use prism_ingest::LlmConfig;
+use prism_python_bridge::tool_server::{ToolServer, ToolServerHandle};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
     discover_workflows, execute_workflow_with_policy, find_workflow, parse_workflow_command_args,
     WorkflowRunResult, WorkflowSpec,
 };
-use prism_python_bridge::tool_server::{ToolServer, ToolServerHandle};
 use serde_json::{json, Value};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::oneshot;
@@ -35,7 +35,7 @@ use crate::hooks::{build_default_hooks, HookRegistry};
 use crate::permissions::{
     PermissionMode, PermissionOverrides, SharedPermissionOverrides, ToolPermissionContext,
 };
-use crate::prompts::SYSTEM_PROMPT;
+use crate::prompts::{append_runtime_tool_guidance, build_system_prompt};
 use crate::scratchpad::Scratchpad;
 use crate::session::{RuntimeSessionState, SessionStore};
 use crate::tool_catalog::ToolCatalog;
@@ -193,7 +193,10 @@ fn default_project_slug() -> String {
     format!("prism-{timestamp}")
 }
 
-fn pick_organization(orgs: &[OrgInfo], prior: Option<&StoredCredentials>) -> Option<(OrgInfo, String)> {
+fn pick_organization(
+    orgs: &[OrgInfo],
+    prior: Option<&StoredCredentials>,
+) -> Option<(OrgInfo, String)> {
     if orgs.is_empty() {
         return None;
     }
@@ -206,7 +209,10 @@ fn pick_organization(orgs: &[OrgInfo], prior: Option<&StoredCredentials>) -> Opt
 
     if orgs.len() == 1 {
         let org = orgs[0].clone();
-        return Some((org.clone(), format!("Using only available organization {}", org.name)));
+        return Some((
+            org.clone(),
+            format!("Using only available organization {}", org.name),
+        ));
     }
 
     let mut sorted = orgs.to_vec();
@@ -214,28 +220,47 @@ fn pick_organization(orgs: &[OrgInfo], prior: Option<&StoredCredentials>) -> Opt
     let org = sorted[0].clone();
     Some((
         org.clone(),
-        format!("Selected default organization {} from {} available options", org.name, orgs.len()),
+        format!(
+            "Selected default organization {} from {} available options",
+            org.name,
+            orgs.len()
+        ),
     ))
 }
 
-fn pick_project(projects: &[ProjectInfo], prior: Option<&StoredCredentials>) -> Option<(ProjectInfo, String)> {
+fn pick_project(
+    projects: &[ProjectInfo],
+    prior: Option<&StoredCredentials>,
+) -> Option<(ProjectInfo, String)> {
     if projects.is_empty() {
         return None;
     }
 
     if let Some(prior_project_id) = prior.and_then(|creds| creds.project_id.as_deref()) {
-        if let Some(project) = projects.iter().find(|project| project.id == prior_project_id) {
+        if let Some(project) = projects
+            .iter()
+            .find(|project| project.id == prior_project_id)
+        {
             return Some((project.clone(), format!("Reused project {}", project.name)));
         }
     }
 
-    if let Some(project) = projects.iter().find(|project| project.name.eq_ignore_ascii_case("Sandbox")) {
-        return Some((project.clone(), format!("Selected default project {}", project.name)));
+    if let Some(project) = projects
+        .iter()
+        .find(|project| project.name.eq_ignore_ascii_case("Sandbox"))
+    {
+        return Some((
+            project.clone(),
+            format!("Selected default project {}", project.name),
+        ));
     }
 
     if projects.len() == 1 {
         let project = projects[0].clone();
-        return Some((project.clone(), format!("Using only available project {}", project.name)));
+        return Some((
+            project.clone(),
+            format!("Using only available project {}", project.name),
+        ));
     }
 
     let mut sorted = projects.to_vec();
@@ -243,7 +268,11 @@ fn pick_project(projects: &[ProjectInfo], prior: Option<&StoredCredentials>) -> 
     let project = sorted[0].clone();
     Some((
         project.clone(),
-        format!("Selected default project {} from {} available options", project.name, projects.len()),
+        format!(
+            "Selected default project {} from {} available options",
+            project.name,
+            projects.len()
+        ),
     ))
 }
 
@@ -303,11 +332,23 @@ async fn select_project_context_automatically(
     }
 
     let created = platform
-        .create_project(&org.id, &default_project_name(display_name), &default_project_slug())
+        .create_project(
+            &org.id,
+            &default_project_name(display_name),
+            &default_project_slug(),
+        )
         .await
-        .with_context(|| format!("failed to auto-create a PRISM project in organization {}", org.name))?;
+        .with_context(|| {
+            format!(
+                "failed to auto-create a PRISM project in organization {}",
+                org.name
+            )
+        })?;
 
-    notes.push(format!("Created project {} because none were available", created.name));
+    notes.push(format!(
+        "Created project {} because none were available",
+        created.name
+    ));
     Ok(SelectionOutcome {
         context: SelectedContext {
             org_id: Some(org.id),
@@ -323,7 +364,8 @@ async fn start_native_device_login(endpoints: &PlatformEndpoints) -> Result<Devi
     let platform = PlatformClient::new(&endpoints.api_base);
     let http = platform.inner().clone();
 
-    let start: DeviceCodeResponse = DeviceFlowAuth::start_device_flow(&http, &endpoints.api_base).await?;
+    let start: DeviceCodeResponse =
+        DeviceFlowAuth::start_device_flow(&http, &endpoints.api_base).await?;
     if let Err(error) = open_browser(&start.verification_uri) {
         tracing::warn!(error = %error, "failed to open browser automatically during login");
     }
@@ -444,7 +486,9 @@ fn open_browser(url: &str) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("browser opener exited with status {status}"))
+        Err(anyhow::anyhow!(
+            "browser opener exited with status {status}"
+        ))
     }
 }
 
@@ -480,8 +524,12 @@ enum BashSlashAction {
         run_in_background: bool,
     },
     Tasks,
-    Read { task_id: String },
-    Stop { task_id: String },
+    Read {
+        task_id: String,
+    },
+    Stop {
+        task_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,7 +629,11 @@ fn parse_bash_slash_action(command: &str) -> Result<BashSlashAction> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| anyhow::anyhow!("Usage: /bash --timeout <seconds> <command>"))?;
-                timeout = Some(value.parse::<u64>().context("Invalid /bash timeout value")?);
+                timeout = Some(
+                    value
+                        .parse::<u64>()
+                        .context("Invalid /bash timeout value")?,
+                );
                 index += 2;
             }
             "--description" | "-d" => {
@@ -658,10 +710,14 @@ fn parse_python_slash_action(command: &str) -> Result<PythonSlashAction> {
     while index < header_args.len() {
         match header_args[index].as_str() {
             "--timeout" | "-t" => {
-                let value = header_args
-                    .get(index + 1)
-                    .ok_or_else(|| anyhow::anyhow!("Usage: /python --timeout <seconds> -- <code>"))?;
-                timeout = Some(value.parse::<u64>().context("Invalid /python timeout value")?);
+                let value = header_args.get(index + 1).ok_or_else(|| {
+                    anyhow::anyhow!("Usage: /python --timeout <seconds> -- <code>")
+                })?;
+                timeout = Some(
+                    value
+                        .parse::<u64>()
+                        .context("Invalid /python timeout value")?,
+                );
                 index += 2;
             }
             "--description" | "-d" => {
@@ -771,8 +827,9 @@ fn parse_edit_slash_action(command: &str) -> Result<EditSlashAction> {
         ));
     }
 
-    let (old_text, new_text) = split_edit_segment(old_and_new, &[" --new --", "\n--new --", "--new --"])
-        .ok_or_else(|| anyhow::anyhow!("Usage: /edit <path> --old -- <old> --new -- <new>"))?;
+    let (old_text, new_text) =
+        split_edit_segment(old_and_new, &[" --new --", "\n--new --", "--new --"])
+            .ok_or_else(|| anyhow::anyhow!("Usage: /edit <path> --old -- <old> --new -- <new>"))?;
 
     Ok(EditSlashAction::Edit {
         path: header_args[0].clone(),
@@ -1010,9 +1067,14 @@ async fn execute_manual_tool_call(
         Err(error) => (format!("Tool error: {error}"), true),
     };
 
-    let summary = summarize_manual_tool_result(tool_name, preview.as_deref(), &raw_content, is_error);
-    let (display_content, _) =
-        build_tool_card_payload(tool_name, &raw_content, preview.as_deref(), Some(summary.as_str()));
+    let summary =
+        summarize_manual_tool_result(tool_name, preview.as_deref(), &raw_content, is_error);
+    let (display_content, _) = build_tool_card_payload(
+        tool_name,
+        &raw_content,
+        preview.as_deref(),
+        Some(summary.as_str()),
+    );
 
     emit_agent_event(AgentEvent::ToolCallResult {
         call_id: call_id.clone(),
@@ -1189,9 +1251,7 @@ fn build_permission_context(mode: SessionMode, tools: &ToolCatalog) -> ToolPermi
     // instead of keeping a second hand-maintained allowlist in Rust.
     let dynamic_auto_approved = tools
         .iter()
-        .filter(|tool| {
-            tool.permission_mode == PermissionMode::ReadOnly && !tool.requires_approval
-        })
+        .filter(|tool| tool.permission_mode == PermissionMode::ReadOnly && !tool.requires_approval)
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
     let base = ToolPermissionContext::default().with_auto_approve(&dynamic_auto_approved);
@@ -1295,8 +1355,12 @@ fn apply_deferred_runtime_updates(
 
     for update in updates.drain(..) {
         match update {
-            DeferredRuntimeUpdate::AllowTool(tool_name) => runtime.permission_overrides.allow(&tool_name),
-            DeferredRuntimeUpdate::DenyTool(tool_name) => runtime.permission_overrides.deny(&tool_name),
+            DeferredRuntimeUpdate::AllowTool(tool_name) => {
+                runtime.permission_overrides.allow(&tool_name)
+            }
+            DeferredRuntimeUpdate::DenyTool(tool_name) => {
+                runtime.permission_overrides.deny(&tool_name)
+            }
         }
     }
 
@@ -1374,7 +1438,9 @@ fn system_prompt_for_mode(
     mode: SessionMode,
     base_prompt: &str,
     plan_state: &PlanRuntimeState,
+    tools: &ToolCatalog,
 ) -> String {
+    let base_prompt = append_runtime_tool_guidance(base_prompt, tools);
     match mode {
         SessionMode::Chat => {
             if let Some(approved_plan) = &plan_state.approved_plan_body {
@@ -1384,7 +1450,7 @@ fn system_prompt_for_mode(
                     "{base_prompt}\n\nThe user approved the following execution plan. Follow it unless the user explicitly changes direction.\n<approved_plan>\n{approved_plan}\n</approved_plan>"
                 )
             } else {
-                base_prompt.to_string()
+                base_prompt
             }
         }
         SessionMode::Plan => format!(
@@ -1432,7 +1498,13 @@ fn loaded_tools_by_access(
     all.extend(full_access.clone());
     all.sort();
 
-    (read_only, workspace_write, full_access, approval_required, tool_names)
+    (
+        read_only,
+        workspace_write,
+        full_access,
+        approval_required,
+        tool_names,
+    )
 }
 
 fn resolve_loaded_tool_name(tool_name: &str, tools: &ToolCatalog) -> Option<String> {
@@ -1958,17 +2030,19 @@ fn format_usage_report(transcript: &TranscriptStore, session_store: &SessionStor
     )
 }
 
-fn format_account_result(title: &str, creds: &StoredCredentials, notes: &[String], paths: &PrismPaths) -> String {
+fn format_account_result(
+    title: &str,
+    creds: &StoredCredentials,
+    notes: &[String],
+    paths: &PrismPaths,
+) -> String {
     let mut lines = vec![
         title.to_string(),
         format!(
             "  user: {}",
             creds.display_name.as_deref().unwrap_or("(unknown)")
         ),
-        format!(
-            "  org: {}",
-            creds.org_name.as_deref().unwrap_or("(none)")
-        ),
+        format!("  org: {}", creds.org_name.as_deref().unwrap_or("(none)")),
         format!(
             "  project: {}",
             creds.project_name.as_deref().unwrap_or("(none)")
@@ -2539,8 +2613,12 @@ fn emit_agent_event(event: AgentEvent) {
             elapsed_ms,
             is_error,
         } => {
-            let (display_content, extra_data) =
-                build_tool_card_payload(&tool_name, &content, preview.as_deref(), summary.as_deref());
+            let (display_content, extra_data) = build_tool_card_payload(
+                &tool_name,
+                &content,
+                preview.as_deref(),
+                summary.as_deref(),
+            );
             let mut data = serde_json::Map::new();
             data.insert("call_id".to_string(), serde_json::json!(call_id));
             if let Some(summary) = summary {
@@ -2802,7 +2880,11 @@ fn build_tool_card_payload(
                 }
                 sections.push(format!(
                     "status: {}",
-                    if success { "completed" } else { "returned non-zero" }
+                    if success {
+                        "completed"
+                    } else {
+                        "returned non-zero"
+                    }
                 ));
                 if let Some(exit_code) = exit_code {
                     sections.push(format!("exit code: {exit_code}"));
@@ -2926,9 +3008,7 @@ fn build_tool_card_payload(
                     .and_then(|value| value.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let exit_code = object
-                    .get("exit_code")
-                    .and_then(|value| value.as_i64());
+                let exit_code = object.get("exit_code").and_then(|value| value.as_i64());
                 let cwd = object
                     .get("cwd")
                     .and_then(|value| value.as_str())
@@ -3095,6 +3175,7 @@ fn spawn_agent_turn(
             runtime.session_mode,
             &config.system_prompt,
             &runtime.plan_state,
+            tools.as_ref(),
         );
 
         let turn_result = agent_loop::run_turn(
@@ -3112,7 +3193,9 @@ fn spawn_agent_turn(
             &mut runtime.scratchpad,
             &mut |event| {
                 match &event {
-                    AgentEvent::TurnComplete { text: Some(text), .. } if !text.is_empty() => {
+                    AgentEvent::TurnComplete {
+                        text: Some(text), ..
+                    } if !text.is_empty() => {
                         runtime
                             .session_store
                             .append_message("assistant", text, "", "", None);
@@ -3123,13 +3206,9 @@ fn spawn_agent_turn(
                         content,
                         ..
                     } => {
-                        runtime.session_store.append_message(
-                            "tool",
-                            content,
-                            tool_name,
-                            call_id,
-                            None,
-                        );
+                        runtime
+                            .session_store
+                            .append_message("tool", content, tool_name, call_id, None);
                     }
                     _ => {}
                 }
@@ -3285,7 +3364,12 @@ async fn handle_command(
             *permissions =
                 build_effective_permission_context(*session_mode, tools, permission_overrides);
             let new_session_id = session_store.new_session(&llm_config.model);
-            persist_runtime_state(session_store, *session_mode, permission_overrides, plan_state);
+            persist_runtime_state(
+                session_store,
+                *session_mode,
+                permission_overrides,
+                plan_state,
+            );
             emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
             emit_notification(
                 "ui.text.delta",
@@ -3394,7 +3478,11 @@ async fn handle_command(
                     timeout,
                 } => {
                     let label = if let Some(description) = description.as_deref() {
-                        format!("/python --description {:?} -- {}", description, code.lines().next().unwrap_or(""))
+                        format!(
+                            "/python --description {:?} -- {}",
+                            description,
+                            code.lines().next().unwrap_or("")
+                        )
                     } else {
                         format!("/python {}", code.lines().next().unwrap_or(""))
                     };
@@ -3576,7 +3664,12 @@ async fn handle_command(
                 emit_view(
                     "account",
                     "Setup Complete",
-                    &format_account_result("PRISM account setup finished.", &creds, &selected.notes, &paths),
+                    &format_account_result(
+                        "PRISM account setup finished.",
+                        &creds,
+                        &selected.notes,
+                        &paths,
+                    ),
                     "info",
                 );
             }
@@ -3658,7 +3751,12 @@ async fn handle_command(
             emit_view(
                 "account",
                 "Login Complete",
-                &format_account_result("Stored MARC27 account credentials.", &creds, &selected.notes, &paths),
+                &format_account_result(
+                    "Stored MARC27 account credentials.",
+                    &creds,
+                    &selected.notes,
+                    &paths,
+                ),
                 "info",
             );
             emit_notification("ui.turn.complete", serde_json::json!({}));
@@ -3682,7 +3780,7 @@ async fn handle_command(
         }
         "/context" => {
             let system_prompt =
-                system_prompt_for_mode(*session_mode, &config.system_prompt, plan_state);
+                system_prompt_for_mode(*session_mode, &config.system_prompt, plan_state, tools);
             let text = format_context_report(
                 slash_ctx,
                 session_store,
@@ -3895,7 +3993,12 @@ async fn handle_command(
                 plan_state.status = Some(PlanStatus::Approved);
                 plan_state.approved_plan_body = Some(plan_body.clone());
                 scratchpad.log("decision", None, "approved current execution plan", None);
-                persist_runtime_state(session_store, *session_mode, permission_overrides, plan_state);
+                persist_runtime_state(
+                    session_store,
+                    *session_mode,
+                    permission_overrides,
+                    plan_state,
+                );
                 emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
                 emit_view(
                     "plan",
@@ -3914,7 +4017,12 @@ async fn handle_command(
             if matches!(action, "reject" | "revise") {
                 plan_state.status = Some(PlanStatus::Rejected);
                 plan_state.approved_plan_body = None;
-                persist_runtime_state(session_store, *session_mode, permission_overrides, plan_state);
+                persist_runtime_state(
+                    session_store,
+                    *session_mode,
+                    permission_overrides,
+                    plan_state,
+                );
                 emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
                 emit_view(
                     "plan",
@@ -3929,7 +4037,12 @@ async fn handle_command(
             if action == "clear" {
                 plan_state.status = Some(PlanStatus::None);
                 plan_state.approved_plan_body = None;
-                persist_runtime_state(session_store, *session_mode, permission_overrides, plan_state);
+                persist_runtime_state(
+                    session_store,
+                    *session_mode,
+                    permission_overrides,
+                    plan_state,
+                );
                 emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
                 emit_view(
                     "plan",
@@ -3951,7 +4064,12 @@ async fn handle_command(
                 if plan_state.status == Some(PlanStatus::Draft) {
                     plan_state.approved_plan_body = None;
                 }
-                persist_runtime_state(session_store, *session_mode, permission_overrides, plan_state);
+                persist_runtime_state(
+                    session_store,
+                    *session_mode,
+                    permission_overrides,
+                    plan_state,
+                );
                 emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
                 emit_view(
                     "plan",
@@ -3985,7 +4103,12 @@ async fn handle_command(
                 // A fresh planning cycle supersedes any previously approved plan.
                 plan_state.status = Some(PlanStatus::Draft);
                 plan_state.approved_plan_body = None;
-                persist_runtime_state(session_store, *session_mode, permission_overrides, plan_state);
+                persist_runtime_state(
+                    session_store,
+                    *session_mode,
+                    permission_overrides,
+                    plan_state,
+                );
                 emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
                 let plan_body = format_plan_report(transcript, scratchpad);
                 let plan_path = persist_plan_snapshot(slash_ctx, &session_id, &plan_body)?;
@@ -4120,7 +4243,12 @@ async fn handle_command(
                         tools,
                         permission_overrides,
                     );
-                    emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
+                    emit_status_snapshot(
+                        config.auto_approve,
+                        transcript,
+                        *session_mode,
+                        plan_state,
+                    );
                     emit_notification(
                         "ui.text.delta",
                         serde_json::json!({
@@ -4170,7 +4298,12 @@ async fn handle_command(
                         tools,
                         permission_overrides,
                     );
-                    emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
+                    emit_status_snapshot(
+                        config.auto_approve,
+                        transcript,
+                        *session_mode,
+                        plan_state,
+                    );
                     emit_notification(
                         "ui.text.delta",
                         serde_json::json!({
@@ -4392,7 +4525,7 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
     tracing::info!(tool_count = tools.len(), "loaded tool catalog");
 
     let config = Arc::new(AgentConfig {
-        system_prompt: SYSTEM_PROMPT.to_string(),
+        system_prompt: build_system_prompt(true),
         ..Default::default()
     });
     let slash_ctx = SlashCommandContext {
@@ -4431,12 +4564,10 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
     );
 
     // Approval channel — protocol sends responses, agent loop receives
-    let (approval_tx, approval_rx) =
-        tokio::sync::mpsc::channel::<agent_loop::ApprovalResponse>(1);
+    let (approval_tx, approval_rx) = tokio::sync::mpsc::channel::<agent_loop::ApprovalResponse>(1);
     let approval_rx = Arc::new(tokio::sync::Mutex::new(approval_rx));
-    let live_permission_overrides = Arc::new(tokio::sync::RwLock::new(
-        permission_overrides.clone(),
-    ));
+    let live_permission_overrides =
+        Arc::new(tokio::sync::RwLock::new(permission_overrides.clone()));
 
     // OPA policy engine — loads built-in + user/project policies
     let policy_engine = match prism_policy::PolicyEngine::with_discovery(None) {
@@ -4558,7 +4689,8 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                 });
 
                 if !resume_ref.is_empty() {
-                    if let Some((sid, messages)) = runtime.session_store.resume_session(resume_ref) {
+                    if let Some((sid, messages)) = runtime.session_store.resume_session(resume_ref)
+                    {
                         restore_history_and_transcript_from_messages(
                             &mut runtime.history,
                             &mut runtime.transcript,
@@ -4568,7 +4700,8 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                         welcome["resumed"] = serde_json::json!(true);
                         welcome["session_id"] = serde_json::json!(sid);
                         welcome["resumed_messages"] = serde_json::json!(messages.len());
-                        if let Some(runtime_state) = runtime.session_store.load_runtime_state(&sid) {
+                        if let Some(runtime_state) = runtime.session_store.load_runtime_state(&sid)
+                        {
                             let (restored_mode, restored_overrides, restored_plan_state) =
                                 restore_runtime_session_state(runtime_state);
                             runtime.session_mode = restored_mode;
@@ -4812,9 +4945,7 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
 
                 let approval = match response_str {
                     "y" | "yes" | "allow" => agent_loop::ApprovalResponse::Allow,
-                    "a" | "all" | "always" | "allow-session" => {
-                        agent_loop::ApprovalResponse::Allow
-                    }
+                    "a" | "all" | "always" | "allow-session" => agent_loop::ApprovalResponse::Allow,
                     _ => agent_loop::ApprovalResponse::Deny,
                 };
                 let _ = approval_tx.try_send(approval);
@@ -4830,7 +4961,11 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
     tracing::info!("stdin closed, shutting down");
     if let Some(mut receiver) = pending_turn.take() {
         if let Ok(mut restored_runtime) = receiver.try_recv() {
-            apply_deferred_runtime_updates(&mut restored_runtime, tools.as_ref(), &mut deferred_updates);
+            apply_deferred_runtime_updates(
+                &mut restored_runtime,
+                tools.as_ref(),
+                &mut deferred_updates,
+            );
             sync_live_permission_overrides(
                 &live_permission_overrides,
                 &restored_runtime.permission_overrides,
@@ -4851,11 +4986,10 @@ mod tests {
         build_effective_permission_context, build_tool_card_payload, inline_list,
         load_plan_snapshot, parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
         parse_edit_slash_action, parse_python_slash_action, parse_read_slash_path,
-        parse_slash_command, parse_write_slash_action,
-        persist_plan_snapshot, pick_organization, pick_project, plan_snapshot_path,
-        project_api_history, shell_command_join, summarize_api_view, truncate_for_ui,
-        BashSlashAction, DiffSlashAction, EditSlashAction, PythonSlashAction, SessionMode,
-        SlashCommandContext, WriteSlashAction,
+        parse_slash_command, parse_write_slash_action, persist_plan_snapshot, pick_organization,
+        pick_project, plan_snapshot_path, project_api_history, shell_command_join,
+        summarize_api_view, truncate_for_ui, BashSlashAction, DiffSlashAction, EditSlashAction,
+        PythonSlashAction, SessionMode, SlashCommandContext, WriteSlashAction,
     };
     use crate::commands::is_cli_backed_slash_root;
     use crate::permissions::PermissionOverrides;
@@ -5000,10 +5134,9 @@ mod tests {
 
     #[test]
     fn parse_edit_slash_action_preserves_old_and_new_blocks() {
-        let parsed = parse_edit_slash_action(
-            "/edit src/main.rs --old -- old line\n--new -- new line\n",
-        )
-        .expect("edit slash command should parse");
+        let parsed =
+            parse_edit_slash_action("/edit src/main.rs --old -- old line\n--new -- new line\n")
+                .expect("edit slash command should parse");
 
         assert_eq!(
             parsed,
@@ -5212,7 +5345,8 @@ mod tests {
             ..StoredCredentials::default()
         };
 
-        let (selected, note) = pick_organization(&orgs, Some(&prior)).expect("org should be selected");
+        let (selected, note) =
+            pick_organization(&orgs, Some(&prior)).expect("org should be selected");
         assert_eq!(selected.id, "org-b");
         assert!(note.contains("Reused organization"));
     }
@@ -5268,7 +5402,10 @@ mod tests {
         assert!(content.contains("command: prism query"));
         assert!(content.contains("status: completed"));
         assert!(content.contains("stdout"));
-        assert_eq!(data["invocation"], "prism query \"band gap materials\" --json");
+        assert_eq!(
+            data["invocation"],
+            "prism query \"band gap materials\" --json"
+        );
         assert_eq!(data["exit_code"], 0);
         assert_eq!(data["success"], true);
     }
@@ -5284,7 +5421,10 @@ mod tests {
 
         assert!(content.contains("status: completed"));
         assert_eq!(data["root"], "models");
-        assert_eq!(data["parsed_stdout"][0]["model_id"], "gemini-3.1-pro-preview");
+        assert_eq!(
+            data["parsed_stdout"][0]["model_id"],
+            "gemini-3.1-pro-preview"
+        );
     }
 
     #[test]

@@ -1,174 +1,310 @@
 //! System prompts for PRISM agent modes.
 //!
-//! The prompt teaches the agent HOW to think and behave — not what tools exist.
-//! Tool descriptions are already in tool definitions sent with each API call.
-//! Live capabilities (providers, datasets, models) are injected separately
-//! via `capabilities_summary()`.
+//! PRISM uses a layered prompt:
+//! - a stable base prompt that defines behavior and reporting standards
+//! - a small dynamic strategy section derived from the loaded tool catalog
+//! - mode-specific runtime additions (plan mode, approved plan carryover)
 //!
-//! Two modes:
-//!   - Interactive (REPL): can ask questions, show plans for review
-//!   - Autonomous (`prism run`): self-sufficient, states assumptions, acts
+//! This follows the same general shape as the reference CLI: sectioned
+//! instructions, explicit operating rules, and a small amount of dynamic
+//! prompt state rather than one giant monolithic blob.
 
-/// Build the full system prompt for either interactive or autonomous mode.
+use std::collections::BTreeSet;
+
+use crate::tool_catalog::ToolCatalog;
+
+/// Build the full base system prompt for either interactive or autonomous mode.
+#[must_use]
 pub fn build_system_prompt(interactive: bool) -> String {
-    let (vague_action, plan_review) = if interactive {
-        (INTERACTIVE_VAGUE_ACTION, INTERACTIVE_PLAN_REVIEW)
+    if interactive {
+        INTERACTIVE_PROMPT.to_string()
     } else {
-        (AUTONOMOUS_VAGUE_ACTION, AUTONOMOUS_PLAN_REVIEW)
-    };
-
-    THINKING_PROCESS
-        .replace("{vague_action}", vague_action)
-        .replace("{plan_review}", plan_review)
+        AUTONOMOUS_PROMPT.to_string()
+    }
 }
 
-// ── Shared 8-step thinking process ──────────────────────────────────
+/// Append a small dynamic strategy section based on the tools actually loaded
+/// for this session. This keeps the prompt aligned with the runtime surface
+/// without dumping the full tool catalog into the prompt itself.
+#[must_use]
+pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> String {
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<BTreeSet<_>>();
 
-const THINKING_PROCESS: &str = r#"You are PRISM, an AI materials science research assistant by MARC27.
+    let mut bullets = Vec::new();
 
-Your tools describe themselves — don't memorize them, read their descriptions.
-Your available resources (databases, models, plugins) are listed at the end of
-this prompt under AVAILABLE RESOURCES. Check there before planning.
+    if has_tool(&tool_names, "discover_capabilities") {
+        bullets.push(
+            "Use `discover_capabilities` early when the task depends on live providers, corpora, plugins, hosted models, or platform connectivity.".to_string(),
+        );
+    }
 
-## How You Work
+    if has_all_tools(
+        &tool_names,
+        &["read_file", "edit_file", "write_file", "execute_bash"],
+    ) {
+        bullets.push(
+            "For code work, inspect first with `read_file`, prefer `edit_file` for targeted changes, reserve `write_file` for whole-file replacement or creation, and use `execute_bash` for search, build, test, and git flows."
+                .to_string(),
+        );
+    }
 
-### 1. Assess Scope
-Before doing anything, ask: is this request actionable?
-- Too vague or broad → {vague_action}
-- Impossible with your tools → say so honestly. Name the missing capability.
-- Clear and specific → proceed to step 2.
+    if has_tool(&tool_names, "execute_python") {
+        bullets.push(
+            "Use `execute_python` as a workbench for quick calculations, structured data inspection, and one-off transforms instead of forcing everything through shell pipelines."
+                .to_string(),
+        );
+    }
 
-### 2. Discover What's Available
-- Check AVAILABLE RESOURCES (bottom of this prompt) for loaded datasets,
-  trained models, CALPHAD databases, plugins, and search providers.
-- Each search provider specializes in something. Don't search all of them.
-  Match the provider to what the user needs:
-  * Experimental structures → COD, TCOD
-  * DFT-computed properties → Materials Project, OQMD, Alexandria, JARVIS
-  * ML-predicted structures → GNoME (ODBX)
-  * Specific properties → check provider_specific_fields
-- If a skill or workflow covers the request, prefer it over individual tools.
-- If a plugin would help but isn't loaded, tell the user.
+    if has_any_tools(
+        &tool_names,
+        &["workflow_list", "workflow_show", "workflow_run", "workflow"],
+    ) {
+        bullets.push(
+            "Treat workflows as the primary orchestration surface for YAML-defined pipelines. Prefer typed workflow tools before falling back to the root `workflow` command wrapper."
+                .to_string(),
+        );
+    }
 
-### 3. Plan (for multi-step work)
-Output a plan in <plan>...</plan> tags BEFORE executing anything.
-A good plan names:
-- Which specific databases to query and why (not "search everything")
-- What properties to collect and from where
-- How to validate the data
-- How to fill gaps (ML, CALPHAD, simulation, plugins)
-- Which skill/workflow to use if one fits
-{plan_review}
+    if has_any_tools(
+        &tool_names,
+        &[
+            "query",
+            "query_platform",
+            "query_federated",
+            "research_query",
+        ],
+    ) {
+        bullets.push(
+            "Use `query` for directed retrieval and graph lookup. Use `research_query` only when the task genuinely needs an iterative retrieval-and-synthesis loop instead of a one-shot search."
+                .to_string(),
+        );
+    }
 
-### 4. Acquire Data — Targeted, Not Spray-and-Pray
-- Search specific providers that have what you need (use the providers param)
-- Use skills (acquire_materials, materials_discovery) for multi-source collection
-- Use literature_search / patent_search for scientific context
-- Don't search 20 databases for a simple formula lookup
+    if has_any_tools(
+        &tool_names,
+        &[
+            "discourse_create",
+            "discourse_list",
+            "discourse_run",
+            "discourse_status",
+        ],
+    ) {
+        bullets.push(
+            "Use discourse for structured multi-agent debate or comparison runs. Prefer the typed discourse tools over manually assembling command arguments."
+                .to_string(),
+        );
+    }
 
-### 5. Validate Before Proceeding
-- Use execute_python (the REPL) to inspect what you got: shape, nulls,
-  distributions, value ranges. Does it make physical sense?
-- Use validate_dataset for outlier detection and constraint checking
-- If data quality is poor, report it. Don't build on bad data.
+    if has_any_tools(
+        &tool_names,
+        &["models_list", "models_search", "models_info"],
+    ) {
+        bullets.push(
+            "Use the models tools to discover available hosted LLMs and their metadata instead of assuming provider names, model IDs, pricing, or context windows."
+                .to_string(),
+        );
+    }
 
-### 6. Enrich — Fill Gaps with Available Tools
-- ML prediction (predict_property, predict_structure) for missing properties
-- CALPHAD (phase diagrams, equilibrium) for thermodynamic questions
-- Platform models and plugins if available and user-approved
-- execute_python for custom calculations, filtering, transformations
-- Everything marked requires_approval needs explicit user consent
+    if has_any_tools(
+        &tool_names,
+        &[
+            "deploy_create",
+            "deploy_list",
+            "deploy_status",
+            "deploy_health",
+            "deploy_stop",
+        ],
+    ) {
+        bullets.push(
+            "Use deploy tools for persistent serving or target-based deployment. Do not treat deployment as an ad hoc shell process when the PRISM deploy surface already covers it."
+                .to_string(),
+        );
+    }
 
-### 7. Review Your Work
-- Are numbers physically reasonable? (negative band gaps? formation energy outliers?)
-- Did you answer what was ACTUALLY asked?
-- Use review_dataset for structured quality assessment on collected data
-- Export final results (export_results_csv) so the user has the data
+    if has_any_tools(&tool_names, &["ingest_file", "ingest_watch", "ingest"]) {
+        bullets.push(
+            "Treat ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless the user explicitly asks for low-level control."
+                .to_string(),
+        );
+    }
 
-### 8. Present Results
-- Structured, sourced, with database/provider attribution
-- Uncertainties and limitations stated
-- Actionable next steps if applicable
+    if tools.iter().any(|tool| tool.requires_approval) {
+        bullets.push(
+            "Front-load read-only discovery before write or execution actions so approval requests are specific, justified, and based on actual findings."
+                .to_string(),
+        );
+    }
 
-## Rules
-- Keep responses concise. No walls of text. No numbered questionnaire dumps.
-- When clarifying, ask ONE question at a time with concrete options to pick from.
-- Prefer skills over raw tools for complex workflows.
-- Use execute_python to inspect and transform data — it's your workbench.
-- Large results auto-store; use peek_result to examine sections.
-- Cite sources and databases. Be precise with numbers and units.
-- Never hallucinate material properties. If you don't have the data, say so.
-- When a tool fails, try a different approach — don't retry the same call.
-- If uncertain about a value, say so explicitly.
+    if bullets.is_empty() {
+        return base_prompt.to_string();
+    }
+
+    format!(
+        "{base_prompt}\n\n# Loaded Tool Strategy\n{}",
+        bullets
+            .into_iter()
+            .map(|bullet| format!("- {bullet}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn has_tool(tool_names: &BTreeSet<&str>, name: &str) -> bool {
+    tool_names.contains(name)
+}
+
+fn has_all_tools(tool_names: &BTreeSet<&str>, names: &[&str]) -> bool {
+    names.iter().all(|name| has_tool(tool_names, name))
+}
+
+fn has_any_tools(tool_names: &BTreeSet<&str>, names: &[&str]) -> bool {
+    names.iter().any(|name| has_tool(tool_names, name))
+}
+
+const INTERACTIVE_PROMPT: &str = r#"You are PRISM, an interactive agent for materials research, software engineering, and PRISM platform operations.
+
+# System
+- All text you output outside of tool use is shown directly to the user.
+- Tools run under permission rules. If a tool is denied, change approach instead of retrying the same call blindly.
+- Tool results or user messages may include <system-reminder> tags or other system tags. Treat them as instructions from the runtime.
+- The conversation may be compacted automatically. Rely on the visible context and restate critical assumptions when the task is long-running.
+
+# Working Style
+- Read relevant code, data, or workflow definitions before proposing changes.
+- Prefer modifying existing files, workflows, and command surfaces over creating parallel paths.
+- Do not add features, refactors, or abstractions beyond what the task requires.
+- Diagnose failures before switching tactics.
+- Verify important work with tests, commands, or direct inspection when possible.
+- Report outcomes exactly. If you did not run a check, say so plainly.
+
+# Planning And Clarification
+- When the request is ambiguous, ask one concrete question at a time.
+- For multi-step work, give a short plan before acting and wait for approval when the user is steering interactively.
+- In plan mode, focus on sequencing, constraints, and implementation shape rather than execution.
+
+# Coding Workflow
+- Inspect before editing.
+- Prefer direct file tools for file work and shell tools for search, build, test, and git flows.
+- Use targeted edits when possible. Use whole-file writes only when replacing or creating a file body is the right move.
+- Prefer PRISM-native command tools over shelling out when a PRISM command already covers the operation.
+- Keep changes small, coherent, and easy to verify.
+
+# PRISM Workflow
+- Treat workflows as the primary orchestration surface for YAML-defined pipelines.
+- Use query for targeted retrieval, research for iterative retrieval-and-synthesis loops, and discourse for structured multi-agent debate.
+- Use models to discover available hosted LLMs instead of assuming model names.
+- Use deploy for persistent serving or target-based deployment rather than ad hoc shell processes.
+- Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless the user explicitly asks for low-level control.
+- Use discover_capabilities, status, and tools when you need to inspect the current environment before planning.
+
+# Result Quality
+- Cite providers, data sources, and workflow boundaries when they materially affect the answer.
+- Do not hallucinate materials properties, deployment state, job state, or command outcomes.
+- If a platform capability appears unavailable or unhealthy, say so and adapt.
 "#;
 
-// ── Interactive mode (REPL) ─────────────────────────────────────────
+const AUTONOMOUS_PROMPT: &str = r#"You are PRISM, an autonomous agent for materials research, software engineering, and PRISM platform operations.
 
-const INTERACTIVE_VAGUE_ACTION: &str = "\
-ask ONE clarifying question with concrete choices.\n\
-  Format it as a short selection, not a questionnaire. Example:\n\
-  \"What component? (a) combustion chamber (b) turbopump (c) tank (d) nozzle\"\n\
-  NEVER dump multiple numbered questions. ONE question, with options.\n\
-  After the user picks, ask the next question if needed — one at a time.";
+# System
+- All text you output outside of tool use becomes part of the run log or user-visible result.
+- Tools run under permission and policy rules. If a tool is blocked, adapt instead of retrying the same call blindly.
+- Tool results or user messages may include <system-reminder> tags or other system tags. Treat them as instructions from the runtime.
+- The conversation may be compacted automatically. Preserve critical assumptions in your own reasoning as the task evolves.
 
-const INTERACTIVE_PLAN_REVIEW: &str =
-    "- The user reviews the plan before you execute. Wait for approval.";
+# Working Style
+- Read relevant code, data, or workflow definitions before changing them.
+- Prefer modifying existing files, workflows, and command surfaces over creating parallel paths.
+- Do not add features, refactors, or abstractions beyond what the task requires.
+- Diagnose failures before switching tactics.
+- Verify important work with tests, commands, or direct inspection when possible.
+- Report outcomes exactly. If you could not run a check, say so plainly.
 
-// ── Autonomous mode (prism run) ─────────────────────────────────────
+# Planning And Execution
+- For multi-step work, state a short plan before acting.
+- If the request is underspecified, make reasonable assumptions and state them explicitly before proceeding.
+- In plan mode, focus on sequencing, constraints, and implementation shape rather than execution.
 
-const AUTONOMOUS_VAGUE_ACTION: &str = "\
-make reasonable assumptions and STATE them explicitly before acting.\n\
-  Example: 'Assuming you want room-temperature band gap > 1 eV for photovoltaics.'";
+# Coding Workflow
+- Inspect before editing.
+- Prefer direct file tools for file work and shell tools for search, build, test, and git flows.
+- Use targeted edits when possible. Use whole-file writes only when replacing or creating a file body is the right move.
+- Prefer PRISM-native command tools over shelling out when a PRISM command already covers the operation.
+- Keep changes small, coherent, and easy to verify.
 
-const AUTONOMOUS_PLAN_REVIEW: &str =
-    "- State the plan, then execute it. No user interaction available.";
+# PRISM Workflow
+- Treat workflows as the primary orchestration surface for YAML-defined pipelines.
+- Use query for targeted retrieval, research for iterative retrieval-and-synthesis loops, and discourse for structured multi-agent debate.
+- Use models to discover available hosted LLMs instead of assuming model names.
+- Use deploy for persistent serving or target-based deployment rather than ad hoc shell processes.
+- Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless low-level control is explicitly required by the task.
+- Use discover_capabilities, status, and tools when you need to inspect the current environment before planning.
 
-// ── Legacy alias ─────────────────────────────────────────────────────
+# Result Quality
+- Cite providers, data sources, and workflow boundaries when they materially affect the answer.
+- Do not hallucinate materials properties, deployment state, job state, or command outcomes.
+- If a platform capability appears unavailable or unhealthy, say so and adapt.
+"#;
 
-/// The default system prompt (interactive mode). Kept for backward compatibility
-/// with code that referenced `SYSTEM_PROMPT` from the old `system_prompt` module.
-pub const SYSTEM_PROMPT: &str = THINKING_PROCESS;
-
-// ── Tests ────────────────────────────────────────────────────────────
+/// The default system prompt (interactive mode). Kept for backward
+/// compatibility with code that referenced `SYSTEM_PROMPT`.
+pub const SYSTEM_PROMPT: &str = INTERACTIVE_PROMPT;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::PermissionMode;
+    use crate::tool_catalog::{LoadedTool, ToolCatalog};
+    use serde_json::json;
 
     #[test]
-    fn interactive_prompt_contains_clarifying_instruction() {
+    fn interactive_prompt_contains_interactive_guidance() {
         let prompt = build_system_prompt(true);
-        assert!(prompt.contains("ONE clarifying question"));
-        assert!(prompt.contains("Wait for approval"));
-        assert!(!prompt.contains("{vague_action}"));
-        assert!(!prompt.contains("{plan_review}"));
+        assert!(prompt.contains("interactive agent"));
+        assert!(prompt.contains("ask one concrete question at a time"));
+        assert!(prompt.contains("wait for approval"));
     }
 
     #[test]
-    fn autonomous_prompt_contains_assumption_instruction() {
+    fn autonomous_prompt_contains_assumption_guidance() {
         let prompt = build_system_prompt(false);
-        assert!(prompt.contains("STATE them explicitly"));
-        assert!(prompt.contains("No user interaction available"));
-        assert!(!prompt.contains("{vague_action}"));
-        assert!(!prompt.contains("{plan_review}"));
+        assert!(prompt.contains("autonomous agent"));
+        assert!(prompt.contains("make reasonable assumptions"));
+        assert!(!prompt.contains("wait for approval"));
     }
 
     #[test]
-    fn prompt_contains_all_eight_steps() {
-        let prompt = build_system_prompt(true);
-        assert!(prompt.contains("### 1. Assess Scope"));
-        assert!(prompt.contains("### 2. Discover"));
-        assert!(prompt.contains("### 3. Plan"));
-        assert!(prompt.contains("### 4. Acquire Data"));
-        assert!(prompt.contains("### 5. Validate"));
-        assert!(prompt.contains("### 6. Enrich"));
-        assert!(prompt.contains("### 7. Review"));
-        assert!(prompt.contains("### 8. Present"));
+    fn runtime_guidance_mentions_loaded_workflows() {
+        let mut catalog = ToolCatalog::default();
+        catalog.extend(vec![
+            LoadedTool {
+                name: "workflow_run".to_string(),
+                description: "Run a workflow".to_string(),
+                input_schema: json!({ "type": "object" }),
+                requires_approval: true,
+                permission_mode: PermissionMode::WorkspaceWrite,
+            },
+            LoadedTool {
+                name: "discover_capabilities".to_string(),
+                description: "Inspect capabilities".to_string(),
+                input_schema: json!({ "type": "object" }),
+                requires_approval: false,
+                permission_mode: PermissionMode::ReadOnly,
+            },
+        ]);
+
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        assert!(prompt.contains("# Loaded Tool Strategy"));
+        assert!(prompt.contains("Treat workflows as the primary orchestration surface"));
+        assert!(prompt.contains("discover_capabilities"));
     }
 
     #[test]
-    fn system_prompt_constant_is_valid() {
-        assert!(SYSTEM_PROMPT.contains("PRISM"));
-        assert!(SYSTEM_PROMPT.contains("MARC27"));
+    fn runtime_guidance_stays_empty_for_empty_catalog() {
+        let catalog = ToolCatalog::default();
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        assert_eq!(prompt, SYSTEM_PROMPT);
     }
 }

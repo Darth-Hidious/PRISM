@@ -17,6 +17,8 @@ import { PlanCard } from "./PlanCard.js";
 import { CostLine } from "./CostLine.js";
 import { ApprovalPrompt } from "./ApprovalPrompt.js";
 import { SessionList } from "./SessionList.js";
+import { Byline } from "./chrome/Byline.js";
+import { Pane } from "./chrome/Pane.js";
 
 export interface TurnInput {
   text: string;
@@ -138,7 +140,6 @@ export function cloneTurn(turn: TurnData): TurnData {
 
 function TurnInputHeader({ input }: { input: TurnInput }) {
   const isCommand = input.kind === "command";
-  const label = isCommand ? "you · command" : "you · prompt";
   const prefix = isCommand ? "/" : "›";
 
   return (
@@ -153,7 +154,12 @@ function TurnInputHeader({ input }: { input: TurnInput }) {
       marginTop={1}
       flexDirection="column"
     >
-      <Text color={TEXT_DIM}>{label}</Text>
+      <Text color={TEXT_DIM}>
+        <Byline>
+          <Text>you</Text>
+          <Text>{isCommand ? "command" : "prompt"}</Text>
+        </Byline>
+      </Text>
       <Text color={isCommand ? WARNING : TEXT} bold>
         {prefix} {input.text}
       </Text>
@@ -178,30 +184,18 @@ function CommandViewPreview({ view }: { view: TurnCommandView }) {
   const body = activeTab?.body ?? view.body ?? "";
 
   return (
-    <Box
-      flexDirection="column"
-      borderStyle="single"
-      borderLeft
-      borderRight={false}
-      borderTop={false}
-      borderBottom={false}
-      borderColor={PRIMARY}
-      paddingLeft={2}
-      marginTop={1}
+    <Pane
+      color={PRIMARY}
+      title={view.title}
+      subtitle={activeTab?.title}
+      footer={view.footer ?? undefined}
     >
-      <Text color={PRIMARY} bold>
-        {view.title}
-        {activeTab ? <Text color={TEXT_DIM}>{` · ${activeTab.title}`}</Text> : null}
-      </Text>
       {body ? (
-        <Box marginTop={0} flexDirection="column">
+        <Box flexDirection="column">
           <MarkdownText text={body} />
         </Box>
       ) : null}
-      {view.footer ? (
-        <Text color={TEXT_DIM}>{view.footer}</Text>
-      ) : null}
-    </Box>
+    </Pane>
   );
 }
 
@@ -220,14 +214,14 @@ export function TurnCard({ turn, streaming = false, onApprovalResponse }: Props)
   const pendingTool = turn.toolCalls.find((toolCall) => toolCall.pending);
   const hasActivity = turn.toolCalls.length > 0 || turn.approvalRequest;
   const assistantLabel = turn.approvalRequest
-    ? "prism · approval"
+    ? "approval"
     : pendingTool
-      ? "prism · tools"
+      ? "tools"
       : turn.commandView
-        ? "prism · command"
+        ? "command"
         : streaming
-          ? "prism · working"
-          : "prism";
+          ? "working"
+          : "response";
 
   return (
     <Box flexDirection="column">
@@ -245,7 +239,13 @@ export function TurnCard({ turn, streaming = false, onApprovalResponse }: Props)
           marginTop={turn.input ? 0 : 1}
           flexDirection="column"
         >
-          <Text color={SECONDARY}>{assistantLabel}</Text>
+          <Text color={SECONDARY}>
+            <Byline>
+              <Text>prism</Text>
+              <Text>{assistantLabel}</Text>
+              {pendingTool?.verb ? <Text color={TEXT_DIM}>{pendingTool.verb}</Text> : null}
+            </Byline>
+          </Text>
 
           {turn.assistantText ? (
             <Box marginTop={0} flexDirection="column">
@@ -317,8 +317,6 @@ export function TurnCard({ turn, streaming = false, onApprovalResponse }: Props)
 
           {streaming && pendingTool?.verb ? (
             <Box marginTop={1}>
-              {/* Keep the active tool verb visible even when the row itself is
-                  still in a compact pending state. */}
               <Text color={TEXT_DIM}>{pendingTool.verb}</Text>
             </Box>
           ) : null}

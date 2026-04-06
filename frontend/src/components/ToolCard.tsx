@@ -5,6 +5,7 @@ import {
   BORDER, BG_PANEL, BORDER_AGENT,
 } from "../theme.js";
 import { MarkdownText } from "./MarkdownText.js";
+import { Pane } from "./chrome/Pane.js";
 
 interface Props {
   cardType: string;
@@ -258,23 +259,19 @@ export function ToolCard({ cardType, toolName, elapsedMs, content, data, pending
     // Execution tools benefit from a structured block view: preview first, then
     // exit semantics and stdout/stderr as separate sections.
     return (
-      <Box
-        flexDirection="column"
-        borderStyle="single"
-        borderLeft
-        borderRight={false}
-        borderTop={false}
-        borderBottom={false}
-        borderColor={isError ? ERROR : BORDER}
-        paddingLeft={2}
-        marginTop={1}
+      <Pane
+        color={isError ? ERROR : BORDER_AGENT}
+        title={toolName}
+        subtitle={
+          elapsed
+            ? isError
+              ? `${elapsed} · failed`
+              : elapsed
+            : isError
+              ? "failed"
+              : undefined
+        }
       >
-        <Box>
-          <Text color={isError ? ERROR : SUCCESS}>{isError ? "✗" : "✓"}</Text>
-          <Text color={TEXT} bold>{" "}{toolName}</Text>
-          {elapsed ? <Text color={TEXT_DIM}>{" · "}{elapsed}</Text> : null}
-        </Box>
-
         {preview ? (
           <Text color={TEXT_MUTED}>{preview}</Text>
         ) : null}
@@ -325,7 +322,7 @@ export function ToolCard({ cardType, toolName, elapsedMs, content, data, pending
             <MarkdownText text={content} />
           </Box>
         ) : null}
-      </Box>
+      </Pane>
     );
   }
 

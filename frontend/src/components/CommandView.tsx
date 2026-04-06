@@ -1,7 +1,6 @@
 import React from "react";
 import { Box, Text, useInput } from "ink";
 import {
-  ACCENT,
   PRIMARY,
   TEXT,
   TEXT_DIM,
@@ -9,6 +8,9 @@ import {
 } from "../theme.js";
 import { MarkdownText } from "./MarkdownText.js";
 import type { UiViewTab } from "../bridge/types.js";
+import { Byline } from "./chrome/Byline.js";
+import { KeyboardShortcutHint } from "./chrome/KeyboardShortcutHint.js";
+import { Pane } from "./chrome/Pane.js";
 
 interface Props {
   title: string;
@@ -24,8 +26,6 @@ function borderColorForTone(tone?: string): string {
   switch (tone) {
     case "warning":
       return WARNING;
-    case "accent":
-      return ACCENT;
     default:
       return PRIMARY;
   }
@@ -61,6 +61,17 @@ export function CommandView({
   const activeTab = tabList[tabIndex];
   const activeBody = activeTab?.body ?? body ?? "";
   const activeTone = activeTab?.tone ?? tone;
+  const footerGuide = (
+    <Text color={TEXT_DIM}>
+      <Byline>
+        {tabList.length > 1 ? (
+          <KeyboardShortcutHint shortcut="tab/shift+tab" action="switch tabs" />
+        ) : null}
+        <KeyboardShortcutHint shortcut="1-9" action="jump" />
+        <KeyboardShortcutHint shortcut="esc" action="close" />
+      </Byline>
+    </Text>
+  );
 
   useInput((input, key) => {
     if (key.escape || key.return || input === "q" || input === "Q") {
@@ -89,24 +100,19 @@ export function CommandView({
   });
 
   return (
-    <Box
-      flexDirection="column"
-      borderStyle="round"
-      borderColor={borderColorForTone(activeTone)}
-      paddingX={1}
-      paddingY={0}
-      marginTop={1}
+    <Pane
+      color={borderColorForTone(activeTone)}
+      title={title}
+      subtitle={activeTab ? activeTab.title : undefined}
+      footer={
+        <Box flexDirection="column">
+          {footer ? <Text color={TEXT_DIM}>{footer}</Text> : null}
+          {footerGuide}
+        </Box>
+      }
     >
-      <Box justifyContent="space-between">
-        <Text color={TEXT} bold>
-          {title}
-        </Text>
-        <Text color={TEXT_DIM}>
-          {tabList.length > 1 ? "tab switch" : "esc close"}
-        </Text>
-      </Box>
       {tabList.length > 0 ? (
-        <Box marginTop={1} gap={1} flexWrap="wrap">
+        <Box gap={1} flexWrap="wrap">
           {tabList.map((tab, index) => {
             const isActive = index === tabIndex;
             return (
@@ -114,21 +120,17 @@ export function CommandView({
                 key={tab.id}
                 color={isActive ? TEXT : TEXT_DIM}
                 inverse={isActive}
+                bold={isActive}
               >
-                {index + 1}. {tab.title}
+                {` ${index + 1}. ${tab.title} `}
               </Text>
             );
           })}
         </Box>
       ) : null}
-      <Box marginTop={1} flexDirection="column">
+      <Box marginTop={tabList.length > 0 ? 1 : 0} flexDirection="column">
         <MarkdownText text={activeBody} />
       </Box>
-      {footer ? (
-        <Box marginTop={1}>
-          <Text color={TEXT_DIM}>{footer}</Text>
-        </Box>
-      ) : null}
-    </Box>
+    </Pane>
   );
 }
