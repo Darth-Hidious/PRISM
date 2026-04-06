@@ -1,6 +1,6 @@
 # PRISM Sprint Status — Full Audit (2026-04-04)
 
-## What's Shipped (v2.6.0)
+## What's Shipped (v2.6.1)
 
 **Rust Agent (crates/agent/) — DONE:**
 - [x] TAOR agent loop (think-act-observe-repeat)

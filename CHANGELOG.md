@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.6.0] - 2026-04-04
 
+## [2.6.1] - 2026-04-06
+
+### Added
+- Native PRISM command/tool parity across the Rust agent, CLI, and TUI, including typed surfaces for workflow, deploy, discourse, ingest, models, run, publish, and node flows.
+- Live platform discovery integration for agent capabilities, knowledge capabilities, and project-scoped hosted LLM models.
+- External MCP tool loading in the merged catalog used by `prism tools`, the Rust agent, and the TUI permission/editor flow.
+- Node-side deployment lifecycle handling plus platform-aligned node public-key and E2EE exchange support.
+
+### Changed
+- The shell/TUI now renders grouped turns, inline approvals, structured command views, and richer status/session/plan screens.
+- `prism ingest` now uses one unified command shape for local and platform-backed ingestion, including PDF routing and corpus-aware status reporting.
+- The PM dashboard is wired to live PRISM data and the native release pipeline ships the real dashboard and standalone TUI binaries.
+- CLI node key fetch/exchange now honor env-based MARC27 auth in the same way as the rest of the platform-backed command surface.
+
 ### Added — Rust Agent (prism-agent crate)
 - **TAOR agent loop**: Think-Act-Observe-Repeat loop in pure Rust with hooks, permissions, doom loop detection, compaction, and scratchpad logging.
 - **10 agent modules**: types, models, transcript, permissions, hooks, scratchpad, session, prompts, agent_loop, protocol — faithfully ported from deleted Python agent.
