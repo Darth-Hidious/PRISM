@@ -2637,6 +2637,83 @@ fn format_current_session_report(
     }
 }
 
+fn emit_current_session_screen(
+    session_store: &SessionStore,
+    llm_config: &LlmConfig,
+    transcript: &TranscriptStore,
+    session_mode: SessionMode,
+    plan_state: &PlanRuntimeState,
+) {
+    let current_session = session_store
+        .current_id()
+        .unwrap_or(transcript.session_id.as_str());
+    let summary = format!(
+        "Current session\n  id: {}\n  model: {}\n  mode: {}\n  plan status: {}\n  turns: {}\n  transcript entries: {}",
+        current_session,
+        llm_config.model,
+        session_mode.as_str(),
+        plan_state.status.unwrap_or(PlanStatus::None).as_str(),
+        session_store.meta().map(|meta| meta.turn_count).unwrap_or(0),
+        transcript.entries.len(),
+    );
+    let transcript_body = format!(
+        "Conversation\n  transcript entries: {}\n  turns: {}\n  compactions: {}\n  input tokens: {}\n  output tokens: {}",
+        transcript.entries.len(),
+        transcript.turn_count,
+        session_store
+            .meta()
+            .map(|meta| meta.compaction_count)
+            .unwrap_or(0),
+        transcript.cost.total_input,
+        transcript.cost.total_output,
+    );
+    let raw = format_current_session_report(session_store, llm_config, transcript);
+    emit_tabbed_view(
+        "session",
+        "Current Session",
+        &[
+            ("summary", "Summary", &summary, "info"),
+            ("conversation", "Conversation", &transcript_body, "accent"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        "summary",
+        "info",
+        "tab switch • esc close",
+    );
+}
+
+fn emit_plan_screen(
+    title: &str,
+    headline: &str,
+    session_mode: SessionMode,
+    plan_state: &PlanRuntimeState,
+    plan_body: &str,
+    plan_path: &std::path::Path,
+    tone: &str,
+    selected_tab: &str,
+) {
+    let summary = format!(
+        "{}\n\nMode\n  {}\n\nPlan status\n  {}\n\nSnapshot\n  {}",
+        headline,
+        session_mode.as_str(),
+        plan_state.status.unwrap_or(PlanStatus::None).as_str(),
+        plan_path.display(),
+    );
+    let commands = "Commands\n  /plan\n  /plan accept\n  /plan reject\n  /plan clear\n  /plan off\n  /plan path";
+    emit_tabbed_view(
+        "plan",
+        title,
+        &[
+            ("summary", "Summary", &summary, tone),
+            ("plan", "Plan", plan_body, "accent"),
+            ("commands", "Commands", commands, "info"),
+        ],
+        selected_tab,
+        tone,
+        "tab switch • esc close",
+    );
+}
+
 fn format_workflow_arguments(spec: &WorkflowSpec) -> String {
     if spec.arguments.is_empty() {
         return "(no arguments)".to_string();
@@ -4697,15 +4774,15 @@ async fn handle_command(
                     llm_config,
                     slash_ctx,
                 );
-                emit_view(
-                    "plan",
+                emit_plan_screen(
                     "Plan Approved",
-                    &format!(
-                        "The current plan is approved for execution.\n\nExecution mode is active again and the approved plan will be carried into future turns until you clear or replace it.\nPlan snapshot: {}\n\n{}",
-                        plan_path.display(),
-                        plan_body
-                    ),
+                    "The current plan is approved for execution. Execution mode is active again and the approved plan will be carried into future turns until you clear or replace it.",
+                    *session_mode,
+                    plan_state,
+                    &plan_body,
+                    &plan_path,
                     "accent",
+                    "plan",
                 );
                 emit_notification("ui.turn.complete", serde_json::json!({}));
                 return Ok(true);
@@ -4728,11 +4805,18 @@ async fn handle_command(
                     llm_config,
                     slash_ctx,
                 );
-                emit_view(
-                    "plan",
+                let plan_body = load_plan_snapshot(slash_ctx, &session_id)
+                    .unwrap_or_else(|| format_plan_report(transcript, scratchpad));
+                let plan_path = plan_snapshot_path(slash_ctx, &session_id);
+                emit_plan_screen(
                     "Plan Rejected",
                     "The current plan stays in review mode. Keep refining it or use `/plan accept` once it is ready to execute.",
+                    *session_mode,
+                    plan_state,
+                    &plan_body,
+                    &plan_path,
                     "warning",
+                    "summary",
                 );
                 emit_notification("ui.turn.complete", serde_json::json!({}));
                 return Ok(true);
@@ -4755,11 +4839,17 @@ async fn handle_command(
                     llm_config,
                     slash_ctx,
                 );
-                emit_view(
-                    "plan",
+                let plan_body = format_plan_report(transcript, scratchpad);
+                let plan_path = plan_snapshot_path(slash_ctx, &session_id);
+                emit_plan_screen(
                     "Plan State Cleared",
                     "Cleared the stored approved-plan context. Future execution turns will use only live conversation context.",
+                    *session_mode,
+                    plan_state,
+                    &plan_body,
+                    &plan_path,
                     "info",
+                    "summary",
                 );
                 emit_notification("ui.turn.complete", serde_json::json!({}));
                 return Ok(true);
@@ -4789,14 +4879,15 @@ async fn handle_command(
                     llm_config,
                     slash_ctx,
                 );
-                emit_view(
-                    "plan",
+                emit_plan_screen(
                     "Plan Mode",
-                    &format!(
-                        "Plan mode disabled.\n\nThe agent is back in normal execution mode.\nLatest plan snapshot: {}",
-                        plan_path.display()
-                    ),
+                    "Plan mode disabled. The agent is back in normal execution mode.",
+                    *session_mode,
+                    plan_state,
+                    &plan_body,
+                    &plan_path,
                     "accent",
+                    "summary",
                 );
                 emit_notification("ui.turn.complete", serde_json::json!({}));
                 return Ok(true);
@@ -4804,11 +4895,17 @@ async fn handle_command(
 
             if action == "path" {
                 let path = plan_snapshot_path(slash_ctx, &session_id);
-                emit_view(
-                    "plan",
+                let plan_body = load_plan_snapshot(slash_ctx, &session_id)
+                    .unwrap_or_else(|| format_plan_report(transcript, scratchpad));
+                emit_plan_screen(
                     "Plan Snapshot",
-                    &format!("Plan snapshot path\n\n{}", path.display()),
+                    "Plan snapshots are stored in the project so planning work survives resume and handoff.",
+                    *session_mode,
+                    plan_state,
+                    &plan_body,
+                    &path,
                     "accent",
+                    "summary",
                 );
                 emit_notification("ui.turn.complete", serde_json::json!({}));
                 return Ok(true);
@@ -4837,12 +4934,16 @@ async fn handle_command(
                 );
                 let plan_body = format_plan_report(transcript, scratchpad);
                 let plan_path = persist_plan_snapshot(slash_ctx, &session_id, &plan_body)?;
-                let body = format!(
-                    "Plan mode enabled.\n\nWrite and execution tools are blocked in this mode.\nThe next prompt will be treated as planning-first work.\nUse `/plan accept` to carry the approved plan into execution mode, `/plan reject` to keep iterating, or `/plan off` to leave planning without approval.\nPlan snapshot: {}\n\n{}",
-                    plan_path.display(),
-                    plan_body
+                emit_plan_screen(
+                    "Plan Mode",
+                    "Plan mode enabled. Write and execution tools are blocked in this mode, and the next prompt will be treated as planning-first work.",
+                    *session_mode,
+                    plan_state,
+                    &plan_body,
+                    &plan_path,
+                    "accent",
+                    "plan",
                 );
-                emit_view("plan", "Plan Mode", &body, "accent");
                 emit_notification("ui.turn.complete", serde_json::json!({}));
                 return Ok(true);
             }
@@ -4852,15 +4953,16 @@ async fn handle_command(
                 let _ = persist_plan_snapshot(slash_ctx, &session_id, &plan_body);
                 plan_body
             });
-            emit_view(
-                "plan",
+            let plan_path = plan_snapshot_path(slash_ctx, &session_id);
+            emit_plan_screen(
                 "Current Plan",
-                &format!(
-                    "Plan status: {}\n\n{}\n\nCommands\n  /plan accept\n  /plan reject\n  /plan clear\n  /plan off",
-                    plan_state.status.unwrap_or(PlanStatus::None).as_str(),
-                    text
-                ),
+                "Current planning state for this session.",
+                *session_mode,
+                plan_state,
+                &text,
+                &plan_path,
                 "accent",
+                "plan",
             );
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
@@ -4903,8 +5005,13 @@ async fn handle_command(
             Ok(true)
         }
         "/session" => {
-            let text = format_current_session_report(session_store, llm_config, transcript);
-            emit_view("session", "Current Session", &text, "info");
+            emit_current_session_screen(
+                session_store,
+                llm_config,
+                transcript,
+                *session_mode,
+                plan_state,
+            );
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
