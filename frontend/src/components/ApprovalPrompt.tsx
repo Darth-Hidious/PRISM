@@ -10,6 +10,7 @@ import {
 import { Byline } from "./chrome/Byline.js";
 import { KeyboardShortcutHint } from "./chrome/KeyboardShortcutHint.js";
 import { Pane } from "./chrome/Pane.js";
+import { Pill } from "./chrome/Pill.js";
 
 interface Props {
   toolName: string;
@@ -98,13 +99,12 @@ export function ApprovalPrompt({
 
       <Box marginTop={1} gap={1}>
         {OPTIONS.map((opt, i) => (
-          <Text
+          <Pill
             key={opt.key}
-            backgroundColor={i === selected ? WARNING : BG_MENU}
+            label={`${opt.label} (${opt.key})`}
             color={i === selected ? "#0a0a0a" : TEXT_MUTED}
-          >
-            {` ${opt.label} (${opt.key}) `}
-          </Text>
+            active={i === selected}
+          />
         ))}
       </Box>
     </Pane>

@@ -9,6 +9,11 @@ import { SessionList } from "./components/SessionList.js";
 import { ModelSelector } from "./components/ModelSelector.js";
 import { CommandView } from "./components/CommandView.js";
 import {
+  PermissionEditor,
+  type PermissionTool,
+} from "./components/PermissionEditor.js";
+import { SessionPicker } from "./components/SessionPicker.js";
+import {
   cloneTurn,
   TurnCard,
   type TurnCommandView,
@@ -64,6 +69,18 @@ interface ActiveView {
   footer?: string;
 }
 
+interface ActivePermissions {
+  mode: string;
+  autoApproved: PermissionTool[];
+  blocked: PermissionTool[];
+  approvalRequired: PermissionTool[];
+  readOnly: PermissionTool[];
+  workspaceWrite: PermissionTool[];
+  fullAccess: PermissionTool[];
+  allowOverrides: string[];
+  denyOverrides: string[];
+}
+
 function toTurnCommandView(view: ActiveView): TurnCommandView {
   return {
     title: view.title,
@@ -87,6 +104,10 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
   const [statusState, setStatusState] = useState<StatusState | null>(null);
   const [welcomeState, setWelcomeState] = useState<WelcomeState | null>(null);
   const [activeView, setActiveView] = useState<ActiveView | null>(null);
+  const [activePermissions, setActivePermissions] = useState<ActivePermissions | null>(null);
+  const [activeSessionPicker, setActiveSessionPicker] = useState<TurnSessionSummary[] | null>(
+    null,
+  );
   const nextIdRef = React.useRef(0);
   const lastProcessedRef = React.useRef(0);
   const historyRef = React.useRef<HistoryItem[]>([]);
@@ -304,14 +325,90 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
                 })) satisfies TurnSessionSummary[]
               : [];
             localDraft.viewSummary = `Listed ${localDraft.sessionList.length} sessions`;
+            setActiveSessionPicker(localDraft.sessionList ?? []);
+            setActiveView(null);
+            setActivePermissions(null);
             draftChanged = true;
           } else {
             localHistory.push({ id: takeId(), type: "sessions", data: ev.params });
             historyChanged = true;
           }
           break;
+        case "ui.permissions":
+          setActivePermissions({
+            mode: String(ev.params.mode ?? "chat"),
+            autoApproved: Array.isArray(ev.params.auto_approved)
+              ? ev.params.auto_approved.map((tool: any) => ({
+                  name: String(tool.name ?? ""),
+                  permission_mode: String(tool.permission_mode ?? ""),
+                  requires_approval: !!tool.requires_approval,
+                  description: String(tool.description ?? ""),
+                  current_behavior: String(tool.current_behavior ?? ""),
+                }))
+              : [],
+            blocked: Array.isArray(ev.params.blocked)
+              ? ev.params.blocked.map((tool: any) => ({
+                  name: String(tool.name ?? ""),
+                  permission_mode: String(tool.permission_mode ?? ""),
+                  requires_approval: !!tool.requires_approval,
+                  description: String(tool.description ?? ""),
+                  current_behavior: String(tool.current_behavior ?? ""),
+                }))
+              : [],
+            approvalRequired: Array.isArray(ev.params.approval_required)
+              ? ev.params.approval_required.map((tool: any) => ({
+                  name: String(tool.name ?? ""),
+                  permission_mode: String(tool.permission_mode ?? ""),
+                  requires_approval: !!tool.requires_approval,
+                  description: String(tool.description ?? ""),
+                  current_behavior: String(tool.current_behavior ?? ""),
+                }))
+              : [],
+            readOnly: Array.isArray(ev.params.read_only)
+              ? ev.params.read_only.map((tool: any) => ({
+                  name: String(tool.name ?? ""),
+                  permission_mode: String(tool.permission_mode ?? ""),
+                  requires_approval: !!tool.requires_approval,
+                  description: String(tool.description ?? ""),
+                  current_behavior: String(tool.current_behavior ?? ""),
+                }))
+              : [],
+            workspaceWrite: Array.isArray(ev.params.workspace_write)
+              ? ev.params.workspace_write.map((tool: any) => ({
+                  name: String(tool.name ?? ""),
+                  permission_mode: String(tool.permission_mode ?? ""),
+                  requires_approval: !!tool.requires_approval,
+                  description: String(tool.description ?? ""),
+                  current_behavior: String(tool.current_behavior ?? ""),
+                }))
+              : [],
+            fullAccess: Array.isArray(ev.params.full_access)
+              ? ev.params.full_access.map((tool: any) => ({
+                  name: String(tool.name ?? ""),
+                  permission_mode: String(tool.permission_mode ?? ""),
+                  requires_approval: !!tool.requires_approval,
+                  description: String(tool.description ?? ""),
+                  current_behavior: String(tool.current_behavior ?? ""),
+                }))
+              : [],
+            allowOverrides: Array.isArray(ev.params.allow_overrides)
+              ? ev.params.allow_overrides.map(String)
+              : [],
+            denyOverrides: Array.isArray(ev.params.deny_overrides)
+              ? ev.params.deny_overrides.map(String)
+              : [],
+          });
+          setActiveView(null);
+          if (localDraft?.input?.kind === "command") {
+            localDraft.viewSummary = "Opened Permissions";
+            draftChanged = true;
+          }
+          break;
         case "ui.model.list":
           setModelList({ current: ev.params.current, models: ev.params.models });
+          setActiveView(null);
+          setActivePermissions(null);
+          setActiveSessionPicker(null);
           break;
         case "ui.view":
           const nextView = {
@@ -333,6 +430,8 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
             footer: ev.params.footer ? String(ev.params.footer) : undefined,
           } satisfies ActiveView;
           setActiveView(nextView);
+          setActivePermissions(null);
+          setActiveSessionPicker(null);
           if (localDraft?.input?.kind === "command") {
             // Keep a compact transcript breadcrumb for slash commands even when
             // the rich body is shown in the modal-style command view.
@@ -377,7 +476,7 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
     [draftTurn?.approvalRequest?.toolName, sendPromptResponse],
   );
 
-  const handleSubmit = useCallback(
+  const dispatchInput = useCallback(
     (text: string) => {
       const input: TurnInput = {
         text,
@@ -389,6 +488,9 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
       // state, so both need the same draft instance immediately.
       draftTurnRef.current = nextDraft;
       setDraftTurn(nextDraft);
+      setActiveView(null);
+      setActivePermissions(null);
+      setActiveSessionPicker(null);
 
       if (text.startsWith("/")) {
         sendCommand(text);
@@ -398,6 +500,18 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
     },
     [createDraftTurn, sendMessage, sendCommand],
   );
+
+  const handleSubmit = useCallback((text: string) => {
+    dispatchInput(text);
+  }, [dispatchInput]);
+
+  const activeOverlayTitle = modelList
+    ? "Model"
+    : activePermissions
+      ? "Permissions"
+      : activeSessionPicker
+        ? "Sessions"
+        : activeView?.title;
 
   if (!ready) return <Spinner verb="Starting PRISM..." />;
 
@@ -414,7 +528,27 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
           onApprovalResponse={handleApprovalResponse}
         />
       ) : null}
-      {activeView ? (
+      {activePermissions ? (
+        <PermissionEditor
+          mode={activePermissions.mode}
+          autoApproved={activePermissions.autoApproved}
+          blocked={activePermissions.blocked}
+          approvalRequired={activePermissions.approvalRequired}
+          readOnly={activePermissions.readOnly}
+          workspaceWrite={activePermissions.workspaceWrite}
+          fullAccess={activePermissions.fullAccess}
+          allowOverrides={activePermissions.allowOverrides}
+          denyOverrides={activePermissions.denyOverrides}
+          onCommand={(command) => dispatchInput(command)}
+          onClose={() => setActivePermissions(null)}
+        />
+      ) : activeSessionPicker ? (
+        <SessionPicker
+          sessions={activeSessionPicker}
+          onResume={(sessionId) => dispatchInput(`/resume ${sessionId}`)}
+          onClose={() => setActiveSessionPicker(null)}
+        />
+      ) : activeView ? (
         <CommandView
           title={activeView.title}
           body={activeView.body}
@@ -437,7 +571,7 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
           resumed={welcomeState?.resumed}
           approvalPending={!!draftTurn?.approvalRequest}
           turnActive={!!draftTurn}
-          activeViewTitle={activeView?.title}
+          activeViewTitle={activeOverlayTitle}
           model={statusState.model}
           projectRoot={statusState.projectRoot}
         />
@@ -454,7 +588,7 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
           onCancel={() => setModelList(null)}
         />
       ) : (
-        activeView ? null : (
+        activeView || activePermissions || activeSessionPicker ? null : (
           <Prompt
             onSubmit={handleSubmit}
             active={!draftTurn}
