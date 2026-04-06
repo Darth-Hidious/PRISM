@@ -13,6 +13,8 @@ pub struct LoadedTool {
     pub input_schema: Value,
     pub requires_approval: bool,
     pub permission_mode: PermissionMode,
+    pub source: Option<String>,
+    pub source_detail: Option<String>,
 }
 
 impl LoadedTool {
@@ -66,6 +68,14 @@ impl ToolCatalog {
                     description,
                     input_schema,
                     requires_approval,
+                    source: tool
+                        .get("source")
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned),
+                    source_detail: tool
+                        .get("source_detail")
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned),
                 })
             })
             .collect::<Vec<_>>();
@@ -122,7 +132,8 @@ mod tests {
                     "name": "execute_bash",
                     "description": "Run a guarded local bash command",
                     "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } },
-                    "requires_approval": true
+                    "requires_approval": true,
+                    "source": "builtin"
                 }
             ]
         });
@@ -133,6 +144,7 @@ mod tests {
         assert_eq!(catalog.len(), 1);
         assert!(tool.requires_approval);
         assert_eq!(tool.permission_mode, PermissionMode::FullAccess);
+        assert_eq!(tool.source.as_deref(), Some("builtin"));
         assert_eq!(catalog.definitions()[0].function.name, "execute_bash");
     }
 
@@ -145,6 +157,8 @@ mod tests {
             input_schema: json!({ "type": "object" }),
             requires_approval: false,
             permission_mode: PermissionMode::ReadOnly,
+            source: None,
+            source_detail: None,
         }]);
 
         assert_eq!(catalog.len(), 1);

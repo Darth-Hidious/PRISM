@@ -180,6 +180,13 @@ pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> S
         );
     }
 
+    if tools.iter().any(|tool| tool.source.as_deref() == Some("mcp")) {
+        bullets.push(
+            "Some loaded tools come from external MCP servers. Treat them as remote capabilities: inspect their descriptions carefully, prefer read-only discovery first, and expect approval before mutation or execution."
+                .to_string(),
+        );
+    }
+
     if tools.iter().any(|tool| tool.requires_approval) {
         bullets.push(
             "Front-load read-only discovery before write or execution actions so approval requests are specific, justified, and based on actual findings."
@@ -340,6 +347,8 @@ mod tests {
                 input_schema: json!({ "type": "object" }),
                 requires_approval: true,
                 permission_mode: PermissionMode::WorkspaceWrite,
+                source: None,
+                source_detail: None,
             },
             LoadedTool {
                 name: "discover_capabilities".to_string(),
@@ -347,6 +356,8 @@ mod tests {
                 input_schema: json!({ "type": "object" }),
                 requires_approval: false,
                 permission_mode: PermissionMode::ReadOnly,
+                source: None,
+                source_detail: None,
             },
         ]);
 
@@ -366,6 +377,8 @@ mod tests {
                 input_schema: json!({ "type": "object" }),
                 requires_approval: false,
                 permission_mode: PermissionMode::ReadOnly,
+                source: None,
+                source_detail: None,
             },
             LoadedTool {
                 name: "mesh_publish".to_string(),
@@ -373,6 +386,8 @@ mod tests {
                 input_schema: json!({ "type": "object" }),
                 requires_approval: true,
                 permission_mode: PermissionMode::FullAccess,
+                source: None,
+                source_detail: None,
             },
             LoadedTool {
                 name: "marketplace_search".to_string(),
@@ -380,6 +395,8 @@ mod tests {
                 input_schema: json!({ "type": "object" }),
                 requires_approval: false,
                 permission_mode: PermissionMode::ReadOnly,
+                source: None,
+                source_detail: None,
             },
         ]);
 
@@ -393,5 +410,22 @@ mod tests {
         let catalog = ToolCatalog::default();
         let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
         assert_eq!(prompt, SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn runtime_guidance_mentions_external_mcp_tools() {
+        let mut catalog = ToolCatalog::default();
+        catalog.extend(vec![LoadedTool {
+            name: "atlas_lookup".to_string(),
+            description: "Remote lookup".to_string(),
+            input_schema: json!({ "type": "object" }),
+            requires_approval: true,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            source: Some("mcp".to_string()),
+            source_detail: Some("atlas".to_string()),
+        }]);
+
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        assert!(prompt.contains("external MCP servers"));
     }
 }

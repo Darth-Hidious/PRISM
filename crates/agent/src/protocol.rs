@@ -2013,17 +2013,22 @@ fn format_permissions_report(
 
 fn format_tool_entry(tool_name: &str, tools: &ToolCatalog) -> String {
     match tools.find(tool_name) {
-        Some(tool) => format!(
-            "{} · {} · {}\n  {}",
-            tool.name,
-            tool.permission_mode.as_str(),
+        Some(tool) => {
+            let mut meta = vec![tool.permission_mode.as_str().to_string()];
             if tool.requires_approval {
-                "approval required"
+                meta.push("approval required".to_string());
             } else {
-                "no approval prompt by default"
-            },
-            tool.description
-        ),
+                meta.push("no approval prompt by default".to_string());
+            }
+            if let Some(source) = &tool.source {
+                match tool.source_detail.as_deref() {
+                    Some(detail) => meta.push(format!("{source}:{detail}")),
+                    None => meta.push(source.clone()),
+                }
+            }
+
+            format!("{} · {}\n  {}", tool.name, meta.join(" · "), tool.description)
+        }
         None => tool_name.to_string(),
     }
 }
@@ -2039,6 +2044,8 @@ fn permission_tool_json(
             "permission_mode": tool.permission_mode.as_str(),
             "requires_approval": tool.requires_approval,
             "description": tool.description,
+            "source": tool.source,
+            "source_detail": tool.source_detail,
             "current_behavior": if permissions.blocks(&tool.name) {
                 "blocked"
             } else if permissions.auto_approves(&tool.name) {
@@ -2123,6 +2130,10 @@ fn format_tools_summary_report(tools: &ToolCatalog, permissions: &ToolPermission
         .iter()
         .filter(|name| permissions.blocks(name))
         .count();
+    let external_mcp = tools
+        .iter()
+        .filter(|tool| tool.source.as_deref() == Some("mcp"))
+        .count();
     let bash_status = tools.find("execute_bash").map(|tool| {
         format!(
             "loaded · {} · {}",
@@ -2137,8 +2148,9 @@ fn format_tools_summary_report(tools: &ToolCatalog, permissions: &ToolPermission
 
     truncate_for_ui(
         &format!(
-            "Tools\n  loaded: {}\n  read-only: {}\n  workspace-write: {}\n  full-access: {}\n  approval-required: {}\n  auto-approved now: {}\n  blocked now: {}\n  execute_bash: {}",
+            "Tools\n  loaded: {}\n  external MCP: {}\n  read-only: {}\n  workspace-write: {}\n  full-access: {}\n  approval-required: {}\n  auto-approved now: {}\n  blocked now: {}\n  execute_bash: {}",
             tools.len(),
+            external_mcp,
             read_only.len(),
             workspace_write.len(),
             full_access.len(),

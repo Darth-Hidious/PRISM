@@ -336,61 +336,34 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
           }
           break;
         case "ui.permissions":
+          const mapPermissionTool = (tool: any) => ({
+            name: String(tool.name ?? ""),
+            permission_mode: String(tool.permission_mode ?? ""),
+            requires_approval: !!tool.requires_approval,
+            description: String(tool.description ?? ""),
+            source: tool.source ? String(tool.source) : undefined,
+            source_detail: tool.source_detail ? String(tool.source_detail) : undefined,
+            current_behavior: String(tool.current_behavior ?? ""),
+          });
           setActivePermissions({
             mode: String(ev.params.mode ?? "chat"),
             autoApproved: Array.isArray(ev.params.auto_approved)
-              ? ev.params.auto_approved.map((tool: any) => ({
-                  name: String(tool.name ?? ""),
-                  permission_mode: String(tool.permission_mode ?? ""),
-                  requires_approval: !!tool.requires_approval,
-                  description: String(tool.description ?? ""),
-                  current_behavior: String(tool.current_behavior ?? ""),
-                }))
+              ? ev.params.auto_approved.map(mapPermissionTool)
               : [],
             blocked: Array.isArray(ev.params.blocked)
-              ? ev.params.blocked.map((tool: any) => ({
-                  name: String(tool.name ?? ""),
-                  permission_mode: String(tool.permission_mode ?? ""),
-                  requires_approval: !!tool.requires_approval,
-                  description: String(tool.description ?? ""),
-                  current_behavior: String(tool.current_behavior ?? ""),
-                }))
+              ? ev.params.blocked.map(mapPermissionTool)
               : [],
             approvalRequired: Array.isArray(ev.params.approval_required)
-              ? ev.params.approval_required.map((tool: any) => ({
-                  name: String(tool.name ?? ""),
-                  permission_mode: String(tool.permission_mode ?? ""),
-                  requires_approval: !!tool.requires_approval,
-                  description: String(tool.description ?? ""),
-                  current_behavior: String(tool.current_behavior ?? ""),
-                }))
+              ? ev.params.approval_required.map(mapPermissionTool)
               : [],
             readOnly: Array.isArray(ev.params.read_only)
-              ? ev.params.read_only.map((tool: any) => ({
-                  name: String(tool.name ?? ""),
-                  permission_mode: String(tool.permission_mode ?? ""),
-                  requires_approval: !!tool.requires_approval,
-                  description: String(tool.description ?? ""),
-                  current_behavior: String(tool.current_behavior ?? ""),
-                }))
+              ? ev.params.read_only.map(mapPermissionTool)
               : [],
             workspaceWrite: Array.isArray(ev.params.workspace_write)
-              ? ev.params.workspace_write.map((tool: any) => ({
-                  name: String(tool.name ?? ""),
-                  permission_mode: String(tool.permission_mode ?? ""),
-                  requires_approval: !!tool.requires_approval,
-                  description: String(tool.description ?? ""),
-                  current_behavior: String(tool.current_behavior ?? ""),
-                }))
+              ? ev.params.workspace_write.map(mapPermissionTool)
               : [],
             fullAccess: Array.isArray(ev.params.full_access)
-              ? ev.params.full_access.map((tool: any) => ({
-                  name: String(tool.name ?? ""),
-                  permission_mode: String(tool.permission_mode ?? ""),
-                  requires_approval: !!tool.requires_approval,
-                  description: String(tool.description ?? ""),
-                  current_behavior: String(tool.current_behavior ?? ""),
-                }))
+              ? ev.params.full_access.map(mapPermissionTool)
               : [],
             allowOverrides: Array.isArray(ev.params.allow_overrides)
               ? ev.params.allow_overrides.map(String)

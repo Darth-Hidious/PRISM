@@ -111,6 +111,8 @@ export interface UiPermissionTool {
   permission_mode: string;
   requires_approval: boolean;
   description: string;
+  source?: string;
+  source_detail?: string;
   current_behavior: string;
 }
 

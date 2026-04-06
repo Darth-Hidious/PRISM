@@ -20,6 +20,8 @@ export interface PermissionTool {
   permission_mode: string;
   requires_approval: boolean;
   description: string;
+  source?: string;
+  source_detail?: string;
   current_behavior: string;
 }
 
@@ -65,6 +67,9 @@ function summarizeTool(tool: PermissionTool): string {
   if (tool.requires_approval) parts.push("approval");
   if (tool.current_behavior === "auto-approved") parts.push("auto");
   if (tool.current_behavior === "blocked") parts.push("blocked");
+  if (tool.source) {
+    parts.push(tool.source_detail ? `${tool.source}:${tool.source_detail}` : tool.source);
+  }
   return parts.join(" · ");
 }
 
