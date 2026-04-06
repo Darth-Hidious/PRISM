@@ -1,7 +1,9 @@
 import React from "react";
 import { Box, Text } from "ink";
-import { MUTED, SECONDARY, TEXT_DIM, TEXT_MUTED, PRIMARY } from "../theme.js";
+import { MUTED, SECONDARY, TEXT_MUTED, PRIMARY } from "../theme.js";
 import { Pane } from "./chrome/Pane.js";
+import { Byline } from "./chrome/Byline.js";
+import { Pill } from "./chrome/Pill.js";
 
 interface Session {
   session_id: string;
@@ -37,13 +39,17 @@ export function SessionList({ sessions }: Props) {
     >
       {sessions.map((s) => (
         <Box key={s.session_id} flexDirection="column" marginTop={1}>
-          <Box>
-            <Text color={s.is_latest ? PRIMARY : MUTED}>{s.session_id.slice(0, 16)}</Text>
-            {s.is_latest ? <Text color={PRIMARY}>{"  latest"}</Text> : null}
-          </Box>
+          <Text color={TEXT_MUTED}>
+            <Byline>
+              <Text color={s.is_latest ? PRIMARY : MUTED}>{s.session_id.slice(0, 16)}</Text>
+              {s.is_latest ? <Pill label="latest" color={PRIMARY} /> : null}
+              <Pill label={`${s.turn_count} turns`} color={TEXT_MUTED} />
+              <Pill label={`${s.size_kb.toFixed(1)}KB`} color={TEXT_MUTED} />
+            </Byline>
+          </Text>
           <Text color={TEXT_MUTED}>
             {formatCreatedAt(s.created_at)}
-            {` · ${s.turn_count} turns · ${s.model || "unknown model"} · ${s.size_kb.toFixed(1)}KB`}
+            {` · ${s.model || "unknown model"}`}
           </Text>
         </Box>
       ))}

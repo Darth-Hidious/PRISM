@@ -19,6 +19,7 @@ import { ApprovalPrompt } from "./ApprovalPrompt.js";
 import { SessionList } from "./SessionList.js";
 import { Byline } from "./chrome/Byline.js";
 import { Pane } from "./chrome/Pane.js";
+import { Pill } from "./chrome/Pill.js";
 
 export interface TurnInput {
   text: string;
@@ -156,8 +157,8 @@ function TurnInputHeader({ input }: { input: TurnInput }) {
     >
       <Text color={TEXT_DIM}>
         <Byline>
-          <Text>you</Text>
-          <Text>{isCommand ? "command" : "prompt"}</Text>
+          <Pill label="you" color={SECONDARY} />
+          <Pill label={isCommand ? "command" : "prompt"} color={TEXT_DIM} />
         </Byline>
       </Text>
       <Text color={isCommand ? WARNING : TEXT} bold>
@@ -241,8 +242,8 @@ export function TurnCard({ turn, streaming = false, onApprovalResponse }: Props)
         >
           <Text color={SECONDARY}>
             <Byline>
-              <Text>prism</Text>
-              <Text>{assistantLabel}</Text>
+              <Pill label="prism" color={PRIMARY} />
+              <Pill label={assistantLabel} color={TEXT_DIM} />
               {pendingTool?.verb ? <Text color={TEXT_DIM}>{pendingTool.verb}</Text> : null}
             </Byline>
           </Text>

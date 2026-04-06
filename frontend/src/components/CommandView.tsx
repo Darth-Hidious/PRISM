@@ -11,6 +11,7 @@ import type { UiViewTab } from "../bridge/types.js";
 import { Byline } from "./chrome/Byline.js";
 import { KeyboardShortcutHint } from "./chrome/KeyboardShortcutHint.js";
 import { Pane } from "./chrome/Pane.js";
+import { Pill } from "./chrome/Pill.js";
 
 interface Props {
   title: string;
@@ -116,14 +117,12 @@ export function CommandView({
           {tabList.map((tab, index) => {
             const isActive = index === tabIndex;
             return (
-              <Text
+              <Pill
                 key={tab.id}
+                label={`${index + 1}. ${tab.title}`}
                 color={isActive ? TEXT : TEXT_DIM}
-                inverse={isActive}
-                bold={isActive}
-              >
-                {` ${index + 1}. ${tab.title} `}
-              </Text>
+                active={isActive}
+              />
             );
           })}
         </Box>

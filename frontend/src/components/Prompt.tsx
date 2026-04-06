@@ -1,8 +1,9 @@
 import React, { useState, useRef } from "react";
 import { Box, Text, useInput } from "ink";
-import { PRIMARY, TEXT_DIM } from "../theme.js";
+import { PRIMARY, SECONDARY, TEXT_DIM, TEXT_MUTED, WARNING } from "../theme.js";
 import { Byline } from "./chrome/Byline.js";
 import { KeyboardShortcutHint } from "./chrome/KeyboardShortcutHint.js";
+import { Pill } from "./chrome/Pill.js";
 
 interface Props {
   onSubmit: (text: string) => void;
@@ -102,11 +103,34 @@ export function Prompt({ onSubmit, active = true }: Props) {
   const before = display.slice(0, cursorRef.current);
   const cursorChar = display[cursorRef.current] ?? " ";
   const after = display.slice(cursorRef.current + 1);
+  const trimmed = display.trimStart();
+  const commandMode = trimmed.startsWith("/");
+  const promptLabel = commandMode ? "command" : "prompt";
+  const promptColor = active
+    ? commandMode
+      ? WARNING
+      : PRIMARY
+    : TEXT_DIM;
+  const quickGuide = commandMode
+    ? "/status  /context  /models  /deploy  /discourse"
+    : "inspect, patch, test, or orchestrate from here";
 
   return (
     <Box flexDirection="column" paddingLeft={1} marginTop={1}>
+      <Text color={TEXT_DIM}>
+        <Byline>
+          <Pill
+            label={promptLabel}
+            color={commandMode ? WARNING : SECONDARY}
+            active={active}
+          />
+          <Text color={TEXT_MUTED}>{quickGuide}</Text>
+        </Byline>
+      </Text>
       <Box>
-        <Text color={active ? PRIMARY : TEXT_DIM} bold>{"› "}</Text>
+        <Text color={promptColor} bold>
+          {commandMode ? "/" : "› "}
+        </Text>
         {active ? (
           <Text>
             <Text>{before}</Text>
@@ -120,9 +144,13 @@ export function Prompt({ onSubmit, active = true }: Props) {
       <Box paddingLeft={2}>
         <Text color={TEXT_DIM}>
           <Byline>
-            <KeyboardShortcutHint shortcut="enter" action="send" />
-            <KeyboardShortcutHint shortcut="/" action="command" />
+            <KeyboardShortcutHint
+              shortcut="enter"
+              action={commandMode ? "run" : "send"}
+            />
+            <KeyboardShortcutHint shortcut="/" action="slash mode" />
             <KeyboardShortcutHint shortcut="↑/↓" action="history" />
+            <KeyboardShortcutHint shortcut="esc" action="clear overlays" />
             <KeyboardShortcutHint shortcut="ctrl+c" action="exit" />
           </Byline>
         </Text>
