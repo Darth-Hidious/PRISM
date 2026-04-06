@@ -2975,6 +2975,10 @@ fn json_pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+fn json_inline(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
 fn value_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(|field| field.as_str()))
@@ -3121,6 +3125,94 @@ fn emit_deployments_view(title: &str, value: &Value) {
         },
         "info",
         "persistent deployment state",
+    );
+}
+
+fn format_job_status_label(value: &Value) -> String {
+    if let Some(label) = value.as_str() {
+        return label.to_string();
+    }
+    if let Some(progress) = value
+        .get("Running")
+        .and_then(|running| running.get("progress"))
+        .and_then(|progress| progress.as_f64())
+    {
+        return format!("Running ({:.0}%)", progress * 100.0);
+    }
+    if let Some(failed) = value.get("Failed") {
+        let error = failed
+            .get("error")
+            .and_then(|error| error.as_str())
+            .unwrap_or("unknown error");
+        return format!("Failed ({error})");
+    }
+    json_inline(value)
+}
+
+fn emit_run_view(title: &str, value: &Value) {
+    let job_id = value_string(value, &["job_id"]).unwrap_or("?");
+    let name = value_string(value, &["name"]).unwrap_or("(unnamed)");
+    let image = value_string(value, &["image"]).unwrap_or("-");
+    let backend = value_string(value, &["backend"]).unwrap_or("-");
+    let status = value
+        .get("initial_status")
+        .map(format_job_status_label)
+        .or_else(|| {
+            value
+                .get("status_error")
+                .and_then(|error| error.as_str())
+                .map(|error| format!("status unavailable ({error})"))
+        })
+        .unwrap_or_else(|| "status unavailable".to_string());
+    let target = value
+        .get("target")
+        .map(json_inline)
+        .unwrap_or_else(|| "-".to_string());
+    let inputs = value
+        .get("inputs")
+        .map(json_pretty)
+        .unwrap_or_else(|| "{}".to_string());
+    let summary = format!("job: {job_id}\nbackend: {backend}\nstatus: {status}");
+    let details = format!("name: {name}\nimage: {image}\ntarget: {target}\n\ninputs\n{inputs}");
+    let raw = json_pretty(value);
+    emit_tabbed_view(
+        "run",
+        title,
+        &[
+            ("summary", "Summary", &summary, "info"),
+            ("details", "Details", &details, "accent"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        "summary",
+        "info",
+        "compute job submission",
+    );
+}
+
+fn emit_publish_view(title: &str, value: &Value) {
+    let target = value_string(value, &["target"]).unwrap_or("?");
+    let path = value_string(value, &["path"]).unwrap_or("-");
+    let repo = value_string(value, &["repo"]).unwrap_or("-");
+    let published_url = value_string(value, &["published_url", "url"]).unwrap_or("-");
+    let private = value_bool(value, &["private"]).unwrap_or(false);
+    let result = value.get("result").unwrap_or(value);
+    let summary = format!("target: {target}\nrepo: {repo}\nprivate: {private}");
+    let details = format!(
+        "path: {path}\npublished url: {published_url}\n\nresult\n{}",
+        json_pretty(result)
+    );
+    let raw = json_pretty(value);
+    emit_tabbed_view(
+        "publish",
+        title,
+        &[
+            ("summary", "Summary", &summary, "info"),
+            ("details", "Details", &details, "accent"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        "summary",
+        "info",
+        "artifact publishing",
     );
 }
 
@@ -3285,6 +3377,21 @@ async fn handle_deploy_slash_command(
     }
 }
 
+async fn handle_run_slash_command(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("run") {
+        return Ok(false);
+    }
+
+    let json_args = ensure_json_flag(args);
+    let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
+    emit_run_view("Run Job", &value);
+    emit_notification("ui.turn.complete", serde_json::json!({}));
+    Ok(true)
+}
+
 async fn handle_discourse_slash_command(
     args: &[String],
     slash_ctx: &SlashCommandContext,
@@ -3311,6 +3418,21 @@ async fn handle_discourse_slash_command(
         }
         _ => Ok(false),
     }
+}
+
+async fn handle_publish_slash_command(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("publish") {
+        return Ok(false);
+    }
+
+    let json_args = ensure_json_flag(args);
+    let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
+    emit_publish_view("Publish Artifact", &value);
+    emit_notification("ui.turn.complete", serde_json::json!({}));
+    Ok(true)
 }
 
 async fn handle_workflow_slash_command(
@@ -3737,7 +3859,10 @@ fn build_tool_card_payload(
                     sections.push("timed out".to_string());
                 }
 
-                if matches!(root.as_str(), "models" | "deploy" | "discourse") {
+                if matches!(
+                    root.as_str(),
+                    "models" | "deploy" | "discourse" | "run" | "publish"
+                ) {
                     let mut data = serde_json::json!({
                         "root": root,
                         "invocation": invocation,
@@ -5413,7 +5538,13 @@ async fn handle_command(
             if handle_deploy_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
+            if handle_run_slash_command(&args, slash_ctx).await? {
+                return Ok(true);
+            }
             if handle_discourse_slash_command(&args, slash_ctx).await? {
+                return Ok(true);
+            }
+            if handle_publish_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
 
@@ -6378,6 +6509,34 @@ mod tests {
         assert_eq!(data["root"], "discourse");
         assert_eq!(data["parsed_stdout"]["instance_id"], "inst-1");
         assert_eq!(data["parsed_stdout"]["events"][1]["step"], "complete");
+    }
+
+    #[test]
+    fn build_tool_card_payload_parses_run_stdout_json() {
+        let (content, data) = build_tool_card_payload(
+            "run_submit",
+            r#"{"root":"run","success":true,"timed_out":false,"exit_code":0,"invocation":"prism run --name trial --json ghcr.io/acme/model:latest","stdout":"{\"job_id\":\"job-1\",\"name\":\"trial\",\"image\":\"ghcr.io/acme/model:latest\",\"backend\":\"local\",\"initial_status\":\"Queued\"}","stderr":""}"#,
+            Some("prism run --name trial --json ghcr.io/acme/model:latest"),
+            Some("run_submit: job-1"),
+        );
+
+        assert!(content.contains("status: completed"));
+        assert_eq!(data["root"], "run");
+        assert_eq!(data["parsed_stdout"]["job_id"], "job-1");
+    }
+
+    #[test]
+    fn build_tool_card_payload_parses_publish_stdout_json() {
+        let (content, data) = build_tool_card_payload(
+            "publish_artifact",
+            r#"{"root":"publish","success":true,"timed_out":false,"exit_code":0,"invocation":"prism publish model.ckpt --to marc27 --json","stdout":"{\"target\":\"marc27\",\"path\":\"model.ckpt\",\"repo\":\"team/model\",\"private\":true,\"result\":{\"id\":\"pub-1\"}}","stderr":""}"#,
+            Some("prism publish model.ckpt --to marc27 --json"),
+            Some("publish_artifact: team/model"),
+        );
+
+        assert!(content.contains("status: completed"));
+        assert_eq!(data["root"], "publish");
+        assert_eq!(data["parsed_stdout"]["repo"], "team/model");
     }
 
     #[test]

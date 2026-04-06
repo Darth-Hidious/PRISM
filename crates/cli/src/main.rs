@@ -198,6 +198,9 @@ enum Commands {
         /// SLURM partition.
         #[arg(long, default_value = "default")]
         slurm_partition: String,
+        /// Emit machine-readable JSON instead of human-readable status lines.
+        #[arg(long)]
+        json: bool,
     },
     /// Check status of a compute job.
     JobStatus {
@@ -264,6 +267,9 @@ enum Commands {
         /// Make the published artifact private.
         #[arg(long)]
         private: bool,
+        /// Emit machine-readable JSON instead of human-readable status lines.
+        #[arg(long)]
+        json: bool,
     },
     /// Configure PRISM settings — writes to ~/.prism/prism.toml.
     Configure {
@@ -1622,6 +1628,7 @@ async fn main() -> Result<()> {
             k8s_namespace,
             slurm,
             slurm_partition,
+            json,
         } => {
             handle_run(
                 &name,
@@ -1636,6 +1643,7 @@ async fn main() -> Result<()> {
                 &k8s_namespace,
                 slurm.as_deref(),
                 &slurm_partition,
+                json,
             )
             .await?;
         }
@@ -1780,6 +1788,7 @@ async fn main() -> Result<()> {
             to,
             repo,
             private,
+            json,
         } => {
             let artifact_path = std::path::Path::new(&path);
             if !artifact_path.exists() {
@@ -1795,27 +1804,96 @@ async fn main() -> Result<()> {
                             .unwrap_or("my-model")
                             .to_string()
                     });
-                    println!("Publishing to HuggingFace: {repo_name}");
-                    let visibility = if private { "--private" } else { "" };
-                    let status = std::process::Command::new("hf")
-                        .args(["repo", "create", &repo_name, "--type", "model", visibility])
-                        .status();
-                    match status {
-                        Ok(s) if s.success() => {
-                            println!("Repository created. Uploading...");
+                    let mut create_args = vec![
+                        "repo".to_string(),
+                        "create".to_string(),
+                        repo_name.clone(),
+                        "--type".to_string(),
+                        "model".to_string(),
+                    ];
+                    if private {
+                        create_args.push("--private".to_string());
+                    }
+                    let create = std::process::Command::new("hf").args(&create_args).output();
+                    match create {
+                        Ok(output) if output.status.success() => {
                             let upload = std::process::Command::new("hf")
                                 .args(["upload", &repo_name, &path])
-                                .status();
+                                .output();
                             match upload {
-                                Ok(s) if s.success() => {
-                                    println!("Published: https://huggingface.co/{repo_name}");
+                                Ok(upload_output) if upload_output.status.success() => {
+                                    let published_url =
+                                        format!("https://huggingface.co/{repo_name}");
+                                    if json {
+                                        println!(
+                                            "{}",
+                                            serde_json::to_string_pretty(&serde_json::json!({
+                                                "target": "huggingface",
+                                                "path": path,
+                                                "repo": repo_name,
+                                                "private": private,
+                                                "published_url": published_url,
+                                                "created": true,
+                                                "uploaded": true,
+                                            }))?
+                                        );
+                                    } else {
+                                        println!("Publishing to HuggingFace: {repo_name}");
+                                        println!("Repository created. Uploading...");
+                                        println!("Published: {published_url}");
+                                    }
                                 }
-                                _ => {
+                                Ok(upload_output) => {
+                                    let stderr = String::from_utf8_lossy(&upload_output.stderr)
+                                        .trim()
+                                        .to_string();
+                                    if json {
+                                        anyhow::bail!(
+                                            "hf upload failed{}",
+                                            if stderr.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(": {stderr}")
+                                            }
+                                        );
+                                    }
+                                    eprintln!("Upload failed. Try: hf upload {repo_name} {path}");
+                                    if !stderr.is_empty() {
+                                        eprintln!("{stderr}");
+                                    }
+                                }
+                                Err(error) => {
+                                    if json {
+                                        return Err(error.into());
+                                    }
                                     eprintln!("Upload failed. Try: hf upload {repo_name} {path}");
                                 }
                             }
                         }
-                        _ => {
+                        Ok(output) => {
+                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                            if json {
+                                anyhow::bail!(
+                                    "hf repo create failed{}",
+                                    if stderr.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(": {stderr}")
+                                    }
+                                );
+                            }
+                            eprintln!(
+                                "HuggingFace CLI (hf) not found or failed. Install: pip install huggingface_hub"
+                            );
+                            if !stderr.is_empty() {
+                                eprintln!("{stderr}");
+                            }
+                            eprintln!("Then: hf login && prism publish {path} --to hf");
+                        }
+                        Err(error) => {
+                            if json {
+                                return Err(error.into());
+                            }
                             eprintln!(
                                 "HuggingFace CLI (hf) not found or failed. Install: pip install huggingface_hub"
                             );
@@ -1852,7 +1930,20 @@ async fn main() -> Result<()> {
                             }),
                         )
                         .await?;
-                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "target": "marc27",
+                                "path": path,
+                                "repo": name,
+                                "private": private,
+                                "result": resp,
+                            }))?
+                        );
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    }
                 }
                 other => {
                     eprintln!("Unknown target: {other}. Use 'huggingface' or 'marc27'.");
@@ -4879,6 +4970,7 @@ async fn handle_run(
     k8s_namespace: &str,
     slurm: Option<&str>,
     slurm_partition: &str,
+    json: bool,
 ) -> Result<()> {
     use prism_compute::backend::ComputeRouter;
     use prism_compute::byoc::ByocTarget;
@@ -4892,13 +4984,14 @@ async fn handle_run(
         }
     }
 
+    let inputs_json = serde_json::Value::Object(input_map);
     let plan = ExperimentPlan {
         name: name.to_string(),
         image: image.to_string(),
-        inputs: serde_json::Value::Object(input_map),
+        inputs: inputs_json.clone(),
     };
 
-    let router = if let Some(ssh_target) = ssh {
+    let (router, resolved_backend, target) = if let Some(ssh_target) = ssh {
         // Parse user@host — default user is "root" if no '@' present
         let (user, host) = if let Some((u, h)) = ssh_target.split_once('@') {
             (u.to_string(), h.to_string())
@@ -4911,13 +5004,29 @@ async fn handle_run(
             key_path: ssh_key.to_string(),
             port: ssh_port,
         };
-        ComputeRouter::local_only().with_byoc(target)
+        (
+            ComputeRouter::local_only().with_byoc(target),
+            "byoc",
+            serde_json::json!({
+                "kind": "ssh",
+                "endpoint": ssh_target,
+                "port": ssh_port,
+            }),
+        )
     } else if let Some(ctx) = k8s_context {
         let target = ByocTarget::Kubernetes {
             context: ctx.to_string(),
             namespace: k8s_namespace.to_string(),
         };
-        ComputeRouter::local_only().with_byoc(target)
+        (
+            ComputeRouter::local_only().with_byoc(target),
+            "byoc",
+            serde_json::json!({
+                "kind": "kubernetes",
+                "context": ctx,
+                "namespace": k8s_namespace,
+            }),
+        )
     } else if let Some(slurm_host) = slurm {
         // Parse user@host for SLURM head node
         let (user, head_node) = if let Some((u, h)) = slurm_host.split_once('@') {
@@ -4930,19 +5039,42 @@ async fn handle_run(
             user,
             partition: slurm_partition.to_string(),
         };
-        ComputeRouter::local_only().with_byoc(target)
+        (
+            ComputeRouter::local_only().with_byoc(target),
+            "byoc",
+            serde_json::json!({
+                "kind": "slurm",
+                "endpoint": slurm_host,
+                "partition": slurm_partition,
+            }),
+        )
     } else {
         match backend {
             "marc27" | "platform" => {
                 // Read token from credentials
                 let token = std::env::var("MARC27_API_TOKEN").unwrap_or_else(|_| "".to_string());
-                ComputeRouter::with_marc27(platform_url, &token)
+                (
+                    ComputeRouter::with_marc27(platform_url, &token),
+                    "marc27",
+                    serde_json::json!({
+                        "kind": "marc27",
+                        "platform_url": platform_url,
+                    }),
+                )
             }
-            _ => ComputeRouter::local_only(),
+            _ => (
+                ComputeRouter::local_only(),
+                "local",
+                serde_json::json!({
+                    "kind": "local",
+                }),
+            ),
         }
     };
 
-    println!("Submitting job '{name}' (image: {image}, backend: {backend})...");
+    if !json {
+        println!("Submitting job '{name}' (image: {image}, backend: {resolved_backend})...");
+    }
 
     // Timeout for submit (Docker may need to pull the image)
     let job_id = tokio::time::timeout(std::time::Duration::from_secs(120), router.submit(&plan))
@@ -4951,14 +5083,40 @@ async fn handle_run(
             anyhow::anyhow!("Job submission timed out after 120s (image pull may be slow)")
         })??;
 
-    println!("Job submitted: {job_id}");
-    println!("Check status:  prism job-status {job_id}");
-
     // Brief poll for initial status
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    match router.status(job_id).await {
-        Ok(status) => println!("Status: {:?}", status),
-        Err(e) => println!("Status check: {e}"),
+    let status_result = router.status(job_id).await;
+
+    if json {
+        let mut payload = serde_json::json!({
+            "job_id": job_id,
+            "name": name,
+            "image": image,
+            "backend": resolved_backend,
+            "target": target,
+            "inputs": inputs_json,
+        });
+        if let Some(object) = payload.as_object_mut() {
+            match status_result {
+                Ok(status) => {
+                    object.insert("initial_status".to_string(), serde_json::to_value(status)?);
+                }
+                Err(error) => {
+                    object.insert(
+                        "status_error".to_string(),
+                        serde_json::Value::String(error.to_string()),
+                    );
+                }
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("Job submitted: {job_id}");
+        println!("Check status:  prism job-status {job_id}");
+        match status_result {
+            Ok(status) => println!("Status: {:?}", status),
+            Err(e) => println!("Status check: {e}"),
+        }
     }
 
     Ok(())
@@ -5330,6 +5488,65 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected Research command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_run_json_command() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "run",
+            "--name",
+            "trial",
+            "--backend",
+            "marc27",
+            "--json",
+            "ghcr.io/acme/model:latest",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Run {
+                image,
+                name,
+                backend,
+                json,
+                ..
+            } => {
+                assert_eq!(image, "ghcr.io/acme/model:latest");
+                assert_eq!(name, "trial");
+                assert_eq!(backend, "marc27");
+                assert!(json);
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_publish_json_command() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "publish",
+            "models/mace.ckpt",
+            "--to",
+            "marc27",
+            "--private",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Publish {
+                path,
+                to,
+                private,
+                json,
+                ..
+            } => {
+                assert_eq!(path, "models/mace.ckpt");
+                assert_eq!(to, "marc27");
+                assert!(private);
+                assert!(json);
+            }
+            _ => panic!("expected Publish command"),
         }
     }
 
