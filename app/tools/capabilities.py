@@ -4,10 +4,74 @@ The agent calls this once at session start (or when asked) to learn what
 databases, models, services, providers, and plugins are available. This
 replaces calling 5+ separate list tools.
 """
+import json
 import logging
+import os
+from pathlib import Path
+
 from app.tools.base import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _get_platform_client():
+    """Return the MARC27 PlatformClient if the SDK/auth context is available."""
+    try:
+        from marc27 import PlatformClient
+        return PlatformClient()
+    except Exception:
+        return None
+
+
+def _read_platform_json(client, path: str):
+    """Read a raw JSON payload from the public platform API."""
+    from marc27.api.base import BaseAPI
+
+    base: BaseAPI = client._base
+    resp = base.get(path)
+    return resp.json()
+
+
+def _load_project_context() -> dict:
+    """Resolve the active project context for project-scoped platform endpoints."""
+    project_id = os.getenv("MARC27_PROJECT_ID")
+    project_name = None
+
+    if project_id:
+        return {"project_id": project_id, "project_name": None}
+
+    # PRISM's native CLI persists the active org/project here.
+    cli_state_path = (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "com.marc27.prism"
+        / "cli-state.json"
+    )
+    if cli_state_path.exists():
+        try:
+            data = json.loads(cli_state_path.read_text())
+            creds = data.get("credentials") or {}
+            project_id = creds.get("project_id")
+            project_name = creds.get("project_name")
+            if project_id:
+                return {"project_id": project_id, "project_name": project_name}
+        except Exception:
+            pass
+
+    # Older Python-side auth flow stores a simpler credentials blob here.
+    legacy_path = Path.home() / ".prism" / "credentials.json"
+    if legacy_path.exists():
+        try:
+            creds = json.loads(legacy_path.read_text())
+            project_id = creds.get("project_id")
+            project_name = creds.get("project_name")
+            if project_id:
+                return {"project_id": project_id, "project_name": project_name}
+        except Exception:
+            pass
+
+    return {"project_id": None, "project_name": None}
 
 
 def discover_capabilities(**kwargs) -> dict:
@@ -119,8 +183,9 @@ def discover_capabilities(**kwargs) -> dict:
 
     # 10. MARC27 Knowledge Plane
     try:
-        from marc27 import PlatformClient
-        client = PlatformClient()
+        client = _get_platform_client()
+        if not client:
+            raise RuntimeError("MARC27 platform not connected.")
         stats = client.knowledge.graph_stats()
         caps["marc27_knowledge"] = {
             "connected": True,
@@ -136,6 +201,54 @@ def discover_capabilities(**kwargs) -> dict:
     except Exception:
         caps["marc27_knowledge"] = {"connected": False}
         caps["marc27_embeddings"] = {"count": 0}
+
+    # 11. Dynamic platform capability catalog + hosted model discovery
+    try:
+        client = _get_platform_client()
+        if not client:
+            raise RuntimeError("MARC27 platform not connected.")
+
+        agent_capabilities = _read_platform_json(client, "/agent/capabilities")
+        knowledge_capabilities = _read_platform_json(client, "/knowledge/capabilities")
+        project_ctx = _load_project_context()
+
+        hosted_models = []
+        if project_ctx["project_id"]:
+            hosted_models = _read_platform_json(
+                client,
+                f"/projects/{project_ctx['project_id']}/llm/models",
+            )
+
+        provider_names = sorted(
+            {
+                model.get("provider")
+                for model in hosted_models
+                if isinstance(model, dict) and model.get("provider")
+            }
+        )
+
+        caps["marc27_platform"] = {
+            "connected": True,
+            "project_id": project_ctx["project_id"],
+            "project_name": project_ctx["project_name"],
+            "agent_capabilities": agent_capabilities,
+            "knowledge_capabilities": knowledge_capabilities,
+            # Keep the full dynamic model list here so discovery does not need a
+            # second bespoke command path for hosted model inventory.
+            "hosted_models": hosted_models,
+            "hosted_model_count": len(hosted_models),
+            "hosted_model_providers": provider_names,
+        }
+    except Exception as e:
+        caps["marc27_platform"] = {
+            "connected": False,
+            "error": str(e),
+            "project_id": None,
+            "project_name": None,
+            "hosted_models": [],
+            "hosted_model_count": 0,
+            "hosted_model_providers": [],
+        }
 
     return caps
 
@@ -229,6 +342,15 @@ def capabilities_summary() -> str:
     if plugins:
         lines.append(f"Plugins loaded: {', '.join(plugins)}")
 
+    platform = caps.get("marc27_platform", {})
+    if platform.get("connected"):
+        provider_list = platform.get("hosted_model_providers", [])
+        provider_text = ", ".join(provider_list) if provider_list else "unknown providers"
+        lines.append(
+            "Platform LLM models: "
+            f"{platform.get('hosted_model_count', 0)} discovered across {provider_text}"
+        )
+
     return "\n".join(lines)
 
 
@@ -240,7 +362,8 @@ def create_capabilities_tools(registry: ToolRegistry) -> None:
         description=(
             "Discover all available PRISM capabilities: search providers, datasets, "
             "trained models, pre-trained GNNs, CALPHAD databases, simulation status, "
-            "lab subscriptions, and loaded plugins. Call this to understand what "
+            "lab subscriptions, loaded plugins, dynamic platform capability catalogs, "
+            "and project-scoped hosted LLM models. Call this to understand what "
             "resources are available before planning a workflow."
         ),
         input_schema={"type": "object", "properties": {}},

@@ -94,7 +94,7 @@ class UpdateSettings:
 class PermissionSettings:
     """Tool permission configuration."""
     require_approval: List[str] = field(default_factory=lambda: [
-        "execute_python", "write_file", "submit_lab_job",
+        "execute_python", "execute_bash", "write_file", "submit_lab_job",
     ])
     deny: List[str] = field(default_factory=list)
 
