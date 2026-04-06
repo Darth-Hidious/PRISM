@@ -22,19 +22,13 @@ jobs:
             rust_target: x86_64-unknown-linux-gnu
             bun_target: bun-linux-x64
             archive: prism-linux-x86_64.tar.gz
-            tui_binary: prism-tui
+            tui_binary: prism-tui-linux-x64
           - os: macos-14
             label: macos-aarch64
             rust_target: aarch64-apple-darwin
             bun_target: bun-darwin-arm64
             archive: prism-macos-aarch64.tar.gz
-            tui_binary: prism-tui
-          - os: macos-13
-            label: macos-x86_64
-            rust_target: x86_64-apple-darwin
-            bun_target: bun-darwin-x64
-            archive: prism-macos-x86_64.tar.gz
-            tui_binary: prism-tui
+            tui_binary: prism-tui-darwin-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -87,11 +81,13 @@ jobs:
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
+          overwrite: true
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.tui_binary }}
           path: dist/${{ matrix.tui_binary }}
+          overwrite: true
 
       - name: Publish release assets
         if: startsWith(github.ref, 'refs/tags/')
@@ -99,4 +95,3 @@ jobs:
         with:
           files: |
             ${{ matrix.archive }}
-            dist/${{ matrix.tui_binary }}
