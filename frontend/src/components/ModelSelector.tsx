@@ -1,6 +1,9 @@
 import React, { useState } from "react";
 import { Box, Text, useInput } from "ink";
-import { PRIMARY, MUTED, TEXT, DIM, SUCCESS, WARNING } from "../theme.js";
+import { PRIMARY, MUTED, TEXT, DIM, SUCCESS } from "../theme.js";
+import { Byline } from "./chrome/Byline.js";
+import { KeyboardShortcutHint } from "./chrome/KeyboardShortcutHint.js";
+import { Pane } from "./chrome/Pane.js";
 
 interface ModelEntry {
   id: string;
@@ -54,18 +57,25 @@ export function ModelSelector({ current, models, onSelect, onCancel }: Props) {
   });
 
   return (
-    <Box flexDirection="column" paddingX={1}>
-      <Box marginBottom={1}>
-        <Text color={PRIMARY} bold>Model</Text>
-        <Text color={MUTED}>{"  current: "}</Text>
-        <Text color={TEXT} bold>{current}</Text>
-      </Box>
-
+    <Pane
+      color={PRIMARY}
+      title="Model"
+      subtitle={`current: ${current}`}
+      footer={
+        <Text color={DIM}>
+          <Byline>
+            <KeyboardShortcutHint shortcut="↑/↓" action="navigate" />
+            <KeyboardShortcutHint shortcut="enter" action="select" />
+            <KeyboardShortcutHint shortcut="esc" action="cancel" />
+          </Byline>
+        </Text>
+      }
+    >
       {providers.map((provider) => {
         const providerModels = models.filter((m) => m.provider === provider);
         return (
-          <Box key={provider} flexDirection="column">
-            <Text color={MUTED} bold>{`  ${provider.toUpperCase()}`}</Text>
+          <Box key={provider} flexDirection="column" marginTop={1}>
+            <Text color={MUTED} bold>{provider.toUpperCase()}</Text>
             {providerModels.map((m) => {
               const globalIdx = models.indexOf(m);
               const isSelected = globalIdx === selected;
@@ -81,7 +91,7 @@ export function ModelSelector({ current, models, onSelect, onCancel }: Props) {
               return (
                 <Box key={m.id}>
                   <Text color={isSelected ? PRIMARY : DIM}>
-                    {isSelected ? " \u276f " : "   "}
+                    {isSelected ? " ❯ " : "   "}
                   </Text>
                   <Text
                     color={isCurrent ? SUCCESS : isSelected ? TEXT : MUTED}
@@ -91,24 +101,18 @@ export function ModelSelector({ current, models, onSelect, onCancel }: Props) {
                   </Text>
                   {ctx ? <Text color={DIM}>{`  ${ctx}`}</Text> : null}
                   {!m.local ? (
-                    <Text color={DIM}>{`  ${priceIn}\u2192${priceOut}`}</Text>
+                    <Text color={DIM}>{`  ${priceIn}→${priceOut}`}</Text>
                   ) : null}
                   {badges.length > 0 ? (
                     <Text color={DIM}>{`  [${badges.join(", ")}]`}</Text>
                   ) : null}
-                  {isCurrent ? <Text color={SUCCESS}>{" \u2713"}</Text> : null}
+                  {isCurrent ? <Text color={SUCCESS}>{" ✓"}</Text> : null}
                 </Box>
               );
             })}
           </Box>
         );
       })}
-
-      <Box marginTop={1}>
-        <Text color={DIM}>
-          {"  \u2191\u2193 navigate  enter select  esc cancel"}
-        </Text>
-      </Box>
-    </Box>
+    </Pane>
   );
 }
