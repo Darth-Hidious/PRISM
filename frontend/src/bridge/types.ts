@@ -93,6 +93,26 @@ export interface UiViewTab {
   tone?: string;
 }
 
+export interface UiPermissions {
+  mode: string;
+  auto_approved: UiPermissionTool[];
+  blocked: UiPermissionTool[];
+  approval_required: UiPermissionTool[];
+  read_only: UiPermissionTool[];
+  workspace_write: UiPermissionTool[];
+  full_access: UiPermissionTool[];
+  allow_overrides: string[];
+  deny_overrides: string[];
+}
+
+export interface UiPermissionTool {
+  name: string;
+  permission_mode: string;
+  requires_approval: boolean;
+  description: string;
+  current_behavior: string;
+}
+
 export interface Init {
   provider?: string;
   auto_approve?: boolean;
@@ -117,7 +137,7 @@ export interface InputLoadSession {
   session_id?: string;
 }
 
-export type UIEvent = UiTextDelta | UiTextFlush | UiToolStart | UiCard | UiCost | UiPrompt | UiWelcome | UiStatus | UiTurnComplete | UiSessionList | UiView;
+export type UIEvent = UiTextDelta | UiTextFlush | UiToolStart | UiCard | UiCost | UiPrompt | UiWelcome | UiStatus | UiTurnComplete | UiSessionList | UiView | UiPermissions;
 export type InputEvent = Init | InputMessage | InputCommand | InputPromptResponse | InputLoadSession;
 
 export const UI_EVENT_MAP: Record<string, string> = {
@@ -132,4 +152,5 @@ export const UI_EVENT_MAP: Record<string, string> = {
   "ui.turn.complete": "UiTurnComplete",
   "ui.session.list": "UiSessionList",
   "ui.view": "UiView",
+  "ui.permissions": "UiPermissions",
 };
