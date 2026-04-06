@@ -1,6 +1,7 @@
 import React from "react";
 import { Box, Text } from "ink";
 import { MUTED, SECONDARY, TEXT_DIM, TEXT_MUTED, PRIMARY } from "../theme.js";
+import { Pane } from "./chrome/Pane.js";
 
 interface Session {
   session_id: string;
@@ -29,19 +30,11 @@ export function SessionList({ sessions }: Props) {
   };
 
   return (
-    <Box
-      flexDirection="column"
-      borderStyle="single"
-      borderLeft
-      borderRight={false}
-      borderTop={false}
-      borderBottom={false}
-      borderColor={SECONDARY}
-      paddingLeft={2}
-      marginTop={1}
-      marginBottom={1}
+    <Pane
+      color={SECONDARY}
+      title="Sessions"
+      footer="/resume <session-id> to reopen one"
     >
-      <Text color={SECONDARY} bold>Sessions</Text>
       {sessions.map((s) => (
         <Box key={s.session_id} flexDirection="column" marginTop={1}>
           <Box>
@@ -54,7 +47,6 @@ export function SessionList({ sessions }: Props) {
           </Text>
         </Box>
       ))}
-      <Text color={TEXT_DIM}>/resume &lt;session-id&gt; to reopen one</Text>
-    </Box>
+    </Pane>
   );
 }

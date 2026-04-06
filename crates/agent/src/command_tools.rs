@@ -225,7 +225,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "ingest",
         aliases: &["prism_ingest"],
         kind: CommandToolKind::RootArgs,
-        description: "Run `prism ingest ...` for the Rust ingest pipeline. Use this for CSV, Parquet, PDF, and watch-mode ingestion into PRISM's graph/vector stack instead of inventing shell glue.",
+        description: "Run `prism ingest ...` for PRISM's unified ingest pipeline. Use this for CSV/Parquet local ingest, PDF/text-like file ingest into the platform knowledge stack, watch mode, and ingest status checks instead of inventing shell glue.",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
     },
@@ -791,6 +791,10 @@ fn ingest_schema(path_description: &str) -> Value {
                 "type": "string",
                 "description": "Optional YAML ontology mapping file."
             },
+            "corpus": {
+                "type": "string",
+                "description": "Optional corpus slug to attach to the ingest job."
+            },
             "model": {
                 "type": "string",
                 "description": "Override generation model for ingest."
@@ -818,6 +822,14 @@ fn ingest_schema(path_description: &str) -> Value {
             "qdrant_url": {
                 "type": "string",
                 "description": "Override Qdrant HTTP endpoint."
+            },
+            "runtime_url": {
+                "type": "string",
+                "description": "Override the local runtime URL used for PDF text extraction."
+            },
+            "json": {
+                "type": "boolean",
+                "description": "Return JSON output instead of human-readable summaries."
             }
         },
         "required": ["path"],
@@ -1138,17 +1150,16 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
             "Optional marketplace search query. Leave empty to browse the default listing.",
             false,
         ),
-        CommandToolKind::MarketplaceInfo => marketplace_query_schema(
-            "Marketplace item name to inspect.",
-            true,
-        ),
+        CommandToolKind::MarketplaceInfo => {
+            marketplace_query_schema("Marketplace item name to inspect.", true)
+        }
         CommandToolKind::MarketplaceInstall => marketplace_install_schema(),
-        CommandToolKind::IngestFile => ingest_schema(
-            "File or local path to ingest into PRISM's graph/vector pipeline.",
-        ),
-        CommandToolKind::IngestWatch => ingest_schema(
-            "Directory to watch continuously for ingestable files.",
-        ),
+        CommandToolKind::IngestFile => {
+            ingest_schema("File or local path to ingest into PRISM's graph/vector pipeline.")
+        }
+        CommandToolKind::IngestWatch => {
+            ingest_schema("Directory to watch continuously for ingestable files.")
+        }
         CommandToolKind::ResearchQuery => research_query_schema(),
         CommandToolKind::ModelsList => models_list_schema(),
         CommandToolKind::ModelsSearch => models_search_schema(),
@@ -1170,10 +1181,9 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
             discourse_show_schema("spec_id", "UUID of the discourse spec to inspect.")
         }
         CommandToolKind::DiscourseRun => discourse_run_schema(),
-        CommandToolKind::DiscourseStatus => discourse_show_schema(
-            "instance_id",
-            "UUID of the discourse instance to inspect.",
-        ),
+        CommandToolKind::DiscourseStatus => {
+            discourse_show_schema("instance_id", "UUID of the discourse instance to inspect.")
+        }
         CommandToolKind::DiscourseTurns => discourse_show_schema(
             "instance_id",
             "UUID of the discourse instance whose stored turns should be fetched.",
@@ -1225,7 +1235,8 @@ fn parse_args(input: &Value) -> Result<Vec<String>> {
 }
 
 fn required_string(input: &Value, key: &str) -> Result<String> {
-    input.get(key)
+    input
+        .get(key)
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
@@ -1385,7 +1396,10 @@ fn format_execution_invocation(execution: &CommandExecution) -> String {
             name,
             values,
             execute,
-        } => format_invocation("workflow", &workflow_run_display_args(name, values, *execute)),
+        } => format_invocation(
+            "workflow",
+            &workflow_run_display_args(name, values, *execute),
+        ),
     }
 }
 
@@ -1405,7 +1419,9 @@ fn truncate_for_ui(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect::<String>() + "\n\n[Output truncated]"
 }
 
-fn parse_workflow_run_subcommand_args(args: &[String]) -> Result<(String, BTreeMap<String, String>, bool)> {
+fn parse_workflow_run_subcommand_args(
+    args: &[String],
+) -> Result<(String, BTreeMap<String, String>, bool)> {
     let Some(name) = args.first() else {
         bail!("workflow run requires a workflow name");
     };
@@ -1459,7 +1475,9 @@ fn parse_workflow_execution_from_root_args(args: &[String]) -> Result<CommandExe
             let mut request = parse_workflow_command_args(args)?;
             // The autonomous agent path must not be able to spoof an elevated
             // workflow role through arbitrary CLI-style args.
-            request.values.insert("role".to_string(), "agent".to_string());
+            request
+                .values
+                .insert("role".to_string(), "agent".to_string());
             Ok(CommandExecution::WorkflowRun {
                 name: request.name,
                 values: request.values,
@@ -1483,6 +1501,10 @@ fn build_ingest_args(input: &Value, watch: bool) -> Result<Vec<String>> {
         args.push("--mapping".to_string());
         args.push(mapping_path);
     }
+    if let Some(corpus) = optional_string(input, "corpus") {
+        args.push("--corpus".to_string());
+        args.push(corpus);
+    }
     for (flag, value) in [
         ("--model", optional_string(input, "model")),
         ("--llm-url", optional_string(input, "llm_url")),
@@ -1491,11 +1513,15 @@ fn build_ingest_args(input: &Value, watch: bool) -> Result<Vec<String>> {
         ("--neo4j-user", optional_string(input, "neo4j_user")),
         ("--neo4j-pass", optional_string(input, "neo4j_pass")),
         ("--qdrant-url", optional_string(input, "qdrant_url")),
+        ("--runtime-url", optional_string(input, "runtime_url")),
     ] {
         if let Some(value) = value {
             args.push(flag.to_string());
             args.push(value);
         }
+    }
+    if optional_bool(input, "json") {
+        args.push("--json".to_string());
     }
 
     args.push(path);
@@ -1610,10 +1636,7 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             })
         }
         CommandToolKind::ModelsSearch => {
-            let mut args = vec![
-                "search".to_string(),
-                required_string(input, "query")?,
-            ];
+            let mut args = vec!["search".to_string(), required_string(input, "query")?];
             if let Some(provider) = optional_string(input, "provider") {
                 args.push("--provider".to_string());
                 args.push(provider);
@@ -1725,10 +1748,7 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             args: vec!["list".to_string(), "--json".to_string()],
         }),
         CommandToolKind::DiscourseCreate => {
-            let mut args = vec![
-                "create".to_string(),
-                required_string(input, "yaml_file")?,
-            ];
+            let mut args = vec!["create".to_string(), required_string(input, "yaml_file")?];
             if let Some(slug) = optional_string(input, "slug") {
                 args.push("--slug".to_string());
                 args.push(slug);
@@ -1748,10 +1768,7 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             ],
         }),
         CommandToolKind::DiscourseRun => {
-            let mut args = vec![
-                "run".to_string(),
-                required_string(input, "spec_id")?,
-            ];
+            let mut args = vec!["run".to_string(), required_string(input, "spec_id")?];
             for (key, value) in parse_string_map(input, "params")? {
                 args.push("--param".to_string());
                 args.push(format!("{key}={value}"));
@@ -1918,19 +1935,17 @@ fn render_workflow_result(spec: &WorkflowSpec, result: &WorkflowRunResult) -> St
     lines.join("\n")
 }
 
-fn structured_success(
-    root: &str,
-    invocation: &str,
-    stdout: String,
-    extra: Value,
-) -> Value {
+fn structured_success(root: &str, invocation: &str, stdout: String, extra: Value) -> Value {
     let mut object = serde_json::Map::new();
     object.insert("root".to_string(), json!(root));
     object.insert("invocation".to_string(), json!(invocation));
     object.insert("success".to_string(), json!(true));
     object.insert("timed_out".to_string(), json!(false));
     object.insert("exit_code".to_string(), json!(0));
-    object.insert("stdout".to_string(), json!(truncate_for_ui(stdout.trim(), 30_000)));
+    object.insert(
+        "stdout".to_string(),
+        json!(truncate_for_ui(stdout.trim(), 30_000)),
+    );
     object.insert("stderr".to_string(), json!(""));
     if let Some(extra) = extra.as_object() {
         for (key, value) in extra {
@@ -2014,8 +2029,11 @@ async fn execute_workflow_command(
             let output = if specs.is_empty() {
                 "No workflows found.".to_string()
             } else {
-                specs.values()
-                    .map(|spec| format!("{}\t{}\t{}", spec.name, spec.command_name, spec.description))
+                specs
+                    .values()
+                    .map(|spec| {
+                        format!("{}\t{}\t{}", spec.name, spec.command_name, spec.description)
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -2094,7 +2112,9 @@ async fn execute_workflow_command(
                 ),
             }
         }
-        CommandExecution::Cli { .. } => unreachable!("workflow executor only handles workflow commands"),
+        CommandExecution::Cli { .. } => {
+            unreachable!("workflow executor only handles workflow commands")
+        }
     };
 
     Ok(result)
@@ -2185,8 +2205,11 @@ mod tests {
 
     #[test]
     fn renders_preview_from_structured_args() {
-        let preview = command_tool_preview("query", &json!({ "args": ["band gap materials", "--json"] }))
-            .expect("preview should render");
+        let preview = command_tool_preview(
+            "query",
+            &json!({ "args": ["band gap materials", "--json"] }),
+        )
+        .expect("preview should render");
 
         assert_eq!(preview, "prism query 'band gap materials' --json");
     }

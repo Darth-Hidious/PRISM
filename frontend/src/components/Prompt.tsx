@@ -1,6 +1,8 @@
 import React, { useState, useRef } from "react";
 import { Box, Text, useInput } from "ink";
-import { PRIMARY, TEXT_MUTED, TEXT_DIM, BORDER, BORDER_ACTIVE } from "../theme.js";
+import { PRIMARY, TEXT_DIM } from "../theme.js";
+import { Byline } from "./chrome/Byline.js";
+import { KeyboardShortcutHint } from "./chrome/KeyboardShortcutHint.js";
 
 interface Props {
   onSubmit: (text: string) => void;
@@ -117,7 +119,12 @@ export function Prompt({ onSubmit, active = true }: Props) {
       </Box>
       <Box paddingLeft={2}>
         <Text color={TEXT_DIM}>
-          enter send · / command · ctrl+c exit
+          <Byline>
+            <KeyboardShortcutHint shortcut="enter" action="send" />
+            <KeyboardShortcutHint shortcut="/" action="command" />
+            <KeyboardShortcutHint shortcut="↑/↓" action="history" />
+            <KeyboardShortcutHint shortcut="ctrl+c" action="exit" />
+          </Byline>
         </Text>
       </Box>
     </Box>

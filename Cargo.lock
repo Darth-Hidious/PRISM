@@ -2697,6 +2697,7 @@ name = "prism-cli"
 version = "2.6.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "prism-agent",

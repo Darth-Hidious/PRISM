@@ -1,9 +1,15 @@
 import React, { useState } from "react";
 import { Box, Text, useInput } from "ink";
 import {
-  WARNING, TEXT, TEXT_MUTED, TEXT_DIM,
-  BG_MENU, ERROR,
+  WARNING,
+  TEXT,
+  TEXT_MUTED,
+  TEXT_DIM,
+  BG_MENU,
 } from "../theme.js";
+import { Byline } from "./chrome/Byline.js";
+import { KeyboardShortcutHint } from "./chrome/KeyboardShortcutHint.js";
+import { Pane } from "./chrome/Pane.js";
 
 interface Props {
   toolName: string;
@@ -62,45 +68,34 @@ export function ApprovalPrompt({
     .join(" · ");
 
   return (
-    <Box
-      flexDirection="column"
-      borderStyle="single"
-      borderLeft
-      borderRight={false}
-      borderTop={false}
-      borderBottom={false}
-      borderColor={WARNING}
-      paddingLeft={2}
-      paddingTop={0}
-      paddingBottom={1}
+    <Pane
+      color={WARNING}
+      title="Permission required"
+      subtitle={
+        meta ? `${toolName} · ${meta}` : toolName
+      }
+      footer={
+        <Text color={TEXT_DIM}>
+          <Byline>
+            <KeyboardShortcutHint shortcut="←/→" action="choose" />
+            <KeyboardShortcutHint shortcut="enter" action="confirm" />
+            <KeyboardShortcutHint shortcut="esc" action="reject" />
+          </Byline>
+        </Text>
+      }
     >
-      {/* Header: △ Permission required */}
-      <Box>
-        <Text color={WARNING}>△ </Text>
-        <Text color={TEXT} bold>{toolName}</Text>
-      </Box>
-
-      {/* Summary of what the tool will do */}
       {summary ? (
-        <Box paddingLeft={2}>
+        <Box>
           <Text color={TEXT_DIM}>{summary}</Text>
         </Box>
       ) : null}
 
-      {meta ? (
-        <Box paddingLeft={2}>
-          <Text color={TEXT_MUTED}>{meta}</Text>
-        </Box>
-      ) : null}
-
       {description ? (
-        <Box paddingLeft={2} marginTop={summary || meta ? 0 : 0}>
+        <Box marginTop={summary ? 1 : 0}>
           <Text color={TEXT_MUTED}>{description}</Text>
         </Box>
       ) : null}
 
-      {/* Action buttons. Session-scoped choices update the backend override
-          state so later tool calls reflect the user's decision. */}
       <Box marginTop={1} gap={1}>
         {OPTIONS.map((opt, i) => (
           <Text
@@ -112,6 +107,6 @@ export function ApprovalPrompt({
           </Text>
         ))}
       </Box>
-    </Box>
+    </Pane>
   );
 }

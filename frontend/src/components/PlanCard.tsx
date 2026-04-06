@@ -2,6 +2,9 @@ import React from "react";
 import { Box, Text } from "ink";
 import { ACCENT, TEXT_MUTED } from "../theme.js";
 import { MarkdownText } from "./MarkdownText.js";
+import { Byline } from "./chrome/Byline.js";
+import { KeyboardShortcutHint } from "./chrome/KeyboardShortcutHint.js";
+import { Pane } from "./chrome/Pane.js";
 
 interface Props {
   content: string;
@@ -9,22 +12,21 @@ interface Props {
 
 export function PlanCard({ content }: Props) {
   return (
-    <Box
-      flexDirection="column"
-      borderStyle="single"
-      borderLeft
-      borderRight={false}
-      borderTop={false}
-      borderBottom={false}
-      borderColor={ACCENT}
-      paddingLeft={2}
-      marginTop={1}
+    <Pane
+      color={ACCENT}
+      title="Plan"
+      footer={
+        <Text color={TEXT_MUTED}>
+          <Byline>
+            <KeyboardShortcutHint shortcut="y" action="execute" />
+            <KeyboardShortcutHint shortcut="n" action="reject" />
+          </Byline>
+        </Text>
+      }
     >
-      <Text color={ACCENT} bold>◆ Plan</Text>
-      <Box marginTop={0}>
+      <Box>
         <MarkdownText text={content} />
       </Box>
-      <Text color={TEXT_MUTED}>  [y] execute  [n] reject</Text>
-    </Box>
+    </Pane>
   );
 }
