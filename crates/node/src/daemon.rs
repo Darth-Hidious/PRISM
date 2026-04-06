@@ -512,14 +512,14 @@ async fn connect_and_run(
                 sink.send(Message::Text(serde_json::to_string(&hb)?)).await?;
             }
             _ = rest_heartbeat_timer.tick() => {
-                // REST heartbeat complements the WS heartbeat above.
-                // The platform may not support this endpoint yet (see docs/marc27-api-discrepancies.md).
-                // Failures are silently ignored — the WS heartbeat is authoritative.
+                // REST heartbeat complements the WS heartbeat above so the DB-backed node
+                // registry stays fresh even if downstream consumers are reading REST state.
+                // Failures remain non-fatal because the WS heartbeat is still authoritative.
                 if let (Some(client), Some(nid)) = (platform_client, platform_node_id) {
                     let active = active_jobs.load(Ordering::Relaxed);
                     let registry = prism_client::node_registry::NodeRegistryClient::new(client);
                     if let Err(e) = registry.heartbeat(nid, "online", active).await {
-                        tracing::debug!(error = %e, "REST heartbeat unavailable (WS heartbeat active)");
+                        tracing::debug!(error = %e, "REST heartbeat failed (WS heartbeat still active)");
                     }
                 }
             }

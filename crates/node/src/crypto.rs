@@ -1,23 +1,40 @@
 //! E2EE primitives for node-to-node communication.
 //!
-//! Protocol: X25519 key agreement + ChaCha20-Poly1305 AEAD.
-//! Same cryptographic pattern as Signal and WireGuard.
+//! Protocol: X25519 key agreement + AES-256-GCM AEAD.
+//!
+//! The transport key derivation mirrors the platform's v1 crypto contract:
+//! hash the raw Diffie-Hellman output with the `marc27-e2ee-v1` domain separator,
+//! then use the derived 32-byte value as the AES-256-GCM key.
 
 use std::path::{Path, PathBuf};
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 const NONCE_LEN: usize = 12;
 const KEY_FILE_NAME: &str = "node_key";
 const SIGNING_KEY_FILE_NAME: &str = "node_signing_key";
+const E2EE_DOMAIN_SEPARATOR: &[u8] = b"marc27-e2ee-v1";
+
+/// Wire payload used for node-to-node encrypted transfers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncryptedPayload {
+    /// Base64-encoded 12-byte AES-GCM nonce.
+    pub nonce: String,
+    /// Base64-encoded AES-GCM ciphertext.
+    pub ciphertext: String,
+    /// Base64-encoded sender X25519 public key.
+    pub sender_public_key: String,
+}
 
 /// Load an existing keypair from disk, or generate a new one.
 ///
@@ -191,15 +208,20 @@ pub fn rotate_signing_key(state_dir: &Path) -> Result<VerifyingKey> {
 
 /// Compute a shared secret from our private key and their public key.
 pub fn compute_shared_secret(our_secret: &StaticSecret, their_public: &PublicKey) -> [u8; 32] {
-    our_secret.diffie_hellman(their_public).to_bytes()
+    let shared = our_secret.diffie_hellman(their_public);
+    let mut hasher = Sha256::new();
+    hasher.update(shared.as_bytes());
+    hasher.update(E2EE_DOMAIN_SEPARATOR);
+    hasher.finalize().into()
 }
 
-/// Encrypt plaintext using ChaCha20-Poly1305 with a shared secret.
-///
-/// Output format: `nonce(12) || ciphertext || tag(16)`
-pub fn encrypt(shared_secret: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new_from_slice(shared_secret)
-        .map_err(|e| anyhow::anyhow!("cipher init failed: {e}"))?;
+/// Encrypt plaintext using AES-256-GCM with a derived transport key.
+pub fn encrypt(
+    shared_secret: &[u8; 32],
+    plaintext: &[u8],
+    sender_public_key: &str,
+) -> EncryptedPayload {
+    let cipher = Aes256Gcm::new_from_slice(shared_secret).expect("32-byte transport key");
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -207,36 +229,33 @@ pub fn encrypt(shared_secret: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
-        .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
+        .expect("aes-gcm encryption should not fail");
 
-    // Prepend nonce to ciphertext
-    let mut output = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-    output.extend_from_slice(&nonce_bytes);
-    output.extend_from_slice(&ciphertext);
-
-    Ok(output)
+    EncryptedPayload {
+        nonce: base64_encode(&nonce_bytes),
+        ciphertext: base64_encode(&ciphertext),
+        sender_public_key: sender_public_key.to_string(),
+    }
 }
 
-/// Decrypt data encrypted with `encrypt()`.
-///
-/// Input format: `nonce(12) || ciphertext || tag(16)`
-pub fn decrypt(shared_secret: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
-    if data.len() < NONCE_LEN + 16 {
+/// Decrypt an [`EncryptedPayload`] produced by [`encrypt`].
+pub fn decrypt(shared_secret: &[u8; 32], payload: &EncryptedPayload) -> Result<Vec<u8>> {
+    let nonce_bytes = base64_decode(&payload.nonce).context("invalid base64 in payload nonce")?;
+    if nonce_bytes.len() != NONCE_LEN {
         bail!(
-            "encrypted data too short ({} bytes, minimum {})",
-            data.len(),
-            NONCE_LEN + 16
+            "encrypted payload nonce has invalid length {} (expected {NONCE_LEN})",
+            nonce_bytes.len()
         );
     }
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext =
+        base64_decode(&payload.ciphertext).context("invalid base64 in payload ciphertext")?;
 
-    let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    let cipher = ChaCha20Poly1305::new_from_slice(shared_secret)
+    let cipher = Aes256Gcm::new_from_slice(shared_secret)
         .map_err(|e| anyhow::anyhow!("cipher init failed: {e}"))?;
 
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(nonce, ciphertext.as_ref())
         .map_err(|e| anyhow::anyhow!("decryption failed (wrong key or corrupted data): {e}"))
 }
 
@@ -306,6 +325,16 @@ pub fn verify_signature(public: &VerifyingKey, data: &[u8], signature_b64: &str)
         .context("signature verification failed")
 }
 
+fn base64_encode(data: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+fn base64_decode(encoded: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("invalid base64")
+}
+
 fn key_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join(KEY_FILE_NAME)
 }
@@ -345,7 +374,7 @@ mod tests {
 
         // Alice encrypts, Bob decrypts
         let plaintext = b"Li-Fe-P-O phase diagram results";
-        let encrypted = encrypt(&alice_shared, plaintext).unwrap();
+        let encrypted = encrypt(&alice_shared, plaintext, &encode_public_key(&alice_public));
         let decrypted = decrypt(&bob_shared, &encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }
@@ -353,13 +382,15 @@ mod tests {
     #[test]
     fn wrong_key_fails_decrypt() {
         let secret = StaticSecret::random_from_rng(OsRng);
-        let shared = compute_shared_secret(&secret, &PublicKey::from(&secret));
+        let public = PublicKey::from(&secret);
+        let shared = compute_shared_secret(&secret, &public);
 
-        let encrypted = encrypt(&shared, b"secret data").unwrap();
+        let encrypted = encrypt(&shared, b"secret data", &encode_public_key(&public));
 
         // Try decrypting with a different key
         let wrong_secret = StaticSecret::random_from_rng(OsRng);
-        let wrong_shared = compute_shared_secret(&wrong_secret, &PublicKey::from(&wrong_secret));
+        let wrong_public = PublicKey::from(&wrong_secret);
+        let wrong_shared = compute_shared_secret(&wrong_secret, &wrong_public);
 
         assert!(decrypt(&wrong_shared, &encrypted).is_err());
     }
@@ -389,9 +420,15 @@ mod tests {
     }
 
     #[test]
-    fn short_data_rejected() {
-        let shared = [0u8; 32];
-        assert!(decrypt(&shared, &[0u8; 10]).is_err());
+    fn encrypted_payload_roundtrips_via_serde() {
+        let payload = EncryptedPayload {
+            nonce: base64_encode(&[1u8; NONCE_LEN]),
+            ciphertext: base64_encode(&[2u8; 32]),
+            sender_public_key: base64_encode(&[3u8; 32]),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded: EncryptedPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, payload);
     }
 
     #[test]
@@ -442,14 +479,23 @@ mod tests {
     #[test]
     fn decrypt_empty_data_fails() {
         let shared = [42u8; 32];
-        assert!(decrypt(&shared, &[]).is_err());
+        let payload = EncryptedPayload {
+            nonce: String::new(),
+            ciphertext: String::new(),
+            sender_public_key: String::new(),
+        };
+        assert!(decrypt(&shared, &payload).is_err());
     }
 
     #[test]
-    fn decrypt_too_short_data_fails() {
+    fn decrypt_invalid_nonce_length_fails() {
         let shared = [42u8; 32];
-        // Need at least 12 (nonce) + 16 (tag) = 28 bytes.
-        assert!(decrypt(&shared, &[0u8; 27]).is_err());
+        let payload = EncryptedPayload {
+            nonce: base64_encode(&[0u8; 8]),
+            ciphertext: base64_encode(&[0u8; 16]),
+            sender_public_key: String::new(),
+        };
+        assert!(decrypt(&shared, &payload).is_err());
     }
 
     #[test]
@@ -458,10 +504,11 @@ mod tests {
         let public = PublicKey::from(&secret);
         let shared = compute_shared_secret(&secret, &public);
 
-        let mut encrypted = encrypt(&shared, b"hello").unwrap();
-        // Flip a byte in the ciphertext portion.
-        let last = encrypted.len() - 1;
-        encrypted[last] ^= 0xFF;
+        let mut encrypted = encrypt(&shared, b"hello", &encode_public_key(&public));
+        let mut ciphertext = base64_decode(&encrypted.ciphertext).unwrap();
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 0xFF;
+        encrypted.ciphertext = base64_encode(&ciphertext);
 
         assert!(decrypt(&shared, &encrypted).is_err());
     }
@@ -469,7 +516,7 @@ mod tests {
     #[test]
     fn encrypt_empty_plaintext() {
         let shared = [1u8; 32];
-        let encrypted = encrypt(&shared, b"").unwrap();
+        let encrypted = encrypt(&shared, b"", &base64_encode(&[7u8; 32]));
         let decrypted = decrypt(&shared, &encrypted).unwrap();
         assert!(decrypted.is_empty());
     }
@@ -478,25 +525,26 @@ mod tests {
     fn encrypt_large_plaintext() {
         let shared = [2u8; 32];
         let big = vec![0xAB; 100_000];
-        let encrypted = encrypt(&shared, &big).unwrap();
+        let encrypted = encrypt(&shared, &big, &base64_encode(&[8u8; 32]));
         let decrypted = decrypt(&shared, &encrypted).unwrap();
         assert_eq!(decrypted, big);
     }
 
     #[test]
-    fn encrypted_output_has_nonce_prefix() {
+    fn encrypted_payload_contains_sender_and_nonce() {
         let shared = [3u8; 32];
-        let encrypted = encrypt(&shared, b"test").unwrap();
-        // Output should be: 12 (nonce) + plaintext_len + 16 (tag)
-        assert!(encrypted.len() >= 12 + 16);
+        let sender = base64_encode(&[9u8; 32]);
+        let encrypted = encrypt(&shared, b"test", &sender);
+        assert_eq!(encrypted.sender_public_key, sender);
+        assert_eq!(base64_decode(&encrypted.nonce).unwrap().len(), NONCE_LEN);
     }
 
     #[test]
     fn two_encryptions_produce_different_ciphertext() {
         let shared = [4u8; 32];
         let plain = b"same data twice";
-        let enc1 = encrypt(&shared, plain).unwrap();
-        let enc2 = encrypt(&shared, plain).unwrap();
+        let enc1 = encrypt(&shared, plain, &base64_encode(&[10u8; 32]));
+        let enc2 = encrypt(&shared, plain, &base64_encode(&[10u8; 32]));
         // Different nonces → different ciphertext.
         assert_ne!(enc1, enc2);
         // But both decrypt to the same plaintext.
