@@ -176,20 +176,23 @@ impl LlmSection {
     /// Resolve the ingest/search model, allowing platform-backed providers to
     /// fall back to the hosted Gemini default when no explicit model is set.
     pub fn resolve_model_or_platform_default(&self) -> Result<String> {
-        self.model.clone().or_else(|| {
-            if is_platform_llm_provider(&self.provider) {
-                Some(PLATFORM_INGEST_MODEL.to_string())
-            } else {
-                None
-            }
-        }).ok_or_else(|| {
-            anyhow::anyhow!(
-                "No LLM model configured. Set one with:\n  \
+        self.model
+            .clone()
+            .or_else(|| {
+                if is_platform_llm_provider(&self.provider) {
+                    Some(PLATFORM_INGEST_MODEL.to_string())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No LLM model configured. Set one with:\n  \
                  prism configure --model <name>\n\
                  Or pass --model explicitly for this command.\n\
                  Example: prism configure --model gemma-4-E4B-it --url http://localhost:8080"
-            )
-        })
+                )
+            })
     }
 
     /// Resolve the embedding model, defaulting platform-backed flows to the
@@ -629,7 +632,9 @@ api_key_env = "ANTHROPIC_API_KEY"
             "gemini-3.1-flash-preview"
         );
         assert_eq!(
-            section.resolve_embedding_model_or_platform_default().as_deref(),
+            section
+                .resolve_embedding_model_or_platform_default()
+                .as_deref(),
             Some("gemini-embedding-2")
         );
     }
@@ -645,7 +650,9 @@ api_key_env = "ANTHROPIC_API_KEY"
             Some("gemini-3.1-flash-preview")
         );
         assert_eq!(
-            section.resolve_embedding_model_or_platform_default().as_deref(),
+            section
+                .resolve_embedding_model_or_platform_default()
+                .as_deref(),
             Some("gemini-embedding-2")
         );
     }
