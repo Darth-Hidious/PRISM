@@ -39,6 +39,8 @@ interface StatusState {
   hasPlan: boolean;
   sessionMode?: string;
   planStatus?: string;
+  model?: string;
+  projectRoot?: string;
 }
 
 interface WelcomeState {
@@ -256,6 +258,10 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
             hasPlan: !!ev.params.has_plan,
             sessionMode: ev.params.session_mode ? String(ev.params.session_mode) : undefined,
             planStatus: ev.params.plan_status ? String(ev.params.plan_status) : undefined,
+            model: ev.params.model ? String(ev.params.model) : undefined,
+            projectRoot: ev.params.project_root
+              ? String(ev.params.project_root)
+              : undefined,
           });
           break;
         case "ui.prompt":
@@ -432,6 +438,8 @@ export function App({ pythonPath, backendBin, autoApprove, resume }: Props) {
           approvalPending={!!draftTurn?.approvalRequest}
           turnActive={!!draftTurn}
           activeViewTitle={activeView?.title}
+          model={statusState.model}
+          projectRoot={statusState.projectRoot}
         />
       ) : null}
 
