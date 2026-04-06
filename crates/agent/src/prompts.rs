@@ -111,6 +111,21 @@ pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> S
     if has_any_tools(
         &tool_names,
         &[
+            "marketplace_search",
+            "marketplace_info",
+            "marketplace_install",
+            "marketplace",
+        ],
+    ) {
+        bullets.push(
+            "Use marketplace tools when the task depends on installing or inspecting published workflows and tools. Do not assume a workflow is locally available until you have checked the marketplace or local workflow catalog."
+                .to_string(),
+        );
+    }
+
+    if has_any_tools(
+        &tool_names,
+        &[
             "deploy_create",
             "deploy_list",
             "deploy_status",
@@ -120,6 +135,26 @@ pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> S
     ) {
         bullets.push(
             "Use deploy tools for persistent serving or target-based deployment. Do not treat deployment as an ad hoc shell process when the PRISM deploy surface already covers it."
+                .to_string(),
+        );
+    }
+
+    if has_any_tools(
+        &tool_names,
+        &[
+            "node_probe",
+            "node_status",
+            "node_logs",
+            "mesh_discover",
+            "mesh_peers",
+            "mesh_publish",
+            "mesh_subscribe",
+            "mesh_unsubscribe",
+            "mesh_subscriptions",
+        ],
+    ) {
+        bullets.push(
+            "Use node tools to inspect local capability, visibility, and operator state before assuming compute or storage exists. Use mesh tools for discovery, publication, and subscription flows between nodes instead of treating deployment or ingest as the same thing."
                 .to_string(),
         );
     }
@@ -210,9 +245,12 @@ const INTERACTIVE_PROMPT: &str = r#"You are PRISM, an interactive agent for mate
 - Treat workflows as the primary orchestration surface for YAML-defined pipelines.
 - Use query for targeted retrieval, research for iterative retrieval-and-synthesis loops, and discourse for structured multi-agent debate.
 - Use models to discover available hosted LLMs instead of assuming model names.
+- Use marketplace when a workflow, tool, or artifact may need to be discovered or installed before execution.
 - Use deploy for persistent serving or target-based deployment rather than ad hoc shell processes.
+- Use node to inspect or prepare local capability, and use mesh for discovery/publication/subscription between nodes.
 - Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless the user explicitly asks for low-level control.
 - Use discover_capabilities, status, and tools when you need to inspect the current environment before planning.
+- Keep local, MARC27-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
 
 # Result Quality
 - Cite providers, data sources, and workflow boundaries when they materially affect the answer.
@@ -252,9 +290,12 @@ const AUTONOMOUS_PROMPT: &str = r#"You are PRISM, an autonomous agent for materi
 - Treat workflows as the primary orchestration surface for YAML-defined pipelines.
 - Use query for targeted retrieval, research for iterative retrieval-and-synthesis loops, and discourse for structured multi-agent debate.
 - Use models to discover available hosted LLMs instead of assuming model names.
+- Use marketplace when a workflow, tool, or artifact may need to be discovered or installed before execution.
 - Use deploy for persistent serving or target-based deployment rather than ad hoc shell processes.
+- Use node to inspect or prepare local capability, and use mesh for discovery/publication/subscription between nodes.
 - Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless low-level control is explicitly required by the task.
 - Use discover_capabilities, status, and tools when you need to inspect the current environment before planning.
+- Keep local, MARC27-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
 
 # Result Quality
 - Cite providers, data sources, and workflow boundaries when they materially affect the answer.
@@ -313,6 +354,38 @@ mod tests {
         assert!(prompt.contains("# Loaded Tool Strategy"));
         assert!(prompt.contains("Treat workflows as the primary orchestration surface"));
         assert!(prompt.contains("discover_capabilities"));
+    }
+
+    #[test]
+    fn runtime_guidance_mentions_node_mesh_and_marketplace() {
+        let mut catalog = ToolCatalog::default();
+        catalog.extend(vec![
+            LoadedTool {
+                name: "node_probe".to_string(),
+                description: "Inspect node".to_string(),
+                input_schema: json!({ "type": "object" }),
+                requires_approval: false,
+                permission_mode: PermissionMode::ReadOnly,
+            },
+            LoadedTool {
+                name: "mesh_publish".to_string(),
+                description: "Publish to mesh".to_string(),
+                input_schema: json!({ "type": "object" }),
+                requires_approval: true,
+                permission_mode: PermissionMode::FullAccess,
+            },
+            LoadedTool {
+                name: "marketplace_search".to_string(),
+                description: "Search marketplace".to_string(),
+                input_schema: json!({ "type": "object" }),
+                requires_approval: false,
+                permission_mode: PermissionMode::ReadOnly,
+            },
+        ]);
+
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        assert!(prompt.contains("Use node tools to inspect local capability"));
+        assert!(prompt.contains("Use marketplace tools"));
     }
 
     #[test]
