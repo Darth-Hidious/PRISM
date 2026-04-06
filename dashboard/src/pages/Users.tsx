@@ -1,9 +1,19 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 import Card from "../components/Card";
+import SessionNotice from "../components/SessionNotice";
 import Table from "../components/Table";
 
-export default function Users() {
+export default function Users({ authenticated }: { authenticated: boolean }) {
+  if (!authenticated) {
+    return (
+      <div className="space-y-6 max-w-3xl">
+        <h1 className="text-xl font-bold">Users</h1>
+        <SessionNotice detail="Node users, roles, and permissions require a dashboard session." />
+      </div>
+    );
+  }
+
   const { data, isLoading, error } = useQuery({
     queryKey: ["users"],
     queryFn: api.getUsers,

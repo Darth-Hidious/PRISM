@@ -1,17 +1,25 @@
 @import "tailwindcss";
 
 :root {
-  --bg: #0d1117;
-  --fg: #e6edf3;
-  --accent: #fab283;
-  --dim: #8b949e;
-  --card: #161b22;
-  --border: #30363d;
+  --bg: #0b1016;
+  --fg: #e9edf2;
+  --accent: #f0a058;
+  --dim: #90a0b4;
+  --card: #121a24;
+  --panel: #17212d;
+  --border: #273243;
 }
 
 body {
   background: var(--bg);
   color: var(--fg);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
-    sans-serif;
+  font-family: "SF Pro Display", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Helvetica, Arial, sans-serif;
+  background-image:
+    radial-gradient(circle at top left, rgba(240, 160, 88, 0.12), transparent 24rem),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 18rem);
+}
+
+#root {
+  min-height: 100vh;
 }

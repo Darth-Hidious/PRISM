@@ -1,9 +1,19 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 import Card from "../components/Card";
+import SessionNotice from "../components/SessionNotice";
 import Table from "../components/Table";
 
-export default function AuditLog() {
+export default function AuditLog({ authenticated }: { authenticated: boolean }) {
+  if (!authenticated) {
+    return (
+      <div className="space-y-6 max-w-4xl">
+        <h1 className="text-xl font-bold">Audit Log</h1>
+        <SessionNotice detail="Audit history is permission-gated and requires a dashboard session." />
+      </div>
+    );
+  }
+
   const { data, isLoading, error } = useQuery({
     queryKey: ["audit"],
     queryFn: api.getAuditLog,

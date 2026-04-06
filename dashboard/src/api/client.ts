@@ -1,8 +1,19 @@
+import { getSessionToken } from "../lib/session";
+
 const BASE = import.meta.env.DEV ? "" : "";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, init);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const headers = new Headers(init?.headers);
+  const token = getSessionToken();
+  if (token) {
+    headers.set("X-Session-Token", token);
+  }
+  const res = await fetch(`${BASE}${path}`, { ...init, headers });
+  if (!res.ok) {
+    const body = await res.text();
+    const detail = body.trim();
+    throw new Error(detail ? `${res.status} ${res.statusText} — ${detail}` : `${res.status} ${res.statusText}`);
+  }
   return res.json();
 }
 
