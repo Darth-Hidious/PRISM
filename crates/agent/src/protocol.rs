@@ -2028,6 +2028,88 @@ fn format_tool_entry(tool_name: &str, tools: &ToolCatalog) -> String {
     }
 }
 
+fn permission_tool_json(
+    tool_name: &str,
+    tools: &ToolCatalog,
+    permissions: &ToolPermissionContext,
+) -> Value {
+    match tools.find(tool_name) {
+        Some(tool) => json!({
+            "name": tool.name,
+            "permission_mode": tool.permission_mode.as_str(),
+            "requires_approval": tool.requires_approval,
+            "description": tool.description,
+            "current_behavior": if permissions.blocks(&tool.name) {
+                "blocked"
+            } else if permissions.auto_approves(&tool.name) {
+                "auto-approved"
+            } else {
+                "ask"
+            },
+        }),
+        None => json!({
+            "name": tool_name,
+            "permission_mode": "unknown",
+            "requires_approval": false,
+            "description": "",
+            "current_behavior": "ask",
+        }),
+    }
+}
+
+fn emit_permissions_state(
+    permissions: &ToolPermissionContext,
+    overrides: &PermissionOverrides,
+    tools: &ToolCatalog,
+    session_mode: SessionMode,
+) {
+    let (read_only, workspace_write, full_access, approval_required, tool_names) =
+        loaded_tools_by_access(tools);
+    let auto_approved = tool_names
+        .iter()
+        .filter(|name| permissions.auto_approves(name))
+        .map(|name| permission_tool_json(name, tools, permissions))
+        .collect::<Vec<_>>();
+    let blocked = tool_names
+        .iter()
+        .filter(|name| permissions.blocks(name))
+        .map(|name| permission_tool_json(name, tools, permissions))
+        .collect::<Vec<_>>();
+    let approval_required = approval_required
+        .iter()
+        .map(|name| permission_tool_json(name, tools, permissions))
+        .collect::<Vec<_>>();
+    let read_only = read_only
+        .iter()
+        .map(|name| permission_tool_json(name, tools, permissions))
+        .collect::<Vec<_>>();
+    let workspace_write = workspace_write
+        .iter()
+        .map(|name| permission_tool_json(name, tools, permissions))
+        .collect::<Vec<_>>();
+    let full_access = full_access
+        .iter()
+        .map(|name| permission_tool_json(name, tools, permissions))
+        .collect::<Vec<_>>();
+    let allow_overrides = overrides.allow_names().cloned().collect::<Vec<_>>();
+    let deny_overrides = overrides.deny_names().cloned().collect::<Vec<_>>();
+
+    emit_notification(
+        "ui.permissions",
+        json!({
+            "mode": session_mode.as_str(),
+            "auto_approved": auto_approved,
+            "blocked": blocked,
+            "approval_required": approval_required,
+            "read_only": read_only,
+            "workspace_write": workspace_write,
+            "full_access": full_access,
+            "allow_overrides": allow_overrides,
+            "deny_overrides": deny_overrides,
+        }),
+    );
+}
+
 fn format_tools_summary_report(tools: &ToolCatalog, permissions: &ToolPermissionContext) -> String {
     let (read_only, workspace_write, full_access, approval_required, tool_names) =
         loaded_tools_by_access(tools);
@@ -4721,6 +4803,7 @@ async fn handle_command(
                 "warning",
                 "tab switch • esc close",
             );
+            emit_permissions_state(permissions, permission_overrides, tools, *session_mode);
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
