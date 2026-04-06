@@ -211,8 +211,53 @@ const BUILTIN_COMMANDS: &[SlashCommandSpec] = &[
         category: "Settings",
     },
     SlashCommandSpec {
+        usage: "/models search <query>",
+        description: "Search hosted models by ID, name, or provider",
+        category: "Settings",
+    },
+    SlashCommandSpec {
+        usage: "/models info <model-id>",
+        description: "Inspect one hosted model from the active project catalog",
+        category: "Settings",
+    },
+    SlashCommandSpec {
+        usage: "/deploy list",
+        description: "List persistent deployments visible to the current auth context",
+        category: "Settings",
+    },
+    SlashCommandSpec {
+        usage: "/deploy status <deployment-id>",
+        description: "Inspect one deployment in a native screen",
+        category: "Settings",
+    },
+    SlashCommandSpec {
+        usage: "/deploy health <deployment-id>",
+        description: "Run a deployment health check and show the result",
+        category: "Settings",
+    },
+    SlashCommandSpec {
         usage: "/discourse list",
         description: "List platform discourse specs for the current account",
+        category: "Settings",
+    },
+    SlashCommandSpec {
+        usage: "/discourse show <spec-id>",
+        description: "Inspect one discourse spec",
+        category: "Settings",
+    },
+    SlashCommandSpec {
+        usage: "/discourse run <spec-id> [--param key=value]",
+        description: "Run one discourse workflow and inspect its event stream",
+        category: "Settings",
+    },
+    SlashCommandSpec {
+        usage: "/discourse status <instance-id>",
+        description: "Inspect a discourse instance",
+        category: "Settings",
+    },
+    SlashCommandSpec {
+        usage: "/discourse turns <instance-id>",
+        description: "Inspect stored discourse turns",
         category: "Settings",
     },
 ];
