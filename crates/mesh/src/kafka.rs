@@ -4,6 +4,8 @@
 //! and a consumer that deserialises them back into a tokio channel.
 
 use anyhow::{Context, Result};
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -89,6 +91,7 @@ impl MeshKafkaProducer {
 /// Kafka consumer that feeds mesh messages into a channel.
 pub struct MeshKafkaConsumer {
     consumer: StreamConsumer,
+    brokers: String,
     topic_prefix: String,
 }
 
@@ -100,12 +103,15 @@ impl MeshKafkaConsumer {
             .set("group.id", &config.group_id)
             .set("auto.offset.reset", "latest")
             .set("enable.auto.commit", "true")
+            // On a fresh local broker, the mesh topics may not exist yet.
+            .set("allow.auto.create.topics", "true")
             .create()
             .context("failed to create Kafka consumer")?;
 
         info!(brokers = %config.brokers, group = %config.group_id, "Kafka consumer created");
         Ok(Self {
             consumer,
+            brokers: config.brokers.clone(),
             topic_prefix: config.topic_prefix.clone(),
         })
     }
@@ -115,20 +121,8 @@ impl MeshKafkaConsumer {
     /// Deserialised messages are sent to `tx`. Runs until the sender is dropped
     /// or the consumer is shut down.
     pub async fn run(&self, tx: mpsc::Sender<MeshMessage>) -> Result<()> {
-        let topics: Vec<String> = [
-            "announce",
-            "goodbye",
-            "data-publish",
-            "data-subscribe",
-            "data-unsubscribe",
-            "query-forward",
-            "query-result",
-            "ping",
-            "pong",
-        ]
-        .iter()
-        .map(|s| format!("{}.{s}", self.topic_prefix))
-        .collect();
+        let topics = mesh_topics(&self.topic_prefix);
+        ensure_topics_exist(&self.brokers, &topics).await?;
 
         let topic_refs: Vec<&str> = topics.iter().map(|s| s.as_str()).collect();
         self.consumer
@@ -155,7 +149,12 @@ impl MeshKafkaConsumer {
                     }
                 }
                 Err(e) => {
-                    error!(error = %e, "Kafka consumer error");
+                    let msg = e.to_string();
+                    if msg.contains("UnknownTopicOrPartition") {
+                        debug!(error = %msg, "Kafka mesh topics not visible yet; retrying");
+                    } else {
+                        error!(error = %e, "Kafka consumer error");
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
@@ -163,4 +162,51 @@ impl MeshKafkaConsumer {
 
         Ok(())
     }
+}
+
+fn mesh_topics(topic_prefix: &str) -> Vec<String> {
+    [
+        "announce",
+        "goodbye",
+        "data-publish",
+        "data-subscribe",
+        "data-unsubscribe",
+        "query-forward",
+        "query-result",
+        "ping",
+        "pong",
+    ]
+    .iter()
+    .map(|suffix| format!("{topic_prefix}.{suffix}"))
+    .collect()
+}
+
+async fn ensure_topics_exist(brokers: &str, topics: &[String]) -> Result<()> {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .context("failed to create Kafka admin client")?;
+
+    let new_topics: Vec<NewTopic<'_>> = topics
+        .iter()
+        .map(|topic| NewTopic::new(topic, 1, TopicReplication::Fixed(1)))
+        .collect();
+
+    // Fresh local brokers do not have the mesh topics yet. Creating them once
+    // up front avoids the repeated UnknownTopicOrPartition error loop.
+    let results = admin
+        .create_topics(&new_topics, &AdminOptions::new())
+        .await
+        .context("failed to create mesh Kafka topics")?;
+
+    for result in results {
+        if let Err((topic, err)) = result {
+            let msg = err.to_string();
+            if !msg.contains("TopicAlreadyExists") {
+                anyhow::bail!("failed to create Kafka topic {topic}: {msg}");
+            }
+        }
+    }
+
+    Ok(())
 }

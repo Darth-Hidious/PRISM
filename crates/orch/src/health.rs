@@ -158,8 +158,20 @@ impl HealthMonitor {
 
                     // Attempt restart via the orchestrator
                     let restart_result = match handle.name.as_str() {
-                        "neo4j" => orch.start_neo4j_public(&config.neo4j).await,
-                        "qdrant" => orch.start_qdrant_public(&config.vector_db).await,
+                        "neo4j" => {
+                            if let Some(ref neo4j_cfg) = config.neo4j {
+                                orch.start_neo4j_public(neo4j_cfg).await
+                            } else {
+                                continue;
+                            }
+                        }
+                        "qdrant" => {
+                            if let Some(ref vector_cfg) = config.vector_db {
+                                orch.start_qdrant_public(vector_cfg).await
+                            } else {
+                                continue;
+                            }
+                        }
                         "kafka" => {
                             if let Some(ref kfg) = config.kafka {
                                 orch.start_kafka_public(kfg).await

@@ -93,6 +93,7 @@ impl DockerOrchestrator {
         name: &str,
         image: &str,
         env: Vec<String>,
+        cmd: Option<Vec<String>>,
         port_bindings: HashMap<String, Option<Vec<PortBinding>>>,
         volumes: Option<HashMap<String, HashMap<(), ()>>>,
     ) -> Result<String> {
@@ -124,6 +125,7 @@ impl DockerOrchestrator {
         let config = Config {
             image: Some(image.to_string()),
             env: Some(env),
+            cmd,
             labels: Some(labels),
             host_config: Some(host_config),
             volumes,
@@ -197,7 +199,7 @@ impl DockerOrchestrator {
         );
 
         let container_id = self
-            .run_container("neo4j", &config.image, env, port_bindings, None)
+            .run_container("neo4j", &config.image, env, None, port_bindings, None)
             .await?;
 
         Ok(ServiceHandle {
@@ -233,7 +235,7 @@ impl DockerOrchestrator {
         );
 
         let container_id = self
-            .run_container("qdrant", &config.image, vec![], port_bindings, None)
+            .run_container("qdrant", &config.image, vec![], None, port_bindings, None)
             .await?;
 
         Ok(ServiceHandle {
@@ -268,6 +270,7 @@ impl DockerOrchestrator {
             "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1".to_string(),
             "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1".to_string(),
             "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1".to_string(),
+            "KAFKA_AUTO_CREATE_TOPICS_ENABLE=true".to_string(),
             // CLUSTER_ID must be a valid base64 string for KRaft
             "CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk".to_string(),
         ];
@@ -282,7 +285,7 @@ impl DockerOrchestrator {
         );
 
         let container_id = self
-            .run_container("kafka", &config.image, env, port_bindings, None)
+            .run_container("kafka", &config.image, env, None, port_bindings, None)
             .await?;
 
         Ok(ServiceHandle {
@@ -322,8 +325,21 @@ impl DockerOrchestrator {
             }]),
         );
 
+        // The official Spark image does not provide a "master mode" env switch,
+        // so we launch the standalone master process explicitly in the foreground.
+        let cmd = Some(vec![
+            "/opt/spark/bin/spark-class".to_string(),
+            "org.apache.spark.deploy.master.Master".to_string(),
+            "--host".to_string(),
+            "0.0.0.0".to_string(),
+            "--port".to_string(),
+            config.master_port.to_string(),
+            "--webui-port".to_string(),
+            config.ui_port.to_string(),
+        ]);
+
         let container_id = self
-            .run_container("spark-master", &config.image, env, port_bindings, None)
+            .run_container("spark-master", &config.image, env, cmd, port_bindings, None)
             .await?;
 
         Ok(ServiceHandle {
@@ -437,15 +453,17 @@ impl ServiceOrchestrator for DockerOrchestrator {
     async fn start_all(&self, config: &ServiceConfig) -> Result<ServiceHandles> {
         let mut services = Vec::new();
 
-        // Neo4j — always required
-        info!("Starting Neo4j...");
-        let neo4j = self.start_neo4j(&config.neo4j).await?;
-        services.push(neo4j);
+        if let Some(ref neo4j_cfg) = config.neo4j {
+            info!("Starting Neo4j...");
+            let neo4j = self.start_neo4j(neo4j_cfg).await?;
+            services.push(neo4j);
+        }
 
-        // Qdrant
-        info!("Starting Qdrant...");
-        let qdrant = self.start_qdrant(&config.vector_db).await?;
-        services.push(qdrant);
+        if let Some(ref vector_cfg) = config.vector_db {
+            info!("Starting Qdrant...");
+            let qdrant = self.start_qdrant(vector_cfg).await?;
+            services.push(qdrant);
+        }
 
         // Kafka — optional
         if let Some(ref kafka_cfg) = config.kafka {
