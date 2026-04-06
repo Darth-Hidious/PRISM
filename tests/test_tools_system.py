@@ -14,6 +14,7 @@ class TestSystemTools:
         assert "web_search" in names
         assert "read_file" in names
         assert "write_file" in names
+        assert "edit_file" in names
 
     def test_read_file_tool(self, tmp_path):
         registry = ToolRegistry()
@@ -25,6 +26,8 @@ class TestSystemTools:
         with patch("app.tools.system._ALLOWED_BASE", tmp_path.resolve()):
             result = tool.execute(path=str(f))
         assert result["content"] == "hello world"
+        assert result["path"] == str(f.resolve())
+        assert result["size_bytes"] == len("hello world".encode("utf-8"))
 
     def test_read_file_not_found(self):
         registry = ToolRegistry()
@@ -41,7 +44,42 @@ class TestSystemTools:
         with patch("app.tools.system._ALLOWED_BASE", tmp_path.resolve()):
             result = tool.execute(path=str(f), content="written by prism")
         assert result["success"] is True
+        assert result["path"] == str(f.resolve())
+        assert result["size_bytes"] == len("written by prism".encode("utf-8"))
         assert f.read_text() == "written by prism"
+
+    def test_edit_file_tool(self, tmp_path):
+        registry = ToolRegistry()
+        create_system_tools(registry)
+        f = tmp_path / "edit.txt"
+        f.write_text("hello world")
+        tool = registry.get("edit_file")
+        with patch("app.tools.system._ALLOWED_BASE", tmp_path.resolve()):
+            result = tool.execute(
+                path=str(f),
+                old_text="world",
+                new_text="prism",
+            )
+        assert result["success"] is True
+        assert result["path"] == str(f.resolve())
+        assert result["replacements"] == 1
+        assert f.read_text() == "hello prism"
+
+    def test_edit_file_multiple_matches_requires_replace_all(self, tmp_path):
+        registry = ToolRegistry()
+        create_system_tools(registry)
+        f = tmp_path / "edit-many.txt"
+        f.write_text("x\nx\n")
+        tool = registry.get("edit_file")
+        with patch("app.tools.system._ALLOWED_BASE", tmp_path.resolve()):
+            result = tool.execute(
+                path=str(f),
+                old_text="x",
+                new_text="y",
+            )
+        assert "error" in result
+        assert "multiple locations" in result["error"]
+        assert result["match_count"] == 2
 
     def test_read_file_path_traversal_blocked(self, tmp_path):
         """Prevent reading files outside allowed directory."""

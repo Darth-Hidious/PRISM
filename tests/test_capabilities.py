@@ -17,6 +17,7 @@ class TestDiscoverCapabilities:
         assert "simulation" in caps
         assert "lab_subscriptions" in caps
         assert "plugins" in caps
+        assert "marc27_platform" in caps
 
     def test_search_providers_list(self):
         from app.tools.capabilities import discover_capabilities
@@ -57,6 +58,68 @@ class TestDiscoverCapabilities:
         caps = discover_capabilities()
         assert isinstance(caps["lab_subscriptions"], list)
 
+    def test_platform_capabilities_merge(self, monkeypatch):
+        from app.tools import capabilities as mod
+
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        class _Base:
+            def get(self, path):
+                if path == "/agent/capabilities":
+                    return _Resp({"services": {"knowledge": {"endpoint_count": 7}}})
+                if path == "/knowledge/capabilities":
+                    return _Resp({"query": {"semantic_search": {"method": "POST"}}})
+                if path == "/projects/project-123/llm/models":
+                    return _Resp([
+                        {"id": "gemini-3.1-flash-preview", "provider": "google"},
+                        {"id": "claude-sonnet-4-6", "provider": "anthropic"},
+                    ])
+                raise AssertionError(f"unexpected path: {path}")
+
+        class _Knowledge:
+            def graph_stats(self):
+                return {"nodes": 12, "edges": 34, "entity_types": 5}
+
+            def embedding_stats(self):
+                return {"embeddings": 56}
+
+        class _Client:
+            def __init__(self):
+                self._base = _Base()
+                self.knowledge = _Knowledge()
+
+        monkeypatch.setattr(mod, "_get_platform_client", lambda: _Client())
+        monkeypatch.setattr(
+            mod,
+            "_load_project_context",
+            lambda: {"project_id": "project-123", "project_name": "Sandbox"},
+        )
+
+        caps = mod.discover_capabilities()
+        platform = caps["marc27_platform"]
+        assert platform["connected"] is True
+        assert platform["project_id"] == "project-123"
+        assert platform["hosted_model_count"] == 2
+        assert platform["hosted_model_providers"] == ["anthropic", "google"]
+        assert platform["agent_capabilities"]["services"]["knowledge"]["endpoint_count"] == 7
+        assert platform["knowledge_capabilities"]["query"]["semantic_search"]["method"] == "POST"
+
+    def test_platform_capabilities_fallback_when_unavailable(self, monkeypatch):
+        from app.tools import capabilities as mod
+
+        monkeypatch.setattr(mod, "_get_platform_client", lambda: None)
+
+        caps = mod.discover_capabilities()
+        platform = caps["marc27_platform"]
+        assert platform["connected"] is False
+        assert platform["hosted_model_count"] == 0
+        assert isinstance(platform["hosted_models"], list)
+
 
 class TestCapabilitiesSummary:
     """Test the text summary for system prompt injection."""
@@ -81,6 +144,33 @@ class TestCapabilitiesSummary:
         from app.tools.capabilities import capabilities_summary
         summary = capabilities_summary()
         assert "Simulation" in summary
+
+    def test_summary_mentions_platform_models_when_connected(self, monkeypatch):
+        from app.tools import capabilities as mod
+
+        monkeypatch.setattr(
+            mod,
+            "discover_capabilities",
+            lambda: {
+                "search_providers": [],
+                "datasets": [],
+                "trained_models": [],
+                "pretrained_models": [],
+                "feature_backend": "matminer",
+                "calphad": {"available": False, "databases": []},
+                "simulation": {"available": False},
+                "lab_subscriptions": [],
+                "plugins": [],
+                "marc27_platform": {
+                    "connected": True,
+                    "hosted_model_count": 519,
+                    "hosted_model_providers": ["anthropic", "google", "openai", "openrouter"],
+                },
+            },
+        )
+
+        summary = mod.capabilities_summary()
+        assert "Platform LLM models: 519 discovered" in summary
 
 
 class TestCapabilitiesToolRegistered:

@@ -54,6 +54,7 @@ class TestDefaults:
     def test_default_permissions(self):
         s = PrismSettings()
         assert "execute_python" in s.permissions.require_approval
+        assert "execute_bash" in s.permissions.require_approval
         assert s.permissions.deny == []
 
 
