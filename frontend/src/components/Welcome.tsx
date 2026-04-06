@@ -39,8 +39,12 @@ interface Status {
 
 interface Props {
   version: string;
-  status: Status;
-  autoApprove: boolean;
+  status?: Status;
+  autoApprove?: boolean;
+  toolCount?: number;
+  sessionId?: string;
+  resumed?: boolean;
+  resumedMessages?: number;
 }
 
 function Check({ ok, label, detail }: { ok: boolean; label: string; detail?: string }) {
@@ -53,13 +57,25 @@ function Check({ ok, label, detail }: { ok: boolean; label: string; detail?: str
   );
 }
 
-export function Welcome({ version, status, autoApprove }: Props) {
-  const { llm, commands, skills, account } = status;
-  const toolCount = commands.tools.filter((t) => t.registered).length;
+export function Welcome({
+  version,
+  status,
+  autoApprove,
+  toolCount,
+  sessionId,
+  resumed,
+  resumedMessages,
+}: Props) {
+  const llm = status?.llm;
+  const commands = status?.commands;
+  const skills = status?.skills;
+  const account = status?.account;
+  const registeredToolCount =
+    commands?.tools?.filter((t) => t.registered).length ?? toolCount ?? 0;
+  const visibleSkillCount = skills?.count ?? 0;
 
   return (
     <Box flexDirection="column" paddingLeft={1} marginBottom={1}>
-      {/* Title — one line, no animation */}
       <Box>
         <Text bold color={PRIMARY}>PRISM</Text>
         <Text color={TEXT_DIM}> v{version}</Text>
@@ -67,20 +83,32 @@ export function Welcome({ version, status, autoApprove }: Props) {
         <Text color={TEXT_MUTED}>materials research platform</Text>
       </Box>
 
-      {/* Status checks — compact row */}
       <Box gap={2} marginTop={0}>
-        <Check ok={llm.connected} label="model" detail={llm.provider ?? undefined} />
-        <Check ok={toolCount > 0} label={`${toolCount} tools`} />
-        <Check ok={skills.count > 0} label={`${skills.count} skills`} />
+        {llm ? (
+          <Check ok={llm.connected} label="model" detail={llm.provider ?? undefined} />
+        ) : null}
+        <Check ok={registeredToolCount > 0} label={`${registeredToolCount} tools`} />
+        <Check ok={visibleSkillCount > 0} label={`${visibleSkillCount} skills`} />
         <Check
-          ok={account.signed_in}
+          ok={!!account?.signed_in}
           label="account"
-          detail={account.signed_in ? account.display_name ?? undefined : undefined}
+          detail={account?.signed_in ? account.display_name ?? undefined : undefined}
         />
       </Box>
 
-      {/* Contextual hints — only when something needs attention */}
-      {!llm.connected ? (
+      {sessionId ? (
+        <Box marginTop={0}>
+          <Text color={TEXT_DIM}>
+            {resumed ? "  resumed session " : "  session "}
+            <Text color={TEXT_MUTED}>{sessionId.slice(0, 12)}</Text>
+            {resumed && resumedMessages !== undefined ? (
+              <Text color={TEXT_DIM}>{` · ${resumedMessages} restored messages`}</Text>
+            ) : null}
+          </Text>
+        </Box>
+      ) : null}
+
+      {llm && !llm.connected ? (
         <Box marginTop={0}>
           <Text color={TEXT_MUTED}>
             {"  run "}

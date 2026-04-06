@@ -43,10 +43,11 @@ export function useBackend(
   }, []);
 
   const sendPromptResponse = useCallback(
-    (promptType: string, response: string) => {
+    (promptType: string, response: string, toolName?: string) => {
       clientRef.current?.send("input.prompt_response", {
         prompt_type: promptType,
         response,
+        tool_name: toolName,
       });
     },
     [],
