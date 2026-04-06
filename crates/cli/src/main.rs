@@ -212,27 +212,31 @@ enum Commands {
         #[command(subcommand)]
         command: MarketplaceCommands,
     },
-    /// Query the MARC27 Research Language Model (RLM) for materials science research.
+    /// Start a PRISM/MARC27 research loop for a materials-science goal.
     Research {
-        /// Research question or query.
+        /// Research goal or question that can trigger iterative search and synthesis.
         query: String,
+        /// Research depth. Use `0` for the cheapest smoke-test path.
+        #[arg(long, default_value_t = 0)]
+        depth: u32,
         /// Output as JSON (for piping to other tools / agents).
         #[arg(long)]
         json: bool,
     },
     /// Deploy a model or service to the MARC27 compute platform.
     Deploy {
-        /// Docker image to deploy (e.g., "marc27/mace:latest").
-        image: String,
-        /// GPU type (e.g., "A100", "H100").
-        #[arg(long, default_value = "A100")]
-        gpu: String,
-        /// Number of GPUs.
-        #[arg(long, default_value_t = 1)]
-        gpu_count: u32,
-        /// Max runtime in hours.
-        #[arg(long, default_value_t = 1)]
-        max_hours: u32,
+        #[command(subcommand)]
+        command: DeployCommands,
+    },
+    /// Discover hosted LLM models available for the active MARC27 project.
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommands,
+    },
+    /// Run multi-agent discourse workflows backed by the MARC27 platform.
+    Discourse {
+        #[command(subcommand)]
+        command: DiscourseCommands,
     },
     /// Publish a model, dataset, or workflow to a remote registry.
     Publish {
@@ -463,6 +467,158 @@ enum MarketplaceCommands {
     Info {
         /// Name of the tool or workflow.
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeployCommands {
+    /// Create a persistent model or service deployment.
+    Create {
+        /// Deployment name shown in the platform UI.
+        #[arg(long)]
+        name: String,
+        /// Container image to deploy directly.
+        #[arg(long)]
+        image: Option<String>,
+        /// Marketplace resource slug to deploy instead of a raw image.
+        #[arg(long)]
+        resource_slug: Option<String>,
+        /// Target deployment backend: `local`, `mesh`, `runpod`, `lambda`, or `prism_node`.
+        #[arg(long, default_value = "local")]
+        target: String,
+        /// GPU type to request.
+        #[arg(long, default_value = "A100-80GB")]
+        gpu: String,
+        /// Optional maximum budget in USD.
+        #[arg(long)]
+        budget: Option<f64>,
+        /// Optional PRISM node pin. Accepts `--node` or `--node-id`.
+        #[arg(long = "node", alias = "node-id")]
+        node_id: Option<String>,
+        /// Environment variables injected into the deployment container.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env_vars: Vec<String>,
+        /// Service port exposed by the deployed container.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Health-check path on the deployed service.
+        #[arg(long, default_value = "/health")]
+        health_path: String,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List deployments visible to the current auth context.
+    List {
+        /// Optional status filter such as `running` or `stopped`.
+        #[arg(long)]
+        status: Option<String>,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show deployment details for one deployment ID.
+    Status {
+        id: String,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a deployment by ID.
+    Stop {
+        id: String,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Force a deployment health check.
+    Health {
+        id: String,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCommands {
+    /// List hosted models available to the active MARC27 project.
+    List {
+        /// Filter by provider such as `anthropic`, `openai`, `google`, or `openrouter`.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search hosted models client-side by ID, display name, or provider.
+    Search {
+        query: String,
+        /// Optional provider filter applied before the text search.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one hosted model by exact model ID.
+    Info {
+        model_id: String,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DiscourseCommands {
+    /// Create a discourse spec from a YAML file.
+    Create {
+        /// YAML spec file to upload.
+        yaml_file: PathBuf,
+        /// Optional slug override. Defaults to the YAML file stem.
+        #[arg(long)]
+        slug: Option<String>,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List discourse specs for the current user.
+    List {
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one discourse spec by UUID.
+    Show {
+        spec_id: String,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a discourse spec and stream or collect its events.
+    Run {
+        spec_id: String,
+        /// Parameter bindings forwarded to the discourse workflow.
+        #[arg(long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
+        /// Output collected events as JSON instead of a live text stream.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one discourse instance by UUID.
+    Status {
+        instance_id: String,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List all turns for one discourse instance.
+    Turns {
+        instance_id: String,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -697,21 +853,34 @@ async fn main() -> Result<()> {
             };
             let mut handle = server.spawn().await?;
             let resp = handle.list_tools().await?;
-            // Response is {"tools": [...]}, extract the array
-            let tools = resp.get("tools").unwrap_or(&resp);
-            if let Some(arr) = tools.as_array() {
-                for tool in arr {
-                    let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let desc = tool
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    println!("  {:<30} {}", name, desc);
-                }
-                println!("\n{} tools available", arr.len());
-            } else {
-                println!("{}", serde_json::to_string_pretty(&tools)?);
+            let mut tools = prism_agent::tool_catalog::ToolCatalog::from_tool_server_json(&resp);
+            tools.extend(prism_agent::command_tools::command_tools());
+
+            let mut rows = tools
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.name.clone(),
+                        tool.description.clone(),
+                        tool.permission_mode.as_str().to_string(),
+                        tool.requires_approval,
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for (name, desc, permission_mode, requires_approval) in &rows {
+                let approval = if *requires_approval {
+                    "approval required"
+                } else {
+                    "no approval"
+                };
+                println!(
+                    "  {:<30} {:<16} {:<18} {}",
+                    name, permission_mode, approval, desc
+                );
             }
+            println!("\n{} tools available", rows.len());
             handle.shutdown().await?;
         }
         Commands::Node { command } => match command {
@@ -869,7 +1038,27 @@ async fn main() -> Result<()> {
 
                 // ── V2: Start managed services (Docker containers) ──
                 let mut service_handles = None;
-                if !no_services && external_neo4j.is_none() {
+                if !no_services {
+                    let mut svc_config = prism_orch::ServiceConfig::default();
+                    if external_neo4j.is_some() || node_config.services.neo4j_uri.is_some() {
+                        svc_config.neo4j = None;
+                    }
+                    if external_qdrant.is_some() || node_config.services.qdrant_uri.is_some() {
+                        svc_config.vector_db = None;
+                    }
+                    if with_kafka {
+                        svc_config.kafka = Some(prism_orch::services::KafkaConfig::default());
+                    }
+                    if with_spark {
+                        svc_config.spark = Some(prism_orch::services::SparkConfig::default());
+                    }
+
+                    let wants_managed_services = svc_config.neo4j.is_some()
+                        || svc_config.vector_db.is_some()
+                        || svc_config.kafka.is_some()
+                        || svc_config.spark.is_some();
+
+                    if wants_managed_services {
                     println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
                     if offline {
                         println!("  (OFFLINE MODE)");
@@ -880,16 +1069,6 @@ async fn main() -> Result<()> {
                     match prism_orch::DockerOrchestrator::new() {
                         Ok(orch) => {
                             use prism_orch::ServiceOrchestrator;
-                            let mut svc_config = prism_orch::ServiceConfig::default();
-                            if with_kafka {
-                                svc_config.kafka =
-                                    Some(prism_orch::services::KafkaConfig::default());
-                            }
-                            if with_spark {
-                                svc_config.spark =
-                                    Some(prism_orch::services::SparkConfig::default());
-                            }
-
                             match orch.start_all(&svc_config).await {
                                 Ok(handles) => {
                                     for h in &handles.services {
@@ -911,6 +1090,7 @@ async fn main() -> Result<()> {
                             eprintln!("  (Continuing without managed services.)");
                         }
                     }
+                    }
                 }
 
                 // ── V2: Start the embedded dashboard server ──
@@ -922,6 +1102,17 @@ async fn main() -> Result<()> {
                 server_node_state.audit_db_path = Some(state_dir.join("audit.db"));
                 server_node_state.rbac_db_path = Some(state_dir.join("rbac.db"));
                 server_node_state.session_db_path = Some(state_dir.join("sessions.db"));
+                server_node_state.subscriptions = std::sync::Arc::new(std::sync::RwLock::new(
+                    prism_mesh::subscription::SubscriptionManager::open(
+                        &state_dir.join("subscriptions.db"),
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "  Warning: Failed to open subscription store: {e} (using in-memory state)"
+                        );
+                        prism_mesh::subscription::SubscriptionManager::new()
+                    }),
+                ));
 
                 // Scan for tools
                 let tools_dir = paths.config_dir.join("tools");
@@ -932,9 +1123,16 @@ async fn main() -> Result<()> {
                 }
 
                 // Wire backend configs — CLI flags > prism.toml > defaults
+                let managed_neo4j_running = service_handles.as_ref().is_some_and(|handles| {
+                    handles.services.iter().any(|handle| handle.name == "neo4j")
+                });
+                let managed_qdrant_running = service_handles.as_ref().is_some_and(|handles| {
+                    handles.services.iter().any(|handle| handle.name == "qdrant")
+                });
+
                 if external_neo4j.is_some()
                     || node_config.services.neo4j_uri.is_some()
-                    || service_handles.is_some()
+                    || managed_neo4j_running
                 {
                     let neo4j_url = external_neo4j
                         .clone()
@@ -949,7 +1147,7 @@ async fn main() -> Result<()> {
                 }
                 if external_qdrant.is_some()
                     || node_config.services.qdrant_uri.is_some()
-                    || service_handles.is_some()
+                    || managed_qdrant_running
                 {
                     let qdrant_url = external_qdrant
                         .clone()
@@ -1138,9 +1336,7 @@ async fn main() -> Result<()> {
                                 std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
                             });
                             let our_node_id = mesh_node_id.unwrap_or_else(uuid::Uuid::nil);
-                            let subscriptions = std::sync::Arc::new(std::sync::RwLock::new(
-                                prism_mesh::subscription::SubscriptionManager::new(),
-                            ));
+                            let subscriptions = server_state.subscriptions.clone();
 
                             // Build sync config from Neo4j settings if available
                             let sync_config = server_state.neo4j.as_ref().map(|neo4j| {
@@ -1349,7 +1545,7 @@ async fn main() -> Result<()> {
                 // Route through MARC27 platform API
                 handle_platform_query(&text, semantic, json_output, limit).await?;
             } else if federated {
-                handle_federated_query(&text, &dashboard_url).await?;
+                handle_federated_query(&text, &dashboard_url, &paths).await?;
             } else {
                 let llm_cfg = build_llm_config(
                     &project_root,
@@ -1408,7 +1604,7 @@ async fn main() -> Result<()> {
             handle_job_status(&job_id).await?;
         }
         Commands::Mesh { command } => {
-            handle_mesh_command(command).await?;
+            handle_mesh_command(command, &paths).await?;
         }
         Commands::Report {
             description,
@@ -1490,21 +1686,23 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Research { query, json } => {
-            let state = paths.load_cli_state()?;
-            let token = state
-                .credentials
-                .as_ref()
-                .map(|c| c.access_token.clone())
-                .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `prism login` first."))?;
-            let platform = PlatformClient::new(&endpoints.api_base).with_token(&token);
-
-            let resp: serde_json::Value = platform
-                .post(
-                    "/knowledge/research/query",
-                    &serde_json::json!({ "query": query, "stream": false }),
-                )
+        Commands::Research { query, depth, json } => {
+            let (api_base, auth) = resolve_agent_auth()?;
+            let client = reqwest::Client::builder()
+                // Research can take longer than a plain graph query because it may
+                // run an iterative loop before producing the final answer.
+                .timeout(std::time::Duration::from_secs(120))
+                .build()?;
+            let resp = auth
+                .apply(client.post(format!("{api_base}/knowledge/research/query")))
+                // Keep smoke tests cheap by always making depth explicit.
+                .json(&serde_json::json!({ "query": query, "depth": depth, "stream": false }))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
                 .await?;
+            let resp = parse_research_response_body(&resp)?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -1529,40 +1727,14 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Deploy {
-            image,
-            gpu,
-            gpu_count,
-            max_hours,
-        } => {
-            let state = paths.load_cli_state()?;
-            let token = state
-                .credentials
-                .as_ref()
-                .map(|c| c.access_token.clone())
-                .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `prism login` first."))?;
-            let platform = PlatformClient::new(&endpoints.api_base).with_token(&token);
-
-            println!("Deploying {image} on {gpu_count}x {gpu} (max {max_hours}h)...");
-
-            let resp: serde_json::Value = platform
-                .post(
-                    "/compute/submit",
-                    &serde_json::json!({
-                        "image": image,
-                        "gpu_type": gpu,
-                        "gpu_count": gpu_count,
-                        "max_runtime_hours": max_hours,
-                    }),
-                )
-                .await?;
-
-            if let Some(job_id) = resp.get("job_id").and_then(|j| j.as_str()) {
-                println!("Job submitted: {job_id}");
-                println!("Check status: prism job-status {job_id}");
-            } else {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            }
+        Commands::Deploy { command } => {
+            handle_deploy_command(command).await?;
+        }
+        Commands::Models { command } => {
+            handle_models_command(&paths, command).await?;
+        }
+        Commands::Discourse { command } => {
+            handle_discourse_command(command).await?;
         }
         Commands::Publish {
             path,
@@ -1760,7 +1932,10 @@ fn render_workflow_result(spec: &WorkflowSpec, result: &WorkflowRunResult) {
 
 // ── prism mesh ─────────────────────────────────────────────────────────
 
-async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
+async fn handle_mesh_command(
+    command: MeshCommands,
+    paths: &prism_runtime::PrismPaths,
+) -> Result<()> {
     match command {
         MeshCommands::Discover { timeout } => {
             println!(
@@ -1840,9 +2015,11 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
         } => {
             println!("Publishing dataset '{name}' (v{schema_version}) to mesh...");
             let url = format!("{dashboard_url}/api/mesh/publish");
+            let session_token = create_dashboard_session(&dashboard_url, paths).await?;
             let client = reqwest::Client::new();
             let resp = client
                 .post(&url)
+                .header("X-Session-Token", session_token)
                 .json(&serde_json::json!({
                     "name": name,
                     "schema_version": schema_version,
@@ -1869,9 +2046,11 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
         } => {
             println!("Subscribing to '{dataset_name}' from node {publisher}...");
             let url = format!("{dashboard_url}/api/mesh/subscribe");
+            let session_token = create_dashboard_session(&dashboard_url, paths).await?;
             let client = reqwest::Client::new();
             let resp = client
                 .post(&url)
+                .header("X-Session-Token", session_token)
                 .json(&serde_json::json!({
                     "dataset_name": dataset_name,
                     "publisher_node": publisher,
@@ -1896,9 +2075,11 @@ async fn handle_mesh_command(command: MeshCommands) -> Result<()> {
         } => {
             println!("Unsubscribing from '{dataset_name}'...");
             let url = format!("{dashboard_url}/api/mesh/subscribe");
+            let session_token = create_dashboard_session(&dashboard_url, paths).await?;
             let client = reqwest::Client::new();
             let resp = client
                 .delete(&url)
+                .header("X-Session-Token", session_token)
                 .json(&serde_json::json!({
                     "dataset_name": dataset_name,
                     "publisher_node": publisher,
@@ -2320,6 +2501,9 @@ COMPUTE:
   prism run <image> --backend local                    # run container locally
   prism run <image> --backend marc27                   # run on MARC27 cloud
   prism job-status <job-id>                            # check job status
+  prism deploy create --name serve --image marc27/mace:latest --target local
+  prism deploy list                                    # list persistent deployments
+  prism deploy status <deployment-id>                  # inspect one deployment
 
 INGEST:
   prism ingest data.csv                                # ingest CSV into local graph
@@ -2333,6 +2517,15 @@ NODE:
 WORKFLOWS:
   prism workflow list                                  # list available workflows
   prism workflow run <name> --set key=value            # run a workflow
+
+MODELS:
+  prism models list                                    # list hosted project models
+  prism models search gemini                           # search model catalog
+
+DISCOURSE:
+  prism discourse list                                 # list debate specs
+  prism discourse create alloy.yaml                    # upload a YAML discourse spec
+  prism discourse run <spec-id> --param alloy=IN718    # execute a discourse workflow
 
 AUTH (two paths — decoupled):
   # For humans:
@@ -2407,6 +2600,12 @@ fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
             .unwrap_or_else(|_| "https://api.marc27.com/api/v1".to_string());
         return Ok((api_base, PlatformAuth::ApiKey(api_key)));
     }
+    if let Ok(token) = std::env::var("MARC27_TOKEN").or_else(|_| std::env::var("MARC27_API_TOKEN"))
+    {
+        let api_base = std::env::var("MARC27_API_URL")
+            .unwrap_or_else(|_| "https://api.marc27.com/api/v1".to_string());
+        return Ok((api_base, PlatformAuth::Bearer(token)));
+    }
     let (base, token_header) = resolve_user_auth()?;
     // token_header is "Bearer <token>"
     let token = token_header
@@ -2414,6 +2613,921 @@ fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
         .unwrap_or(&token_header)
         .to_string();
     Ok((base, PlatformAuth::Bearer(token)))
+}
+
+fn resolve_active_project_id(paths: &PrismPaths) -> Result<String> {
+    if let Some(project_id) = env_project_override() {
+        return Ok(project_id);
+    }
+
+    let state = paths.load_cli_state()?;
+    state
+        .credentials
+        .as_ref()
+        .and_then(|creds| creds.project_id.clone())
+        .ok_or_else(|| anyhow!("No active project selected. Run `prism login` or set MARC27_PROJECT_ID."))
+}
+
+fn parse_string_map_arg(
+    pairs: &[String],
+    flag_name: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut values = serde_json::Map::new();
+    for pair in pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid {flag_name} value: {pair}. Expected key=value."))?;
+        values.insert(
+            key.trim().to_string(),
+            serde_json::Value::String(value.trim().to_string()),
+        );
+    }
+    Ok(values)
+}
+
+fn value_string<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|field| field.as_str()))
+}
+
+fn value_bool(value: &serde_json::Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|field| field.as_bool()))
+}
+
+fn value_array<'a>(
+    value: &'a serde_json::Value,
+    container_keys: &[&str],
+) -> Option<&'a Vec<serde_json::Value>> {
+    value.as_array().or_else(|| {
+        container_keys
+            .iter()
+            .find_map(|key| value.get(*key).and_then(|field| field.as_array()))
+    })
+}
+
+fn format_price(value: Option<f64>) -> String {
+    match value {
+        Some(price) => format!("${price:.4}"),
+        None => "?".to_string(),
+    }
+}
+
+fn model_matches_query(model: &serde_json::Value, query: &str) -> bool {
+    let needle = query.to_ascii_lowercase();
+    [
+        value_string(model, &["model_id", "id"]),
+        value_string(model, &["display_name", "name"]),
+        value_string(model, &["provider"]),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|field| field.to_ascii_lowercase().contains(&needle))
+}
+
+fn normalize_deploy_target(target: &str, node_id: Option<&str>) -> Result<&'static str> {
+    match target.trim().to_ascii_lowercase().as_str() {
+        "local" | "prism_node" => Ok("prism_node"),
+        // The platform API uses `prism_node` plus an optional pinned node ID.
+        "mesh" => {
+            if node_id.is_none() {
+                bail!("`--target mesh` currently requires `--node` / `--node-id`.");
+            }
+            Ok("prism_node")
+        }
+        "runpod" => Ok("runpod"),
+        "lambda" => Ok("lambda"),
+        other => bail!(
+            "unsupported deploy target `{other}`. Use one of: local, mesh, runpod, lambda."
+        ),
+    }
+}
+
+fn print_deployments_summary(value: &serde_json::Value) -> Result<()> {
+    let Some(items) = value_array(value, &["deployments", "items", "data"]) else {
+        println!("{}", serde_json::to_string_pretty(value)?);
+        return Ok(());
+    };
+
+    if items.is_empty() {
+        println!("No deployments found.");
+        return Ok(());
+    }
+
+    println!("Deployments:\n");
+    for item in items {
+        let id = value_string(item, &["deployment_id", "id"]).unwrap_or("?");
+        let name = value_string(item, &["name"]).unwrap_or("(unnamed)");
+        let status = value_string(item, &["status"]).unwrap_or("?");
+        let image = value_string(item, &["image", "resource_slug"]).unwrap_or("-");
+        println!("  {id}  {name}  [{status}]");
+        println!("  {:<36} {}", "", image);
+    }
+    Ok(())
+}
+
+fn print_deployment_status(value: &serde_json::Value) -> Result<()> {
+    let id = value_string(value, &["deployment_id", "id"]).unwrap_or("?");
+    let name = value_string(value, &["name"]).unwrap_or("(unnamed)");
+    let status = value_string(value, &["status"]).unwrap_or("?");
+    let target = value_string(value, &["target"]).unwrap_or("-");
+    let image = value_string(value, &["image", "resource_slug"]).unwrap_or("-");
+    let endpoint = value_string(value, &["endpoint_url", "endpoint"]).unwrap_or("-");
+    let healthy = value_bool(value, &["healthy"]).unwrap_or(false);
+
+    println!("Deployment: {name}");
+    println!("ID:         {id}");
+    println!("Status:     {status}");
+    println!("Target:     {target}");
+    println!("Image:      {image}");
+    println!("Endpoint:   {endpoint}");
+    println!("Healthy:    {healthy}");
+    if let Some(stopped_at) = value_string(value, &["stopped_at"]) {
+        println!("Stopped at: {stopped_at}");
+    }
+    Ok(())
+}
+
+fn print_models_summary(models: &[serde_json::Value]) {
+    if models.is_empty() {
+        println!("No models found.");
+        return;
+    }
+
+    println!("Hosted models:\n");
+    for model in models {
+        let model_id = value_string(model, &["model_id", "id"]).unwrap_or("?");
+        let display_name = value_string(model, &["display_name", "name"]).unwrap_or(model_id);
+        let provider = value_string(model, &["provider"]).unwrap_or("?");
+        let status = value_string(model, &["status"]).unwrap_or("?");
+        let context_window = model
+            .get("context_window")
+            .and_then(|value| value.as_u64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let input_price = format_price(model.get("input_price").and_then(|value| value.as_f64()));
+        let output_price =
+            format_price(model.get("output_price").and_then(|value| value.as_f64()));
+
+        println!("  {model_id}  [{provider}]  {status}");
+        println!(
+            "  {:<36} {}  ctx={}  in={}  out={}",
+            "",
+            display_name,
+            context_window,
+            input_price,
+            output_price
+        );
+    }
+}
+
+fn print_discourse_specs_summary(value: &serde_json::Value) -> Result<()> {
+    let Some(items) = value_array(value, &["specs", "items", "data"]) else {
+        println!("{}", serde_json::to_string_pretty(value)?);
+        return Ok(());
+    };
+
+    if items.is_empty() {
+        println!("No discourse specs found.");
+        return Ok(());
+    }
+
+    println!("Discourse specs:\n");
+    for item in items {
+        let id = value_string(item, &["id"]).unwrap_or("?");
+        let slug = value_string(item, &["slug"]).unwrap_or("(no slug)");
+        let name = value_string(item, &["name"]).unwrap_or("(unnamed)");
+        let version = item
+            .get("version")
+            .and_then(|value| value.as_i64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        println!("  {id}  {slug}  v{version}");
+        println!("  {:<36} {}", "", name);
+    }
+    Ok(())
+}
+
+fn print_discourse_status(value: &serde_json::Value) -> Result<()> {
+    let instance_id = value_string(value, &["instance_id"]).unwrap_or("?");
+    let spec_id = value_string(value, &["spec_id"]).unwrap_or("?");
+    let status = value_string(value, &["status"]).unwrap_or("?");
+    let total_turns = value
+        .get("total_turns")
+        .and_then(|value| value.as_i64())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let total_calls = value
+        .get("total_llm_calls")
+        .and_then(|value| value.as_i64())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let cost = value
+        .get("cost_usd")
+        .and_then(|value| value.as_f64())
+        .map(|value| format!("${value:.4}"))
+        .unwrap_or_else(|| "?".to_string());
+
+    println!("Discourse instance: {instance_id}");
+    println!("Spec:               {spec_id}");
+    println!("Status:             {status}");
+    println!("Turns:              {total_turns}");
+    println!("LLM calls:          {total_calls}");
+    println!("Cost:               {cost}");
+    Ok(())
+}
+
+fn print_discourse_turns(value: &serde_json::Value) -> Result<()> {
+    let Some(items) = value_array(value, &["turns", "items", "data"]) else {
+        println!("{}", serde_json::to_string_pretty(value)?);
+        return Ok(());
+    };
+
+    if items.is_empty() {
+        println!("No discourse turns found.");
+        return Ok(());
+    }
+
+    println!("Discourse turns:\n");
+    for item in items {
+        let round = item
+            .get("round_num")
+            .and_then(|value| value.as_i64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let turn = item
+            .get("turn_num")
+            .and_then(|value| value.as_i64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let agent = value_string(item, &["agent_id"]).unwrap_or("?");
+        let content = value_string(item, &["content"]).unwrap_or("");
+        let preview = if content.len() > 120 {
+            format!("{}...", &content[..120])
+        } else {
+            content.to_string()
+        };
+        println!("  round {round} turn {turn}  [{agent}]");
+        println!("  {:<36} {}", "", preview.replace('\n', " "));
+    }
+    Ok(())
+}
+
+fn print_discourse_run_events(events: &[serde_json::Value]) {
+    if events.is_empty() {
+        println!("No discourse events returned.");
+        return;
+    }
+
+    for event in events {
+        let event_name = value_string(event, &["event", "step"]).unwrap_or("event");
+        match event_name {
+            "started" => {
+                let instance_id = value_string(event, &["instance_id"]).unwrap_or("?");
+                let spec_name = value_string(event, &["spec_name", "name"]).unwrap_or("?");
+                println!("started: {spec_name} ({instance_id})");
+            }
+            "round_started" => {
+                let round = event
+                    .get("round")
+                    .and_then(|value| value.as_i64())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let round_type = value_string(event, &["type"]).unwrap_or("?");
+                println!("round_started: round {round} [{round_type}]");
+            }
+            "agent_turn" => {
+                let agent = value_string(event, &["agent_id"]).unwrap_or("?");
+                let content = value_string(event, &["content"]).unwrap_or("");
+                let preview = if content.len() > 140 {
+                    format!("{}...", &content[..140])
+                } else {
+                    content.to_string()
+                };
+                println!("agent_turn: {agent}: {}", preview.replace('\n', " "));
+            }
+            "round_complete" => {
+                let round = event
+                    .get("round")
+                    .and_then(|value| value.as_i64())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                println!("round_complete: round {round}");
+            }
+            "complete" => {
+                let turns = event
+                    .get("total_turns")
+                    .and_then(|value| value.as_i64())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let cost = event
+                    .get("cost_usd")
+                    .and_then(|value| value.as_f64())
+                    .map(|value| format!("${value:.4}"))
+                    .unwrap_or_else(|| "?".to_string());
+                println!("complete: turns={turns} cost={cost}");
+            }
+            other => {
+                println!("{other}: {}", event);
+            }
+        }
+    }
+}
+
+async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    match command {
+        DeployCommands::Create {
+            name,
+            image,
+            resource_slug,
+            target,
+            gpu,
+            budget,
+            node_id,
+            env_vars,
+            port,
+            health_path,
+            json,
+        } => {
+            let has_image = image.is_some();
+            let has_resource = resource_slug.is_some();
+            if has_image == has_resource {
+                bail!("Specify exactly one of `--image` or `--resource-slug`.");
+            }
+            let target = normalize_deploy_target(&target, node_id.as_deref())?;
+
+            let mut body = serde_json::Map::new();
+            body.insert("name".to_string(), serde_json::Value::String(name.clone()));
+            body.insert(
+                "target".to_string(),
+                serde_json::Value::String(target.to_string()),
+            );
+            body.insert("gpu_type".to_string(), serde_json::Value::String(gpu));
+            body.insert(
+                "deploy_config".to_string(),
+                serde_json::json!({
+                    "port": port,
+                    "health_path": health_path,
+                }),
+            );
+
+            if let Some(image) = image {
+                body.insert("image".to_string(), serde_json::Value::String(image));
+            }
+            if let Some(resource_slug) = resource_slug {
+                body.insert(
+                    "resource_slug".to_string(),
+                    serde_json::Value::String(resource_slug),
+                );
+            }
+            if let Some(budget) = budget {
+                body.insert("budget_max_usd".to_string(), serde_json::json!(budget));
+            }
+            if let Some(node_id) = node_id {
+                body.insert("node_id".to_string(), serde_json::Value::String(node_id));
+            }
+            if !env_vars.is_empty() {
+                body.insert(
+                    "env_vars".to_string(),
+                    serde_json::Value::Object(parse_string_map_arg(&env_vars, "--env")?),
+                );
+            }
+
+            let response: serde_json::Value = auth
+                .apply(client.post(format!("{api_base}/compute/deployments")))
+                .json(&serde_json::Value::Object(body))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("Deployment create requested.");
+                print_deployment_status(&response)?;
+            }
+        }
+        DeployCommands::List { status, json } => {
+            let mut request = auth.apply(client.get(format!("{api_base}/compute/deployments")));
+            if let Some(status) = status.as_deref() {
+                request = request.query(&[("status", status)]);
+            }
+            let response: serde_json::Value = request.send().await?.error_for_status()?.json().await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                print_deployments_summary(&response)?;
+            }
+        }
+        DeployCommands::Status { id, json } => {
+            let response: serde_json::Value = auth
+                .apply(client.get(format!("{api_base}/compute/deployments/{id}")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                print_deployment_status(&response)?;
+            }
+        }
+        DeployCommands::Stop { id, json } => {
+            let response = auth
+                .apply(client.delete(format!("{api_base}/compute/deployments/{id}")))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+
+            if json {
+                let value = if response.trim().is_empty() {
+                    serde_json::json!({ "deployment_id": id, "status": "stop_requested" })
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&response).unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "deployment_id": id,
+                            "status": "stop_requested",
+                            "message": response,
+                        })
+                    })
+                };
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("Stop requested for deployment {id}.");
+            }
+        }
+        DeployCommands::Health { id, json } => {
+            let response: serde_json::Value = auth
+                .apply(client.get(format!(
+                    "{api_base}/compute/deployments/{id}/health"
+                )))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                print_deployment_status(&response)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> Result<()> {
+    let (api_base, auth) = resolve_agent_auth()?;
+    let project_id = resolve_active_project_id(paths)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let response: serde_json::Value = auth
+        .apply(client.get(format!(
+            "{api_base}/projects/{project_id}/llm/models"
+        )))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let mut models = value_array(&response, &["models", "items", "data"])
+        .cloned()
+        .unwrap_or_default();
+
+    match command {
+        ModelsCommands::List { provider, json } => {
+            if let Some(provider) = provider {
+                let provider = provider.to_ascii_lowercase();
+                models.retain(|model| {
+                    value_string(model, &["provider"])
+                        .map(|value| value.eq_ignore_ascii_case(&provider))
+                        .unwrap_or(false)
+                });
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&models)?);
+            } else {
+                print_models_summary(&models);
+            }
+        }
+        ModelsCommands::Search {
+            query,
+            provider,
+            json,
+        } => {
+            if let Some(provider) = provider {
+                let provider = provider.to_ascii_lowercase();
+                models.retain(|model| {
+                    value_string(model, &["provider"])
+                        .map(|value| value.eq_ignore_ascii_case(&provider))
+                        .unwrap_or(false)
+                });
+            }
+            models.retain(|model| model_matches_query(model, &query));
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&models)?);
+            } else {
+                print_models_summary(&models);
+            }
+        }
+        ModelsCommands::Info { model_id, json } => {
+            let model = models
+                .into_iter()
+                .find(|model| {
+                    value_string(model, &["model_id", "id"])
+                        .map(|value| value == model_id)
+                        .unwrap_or(false)
+                })
+                .ok_or_else(|| anyhow!("Model not found in project catalog: {model_id}"))?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&model)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&model)?);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
+
+    match command {
+        DiscourseCommands::Create {
+            yaml_file,
+            slug,
+            json,
+        } => {
+            let yaml = std::fs::read_to_string(&yaml_file)
+                .with_context(|| format!("failed to read discourse YAML {}", yaml_file.display()))?;
+            let slug = slug.unwrap_or_else(|| {
+                yaml_file
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("discourse-spec")
+                    .to_string()
+            });
+            let response: serde_json::Value = auth
+                .apply(client.post(format!("{api_base}/discourse/specs")))
+                .json(&serde_json::json!({
+                    "slug": slug,
+                    "yaml": yaml,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                let id = value_string(&response, &["id"]).unwrap_or("?");
+                let slug = value_string(&response, &["slug"]).unwrap_or("?");
+                let name = value_string(&response, &["name"]).unwrap_or("(unnamed)");
+                let version = response
+                    .get("version")
+                    .and_then(|value| value.as_i64())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                println!("Created discourse spec {name} ({slug}) v{version}");
+                println!("ID: {id}");
+            }
+        }
+        DiscourseCommands::List { json } => {
+            let response: serde_json::Value = auth
+                .apply(client.get(format!("{api_base}/discourse/specs")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                print_discourse_specs_summary(&response)?;
+            }
+        }
+        DiscourseCommands::Show { spec_id, .. } => {
+            let response: serde_json::Value = auth
+                .apply(client.get(format!("{api_base}/discourse/specs/{spec_id}")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            // YAML-backed specs are easier to inspect as pretty JSON than a lossy summary.
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        DiscourseCommands::Run {
+            spec_id,
+            params,
+            json,
+        } => {
+            let body = serde_json::json!({
+                "parameters": parse_string_map_arg(&params, "--param")?,
+            });
+            let response = auth
+                .apply(client.post(format!("{api_base}/discourse/run/{spec_id}")))
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            let events = normalize_stream_events(parse_sse_json_events(&response)?);
+
+            if json {
+                let mut payload = serde_json::Map::new();
+                payload.insert("events".to_string(), serde_json::Value::Array(events.clone()));
+                if let Some(instance_id) = events
+                    .iter()
+                    .find_map(|event| value_string(event, &["instance_id"]).map(|value| value.to_string()))
+                {
+                    payload.insert("instance_id".to_string(), serde_json::Value::String(instance_id));
+                }
+                if let Some(complete) = events
+                    .iter()
+                    .find(|event| value_string(event, &["event", "step"]) == Some("complete"))
+                {
+                    payload.insert("complete".to_string(), complete.clone());
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Object(payload))?
+                );
+            } else {
+                print_discourse_run_events(&events);
+            }
+        }
+        DiscourseCommands::Status { instance_id, json } => {
+            let response: serde_json::Value = auth
+                .apply(client.get(format!("{api_base}/discourse/{instance_id}")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                print_discourse_status(&response)?;
+            }
+        }
+        DiscourseCommands::Turns { instance_id, json } => {
+            let response: serde_json::Value = auth
+                .apply(client.get(format!("{api_base}/discourse/{instance_id}/turns")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                print_discourse_turns(&response)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_research_response_body(body: &str) -> Result<serde_json::Value> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        bail!("research endpoint returned an empty response body");
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Ok(value);
+    }
+
+    let events = normalize_stream_events(parse_sse_json_events(trimmed)?);
+    if events.is_empty() {
+        bail!("research endpoint returned a non-JSON response body");
+    }
+
+    let mut result = serde_json::Map::new();
+    let mut answer = None;
+    let mut sources = None;
+    let mut complete = None;
+
+    for event in &events {
+        if let Some(obj) = event.as_object() {
+            let step = obj.get("step").and_then(|value| value.as_str());
+            let event_answer = extract_research_answer(obj);
+            if step == Some("answer") {
+                answer = event_answer.or(answer);
+            } else if answer.is_none() {
+                answer = event_answer;
+            }
+            if sources.is_none() {
+                if let Some(found) = obj.get("sources").and_then(|value| value.as_array()) {
+                    sources = Some(serde_json::Value::Array(found.clone()));
+                }
+            }
+            if complete.is_none() && obj.get("step").and_then(|value| value.as_str()) == Some("complete") {
+                complete = Some(event.clone());
+            }
+        }
+    }
+
+    result.insert("events".to_string(), serde_json::Value::Array(events));
+    if let Some(answer) = answer {
+        result.insert("answer".to_string(), serde_json::Value::String(answer));
+    }
+    if let Some(sources) = sources {
+        result.insert("sources".to_string(), sources);
+    }
+    if let Some(complete) = complete {
+        result.insert("complete".to_string(), complete);
+    }
+
+    Ok(serde_json::Value::Object(result))
+}
+
+fn parse_sse_json_events(body: &str) -> Result<Vec<serde_json::Value>> {
+    fn flush_sse_event(
+        events: &mut Vec<serde_json::Value>,
+        event_name: &Option<String>,
+        data_lines: &mut Vec<String>,
+    ) {
+        if data_lines.is_empty() {
+            return;
+        }
+
+        let payload = data_lines.join("\n");
+        data_lines.clear();
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return;
+        }
+
+        let mut value = serde_json::from_str::<serde_json::Value>(payload)
+            .unwrap_or_else(|_| serde_json::json!({ "text": payload }));
+        if let Some(name) = event_name {
+            if let Some(obj) = value.as_object_mut() {
+                obj.entry("event".to_string())
+                    .or_insert_with(|| serde_json::Value::String(name.clone()));
+            } else {
+                value = serde_json::json!({
+                    "event": name,
+                    "data": value,
+                });
+            }
+        }
+        events.push(value);
+    }
+
+    let mut events = Vec::new();
+    let mut event_name = None;
+    let mut data_lines = Vec::new();
+
+    for raw_line in body.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() {
+            flush_sse_event(&mut events, &event_name, &mut data_lines);
+            event_name = None;
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("event:") {
+            event_name = Some(name.trim().to_string());
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            // Some platform streams send one JSON payload per `data:` line without
+            // blank-line separators. When that happens, treat each new `data:` line
+            // as a fresh event so discourse/research JSON stays structured.
+            if event_name.is_none() && !data_lines.is_empty() {
+                flush_sse_event(&mut events, &event_name, &mut data_lines);
+            }
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+    flush_sse_event(&mut events, &event_name, &mut data_lines);
+
+    Ok(events)
+}
+
+fn normalize_stream_events(events: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut normalized = Vec::new();
+
+    for event in events {
+        // Some routes hand back transport-level `data: {...}` strings inside a
+        // generic `text` field. Unwrap those so downstream code sees the real
+        // event objects, not opaque transport wrappers.
+        if let Some(text) = event.get("text").and_then(|value| value.as_str()) {
+            if let Some(payload) = text.trim().strip_prefix("data:") {
+                let payload = payload.trim();
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                    normalized.push(value);
+                    continue;
+                }
+            }
+        }
+
+        normalized.push(event);
+    }
+
+    normalized
+}
+
+fn extract_research_answer(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    for key in ["answer", "text", "content", "message"] {
+        if let Some(value) = obj.get(key).and_then(|value| value.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Some(data) = obj.get("data").and_then(|value| value.as_object()) {
+        return extract_research_answer(data);
+    }
+
+    None
+}
+
+#[derive(serde::Deserialize)]
+struct DashboardSessionResponse {
+    session_id: String,
+}
+
+async fn create_dashboard_session(
+    dashboard_url: &str,
+    paths: &prism_runtime::PrismPaths,
+) -> Result<String> {
+    let state = paths.load_cli_state()?;
+    let creds = state
+        .credentials
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `prism login` first."))?;
+    let user_id = creds
+        .user_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Stored credentials are missing user_id. Run `prism login` again."))?;
+
+    // The local CLI is the node operator on this machine, so it should be able
+    // to manage its own dashboard routes without a separate bootstrap dance.
+    let rbac_db_path = paths.state_dir.join("rbac.db");
+    let rbac_engine = prism_core::rbac::RbacEngine::new(&rbac_db_path)?;
+    rbac_engine.assign_role(user_id, prism_core::rbac::LocalRole::NodeAdmin)?;
+
+    create_dashboard_session_for_user(dashboard_url, user_id, creds.display_name.as_deref()).await
+}
+
+async fn create_dashboard_session_for_user(
+    dashboard_url: &str,
+    user_id: &str,
+    display_name: Option<&str>,
+) -> Result<String> {
+    let url = format!("{dashboard_url}/api/sessions");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({
+            "user_id": user_id,
+            "display_name": display_name,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("Failed to create dashboard session at {url}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("Dashboard session creation failed: {status} — {body}");
+    }
+
+    let session: DashboardSessionResponse = resp.json().await?;
+    Ok(session.session_id)
 }
 
 /// Query the MARC27 platform API (graph search or semantic search).
@@ -3036,7 +4150,11 @@ fn print_node_status(caps: &NodeCapabilities, endpoints: &PlatformEndpoints) {
 
 // ── prism query --federated ────────────────────────────────────────────
 
-async fn handle_federated_query(query: &str, dashboard_url: &str) -> Result<()> {
+async fn handle_federated_query(
+    query: &str,
+    dashboard_url: &str,
+    paths: &prism_runtime::PrismPaths,
+) -> Result<()> {
     // Step 1: Get peer list from the running node
     let peers_url = format!("{dashboard_url}/api/mesh/nodes");
     let resp: serde_json::Value = reqwest::get(&peers_url)
@@ -3058,11 +4176,14 @@ async fn handle_federated_query(query: &str, dashboard_url: &str) -> Result<()> 
     // Step 2: Query local node
     let local_url = format!("{dashboard_url}/api/query");
     let local_body = serde_json::json!({"query": query, "mode": "nl"});
-    let local_result = reqwest::Client::new()
-        .post(&local_url)
-        .json(&local_body)
-        .send()
-        .await;
+    // Protected dashboard routes need a local session token, even for the CLI
+    // running on the same machine as the node.
+    let local_session = create_dashboard_session(dashboard_url, paths).await.ok();
+    let mut local_req = reqwest::Client::new().post(&local_url).json(&local_body);
+    if let Some(session_token) = local_session {
+        local_req = local_req.header("X-Session-Token", session_token);
+    }
+    let local_result = local_req.send().await;
 
     println!("[local] ");
     match local_result {
@@ -3085,17 +4206,20 @@ async fn handle_federated_query(query: &str, dashboard_url: &str) -> Result<()> 
         let addr = peer["address"].as_str().unwrap_or("127.0.0.1");
         let port = peer["port"].as_u64().unwrap_or(7327);
         let name = peer["name"].as_str().unwrap_or("unknown");
-        let peer_url = format!("http://{}:{}/api/query", addr, port);
+        let peer_base = format!("http://{}:{}", addr, port);
+        let peer_url = format!("{peer_base}/api/query");
         let body = serde_json::json!({"query": query, "mode": "nl"});
+        let peer_session =
+            create_dashboard_session_for_user(&peer_base, "federated-cli", Some("PRISM CLI"))
+                .await
+                .ok();
 
         print!("[{name}] ");
-        match reqwest::Client::new()
-            .post(&peer_url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-        {
+        let mut peer_req = reqwest::Client::new().post(&peer_url).json(&body);
+        if let Some(session_token) = peer_session {
+            peer_req = peer_req.header("X-Session-Token", session_token);
+        }
+        match peer_req.timeout(std::time::Duration::from_secs(10)).send().await {
             Ok(r) => {
                 let data: serde_json::Value = r.json().await.unwrap_or_default();
                 let count = data["count"].as_u64().unwrap_or(0);
@@ -3506,6 +4630,181 @@ mod tests {
                 assert_eq!(limit, 5);
             }
             _ => panic!("expected Query command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_research_depth() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "research",
+            "--depth",
+            "0",
+            "--json",
+            "Find materials containing nickel",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Research { query, depth, json } => {
+                assert_eq!(query, "Find materials containing nickel");
+                assert_eq!(depth, 0);
+                assert!(json);
+            }
+            _ => panic!("expected Research command"),
+        }
+    }
+
+    #[test]
+    fn parse_research_response_body_accepts_plain_json() {
+        let parsed = parse_research_response_body(
+            r#"{"answer":"Nickel Oxide","sources":[{"title":"Paper","url":"https://example.com"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed["answer"], "Nickel Oxide");
+        assert_eq!(parsed["sources"][0]["title"], "Paper");
+    }
+
+    #[test]
+    fn parse_research_response_body_accepts_sse_events() {
+        let parsed = parse_research_response_body(
+            "event: step\n\
+data: {\"step\":\"started\",\"session_id\":\"abc\"}\n\
+\n\
+event: step\n\
+data: {\"step\":\"answer\",\"answer\":\"Nickel oxide\"}\n\
+\n\
+event: step\n\
+data: {\"step\":\"complete\",\"graph_queries\":2}\n\
+\n",
+        )
+        .unwrap();
+
+        assert_eq!(parsed["answer"], "Nickel oxide");
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["complete"]["step"], "complete");
+    }
+
+    #[test]
+    fn parse_research_response_body_prefers_final_answer_step() {
+        let parsed = parse_research_response_body(
+            "event: step\n\
+data: {\"step\":\"reasoning\",\"data\":{\"text\":\"thinking\"}}\n\
+\n\
+event: step\n\
+data: {\"step\":\"answer\",\"data\":{\"text\":\"final answer\"}}\n\
+\n",
+        )
+        .unwrap();
+
+        assert_eq!(parsed["answer"], "final answer");
+    }
+
+    #[test]
+    fn parse_sse_json_events_accepts_line_delimited_data_events() {
+        let events = parse_sse_json_events(
+            "data: {\"step\":\"started\",\"instance_id\":\"abc\"}\n\
+data: {\"step\":\"agent_turn\",\"agent_id\":\"metallurgist\"}\n\
+data: {\"step\":\"complete\",\"total_turns\":2}\n",
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["step"], "started");
+        assert_eq!(events[1]["agent_id"], "metallurgist");
+        assert_eq!(events[2]["step"], "complete");
+    }
+
+    #[test]
+    fn normalize_stream_events_unwraps_text_wrapped_data_payloads() {
+        let normalized = normalize_stream_events(vec![
+            serde_json::json!({"text": "data: {\"step\":\"started\",\"instance_id\":\"abc\"}"}),
+            serde_json::json!({"text": "plain text"}),
+        ]);
+
+        assert_eq!(normalized[0]["step"], "started");
+        assert_eq!(normalized[0]["instance_id"], "abc");
+        assert_eq!(normalized[1]["text"], "plain text");
+    }
+
+    #[test]
+    fn cli_parses_models_list_command() {
+        let cli =
+            Cli::try_parse_from(["prism", "models", "list", "--provider", "google"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Models {
+                command: ModelsCommands::List { provider, json },
+            } => {
+                assert_eq!(provider.as_deref(), Some("google"));
+                assert!(!json);
+            }
+            _ => panic!("expected Models::List command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_deploy_create_command() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "deploy",
+            "create",
+            "--name",
+            "serve-demo",
+            "--image",
+            "marc27/mace:latest",
+            "--target",
+            "local",
+            "--env",
+            "MODEL_PATH=/models/demo",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Deploy {
+                command:
+                    DeployCommands::Create {
+                        name,
+                        image,
+                        resource_slug,
+                        target,
+                        env_vars,
+                        ..
+                    },
+            } => {
+                assert_eq!(name, "serve-demo");
+                assert_eq!(image.as_deref(), Some("marc27/mace:latest"));
+                assert!(resource_slug.is_none());
+                assert_eq!(target, "local");
+                assert_eq!(env_vars, vec!["MODEL_PATH=/models/demo".to_string()]);
+            }
+            _ => panic!("expected Deploy::Create command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_discourse_run_command() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "discourse",
+            "run",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "--param",
+            "alloy=IN718",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Discourse {
+                command:
+                    DiscourseCommands::Run {
+                        spec_id,
+                        params,
+                        json,
+                    },
+            } => {
+                assert_eq!(spec_id, "123e4567-e89b-12d3-a456-426614174000");
+                assert_eq!(params, vec!["alloy=IN718".to_string()]);
+                assert!(json);
+            }
+            _ => panic!("expected Discourse::Run command"),
         }
     }
 }

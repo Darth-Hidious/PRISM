@@ -153,6 +153,13 @@ fn default_llm_timeout() -> u64 {
     120
 }
 
+fn is_platform_llm_provider(provider: &str) -> bool {
+    matches!(provider, "marc27" | "platform" | "google" | "vertexai")
+}
+
+const PLATFORM_INGEST_MODEL: &str = "gemini-3.1-flash-preview";
+const PLATFORM_EMBEDDING_MODEL: &str = "gemini-embedding-2";
+
 impl LlmSection {
     /// Resolve the model name — returns a helpful error if not configured.
     pub fn resolve_model(&self) -> Result<String> {
@@ -163,6 +170,37 @@ impl LlmSection {
                  Or pass --model explicitly for this command.\n\
                  Example: prism configure --model gemma-4-E4B-it --url http://localhost:8080"
             )
+        })
+    }
+
+    /// Resolve the ingest/search model, allowing platform-backed providers to
+    /// fall back to the hosted Gemini default when no explicit model is set.
+    pub fn resolve_model_or_platform_default(&self) -> Result<String> {
+        self.model.clone().or_else(|| {
+            if is_platform_llm_provider(&self.provider) {
+                Some(PLATFORM_INGEST_MODEL.to_string())
+            } else {
+                None
+            }
+        }).ok_or_else(|| {
+            anyhow::anyhow!(
+                "No LLM model configured. Set one with:\n  \
+                 prism configure --model <name>\n\
+                 Or pass --model explicitly for this command.\n\
+                 Example: prism configure --model gemma-4-E4B-it --url http://localhost:8080"
+            )
+        })
+    }
+
+    /// Resolve the embedding model, defaulting platform-backed flows to the
+    /// hosted Gemini embedding model when no explicit override is present.
+    pub fn resolve_embedding_model_or_platform_default(&self) -> Option<String> {
+        self.embedding_model.clone().or_else(|| {
+            if is_platform_llm_provider(&self.provider) {
+                Some(PLATFORM_EMBEDDING_MODEL.to_string())
+            } else {
+                None
+            }
         })
     }
 
@@ -373,6 +411,30 @@ impl Default for ModelServiceSection {
     }
 }
 
+impl ModelServiceSection {
+    /// Resolve a model id for platform-backed service sections.
+    pub fn resolve_model_or_platform_default(&self) -> Option<String> {
+        self.model.clone().or_else(|| {
+            if matches!(self.mode.as_str(), "platform" | "marc27") {
+                Some(PLATFORM_INGEST_MODEL.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Resolve an embedding model id for platform-backed service sections.
+    pub fn resolve_embedding_model_or_platform_default(&self) -> Option<String> {
+        self.embedding_model.clone().or_else(|| {
+            if matches!(self.mode.as_str(), "platform" | "marc27") {
+                Some(PLATFORM_EMBEDDING_MODEL.to_string())
+            } else {
+                None
+            }
+        })
+    }
+}
+
 impl NodeConfig {
     /// Load config from a TOML file, falling back to defaults for missing fields.
     pub fn from_file(path: &Path) -> Result<Self> {
@@ -553,6 +615,38 @@ api_key_env = "ANTHROPIC_API_KEY"
         assert_eq!(
             NodeConfig::resolve_api_key(&section),
             std::env::var("LLM_API_KEY").ok().filter(|k| !k.is_empty())
+        );
+    }
+
+    #[test]
+    fn llm_section_platform_defaults_kick_in() {
+        let section = LlmSection {
+            provider: "marc27".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            section.resolve_model_or_platform_default().unwrap(),
+            "gemini-3.1-flash-preview"
+        );
+        assert_eq!(
+            section.resolve_embedding_model_or_platform_default().as_deref(),
+            Some("gemini-embedding-2")
+        );
+    }
+
+    #[test]
+    fn model_service_platform_defaults_kick_in() {
+        let section = ModelServiceSection {
+            mode: "platform".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            section.resolve_model_or_platform_default().as_deref(),
+            Some("gemini-3.1-flash-preview")
+        );
+        assert_eq!(
+            section.resolve_embedding_model_or_platform_default().as_deref(),
+            Some("gemini-embedding-2")
         );
     }
 }

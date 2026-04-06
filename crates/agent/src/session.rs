@@ -75,6 +75,21 @@ pub struct SessionInfo {
     pub is_latest: bool,
 }
 
+/// Non-transcript runtime state that should survive resume/fork flows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSessionState {
+    #[serde(default)]
+    pub session_mode: String,
+    #[serde(default)]
+    pub permission_allow: Vec<String>,
+    #[serde(default)]
+    pub permission_deny: Vec<String>,
+    #[serde(default)]
+    pub plan_status: String,
+    #[serde(default)]
+    pub approved_plan_body: Option<String>,
+}
+
 // ── SessionStore ─────────────────────────────────────────────────────
 
 /// Manages session persistence to JSONL files.
@@ -212,7 +227,7 @@ impl SessionStore {
         let new_id = self.new_session(&old_model);
 
         if let Some(meta) = self.meta.as_mut() {
-            meta.parent_session_id = old_id;
+            meta.parent_session_id = old_id.clone();
             let name = if branch_name.is_empty() {
                 format!("fork-{}", &new_id[..new_id.len().min(8)])
             } else {
@@ -235,6 +250,19 @@ impl SessionStore {
                         }
                     }
                 }
+            }
+        }
+
+        if let Some(parent_id) = self
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.parent_session_id.clone())
+            .or(old_id)
+        {
+            let old_state_path = self.runtime_state_path(&parent_id);
+            let new_state_path = self.runtime_state_path(&new_id);
+            if old_state_path.exists() {
+                let _ = fs::copy(old_state_path, new_state_path);
             }
         }
 
@@ -367,6 +395,24 @@ impl SessionStore {
         self.meta.as_ref()
     }
 
+    /// Persist non-transcript session state to a sidecar JSON file.
+    pub fn save_runtime_state(&self, session_id: &str, state: &RuntimeSessionState) {
+        let path = self.runtime_state_path(session_id);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(state) {
+            let _ = fs::write(path, json);
+        }
+    }
+
+    /// Load runtime state sidecar for a session, if present.
+    pub fn load_runtime_state(&self, session_id: &str) -> Option<RuntimeSessionState> {
+        let path = self.runtime_state_path(session_id);
+        let text = fs::read_to_string(path).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
     // ── Internal ─────────────────────────────────────────────────────
 
     fn write_entry(&self, entry: &SessionEntry) {
@@ -429,6 +475,10 @@ impl SessionStore {
     fn update_latest(&self, sid: &str) {
         let latest_path = self.sessions_dir.join(LATEST_FILE);
         let _ = fs::write(latest_path, sid);
+    }
+
+    fn runtime_state_path(&self, session_id: &str) -> PathBuf {
+        self.sessions_dir.join(format!("{session_id}.state.json"))
     }
 }
 
@@ -547,6 +597,25 @@ mod tests {
         store.append_compaction("Summary of conversation so far.");
 
         assert_eq!(store.meta().unwrap().compaction_count, 1);
+    }
+
+    #[test]
+    fn runtime_state_roundtrip() {
+        let (mut store, _tmp) = make_store();
+        let sid = store.new_session("m1");
+        let state = RuntimeSessionState {
+            session_mode: "plan".to_string(),
+            permission_allow: vec!["read_file".to_string()],
+            permission_deny: vec!["execute_bash".to_string()],
+            plan_status: "approved".to_string(),
+            approved_plan_body: Some("Current Plan\n  1. Audit\n  2. Patch".to_string()),
+        };
+
+        store.save_runtime_state(&sid, &state);
+        let loaded = store
+            .load_runtime_state(&sid)
+            .expect("runtime state should load");
+        assert_eq!(loaded, state);
     }
 
     #[test]
