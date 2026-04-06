@@ -1477,6 +1477,8 @@ fn emit_status_snapshot(
     transcript: &TranscriptStore,
     session_mode: SessionMode,
     plan_state: &PlanRuntimeState,
+    llm_config: &LlmConfig,
+    slash_ctx: &SlashCommandContext,
 ) {
     emit_notification(
         "ui.status",
@@ -1486,6 +1488,8 @@ fn emit_status_snapshot(
             "has_plan": session_mode == SessionMode::Plan,
             "session_mode": session_mode.as_str(),
             "plan_status": plan_state.status.unwrap_or(PlanStatus::None).as_str(),
+            "model": llm_config.model,
+            "project_root": slash_ctx.project_root.display().to_string(),
         }),
     );
 }
@@ -2272,6 +2276,289 @@ fn format_plan_report(transcript: &TranscriptStore, scratchpad: &Scratchpad) -> 
     )
 }
 
+fn emit_context_screen(
+    slash_ctx: &SlashCommandContext,
+    session_store: &SessionStore,
+    history: &[ChatMessage],
+    llm_config: &LlmConfig,
+    system_prompt: &str,
+    transcript: &TranscriptStore,
+    scratchpad: &Scratchpad,
+    permissions: &ToolPermissionContext,
+    tools: &ToolCatalog,
+    plan_state: &PlanRuntimeState,
+) {
+    let api_view = summarize_api_view(history, system_prompt);
+    let transcript_blob = transcript_text(transcript);
+    let pending = extract_pending_work(&transcript_blob, 6);
+    let key_files = extract_key_files(&transcript_blob, 10);
+    let warning = transcript
+        .budget_warning()
+        .unwrap_or_else(|| "none".to_string());
+    let (read_only, workspace_write, full_access, approval_required, tool_names) =
+        loaded_tools_by_access(tools);
+    let auto_approved = tool_names
+        .iter()
+        .filter(|name| permissions.auto_approves(name))
+        .count();
+    let blocked = tool_names
+        .iter()
+        .filter(|name| permissions.blocks(name))
+        .count();
+    let current_session = session_store
+        .current_id()
+        .unwrap_or(transcript.session_id.as_str());
+
+    let summary = format!(
+        "Runtime\n  session: {current_session}\n  model: {}\n  project root: {}\n  python: {}\n\nPrompt load\n  visible messages: {}\n  estimated tokens: {}\n  tool calls in view: {}\n  budget warning: {}\n\nTools\n  loaded: {}\n  approval-required: {}\n  auto-approved now: {}\n  blocked now: {}",
+        llm_config.model,
+        slash_ctx.project_root.display(),
+        slash_ctx.python_bin.display(),
+        api_view.visible_messages,
+        api_view.total_estimated_tokens,
+        api_view.tool_call_count,
+        warning,
+        tools.len(),
+        approval_required.len(),
+        auto_approved,
+        blocked,
+    );
+    let api_view_body = format!(
+        "Model-facing API view\n  system: {}\n  user: {}\n  assistant: {}\n  tool: {}\n  compact boundary: {}\n\nVisible messages\n{}",
+        api_view.system_messages,
+        api_view.user_messages,
+        api_view.assistant_messages,
+        api_view.tool_messages,
+        api_view
+            .compact_boundary_preview
+            .as_deref()
+            .unwrap_or("none; full visible history is in play"),
+        numbered_section(&api_view.visible_previews, "(no visible messages yet)"),
+    );
+    let work_body = format!(
+        "Pending work\n{}\n\nApproved plan context\n{}\n\nScratchpad\n  entries: {}\n\nTranscript\n  entries: {}\n  turns: {}\n  input tokens: {}\n  output tokens: {}",
+        numbered_section(&pending, "(none inferred yet)"),
+        plan_state
+            .approved_plan_body
+            .as_deref()
+            .unwrap_or("(none loaded into execution prompt)"),
+        scratchpad.entries().len(),
+        transcript.entries.len(),
+        transcript.turn_count,
+        transcript.cost.total_input,
+        transcript.cost.total_output,
+    );
+    let files_body = format!(
+        "Key files\n{}\n\nLoaded tools by minimum access\n  read-only: {}\n  workspace-write: {}\n  full-access: {}",
+        numbered_section(&key_files, "(none detected yet)"),
+        read_only.len(),
+        workspace_write.len(),
+        full_access.len(),
+    );
+    let raw = format_context_report(
+        slash_ctx,
+        session_store,
+        history,
+        llm_config,
+        system_prompt,
+        transcript,
+        scratchpad,
+        permissions,
+        tools,
+        plan_state,
+    );
+    emit_tabbed_view(
+        "context",
+        "Context",
+        &[
+            ("summary", "Summary", &summary, "info"),
+            ("api-view", "API View", &api_view_body, "info"),
+            ("work", "Work", &work_body, "accent"),
+            ("files", "Files", &files_body, "info"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        "summary",
+        "info",
+        "tab switch • esc close",
+    );
+}
+
+fn emit_memory_screen(transcript: &TranscriptStore, scratchpad: &Scratchpad) {
+    let transcript_blob = transcript_text(transcript);
+    let pending = extract_pending_work(&transcript_blob, 5);
+    let key_files = extract_key_files(&transcript_blob, 8);
+    let recent_actions = scratchpad
+        .entries()
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|entry| match &entry.tool_name {
+            Some(tool_name) => format!("[{}] {}: {}", entry.step_type, tool_name, entry.summary),
+            None => format!("[{}] {}", entry.step_type, entry.summary),
+        })
+        .collect::<Vec<_>>();
+    let recent_requests = transcript
+        .entries
+        .iter()
+        .rev()
+        .filter(|entry| entry.role == "user")
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|entry| entry.content.replace('\n', " "))
+        .collect::<Vec<_>>();
+    let summary = format!(
+        "Session memory\n  scratchpad entries: {}\n  transcript entries: {}\n  pending items: {}\n  key files: {}",
+        scratchpad.entries().len(),
+        transcript.entries.len(),
+        pending.len(),
+        key_files.len(),
+    );
+    let actions_body = format!(
+        "Recent actions\n{}",
+        numbered_section(&recent_actions, "(no actions recorded)")
+    );
+    let requests_body = format!(
+        "Recent requests\n{}",
+        numbered_section(&recent_requests, "(no user requests recorded)")
+    );
+    let work_body = format!(
+        "Pending work\n{}\n\nKey files\n{}",
+        numbered_section(&pending, "(none inferred yet)"),
+        numbered_section(&key_files, "(none detected yet)"),
+    );
+    let raw = format_memory_report(transcript, scratchpad);
+    emit_tabbed_view(
+        "memory",
+        "Memory",
+        &[
+            ("summary", "Summary", &summary, "accent"),
+            ("actions", "Actions", &actions_body, "info"),
+            ("requests", "Requests", &requests_body, "info"),
+            ("work", "Work", &work_body, "accent"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        "summary",
+        "accent",
+        "tab switch • esc close",
+    );
+}
+
+fn emit_files_screen(transcript: &TranscriptStore, scratchpad: &Scratchpad) {
+    let transcript_blob = transcript_text(transcript);
+    let key_files = extract_key_files(&transcript_blob, 12);
+    let file_actions = scratchpad
+        .entries()
+        .iter()
+        .rev()
+        .filter(|entry| {
+            matches!(
+                entry.tool_name.as_deref(),
+                Some("read_file" | "write_file" | "edit_file" | "execute_bash" | "execute_python")
+            )
+        })
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|entry| match &entry.tool_name {
+            Some(tool_name) => format!("{tool_name}: {}", entry.summary),
+            None => entry.summary.clone(),
+        })
+        .collect::<Vec<_>>();
+    let summary = format!(
+        "Files in focus\n  referenced files: {}\n  recent file actions: {}",
+        key_files.len(),
+        file_actions.len(),
+    );
+    let focus_body = format!(
+        "Files in focus\n{}",
+        numbered_section(&key_files, "(none detected yet)")
+    );
+    let actions_body = format!(
+        "Recent file-oriented actions\n{}",
+        numbered_section(&file_actions, "(no recent file-oriented actions)")
+    );
+    let raw = format_files_report(transcript, scratchpad);
+    emit_tabbed_view(
+        "files",
+        "Files",
+        &[
+            ("summary", "Summary", &summary, "info"),
+            ("focus", "Focus", &focus_body, "info"),
+            ("actions", "Actions", &actions_body, "accent"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        "focus",
+        "info",
+        "tab switch • esc close",
+    );
+}
+
+fn emit_tasks_screen(transcript: &TranscriptStore, scratchpad: &Scratchpad) {
+    let transcript_blob = transcript_text(transcript);
+    let pending = extract_pending_work(&transcript_blob, 10);
+    let recent_decisions = scratchpad
+        .entries()
+        .iter()
+        .rev()
+        .filter(|entry| entry.step_type == "decision")
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|entry| entry.summary.clone())
+        .collect::<Vec<_>>();
+    let recent_requests = transcript
+        .entries
+        .iter()
+        .rev()
+        .filter(|entry| entry.role == "user")
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|entry| entry.content.replace('\n', " "))
+        .collect::<Vec<_>>();
+    let summary = format!(
+        "Tasks\n  pending: {}\n  recent requests: {}\n  recent decisions: {}",
+        pending.len(),
+        recent_requests.len(),
+        recent_decisions.len(),
+    );
+    let pending_body = format!(
+        "Pending tasks\n{}",
+        numbered_section(&pending, "(none inferred yet)")
+    );
+    let requests_body = format!(
+        "Recent requests\n{}",
+        numbered_section(&recent_requests, "(no user requests recorded)")
+    );
+    let decisions_body = format!(
+        "Recent decisions\n{}",
+        numbered_section(&recent_decisions, "(no decisions recorded yet)")
+    );
+    let raw = format_tasks_report(transcript, scratchpad);
+    emit_tabbed_view(
+        "tasks",
+        "Tasks",
+        &[
+            ("summary", "Summary", &summary, "accent"),
+            ("pending", "Pending", &pending_body, "accent"),
+            ("requests", "Requests", &requests_body, "info"),
+            ("decisions", "Decisions", &decisions_body, "info"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        "pending",
+        "accent",
+        "tab switch • esc close",
+    );
+}
+
 fn plan_snapshot_path(slash_ctx: &SlashCommandContext, session_id: &str) -> PathBuf {
     slash_ctx
         .project_root
@@ -2559,7 +2846,9 @@ fn ensure_json_flag(args: &[String]) -> Vec<String> {
 
 fn emit_models_view(title: &str, models: &[Value]) {
     let provider_counts = models.iter().fold(BTreeMap::new(), |mut acc, model| {
-        let provider = value_string(model, &["provider"]).unwrap_or("?").to_string();
+        let provider = value_string(model, &["provider"])
+            .unwrap_or("?")
+            .to_string();
         *acc.entry(provider).or_insert(0usize) += 1;
         acc
     });
@@ -2633,7 +2922,8 @@ fn emit_deployments_view(title: &str, value: &Value) {
         if items.is_empty() {
             "No deployments found.".to_string()
         } else {
-            items.iter()
+            items
+                .iter()
                 .map(|item| {
                     let id = value_string(item, &["deployment_id", "id"]).unwrap_or("?");
                     let name = value_string(item, &["name"]).unwrap_or("(unnamed)");
@@ -2665,7 +2955,11 @@ fn emit_deployments_view(title: &str, value: &Value) {
             ("details", "Details", &list, "accent"),
             ("raw", "Raw", &raw, "info"),
         ],
-        if items.is_some() { "details" } else { "summary" },
+        if items.is_some() {
+            "details"
+        } else {
+            "summary"
+        },
         "info",
         "persistent deployment state",
     );
@@ -2680,7 +2974,8 @@ fn emit_discourse_view(title: &str, value: &Value) {
         details = if items.is_empty() {
             "No discourse specs found.".to_string()
         } else {
-            items.iter()
+            items
+                .iter()
                 .map(|item| {
                     let id = value_string(item, &["id"]).unwrap_or("?");
                     let slug = value_string(item, &["slug"]).unwrap_or("(no slug)");
@@ -2700,7 +2995,8 @@ fn emit_discourse_view(title: &str, value: &Value) {
         details = if items.is_empty() {
             "No discourse turns found.".to_string()
         } else {
-            items.iter()
+            items
+                .iter()
                 .map(|item| {
                     let round = item
                         .get("round_num")
@@ -2735,9 +3031,7 @@ fn emit_discourse_view(title: &str, value: &Value) {
                     let detail = value_string(event, &["content"])
                         .map(|content| preview_text(content, 180))
                         .or_else(|| value_string(event, &["agent_id"]).map(str::to_string))
-                        .or_else(|| {
-                            event.get("round").map(|round| format!("round {}", round))
-                        })
+                        .or_else(|| event.get("round").map(|round| format!("round {}", round)))
                         .unwrap_or_else(|| event.to_string());
                     format!("{step}\n  {detail}")
                 })
@@ -3636,6 +3930,8 @@ fn spawn_agent_turn(
                     &runtime.transcript,
                     runtime.session_mode,
                     &runtime.plan_state,
+                    &runtime.llm_config,
+                    &slash_ctx,
                 );
             }
             Err(error) => {
@@ -3761,7 +4057,14 @@ async fn handle_command(
                 permission_overrides,
                 plan_state,
             );
-            emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
+            emit_status_snapshot(
+                config.auto_approve,
+                transcript,
+                *session_mode,
+                plan_state,
+                llm_config,
+                slash_ctx,
+            );
             emit_notification(
                 "ui.text.delta",
                 serde_json::json!({
@@ -4172,7 +4475,7 @@ async fn handle_command(
         "/context" => {
             let system_prompt =
                 system_prompt_for_mode(*session_mode, &config.system_prompt, plan_state, tools);
-            let text = format_context_report(
+            emit_context_screen(
                 slash_ctx,
                 session_store,
                 history,
@@ -4184,7 +4487,6 @@ async fn handle_command(
                 tools,
                 plan_state,
             );
-            emit_view("context", "Context", &text, "info");
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
@@ -4346,20 +4648,17 @@ async fn handle_command(
             Ok(true)
         }
         "/memory" => {
-            let text = format_memory_report(transcript, scratchpad);
-            emit_view("memory", "Memory", &text, "accent");
+            emit_memory_screen(transcript, scratchpad);
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
         "/files" => {
-            let text = format_files_report(transcript, scratchpad);
-            emit_view("files", "Files", &text, "info");
+            emit_files_screen(transcript, scratchpad);
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
         "/tasks" => {
-            let text = format_tasks_report(transcript, scratchpad);
-            emit_view("tasks", "Tasks", &text, "accent");
+            emit_tasks_screen(transcript, scratchpad);
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
@@ -4390,7 +4689,14 @@ async fn handle_command(
                     permission_overrides,
                     plan_state,
                 );
-                emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
+                emit_status_snapshot(
+                    config.auto_approve,
+                    transcript,
+                    *session_mode,
+                    plan_state,
+                    llm_config,
+                    slash_ctx,
+                );
                 emit_view(
                     "plan",
                     "Plan Approved",
@@ -4414,7 +4720,14 @@ async fn handle_command(
                     permission_overrides,
                     plan_state,
                 );
-                emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
+                emit_status_snapshot(
+                    config.auto_approve,
+                    transcript,
+                    *session_mode,
+                    plan_state,
+                    llm_config,
+                    slash_ctx,
+                );
                 emit_view(
                     "plan",
                     "Plan Rejected",
@@ -4434,7 +4747,14 @@ async fn handle_command(
                     permission_overrides,
                     plan_state,
                 );
-                emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
+                emit_status_snapshot(
+                    config.auto_approve,
+                    transcript,
+                    *session_mode,
+                    plan_state,
+                    llm_config,
+                    slash_ctx,
+                );
                 emit_view(
                     "plan",
                     "Plan State Cleared",
@@ -4461,7 +4781,14 @@ async fn handle_command(
                     permission_overrides,
                     plan_state,
                 );
-                emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
+                emit_status_snapshot(
+                    config.auto_approve,
+                    transcript,
+                    *session_mode,
+                    plan_state,
+                    llm_config,
+                    slash_ctx,
+                );
                 emit_view(
                     "plan",
                     "Plan Mode",
@@ -4500,7 +4827,14 @@ async fn handle_command(
                     permission_overrides,
                     plan_state,
                 );
-                emit_status_snapshot(config.auto_approve, transcript, *session_mode, plan_state);
+                emit_status_snapshot(
+                    config.auto_approve,
+                    transcript,
+                    *session_mode,
+                    plan_state,
+                    llm_config,
+                    slash_ctx,
+                );
                 let plan_body = format_plan_report(transcript, scratchpad);
                 let plan_path = persist_plan_snapshot(slash_ctx, &session_id, &plan_body)?;
                 let body = format!(
@@ -4639,6 +4973,8 @@ async fn handle_command(
                         transcript,
                         *session_mode,
                         plan_state,
+                        llm_config,
+                        slash_ctx,
                     );
                     emit_notification(
                         "ui.text.delta",
@@ -4694,6 +5030,8 @@ async fn handle_command(
                         transcript,
                         *session_mode,
                         plan_state,
+                        llm_config,
+                        slash_ctx,
                     );
                     emit_notification(
                         "ui.text.delta",
@@ -5037,6 +5375,8 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                         &restored_runtime.transcript,
                         restored_runtime.session_mode,
                         &restored_runtime.plan_state,
+                        &restored_runtime.llm_config,
+                        &slash_ctx,
                     );
                     runtime = Some(restored_runtime);
                 }
@@ -5133,6 +5473,8 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                     &runtime.transcript,
                     runtime.session_mode,
                     &runtime.plan_state,
+                    &runtime.llm_config,
+                    &slash_ctx,
                 );
             }
 
@@ -5242,6 +5584,8 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                         &runtime_ref.transcript,
                         runtime_ref.session_mode,
                         &runtime_ref.plan_state,
+                        &runtime_ref.llm_config,
+                        &slash_ctx,
                     );
                     continue;
                 }
@@ -5301,6 +5645,8 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                                     &runtime.transcript,
                                     runtime.session_mode,
                                     &runtime.plan_state,
+                                    &runtime.llm_config,
+                                    &slash_ctx,
                                 );
                             } else {
                                 live_permission_overrides.write().await.allow(tool_name);
@@ -5332,6 +5678,8 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                                     &runtime.transcript,
                                     runtime.session_mode,
                                     &runtime.plan_state,
+                                    &runtime.llm_config,
+                                    &slash_ctx,
                                 );
                             } else {
                                 live_permission_overrides.write().await.deny(tool_name);

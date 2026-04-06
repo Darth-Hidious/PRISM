@@ -58,6 +58,8 @@ export interface UiStatus {
   has_plan: boolean;
   session_mode: string;
   plan_status?: string;
+  model?: string;
+  project_root?: string;
 }
 
 export interface UiTurnComplete {
