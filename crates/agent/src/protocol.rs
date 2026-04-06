@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use prism_client::api::{OrgInfo, PlatformClient, ProjectInfo};
 use prism_client::{auth::DeviceCodeResponse, auth::TokenResponse, DeviceFlowAuth};
 use prism_ingest::llm::{ChatMessage, LlmClient};
@@ -1149,22 +1149,50 @@ async fn run_cli_backed_slash_command(
     args: &[String],
     slash_ctx: &SlashCommandContext,
 ) -> Result<String> {
+    let raw = run_cli_backed_slash_command_raw(args, slash_ctx).await?;
+    Ok(truncate_for_ui(
+        &format_cli_output(
+            &raw.invocation,
+            &raw.stdout,
+            &raw.stderr,
+            raw.success,
+            raw.code,
+        ),
+        30_000,
+    ))
+}
+
+struct RawCliSlashOutput {
+    invocation: String,
+    stdout: String,
+    stderr: String,
+    success: bool,
+    code: Option<i32>,
+}
+
+async fn run_cli_backed_slash_command_raw(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<RawCliSlashOutput> {
     if args.is_empty() {
-        return Ok(
-            "Enter a slash command such as `/status`, `/query ...`, or `/workflow list`."
-                .to_string(),
-        );
+        bail!("Enter a slash command such as `/status`, `/query ...`, or `/workflow list`.");
     }
 
     let root = args[0].as_str();
     if !is_cli_backed_slash_root(root) {
-        return Ok(String::new());
+        bail!("Unsupported slash command root: {root}");
     }
 
     if matches!(root, "setup" | "backend") {
-        return Ok(format!(
+        return Ok(RawCliSlashOutput {
+            invocation: format!("prism {}", args.join(" ")),
+            stdout: format!(
             "`/{root}` is not available inside the embedded REPL. Run `prism {root}` from your shell."
-        ));
+            ),
+            stderr: String::new(),
+            success: true,
+            code: Some(0),
+        });
     }
 
     let invocation = format!("prism {}", args.join(" "));
@@ -1185,24 +1213,46 @@ async fn run_cli_backed_slash_command(
     let output = match timeout(command_timeout_for_root(root), cmd.output()).await {
         Ok(result) => result.context("failed to run embedded CLI command")?,
         Err(_) => {
-            return Ok(format!(
-                "`{invocation}` is still running after {timeout_secs} seconds. Run it in your shell for an interactive or long-lived session."
-            ));
+            return Ok(RawCliSlashOutput {
+                invocation,
+                stdout: format!(
+                    "`{root}` is still running after {timeout_secs} seconds. Run it in your shell for an interactive or long-lived session."
+                ),
+                stderr: String::new(),
+                success: false,
+                code: None,
+            });
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Ok(truncate_for_ui(
-        &format_cli_output(
-            &invocation,
-            &stdout,
-            &stderr,
-            output.status.success(),
-            output.status.code(),
-        ),
-        30_000,
-    ))
+    Ok(RawCliSlashOutput {
+        invocation,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        success: output.status.success(),
+        code: output.status.code(),
+    })
+}
+
+async fn run_cli_backed_slash_command_json(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<Value> {
+    let raw = run_cli_backed_slash_command_raw(args, slash_ctx).await?;
+    if !raw.success {
+        bail!(
+            "{}",
+            format_cli_output(
+                &raw.invocation,
+                &raw.stdout,
+                &raw.stderr,
+                raw.success,
+                raw.code
+            )
+        );
+    }
+    serde_json::from_str(raw.stdout.trim())
+        .with_context(|| format!("command did not return JSON: {}", raw.invocation))
 }
 
 fn transcript_text(transcript: &TranscriptStore) -> String {
@@ -2473,6 +2523,341 @@ fn emit_workflow_result_view(spec: &WorkflowSpec, result: &WorkflowRunResult) {
         "accent",
         "policy-aware workflow result",
     );
+}
+
+fn json_pretty(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn value_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|field| field.as_str()))
+}
+
+fn value_bool(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|field| field.as_bool()))
+}
+
+fn value_array<'a>(value: &'a Value, container_keys: &[&str]) -> Option<&'a Vec<Value>> {
+    value.as_array().or_else(|| {
+        container_keys
+            .iter()
+            .find_map(|key| value.get(*key).and_then(|field| field.as_array()))
+    })
+}
+
+fn ensure_json_flag(args: &[String]) -> Vec<String> {
+    if args.iter().any(|arg| arg == "--json") {
+        args.to_vec()
+    } else {
+        let mut with_json = args.to_vec();
+        with_json.push("--json".to_string());
+        with_json
+    }
+}
+
+fn emit_models_view(title: &str, models: &[Value]) {
+    let provider_counts = models.iter().fold(BTreeMap::new(), |mut acc, model| {
+        let provider = value_string(model, &["provider"]).unwrap_or("?").to_string();
+        *acc.entry(provider).or_insert(0usize) += 1;
+        acc
+    });
+    let summary = if models.is_empty() {
+        "No hosted models found.".to_string()
+    } else {
+        format!(
+            "models: {}\nproviders: {}",
+            models.len(),
+            provider_counts
+                .iter()
+                .map(|(provider, count)| format!("{provider} ({count})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let list_body = if models.is_empty() {
+        "No models found.".to_string()
+    } else {
+        models
+            .iter()
+            .map(|model| {
+                let model_id = value_string(model, &["model_id", "id"]).unwrap_or("?");
+                let display_name =
+                    value_string(model, &["display_name", "name"]).unwrap_or(model_id);
+                let provider = value_string(model, &["provider"]).unwrap_or("?");
+                let context_window = model
+                    .get("context_window")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                format!("{provider}  {display_name}\n  {model_id}  ctx={context_window}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let raw = json_pretty(&Value::Array(models.to_vec()));
+    emit_tabbed_view(
+        "models",
+        title,
+        &[
+            ("summary", "Summary", &summary, "info"),
+            ("list", "List", &list_body, "info"),
+            ("raw", "Raw", &raw, "accent"),
+        ],
+        if models.is_empty() { "summary" } else { "list" },
+        "info",
+        "hosted model catalog",
+    );
+}
+
+fn emit_deployments_view(title: &str, value: &Value) {
+    let items = value_array(value, &["deployments", "items", "data"]);
+    let summary = if let Some(items) = items {
+        if items.is_empty() {
+            "No deployments found.".to_string()
+        } else {
+            let healthy = items
+                .iter()
+                .filter(|item| value_bool(item, &["healthy"]).unwrap_or(false))
+                .count();
+            format!("deployments: {}\nhealthy: {}", items.len(), healthy)
+        }
+    } else {
+        let status = value_string(value, &["status"]).unwrap_or("?");
+        let target = value_string(value, &["target"]).unwrap_or("-");
+        let endpoint = value_string(value, &["endpoint_url", "endpoint"]).unwrap_or("-");
+        format!("status: {status}\ntarget: {target}\nendpoint: {endpoint}")
+    };
+    let list = if let Some(items) = items {
+        if items.is_empty() {
+            "No deployments found.".to_string()
+        } else {
+            items.iter()
+                .map(|item| {
+                    let id = value_string(item, &["deployment_id", "id"]).unwrap_or("?");
+                    let name = value_string(item, &["name"]).unwrap_or("(unnamed)");
+                    let status = value_string(item, &["status"]).unwrap_or("?");
+                    let target = value_string(item, &["target"]).unwrap_or("-");
+                    format!("{name}  [{status}]\n  {id}  {target}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        }
+    } else {
+        let id = value_string(value, &["deployment_id", "id"]).unwrap_or("?");
+        let name = value_string(value, &["name"]).unwrap_or("(unnamed)");
+        let status = value_string(value, &["status"]).unwrap_or("?");
+        let image = value_string(value, &["image", "resource_slug"]).unwrap_or("-");
+        let target = value_string(value, &["target"]).unwrap_or("-");
+        let endpoint = value_string(value, &["endpoint_url", "endpoint"]).unwrap_or("-");
+        let healthy = value_bool(value, &["healthy"]).unwrap_or(false);
+        format!(
+            "name: {name}\nid: {id}\nstatus: {status}\ntarget: {target}\nimage: {image}\nendpoint: {endpoint}\nhealthy: {healthy}"
+        )
+    };
+    let raw = json_pretty(value);
+    emit_tabbed_view(
+        "deploy",
+        title,
+        &[
+            ("summary", "Summary", &summary, "info"),
+            ("details", "Details", &list, "accent"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        if items.is_some() { "details" } else { "summary" },
+        "info",
+        "persistent deployment state",
+    );
+}
+
+fn emit_discourse_view(title: &str, value: &Value) {
+    let summary;
+    let details;
+
+    if let Some(items) = value_array(value, &["specs", "items", "data"]) {
+        summary = format!("specs: {}", items.len());
+        details = if items.is_empty() {
+            "No discourse specs found.".to_string()
+        } else {
+            items.iter()
+                .map(|item| {
+                    let id = value_string(item, &["id"]).unwrap_or("?");
+                    let slug = value_string(item, &["slug"]).unwrap_or("(no slug)");
+                    let name = value_string(item, &["name"]).unwrap_or("(unnamed)");
+                    let version = item
+                        .get("version")
+                        .and_then(|value| value.as_i64())
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{slug}  v{version}\n  {name}\n  {id}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+    } else if let Some(items) = value_array(value, &["turns", "items", "data"]) {
+        summary = format!("turns: {}", items.len());
+        details = if items.is_empty() {
+            "No discourse turns found.".to_string()
+        } else {
+            items.iter()
+                .map(|item| {
+                    let round = item
+                        .get("round_num")
+                        .and_then(|value| value.as_i64())
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let turn = item
+                        .get("turn_num")
+                        .and_then(|value| value.as_i64())
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let agent = value_string(item, &["agent_id"]).unwrap_or("?");
+                    let content = value_string(item, &["content"]).unwrap_or("");
+                    format!(
+                        "round {round} turn {turn}  [{agent}]\n  {}",
+                        preview_text(content, 180)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+    } else if let Some(events) = value.get("events").and_then(|value| value.as_array()) {
+        let instance_id = value_string(value, &["instance_id"]).unwrap_or("?");
+        summary = format!("instance: {instance_id}\nevents: {}", events.len());
+        details = if events.is_empty() {
+            "No discourse events returned.".to_string()
+        } else {
+            events
+                .iter()
+                .map(|event| {
+                    let step = value_string(event, &["event", "step"]).unwrap_or("event");
+                    let detail = value_string(event, &["content"])
+                        .map(|content| preview_text(content, 180))
+                        .or_else(|| value_string(event, &["agent_id"]).map(str::to_string))
+                        .or_else(|| {
+                            event.get("round").map(|round| format!("round {}", round))
+                        })
+                        .unwrap_or_else(|| event.to_string());
+                    format!("{step}\n  {detail}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+    } else {
+        let status = value_string(value, &["status"]).unwrap_or("?");
+        let spec_id = value_string(value, &["spec_id"]).unwrap_or("?");
+        let instance_id = value_string(value, &["instance_id"]).unwrap_or("?");
+        let total_turns = value
+            .get("total_turns")
+            .and_then(|value| value.as_i64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        summary = format!(
+            "instance: {instance_id}\nstatus: {status}\nspec: {spec_id}\nturns: {total_turns}"
+        );
+        details = json_pretty(value);
+    }
+
+    let raw = json_pretty(value);
+    emit_tabbed_view(
+        "discourse",
+        title,
+        &[
+            ("summary", "Summary", &summary, "info"),
+            ("details", "Details", &details, "accent"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        "details",
+        "info",
+        "multi-agent discourse workflow",
+    );
+}
+
+async fn handle_models_slash_command(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("models") {
+        return Ok(false);
+    }
+
+    let action = args.get(1).map(String::as_str).unwrap_or("list");
+    match action {
+        "list" | "search" | "info" => {
+            let json_args = ensure_json_flag(args);
+            let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
+            let models = value_array(&value, &["models", "items", "data"])
+                .cloned()
+                .unwrap_or_else(|| match value {
+                    Value::Array(items) => items,
+                    other => vec![other],
+                });
+            let title = match action {
+                "search" => "Models Search",
+                "info" => "Model Info",
+                _ => "Hosted Models",
+            };
+            emit_models_view(title, &models);
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn handle_deploy_slash_command(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("deploy") {
+        return Ok(false);
+    }
+
+    let action = args.get(1).map(String::as_str).unwrap_or("list");
+    match action {
+        "list" | "status" | "health" => {
+            let json_args = ensure_json_flag(args);
+            let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
+            let title = match action {
+                "status" => "Deployment Status",
+                "health" => "Deployment Health",
+                _ => "Deployments",
+            };
+            emit_deployments_view(title, &value);
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn handle_discourse_slash_command(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("discourse") {
+        return Ok(false);
+    }
+
+    let action = args.get(1).map(String::as_str).unwrap_or("list");
+    match action {
+        "list" | "show" | "run" | "status" | "turns" => {
+            let json_args = ensure_json_flag(args);
+            let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
+            let title = match action {
+                "show" => "Discourse Spec",
+                "run" => "Discourse Run",
+                "status" => "Discourse Status",
+                "turns" => "Discourse Turns",
+                _ => "Discourse Specs",
+            };
+            emit_discourse_view(title, &value);
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 async fn handle_workflow_slash_command(
@@ -4492,6 +4877,15 @@ async fn handle_command(
             }
 
             if handle_workflow_slash_command(&args, slash_ctx, policy_engine).await? {
+                return Ok(true);
+            }
+            if handle_models_slash_command(&args, slash_ctx).await? {
+                return Ok(true);
+            }
+            if handle_deploy_slash_command(&args, slash_ctx).await? {
+                return Ok(true);
+            }
+            if handle_discourse_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
 
