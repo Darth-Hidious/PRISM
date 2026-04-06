@@ -148,6 +148,53 @@ function renderStructuredCommandData(data: Record<string, any>) {
     }
   }
 
+  if (root === "ingest") {
+    const items = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+    if (!items.length) return null;
+    return (
+      <Box marginTop={1} flexDirection="column">
+        <Text color={TEXT_DIM}>{`ingest items: ${items.length}`}</Text>
+        {items.slice(0, 5).map((item: any, index: number) => {
+          const path = String(item?.path ?? "?");
+          const backend = String(item?.backend ?? "ingest");
+          const detail =
+            backend === "platform_text"
+              ? `chunks=${item?.chunk_count ?? 0}`
+              : item?.result?.row_count !== undefined
+                ? `rows=${item.result.row_count} cols=${item.result.column_count ?? 0}`
+                : previewValue(item);
+          return (
+            <Text key={`${path}-${index}`} color={TEXT_MUTED}>
+              {`${path} · ${backend} · ${detail}`}
+            </Text>
+          );
+        })}
+      </Box>
+    );
+  }
+
+  if (root === "research" && parsed && typeof parsed === "object") {
+    const answer = parsed?.answer ? previewValue(parsed.answer, 140) : "";
+    const sourceCount = Array.isArray(parsed?.sources) ? parsed.sources.length : 0;
+    const eventCount = Array.isArray(parsed?.events) ? parsed.events.length : 0;
+    const lines = [
+      answer ? `answer: ${answer}` : "",
+      sourceCount ? `sources: ${sourceCount}` : "",
+      eventCount ? `events: ${eventCount}` : "",
+    ].filter(Boolean);
+    if (lines.length) {
+      return (
+        <Box marginTop={1} flexDirection="column">
+          {lines.map((line, index) => (
+            <Text key={`${line}-${index}`} color={TEXT_MUTED}>
+              {line}
+            </Text>
+          ))}
+        </Box>
+      );
+    }
+  }
+
   if (root === "discourse" && parsed && typeof parsed === "object") {
     if (Array.isArray(parsed?.specs)) {
       const specs = parsed.specs;

@@ -103,6 +103,7 @@ export interface UiPermissions {
   full_access: UiPermissionTool[];
   allow_overrides: string[];
   deny_overrides: string[];
+  notice?: string;
 }
 
 export interface UiPermissionTool {
@@ -125,6 +126,7 @@ export interface InputMessage {
 
 export interface InputCommand {
   command?: string;
+  silent?: boolean;
 }
 
 export interface InputPromptResponse {

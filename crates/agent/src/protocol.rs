@@ -2062,6 +2062,7 @@ fn emit_permissions_state(
     overrides: &PermissionOverrides,
     tools: &ToolCatalog,
     session_mode: SessionMode,
+    notice: Option<&str>,
 ) {
     let (read_only, workspace_write, full_access, approval_required, tool_names) =
         loaded_tools_by_access(tools);
@@ -2106,6 +2107,7 @@ fn emit_permissions_state(
             "full_access": full_access,
             "allow_overrides": allow_overrides,
             "deny_overrides": deny_overrides,
+            "notice": notice,
         }),
     );
 }
@@ -3216,6 +3218,137 @@ fn emit_publish_view(title: &str, value: &Value) {
     );
 }
 
+fn emit_ingest_view(title: &str, value: &Value) {
+    let items = value_array(value, &[])
+        .cloned()
+        .unwrap_or_else(|| vec![value.clone()]);
+    let summary = if let Some(graph) = value.get("graph") {
+        let nodes = graph
+            .get("nodes")
+            .and_then(|entry| entry.as_u64())
+            .unwrap_or(0);
+        let edges = graph
+            .get("edges")
+            .and_then(|entry| entry.as_u64())
+            .unwrap_or(0);
+        let embeddings = value
+            .get("embeddings")
+            .and_then(|entry| entry.get("embeddings"))
+            .and_then(|entry| entry.as_u64())
+            .unwrap_or(0);
+        format!("graph: {nodes} nodes\nedges: {edges}\nembeddings: {embeddings}")
+    } else {
+        format!("items: {}", items.len())
+    };
+
+    let details = items
+        .iter()
+        .map(|item| {
+            let path = value_string(item, &["path"]).unwrap_or("?");
+            let backend = value_string(item, &["backend"]).unwrap_or("ingest");
+            if backend == "platform_text" {
+                let chunks = item
+                    .get("chunk_count")
+                    .and_then(|entry| entry.as_u64())
+                    .unwrap_or(0);
+                let chars = item
+                    .get("chars")
+                    .and_then(|entry| entry.as_u64())
+                    .unwrap_or(0);
+                let corpus = value_string(item, &["corpus"]).unwrap_or("-");
+                format!(
+                    "{path}\n  backend={backend}  chunks={chunks}  chars={chars}  corpus={corpus}"
+                )
+            } else if let Some(result) = item.get("result") {
+                let rows = result
+                    .get("row_count")
+                    .and_then(|entry| entry.as_u64())
+                    .unwrap_or(0);
+                let columns = result
+                    .get("column_count")
+                    .and_then(|entry| entry.as_u64())
+                    .unwrap_or(0);
+                format!("{path}\n  backend={backend}  rows={rows}  columns={columns}")
+            } else {
+                format!("{path}\n  {}", json_inline(item))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let raw = json_pretty(value);
+    emit_tabbed_view(
+        "ingest",
+        title,
+        &[
+            ("summary", "Summary", &summary, "info"),
+            ("details", "Details", &details, "accent"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        "details",
+        "info",
+        "ingest pipeline state",
+    );
+}
+
+fn emit_research_view(title: &str, value: &Value) {
+    let answer = value_string(value, &["answer"]).unwrap_or("No final answer returned.");
+    let source_lines = value
+        .get("sources")
+        .and_then(|sources| sources.as_array())
+        .map(|sources| {
+            if sources.is_empty() {
+                "(none)".to_string()
+            } else {
+                sources
+                    .iter()
+                    .map(|source| {
+                        let title = value_string(source, &["title"]).unwrap_or("source");
+                        let url = value_string(source, &["url"]).unwrap_or("");
+                        format!("{title}  {url}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        })
+        .unwrap_or_else(|| "(none)".to_string());
+    let events = value
+        .get("events")
+        .and_then(|events| events.as_array())
+        .map(|events| {
+            if events.is_empty() {
+                "(none)".to_string()
+            } else {
+                events
+                    .iter()
+                    .map(|event| {
+                        let step = value_string(event, &["step", "event"]).unwrap_or("event");
+                        let preview = value_string(event, &["answer", "text", "message"])
+                            .map(|text| preview_text(text, 160))
+                            .unwrap_or_else(|| json_inline(event));
+                        format!("{step}\n  {preview}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            }
+        })
+        .unwrap_or_else(|| "(none)".to_string());
+    let raw = json_pretty(value);
+    emit_tabbed_view(
+        "research",
+        title,
+        &[
+            ("answer", "Answer", answer, "info"),
+            ("sources", "Sources", &source_lines, "accent"),
+            ("events", "Events", &events, "info"),
+            ("raw", "Raw", &raw, "info"),
+        ],
+        "answer",
+        "info",
+        "iterative research loop",
+    );
+}
+
 fn emit_discourse_view(title: &str, value: &Value) {
     let summary;
     let details;
@@ -3392,6 +3525,30 @@ async fn handle_run_slash_command(
     Ok(true)
 }
 
+async fn handle_ingest_slash_command(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("ingest") {
+        return Ok(false);
+    }
+
+    if args.iter().any(|arg| arg == "--watch") {
+        return Ok(false);
+    }
+
+    let json_args = ensure_json_flag(args);
+    let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
+    let title = if args.iter().any(|arg| arg == "--status") {
+        "Ingest Status"
+    } else {
+        "Ingest"
+    };
+    emit_ingest_view(title, &value);
+    emit_notification("ui.turn.complete", serde_json::json!({}));
+    Ok(true)
+}
+
 async fn handle_discourse_slash_command(
     args: &[String],
     slash_ctx: &SlashCommandContext,
@@ -3418,6 +3575,21 @@ async fn handle_discourse_slash_command(
         }
         _ => Ok(false),
     }
+}
+
+async fn handle_research_slash_command(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("research") {
+        return Ok(false);
+    }
+
+    let json_args = ensure_json_flag(args);
+    let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
+    emit_research_view("Research", &value);
+    emit_notification("ui.turn.complete", serde_json::json!({}));
+    Ok(true)
 }
 
 async fn handle_publish_slash_command(
@@ -3861,7 +4033,7 @@ fn build_tool_card_payload(
 
                 if matches!(
                     root.as_str(),
-                    "models" | "deploy" | "discourse" | "run" | "publish"
+                    "models" | "deploy" | "discourse" | "run" | "publish" | "ingest" | "research"
                 ) {
                     let mut data = serde_json::json!({
                         "root": root,
@@ -4239,6 +4411,7 @@ fn spawn_agent_turn(
 /// Handle built-in slash commands. Returns `true` if the command was handled.
 async fn handle_command(
     command: &str,
+    silent: bool,
     slash_ctx: &SlashCommandContext,
     config: &AgentConfig,
     tool_server: &mut ToolServerHandle,
@@ -4793,13 +4966,25 @@ async fn handle_command(
                         permission_overrides,
                         plan_state,
                     );
-                    emit_notification(
-                        "ui.text.delta",
-                        serde_json::json!({
-                            "text": "Cleared all session-local permission overrides."
-                        }),
-                    );
-                    emit_notification("ui.turn.complete", serde_json::json!({}));
+                    let detail = "Cleared all session-local permission overrides.";
+                    if silent {
+                        emit_permissions_state(
+                            permissions,
+                            permission_overrides,
+                            tools,
+                            *session_mode,
+                            Some(detail),
+                        );
+                    }
+                    if !silent {
+                        emit_notification(
+                            "ui.text.delta",
+                            serde_json::json!({
+                                "text": detail
+                            }),
+                        );
+                        emit_notification("ui.turn.complete", serde_json::json!({}));
+                    }
                     return Ok(true);
                 }
 
@@ -4854,8 +5039,19 @@ async fn handle_command(
                         ),
                         _ => unreachable!(),
                     };
-                    emit_notification("ui.text.delta", serde_json::json!({ "text": detail }));
-                    emit_notification("ui.turn.complete", serde_json::json!({}));
+                    if silent {
+                        emit_permissions_state(
+                            permissions,
+                            permission_overrides,
+                            tools,
+                            *session_mode,
+                            Some(&detail),
+                        );
+                    }
+                    if !silent {
+                        emit_notification("ui.text.delta", serde_json::json!({ "text": detail }));
+                        emit_notification("ui.turn.complete", serde_json::json!({}));
+                    }
                     return Ok(true);
                 }
             }
@@ -4928,7 +5124,13 @@ async fn handle_command(
                 "warning",
                 "tab switch • esc close",
             );
-            emit_permissions_state(permissions, permission_overrides, tools, *session_mode);
+            emit_permissions_state(
+                permissions,
+                permission_overrides,
+                tools,
+                *session_mode,
+                None,
+            );
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
@@ -5541,7 +5743,13 @@ async fn handle_command(
             if handle_run_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
+            if handle_ingest_slash_command(&args, slash_ctx).await? {
+                return Ok(true);
+            }
             if handle_discourse_slash_command(&args, slash_ctx).await? {
+                return Ok(true);
+            }
+            if handle_research_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
             if handle_publish_slash_command(&args, slash_ctx).await? {
@@ -5842,6 +6050,10 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
 
             "input.command" => {
                 let command = params.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                let silent = params
+                    .get("silent")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
                 emit_response(id.clone(), serde_json::json!({ "status": "ok" }));
 
                 if turn_active {
@@ -5858,6 +6070,7 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                 let runtime_ref = runtime.as_mut().expect("runtime should exist");
                 let handled = match handle_command(
                     command,
+                    silent,
                     &slash_ctx,
                     config.as_ref(),
                     &mut runtime_ref.tool_server,
@@ -6537,6 +6750,34 @@ mod tests {
         assert!(content.contains("status: completed"));
         assert_eq!(data["root"], "publish");
         assert_eq!(data["parsed_stdout"]["repo"], "team/model");
+    }
+
+    #[test]
+    fn build_tool_card_payload_parses_ingest_stdout_json() {
+        let (content, data) = build_tool_card_payload(
+            "ingest_file",
+            r#"{"root":"ingest","success":true,"timed_out":false,"exit_code":0,"invocation":"prism ingest paper.pdf --json","stdout":"{\"backend\":\"platform_text\",\"path\":\"paper.pdf\",\"chunk_count\":3,\"chars\":12000,\"jobs\":[{\"job_id\":\"job-1\",\"status\":\"submitted\"}]}","stderr":""}"#,
+            Some("prism ingest paper.pdf --json"),
+            Some("ingest_file: paper.pdf"),
+        );
+
+        assert!(content.contains("status: completed"));
+        assert_eq!(data["root"], "ingest");
+        assert_eq!(data["parsed_stdout"]["chunk_count"], 3);
+    }
+
+    #[test]
+    fn build_tool_card_payload_parses_research_stdout_json() {
+        let (content, data) = build_tool_card_payload(
+            "research_query",
+            r#"{"root":"research","success":true,"timed_out":false,"exit_code":0,"invocation":"prism research --depth 0 --json nickel","stdout":"{\"answer\":\"Nickel oxide\",\"sources\":[{\"title\":\"Paper\",\"url\":\"https://example.com\"}],\"events\":[{\"step\":\"answer\",\"answer\":\"Nickel oxide\"}]}","stderr":""}"#,
+            Some("prism research --depth 0 --json nickel"),
+            Some("research_query: nickel oxide"),
+        );
+
+        assert!(content.contains("status: completed"));
+        assert_eq!(data["root"], "research");
+        assert_eq!(data["parsed_stdout"]["answer"], "Nickel oxide");
     }
 
     #[test]
