@@ -1522,36 +1522,77 @@ async fn main() -> Result<()> {
                     );
                 }
                 KeyCommands::Fetch { node_id, json } => {
-                    let (api_base, auth_header) = resolve_user_auth()?;
-                    let token = auth_header.strip_prefix("Bearer ").unwrap_or(&auth_header);
-                    let platform = PlatformClient::new(&api_base).with_token(token);
-                    let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
-                    let response = registry.get_public_key(&node_id).await?;
+                    let (api_base, auth) = resolve_agent_auth()?;
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .build()?;
+                    let response: serde_json::Value = auth
+                        .apply(client.get(format!("{api_base}/nodes/{node_id}/public-key")))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&response)?);
                     } else {
-                        println!("Node: {}", response.name);
-                        println!("Node ID: {}", response.node_id);
-                        println!("Algorithm: {}", response.algorithm);
-                        println!("Public key: {}", response.public_key);
+                        println!(
+                            "Node: {}",
+                            value_string(&response, &["name"]).unwrap_or("unknown")
+                        );
+                        println!(
+                            "Node ID: {}",
+                            value_string(&response, &["node_id", "id"]).unwrap_or(&node_id)
+                        );
+                        println!(
+                            "Algorithm: {}",
+                            value_string(&response, &["algorithm"]).unwrap_or("x25519")
+                        );
+                        println!(
+                            "Public key: {}",
+                            value_string(&response, &["public_key"]).unwrap_or("")
+                        );
                     }
                 }
                 KeyCommands::Exchange { node_id, json } => {
                     let (_secret, public) =
                         prism_node::crypto::load_or_generate_key(&paths.state_dir)?;
                     let our_public_key = prism_node::crypto::encode_public_key(&public);
-                    let (api_base, auth_header) = resolve_user_auth()?;
-                    let token = auth_header.strip_prefix("Bearer ").unwrap_or(&auth_header);
-                    let platform = PlatformClient::new(&api_base).with_token(token);
-                    let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
-                    let response = registry.exchange_key(&node_id, &our_public_key).await?;
+                    let (api_base, auth) = resolve_agent_auth()?;
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .build()?;
+                    let response: serde_json::Value = auth
+                        .apply(client.post(format!("{api_base}/nodes/{node_id}/exchange-key")))
+                        .json(&serde_json::json!({
+                            "public_key": our_public_key,
+                        }))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&response)?);
                     } else {
-                        println!("Target node ID: {}", response.target_node_id);
-                        println!("Algorithm: {}", response.algorithm);
-                        println!("Target public key: {}", response.target_public_key);
-                        println!("Public key sent: {}", response.your_public_key_received);
+                        println!(
+                            "Target node ID: {}",
+                            value_string(&response, &["target_node_id", "node_id", "id"])
+                                .unwrap_or(&node_id)
+                        );
+                        println!(
+                            "Algorithm: {}",
+                            value_string(&response, &["algorithm"]).unwrap_or("x25519")
+                        );
+                        println!(
+                            "Target public key: {}",
+                            value_string(&response, &["target_public_key", "public_key"])
+                                .unwrap_or("")
+                        );
+                        println!(
+                            "Public key sent: {}",
+                            value_string(&response, &["your_public_key_received"]).unwrap_or("")
+                        );
                     }
                 }
             },
