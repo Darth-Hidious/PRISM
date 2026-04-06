@@ -20,9 +20,15 @@ const navItems = [
 
 export default function App() {
   const [token, setToken] = useState<string | null>(null);
+  const [clock, setClock] = useState(() => new Date());
 
   useEffect(() => {
     setToken(bootstrapSessionTokenFromUrl());
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(new Date()), 1000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const { connected } = useWebSocket({ token: token ?? "" });
@@ -40,14 +46,68 @@ export default function App() {
   }, [connected, token]);
 
   return (
-    <div className="flex min-h-screen bg-[var(--bg)] text-[var(--fg)]">
-      <nav className="w-64 shrink-0 border-r border-[var(--border)] bg-[var(--card)] px-5 py-6 flex flex-col gap-2">
-        <div className="mb-6">
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--dim)]">MARC27 Research Ops</div>
-          <div className="mt-2 text-3xl font-semibold tracking-tight text-[var(--fg)]">PRISM</div>
-          <div className="mt-3 rounded-2xl border border-[var(--border)] bg-[var(--panel)] px-3 py-3">
-            <div className="text-xs font-medium text-[var(--accent)]">{sessionState.label}</div>
-            <div className="mt-1 text-xs leading-5 text-[var(--dim)]">{sessionState.detail}</div>
+    <div className="min-h-screen bg-[var(--bg)] bg-grid text-[var(--fg)]">
+      <header className="sticky top-0 z-40 border-b border-[var(--border)] bg-[var(--card)]/88 backdrop-blur-md">
+        <div className="mx-auto flex h-16 max-w-[1560px] items-center justify-between gap-6 px-6">
+          <div className="flex items-center gap-8">
+            <div className="flex items-center gap-3">
+              <div className="flex h-8 w-8 items-center justify-center border border-[var(--border-strong)] bg-[var(--panel-strong)] text-sm font-semibold tracking-tight text-[var(--fg)]">
+                P
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-[0.22em] text-[var(--dim)]">MARC27 Research Ops</div>
+                <div className="text-lg font-semibold tracking-tight text-[var(--fg)]">PRISM Board</div>
+              </div>
+            </div>
+            <nav className="hidden items-center gap-2 lg:flex">
+              {navItems.map((item) => (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  end={item.to === "/"}
+                  className={({ isActive }) =>
+                    `rounded-sm px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.18em] transition-colors ${
+                      isActive
+                        ? "bg-[var(--panel-strong)] text-[var(--accent)]"
+                        : "text-[var(--dim)] hover:bg-[var(--panel)] hover:text-[var(--fg)]"
+                    }`
+                  }
+                >
+                  {item.label}
+                </NavLink>
+              ))}
+            </nav>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <div className="hidden min-w-[220px] items-center gap-2 border border-[var(--border)] bg-[var(--panel)] px-3 py-2 md:flex">
+              <span className="text-[10px] uppercase tracking-[0.18em] text-[var(--dim)]">Command</span>
+              <input
+                readOnly
+                value="OPEN / TOKEN / FILTER / PROJECT"
+                className="w-full bg-transparent text-[11px] font-medium uppercase tracking-[0.16em] text-[var(--fg)] outline-none"
+              />
+            </div>
+            <div className="rounded-sm border border-[var(--border)] bg-[var(--panel)] px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-[var(--dim)]">
+              {clock.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })} UTC
+            </div>
+            <div className="rounded-sm border border-[var(--border-strong)] bg-[var(--panel-strong)] px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-[var(--accent)]">
+              {sessionState.label}
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <div className="border-b border-[var(--border)] bg-[var(--panel)]/78">
+        <div className="mx-auto flex max-w-[1560px] flex-wrap items-center justify-between gap-4 px-6 py-4">
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.22em] text-[var(--dim)]">Control Surface</div>
+            <div className="mt-1 text-sm text-[var(--fg)]">{sessionState.detail}</div>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="rounded-sm border border-[var(--border)] bg-[var(--card)] px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-[var(--dim)]">
+              {connected ? "Realtime feed live" : "Snapshot mode"}
+            </div>
             {token ? (
               <button
                 type="button"
@@ -55,41 +115,16 @@ export default function App() {
                   clearSessionToken();
                   setToken(getSessionToken());
                 }}
-                className="mt-3 text-xs text-[var(--dim)] underline-offset-4 hover:text-[var(--fg)] hover:underline"
+                className="rounded-sm border border-[var(--border)] px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-[var(--dim)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
               >
-                Clear local session
+                Clear Session
               </button>
             ) : null}
           </div>
         </div>
-        {navItems.map((item) => (
-          <NavLink
-            key={item.to}
-            to={item.to}
-            end={item.to === "/"}
-            className={({ isActive }) =>
-              `block rounded-xl px-3 py-2.5 text-sm transition-colors ${
-                isActive
-                  ? "bg-[var(--accent)]/12 text-[var(--accent)] shadow-[inset_0_0_0_1px_rgba(240,160,88,0.18)]"
-                  : "text-[var(--dim)] hover:bg-[var(--panel)] hover:text-[var(--fg)]"
-              }`
-            }
-          >
-            {item.label}
-          </NavLink>
-        ))}
-        <div className="mt-auto pt-6 text-xs text-[var(--dim)] space-y-2">
-          <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] px-3 py-3">
-            <div className="font-medium text-[var(--fg)]">Ops Signal</div>
-            <div className="mt-1 leading-5">
-              {connected ? "The dashboard is receiving live node updates." : "The dashboard is in snapshot mode."}
-            </div>
-          </div>
-          <a href="https://marc27.com" className="inline-block hover:text-[var(--accent)]">MARC27</a>
-        </div>
-      </nav>
+      </div>
 
-      <main className="flex-1 overflow-auto px-8 py-7">
+      <main className="mx-auto w-full max-w-[1560px] px-6 py-8">
         <Routes>
           <Route path="/" element={<NodeStatus connected={connected} authenticated={Boolean(token)} />} />
           <Route path="/query" element={<QueryPage authenticated={Boolean(token)} />} />
@@ -99,6 +134,13 @@ export default function App() {
           <Route path="/audit" element={<AuditLog authenticated={Boolean(token)} />} />
         </Routes>
       </main>
+
+      <footer className="border-t border-[var(--border)] bg-[var(--card)]">
+        <div className="mx-auto flex max-w-[1560px] items-center justify-between gap-4 px-6 py-3 text-[10px] uppercase tracking-[0.18em] text-[var(--dim)]">
+          <span>PRISM Board Preview</span>
+          <span>CLI, TUI, and dashboard share one backend contract</span>
+        </div>
+      </footer>
     </div>
   );
 }
