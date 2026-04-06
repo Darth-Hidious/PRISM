@@ -8,7 +8,7 @@
   <em>MARC27</em>
 </p>
 <p align="center">
-  <code>v2.6.0</code> &nbsp;|&nbsp; <code>16 Rust crates</code> &nbsp;|&nbsp; <code>494 Rust tests + 551 Python tests</code> &nbsp;|&nbsp; <code>49 tools</code>
+  <code>v2.6.1</code> &nbsp;|&nbsp; <code>16 Rust crates</code> &nbsp;|&nbsp; <code>494 Rust tests + 551 Python tests</code> &nbsp;|&nbsp; <code>49 tools</code>
 </p>
 
 <p align="center">
