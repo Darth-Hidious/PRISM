@@ -20,7 +20,10 @@ export default function Table<T extends Record<string, any>>({
         <thead>
           <tr className="border-b border-[var(--border)]">
             {columns.map((col) => (
-              <th key={col.key} className="text-left py-2 px-3 text-[var(--dim)] font-medium">
+              <th
+                key={col.key}
+                className="px-3 py-2 text-left text-[10px] font-medium uppercase tracking-[0.18em] text-[var(--dim)]"
+              >
                 {col.header}
               </th>
             ))}
@@ -28,9 +31,9 @@ export default function Table<T extends Record<string, any>>({
         </thead>
         <tbody>
           {rows.map((row, i) => (
-            <tr key={i} className="border-b border-[var(--border)] last:border-b-0">
+            <tr key={i} className="border-b border-[var(--border)]/70 last:border-b-0 hover:bg-white/2">
               {columns.map((col) => (
-                <td key={col.key} className="py-2 px-3">
+                <td key={col.key} className="px-3 py-3 text-[13px] text-[var(--fg)]">
                   {col.render ? col.render(row) : String(row[col.key] ?? "")}
                 </td>
               ))}
@@ -39,7 +42,9 @@ export default function Table<T extends Record<string, any>>({
         </tbody>
       </table>
       {rows.length === 0 && (
-        <div className="py-8 text-center text-[var(--dim)]">No data</div>
+        <div className="border border-dashed border-[var(--border)] px-4 py-8 text-center text-[12px] uppercase tracking-[0.16em] text-[var(--dim)]">
+          No data
+        </div>
       )}
     </div>
   );

@@ -1,25 +1,45 @@
 @import "tailwindcss";
 
 :root {
-  --bg: #0b1016;
-  --fg: #e9edf2;
-  --accent: #f0a058;
-  --dim: #90a0b4;
-  --card: #121a24;
-  --panel: #17212d;
-  --border: #273243;
+  --bg: #0a0d12;
+  --fg: #eff4fb;
+  --accent: #62a5ff;
+  --accent-warm: #f0a058;
+  --dim: #98a7ba;
+  --card: rgba(14, 20, 29, 0.92);
+  --panel: rgba(19, 28, 39, 0.9);
+  --panel-strong: rgba(26, 38, 53, 0.96);
+  --border: rgba(124, 154, 191, 0.18);
+  --border-strong: rgba(124, 154, 191, 0.3);
+}
+
+* {
+  box-sizing: border-box;
 }
 
 body {
   background: var(--bg);
   color: var(--fg);
-  font-family: "SF Pro Display", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
-    Helvetica, Arial, sans-serif;
+  font-family: "Avenir Next", "IBM Plex Sans", "Segoe UI", sans-serif;
   background-image:
-    radial-gradient(circle at top left, rgba(240, 160, 88, 0.12), transparent 24rem),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 18rem);
+    radial-gradient(circle at top left, rgba(98, 165, 255, 0.12), transparent 22rem),
+    radial-gradient(circle at bottom right, rgba(240, 160, 88, 0.08), transparent 18rem),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 16rem);
+}
+
+input,
+button,
+textarea {
+  font: inherit;
 }
 
 #root {
   min-height: 100vh;
+}
+
+.bg-grid {
+  background-image:
+    linear-gradient(rgba(124, 154, 191, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(124, 154, 191, 0.04) 1px, transparent 1px);
+  background-size: 28px 28px;
 }
