@@ -7,9 +7,17 @@ Reads one JSON object per line from stdin, writes one JSON object per line
 to stdout.  Methods: list_tools, call_tool.
 """
 import json
+import os
 import sys
 
 from app.plugins.bootstrap import build_full_registry
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _handle(registry, request: dict) -> dict:
@@ -25,6 +33,8 @@ def _handle(registry, request: dict) -> dict:
                     "description": t.description,
                     "input_schema": t.input_schema,
                     "requires_approval": t.requires_approval,
+                    "source": t.source,
+                    "source_detail": t.source_detail,
                 }
                 for t in registry.list_tools()
             ]
@@ -46,7 +56,15 @@ def _handle(registry, request: dict) -> dict:
 
 
 def main():
-    tool_reg, _, _ = build_full_registry(enable_mcp=False, enable_plugins=False)
+    # External MCP tools are now part of the same runtime catalog as local
+    # PRISM tools. Keep a simple env kill-switch so operators can disable them
+    # without patching the launcher.
+    enable_mcp = _env_flag("PRISM_ENABLE_MCP", True)
+    enable_plugins = _env_flag("PRISM_ENABLE_PLUGINS", False)
+    tool_reg, _, _ = build_full_registry(
+        enable_mcp=enable_mcp,
+        enable_plugins=enable_plugins,
+    )
 
     for line in sys.stdin:
         line = line.strip()

@@ -2308,6 +2308,8 @@ pub fn command_tools() -> Vec<LoadedTool> {
             input_schema: schema_for_spec(spec),
             requires_approval: spec.requires_approval,
             permission_mode: spec.permission_mode,
+            source: Some("prism-command".to_string()),
+            source_detail: None,
         })
         .collect()
 }

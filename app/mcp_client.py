@@ -120,6 +120,9 @@ def discover_and_register_mcp_tools(
                 func=make_handler(
                     server_name, server_config, tool_info["original_name"]
                 ),
+                requires_approval=True,
+                source="mcp",
+                source_detail=server_name,
             )
             registry.register(tool)
             registered.append(tool_info["name"])

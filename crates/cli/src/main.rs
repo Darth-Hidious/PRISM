@@ -856,19 +856,24 @@ async fn main() -> Result<()> {
                 ..Default::default()
             };
 
+            let mut tool_server_env = std::collections::BTreeMap::new();
+            tool_server_env.insert("PRISM_ENABLE_MCP".to_string(), "1".to_string());
+
             let tool_server = prism_python_bridge::ToolServer {
                 python_bin: backend_py,
                 project_root: backend_pr,
-                env: Default::default(),
+                env: tool_server_env,
             };
 
             prism_agent::protocol::run_server(llm_config, tool_server).await?;
         }
         Commands::Tools => {
+            let mut tool_server_env = std::collections::BTreeMap::new();
+            tool_server_env.insert("PRISM_ENABLE_MCP".to_string(), "1".to_string());
             let server = ToolServer {
                 python_bin: python.clone(),
                 project_root: project_root.clone(),
-                env: Default::default(),
+                env: tool_server_env,
             };
             let mut handle = server.spawn().await?;
             let resp = handle.list_tools().await?;
