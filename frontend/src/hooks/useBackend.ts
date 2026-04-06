@@ -21,6 +21,8 @@ export function useBackend(
     clientRef.current = client;
 
     client.on("event", (event: BackendEvent) => {
+      // Keep raw protocol events append-only here. App-level folding happens in
+      // the root renderer so alternative frontends can reuse the same stream.
       setEvents((prev) => [...prev, event]);
     });
 

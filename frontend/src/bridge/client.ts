@@ -23,6 +23,8 @@ export class BackendClient extends EventEmitter {
 
   constructor(pythonPath: string, backendBin?: string) {
     super();
+    // The frontend treats the backend as a protocol server. That keeps the UI
+    // replaceable: Ink today, VSX/desktop later, same JSON-RPC transport.
     this.process = backendBin
       ? spawn(
           backendBin,
@@ -61,6 +63,8 @@ export class BackendClient extends EventEmitter {
 
       // Notification (backend -> frontend event)
       if (msg.method) {
+        // UI notifications are intentionally low-level transport events. The
+        // app layer folds them into higher-level turns before rendering.
         this.emit("event", { method: msg.method, params: msg.params || {} });
       }
     } catch {

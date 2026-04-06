@@ -1372,6 +1372,9 @@ fn apply_deferred_runtime_updates(
 }
 
 fn emit_view(view_type: &str, title: &str, body: &str, tone: &str) {
+    // `ui.view` is the portable command-screen primitive. The Ink TUI uses it
+    // today, but the same payload shape is what a VSX/desktop renderer should
+    // consume instead of reaching into backend internals directly.
     emit_notification(
         "ui.view",
         serde_json::json!({
@@ -1391,6 +1394,9 @@ fn emit_tabbed_view(
     tone: &str,
     footer: &str,
 ) {
+    // Tabbed views keep richer command state out of the transcript transport
+    // stream while still giving frontends enough structure to build settings,
+    // permissions, workflow, or deploy screens natively.
     let tabs = tabs
         .iter()
         .map(|(id, title, body, tab_tone)| {
