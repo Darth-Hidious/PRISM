@@ -410,6 +410,18 @@ enum KeyCommands {
     Show,
     /// Rotate the keypair — generates a new key, old data unrecoverable.
     Rotate,
+    /// Fetch another node's registered public key from the platform.
+    Fetch {
+        node_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Exchange this node's public key for another node's key through the platform.
+    Exchange {
+        node_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1508,6 +1520,39 @@ async fn main() -> Result<()> {
                         "New public key: {}",
                         prism_node::crypto::encode_public_key(&public)
                     );
+                }
+                KeyCommands::Fetch { node_id, json } => {
+                    let (api_base, auth_header) = resolve_user_auth()?;
+                    let token = auth_header.strip_prefix("Bearer ").unwrap_or(&auth_header);
+                    let platform = PlatformClient::new(&api_base).with_token(token);
+                    let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
+                    let response = registry.get_public_key(&node_id).await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&response)?);
+                    } else {
+                        println!("Node: {}", response.name);
+                        println!("Node ID: {}", response.node_id);
+                        println!("Algorithm: {}", response.algorithm);
+                        println!("Public key: {}", response.public_key);
+                    }
+                }
+                KeyCommands::Exchange { node_id, json } => {
+                    let (_secret, public) =
+                        prism_node::crypto::load_or_generate_key(&paths.state_dir)?;
+                    let our_public_key = prism_node::crypto::encode_public_key(&public);
+                    let (api_base, auth_header) = resolve_user_auth()?;
+                    let token = auth_header.strip_prefix("Bearer ").unwrap_or(&auth_header);
+                    let platform = PlatformClient::new(&api_base).with_token(token);
+                    let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
+                    let response = registry.exchange_key(&node_id, &our_public_key).await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&response)?);
+                    } else {
+                        println!("Target node ID: {}", response.target_node_id);
+                        println!("Algorithm: {}", response.algorithm);
+                        println!("Target public key: {}", response.target_public_key);
+                        println!("Public key sent: {}", response.your_public_key_received);
+                    }
                 }
             },
         },
