@@ -68,6 +68,18 @@ pub struct ContainerJobSpec {
     pub memory_limit: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ContainerDeploymentSpec {
+    pub deployment_id: Uuid,
+    pub image: String,
+    pub env_vars: BTreeMap<String, String>,
+    pub gpu_type: Option<String>,
+    pub port: u16,
+    pub command: Option<Vec<String>>,
+    /// Memory limit for the container (e.g. "8g", "16g"). If None, uses 75% of system RAM.
+    pub memory_limit: Option<String>,
+}
+
 /// Result of a completed job.
 #[derive(Debug, Clone)]
 pub struct JobOutput {
@@ -113,6 +125,10 @@ pub fn resolve_container_runtime(preferred: Option<&str>) -> Option<ContainerRun
 
 pub fn runtime_handle(job_id: Uuid) -> String {
     format!("prism-job-{}", job_id.as_simple())
+}
+
+pub fn deployment_handle(deployment_id: Uuid) -> String {
+    format!("prism-deploy-{}", deployment_id.as_simple())
 }
 
 pub fn sanitize_env_vars(env_vars: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
@@ -273,6 +289,113 @@ pub async fn execute_container_job(
 pub async fn cancel_container_job(runtime: ContainerRuntime, handle: &str) {
     Command::new(runtime.binary())
         .args(["kill", handle])
+        .output()
+        .await
+        .ok();
+    cleanup_container(runtime, handle).await;
+}
+
+pub async fn start_container_deployment(
+    runtime: ContainerRuntime,
+    spec: &ContainerDeploymentSpec,
+) -> Result<String> {
+    verify_runtime_available(runtime).await?;
+
+    let handle = deployment_handle(spec.deployment_id);
+
+    let pull = Command::new(runtime.binary())
+        .args(["pull", &spec.image])
+        .output()
+        .await
+        .with_context(|| format!("failed to pull image with {}", runtime.binary()))?;
+
+    if !pull.status.success() {
+        let err = String::from_utf8_lossy(&pull.stderr);
+        bail!("{} pull failed: {err}", runtime.binary());
+    }
+
+    let mut args = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--name".to_string(),
+        handle.clone(),
+        "--label".to_string(),
+        format!("prism.deployment_id={}", spec.deployment_id),
+        "--restart".to_string(),
+        "unless-stopped".to_string(),
+        "-p".to_string(),
+        format!("{}:{}", spec.port, spec.port),
+    ];
+
+    if spec.gpu_type.is_some() {
+        args.push("--gpus".to_string());
+        args.push("all".to_string());
+    }
+
+    let mem_limit = spec.memory_limit.clone().unwrap_or_else(|| {
+        let sys = sysinfo::System::new_all();
+        let total_gb = sys.total_memory() / 1024 / 1024 / 1024;
+        let limit_gb = (total_gb * 3 / 4).max(2);
+        format!("{limit_gb}g")
+    });
+    args.push("--memory".to_string());
+    args.push(mem_limit);
+
+    let env_vars = sanitize_env_vars(&spec.env_vars)?;
+    for (key, value) in &env_vars {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    args.push("-e".to_string());
+    args.push(format!("PORT={}", spec.port));
+
+    args.push(spec.image.clone());
+    if let Some(command) = &spec.command {
+        args.extend(command.iter().cloned());
+    }
+
+    let run = Command::new(runtime.binary())
+        .args(&args)
+        .output()
+        .await
+        .with_context(|| format!("failed to start {} container", runtime.binary()))?;
+
+    if !run.status.success() {
+        let err = String::from_utf8_lossy(&run.stderr);
+        bail!("{} run failed: {err}", runtime.binary());
+    }
+
+    Ok(handle)
+}
+
+pub async fn inspect_container_handle(
+    runtime: ContainerRuntime,
+    handle: &str,
+) -> Result<(String, i32)> {
+    let inspect = Command::new(runtime.binary())
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Status}}:{{.State.ExitCode}}",
+            handle,
+        ])
+        .output()
+        .await
+        .with_context(|| format!("{} inspect failed", runtime.binary()))?;
+
+    if !inspect.status.success() {
+        bail!("container handle {handle} not found");
+    }
+
+    let output = String::from_utf8_lossy(&inspect.stdout);
+    let output = output.trim();
+    let (status, exit_code) = output.split_once(':').unwrap_or((output, "1"));
+    Ok((status.to_string(), exit_code.parse().unwrap_or(1)))
+}
+
+pub async fn stop_container_handle(runtime: ContainerRuntime, handle: &str) {
+    Command::new(runtime.binary())
+        .args(["stop", handle])
         .output()
         .await
         .ok();
