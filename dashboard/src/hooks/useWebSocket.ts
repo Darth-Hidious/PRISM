@@ -45,7 +45,8 @@ export function useWebSocket({ token, url, onEvent }: UseWebSocketOptions) {
   const backoff = useRef(1000);
 
   const connect = useCallback(() => {
-    const wsUrl = url ?? `ws://${window.location.host}/ws?token=${encodeURIComponent(token)}`;
+    const defaultScheme = window.location.protocol === "https:" ? "wss" : "ws";
+    const wsUrl = url ?? `${defaultScheme}://${window.location.host}/ws?token=${encodeURIComponent(token)}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
@@ -62,13 +63,14 @@ export function useWebSocket({ token, url, onEvent }: UseWebSocketOptions) {
         // Invalidate relevant query caches so pages auto-refresh.
         switch (event.type) {
           case "NodeStatusUpdate":
-            queryClient.invalidateQueries({ queryKey: ["nodeInfo"] });
+            queryClient.invalidateQueries({ queryKey: ["node-info"] });
             break;
           case "MeshPeerChange":
-            queryClient.invalidateQueries({ queryKey: ["meshNodes"] });
+            queryClient.invalidateQueries({ queryKey: ["mesh-nodes"] });
+            queryClient.invalidateQueries({ queryKey: ["mesh-subs"] });
             break;
           case "AuditEntry":
-            queryClient.invalidateQueries({ queryKey: ["auditLog"] });
+            queryClient.invalidateQueries({ queryKey: ["audit"] });
             break;
         }
       } catch {

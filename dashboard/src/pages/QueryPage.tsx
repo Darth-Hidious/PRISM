@@ -2,9 +2,19 @@ import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { api } from "../api/client";
 import Card from "../components/Card";
+import SessionNotice from "../components/SessionNotice";
 
-export default function QueryPage() {
+export default function QueryPage({ authenticated }: { authenticated: boolean }) {
   const [query, setQuery] = useState("");
+
+  if (!authenticated) {
+    return (
+      <div className="space-y-6 max-w-4xl">
+        <h1 className="text-xl font-bold">Query</h1>
+        <SessionNotice detail="Knowledge queries run against protected node data and require a dashboard session." />
+      </div>
+    );
+  }
 
   const mutation = useMutation({
     mutationFn: (q: string) => api.query(q),
