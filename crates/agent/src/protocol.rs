@@ -3028,56 +3028,65 @@ fn ensure_json_flag(args: &[String]) -> Vec<String> {
 }
 
 fn emit_models_view(title: &str, models: &[Value]) {
-    let provider_counts = models.iter().fold(BTreeMap::new(), |mut acc, model| {
+    // Group models by provider
+    let mut by_provider: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    for model in models {
         let provider = value_string(model, &["provider"])
             .unwrap_or("?")
             .to_string();
-        *acc.entry(provider).or_insert(0usize) += 1;
-        acc
-    });
+        by_provider.entry(provider).or_default().push(model);
+    }
+
+    // Summary: provider counts + total
     let summary = if models.is_empty() {
         "No hosted models found.".to_string()
     } else {
-        format!(
-            "models: {}\nproviders: {}",
-            models.len(),
-            provider_counts
-                .iter()
-                .map(|(provider, count)| format!("{provider} ({count})"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        let mut lines = vec![format!("{} models across {} providers\n", models.len(), by_provider.len())];
+        lines.push("Use /model <id> to switch.\n".to_string());
+        for (provider, provider_models) in &by_provider {
+            lines.push(format!("  {provider}: {} models", provider_models.len()));
+        }
+        lines.join("\n")
     };
-    let list_body = if models.is_empty() {
-        "No models found.".to_string()
-    } else {
-        models
+
+    // Build one tab per provider (compact, no raw JSON dump)
+    let mut tabs: Vec<(String, String, String, &str)> = Vec::new();
+    tabs.push(("summary".to_string(), "Summary".to_string(), summary, "info"));
+
+    for (provider, provider_models) in &by_provider {
+        let body = provider_models
             .iter()
             .map(|model| {
                 let model_id = value_string(model, &["model_id", "id"]).unwrap_or("?");
                 let display_name =
                     value_string(model, &["display_name", "name"]).unwrap_or(model_id);
-                let provider = value_string(model, &["provider"]).unwrap_or("?");
-                let context_window = model
+                let ctx = model
                     .get("context_window")
-                    .and_then(|value| value.as_u64())
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                format!("{provider}  {display_name}\n  {model_id}  ctx={context_window}")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| format!("ctx={v}"))
+                    .unwrap_or_default();
+                let price_in = model
+                    .get("input_price_per_million")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| format!("${v:.2}/M"))
+                    .unwrap_or_default();
+                format!("  {model_id}\n    {display_name}  {ctx}  {price_in}")
             })
             .collect::<Vec<_>>()
-            .join("\n\n")
-    };
-    let raw = json_pretty(&Value::Array(models.to_vec()));
+            .join("\n");
+        let tab_title = format!("{} ({})", provider, provider_models.len());
+        tabs.push((provider.clone(), tab_title, body, "info"));
+    }
+
+    let tab_refs: Vec<(&str, &str, &str, &str)> = tabs
+        .iter()
+        .map(|(id, title, body, tone)| (id.as_str(), title.as_str(), body.as_str(), *tone))
+        .collect();
     emit_tabbed_view(
         "models",
         title,
-        &[
-            ("summary", "Summary", &summary, "info"),
-            ("list", "List", &list_body, "info"),
-            ("raw", "Raw", &raw, "accent"),
-        ],
-        if models.is_empty() { "summary" } else { "list" },
+        &tab_refs,
+        "summary",
         "info",
         "hosted model catalog",
     );
