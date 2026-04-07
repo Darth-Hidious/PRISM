@@ -93,15 +93,26 @@ impl LlmClient {
         self.chat("You are a helpful assistant.", prompt).await
     }
 
+    /// Whether this client targets the MARC27 platform LLM proxy
+    /// (which uses `/stream` + SSE instead of OpenAI `/v1/chat/completions`).
+    fn is_marc27(&self) -> bool {
+        self.config.base_url.contains("marc27.com")
+            || self.config.base_url.contains("/llm")
+    }
+
     /// Generate text with a system + user message.
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
+        let messages = serde_json::json!([
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]);
+        if self.is_marc27() {
+            return self.chat_marc27_simple(&messages).await;
+        }
         let url = format!("{}/v1/chat/completions", self.config.base_url);
         let body = serde_json::json!({
             "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user}
-            ],
+            "messages": messages,
             "temperature": 0.1,
             "max_tokens": 4096,
         });
@@ -113,6 +124,36 @@ impl LlmClient {
             .to_string())
     }
 
+    /// MARC27 platform LLM: POST /stream with SSE response.
+    async fn chat_marc27_simple(&self, messages: &serde_json::Value) -> Result<String> {
+        let url = format!("{}/stream", self.config.base_url);
+        let body = serde_json::json!({
+            "model": self.config.model,
+            "messages": messages,
+        });
+        let resp = self.post(&url, &body).await?;
+        let text = resp.text().await.context("failed to read MARC27 stream")?;
+        let mut result = String::new();
+        for line in text.lines() {
+            let line = line.strip_prefix("data: ").unwrap_or(line).trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
+                    result.push_str(delta);
+                }
+                if chunk.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                    break;
+                }
+            }
+        }
+        if result.is_empty() {
+            bail!("MARC27 LLM returned empty response");
+        }
+        Ok(result)
+    }
+
     /// Chat with tool-calling support.
     /// Sends full message history + tool definitions, returns response
     /// which may contain tool_calls.
@@ -121,6 +162,20 @@ impl LlmClient {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<ChatResponse> {
+        // MARC27 platform proxy: use /stream, collect text (no tool-calling support yet)
+        if self.is_marc27() {
+            let msgs = serde_json::to_value(messages)?;
+            let text = self.chat_marc27_simple(&msgs).await?;
+            return Ok(ChatResponse {
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                usage: None,
+            });
+        }
         let url = format!("{}/v1/chat/completions", self.config.base_url);
 
         let mut body = serde_json::json!({
@@ -219,6 +274,51 @@ impl LlmClient {
         tools: &[ToolDefinition],
         mut on_delta: impl FnMut(&str),
     ) -> Result<ChatResponse> {
+        // MARC27 platform: use /stream with SSE
+        if self.is_marc27() {
+            let url = format!("{}/stream", self.config.base_url);
+            let body = serde_json::json!({
+                "model": self.config.model,
+                "messages": messages,
+            });
+            let resp = self.post(&url, &body).await?;
+            let text = resp.text().await.context("failed to read MARC27 stream")?;
+            let mut full_text = String::new();
+            let mut usage_info = None;
+            for line in text.lines() {
+                let line = line.strip_prefix("data: ").unwrap_or(line).trim();
+                if line.is_empty() { continue; }
+                if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
+                        if !delta.is_empty() {
+                            on_delta(delta);
+                            full_text.push_str(delta);
+                        }
+                    }
+                    if let Some(u) = chunk.get("usage") {
+                        if let (Some(pt), Some(ct)) = (
+                            u.get("prompt_tokens").and_then(|v| v.as_u64()),
+                            u.get("completion_tokens").and_then(|v| v.as_u64()),
+                        ) {
+                            usage_info = Some(UsageInfo {
+                                prompt_tokens: pt,
+                                completion_tokens: ct,
+                                total_tokens: pt + ct,
+                            });
+                        }
+                    }
+                }
+            }
+            return Ok(ChatResponse {
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: if full_text.is_empty() { None } else { Some(full_text) },
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                usage: usage_info,
+            });
+        }
         let url = format!("{}/v1/chat/completions", self.config.base_url);
 
         let mut body = serde_json::json!({
