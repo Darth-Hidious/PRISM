@@ -14,11 +14,15 @@ mesh. Everything happens locally &mdash; your data never leaves your machine
 unless you tell it to.
 
 ```
-prism
+prism query --platform "nickel superalloys"
+prism research "refractory high-entropy alloys" --depth 1
+prism ingest ./data.csv
+prism models list
 ```
 
-Run it bare to launch the interactive agent (Ink TUI).  
-Run it with a subcommand for everything else.
+> **Note:** The interactive TUI is currently out of commission and lives on the
+> [`tui-frontend`](../../tree/tui-frontend) branch. We're looking for contributors
+> to help rebuild it. The CLI and all backend functionality work fully.
 
 ## Install
 
@@ -160,6 +164,7 @@ prism tools                          # List all available Python tools
 prism agent                          # Print agent-friendly command catalog
 prism report "bug description"       # File a bug report with system context
 prism serve                          # Start as MCP server
+prism backend                        # Start JSON-RPC backend (for IDE/TUI integration)
 ```
 
 ## Architecture
@@ -238,6 +243,16 @@ CLI flags always override config values. Use `prism configure` to set defaults.
 cargo test --workspace           # Rust tests
 cargo clippy --workspace -- -D warnings
 ```
+
+## Contributing
+
+We're actively looking for help with:
+
+- **TUI Frontend** &mdash; The interactive terminal UI (Ink/React) needs work. The backend JSON-RPC protocol is stable and documented in [`docs/FRONTEND_PROTOCOL.md`](docs/FRONTEND_PROTOCOL.md). Code is on the [`tui-frontend`](../../tree/tui-frontend) branch.
+- **VSX Extension** &mdash; A VS Code / VSCodium extension that connects to `prism backend` via JSON-RPC.
+- **Materials science tools** &mdash; New Python tools for specific simulation codes, databases, or analysis workflows.
+
+See [`docs/FRONTEND_PROTOCOL.md`](docs/FRONTEND_PROTOCOL.md) for the full backend wire protocol reference.
 
 ## License
 
