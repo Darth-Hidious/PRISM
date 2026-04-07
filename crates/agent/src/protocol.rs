@@ -3041,7 +3041,11 @@ fn emit_models_view(title: &str, models: &[Value]) {
     let summary = if models.is_empty() {
         "No hosted models found.".to_string()
     } else {
-        let mut lines = vec![format!("{} models across {} providers\n", models.len(), by_provider.len())];
+        let mut lines = vec![format!(
+            "{} models across {} providers\n",
+            models.len(),
+            by_provider.len()
+        )];
         lines.push("Use /model <id> to switch.\n".to_string());
         for (provider, provider_models) in &by_provider {
             lines.push(format!("  {provider}: {} models", provider_models.len()));
@@ -3051,7 +3055,12 @@ fn emit_models_view(title: &str, models: &[Value]) {
 
     // Build one tab per provider (compact, no raw JSON dump)
     let mut tabs: Vec<(String, String, String, &str)> = Vec::new();
-    tabs.push(("summary".to_string(), "Summary".to_string(), summary, "info"));
+    tabs.push((
+        "summary".to_string(),
+        "Summary".to_string(),
+        summary,
+        "info",
+    ));
 
     for (provider, provider_models) in &by_provider {
         let body = provider_models
