@@ -3481,7 +3481,12 @@ async fn handle_models_slash_command(
     let action = args.get(1).map(String::as_str).unwrap_or("list");
     match action {
         "list" | "search" | "info" => {
-            let json_args = ensure_json_flag(args);
+            // Ensure the subcommand is present: /models → ["models","list","--json"]
+            let mut full_args = args.to_vec();
+            if full_args.len() == 1 {
+                full_args.push(action.to_string());
+            }
+            let json_args = ensure_json_flag(&full_args);
             let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
             let models = value_array(&value, &["models", "items", "data"])
                 .cloned()
@@ -3513,7 +3518,11 @@ async fn handle_deploy_slash_command(
     let action = args.get(1).map(String::as_str).unwrap_or("list");
     match action {
         "list" | "status" | "health" => {
-            let json_args = ensure_json_flag(args);
+            let mut full_args = args.to_vec();
+            if full_args.len() == 1 {
+                full_args.push(action.to_string());
+            }
+            let json_args = ensure_json_flag(&full_args);
             let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
             let title = match action {
                 "status" => "Deployment Status",
@@ -3578,7 +3587,11 @@ async fn handle_discourse_slash_command(
     let action = args.get(1).map(String::as_str).unwrap_or("list");
     match action {
         "list" | "show" | "run" | "status" | "turns" => {
-            let json_args = ensure_json_flag(args);
+            let mut full_args = args.to_vec();
+            if full_args.len() == 1 {
+                full_args.push(action.to_string());
+            }
+            let json_args = ensure_json_flag(&full_args);
             let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
             let title = match action {
                 "show" => "Discourse Spec",
