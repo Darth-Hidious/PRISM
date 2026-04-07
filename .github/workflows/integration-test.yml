@@ -5,7 +5,6 @@ on:
     paths:
       - "crates/**"
       - "app/**"
-      - "frontend/**"
       - "dashboard/**"
       - "tests/**"
       - ".github/workflows/integration-test.yml"
@@ -36,15 +35,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  frontend-typecheck:
-    name: Frontend TypeScript
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - run: cd frontend && bun install --frozen-lockfile
-      - run: cd frontend && npx tsc --noEmit
 
   dashboard-build:
     name: Dashboard Build

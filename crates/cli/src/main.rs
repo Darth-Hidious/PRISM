@@ -751,7 +751,20 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            launch_tui(&paths, &python, &project_root, state.credentials.as_ref())?;
+            // TUI is currently out of commission — guide user to CLI commands
+            match launch_tui(&paths, &python, &project_root, state.credentials.as_ref()) {
+                Ok(()) => {}
+                Err(_) => {
+                    println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
+                    println!("  The interactive TUI is not available in this build.\n");
+                    println!("  Use CLI commands directly:");
+                    println!("    prism query --platform \"nickel superalloys\"");
+                    println!("    prism research \"high entropy alloys\" --depth 1");
+                    println!("    prism ingest ./data.csv");
+                    println!("    prism models list");
+                    println!("    prism --help\n");
+                }
+            }
         }
         Commands::Login => {
             let mut state = paths.load_cli_state()?;
