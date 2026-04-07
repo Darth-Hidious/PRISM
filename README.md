@@ -54,7 +54,7 @@ prism node up --external-neo4j bolt://db:7687   # Use existing infrastructure
 prism node down                      # Graceful shutdown
 prism node status                    # Health check all services
 prism node logs neo4j                # Stream container logs
-prism node probe <url>               # Probe a remote node
+prism node probe                     # Probe local machine capabilities
 ```
 
 ### Ingest data
