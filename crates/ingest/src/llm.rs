@@ -96,8 +96,7 @@ impl LlmClient {
     /// Whether this client targets the MARC27 platform LLM proxy
     /// (which uses `/stream` + SSE instead of OpenAI `/v1/chat/completions`).
     fn is_marc27(&self) -> bool {
-        self.config.base_url.contains("marc27.com")
-            || self.config.base_url.contains("/llm")
+        self.config.base_url.contains("marc27.com") || self.config.base_url.contains("/llm")
     }
 
     /// Generate text with a system + user message.
@@ -287,7 +286,9 @@ impl LlmClient {
             let mut usage_info = None;
             for line in text.lines() {
                 let line = line.strip_prefix("data: ").unwrap_or(line).trim();
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
                 if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(line) {
                     if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
                         if !delta.is_empty() {
@@ -312,7 +313,11 @@ impl LlmClient {
             return Ok(ChatResponse {
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content: if full_text.is_empty() { None } else { Some(full_text) },
+                    content: if full_text.is_empty() {
+                        None
+                    } else {
+                        Some(full_text)
+                    },
                     tool_calls: None,
                     tool_call_id: None,
                 },
