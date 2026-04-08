@@ -170,34 +170,31 @@ pub fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn info_item<'a>(key: &'a str, value: &'a str) -> ListItem<'a> {
+fn info_item(key: &str, value: &str) -> ListItem<'static> {
     ListItem::new(Line::from(vec![
         Span::styled(
             format!(" {key}: "),
             Style::default().fg(Color::Rgb(100, 100, 100)),
         ),
-        Span::styled(value, Style::default().fg(Color::White)),
+        Span::styled(value.to_string(), Style::default().fg(Color::White)),
     ]))
 }
 
-fn cmd_item<'a>(cmd: &'a str, desc: &'a str) -> ListItem<'a> {
-    ListItem::new(Line::from(vec![
-        Span::styled(
-            format!(" {cmd}"),
-            Style::default().fg(Color::Cyan),
-        ),
-        if desc.is_empty() {
-            Span::raw("")
-        } else {
-            Span::styled(
-                format!(" — {desc}"),
-                Style::default().fg(Color::Rgb(80, 80, 80)),
-            )
-        },
-    ]))
+fn cmd_item(cmd: &str, desc: &str) -> ListItem<'static> {
+    let mut spans = vec![Span::styled(
+        format!(" {cmd}"),
+        Style::default().fg(Color::Cyan),
+    )];
+    if !desc.is_empty() {
+        spans.push(Span::styled(
+            format!(" \u{2014} {desc}"),
+            Style::default().fg(Color::Rgb(80, 80, 80)),
+        ));
+    }
+    ListItem::new(Line::from(spans))
 }
 
-fn header(text: &str) -> ListItem<'_> {
+fn header(text: &str) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(
         format!(" {text}"),
         Style::default()
@@ -206,6 +203,6 @@ fn header(text: &str) -> ListItem<'_> {
     )))
 }
 
-fn spacer<'a>() -> ListItem<'a> {
+fn spacer() -> ListItem<'static> {
     ListItem::new(Line::from(""))
 }
