@@ -901,6 +901,19 @@ async fn main() -> Result<()> {
             }
             tool_server_env.insert("MARC27_API_URL".to_string(), endpoints.api_base.clone());
 
+            // Pass through any API keys the user has set
+            for key in &[
+                "MP_API_KEY",
+                "LENS_API_TOKEN",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "FIRECRAWL_API_KEY",
+            ] {
+                if let Ok(val) = std::env::var(key) {
+                    tool_server_env.insert(key.to_string(), val);
+                }
+            }
+
             let tool_server = prism_python_bridge::ToolServer {
                 python_bin: backend_py,
                 project_root: backend_pr,
