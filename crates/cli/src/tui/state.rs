@@ -13,6 +13,14 @@ pub enum ChatElement {
     Cost(UiCost),
 }
 
+/// Which UI zone has keyboard focus
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusZone {
+    Input,   // Text input bar (default)
+    Chat,    // Chat canvas (scrollable)
+    Sidebar, // Sidebar panel (scrollable)
+}
+
 /// The main content area workspace
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Workspace {
@@ -138,12 +146,18 @@ pub struct App {
 
     // Input
     pub input_buffer: String,
+    pub input_cursor: usize, // byte position in input_buffer
     pub input_history: Vec<String>,
     pub input_history_idx: Option<usize>,
 
     // Command palette (autocomplete)
     pub palette_visible: bool,
     pub palette_selected: usize,
+
+    // Focus & navigation
+    pub focus: FocusZone,
+    pub chat_scroll: u16,
+    pub sidebar_scroll: u16,
 
     // Background loading flags
     pub loading_models: bool,
@@ -186,10 +200,14 @@ impl App {
             view_scroll: 0,
             active_prompt: None,
             input_buffer: String::new(),
+            input_cursor: 0,
             input_history: Vec::new(),
             input_history_idx: None,
             palette_visible: false,
             palette_selected: 0,
+            focus: FocusZone::Input,
+            chat_scroll: 0,
+            sidebar_scroll: 0,
             loading_models: false,
             model_picker_visible: false,
             model_picker_search: String::new(),

@@ -8,22 +8,24 @@ use ratatui::Frame;
 use crate::tui::state::{App, Workspace};
 
 pub fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
+    // All sidebar drawers now use the focused variant
+    let focused = app.focus == crate::tui::state::FocusZone::Sidebar;
     match app.workspace {
-        Workspace::Chat => draw_explorer(f, app, area),
-        Workspace::Models => draw_models(f, app, area),
-        Workspace::Mesh => draw_mesh(f, app, area),
-        Workspace::Compute => draw_compute(f, app, area),
-        Workspace::Data => draw_data(f, app, area),
-        Workspace::Marketplace => draw_marketplace(f, app, area),
-        Workspace::Workflows => draw_workflows(f, app, area),
-        Workspace::Settings => draw_settings(f, app, area),
-        _ => draw_explorer(f, app, area),
+        Workspace::Chat => draw_explorer(f, app, area, focused),
+        Workspace::Models => draw_models(f, app, area, focused),
+        Workspace::Mesh => draw_mesh(f, app, area, focused),
+        Workspace::Compute => draw_compute(f, app, area, focused),
+        Workspace::Data => draw_data(f, app, area, focused),
+        Workspace::Marketplace => draw_marketplace(f, app, area, focused),
+        Workspace::Workflows => draw_workflows(f, app, area, focused),
+        Workspace::Settings => draw_settings(f, app, area, focused),
+        _ => draw_explorer(f, app, area, focused),
     }
 }
 
 // ── Explorer (Chat tab) ─────────────────────────────────────────────
 
-fn draw_explorer(f: &mut Frame, _app: &App, area: Rect) {
+fn draw_explorer(f: &mut Frame, _app: &App, area: Rect, focused: bool) {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
@@ -60,12 +62,12 @@ fn draw_explorer(f: &mut Frame, _app: &App, area: Rect) {
         }
     }
 
-    render_panel(f, " Explorer ", items, area);
+    render_panel_focused(f, " Explorer ", items, area, focused);
 }
 
 // ── Models ──────────────────────────────────────────────────────────
 
-fn draw_models(f: &mut Frame, app: &App, area: Rect) {
+fn draw_models(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let mut items = vec![
         section("Active Model"),
         item_highlight(
@@ -100,12 +102,12 @@ fn draw_models(f: &mut Frame, app: &App, area: Rect) {
     items.push(item("  Google, DeepSeek"));
     items.push(action("/config", "Manage keys"));
 
-    render_panel(f, " Models ", items, area);
+    render_panel_focused(f, " Models ", items, area, focused);
 }
 
 // ── Mesh ────────────────────────────────────────────────────────────
 
-fn draw_mesh(f: &mut Frame, app: &App, area: Rect) {
+fn draw_mesh(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let mut items = vec![section("Local Node")];
 
     let node_online = app.node_count.is_some();
@@ -156,12 +158,12 @@ fn draw_mesh(f: &mut Frame, app: &App, area: Rect) {
     items.push(action("/node down", "Stop node"));
     items.push(action("/node status", "Node info"));
 
-    render_panel(f, " Mesh & Nodes ", items, area);
+    render_panel_focused(f, " Mesh & Nodes ", items, area, focused);
 }
 
 // ── Compute ─────────────────────────────────────────────────────────
 
-fn draw_compute(f: &mut Frame, app: &App, area: Rect) {
+fn draw_compute(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let mut items = vec![
         section("GPU Resources"),
         item(&format!("{} types available", app.gpu_count.unwrap_or(0))),
@@ -184,12 +186,12 @@ fn draw_compute(f: &mut Frame, app: &App, area: Rect) {
         action("/run --slurm", "SLURM cluster"),
     ];
 
-    render_panel(f, " Compute ", items, area);
+    render_panel_focused(f, " Compute ", items, area, focused);
 }
 
 // ── Data ────────────────────────────────────────────────────────────
 
-fn draw_data(f: &mut Frame, app: &App, area: Rect) {
+fn draw_data(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let mut items = vec![
         section("Knowledge Graph"),
         item(&format!(
@@ -211,12 +213,12 @@ fn draw_data(f: &mut Frame, app: &App, area: Rect) {
         action("/research", "Research loop"),
     ];
 
-    render_panel(f, " Data ", items, area);
+    render_panel_focused(f, " Data ", items, area, focused);
 }
 
 // ── Marketplace ─────────────────────────────────────────────────────
 
-fn draw_marketplace(f: &mut Frame, app: &App, area: Rect) {
+fn draw_marketplace(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let mut items = vec![
         section(&format!(
             "Resources ({})",
@@ -237,12 +239,12 @@ fn draw_marketplace(f: &mut Frame, app: &App, area: Rect) {
         item("on marc27.com"),
     ];
 
-    render_panel(f, " Marketplace ", items, area);
+    render_panel_focused(f, " Marketplace ", items, area, focused);
 }
 
 // ── Workflows ───────────────────────────────────────────────────────
 
-fn draw_workflows(f: &mut Frame, app: &App, area: Rect) {
+fn draw_workflows(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let mut items = vec![section("Available")];
 
     if app.workflow_names.is_empty() {
@@ -271,12 +273,12 @@ fn draw_workflows(f: &mut Frame, app: &App, area: Rect) {
     items.push(item("Drop YAML in:"));
     items.push(item("  ~/.prism/workflows/"));
 
-    render_panel(f, " Workflows ", items, area);
+    render_panel_focused(f, " Workflows ", items, area, focused);
 }
 
 // ── Settings ────────────────────────────────────────────────────────
 
-fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
+fn draw_settings(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let model = app
         .status
         .as_ref()
@@ -316,17 +318,46 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         item("  anthropic_key sk-..."),
     ];
 
-    render_panel(f, " Settings ", items, area);
+    render_panel_focused(f, " Settings ", items, area, focused);
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn render_panel(f: &mut Frame, title: &str, items: Vec<ListItem<'static>>, area: Rect) {
+    // We can't access App here directly, so check border width heuristic
+    // The caller should pass focus state — for now, always use standard border
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
         .title(Span::styled(
             title,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let list = List::new(items).block(block);
+    f.render_widget(list, area);
+}
+
+/// Same as render_panel but with focus-aware border
+pub fn render_panel_focused(
+    f: &mut Frame,
+    title: &str,
+    items: Vec<ListItem<'static>>,
+    area: Rect,
+    focused: bool,
+) {
+    let border_color = if focused {
+        Color::Cyan
+    } else {
+        Color::Rgb(60, 60, 60)
+    };
+    let title_suffix = if focused { " (↑↓ scroll)" } else { "" };
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            format!("{title}{title_suffix}"),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
