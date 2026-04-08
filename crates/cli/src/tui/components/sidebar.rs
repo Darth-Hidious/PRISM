@@ -323,23 +323,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect, focused: bool) {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn render_panel(f: &mut Frame, title: &str, items: Vec<ListItem<'static>>, area: Rect) {
-    // We can't access App here directly, so check border width heuristic
-    // The caller should pass focus state — for now, always use standard border
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
-}
-
-/// Same as render_panel but with focus-aware border
+/// Render sidebar panel with focus-aware border
 pub fn render_panel_focused(
     f: &mut Frame,
     title: &str,
