@@ -10,42 +10,76 @@ use crate::tui::state::{App, ChatElement};
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
+    let mut last_was_user = false;
+
     for element in &app.chat_history {
         match element {
             ChatElement::UserMessage(msg) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "\u{25cf} you: ",
-                        Style::default().fg(Color::Rgb(0, 200, 255)),
-                    ),
-                    Span::styled(msg.clone(), Style::default().fg(Color::White)),
-                ]));
+                // Separator before user message (if not first)
+                if !lines.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+                        Style::default().fg(Color::Rgb(35, 35, 35)),
+                    )));
+                }
+                lines.push(Line::from(vec![Span::styled(
+                    " \u{25cf} you ",
+                    Style::default()
+                        .fg(Color::Rgb(0, 200, 255))
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )]));
+                lines.push(Line::from(Span::styled(
+                    format!(" {msg}"),
+                    Style::default().fg(Color::White),
+                )));
                 lines.push(Line::from(""));
+                last_was_user = true;
             }
             ChatElement::Text(t) => {
-                // Parse markdown → styled spans
-                lines.extend(markdown::render_markdown(t));
+                // Agent label before first text after user message
+                if last_was_user {
+                    lines.push(Line::from(vec![Span::styled(
+                        " \u{25cf} prism ",
+                        Style::default()
+                            .fg(Color::Rgb(0, 255, 100))
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )]));
+                    last_was_user = false;
+                }
+                // Parse markdown → styled spans, indent by 1 space
+                for line in markdown::render_markdown(t) {
+                    let mut indented = vec![Span::raw(" ".to_string())];
+                    indented.extend(line.spans);
+                    lines.push(Line::from(indented));
+                }
                 lines.push(Line::from(""));
             }
             ChatElement::Cost(c) => {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("  {}in/{}out ", c.input_tokens, c.output_tokens),
-                        Style::default().fg(Color::Rgb(60, 60, 60)),
+                        format!("  \u{25cb} {}in/{}out ", c.input_tokens, c.output_tokens),
+                        Style::default().fg(Color::Rgb(50, 50, 50)),
                     ),
                     Span::styled(
                         format!("${:.4}", c.turn_cost),
-                        Style::default().fg(Color::Rgb(80, 80, 80)),
+                        Style::default().fg(Color::Rgb(70, 70, 70)),
                     ),
                 ]));
+                last_was_user = false;
             }
             ChatElement::ToolStart(ts) => {
+                if last_was_user {
+                    lines.push(Line::from(vec![Span::styled(
+                        " \u{25cf} prism ",
+                        Style::default()
+                            .fg(Color::Rgb(0, 255, 100))
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    )]));
+                    last_was_user = false;
+                }
                 lines.push(Line::from(vec![
-                    Span::styled("\u{26a1} ", Style::default().fg(Color::Yellow)),
-                    Span::styled(
-                        format!("Running {}", ts.tool_name),
-                        Style::default().fg(Color::Cyan),
-                    ),
+                    Span::styled("  \u{26a1} ", Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("{}", ts.verb), Style::default().fg(Color::Cyan)),
                     Span::styled(
                         if let Some(ref preview) = ts.preview {
                             format!(" ({preview})")
