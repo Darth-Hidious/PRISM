@@ -286,7 +286,8 @@ pub async fn execute_workflow_with_policy(
 ) -> Result<WorkflowRunResult> {
     let principal = principal.unwrap_or("agent");
 
-    // Check workflow-level policy
+    // Check workflow-level policy and collect obligations
+    let mut workflow_obligations: Vec<String> = Vec::new();
     if let Some(engine) = policy.as_deref_mut() {
         let input = prism_policy::PolicyInput {
             action: "workflow.execute".into(),
@@ -301,12 +302,60 @@ pub async fn execute_workflow_with_policy(
                 "step_count": spec.steps.len(),
             }),
         };
-        engine
+        let decision = engine
             .require(&input)
             .with_context(|| format!("policy denied workflow '{}'", spec.name))?;
+        workflow_obligations = decision.obligations;
     }
 
     let mut context = build_initial_context(spec, values)?;
+
+    // ── Run on_start hooks ─────────────────────────────────────────
+    let hooks = spec
+        .raw
+        .as_object()
+        .and_then(|o| o.get("hooks"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let client = reqwest::Client::new();
+    if let Some(on_start_steps) = hooks
+        .get("on_start")
+        .and_then(|v| serde_json::from_value::<Vec<WorkflowStep>>(v.clone()).ok())
+    {
+        for hook_step in &on_start_steps {
+            let _ = match hook_step.action.as_str() {
+                "set" => run_set_step(hook_step, &mut context, !execute),
+                "message" => run_message_step(hook_step, &mut context, !execute),
+                "http" => run_http_step(hook_step, &mut context, !execute, &client).await,
+                _ => Ok(WorkflowStepResult {
+                    id: hook_step.id.clone(),
+                    action: hook_step.action.clone(),
+                    status: "skipped".into(),
+                    summary: "unsupported hook action".into(),
+                    data: serde_json::Value::Null,
+                }),
+            };
+        }
+    }
+
+    // ── Fulfill audit_log obligation ───────────────────────────────
+    if workflow_obligations.contains(&"audit_log".to_string()) {
+        tracing::info!(
+            workflow = %spec.name,
+            principal,
+            execute,
+            "AUDIT: workflow execution started"
+        );
+        context.insert(
+            "_audit".to_string(),
+            serde_json::json!({
+                "workflow": spec.name,
+                "principal": principal,
+                "started_at": chrono::Utc::now().to_rfc3339(),
+                "obligations": workflow_obligations,
+            }),
+        );
+    }
     let mut result = WorkflowRunResult {
         workflow: spec.name.clone(),
         mode: if execute { "execute" } else { "dry_run" }.to_string(),
@@ -314,7 +363,6 @@ pub async fn execute_workflow_with_policy(
         steps: Vec::new(),
     };
 
-    let client = reqwest::Client::new();
     for step in &spec.steps {
         // Per-step policy check for tool calls
         if step.action == "tool" {
@@ -424,6 +472,49 @@ pub async fn execute_workflow_with_policy(
             return Err(e);
         }
     }
+
+    // ── Run on_complete hooks ──────────────────────────────────────
+    if let Some(on_complete_steps) = hooks
+        .get("on_complete")
+        .and_then(|v| serde_json::from_value::<Vec<WorkflowStep>>(v.clone()).ok())
+    {
+        for hook_step in &on_complete_steps {
+            let _ = match hook_step.action.as_str() {
+                "set" => run_set_step(hook_step, &mut context, !execute),
+                "message" => run_message_step(hook_step, &mut context, !execute),
+                "http" => run_http_step(hook_step, &mut context, !execute, &client).await,
+                _ => Ok(WorkflowStepResult {
+                    id: hook_step.id.clone(),
+                    action: hook_step.action.clone(),
+                    status: "skipped".into(),
+                    summary: "unsupported hook action".into(),
+                    data: serde_json::Value::Null,
+                }),
+            };
+        }
+    }
+
+    // ── Fulfill notify_admin obligation ────────────────────────────
+    if workflow_obligations.contains(&"notify_admin".to_string()) {
+        tracing::warn!(
+            workflow = %spec.name,
+            principal,
+            steps = result.steps.len(),
+            "NOTIFY_ADMIN: agent executed workflow — review recommended"
+        );
+    }
+
+    // ── Fulfill audit_log completion ───────────────────────────────
+    if workflow_obligations.contains(&"audit_log".to_string()) {
+        tracing::info!(
+            workflow = %spec.name,
+            principal,
+            steps = result.steps.len(),
+            mode = %result.mode,
+            "AUDIT: workflow execution completed"
+        );
+    }
+
     result.context = context;
     Ok(result)
 }
