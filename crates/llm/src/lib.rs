@@ -441,7 +441,9 @@ impl LlmClient {
                                 full_text.push_str(delta);
 
                                 if !hit_tool_call {
-                                    if full_text.contains("```tool_call") {
+                                    if full_text.contains("```tool_call")
+                                        || full_text.contains("<tool_call>")
+                                    {
                                         hit_tool_call = true;
                                     } else {
                                         on_delta(delta);
@@ -855,38 +857,90 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
 /// Parse ```tool_call blocks from response text.
 fn parse_text_tool_calls(text: &str) -> Vec<ToolCallResponse> {
     let mut calls = Vec::new();
-    let mut rest = text;
     let mut call_idx = 0;
 
-    while let Some(start) = rest.find("```tool_call") {
-        let after = &rest[start + 12..];
-        // Skip to next line
-        let after = after.trim_start_matches(|c: char| c != '\n');
-        let after = after.strip_prefix('\n').unwrap_or(after);
+    // Format 1: ```tool_call JSON blocks (Claude, Gemini)
+    {
+        let mut rest = text;
+        while let Some(start) = rest.find("```tool_call") {
+            let after = &rest[start + 12..];
+            let after = after.trim_start_matches(|c: char| c != '\n');
+            let after = after.strip_prefix('\n').unwrap_or(after);
 
-        if let Some(end) = after.find("```") {
-            let json_str = after[..end].trim();
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                let name = parsed
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let arguments = parsed
-                    .get("arguments")
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| "{}".to_string());
+            if let Some(end) = after.find("```") {
+                let json_str = after[..end].trim();
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    let name = parsed
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = parsed
+                        .get("arguments")
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "{}".to_string());
 
-                calls.push(ToolCallResponse {
-                    id: format!("tc_{call_idx}"),
-                    call_type: "function".to_string(),
-                    function: FunctionCall { name, arguments },
-                });
-                call_idx += 1;
+                    calls.push(ToolCallResponse {
+                        id: format!("tc_{call_idx}"),
+                        call_type: "function".to_string(),
+                        function: FunctionCall { name, arguments },
+                    });
+                    call_idx += 1;
+                }
+                rest = &after[end + 3..];
+            } else {
+                break;
             }
-            rest = &after[end + 3..];
-        } else {
-            break;
+        }
+    }
+
+    // Format 2: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+    // Used by Nvidia, Llama, and some open models
+    if calls.is_empty() {
+        let mut rest = text;
+        while let Some(start) = rest.find("<tool_call>") {
+            let after = &rest[start + 11..];
+            if let Some(end) = after.find("</tool_call>") {
+                let block = &after[..end];
+                // Parse <function=NAME>
+                if let Some(fn_start) = block.find("<function=") {
+                    let fn_after = &block[fn_start + 10..];
+                    let fn_name_end = fn_after.find('>').unwrap_or(fn_after.len());
+                    let fn_name = fn_after[..fn_name_end].to_string();
+
+                    // Parse all <parameter=KEY>VALUE</parameter>
+                    let mut args = serde_json::Map::new();
+                    let mut param_rest = fn_after;
+                    while let Some(p_start) = param_rest.find("<parameter=") {
+                        let p_after = &param_rest[p_start + 11..];
+                        if let Some(p_name_end) = p_after.find('>') {
+                            let p_name = p_after[..p_name_end].to_string();
+                            let p_value_start = &p_after[p_name_end + 1..];
+                            let p_value_end = p_value_start
+                                .find("</parameter>")
+                                .unwrap_or(p_value_start.len());
+                            let p_value = p_value_start[..p_value_end].trim().to_string();
+                            args.insert(p_name, serde_json::Value::String(p_value));
+                            param_rest = &p_value_start[p_value_end..];
+                        } else {
+                            break;
+                        }
+                    }
+
+                    calls.push(ToolCallResponse {
+                        id: format!("tc_{call_idx}"),
+                        call_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: fn_name,
+                            arguments: serde_json::Value::Object(args).to_string(),
+                        },
+                    });
+                    call_idx += 1;
+                }
+                rest = &after[end + 12..];
+            } else {
+                break;
+            }
         }
     }
 
@@ -911,7 +965,16 @@ fn dedup_tool_calls(calls: Vec<ToolCallResponse>) -> Vec<ToolCallResponse> {
 /// We only keep the preamble — tool results come from actual execution.
 fn strip_tool_call_blocks(text: &str) -> String {
     // Truncate at first tool_call — everything after is hallucination
-    if let Some(start) = text.find("```tool_call") {
+    // Handle both ```tool_call (Claude/Gemini) and <tool_call> (Nvidia/Llama)
+    let fenced = text.find("```tool_call");
+    let xml = text.find("<tool_call>");
+    let first = match (fenced, xml) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    if let Some(start) = first {
         return text[..start].trim().to_string();
     }
 

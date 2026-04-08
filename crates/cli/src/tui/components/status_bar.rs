@@ -21,6 +21,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     let msg_count = app.chat_history.len();
 
+    let sep = Span::styled(" \u{2502} ", Style::default().fg(Color::Rgb(60, 60, 60)));
+
     let line = Line::from(vec![
         // Mode badge
         Span::styled(
@@ -30,28 +32,31 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" \u{2502} ", Style::default().fg(Color::Rgb(40, 40, 40))),
+        sep.clone(),
         // Model
-        Span::styled(model, Style::default().fg(Color::Rgb(150, 150, 150))),
-        Span::styled(" \u{2502} ", Style::default().fg(Color::Rgb(40, 40, 40))),
+        Span::styled(model, Style::default().fg(Color::Rgb(200, 200, 200))),
+        sep.clone(),
         // Messages
         Span::styled(
             format!("{msg_count} msgs"),
-            Style::default().fg(Color::Rgb(100, 100, 100)),
+            Style::default().fg(Color::Rgb(150, 150, 150)),
         ),
-        Span::styled(" \u{2502} ", Style::default().fg(Color::Rgb(40, 40, 40))),
+        sep.clone(),
         // Cost
         Span::styled(
             format!("${:.4}", app.total_cost),
-            Style::default().fg(Color::Rgb(100, 100, 100)),
+            Style::default().fg(Color::Rgb(150, 150, 150)),
         ),
-        Span::styled(" \u{2502} ", Style::default().fg(Color::Rgb(40, 40, 40))),
+        sep.clone(),
         // Tools
-        Span::styled("106 tools", Style::default().fg(Color::Rgb(80, 80, 80))),
-        // Right-aligned shortcuts
+        Span::styled(
+            format!("{} tools", app.model_count.unwrap_or(106)),
+            Style::default().fg(Color::Rgb(130, 130, 130)),
+        ),
+        // Shortcuts
         Span::styled(
             "  Ctrl+E sidebar \u{2502} Ctrl+1-9 tabs \u{2502} / commands",
-            Style::default().fg(Color::Rgb(50, 50, 50)),
+            Style::default().fg(Color::Rgb(80, 80, 80)),
         ),
     ]);
 

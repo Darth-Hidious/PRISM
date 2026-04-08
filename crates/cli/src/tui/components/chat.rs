@@ -119,10 +119,12 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(50, 50, 50)))
+        .border_style(Style::default().fg(Color::Rgb(70, 70, 70)))
         .title(Span::styled(
             " PRISM Agent ",
-            Style::default().fg(Color::Cyan),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
         ));
 
     let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });

@@ -10,7 +10,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     let input_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Rgb(70, 70, 70)));
 
     let p = Paragraph::new(format!("> {}", app.input_buffer)).block(input_block);
 

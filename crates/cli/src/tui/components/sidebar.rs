@@ -324,10 +324,12 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
 fn render_panel(f: &mut Frame, title: &str, items: Vec<ListItem<'static>>, area: Rect) {
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)))
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
         .title(Span::styled(
             title,
-            Style::default().fg(Color::Rgb(120, 120, 120)),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ));
     let list = List::new(items).block(block);
     f.render_widget(list, area);
@@ -337,7 +339,7 @@ fn section(text: &str) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(
         format!(" {text}"),
         Style::default()
-            .fg(Color::Rgb(140, 140, 140))
+            .fg(Color::Rgb(200, 200, 200))
             .add_modifier(Modifier::BOLD),
     )))
 }
@@ -345,7 +347,7 @@ fn section(text: &str) -> ListItem<'static> {
 fn item(text: &str) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(
         format!("   {text}"),
-        Style::default().fg(Color::Rgb(110, 110, 110)),
+        Style::default().fg(Color::Rgb(170, 170, 170)),
     )))
 }
 
@@ -358,13 +360,10 @@ fn item_highlight(text: &str) -> ListItem<'static> {
 
 fn action(cmd: &str, desc: &str) -> ListItem<'static> {
     ListItem::new(Line::from(vec![
-        Span::styled(
-            format!("   {cmd}"),
-            Style::default().fg(Color::Rgb(80, 180, 180)),
-        ),
+        Span::styled(format!("   {cmd}"), Style::default().fg(Color::Cyan)),
         Span::styled(
             format!("  {desc}"),
-            Style::default().fg(Color::Rgb(70, 70, 70)),
+            Style::default().fg(Color::Rgb(130, 130, 130)),
         ),
     ]))
 }
