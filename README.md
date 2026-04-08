@@ -131,7 +131,7 @@ prism models info <model-id>         # Show model details
 prism discourse create --spec spec.yaml           # Create a discourse
 prism discourse list                               # List discourses
 prism discourse status <id>                        # Check discourse status
-prism discourse events <id>                        # Stream discourse events
+prism discourse turns <id>                         # View discourse turns
 ```
 
 ### Deploy

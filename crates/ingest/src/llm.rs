@@ -297,10 +297,17 @@ impl LlmClient {
                         }
                     }
                     if let Some(u) = chunk.get("usage") {
-                        if let (Some(pt), Some(ct)) = (
-                            u.get("prompt_tokens").and_then(|v| v.as_u64()),
-                            u.get("completion_tokens").and_then(|v| v.as_u64()),
-                        ) {
+                        let pt = u
+                            .get("prompt_tokens")
+                            .or_else(|| u.get("input_tokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let ct = u
+                            .get("completion_tokens")
+                            .or_else(|| u.get("output_tokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if pt > 0 || ct > 0 {
                             usage_info = Some(UsageInfo {
                                 prompt_tokens: pt,
                                 completion_tokens: ct,
@@ -500,6 +507,44 @@ impl LlmClient {
 
     async fn post(&self, url: &str, body: &serde_json::Value) -> Result<reqwest::Response> {
         debug!(%url, "LLM request");
+        for attempt in 0..3u32 {
+            let mut req = self.client.post(url).json(body);
+            if let Some(auth) = self.auth_header() {
+                req = req.header("Authorization", auth);
+            }
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("LLM request to {url} failed"))?;
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let wait = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(2u64.pow(attempt));
+                debug!(attempt, wait_secs = wait, "429 — retrying after backoff");
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                continue;
+            }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                bail!("LLM returned HTTP {status}: {text}");
+            }
+            return Ok(resp);
+        }
+        bail!("LLM request to {url} failed after 3 retries (429 rate limit)");
+    }
+
+    // Keep old signature for callers that held the single-attempt path
+    #[allow(dead_code)]
+    async fn post_no_retry(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        debug!(%url, "LLM request (no retry)");
         let mut req = self.client.post(url).json(body);
         if let Some(auth) = self.auth_header() {
             req = req.header("Authorization", auth);
