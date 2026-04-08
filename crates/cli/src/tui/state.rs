@@ -175,6 +175,7 @@ pub struct App {
     pub should_quit: bool,
 
     // Cached workspace data
+    pub tool_count: usize,
     pub model_count: Option<usize>,
     pub gpu_count: Option<usize>,
     pub node_count: Option<usize>,
@@ -217,6 +218,7 @@ impl App {
             cached_providers: Vec::new(),
             project_root,
             should_quit: false,
+            tool_count: 0,
             model_count: None,
             gpu_count: None,
             node_count: None,

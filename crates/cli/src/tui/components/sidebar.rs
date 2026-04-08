@@ -304,7 +304,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect, focused: bool) {
         action("/billing", "Credit balance"),
         spacer(),
         section("Tools"),
-        item(&format!("{} loaded", app.model_count.unwrap_or(106))),
+        item(&format!("{} loaded", app.tool_count)),
         item("Custom: ~/.prism/tools/"),
         action("/tools", "Browse tools"),
         spacer(),
