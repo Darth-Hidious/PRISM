@@ -347,14 +347,82 @@ pub async fn execute_workflow_with_policy(
             }
         }
 
-        let step_result = match step.action.as_str() {
-            "set" => run_set_step(step, &mut context, !execute)?,
-            "message" => run_message_step(step, &mut context, !execute)?,
-            "http" => run_http_step(step, &mut context, !execute, &client).await?,
-            "tool" => run_tool_step(step, &mut context, !execute, &client).await?,
-            other => bail!("unsupported workflow step action: {other}"),
-        };
-        result.steps.push(step_result);
+        // Retry wrapper — any step can have retry config
+        let max_retries = step
+            .config
+            .get("retries")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let retry_delay_secs = step
+            .config
+            .get("retry_delay_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2);
+
+        let mut last_err = None;
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                if !execute {
+                    break; // dry run doesn't retry
+                }
+                tracing::info!(
+                    step = %step.id,
+                    attempt,
+                    "retrying workflow step after {}s",
+                    retry_delay_secs * u64::from(attempt)
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    retry_delay_secs * u64::from(attempt),
+                ))
+                .await;
+            }
+
+            let step_result = match step.action.as_str() {
+                "set" => run_set_step(step, &mut context, !execute),
+                "message" => run_message_step(step, &mut context, !execute),
+                "http" => run_http_step(step, &mut context, !execute, &client).await,
+                "tool" => run_tool_step(step, &mut context, !execute, &client).await,
+                "if" => {
+                    run_if_step(
+                        step,
+                        &mut context,
+                        !execute,
+                        &client,
+                        policy.as_deref_mut(),
+                        principal,
+                    )
+                    .await
+                }
+                "parallel" => run_parallel_step(step, &mut context, !execute, &client).await,
+                "workflow" => {
+                    run_workflow_step(
+                        step,
+                        &mut context,
+                        !execute,
+                        policy.as_deref_mut(),
+                        principal,
+                    )
+                    .await
+                }
+                other => bail!("unsupported workflow step action: {other}"),
+            };
+
+            match step_result {
+                Ok(r) => {
+                    result.steps.push(r);
+                    last_err = None;
+                    break;
+                }
+                Err(e) if attempt < max_retries && execute => {
+                    tracing::warn!(step = %step.id, attempt, error = %e, "step failed, will retry");
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
     }
     result.context = context;
     Ok(result)
@@ -629,6 +697,276 @@ async fn run_tool_step(
         status: "completed".to_string(),
         summary: format!("tool:{tool_name} → HTTP {status_code}"),
         data: stored,
+    })
+}
+
+// ── Conditional step ─────────────────────────────────────────────────
+//
+// YAML:
+//   - id: check
+//     action: if
+//     condition: "{{ kg_search.body.count }}"  # truthy check
+//     then:
+//       - id: found
+//         action: message
+//         text: "Found materials"
+//     else:
+//       - id: not_found
+//         action: message
+//         text: "No materials found"
+//
+async fn run_if_step(
+    step: &WorkflowStep,
+    context: &mut BTreeMap<String, serde_json::Value>,
+    dry_run: bool,
+    client: &reqwest::Client,
+    _policy: Option<&mut prism_policy::PolicyEngine>,
+    _principal: &str,
+) -> Result<WorkflowStepResult> {
+    let condition_raw = render_value(
+        step.config
+            .get("condition")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        context,
+    )?;
+
+    let is_truthy = match &condition_raw {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => !s.is_empty() && s != "false" && s != "0" && s != "null",
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|v| v != 0.0),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+    };
+
+    let branch_key = if is_truthy { "then" } else { "else" };
+    let branch_steps: Vec<WorkflowStep> = step
+        .config
+        .get(branch_key)
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let mut sub_results = Vec::new();
+    for sub_step in &branch_steps {
+        let sub_result = match sub_step.action.as_str() {
+            "set" => run_set_step(sub_step, context, dry_run)?,
+            "message" => run_message_step(sub_step, context, dry_run)?,
+            "http" => run_http_step(sub_step, context, dry_run, client).await?,
+            "tool" => run_tool_step(sub_step, context, dry_run, client).await?,
+            other => bail!("unsupported step action in if branch: {other}"),
+        };
+        sub_results.push(sub_result);
+    }
+
+    let summary = format!(
+        "if {} → {} ({} steps)",
+        if is_truthy { "true" } else { "false" },
+        branch_key,
+        sub_results.len()
+    );
+
+    context.insert(
+        step.id.clone(),
+        serde_json::json!({
+            "branch": branch_key,
+            "condition": condition_raw,
+            "steps": sub_results.iter().map(|r| &r.id).collect::<Vec<_>>(),
+        }),
+    );
+
+    Ok(WorkflowStepResult {
+        id: step.id.clone(),
+        action: step.action.clone(),
+        status: if dry_run { "planned" } else { "completed" }.to_string(),
+        summary,
+        data: serde_json::json!({
+            "branch": branch_key,
+            "condition": condition_raw,
+            "sub_steps": sub_results,
+        }),
+    })
+}
+
+// ── Parallel step ────────────────────────────────────────────────────
+//
+// YAML:
+//   - id: fan_out
+//     action: parallel
+//     steps:
+//       - id: search_mp
+//         action: http
+//         url: "https://api.materialsproject.org/..."
+//       - id: search_nomad
+//         action: http
+//         url: "https://nomad-lab.eu/..."
+//
+async fn run_parallel_step(
+    step: &WorkflowStep,
+    context: &mut BTreeMap<String, serde_json::Value>,
+    dry_run: bool,
+    client: &reqwest::Client,
+) -> Result<WorkflowStepResult> {
+    let sub_steps: Vec<WorkflowStep> = step
+        .config
+        .get("steps")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    if dry_run {
+        let summaries: Vec<String> = sub_steps
+            .iter()
+            .map(|s| format!("{}:{}", s.action, s.id))
+            .collect();
+        return Ok(WorkflowStepResult {
+            id: step.id.clone(),
+            action: step.action.clone(),
+            status: "planned".to_string(),
+            summary: format!(
+                "parallel {} steps: {}",
+                sub_steps.len(),
+                summaries.join(", ")
+            ),
+            data: serde_json::json!({ "step_count": sub_steps.len(), "steps": summaries }),
+        });
+    }
+
+    // Execute all sub-steps concurrently via tokio::join
+    let mut handles = Vec::new();
+    for sub_step in &sub_steps {
+        let sub_step = sub_step.clone();
+        let mut sub_context = context.clone();
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let result = match sub_step.action.as_str() {
+                "set" => run_set_step(&sub_step, &mut sub_context, false),
+                "message" => run_message_step(&sub_step, &mut sub_context, false),
+                "http" => run_http_step(&sub_step, &mut sub_context, false, &client).await,
+                "tool" => run_tool_step(&sub_step, &mut sub_context, false, &client).await,
+                other => Err(anyhow!("unsupported step action in parallel: {other}")),
+            };
+            (sub_step.id.clone(), result, sub_context)
+        }));
+    }
+
+    let mut sub_results = Vec::new();
+    for handle in handles {
+        let (sub_id, result, sub_context): (String, Result<WorkflowStepResult>, _) =
+            handle.await.context("parallel step panicked")?;
+        let step_result = result.with_context(|| format!("parallel sub-step '{sub_id}' failed"))?;
+        // Merge sub-step context back into parent
+        for (key, value) in sub_context {
+            if !context.contains_key(&key) || key == sub_id {
+                context.insert(key, value);
+            }
+        }
+        sub_results.push(step_result);
+    }
+
+    context.insert(
+        step.id.clone(),
+        serde_json::json!({
+            "completed": sub_results.len(),
+            "steps": sub_results.iter().map(|r| &r.id).collect::<Vec<_>>(),
+        }),
+    );
+
+    Ok(WorkflowStepResult {
+        id: step.id.clone(),
+        action: step.action.clone(),
+        status: "completed".to_string(),
+        summary: format!("parallel {} steps completed", sub_results.len()),
+        data: serde_json::json!({ "sub_steps": sub_results }),
+    })
+}
+
+// ── Sub-workflow step ────────────────────────────────────────────────
+//
+// YAML:
+//   - id: train
+//     action: workflow
+//     name: forge
+//     inputs:
+//       paper: "{{ paper }}"
+//       dataset: "{{ candidates }}"
+//
+async fn run_workflow_step(
+    step: &WorkflowStep,
+    context: &mut BTreeMap<String, serde_json::Value>,
+    dry_run: bool,
+    policy: Option<&mut prism_policy::PolicyEngine>,
+    principal: &str,
+) -> Result<WorkflowStepResult> {
+    let workflow_name = step
+        .config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("workflow step '{}' missing 'name' field", step.id))?;
+
+    let inputs = render_value(
+        step.config
+            .get("inputs")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+        context,
+    )?;
+
+    // Convert inputs to string map for workflow args
+    let mut values = BTreeMap::new();
+    if let Some(obj) = inputs.as_object() {
+        for (k, v) in obj {
+            values.insert(
+                k.clone(),
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string()),
+            );
+        }
+    }
+
+    if dry_run {
+        return Ok(WorkflowStepResult {
+            id: step.id.clone(),
+            action: step.action.clone(),
+            status: "planned".to_string(),
+            summary: format!("workflow:{workflow_name} ({} inputs)", values.len()),
+            data: serde_json::json!({
+                "workflow": workflow_name,
+                "inputs": inputs,
+            }),
+        });
+    }
+
+    // Discover and run the child workflow
+    let project_root = context
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new);
+    let specs = discover_workflows(project_root)?;
+    let child_spec = find_workflow(&specs, workflow_name)
+        .ok_or_else(|| anyhow!("sub-workflow '{}' not found", workflow_name))?;
+
+    let child_result = Box::pin(execute_workflow_with_policy(
+        child_spec,
+        &values,
+        true,
+        policy,
+        Some(principal),
+    ))
+    .await?;
+
+    // Merge child context into parent under the step id
+    context.insert(step.id.clone(), serde_json::to_value(&child_result)?);
+
+    Ok(WorkflowStepResult {
+        id: step.id.clone(),
+        action: step.action.clone(),
+        status: "completed".to_string(),
+        summary: format!(
+            "workflow:{workflow_name} → {} steps completed",
+            child_result.steps.len()
+        ),
+        data: serde_json::to_value(&child_result)?,
     })
 }
 
