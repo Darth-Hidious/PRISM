@@ -1,6 +1,7 @@
 //! Lightweight markdown → ratatui styled spans converter.
 //!
 //! Handles: **bold**, *italic*, `code`, ```code blocks```, # headings.
+#![allow(clippy::manual_strip, clippy::useless_format)]
 //! Not a full parser — just enough to make LLM output look good in a terminal.
 
 use ratatui::style::{Color, Modifier, Style};

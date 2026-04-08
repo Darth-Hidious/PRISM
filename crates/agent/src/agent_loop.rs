@@ -388,6 +388,10 @@ pub async fn run_turn(
                 streaming_deltas.push(delta.to_string());
             })
             .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "LLM call failed: {e:#}");
+                e
+            })
             .context("LLM call failed")?;
 
         // ── 2d. Track usage ───────────────────────────────────────

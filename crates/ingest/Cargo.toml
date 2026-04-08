@@ -18,6 +18,7 @@ tracing = { workspace = true }
 serde_yaml = { workspace = true }
 uuid = { workspace = true }
 polars = { workspace = true }
+prism-llm = { path = "../llm" }
 
 [dev-dependencies]
 tokio = { workspace = true }

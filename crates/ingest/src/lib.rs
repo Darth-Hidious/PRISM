@@ -17,7 +17,11 @@ pub mod connectors;
 pub mod embeddings;
 pub mod graph;
 pub mod graph_validation;
-pub mod llm;
+/// Re-export LLM client from the standalone `prism-llm` crate.
+/// This keeps backward compatibility — existing code using `prism_ingest::llm::*`
+/// and `prism_ingest::LlmConfig` continues to work.
+pub use prism_llm as llm;
+pub use prism_llm::LlmConfig;
 pub mod mapping;
 pub mod nl_query;
 pub mod ontology;
@@ -90,56 +94,6 @@ pub struct EmbeddingBatch {
     pub ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dimension: Option<usize>,
-}
-
-/// Configuration for connecting to an LLM backend.
-///
-/// Uses the OpenAI-compatible API (`/v1/chat/completions`, `/v1/embeddings`)
-/// which is supported by: llama.cpp server, Ollama, vLLM, LiteLLM, OpenAI,
-/// Anthropic (via proxy), and MARC27 platform.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmConfig {
-    /// Base URL of the LLM API.
-    /// - llama.cpp: "http://localhost:8080" (default)
-    /// - Ollama: "http://localhost:11434/v1"
-    /// - OpenAI: "https://api.openai.com"
-    /// - MARC27: "https://platform.marc27.com/api/v1/llm"
-    /// - vLLM: "http://localhost:8000"
-    pub base_url: String,
-    /// Model name (e.g. "gemma-3-27b", "gpt-4o", "claude-sonnet-4-6").
-    pub model: String,
-    /// API key for authenticated providers. Not needed for local llama.cpp.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    /// Separate embedding model (e.g. "nomic-embed-text"). If not set, uses `model`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_model: Option<String>,
-    /// Maximum number of sample rows to include in the extraction prompt.
-    #[serde(default = "default_max_sample_rows")]
-    pub max_sample_rows: usize,
-    /// Request timeout in seconds.
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-}
-
-fn default_max_sample_rows() -> usize {
-    10
-}
-fn default_timeout_secs() -> u64 {
-    120
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            base_url: "http://localhost:8080".into(),
-            model: "gemma-3-27b".into(),
-            api_key: None,
-            embedding_model: None,
-            max_sample_rows: 10,
-            timeout_secs: 120,
-        }
-    }
 }
 
 /// Configuration for connecting to Neo4j.

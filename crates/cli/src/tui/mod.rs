@@ -2,6 +2,11 @@
 //!
 //! Boot sequence animation → interactive agent shell.
 //! Design ported from the Gemini-generated HTML/JS prototype.
+#![allow(
+    clippy::manual_range_contains,
+    clippy::approx_constant,
+    clippy::redundant_pattern_matching
+)]
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -186,7 +191,7 @@ fn get_char_and_color(x: usize, y: usize, t: f64, row_chars: &[char]) -> (char, 
     }
 
     // 5. Knowledge graph background nodes
-    if c == ' ' && (x > 18 || y < 3 || y > 5) && !(x > 18 && x < 31 && (2..=6).contains(&y)) {
+    if c == ' ' && (x > 18 || y < 3 || y > 5) && !((19..31).contains(&x) && (2..=6).contains(&y)) {
         let noise = ((xf * 12.34 + yf * 3.14 + t * 0.05).sin()
             + (xf * 7.1 + yf * 5.2 - t * 0.02).cos())
             / 2.0;

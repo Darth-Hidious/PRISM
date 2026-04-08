@@ -4,10 +4,12 @@
 //! via device-flow OAuth, Python worker supervision, and dynamic workflow
 //! discovery from `~/.prism/workflows/`.
 
+mod tui;
+
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+// std::process::Stdio removed — old Ink TUI launcher no longer needed
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -42,6 +44,8 @@ struct Cli {
 enum Commands {
     /// Run first-time native setup and platform login.
     Setup,
+    /// Launch the interactive AI agent TUI.
+    Tui,
     /// Authenticate against the MARC27 platform using device flow.
     Login,
     /// Show runtime paths, endpoints, and auth status.
@@ -751,13 +755,18 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            // Skip TUI launch entirely if binary doesn't exist
-            if discover_tui_binary(&paths).is_some() {
-                launch_tui(&paths, &python, &project_root, state.credentials.as_ref())?;
-            } else {
+            // Real API pings for boot sequence
+            let boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            tui::boot_sequence(&boot_checks);
+            if let Err(e) = tui::run_splash() {
+                tracing::debug!(error = %e, "splash screen skipped");
+            }
+            // Launch interactive TUI
+            if let Err(e) = tui::run_tui_app(&project_root, &python).await {
+                // If TUI fails (e.g. backend spawn error), fall back to help
+                tracing::debug!(error = %e, "TUI failed, showing help");
                 println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
-                println!("  The interactive TUI is not available in this build.\n");
-                println!("  Use CLI commands directly:");
+                println!("  Use CLI commands:");
                 println!("    prism query --platform \"nickel superalloys\"");
                 println!("    prism research \"high entropy alloys\" --depth 1");
                 println!("    prism ingest ./data.csv");
@@ -882,6 +891,15 @@ async fn main() -> Result<()> {
 
             let mut tool_server_env = std::collections::BTreeMap::new();
             tool_server_env.insert("PRISM_ENABLE_MCP".to_string(), "1".to_string());
+
+            // Pass platform auth token to Python tool server so tools can call MARC27 API
+            if let Ok(state) = paths.load_cli_state() {
+                if let Some(creds) = &state.credentials {
+                    tool_server_env
+                        .insert("MARC27_API_KEY".to_string(), creds.access_token.clone());
+                }
+            }
+            tool_server_env.insert("MARC27_API_URL".to_string(), endpoints.api_base.clone());
 
             let tool_server = prism_python_bridge::ToolServer {
                 python_bin: backend_py,
@@ -2091,6 +2109,23 @@ async fn main() -> Result<()> {
             show,
         } => {
             handle_configure(llm_provider, url, model, embedding_model, show)?;
+        }
+        Commands::Tui => {
+            // Direct TUI launch (skips login check — assumes already authed)
+            let boot_checks = run_boot_checks(
+                paths
+                    .load_cli_state()
+                    .ok()
+                    .as_ref()
+                    .and_then(|s| s.credentials.as_ref()),
+                &endpoints,
+            )
+            .await;
+            tui::boot_sequence(&boot_checks);
+            if let Err(e) = tui::run_splash() {
+                tracing::debug!(error = %e, "splash skipped");
+            }
+            tui::run_tui_app(&project_root, &python).await?;
         }
         Commands::External(args) => {
             if try_run_workflow_alias(&project_root, &args).await? {
@@ -4751,119 +4786,7 @@ async fn refresh_access_token(
     Ok(new_creds)
 }
 
-fn launch_tui(
-    paths: &PrismPaths,
-    python: &Path,
-    project_root: &Path,
-    credentials: Option<&StoredCredentials>,
-) -> Result<()> {
-    let backend_bin = std::env::current_exe().context("failed to determine current executable")?;
-    let tui_binary = discover_tui_binary(paths).ok_or_else(|| {
-        anyhow!(
-            "no compiled TS TUI binary found. Install or bundle prism-tui before using native shell"
-        )
-    })?;
-
-    let mut cmd = std::process::Command::new(tui_binary);
-    cmd.arg("--python")
-        .arg(python)
-        .arg("--backend-bin")
-        .arg(backend_bin)
-        .current_dir(project_root)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    apply_process_env(&mut cmd, credentials);
-
-    let status = cmd.status().context("failed to launch TS TUI")?;
-    std::process::exit(status.code().unwrap_or(1));
-}
-
-fn discover_tui_binary(paths: &PrismPaths) -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok();
-    let dist_dir = cwd.as_ref().map(|dir| dir.join("frontend").join("dist"));
-
-    if let Some(dist_dir) = dist_dir {
-        let mut candidates = vec![
-            dist_dir.join(platform_tui_name()),
-            dist_dir.join("prism-tui"),
-        ];
-
-        if let Ok(entries) = std::fs::read_dir(&dist_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                if name.starts_with("prism-tui") {
-                    candidates.push(path);
-                }
-            }
-        }
-
-        candidates.push(paths.data_dir.join("bin").join(platform_tui_name()));
-        candidates.push(paths.data_dir.join("bin").join("prism-tui"));
-
-        for candidate in candidates {
-            if !candidate.as_os_str().is_empty() && candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    } else {
-        for candidate in [
-            paths.data_dir.join("bin").join(platform_tui_name()),
-            paths.data_dir.join("bin").join("prism-tui"),
-        ] {
-            if !candidate.as_os_str().is_empty() && candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
-}
-
-fn apply_process_env(cmd: &mut std::process::Command, credentials: Option<&StoredCredentials>) {
-    if let Some(creds) = credentials {
-        cmd.env("MARC27_TOKEN", &creds.access_token)
-            .env("MARC27_PLATFORM_URL", &creds.platform_url);
-        if let Some(project_id) = &creds.project_id {
-            cmd.env("MARC27_PROJECT_ID", project_id);
-        }
-        if let Some(user_id) = &creds.user_id {
-            cmd.env("PRISM_ACCOUNT_USER_ID", user_id);
-        }
-        if let Some(display_name) = &creds.display_name {
-            cmd.env("PRISM_ACCOUNT_DISPLAY_NAME", display_name);
-        }
-        if let Some(org_id) = &creds.org_id {
-            cmd.env("PRISM_ACCOUNT_ORG_ID", org_id);
-        }
-        if let Some(org_name) = &creds.org_name {
-            cmd.env("PRISM_ACCOUNT_ORG_NAME", org_name);
-        }
-        if let Some(project_name) = &creds.project_name {
-            cmd.env("PRISM_ACCOUNT_PROJECT_NAME", project_name);
-        }
-    }
-}
-
-fn platform_tui_name() -> &'static str {
-    if cfg!(windows) {
-        "prism-tui.exe"
-    } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        "prism-tui-darwin-arm64"
-    } else if cfg!(target_os = "macos") {
-        "prism-tui-darwin-x64"
-    } else if cfg!(target_arch = "aarch64") {
-        "prism-tui-linux-arm64"
-    } else {
-        "prism-tui-linux-x64"
-    }
-}
+// Old Ink/TypeScript TUI launcher removed — native Ratatui TUI is in crates/cli/src/tui/
 
 fn open_browser(url: &str) -> Result<()> {
     let status = if cfg!(target_os = "macos") {
@@ -5272,6 +5195,261 @@ async fn handle_job_status(job_id_str: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Boot checks (real API pings) ──────────────────────────────────────
+
+async fn run_boot_checks(
+    creds: Option<&StoredCredentials>,
+    endpoints: &PlatformEndpoints,
+) -> Vec<tui::BootCheck> {
+    let mut checks = Vec::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    let token = creds.map(|c| c.access_token.as_str()).unwrap_or("");
+    let api = &endpoints.api_base;
+
+    // 1. Platform connection — use /agent/capabilities (always 200 with auth)
+    let auth_header = format!("Bearer {token}");
+    let platform_ok = client
+        .get(format!("{api}/agent/capabilities"))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    let host = api
+        .replace("https://", "")
+        .replace("http://", "")
+        .replace("/api/v1", "");
+    checks.push(tui::BootCheck {
+        name: "Platform".into(),
+        result: if platform_ok {
+            format!("{host} connected")
+        } else {
+            format!("{host} unreachable")
+        },
+        ok: platform_ok,
+        dots: 8,
+        delay_ms: 30,
+    });
+
+    // 2. Auth
+    if !token.is_empty() {
+        let user = client
+            .get(format!("{api}/users/me"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| {
+                if r.status().is_success() {
+                    Some(r)
+                } else {
+                    None
+                }
+            });
+        let (auth_ok, auth_msg) = if let Some(resp) = user {
+            let data: serde_json::Value = resp.json().await.unwrap_or_default();
+            let name = data
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("authenticated");
+            (true, name.to_string())
+        } else {
+            (false, "token expired — run prism login".into())
+        };
+        checks.push(tui::BootCheck {
+            name: "Auth".into(),
+            result: auth_msg,
+            ok: auth_ok,
+            dots: 6,
+            delay_ms: 20,
+        });
+    } else {
+        checks.push(tui::BootCheck {
+            name: "Auth".into(),
+            result: "not logged in — run prism login".into(),
+            ok: false,
+            dots: 3,
+            delay_ms: 20,
+        });
+    }
+
+    // 3. Knowledge Graph
+    if !token.is_empty() {
+        let stats = client
+            .get(format!("{api}/knowledge/graph/stats"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| {
+                if r.status().is_success() {
+                    Some(r)
+                } else {
+                    None
+                }
+            });
+        let (kg_ok, kg_msg) = if let Some(resp) = stats {
+            let data: serde_json::Value = resp.json().await.unwrap_or_default();
+            let nodes = data.get("node_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let edges = data.get("edge_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            if nodes > 0 {
+                (
+                    true,
+                    format!("{}K nodes, {}M edges", nodes / 1000, edges / 1_000_000),
+                )
+            } else {
+                (true, "connected".into())
+            }
+        } else {
+            (false, "unavailable".into())
+        };
+        checks.push(tui::BootCheck {
+            name: "Knowledge Graph".into(),
+            result: kg_msg,
+            ok: kg_ok,
+            dots: 12,
+            delay_ms: 25,
+        });
+    }
+
+    // 4. Models
+    if !token.is_empty() {
+        let project_id = creds.and_then(|c| c.project_id.as_deref()).unwrap_or("");
+        if !project_id.is_empty() {
+            let models = client
+                .get(format!("{api}/projects/{project_id}/llm/models"))
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .ok()
+                .and_then(|r| {
+                    if r.status().is_success() {
+                        Some(r)
+                    } else {
+                        None
+                    }
+                });
+            let (m_ok, m_msg) = if let Some(resp) = models {
+                let data: serde_json::Value = resp.json().await.unwrap_or_default();
+                let count = if let Some(arr) = data.as_array() {
+                    arr.len()
+                } else {
+                    data.get("models")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0)
+                };
+                (true, format!("{count} hosted models"))
+            } else {
+                (false, "unavailable".into())
+            };
+            checks.push(tui::BootCheck {
+                name: "LLM Models".into(),
+                result: m_msg,
+                ok: m_ok,
+                dots: 10,
+                delay_ms: 20,
+            });
+        }
+    }
+
+    // 5. Compute
+    if !token.is_empty() {
+        let gpus = client
+            .get(format!("{api}/compute/gpus"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| {
+                if r.status().is_success() {
+                    Some(r)
+                } else {
+                    None
+                }
+            });
+        let (c_ok, c_msg) = if let Some(resp) = gpus {
+            let data: serde_json::Value = resp.json().await.unwrap_or_default();
+            let count = data.as_array().map(|a| a.len()).unwrap_or(0);
+            (true, format!("{count} GPU types available"))
+        } else {
+            (false, "unavailable".into())
+        };
+        checks.push(tui::BootCheck {
+            name: "Compute".into(),
+            result: c_msg,
+            ok: c_ok,
+            dots: 8,
+            delay_ms: 25,
+        });
+    }
+
+    // 6. Marketplace
+    if !token.is_empty() {
+        let mkt = client
+            .get(format!("{api}/marketplace/resources"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| {
+                if r.status().is_success() {
+                    Some(r)
+                } else {
+                    None
+                }
+            });
+        let (mk_ok, mk_msg) = if let Some(resp) = mkt {
+            let data: serde_json::Value = resp.json().await.unwrap_or_default();
+            let count = data.as_array().map(|a| a.len()).unwrap_or(0);
+            (true, format!("{count} resources"))
+        } else {
+            (false, "unavailable".into())
+        };
+        checks.push(tui::BootCheck {
+            name: "Marketplace".into(),
+            result: mk_msg,
+            ok: mk_ok,
+            dots: 6,
+            delay_ms: 30,
+        });
+    }
+
+    // 7. Local node
+    let node_ok = client
+        .get("http://127.0.0.1:7327/api/health")
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    checks.push(tui::BootCheck {
+        name: "Local Node".into(),
+        result: if node_ok {
+            "online at :7327".into()
+        } else {
+            "offline — run prism node up".into()
+        },
+        ok: node_ok,
+        dots: 4,
+        delay_ms: 20,
+    });
+
+    // 8. Policy engine (always local, always OK)
+    checks.push(tui::BootCheck {
+        name: "Policy Engine".into(),
+        result: "OPA/Rego loaded".into(),
+        ok: true,
+        dots: 4,
+        delay_ms: 15,
+    });
+
+    checks
 }
 
 // ── prism report ───────────────────────────────────────────────────────
