@@ -16,6 +16,10 @@ on:
       - "crates/**"
       - ".github/workflows/rust-backbone.yml"
 
+permissions:
+  contents: read
+  checks: write
+
 concurrency:
   group: rust-backbone-${{ github.ref }}
   cancel-in-progress: true
