@@ -7,320 +7,333 @@ use ratatui::Frame;
 
 use crate::tui::state::{App, Workspace};
 
-/// Draw the sidebar panel — content depends on active workspace tab.
-/// This is a BROWSER, not an info panel. Shows selectable items.
 pub fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     match app.workspace {
-        Workspace::Chat => draw_file_tree(f, app, area),
-        Workspace::Models => draw_model_browser(f, app, area),
-        Workspace::Mesh => draw_mesh_browser(f, app, area),
-        Workspace::Compute => draw_compute_browser(f, app, area),
-        Workspace::Data => draw_data_browser(f, app, area),
-        Workspace::Marketplace => draw_marketplace_browser(f, app, area),
-        Workspace::Workflows => draw_workflow_browser(f, app, area),
-        Workspace::Settings => draw_settings_panel(f, app, area),
-        _ => draw_file_tree(f, app, area),
+        Workspace::Chat => draw_explorer(f, app, area),
+        Workspace::Models => draw_models(f, app, area),
+        Workspace::Mesh => draw_mesh(f, app, area),
+        Workspace::Compute => draw_compute(f, app, area),
+        Workspace::Data => draw_data(f, app, area),
+        Workspace::Marketplace => draw_marketplace(f, app, area),
+        Workspace::Workflows => draw_workflows(f, app, area),
+        Workspace::Settings => draw_settings(f, app, area),
+        _ => draw_explorer(f, app, area),
     }
 }
 
-fn draw_file_tree(f: &mut Frame, _app: &App, area: Rect) {
-    // Show project file tree like VS Code explorer
+// ── Explorer (Chat tab) ─────────────────────────────────────────────
+
+fn draw_explorer(f: &mut Frame, _app: &App, area: Rect) {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let dir_name = cwd.rsplit('/').next().unwrap_or(&cwd);
 
-    let mut items = vec![ListItem::new(Line::from(vec![Span::styled(
+    let mut items = vec![ListItem::new(Line::from(Span::styled(
         format!(" \u{25bc} {dir_name}"),
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
-    )]))];
+    )))];
 
-    // List files in current directory (first 20)
     if let Ok(entries) = std::fs::read_dir(".") {
-        let mut files: Vec<String> = entries
+        let mut files: Vec<(String, bool)> = entries
             .filter_map(|e| e.ok())
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
             .map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
                 let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                if is_dir {
-                    format!("   \u{25b8} {name}/")
-                } else {
-                    format!("     {name}")
-                }
+                (name, is_dir)
             })
             .collect();
-        files.sort();
-        for f_name in files.iter().take(25) {
-            let is_dir = f_name.contains('\u{25b8}');
+        files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (name, is_dir) in files.iter().take(30) {
+            let icon = if *is_dir { "\u{25b8} " } else { "  " };
             items.push(ListItem::new(Line::from(Span::styled(
-                f_name.clone(),
-                Style::default().fg(if is_dir {
+                format!("   {icon}{name}"),
+                Style::default().fg(if *is_dir {
                     Color::Cyan
                 } else {
-                    Color::Rgb(160, 160, 160)
+                    Color::Rgb(140, 140, 140)
                 }),
             ))));
         }
     }
 
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)))
-        .title(Span::styled(
-            " Explorer ",
-            Style::default().fg(Color::Rgb(120, 120, 120)),
-        ));
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
+    render_panel(f, " Explorer ", items, area);
 }
 
-fn draw_model_browser(f: &mut Frame, app: &App, area: Rect) {
+// ── Models ──────────────────────────────────────────────────────────
+
+fn draw_models(f: &mut Frame, app: &App, area: Rect) {
     let mut items = vec![
-        section_header("Active"),
-        tree_item(
+        section("Active Model"),
+        item_highlight(
             app.status
                 .as_ref()
                 .and_then(|s| s.model.as_deref())
                 .unwrap_or("none"),
-            true,
         ),
         spacer(),
     ];
 
-    if app.cached_models.is_empty() {
-        items.push(tree_item("Loading...", false));
-    } else {
-        // Group by provider, show first few
-        let mut current_prov = "";
-        let mut count = 0;
+    // Model count by provider
+    if !app.cached_models.is_empty() {
+        items.push(section(&format!("Catalog ({})", app.cached_models.len())));
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         for m in &app.cached_models {
-            if m.provider != current_prov {
-                current_prov = &m.provider;
-                items.push(section_header(current_prov));
-                count = 0;
-            }
-            if count < 5 {
-                let badges = m.badges();
-                items.push(ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("   {badges} "),
-                        Style::default().fg(Color::Rgb(100, 100, 50)),
-                    ),
-                    Span::styled(&m.model_id, Style::default().fg(Color::Rgb(180, 180, 180))),
-                ])));
-                count += 1;
-            } else if count == 5 {
-                items.push(tree_item(
-                    &format!(
-                        "   ... +{} more",
-                        app.cached_models
-                            .iter()
-                            .filter(|x| x.provider == current_prov)
-                            .count()
-                            - 5
-                    ),
-                    false,
-                ));
-                count += 1;
-            }
+            *counts.entry(&m.provider).or_default() += 1;
         }
+        for (prov, count) in &counts {
+            items.push(item(&format!("{prov}: {count} models")));
+        }
+        items.push(spacer());
     }
 
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)))
-        .title(Span::styled(
-            " Models ",
-            Style::default().fg(Color::Rgb(120, 120, 120)),
-        ));
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
+    items.push(section("Actions"));
+    items.push(action("/model", "Select model"));
+    items.push(action("/models search", "Search"));
+    items.push(spacer());
+    items.push(section("Bring Your Own Key"));
+    items.push(item("Store API keys for:"));
+    items.push(item("  Anthropic, OpenAI,"));
+    items.push(item("  Google, DeepSeek"));
+    items.push(action("/config", "Manage keys"));
+
+    render_panel(f, " Models ", items, area);
 }
 
-fn draw_mesh_browser(f: &mut Frame, app: &App, area: Rect) {
-    let mut items = vec![
-        section_header("Local Node"),
-        tree_item("Status: offline", false),
-        tree_item("Port: 7327", false),
-        spacer(),
-        section_header("Peers"),
-    ];
+// ── Mesh ────────────────────────────────────────────────────────────
 
-    match app.peer_count {
-        Some(0) | None => items.push(tree_item("No peers found", false)),
-        Some(n) => items.push(tree_item(&format!("{n} peers connected"), true)),
-    }
+fn draw_mesh(f: &mut Frame, app: &App, area: Rect) {
+    let mut items = vec![section("Local Node")];
+
+    let node_online = app.node_count.is_some();
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(
+            if node_online {
+                "   \u{25cf} "
+            } else {
+                "   \u{25cb} "
+            },
+            Style::default().fg(if node_online {
+                Color::Green
+            } else {
+                Color::Rgb(80, 80, 80)
+            }),
+        ),
+        Span::styled(
+            if node_online {
+                "online :7327"
+            } else {
+                "offline"
+            },
+            Style::default().fg(Color::Rgb(140, 140, 140)),
+        ),
+    ])));
 
     items.push(spacer());
-    items.push(section_header("Actions"));
-    items.push(tree_item("/mesh discover", false));
-    items.push(tree_item("/node up", false));
-
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)))
-        .title(Span::styled(
-            " Mesh ",
-            Style::default().fg(Color::Rgb(120, 120, 120)),
-        ));
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
-}
-
-fn draw_compute_browser(f: &mut Frame, app: &App, area: Rect) {
-    let mut items = vec![
-        section_header("GPUs"),
-        tree_item(
-            &format!("{} types available", app.gpu_count.unwrap_or(0)),
-            false,
-        ),
-        spacer(),
-        section_header("Deployments"),
-        tree_item("Run /deploy list", false),
-        spacer(),
-        section_header("Jobs"),
-        tree_item("Run /job-status <id>", false),
-    ];
-
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)))
-        .title(Span::styled(
-            " Compute ",
-            Style::default().fg(Color::Rgb(120, 120, 120)),
-        ));
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
-}
-
-fn draw_data_browser(f: &mut Frame, app: &App, area: Rect) {
-    let mut items = vec![
-        section_header("Knowledge Graph"),
-        tree_item(
-            &format!("Entities: {}", app.entity_count.as_deref().unwrap_or("...")),
-            false,
-        ),
-        tree_item(
-            &format!("Corpora: {}", app.corpus_count.unwrap_or(0)),
-            false,
-        ),
-        spacer(),
-        section_header("Local Datasets"),
-        tree_item("Run /discover_capabilities", false),
-    ];
-
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)))
-        .title(Span::styled(
-            " Data ",
-            Style::default().fg(Color::Rgb(120, 120, 120)),
-        ));
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
-}
-
-fn draw_marketplace_browser(f: &mut Frame, app: &App, area: Rect) {
-    let mut items = vec![
-        section_header("Resources"),
-        tree_item(
-            &format!("{} available", app.marketplace_count.unwrap_or(0)),
-            false,
-        ),
-        spacer(),
-        section_header("Categories"),
-        tree_item("Datasets", false),
-        tree_item("Models", false),
-        tree_item("Plugins", false),
-        tree_item("CLI Tools", false),
-    ];
-
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)))
-        .title(Span::styled(
-            " Marketplace ",
-            Style::default().fg(Color::Rgb(120, 120, 120)),
-        ));
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
-}
-
-fn draw_workflow_browser(f: &mut Frame, app: &App, area: Rect) {
-    let mut items = vec![section_header("Workflows")];
-
-    if app.workflow_names.is_empty() {
-        items.push(tree_item("No workflows found", false));
-    } else {
-        for name in &app.workflow_names {
+    items.push(section("Peers"));
+    match app.peer_count {
+        Some(0) | None => items.push(item("No peers discovered")),
+        Some(n) => {
             items.push(ListItem::new(Line::from(vec![
-                Span::styled("   \u{25b7} ", Style::default().fg(Color::Cyan)),
-                Span::styled(name.clone(), Style::default().fg(Color::Rgb(180, 180, 180))),
+                Span::styled("   \u{25cf} ", Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("{n} peer(s) connected"),
+                    Style::default().fg(Color::Rgb(140, 140, 140)),
+                ),
             ])));
         }
     }
 
     items.push(spacer());
-    items.push(section_header("Actions"));
-    items.push(tree_item("/workflow list", false));
-    items.push(tree_item("/workflow run", false));
+    items.push(section("Actions"));
+    items.push(action("/mesh discover", "Find LAN peers"));
+    items.push(action("/mesh publish", "Share dataset"));
+    items.push(action("/mesh subscribe", "Subscribe"));
+    items.push(action("/node up", "Start node"));
+    items.push(action("/node down", "Stop node"));
+    items.push(action("/node status", "Node info"));
 
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)))
-        .title(Span::styled(
-            " Workflows ",
-            Style::default().fg(Color::Rgb(120, 120, 120)),
-        ));
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
+    render_panel(f, " Mesh & Nodes ", items, area);
 }
 
-fn draw_settings_panel(f: &mut Frame, app: &App, area: Rect) {
+// ── Compute ─────────────────────────────────────────────────────────
+
+fn draw_compute(f: &mut Frame, app: &App, area: Rect) {
     let mut items = vec![
-        section_header("LLM Config"),
-        tree_item(
-            &format!(
-                "Model: {}",
-                app.status
-                    .as_ref()
-                    .and_then(|s| s.model.as_deref())
-                    .unwrap_or("none")
-            ),
-            false,
-        ),
-        tree_item("Temperature: 0.1", false),
-        tree_item("Max tokens: 4096", false),
+        section("GPU Resources"),
+        item(&format!("{} types available", app.gpu_count.unwrap_or(0))),
         spacer(),
-        section_header("Auth"),
-        tree_item("/login", false),
-        tree_item("/logout", false),
+        section("Providers"),
+        item("  RunPod"),
+        item("  Lambda"),
+        item("  PRISM Nodes"),
         spacer(),
-        section_header("Permissions"),
-        tree_item("/permissions", false),
+        section("Actions"),
+        action("/deploy list", "Deployments"),
+        action("/deploy create", "New deployment"),
+        action("/run", "Submit job"),
+        action("/job-status", "Check job"),
         spacer(),
-        section_header("Usage"),
-        tree_item(&format!("Cost: ${:.4}", app.total_cost), false),
-        tree_item("/usage", false),
-        tree_item("/billing", false),
+        section("Bring Your Own Compute"),
+        item("Connect external HPCs:"),
+        action("/run --ssh", "SSH backend"),
+        action("/run --k8s-context", "Kubernetes"),
+        action("/run --slurm", "SLURM cluster"),
     ];
 
+    render_panel(f, " Compute ", items, area);
+}
+
+// ── Data ────────────────────────────────────────────────────────────
+
+fn draw_data(f: &mut Frame, app: &App, area: Rect) {
+    let mut items = vec![
+        section("Knowledge Graph"),
+        item(&format!(
+            "Entities: {}",
+            app.entity_count.as_deref().unwrap_or("...")
+        )),
+        item(&format!("Corpora: {}", app.corpus_count.unwrap_or(0))),
+        spacer(),
+        section("Sources"),
+        item("  MARC27 Knowledge Service"),
+        item("  OPTIMADE (20+ providers)"),
+        item("  Materials Project"),
+        item("  Local Neo4j / Qdrant"),
+        spacer(),
+        section("Actions"),
+        action("/query", "Query graph"),
+        action("/query --semantic", "Semantic search"),
+        action("/ingest", "Ingest data"),
+        action("/research", "Research loop"),
+    ];
+
+    render_panel(f, " Data ", items, area);
+}
+
+// ── Marketplace ─────────────────────────────────────────────────────
+
+fn draw_marketplace(f: &mut Frame, app: &App, area: Rect) {
+    let mut items = vec![
+        section(&format!(
+            "Resources ({})",
+            app.marketplace_count.unwrap_or(0)
+        )),
+        spacer(),
+        section("Categories"),
+        item("  \u{25b8} Datasets"),
+        item("  \u{25b8} Models (MACE, CHGNet)"),
+        item("  \u{25b8} Plugins"),
+        item("  \u{25b8} CLI Tools (QE)"),
+        spacer(),
+        section("Actions"),
+        action("/marketplace search", "Browse"),
+        action("/marketplace install", "Install"),
+        spacer(),
+        item("Click opens model card"),
+        item("on marc27.com"),
+    ];
+
+    render_panel(f, " Marketplace ", items, area);
+}
+
+// ── Workflows ───────────────────────────────────────────────────────
+
+fn draw_workflows(f: &mut Frame, app: &App, area: Rect) {
+    let mut items = vec![section("Available")];
+
+    if app.workflow_names.is_empty() {
+        items.push(item("forge (built-in)"));
+    } else {
+        for name in &app.workflow_names {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("   \u{25b7} ", Style::default().fg(Color::Cyan)),
+                Span::styled(name.clone(), Style::default().fg(Color::Rgb(160, 160, 160))),
+            ])));
+        }
+    }
+
+    items.push(spacer());
+    items.push(section("Step Types"));
+    items.push(item("  set, message, http, tool"));
+    items.push(item("  if, parallel, workflow"));
+    items.push(item("  + retries, hooks, OPA"));
+    items.push(spacer());
+    items.push(section("Actions"));
+    items.push(action("/workflow list", "List all"));
+    items.push(action("/workflow show", "Inspect"));
+    items.push(action("/workflow run", "Execute"));
+    items.push(spacer());
+    items.push(section("Custom Workflows"));
+    items.push(item("Drop YAML in:"));
+    items.push(item("  ~/.prism/workflows/"));
+
+    render_panel(f, " Workflows ", items, area);
+}
+
+// ── Settings ────────────────────────────────────────────────────────
+
+fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
+    let model = app
+        .status
+        .as_ref()
+        .and_then(|s| s.model.as_deref())
+        .unwrap_or("none");
+
+    let mut items = vec![
+        section("LLM"),
+        item(&format!("Model: {model}")),
+        item("Temperature: 0.1"),
+        item("Max tokens: 4096"),
+        action("/config", "Edit config"),
+        action("/model", "Switch model"),
+        spacer(),
+        section("Auth & RBAC"),
+        action("/login", "Re-authenticate"),
+        action("/logout", "Sign out"),
+        action("/permissions", "View permissions"),
+        spacer(),
+        section("Usage & Billing"),
+        item(&format!("Session: ${:.4}", app.total_cost)),
+        action("/usage", "Token usage"),
+        action("/billing", "Credit balance"),
+        spacer(),
+        section("Tools"),
+        item(&format!("{} loaded", app.model_count.unwrap_or(106))),
+        item("Custom: ~/.prism/tools/"),
+        action("/tools", "Browse tools"),
+        spacer(),
+        section("Policies"),
+        item("OPA/Rego engine active"),
+        item("Custom: ~/.prism/policies/"),
+        spacer(),
+        section("BYOK (API Keys)"),
+        item("Store provider keys:"),
+        item("  prism config set"),
+        item("  anthropic_key sk-..."),
+    ];
+
+    render_panel(f, " Settings ", items, area);
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn render_panel(f: &mut Frame, title: &str, items: Vec<ListItem<'static>>, area: Rect) {
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(Color::Rgb(40, 40, 40)))
         .title(Span::styled(
-            " Settings ",
+            title,
             Style::default().fg(Color::Rgb(120, 120, 120)),
         ));
     let list = List::new(items).block(block);
     f.render_widget(list, area);
 }
 
-// Helper functions
-
-fn section_header(text: &str) -> ListItem<'static> {
+fn section(text: &str) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(
         format!(" {text}"),
         Style::default()
@@ -329,15 +342,31 @@ fn section_header(text: &str) -> ListItem<'static> {
     )))
 }
 
-fn tree_item(text: &str, highlight: bool) -> ListItem<'static> {
+fn item(text: &str) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(
         format!("   {text}"),
-        Style::default().fg(if highlight {
-            Color::Cyan
-        } else {
-            Color::Rgb(120, 120, 120)
-        }),
+        Style::default().fg(Color::Rgb(110, 110, 110)),
     )))
+}
+
+fn item_highlight(text: &str) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(
+        format!("   {text}"),
+        Style::default().fg(Color::Cyan),
+    )))
+}
+
+fn action(cmd: &str, desc: &str) -> ListItem<'static> {
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("   {cmd}"),
+            Style::default().fg(Color::Rgb(80, 180, 180)),
+        ),
+        Span::styled(
+            format!("  {desc}"),
+            Style::default().fg(Color::Rgb(70, 70, 70)),
+        ),
+    ]))
 }
 
 fn spacer() -> ListItem<'static> {
