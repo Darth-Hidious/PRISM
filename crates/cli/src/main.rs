@@ -1797,19 +1797,35 @@ async fn main() -> Result<()> {
 
             match command {
                 MarketplaceCommands::Search { query } => {
-                    let tools = marketplace.list_tools(query.as_deref()).await?;
+                    // Empty query → list all resources instead of searching
+                    let tools = if query.as_deref().is_none_or(|q| q.is_empty()) {
+                        marketplace.list_tools(None).await?
+                    } else {
+                        marketplace.list_tools(query.as_deref()).await?
+                    };
                     if tools.is_empty() {
                         println!("No results found.");
                     } else {
-                        println!("Marketplace tools:\n");
+                        println!("Marketplace resources:\n");
                         for t in &tools {
-                            println!("  {:<30} {} (by {})", t.name, t.description, t.author);
-                            if t.install_count > 0 {
-                                println!("  {:<30} {} installs", "", t.install_count);
+                            let tags = if t.tags.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  [{}]", t.tags.join(", "))
+                            };
+                            let author = t.author.as_deref().unwrap_or("MARC27");
+                            println!(
+                                "  {} ({})  by {}  [{}]",
+                                t.name, t.resource_type, author, t.pricing
+                            );
+                            println!("    {}", t.description);
+                            if !t.tags.is_empty() {
+                                println!("    tags: {}", t.tags.join(", "));
                             }
+                            println!();
                         }
                         println!(
-                            "\n{} tools found. Install with: prism marketplace install <name>",
+                            "{} resources found. Install with: prism marketplace install <slug>",
                             tools.len()
                         );
                     }
@@ -1839,12 +1855,18 @@ async fn main() -> Result<()> {
                 MarketplaceCommands::Info { name } => {
                     let tool = marketplace.get_tool(&name).await?;
                     println!("Name:        {}", tool.name);
+                    println!("Slug:        {}", tool.slug);
+                    println!("Type:        {}", tool.resource_type);
                     println!("Version:     {}", tool.version);
-                    println!("Author:      {}", tool.author);
+                    println!(
+                        "Author:      {}",
+                        tool.author.as_deref().unwrap_or("MARC27")
+                    );
                     println!("Description: {}", tool.description);
-                    println!("Installs:    {}", tool.install_count);
-                    if let Some(url) = &tool.download_url {
-                        println!("URL:         {url}");
+                    println!("Pricing:     {}", tool.pricing);
+                    println!("Downloads:   {}", tool.download_count);
+                    if !tool.tags.is_empty() {
+                        println!("Tags:        {}", tool.tags.join(", "));
                     }
                 }
             }
