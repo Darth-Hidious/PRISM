@@ -47,10 +47,10 @@ pub fn draw(f: &mut Frame, app: &App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )
-        .style(Style::default().fg(Color::Rgb(80, 80, 80)))
+        .style(Style::default().fg(Color::Rgb(140, 140, 140)))
         .divider(Span::styled(
             "\u{2502}",
-            Style::default().fg(Color::Rgb(40, 40, 40)),
+            Style::default().fg(Color::Rgb(60, 60, 60)),
         ));
 
     f.render_widget(tabs, tab_area);

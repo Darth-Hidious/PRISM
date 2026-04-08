@@ -411,6 +411,32 @@ pub async fn run_tui_app(
         }
     }
 
+    // Check local node
+    if let Ok(resp) = reqwest::Client::new()
+        .get("http://127.0.0.1:7327/api/health")
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            app.node_count = Some(1);
+            // Try to get peer count
+            if let Ok(mesh) = reqwest::Client::new()
+                .get("http://127.0.0.1:7327/api/mesh/nodes")
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+            {
+                if let Ok(data) = mesh.json::<serde_json::Value>().await {
+                    app.peer_count = data
+                        .get("peer_count")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize);
+                }
+            }
+        }
+    }
+
     // Spawn backend process
     let current_exe = std::env::current_exe()?;
     let mut client =
