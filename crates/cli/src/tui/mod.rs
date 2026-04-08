@@ -509,9 +509,7 @@ pub async fn run_tui_app(
                         }
                     }
                     protocol::ProtocolNotification::Welcome(w) => {
-                        if app.model_count.is_none() {
-                            app.model_count = Some(w.tool_count);
-                        }
+                        app.tool_count = w.tool_count;
                     }
                     protocol::ProtocolNotification::View(view) => {
                         app.active_view = Some(view);
@@ -531,12 +529,24 @@ pub async fn run_tui_app(
                     KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.sidebar_visible = !app.sidebar_visible;
                     }
-                    // Tab switching: Ctrl+1-9 for workspaces
+                    // Tab switching: 1-9 when NOT typing in input
+                    KeyCode::Char(c @ '1'..='9') if app.focus != state::FocusZone::Input => {
+                        let idx = (c as usize) - ('1' as usize);
+                        app.select_activity(idx);
+                    }
+                    // Ctrl+1-9 always works for tab switching
                     KeyCode::Char(c @ '1'..='9') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         let idx = (c as usize) - ('1' as usize);
                         app.select_activity(idx);
                     }
-                    // Alt+Left/Right to cycle workspace tabs
+                    // Left/Right arrows switch tabs when sidebar or chat is focused
+                    KeyCode::Left if app.focus == state::FocusZone::Sidebar || app.focus == state::FocusZone::Chat => {
+                        app.activity_up();
+                    }
+                    KeyCode::Right if app.focus == state::FocusZone::Sidebar || app.focus == state::FocusZone::Chat => {
+                        app.activity_down();
+                    }
+                    // Alt+Left/Right always works
                     KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
                         app.activity_up();
                     }
@@ -741,7 +751,7 @@ pub async fn run_tui_app(
                             }
                         }
                     }
-                    KeyCode::Enter => {
+                    KeyCode::Enter if app.focus == state::FocusZone::Input || app.palette_visible || app.model_picker_visible => {
                         // If palette is visible, execute the selected command
                         if app.palette_visible {
                             let commands = components::command_palette::all_commands();

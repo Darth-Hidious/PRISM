@@ -50,7 +50,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         sep.clone(),
         // Tools
         Span::styled(
-            format!("{} tools", app.model_count.unwrap_or(106)),
+            format!("{} tools", app.tool_count),
             Style::default().fg(Color::Rgb(130, 130, 130)),
         ),
         sep.clone(),
