@@ -589,14 +589,37 @@ pub async fn run_tui_app(
                     KeyCode::End if app.focus == state::FocusZone::Chat => {
                         app.chat_scroll = u16::MAX; // will be clamped by Paragraph
                     }
-                    // Up/Down when sidebar is focused → scroll sidebar
+                    // Up/Down when sidebar is focused → move selection
                     KeyCode::Up if app.focus == state::FocusZone::Sidebar => {
                         if app.sidebar_scroll > 0 {
                             app.sidebar_scroll -= 1;
                         }
                     }
                     KeyCode::Down if app.focus == state::FocusZone::Sidebar => {
-                        app.sidebar_scroll += 1;
+                        let items = components::sidebar::build_items(&app);
+                        let max = components::sidebar::selectable_count(&items);
+                        if (app.sidebar_scroll as usize) < max.saturating_sub(1) {
+                            app.sidebar_scroll += 1;
+                        }
+                    }
+                    // Enter on sidebar → execute selected action
+                    KeyCode::Enter if app.focus == state::FocusZone::Sidebar => {
+                        let items = components::sidebar::build_items(&app);
+                        if let Some(action) = components::sidebar::get_selected_action(&items, app.sidebar_scroll as usize) {
+                            // Execute the slash command
+                            let req = protocol::InputCommandRequest {
+                                jsonrpc: "2.0".to_string(),
+                                method: "input.command".to_string(),
+                                id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                params: protocol::InputCommandParams {
+                                    command: action,
+                                    silent: false,
+                                },
+                            };
+                            let _ = client.tx_requests.send(serde_json::to_string(&req)?).await;
+                            // Switch to chat to see the result
+                            app.focus = state::FocusZone::Chat;
+                        }
                     }
                     KeyCode::Esc => {
                         if app.model_picker_visible {
