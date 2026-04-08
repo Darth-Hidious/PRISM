@@ -316,6 +316,8 @@ impl LlmClient {
             let text = resp.text().await.context("failed to read MARC27 stream")?;
             let mut full_text = String::new();
             let mut usage_info = None;
+            let mut hit_tool_call = false;
+
             for line in text.lines() {
                 let line = line.strip_prefix("data: ").unwrap_or(line).trim();
                 if line.is_empty() {
@@ -324,8 +326,25 @@ impl LlmClient {
                 if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(line) {
                     if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
                         if !delta.is_empty() {
-                            on_delta(delta);
                             full_text.push_str(delta);
+
+                            // Stop forwarding deltas to UI once we see a tool_call block
+                            if !hit_tool_call {
+                                if full_text.contains("```tool_call") {
+                                    hit_tool_call = true;
+                                    // Emit only the text BEFORE the first tool_call
+                                    let before = full_text
+                                        .split("```tool_call")
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    // We already emitted some deltas — the preamble is partial.
+                                    // For simplicity, don't emit this delta (it contains the marker)
+                                } else {
+                                    on_delta(delta);
+                                }
+                            }
+                            // If we already hit tool_call, skip all further deltas
                         }
                     }
                     if let Some(u) = chunk.get("usage") {
@@ -350,8 +369,10 @@ impl LlmClient {
                 }
             }
 
-            // Parse tool calls from response text (```tool_call blocks)
+            // Parse tool calls — only take the FIRST batch (before any "Results:" hallucination)
             let tool_calls = parse_text_tool_calls(&full_text);
+            // Only unique tool calls (LLM sometimes duplicates)
+            let tool_calls = dedup_tool_calls(tool_calls);
             let content_text = strip_tool_call_blocks(&full_text);
 
             return Ok(ChatResponse {
@@ -605,52 +626,118 @@ impl LlmClient {
 
 // ── MARC27 text-based tool calling helpers ──────────────────────────
 
-/// Build a prompt block describing available tools.
-/// The LLM is instructed to call tools using ```tool_call JSON blocks.
+/// Build a lightweight tool catalog for the system prompt.
+///
+/// Instead of dumping all 108 tool definitions (11K+ tokens), we give the model:
+/// 1. A categorized summary of what's available
+/// 2. Instructions to call `discover_capabilities` for specifics
+/// 3. The tool calling syntax
+///
+/// Full tool definitions are injected only after discover_capabilities returns.
 fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
-    let mut block = String::from(
-        "# Available Tools\n\n\
-         You have access to the following tools. To call a tool, output a fenced block:\n\n\
-         ```tool_call\n\
-         {\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n\
-         ```\n\n\
-         You may call multiple tools in one response. After each tool call, the system will \
-         execute it and provide the result. Then continue your response.\n\n\
-         Tools:\n\n",
+    // Categorize tools by prefix/name patterns
+    let mut categories: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for tool in tools {
+        let name = tool.function.name.as_str();
+        let cat = if name.starts_with("knowledge_")
+            || name.starts_with("semantic_")
+            || name == "list_corpora"
+        {
+            "Knowledge Graph"
+        } else if name.starts_with("search_") || name.starts_with("query_") {
+            "Search & Query"
+        } else if name.starts_with("predict_")
+            || name.starts_with("list_models")
+            || name.starts_with("list_predictable")
+        {
+            "ML Prediction"
+        } else if name.starts_with("compute_")
+            || name.starts_with("run")
+            || name.starts_with("job")
+            || name.starts_with("deploy")
+        {
+            "Compute & Deploy"
+        } else if name.starts_with("mesh_") || name.starts_with("node_") {
+            "Mesh & Nodes"
+        } else if name.starts_with("workflow") || name.starts_with("forge") {
+            "Workflows"
+        } else if name.starts_with("marketplace") {
+            "Marketplace"
+        } else if name.starts_with("ingest")
+            || name.starts_with("import")
+            || name.starts_with("export")
+        {
+            "Data & Ingest"
+        } else if name.starts_with("execute_")
+            || name.starts_with("read_")
+            || name.starts_with("write_")
+            || name.starts_with("edit_")
+        {
+            "Code & Files"
+        } else if name.starts_with("plot_") || name.starts_with("visualize") {
+            "Visualization"
+        } else if name.starts_with("literature_")
+            || name.starts_with("patent_")
+            || name.starts_with("web_")
+        {
+            "Literature & Web"
+        } else if name.starts_with("discourse") || name.starts_with("research") {
+            "Research & Discourse"
+        } else {
+            "Other"
+        };
+        categories.entry(cat).or_default().push(name);
+    }
+
+    let mut block = format!(
+        "# Tool Calling\n\n\
+         You have {} tools available across these categories:\n\n",
+        tools.len()
     );
 
-    for tool in tools {
-        block.push_str(&format!("- **{}**", tool.function.name));
-        if !tool.function.description.is_empty() {
-            block.push_str(&format!(": {}", tool.function.description));
+    for (category, tool_names) in &categories {
+        block.push_str(&format!(
+            "- **{}** ({} tools): {}\n",
+            category,
+            tool_names.len(),
+            tool_names
+                .iter()
+                .take(4)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+        if tool_names.len() > 4 {
+            block.push_str(&format!("  ... and {} more\n", tool_names.len() - 4));
         }
-        block.push('\n');
-        let params = &tool.function.parameters;
-        if let Some(props) = params.get("properties").and_then(|p| p.as_object()) {
-            let required: Vec<String> = params
-                .get("required")
-                .and_then(|r| r.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for (name, schema) in props {
-                let desc = schema
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("");
-                let req = if required.iter().any(|r| r == name) {
-                    " (required)"
-                } else {
-                    ""
-                };
-                block.push_str(&format!("  - `{name}`{req}: {desc}\n"));
-            }
-        }
-        block.push('\n');
     }
+
+    block.push_str("\n\
+        ## How to call tools\n\n\
+        When a task requires data retrieval, computation, or platform interaction, call a tool:\n\n\
+        ```tool_call\n\
+        {\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n\
+        ```\n\n\
+        **CRITICAL rules:**\n\
+        - Call `discover_capabilities` first if you need to see what tools exist\n\
+        - Output ONE ```tool_call block, then STOP IMMEDIATELY. Do not write anything after it.\n\
+        - Do NOT output multiple tool_call blocks in one response.\n\
+        - Do NOT guess, fabricate, or hallucinate tool results. EVER.\n\
+        - After your ```tool_call block, the system executes it and returns the result.\n\
+        - You will see the result in your next message, then you can respond or call another tool.\n\
+        - If you need multiple tools, call them one at a time across multiple turns.\n\n\
+        ## Quick reference (most common tools)\n\n\
+        - `discover_capabilities` — see all available tools, providers, models, corpora\n\
+        - `knowledge_search` — search the MARC27 knowledge graph (211K+ entities)\n\
+        - `search_materials` — search 20+ materials databases (OPTIMADE)\n\
+        - `semantic_search` — vector similarity search over embedded documents\n\
+        - `predict_property` — predict material property from composition\n\
+        - `execute_python` — run Python code for analysis\n\
+        - `web_search` / `web_read` — search or read web pages\n\
+        - `literature_search` — search arXiv, Semantic Scholar\n\
+        - `research_query` — iterative research loop via MARC27 platform\n\
+    ");
 
     block
 }
@@ -694,6 +781,19 @@ fn parse_text_tool_calls(text: &str) -> Vec<ToolCallResponse> {
     }
 
     calls
+}
+
+/// Deduplicate tool calls by name+arguments (LLM sometimes repeats the same call).
+fn dedup_tool_calls(calls: Vec<ToolCallResponse>) -> Vec<ToolCallResponse> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for call in calls {
+        let key = format!("{}:{}", call.function.name, call.function.arguments);
+        if seen.insert(key) {
+            result.push(call);
+        }
+    }
+    result
 }
 
 /// Strip everything from the first ```tool_call block onwards.
