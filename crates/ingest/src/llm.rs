@@ -696,8 +696,16 @@ fn parse_text_tool_calls(text: &str) -> Vec<ToolCallResponse> {
     calls
 }
 
-/// Strip ```tool_call blocks from response text, leaving only the prose.
+/// Strip everything from the first ```tool_call block onwards.
+/// The LLM outputs preamble text, then tool calls, then hallucinated results.
+/// We only keep the preamble — tool results come from actual execution.
 fn strip_tool_call_blocks(text: &str) -> String {
+    // Truncate at first tool_call — everything after is hallucination
+    if let Some(start) = text.find("```tool_call") {
+        return text[..start].trim().to_string();
+    }
+
+    // No tool calls — return as-is (dead code path kept for safety)
     let mut result = String::new();
     let mut rest = text;
 
