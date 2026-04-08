@@ -4642,6 +4642,41 @@ async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredent
         chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
     });
 
+    // Store server config (default model, MP API key) if provided
+    if let Some(config) = &token.config {
+        if let Some(ref default_model) = config.default_model {
+            tracing::info!(model = %default_model, "server config: default model");
+        }
+        if config.mp_api_key.is_some() {
+            tracing::info!("server config: Materials Project API key received");
+        }
+        // Write config to prism.toml and env for the current process
+        if let Some(ref mp_key) = config.mp_api_key {
+            std::env::set_var("MP_API_KEY", mp_key);
+        }
+        // Write default model to prism.toml if user hasn't set one
+        if let Some(ref model) = config.default_model {
+            let node_config = prism_core::config::NodeConfig::load(None);
+            if node_config.llm.model.is_none() {
+                // User hasn't set a model — use server default
+                if let Ok(home) = std::env::var("HOME") {
+                    let toml_path = format!("{home}/.prism/prism.toml");
+                    if let Ok(existing) = std::fs::read_to_string(&toml_path) {
+                        if !existing.contains("model =") {
+                            let updated = if existing.contains("[llm]") {
+                                existing.replace("[llm]", &format!("[llm]\nmodel = \"{model}\""))
+                            } else {
+                                format!("{existing}\n[llm]\nmodel = \"{model}\"\n")
+                            };
+                            let _ = std::fs::write(&toml_path, updated);
+                            tracing::info!(model = %model, "set default model from server config");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(StoredCredentials {
         access_token: token.access_token,
         refresh_token: token.refresh_token,

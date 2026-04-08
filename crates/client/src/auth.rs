@@ -13,6 +13,15 @@ pub struct DeviceCodeResponse {
     pub interval: i64,
 }
 
+/// Server-provided config (returned on login).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServerConfig {
+    #[serde(default)]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub mp_api_key: Option<String>,
+}
+
 /// Successful token response (initial or refresh).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TokenResponse {
@@ -22,6 +31,8 @@ pub struct TokenResponse {
     pub token_type: Option<String>,
     #[serde(default)]
     pub expires_in: Option<u64>,
+    #[serde(default)]
+    pub config: Option<ServerConfig>,
 }
 
 impl std::fmt::Debug for TokenResponse {
@@ -46,6 +57,8 @@ struct PollPayload {
     expires_in: Option<u64>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    config: Option<ServerConfig>,
 }
 
 /// Device-code authorisation flow (GitHub CLI-style).
@@ -118,6 +131,7 @@ impl DeviceFlowAuth {
                     refresh_token: payload.refresh_token.unwrap_or_default(),
                     token_type: payload.token_type,
                     expires_in: payload.expires_in,
+                    config: payload.config,
                 });
             }
 
