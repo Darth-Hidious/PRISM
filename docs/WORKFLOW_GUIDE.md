@@ -194,6 +194,10 @@ description: What it does.   # Shown in prism workflow list
 default_mode: dry_run        # "dry_run" or "execute"
 arguments: [...]             # CLI arguments
 steps: [...]                 # DAG of execution steps
+hooks:                       # Optional lifecycle hooks
+  on_start: [...]            # Steps to run before the workflow
+  on_complete: [...]         # Steps to run after success
+  on_error: [...]            # Steps to run on failure
 ```
 
 ### Arguments
@@ -270,6 +274,177 @@ Response stored in context as `{{ step_id.body }}`, `{{ step_id.status_code }}`,
 Calls `POST http://127.0.0.1:7327/api/tools/{name}/run` on the local node. Requires `prism node up` to be running. Response stored as `{{ step_id.output }}`.
 
 **OPA policy is checked per tool step** — see Security section below.
+
+#### `if` — Conditional branching
+
+```yaml
+- id: check_results
+  action: if
+  condition: "{{ search.body.count }}"    # Truthy check
+  then:
+    - id: found
+      action: message
+      text: "Found {{ search.body.count }} materials"
+    - id: process
+      action: tool
+      name: predict_properties
+      inputs:
+        dataset: "{{ search.body }}"
+  else:
+    - id: not_found
+      action: message
+      text: "No materials found — trying broader search"
+```
+
+**Truthy values:** non-empty string (except `"false"`, `"0"`, `"null"`), non-zero number, non-empty array/object, `true`.
+
+**Falsy values:** empty string, `"false"`, `"0"`, `"null"`, `0`, `null`, empty array/object.
+
+Sub-steps in `then`/`else` can be any step type (`set`, `message`, `http`, `tool`). Context set by sub-steps is available to subsequent workflow steps.
+
+Stored in context as `{{ step_id.branch }}` ("then" or "else") and `{{ step_id.condition }}`.
+
+#### `parallel` — Concurrent execution
+
+```yaml
+- id: multi_search
+  action: parallel
+  steps:
+    - id: search_mp
+      action: http
+      method: GET
+      url: "https://api.materialsproject.org/materials?formula={{ formula }}"
+    - id: search_nomad
+      action: http
+      method: GET
+      url: "https://nomad-lab.eu/api/v1/entries?formula={{ formula }}"
+    - id: search_graph
+      action: http
+      method: GET
+      url: "{{ platform_api_base }}/knowledge/graph/search?q={{ formula }}"
+```
+
+All sub-steps execute concurrently via `tokio::spawn`. Each sub-step's context is merged back into the parent. In dry run, shows the plan without executing.
+
+Stored in context as `{{ step_id.completed }}` (count) and `{{ step_id.steps }}` (list of sub-step IDs).
+
+**Note:** Sub-steps run independently — they cannot reference each other's output. Use `parallel` for fan-out queries, not for dependent chains.
+
+#### `workflow` — Call a sub-workflow
+
+```yaml
+- id: train_model
+  action: workflow
+  name: forge                              # Must exist in discovery paths
+  inputs:
+    paper: "{{ paper }}"
+    dataset: "{{ candidates }}"
+    target: "local"
+```
+
+Recursively executes another workflow with its own arguments, steps, and policy checks. The child workflow's full result (context + steps) is stored under the step ID.
+
+Access child results: `{{ train_model.workflow }}`, `{{ train_model.steps }}`, `{{ train_model.context.variable }}`.
+
+**OPA policy:** The child workflow gets its own `workflow.execute` policy check. If the child is denied, the parent aborts.
+
+#### Retries — on any step
+
+Any step can have retry configuration:
+
+```yaml
+- id: flaky_api
+  action: http
+  method: GET
+  url: "https://unreliable-api.example.com/data"
+  retries: 3                  # Retry up to 3 times on failure
+  retry_delay_secs: 2         # Base delay (multiplied by attempt number)
+  expect_status: [200]
+```
+
+Retry behavior:
+- Attempt 0: immediate
+- Attempt 1: wait `retry_delay_secs * 1` seconds
+- Attempt 2: wait `retry_delay_secs * 2` seconds
+- If all attempts fail, the workflow aborts with the last error
+- Dry run mode never retries
+
+Works on all step types: `set`, `message`, `http`, `tool`, `if`, `parallel`, `workflow`.
+
+---
+
+## Hooks
+
+Hooks run before and after the main workflow steps. They're defined at the top level of the YAML:
+
+```yaml
+hooks:
+  on_start:
+    - id: notify_start
+      action: http
+      method: POST
+      url: "https://slack.example.com/webhook"
+      body:
+        text: "Workflow {{ workflow_name }} starting"
+    - id: log_start
+      action: message
+      text: "Starting {{ workflow_name }} at {{ now_iso }}"
+
+  on_complete:
+    - id: notify_done
+      action: http
+      method: POST
+      url: "https://slack.example.com/webhook"
+      body:
+        text: "Workflow {{ workflow_name }} completed"
+
+  on_error:
+    - id: notify_fail
+      action: message
+      text: "Workflow {{ workflow_name }} failed"
+```
+
+| Hook | When it runs | Context available |
+|------|-------------|-------------------|
+| `on_start` | Before any step, after argument resolution | Arguments + builtins only |
+| `on_complete` | After all steps succeed | Full context including all step outputs |
+| `on_error` | When any step fails (planned, not yet wired) | Context up to the failed step |
+
+Hook steps can be `set`, `message`, or `http`. Hook failures are logged but don't abort the workflow.
+
+---
+
+## OPA Obligations
+
+When OPA policy allows a workflow, it may also return **obligations** — things the system must do as a side effect.
+
+### Built-in obligations
+
+| Obligation | Trigger | Effect |
+|------------|---------|--------|
+| `audit_log` | Any `workflow.execute` action | Logs workflow start/complete via `tracing::info` with workflow name, principal, and timestamps |
+| `notify_admin` | Agent role executing a workflow | Emits `tracing::warn` so admin dashboards/alerting can pick it up |
+
+### Custom obligations
+
+Add custom obligations in your `.rego` policy:
+
+```rego
+package prism.policy
+
+# Require cost approval for expensive workflows
+obligations contains "cost_approval" if {
+    input.action == "workflow.execute"
+    input.context.step_count > 10
+}
+
+# Require audit for any agent action
+obligations contains "audit_log" if {
+    input.principal == "agent"
+}
+```
+
+Obligations are returned in the `PolicyDecision.obligations` field and logged/acted on by the workflow engine. Custom obligation handlers can be added in the Rust workflow engine as needed.
 
 ---
 
@@ -447,29 +622,38 @@ prism explore --space "Ni-Cr-Co" --target "hardness > 400" --execute
 
 ### Dry run vs Execute
 
-| Mode | `set` steps | `message` steps | `http` steps | `tool` steps |
-|------|-------------|-----------------|--------------|--------------|
-| `dry_run` | Context updated, status=`planned` | Text rendered, status=`planned` | URL shown but **not called**, status=`planned` | Tool shown but **not called**, status=`planned` |
-| `execute` | Context updated, status=`completed` | Text rendered, status=`completed` | HTTP call made, response stored, status=`completed` | Tool called via node API, response stored, status=`completed` |
+| Mode | `set` | `message` | `http` | `tool` | `if` | `parallel` | `workflow` |
+|------|-------|-----------|--------|--------|------|------------|------------|
+| `dry_run` | Context updated, `planned` | Text rendered, `planned` | URL shown, **not called** | Tool shown, **not called** | Condition evaluated, branch shown | Steps listed, **not called** | Child shown, **not called** |
+| `execute` | Context updated, `completed` | Text rendered, `completed` | HTTP called, response stored | Tool called via node API | Branch executed, sub-steps run | All sub-steps run concurrently | Child workflow fully executed |
 
 ### Error handling
 
-- If an `http` step returns a status not in `expect_status`, the workflow **aborts**
-- If a `tool` step returns HTTP 4xx/5xx, the workflow **aborts**
+- If an `http` step returns a status not in `expect_status`, the workflow **aborts** (unless `retries` is set)
+- If a `tool` step returns HTTP 4xx/5xx, the workflow **aborts** (unless `retries` is set)
 - If a template variable doesn't exist in context, the workflow **aborts** with `unknown workflow context path`
 - If a required argument is missing, the workflow **aborts** before any step runs
 - OPA deny → workflow **aborts** with the deny message
+- `retries` → retries with exponential backoff before aborting
+- `parallel` → if any sub-step fails, the entire parallel step fails
+- `workflow` → if the child workflow fails, the parent aborts
+- Hook failures are **logged but do not abort** the workflow
 
 ### Context lifetime
 
 Context lives for the duration of the workflow run. Each step adds to it:
 
 ```
-Initial context (args + env + defaults + builtins)
+on_start hooks (can set context)
   └─ step 1 output added
-       └─ step 2 output added
-            └─ step 3 can read from step 1, step 2, and all args
+       └─ step 2 output added (if/parallel/workflow sub-steps also add)
+            └─ step 3 can read from step 1, step 2, all args, and hook context
+on_complete hooks (can read full context)
 ```
+
+For `parallel` steps, each sub-step runs with a snapshot of the current context. Sub-step outputs are merged back — if two sub-steps set the same key, last-to-finish wins.
+
+For `workflow` (nesting), the child gets its own context built from `inputs`. The child's full result is stored under the parent step ID — access with `{{ step_id.context.variable }}`.
 
 ---
 
@@ -498,3 +682,116 @@ The complete flow for adding a new GFlowNet exploration capability:
    ```
 
 No Rust code changes. No CLI modifications. No compilation. The workflow engine handles discovery, argument parsing, template rendering, OPA policy, HTTP calls, tool dispatch, and result reporting.
+
+---
+
+## Complete Example: All Features
+
+A workflow that uses every engine feature:
+
+```yaml
+api_version: prism/v1
+kind: workflow
+name: full-pipeline
+command_name: pipeline
+description: End-to-end materials discovery with all engine features.
+
+arguments:
+  - name: formula
+    type: string
+    required: true
+    help: Chemical formula to investigate, e.g. NiCrCoAlTi
+  - name: target
+    type: string
+    default: yield_strength
+    help: Property to optimize
+
+hooks:
+  on_start:
+    - id: h_start
+      action: message
+      text: "Pipeline starting for {{ formula }} targeting {{ target }}"
+  on_complete:
+    - id: h_done
+      action: http
+      method: POST
+      url: "https://hooks.example.com/notify"
+      body:
+        text: "Pipeline for {{ formula }} completed"
+
+steps:
+  # 1. Search multiple databases in parallel
+  - id: search
+    action: parallel
+    steps:
+      - id: graph
+        action: http
+        method: GET
+        url: "https://api.marc27.com/api/v1/knowledge/graph/search?q={{ formula }}"
+      - id: semantic
+        action: http
+        method: POST
+        url: "https://api.marc27.com/api/v1/knowledge/search"
+        body:
+          query: "{{ formula }} {{ target }}"
+
+  # 2. Check if we found anything
+  - id: check
+    action: if
+    condition: "{{ graph.body }}"
+    then:
+      - id: found
+        action: message
+        text: "Found existing data — enriching with predictions"
+    else:
+      - id: not_found
+        action: message
+        text: "No existing data — starting from scratch"
+
+  # 3. Run GFlowNet exploration (retries for flaky GPU)
+  - id: explore
+    action: http
+    method: POST
+    url: "https://api.marc27.com/api/v1/compute/submit"
+    retries: 2
+    retry_delay_secs: 5
+    body:
+      image: "marc27/gflownet:latest"
+      name: "explore-{{ formula }}"
+      inputs:
+        formula: "{{ formula }}"
+        target: "{{ target }}"
+
+  # 4. Run the forge sub-workflow to train a model
+  - id: train
+    action: workflow
+    name: forge
+    inputs:
+      paper: "gflownet-output"
+      dataset: "{{ formula }}"
+      target: "local"
+
+  # 5. Report
+  - id: report
+    action: message
+    text: "Pipeline complete: explored {{ formula }}, job={{ explore.body.job_id }}, model trained"
+```
+
+```bash
+prism pipeline --formula NiCrCoAlTi --target yield_strength --execute
+```
+
+---
+
+## Step Type Summary
+
+| Step | Purpose | OPA check | Context output |
+|------|---------|-----------|---------------|
+| `set` | Set variables | No | `{{ step_id.key }}` |
+| `message` | Display text | No | `{{ step_id.message }}` |
+| `http` | Call any API | No | `{{ step_id.body }}`, `{{ step_id.status_code }}` |
+| `tool` | Call PRISM tool | **Yes** (per-tool) | `{{ step_id.output }}` |
+| `if` | Branch on condition | No | `{{ step_id.branch }}`, `{{ step_id.condition }}` |
+| `parallel` | Fan-out concurrent | No | `{{ step_id.completed }}`, `{{ step_id.steps }}` |
+| `workflow` | Call sub-workflow | **Yes** (child gets own check) | `{{ step_id.context.* }}`, `{{ step_id.steps }}` |
+| `retries` | Retry any step | Inherited | Same as wrapped step |
