@@ -145,6 +145,9 @@ pub struct App {
     pub palette_visible: bool,
     pub palette_selected: usize,
 
+    // Background loading flags
+    pub loading_models: bool,
+
     // Model picker
     pub model_picker_visible: bool,
     pub model_picker_search: String,
@@ -187,6 +190,7 @@ impl App {
             input_history_idx: None,
             palette_visible: false,
             palette_selected: 0,
+            loading_models: false,
             model_picker_visible: false,
             model_picker_search: String::new(),
             model_picker_selected: 0,

@@ -379,6 +379,38 @@ pub async fn run_tui_app(
 
     let mut app = state::App::new(project_root.to_path_buf());
 
+    // Pre-load model catalog via direct HTTP (don't wait for backend)
+    {
+        if let Ok(paths) = prism_runtime::PrismPaths::discover() {
+            if let Ok(cli_state) = paths.load_cli_state() {
+                if let Some(creds) = &cli_state.credentials {
+                    if let Some(project_id) = &creds.project_id {
+                        let url = format!(
+                            "https://api.marc27.com/api/v1/projects/{project_id}/llm/models"
+                        );
+                        if let Ok(resp) = reqwest::Client::new()
+                            .get(&url)
+                            .header("Authorization", format!("Bearer {}", creds.access_token))
+                            .timeout(Duration::from_secs(10))
+                            .send()
+                            .await
+                        {
+                            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                                let models = components::model_picker::parse_models(&data);
+                                if !models.is_empty() {
+                                    app.cached_providers =
+                                        components::model_picker::providers(&models);
+                                    app.model_count = Some(models.len());
+                                    app.cached_models = models;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Spawn backend process
     let current_exe = std::env::current_exe()?;
     let mut client =
@@ -438,9 +470,6 @@ pub async fn run_tui_app(
                     protocol::ProtocolNotification::Prompt(prompt) => {
                         app.active_prompt = Some(prompt);
                     }
-                    protocol::ProtocolNotification::View(view) => {
-                        app.active_view = Some(view);
-                    }
                     protocol::ProtocolNotification::Cost(cost) => {
                         app.total_cost += cost.turn_cost;
                         app.chat_history.push(state::ChatElement::Cost(cost));
@@ -454,7 +483,12 @@ pub async fn run_tui_app(
                         }
                     }
                     protocol::ProtocolNotification::Welcome(w) => {
-                        app.model_count = Some(w.tool_count);
+                        if app.model_count.is_none() {
+                            app.model_count = Some(w.tool_count);
+                        }
+                    }
+                    protocol::ProtocolNotification::View(view) => {
+                        app.active_view = Some(view);
                     }
                     _ => {}
                 }
@@ -484,13 +518,71 @@ pub async fn run_tui_app(
                         app.activity_down();
                     }
                     KeyCode::Esc => {
-                        if app.palette_visible {
+                        if app.model_picker_visible {
+                            app.model_picker_visible = false;
+                        } else if app.palette_visible {
                             app.palette_visible = false;
                         } else {
                             app.active_view = None;
                             app.active_prompt = None;
                         }
                     }
+                    // ── Model picker keys ────────────────────────
+                    KeyCode::Up if app.model_picker_visible => {
+                        if app.model_picker_selected > 0 {
+                            app.model_picker_selected -= 1;
+                        }
+                    }
+                    KeyCode::Down if app.model_picker_visible => {
+                        app.model_picker_selected += 1;
+                    }
+                    KeyCode::Tab if app.model_picker_visible => {
+                        // Cycle provider filter
+                        let max = app.cached_providers.len() + 1; // +1 for "all"
+                        app.model_picker_provider_idx = (app.model_picker_provider_idx + 1) % max;
+                        app.model_picker_selected = 0;
+                    }
+                    KeyCode::Char(c) if app.model_picker_visible => {
+                        app.model_picker_search.push(c);
+                        app.model_picker_selected = 0;
+                    }
+                    KeyCode::Backspace if app.model_picker_visible => {
+                        app.model_picker_search.pop();
+                        app.model_picker_selected = 0;
+                    }
+                    KeyCode::Enter if app.model_picker_visible => {
+                        // Select the model
+                        let provider_filter = if app.model_picker_provider_idx == 0 {
+                            None
+                        } else {
+                            app.cached_providers.get(app.model_picker_provider_idx - 1).map(|s| s.as_str())
+                        };
+                        let filtered = components::model_picker::filter_models(
+                            &app.cached_models,
+                            &app.model_picker_search,
+                            provider_filter,
+                        );
+                        if let Some(model) = filtered.get(app.model_picker_selected) {
+                            // Send /model <id> command to backend
+                            let cmd = format!("/model {}", model.model_id);
+                            let req = protocol::InputCommandRequest {
+                                jsonrpc: "2.0".to_string(),
+                                method: "input.command".to_string(),
+                                id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                params: protocol::InputCommandParams {
+                                    command: cmd,
+                                    silent: true,
+                                },
+                            };
+                            let _ = client.tx_requests.send(serde_json::to_string(&req)?).await;
+                        }
+                        app.model_picker_visible = false;
+                        app.model_picker_search.clear();
+                        app.model_picker_selected = 0;
+                        app.model_picker_provider_idx = 0;
+                        continue;
+                    }
+                    // ── Command palette keys ─────────────────────
                     KeyCode::Up if app.palette_visible => {
                         if app.palette_selected > 0 {
                             app.palette_selected -= 1;
@@ -498,10 +590,8 @@ pub async fn run_tui_app(
                     }
                     KeyCode::Down if app.palette_visible => {
                         app.palette_selected += 1;
-                        // Will be clamped during render
                     }
                     KeyCode::Tab if app.palette_visible => {
-                        // Tab accepts the selected command
                         let commands = components::command_palette::all_commands();
                         let query = app.input_buffer.strip_prefix('/').unwrap_or(&app.input_buffer);
                         let filtered = components::command_palette::filter_commands(&commands, query);
@@ -553,17 +643,38 @@ pub async fn run_tui_app(
                         }
                     }
                     KeyCode::Enter => {
-                        // If palette is visible, select the highlighted command
+                        // If palette is visible, execute the selected command
                         if app.palette_visible {
                             let commands = components::command_palette::all_commands();
                             let query = app.input_buffer.strip_prefix('/').unwrap_or(&app.input_buffer);
                             let filtered = components::command_palette::filter_commands(&commands, query);
                             if let Some(entry) = filtered.get(app.palette_selected) {
-                                app.input_buffer = entry.command.clone();
+                                let cmd = entry.command.clone();
+                                app.input_buffer.clear();
+                                app.palette_visible = false;
+                                app.palette_selected = 0;
+
+                                // Special: /model opens picker
+                                if (cmd == "/model" || cmd == "/models") && !app.cached_models.is_empty() {
+                                    app.model_picker_visible = true;
+                                    continue;
+                                }
+
+                                // Execute the command
+                                let req = protocol::InputCommandRequest {
+                                    jsonrpc: "2.0".to_string(),
+                                    method: "input.command".to_string(),
+                                    id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                    params: protocol::InputCommandParams {
+                                        command: cmd,
+                                        silent: false,
+                                    },
+                                };
+                                let _ = client.tx_requests.send(serde_json::to_string(&req)?).await;
+                                continue;
                             }
                             app.palette_visible = false;
                             app.palette_selected = 0;
-                            // Don't submit — let user add args or press Enter again
                             continue;
                         }
                         if app.active_view.is_none() && app.active_prompt.is_none() && !app.input_buffer.is_empty() {
@@ -571,6 +682,29 @@ pub async fn run_tui_app(
                             app.input_buffer.clear();
 
                             app.chat_history.push(state::ChatElement::UserMessage(text.clone()));
+
+                            // Special handling for /model — open model picker
+                            if text == "/model" || text == "/models" {
+                                if !app.cached_models.is_empty() {
+                                    app.model_picker_visible = true;
+                                    app.model_picker_search.clear();
+                                    app.model_picker_selected = 0;
+                                    app.model_picker_provider_idx = 0;
+                                } else {
+                                    // No cached models — send as regular command
+                                    let req = protocol::InputCommandRequest {
+                                        jsonrpc: "2.0".to_string(),
+                                        method: "input.command".to_string(),
+                                        id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                                        params: protocol::InputCommandParams {
+                                            command: text,
+                                            silent: false,
+                                        },
+                                    };
+                                    let _ = client.tx_requests.send(serde_json::to_string(&req)?).await;
+                                }
+                                continue;
+                            }
 
                             if text.starts_with('/') {
                                 let req = protocol::InputCommandRequest {
