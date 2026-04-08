@@ -9,15 +9,25 @@ use crate::api::PlatformClient;
 pub struct MarketplaceTool {
     pub name: String,
     #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub resource_type: String,
+    #[serde(default)]
     pub version: String,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
-    pub author: String,
+    pub author: Option<String>,
     #[serde(default)]
-    pub download_url: Option<String>,
+    pub pricing: String,
     #[serde(default)]
-    pub install_count: u64,
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub download_count: u64,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub license: Option<String>,
 }
 
 /// Client for the MARC27 marketplace endpoints.
