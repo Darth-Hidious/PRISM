@@ -53,9 +53,19 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             format!("{} tools", app.model_count.unwrap_or(106)),
             Style::default().fg(Color::Rgb(130, 130, 130)),
         ),
+        sep.clone(),
+        // Focus indicator
+        Span::styled(
+            match app.focus {
+                crate::tui::state::FocusZone::Input => "input",
+                crate::tui::state::FocusZone::Chat => "chat",
+                crate::tui::state::FocusZone::Sidebar => "sidebar",
+            },
+            Style::default().fg(Color::Rgb(180, 180, 100)),
+        ),
         // Shortcuts
         Span::styled(
-            "  Ctrl+E sidebar \u{2502} Ctrl+1-9 tabs \u{2502} / commands",
+            "  Tab focus \u{2502} Ctrl+E sidebar \u{2502} / commands",
             Style::default().fg(Color::Rgb(80, 80, 80)),
         ),
     ]);

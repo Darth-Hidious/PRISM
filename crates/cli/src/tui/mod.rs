@@ -536,12 +536,57 @@ pub async fn run_tui_app(
                         let idx = (c as usize) - ('1' as usize);
                         app.select_activity(idx);
                     }
-                    // Alt+Left/Right to cycle tabs
+                    // Alt+Left/Right to cycle workspace tabs
                     KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
                         app.activity_up();
                     }
                     KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
                         app.activity_down();
+                    }
+                    // Tab cycles focus zones (when palette/picker not open)
+                    KeyCode::Tab if !app.palette_visible && !app.model_picker_visible => {
+                        app.focus = match app.focus {
+                            state::FocusZone::Input => {
+                                if app.sidebar_visible {
+                                    state::FocusZone::Sidebar
+                                } else {
+                                    state::FocusZone::Chat
+                                }
+                            }
+                            state::FocusZone::Sidebar => state::FocusZone::Chat,
+                            state::FocusZone::Chat => state::FocusZone::Input,
+                        };
+                    }
+                    // Up/Down when chat is focused → scroll chat
+                    KeyCode::Up if app.focus == state::FocusZone::Chat => {
+                        if app.chat_scroll > 0 {
+                            app.chat_scroll -= 1;
+                        }
+                    }
+                    KeyCode::Down if app.focus == state::FocusZone::Chat => {
+                        app.chat_scroll += 1;
+                    }
+                    KeyCode::PageUp if app.focus == state::FocusZone::Chat => {
+                        app.chat_scroll = app.chat_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown if app.focus == state::FocusZone::Chat => {
+                        app.chat_scroll += 10;
+                    }
+                    // Home goes to top, End goes to bottom
+                    KeyCode::Home if app.focus == state::FocusZone::Chat => {
+                        app.chat_scroll = 0;
+                    }
+                    KeyCode::End if app.focus == state::FocusZone::Chat => {
+                        app.chat_scroll = u16::MAX; // will be clamped by Paragraph
+                    }
+                    // Up/Down when sidebar is focused → scroll sidebar
+                    KeyCode::Up if app.focus == state::FocusZone::Sidebar => {
+                        if app.sidebar_scroll > 0 {
+                            app.sidebar_scroll -= 1;
+                        }
+                    }
+                    KeyCode::Down if app.focus == state::FocusZone::Sidebar => {
+                        app.sidebar_scroll += 1;
                     }
                     KeyCode::Esc => {
                         if app.model_picker_visible {
@@ -627,9 +672,30 @@ pub async fn run_tui_app(
                             app.palette_selected = 0;
                         }
                     }
+                    // Left/Right arrow in input → move cursor
+                    KeyCode::Left if app.focus == state::FocusZone::Input && !app.palette_visible && !app.model_picker_visible => {
+                        if app.input_cursor > 0 {
+                            // Move to previous char boundary
+                            let mut pos = app.input_cursor - 1;
+                            while pos > 0 && !app.input_buffer.is_char_boundary(pos) {
+                                pos -= 1;
+                            }
+                            app.input_cursor = pos;
+                        }
+                    }
+                    KeyCode::Right if app.focus == state::FocusZone::Input && !app.palette_visible && !app.model_picker_visible => {
+                        if app.input_cursor < app.input_buffer.len() {
+                            let mut pos = app.input_cursor + 1;
+                            while pos < app.input_buffer.len() && !app.input_buffer.is_char_boundary(pos) {
+                                pos += 1;
+                            }
+                            app.input_cursor = pos;
+                        }
+                    }
                     KeyCode::Char(c) => {
-                        if app.active_view.is_none() && app.active_prompt.is_none() {
-                            app.input_buffer.push(c);
+                        if app.active_view.is_none() && app.active_prompt.is_none() && app.focus == state::FocusZone::Input {
+                            app.input_buffer.insert(app.input_cursor, c);
+                            app.input_cursor += c.len_utf8();
                             // Show palette when typing /
                             if app.input_buffer.starts_with('/') {
                                 app.palette_visible = true;
@@ -657,9 +723,16 @@ pub async fn run_tui_app(
                         }
                     }
                     KeyCode::Backspace => {
-                        if app.active_view.is_none() && app.active_prompt.is_none() {
-                            app.input_buffer.pop();
-                            // Update palette visibility
+                        if app.active_view.is_none() && app.active_prompt.is_none() && app.focus == state::FocusZone::Input {
+                            if app.input_cursor > 0 {
+                                // Find previous char boundary
+                                let mut prev = app.input_cursor - 1;
+                                while prev > 0 && !app.input_buffer.is_char_boundary(prev) {
+                                    prev -= 1;
+                                }
+                                app.input_buffer.drain(prev..app.input_cursor);
+                                app.input_cursor = prev;
+                            }
                             if app.input_buffer.starts_with('/') {
                                 app.palette_visible = true;
                                 app.palette_selected = 0;
@@ -677,6 +750,7 @@ pub async fn run_tui_app(
                             if let Some(entry) = filtered.get(app.palette_selected) {
                                 let cmd = entry.command.clone();
                                 app.input_buffer.clear();
+                                app.input_cursor = 0;
                                 app.palette_visible = false;
                                 app.palette_selected = 0;
 
@@ -706,6 +780,7 @@ pub async fn run_tui_app(
                         if app.active_view.is_none() && app.active_prompt.is_none() && !app.input_buffer.is_empty() {
                             let text = app.input_buffer.clone();
                             app.input_buffer.clear();
+                                app.input_cursor = 0;
 
                             app.chat_history.push(state::ChatElement::UserMessage(text.clone()));
 

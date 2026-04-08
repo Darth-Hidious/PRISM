@@ -117,17 +117,31 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         lines.extend(markdown::render_markdown(&app.streaming_text));
     }
 
+    let is_focused = app.focus == crate::tui::state::FocusZone::Chat;
+    let border_color = if is_focused {
+        Color::Cyan
+    } else {
+        Color::Rgb(70, 70, 70)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(70, 70, 70)))
+        .border_style(Style::default().fg(border_color))
         .title(Span::styled(
-            " PRISM Agent ",
+            if is_focused {
+                " PRISM Agent (↑↓ scroll) "
+            } else {
+                " PRISM Agent "
+            },
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ));
 
-    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    let p = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: true })
+        .scroll((app.chat_scroll, 0));
 
     f.render_widget(p, area);
 }
