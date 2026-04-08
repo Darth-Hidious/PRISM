@@ -149,3 +149,4 @@ optimade-python-tools/
 
 # Output artifacts
 output/
+node_modules/
