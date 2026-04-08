@@ -12,10 +12,32 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     for element in &app.chat_history {
         match element {
+            ChatElement::UserMessage(msg) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "\u{25cf} you: ",
+                        Style::default().fg(Color::Rgb(0, 200, 255)),
+                    ),
+                    Span::styled(msg.clone(), Style::default().fg(Color::White)),
+                ]));
+                lines.push(Line::from(""));
+            }
             ChatElement::Text(t) => {
                 // Parse markdown → styled spans
                 lines.extend(markdown::render_markdown(t));
                 lines.push(Line::from(""));
+            }
+            ChatElement::Cost(c) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {}in/{}out ", c.input_tokens, c.output_tokens),
+                        Style::default().fg(Color::Rgb(60, 60, 60)),
+                    ),
+                    Span::styled(
+                        format!("${:.4}", c.turn_cost),
+                        Style::default().fg(Color::Rgb(80, 80, 80)),
+                    ),
+                ]));
             }
             ChatElement::ToolStart(ts) => {
                 lines.push(Line::from(vec![
