@@ -471,13 +471,56 @@ pub async fn run_tui_app(
                     KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.sidebar_visible = !app.sidebar_visible;
                     }
+                    // Tab switching: Ctrl+1-9 for workspaces
+                    KeyCode::Char(c @ '1'..='9') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let idx = (c as usize) - ('1' as usize);
+                        app.select_activity(idx);
+                    }
+                    // Alt+Left/Right to cycle tabs
+                    KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                        app.activity_up();
+                    }
+                    KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                        app.activity_down();
+                    }
                     KeyCode::Esc => {
-                        app.active_view = None;
-                        app.active_prompt = None;
+                        if app.palette_visible {
+                            app.palette_visible = false;
+                        } else {
+                            app.active_view = None;
+                            app.active_prompt = None;
+                        }
+                    }
+                    KeyCode::Up if app.palette_visible => {
+                        if app.palette_selected > 0 {
+                            app.palette_selected -= 1;
+                        }
+                    }
+                    KeyCode::Down if app.palette_visible => {
+                        app.palette_selected += 1;
+                        // Will be clamped during render
+                    }
+                    KeyCode::Tab if app.palette_visible => {
+                        // Tab accepts the selected command
+                        let commands = components::command_palette::all_commands();
+                        let query = app.input_buffer.strip_prefix('/').unwrap_or(&app.input_buffer);
+                        let filtered = components::command_palette::filter_commands(&commands, query);
+                        if let Some(entry) = filtered.get(app.palette_selected) {
+                            app.input_buffer = entry.command.clone();
+                            app.palette_visible = false;
+                            app.palette_selected = 0;
+                        }
                     }
                     KeyCode::Char(c) => {
                         if app.active_view.is_none() && app.active_prompt.is_none() {
                             app.input_buffer.push(c);
+                            // Show palette when typing /
+                            if app.input_buffer.starts_with('/') {
+                                app.palette_visible = true;
+                                app.palette_selected = 0;
+                            } else {
+                                app.palette_visible = false;
+                            }
                         } else if let Some(_) = &app.active_prompt {
                             // Quick response bindings y/n/a/b
                             match c {
@@ -500,9 +543,29 @@ pub async fn run_tui_app(
                     KeyCode::Backspace => {
                         if app.active_view.is_none() && app.active_prompt.is_none() {
                             app.input_buffer.pop();
+                            // Update palette visibility
+                            if app.input_buffer.starts_with('/') {
+                                app.palette_visible = true;
+                                app.palette_selected = 0;
+                            } else {
+                                app.palette_visible = false;
+                            }
                         }
                     }
                     KeyCode::Enter => {
+                        // If palette is visible, select the highlighted command
+                        if app.palette_visible {
+                            let commands = components::command_palette::all_commands();
+                            let query = app.input_buffer.strip_prefix('/').unwrap_or(&app.input_buffer);
+                            let filtered = components::command_palette::filter_commands(&commands, query);
+                            if let Some(entry) = filtered.get(app.palette_selected) {
+                                app.input_buffer = entry.command.clone();
+                            }
+                            app.palette_visible = false;
+                            app.palette_selected = 0;
+                            // Don't submit — let user add args or press Enter again
+                            continue;
+                        }
                         if app.active_view.is_none() && app.active_prompt.is_none() && !app.input_buffer.is_empty() {
                             let text = app.input_buffer.clone();
                             app.input_buffer.clear();

@@ -141,6 +141,18 @@ pub struct App {
     pub input_history: Vec<String>,
     pub input_history_idx: Option<usize>,
 
+    // Command palette (autocomplete)
+    pub palette_visible: bool,
+    pub palette_selected: usize,
+
+    // Model picker
+    pub model_picker_visible: bool,
+    pub model_picker_search: String,
+    pub model_picker_selected: usize,
+    pub model_picker_provider_idx: usize, // 0 = all, 1+ = specific provider
+    pub cached_models: Vec<super::components::model_picker::ModelInfo>,
+    pub cached_providers: Vec<String>,
+
     // Misc
     pub project_root: PathBuf,
     pub should_quit: bool,
@@ -173,6 +185,14 @@ impl App {
             input_buffer: String::new(),
             input_history: Vec::new(),
             input_history_idx: None,
+            palette_visible: false,
+            palette_selected: 0,
+            model_picker_visible: false,
+            model_picker_search: String::new(),
+            model_picker_selected: 0,
+            model_picker_provider_idx: 0,
+            cached_models: Vec::new(),
+            cached_providers: Vec::new(),
             project_root,
             should_quit: false,
             model_count: None,
