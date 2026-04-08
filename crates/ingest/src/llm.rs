@@ -273,12 +273,42 @@ impl LlmClient {
         tools: &[ToolDefinition],
         mut on_delta: impl FnMut(&str),
     ) -> Result<ChatResponse> {
-        // MARC27 platform: use /stream with SSE
+        // MARC27 platform: use /stream with SSE.
+        // The platform proxy doesn't support OpenAI-style tool_calls in the response,
+        // so we inject tool definitions into the messages and parse structured tool
+        // calls from the response text.
         if self.is_marc27() {
             let url = format!("{}/stream", self.config.base_url);
+
+            // Inject tool definitions as a system message so the LLM knows what's available
+            let mut aug_messages: Vec<serde_json::Value> =
+                serde_json::to_value(messages)?.as_array().cloned().unwrap_or_default();
+
+            if !tools.is_empty() {
+                let tool_block = build_tool_prompt_block(tools);
+                // Append after the system prompt as a system message
+                let inject_idx = if aug_messages
+                    .first()
+                    .and_then(|m| m.get("role"))
+                    .and_then(|r| r.as_str())
+                    == Some("system")
+                {
+                    1
+                } else {
+                    0
+                };
+                aug_messages.insert(
+                    inject_idx,
+                    serde_json::json!({
+                        "role": "system",
+                        "content": tool_block,
+                    }),
+                );
+            }
+
             let body = serde_json::json!({
                 "model": self.config.model,
-                "messages": messages,
+                "messages": aug_messages,
             });
             let resp = self.post(&url, &body).await?;
             let text = resp.text().await.context("failed to read MARC27 stream")?;
@@ -317,15 +347,24 @@ impl LlmClient {
                     }
                 }
             }
+
+            // Parse tool calls from response text (```tool_call blocks)
+            let tool_calls = parse_text_tool_calls(&full_text);
+            let content_text = strip_tool_call_blocks(&full_text);
+
             return Ok(ChatResponse {
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content: if full_text.is_empty() {
+                    content: if content_text.is_empty() {
                         None
                     } else {
-                        Some(full_text)
+                        Some(content_text)
                     },
-                    tool_calls: None,
+                    tool_calls: if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    },
                     tool_call_id: None,
                 },
                 usage: usage_info,
@@ -560,6 +599,120 @@ impl LlmClient {
         }
         Ok(resp)
     }
+}
+
+// ── MARC27 text-based tool calling helpers ──────────────────────────
+
+/// Build a prompt block describing available tools.
+/// The LLM is instructed to call tools using ```tool_call JSON blocks.
+fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
+    let mut block = String::from(
+        "# Available Tools\n\n\
+         You have access to the following tools. To call a tool, output a fenced block:\n\n\
+         ```tool_call\n\
+         {\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n\
+         ```\n\n\
+         You may call multiple tools in one response. After each tool call, the system will \
+         execute it and provide the result. Then continue your response.\n\n\
+         Tools:\n\n",
+    );
+
+    for tool in tools {
+        block.push_str(&format!("- **{}**", tool.function.name));
+        if !tool.function.description.is_empty() {
+            block.push_str(&format!(": {}", tool.function.description));
+        }
+        block.push('\n');
+        let params = &tool.function.parameters;
+        if let Some(props) = params.get("properties").and_then(|p| p.as_object()) {
+            let required: Vec<String> = params
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (name, schema) in props {
+                let desc = schema
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+                let req = if required.iter().any(|r| r == name) {
+                    " (required)"
+                } else {
+                    ""
+                };
+                block.push_str(&format!("  - `{name}`{req}: {desc}\n"));
+            }
+        }
+        block.push('\n');
+    }
+
+    block
+}
+
+/// Parse ```tool_call blocks from response text.
+fn parse_text_tool_calls(text: &str) -> Vec<ToolCallResponse> {
+    let mut calls = Vec::new();
+    let mut rest = text;
+    let mut call_idx = 0;
+
+    while let Some(start) = rest.find("```tool_call") {
+        let after = &rest[start + 12..];
+        // Skip to next line
+        let after = after.trim_start_matches(|c: char| c != '\n');
+        let after = after.strip_prefix('\n').unwrap_or(after);
+
+        if let Some(end) = after.find("```") {
+            let json_str = after[..end].trim();
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let name = parsed
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let arguments = parsed
+                    .get("arguments")
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "{}".to_string());
+
+                calls.push(ToolCallResponse {
+                    id: format!("tc_{call_idx}"),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name,
+                        arguments,
+                    },
+                });
+                call_idx += 1;
+            }
+            rest = &after[end + 3..];
+        } else {
+            break;
+        }
+    }
+
+    calls
+}
+
+/// Strip ```tool_call blocks from response text, leaving only the prose.
+fn strip_tool_call_blocks(text: &str) -> String {
+    let mut result = String::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find("```tool_call") {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + 12..];
+        if let Some(end) = after.find("```") {
+            rest = &after[end + 3..];
+        } else {
+            break;
+        }
+    }
+    result.push_str(rest);
+    result.trim().to_string()
 }
 
 #[cfg(test)]
