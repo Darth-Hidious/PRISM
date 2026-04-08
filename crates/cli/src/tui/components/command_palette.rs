@@ -62,6 +62,9 @@ pub fn all_commands() -> Vec<CommandEntry> {
         ("/diff", "Git diff", "Files"),
         ("/bash", "Execute shell command", "Code"),
         ("/python", "Execute Python code", "Code"),
+        // Provenance & history
+        ("/scratchpad", "Agent action log", "System"),
+        ("/transcript", "Full conversation", "System"),
         // BYOK / BYOC
         ("/config set", "Set config value", "Settings"),
         ("/billing", "Credit balance", "Billing"),
