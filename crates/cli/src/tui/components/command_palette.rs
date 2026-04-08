@@ -58,8 +58,41 @@ pub fn all_commands() -> Vec<CommandEntry> {
         ("/logout", "Sign out", "Auth"),
         ("/read", "Read a file", "Files"),
         ("/edit", "Edit a file", "Files"),
+        ("/write", "Write a file", "Files"),
+        ("/diff", "Git diff", "Files"),
         ("/bash", "Execute shell command", "Code"),
         ("/python", "Execute Python code", "Code"),
+        // BYOK / BYOC
+        ("/config set", "Set config value", "Settings"),
+        ("/billing", "Credit balance", "Billing"),
+        ("/billing usage", "Usage breakdown", "Billing"),
+        ("/billing topup", "Buy credits", "Billing"),
+        // Compute backends
+        ("/run --ssh", "BYOC via SSH", "Compute"),
+        ("/run --k8s-context", "BYOC via Kubernetes", "Compute"),
+        ("/run --slurm", "BYOC via SLURM", "Compute"),
+        ("/deploy status", "Deployment status", "Compute"),
+        ("/deploy health", "Deployment health", "Compute"),
+        ("/deploy stop", "Stop deployment", "Compute"),
+        // Discourse
+        ("/discourse run", "Run discourse", "Research"),
+        ("/discourse status", "Discourse status", "Research"),
+        ("/discourse turns", "View turns", "Research"),
+        // Mesh extras
+        ("/mesh subscriptions", "Active subscriptions", "Mesh"),
+        ("/mesh unsubscribe", "Unsubscribe", "Mesh"),
+        ("/node probe", "Probe capabilities", "Mesh"),
+        ("/node logs", "Stream node logs", "Mesh"),
+        // Query modes
+        ("/query --cypher", "Direct Cypher query", "Data"),
+        ("/query --semantic", "Semantic search", "Data"),
+        ("/query --platform", "Platform graph", "Data"),
+        ("/query --federated", "Federated query", "Data"),
+        ("/ingest --watch", "Watch directory", "Data"),
+        ("/ingest --schema-only", "Schema detection", "Data"),
+        // Tools & discovery
+        ("/discover_capabilities", "Full capability scan", "System"),
+        ("/models info", "Model details", "Models"),
     ];
 
     for (cmd, desc, cat) in slash {
