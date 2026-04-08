@@ -3435,6 +3435,22 @@ EXAMPLES:
 
 /// Resolve platform auth for the human user (prism login → JWT).
 fn resolve_user_auth() -> Result<(String, String)> {
+    // Primary: read from PrismPaths (cli-state.json)
+    if let Ok(paths) = prism_runtime::PrismPaths::discover() {
+        if let Ok(state) = paths.load_cli_state() {
+            if let Some(creds) = &state.credentials {
+                let raw_url = &creds.platform_url;
+                let api_base = if raw_url.ends_with("/api/v1") {
+                    raw_url.clone()
+                } else {
+                    format!("{}/api/v1", raw_url.trim_end_matches('/'))
+                };
+                return Ok((api_base, format!("Bearer {}", creds.access_token)));
+            }
+        }
+    }
+
+    // Fallback: legacy ~/.prism/credentials.json
     let home = std::env::var("HOME").context("HOME not set")?;
     let cred_path = format!("{home}/.prism/credentials.json");
     let cred_data =
