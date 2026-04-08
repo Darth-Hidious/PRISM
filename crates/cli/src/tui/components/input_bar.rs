@@ -1,7 +1,7 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::style::{Style, Color};
+use ratatui::Frame;
 
 use crate::tui::state::App;
 
@@ -12,11 +12,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
 
-    let p = Paragraph::new(format!("> {}", app.input_buffer))
-        .block(input_block);
+    let p = Paragraph::new(format!("> {}", app.input_buffer)).block(input_block);
 
     f.render_widget(p, area);
-    
+
     // Position cursor
     if app.active_view.is_none() && app.active_prompt.is_none() {
         // Safe to cast, assuming input fits on screen for this prototype.

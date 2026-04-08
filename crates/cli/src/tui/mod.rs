@@ -302,22 +302,17 @@ pub fn run_splash() -> io::Result<()> {
                     Style::default().fg(Color::Rgb(100, 100, 100)),
                 ),
                 Span::styled("211K+", Style::default().fg(Color::Rgb(0, 255, 255))),
-                Span::styled(
-                    " | v",
-                    Style::default().fg(Color::Rgb(100, 100, 100)),
-                ),
+                Span::styled(" | v", Style::default().fg(Color::Rgb(100, 100, 100))),
                 Span::styled(
                     env!("CARGO_PKG_VERSION"),
                     Style::default().fg(Color::Rgb(255, 100, 255)),
                 ),
             ]));
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "   Press any key to continue...",
-                    Style::default().fg(Color::Rgb(80, 80, 80)),
-                ),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                "   Press any key to continue...",
+                Style::default().fg(Color::Rgb(80, 80, 80)),
+            )]));
 
             let paragraph = Paragraph::new(lines)
                 .block(
@@ -367,7 +362,10 @@ pub fn run_splash() -> io::Result<()> {
     Ok(())
 }
 
-pub async fn run_tui_app(project_root: &std::path::Path, python_bin: &std::path::Path) -> anyhow::Result<()> {
+pub async fn run_tui_app(
+    project_root: &std::path::Path,
+    python_bin: &std::path::Path,
+) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -375,10 +373,11 @@ pub async fn run_tui_app(project_root: &std::path::Path, python_bin: &std::path:
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = state::App::new(project_root.to_path_buf());
-    
+
     // Spawn backend process
     let current_exe = std::env::current_exe()?;
-    let mut client = backend_client::BackendClient::spawn(&current_exe, project_root, python_bin).await?;
+    let mut client =
+        backend_client::BackendClient::spawn(&current_exe, project_root, python_bin).await?;
 
     // Send init request
     let init_req = protocol::InitRequest {
@@ -390,16 +389,17 @@ pub async fn run_tui_app(project_root: &std::path::Path, python_bin: &std::path:
             resume: "default".to_string(),
         },
     };
-    client.tx_requests.send(serde_json::to_string(&init_req)?).await?;
+    client
+        .tx_requests
+        .send(serde_json::to_string(&init_req)?)
+        .await?;
 
     // Input thread bridging crossterm events
     let (tx_events, mut rx_events) = tokio::sync::mpsc::unbounded_channel();
-    thread::spawn(move || {
-        loop {
-            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-                if let Ok(e) = event::read() {
-                    let _ = tx_events.send(e);
-                }
+    thread::spawn(move || loop {
+        if event::poll(Duration::from_millis(50)).unwrap_or(false) {
+            if let Ok(e) = event::read() {
+                let _ = tx_events.send(e);
             }
         }
     });
@@ -436,7 +436,22 @@ pub async fn run_tui_app(project_root: &std::path::Path, python_bin: &std::path:
                     protocol::ProtocolNotification::View(view) => {
                         app.active_view = Some(view);
                     }
-                    _ => {} // Handle Welcome, Permission, Cost, etc.
+                    protocol::ProtocolNotification::Cost(cost) => {
+                        app.total_cost += cost.turn_cost;
+                        app.chat_history.push(state::ChatElement::Cost(cost));
+                    }
+                    protocol::ProtocolNotification::TurnComplete(_) => {
+                        // Flush any remaining streaming text
+                        if !app.streaming_text.is_empty() {
+                            let text = app.streaming_text.clone();
+                            app.streaming_text.clear();
+                            app.chat_history.push(state::ChatElement::Text(text));
+                        }
+                    }
+                    protocol::ProtocolNotification::Welcome(w) => {
+                        app.model_count = Some(w.tool_count);
+                    }
+                    _ => {}
                 }
             }
             ev = rx_events.recv() => {
@@ -486,9 +501,9 @@ pub async fn run_tui_app(project_root: &std::path::Path, python_bin: &std::path:
                         if app.active_view.is_none() && app.active_prompt.is_none() && !app.input_buffer.is_empty() {
                             let text = app.input_buffer.clone();
                             app.input_buffer.clear();
-                            
-                            app.chat_history.push(state::ChatElement::Text(format!("> {}", text)));
-                            
+
+                            app.chat_history.push(state::ChatElement::UserMessage(text.clone()));
+
                             if text.starts_with('/') {
                                 let req = protocol::InputCommandRequest {
                                     jsonrpc: "2.0".to_string(),

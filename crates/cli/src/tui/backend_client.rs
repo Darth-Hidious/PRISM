@@ -1,10 +1,10 @@
+use crate::tui::protocol::RpcNotification;
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use anyhow::{Context, Result};
-use crate::tui::protocol::RpcNotification;
 
 pub struct BackendClient {
     pub process: Child,
@@ -13,11 +13,7 @@ pub struct BackendClient {
 }
 
 impl BackendClient {
-    pub async fn spawn(
-        prism_exe: &Path,
-        project_root: &Path,
-        python_bin: &Path,
-    ) -> Result<Self> {
+    pub async fn spawn(prism_exe: &Path, project_root: &Path, python_bin: &Path) -> Result<Self> {
         let mut child = Command::new(prism_exe)
             .arg("backend")
             .arg("--project-root")
