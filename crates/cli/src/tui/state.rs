@@ -1,0 +1,214 @@
+use std::path::PathBuf;
+
+use crate::tui::protocol::{UiCard, UiCost, UiPrompt, UiStatus, UiToolStart, UiView};
+
+#[derive(Debug, Clone)]
+pub enum ChatElement {
+    UserMessage(String),
+    Text(String),
+    ToolStart(UiToolStart),
+    Card(UiCard),
+    Cost(UiCost),
+}
+
+/// The main content area workspace
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Workspace {
+    Chat,
+    Explorer,     // Knowledge graph browser
+    Models,       // Model selection + config
+    Compute,      // GPU jobs, deployments
+    Mesh,         // Nodes, peers, federation
+    Workflows,    // Workflow list + runner
+    Marketplace,  // Browse/install resources
+    Data,         // Datasets, corpora, ingest
+    Settings,     // Config, permissions, billing
+}
+
+/// Activity bar items — like VS Code's left icon strip
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    Chat,
+    Explorer,
+    Models,
+    Compute,
+    Mesh,
+    Workflows,
+    Marketplace,
+    Data,
+    Settings,
+}
+
+impl Activity {
+    pub fn all() -> &'static [Activity] {
+        &[
+            Self::Chat,
+            Self::Explorer,
+            Self::Models,
+            Self::Compute,
+            Self::Mesh,
+            Self::Workflows,
+            Self::Marketplace,
+            Self::Data,
+            Self::Settings,
+        ]
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Chat       => "\u{25cf}",  // ●  (filled = active by default)
+            Self::Explorer    => "\u{2737}",  // ✷  knowledge graph
+            Self::Models      => "\u{2636}",  // ☶  LLM models
+            Self::Compute     => "\u{2699}",  // ⚙  GPU/compute
+            Self::Mesh        => "\u{2630}",  // ☰  mesh/network
+            Self::Workflows   => "\u{25b7}",  // ▷  play/workflow
+            Self::Marketplace => "\u{229e}",  // ⊞  grid/store
+            Self::Data        => "\u{2261}",  // ≡  data/list
+            Self::Settings    => "\u{2638}",  // ☸  settings
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Chat        => "Chat",
+            Self::Explorer    => "Explorer",
+            Self::Models      => "Models",
+            Self::Compute     => "Compute",
+            Self::Mesh        => "Mesh",
+            Self::Workflows   => "Workflows",
+            Self::Marketplace => "Marketplace",
+            Self::Data        => "Data",
+            Self::Settings    => "Settings",
+        }
+    }
+
+    pub fn shortcut(&self) -> &'static str {
+        match self {
+            Self::Chat        => "1",
+            Self::Explorer    => "2",
+            Self::Models      => "3",
+            Self::Compute     => "4",
+            Self::Mesh        => "5",
+            Self::Workflows   => "6",
+            Self::Marketplace => "7",
+            Self::Data        => "8",
+            Self::Settings    => "9",
+        }
+    }
+
+    pub fn to_workspace(&self) -> Workspace {
+        match self {
+            Self::Chat        => Workspace::Chat,
+            Self::Explorer    => Workspace::Explorer,
+            Self::Models      => Workspace::Models,
+            Self::Compute     => Workspace::Compute,
+            Self::Mesh        => Workspace::Mesh,
+            Self::Workflows   => Workspace::Workflows,
+            Self::Marketplace => Workspace::Marketplace,
+            Self::Data        => Workspace::Data,
+            Self::Settings    => Workspace::Settings,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct App {
+    // Chat state
+    pub chat_history: Vec<ChatElement>,
+    pub streaming_text: String,
+
+    // Layout — VS Code style
+    pub activity_bar_idx: usize,   // selected activity (0-8)
+    pub sidebar_visible: bool,     // toggle panel open/closed
+    pub workspace: Workspace,      // what the main content shows
+
+    // Backend state
+    pub status: Option<UiStatus>,
+    pub total_cost: f64,
+
+    // View panel (opens INSIDE the sidebar panel, not the canvas)
+    pub active_view: Option<UiView>,
+    pub view_tab_index: usize,
+    pub view_scroll: u16,
+
+    // Approval prompt (modal overlay — blocks everything)
+    pub active_prompt: Option<UiPrompt>,
+
+    // Input
+    pub input_buffer: String,
+    pub input_history: Vec<String>,
+    pub input_history_idx: Option<usize>,
+
+    // Misc
+    pub project_root: PathBuf,
+    pub should_quit: bool,
+
+    // Cached workspace data
+    pub model_count: Option<usize>,
+    pub gpu_count: Option<usize>,
+    pub node_count: Option<usize>,
+    pub peer_count: Option<usize>,
+    pub marketplace_count: Option<usize>,
+    pub workflow_names: Vec<String>,
+    pub corpus_count: Option<usize>,
+    pub entity_count: Option<String>,
+}
+
+impl App {
+    pub fn new(project_root: PathBuf) -> Self {
+        Self {
+            chat_history: Vec::new(),
+            streaming_text: String::new(),
+            activity_bar_idx: 0,
+            sidebar_visible: true,
+            workspace: Workspace::Chat,
+            status: None,
+            total_cost: 0.0,
+            active_view: None,
+            view_tab_index: 0,
+            view_scroll: 0,
+            active_prompt: None,
+            input_buffer: String::new(),
+            input_history: Vec::new(),
+            input_history_idx: None,
+            project_root,
+            should_quit: false,
+            model_count: None,
+            gpu_count: None,
+            node_count: None,
+            peer_count: None,
+            marketplace_count: None,
+            workflow_names: Vec::new(),
+            corpus_count: None,
+            entity_count: None,
+        }
+    }
+
+    pub fn current_activity(&self) -> Activity {
+        Activity::all()[self.activity_bar_idx]
+    }
+
+    pub fn select_activity(&mut self, idx: usize) {
+        let activities = Activity::all();
+        if idx < activities.len() {
+            self.activity_bar_idx = idx;
+            self.workspace = activities[idx].to_workspace();
+            self.active_view = None;
+            self.view_tab_index = 0;
+            self.view_scroll = 0;
+        }
+    }
+
+    pub fn activity_up(&mut self) {
+        if self.activity_bar_idx > 0 {
+            self.select_activity(self.activity_bar_idx - 1);
+        }
+    }
+
+    pub fn activity_down(&mut self) {
+        let max = Activity::all().len() - 1;
+        if self.activity_bar_idx < max {
+            self.select_activity(self.activity_bar_idx + 1);
+        }
+    }
+}
