@@ -29,13 +29,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Horizontal: [activity bar | sidebar panel | main]
     let h_constraints = if app.sidebar_visible {
         vec![
-            Constraint::Length(3),  // Activity bar (icons)
-            Constraint::Length(25), // Sidebar panel
+            Constraint::Length(5),  // Activity bar (icons)
+            Constraint::Length(26), // Sidebar panel
             Constraint::Min(0),    // Main content
         ]
     } else {
         vec![
-            Constraint::Length(3),  // Activity bar always visible
+            Constraint::Length(5),  // Activity bar always visible
             Constraint::Length(0),  // Sidebar hidden
             Constraint::Min(0),    // Main content
         ]

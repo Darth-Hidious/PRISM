@@ -22,8 +22,8 @@ pub fn draw_activity_bar(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Rgb(80, 80, 80))
             };
             ListItem::new(Line::from(vec![
-                Span::raw(if selected { "\u{2590}" } else { " " }), // ▐ selection indicator
-                Span::styled(act.icon(), style),
+                Span::raw(if selected { " \u{2590}" } else { "  " }), // ▐ selection indicator
+                Span::styled(format!("{} ", act.icon()), style),
             ]))
         })
         .collect();

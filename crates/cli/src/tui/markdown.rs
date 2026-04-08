@@ -38,8 +38,74 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
             continue;
         }
 
-        // Headings
+        // Horizontal rules
+        let trimmed = raw_line.trim();
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            lines.push(Line::from(Span::styled(
+                "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+                Style::default().fg(Color::Rgb(50, 50, 50)),
+            )));
+            continue;
+        }
+
+        // Table rows: | col1 | col2 | col3 |
         let trimmed = raw_line.trim_start();
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            let cells: Vec<&str> = trimmed
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim())
+                .collect();
+
+            // Separator row (|---|---|) → render as border
+            if cells.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == ':')) {
+                let border: String = cells
+                    .iter()
+                    .map(|c| {
+                        let width = c.len().max(3);
+                        format!("\u{253c}{}", "\u{2500}".repeat(width + 2))
+                    })
+                    .collect::<String>();
+                lines.push(Line::from(Span::styled(
+                    format!("\u{251c}{}\u{2524}", &border[1..]),
+                    Style::default().fg(Color::Rgb(60, 60, 60)),
+                )));
+                continue;
+            }
+
+            // Data/header row
+            let mut spans = Vec::new();
+            spans.push(Span::styled(
+                "\u{2502}",
+                Style::default().fg(Color::Rgb(60, 60, 60)),
+            ));
+            for cell in &cells {
+                spans.push(Span::styled(
+                    format!(" {} ", cell),
+                    Style::default().fg(Color::White),
+                ));
+                spans.push(Span::styled(
+                    "\u{2502}",
+                    Style::default().fg(Color::Rgb(60, 60, 60)),
+                ));
+            }
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        // List items: - item or * item
+        if (trimmed.starts_with("- ") || trimmed.starts_with("* ")) && !trimmed.starts_with("**") {
+            let content = &trimmed[2..];
+            let mut spans = vec![Span::styled(
+                " \u{2022} ",
+                Style::default().fg(Color::Cyan),
+            )];
+            spans.extend(parse_inline_markdown(content));
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        // Headings
         if trimmed.starts_with("### ") {
             lines.push(Line::from(Span::styled(
                 trimmed[4..].to_string(),
