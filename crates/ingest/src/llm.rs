@@ -281,8 +281,10 @@ impl LlmClient {
             let url = format!("{}/stream", self.config.base_url);
 
             // Inject tool definitions as a system message so the LLM knows what's available
-            let mut aug_messages: Vec<serde_json::Value> =
-                serde_json::to_value(messages)?.as_array().cloned().unwrap_or_default();
+            let mut aug_messages: Vec<serde_json::Value> = serde_json::to_value(messages)?
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
 
             if !tools.is_empty() {
                 let tool_block = build_tool_prompt_block(tools);
@@ -681,10 +683,7 @@ fn parse_text_tool_calls(text: &str) -> Vec<ToolCallResponse> {
                 calls.push(ToolCallResponse {
                     id: format!("tc_{call_idx}"),
                     call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name,
-                        arguments,
-                    },
+                    function: FunctionCall { name, arguments },
                 });
                 call_idx += 1;
             }
