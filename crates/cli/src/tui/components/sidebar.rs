@@ -1,7 +1,7 @@
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
-use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use crate::tui::state::{Activity, App, Workspace};
@@ -51,9 +51,21 @@ pub fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     match app.workspace {
         Workspace::Chat => {
             let mut items = vec![
-                info_item("Session", app.status.as_ref().map(|s| s.session_mode.as_str()).unwrap_or("chat")),
+                info_item(
+                    "Session",
+                    app.status
+                        .as_ref()
+                        .map(|s| s.session_mode.as_str())
+                        .unwrap_or("chat"),
+                ),
                 info_item("Messages", &app.chat_history.len().to_string()),
-                info_item("Model", app.status.as_ref().and_then(|s| s.model.as_deref()).unwrap_or("none")),
+                info_item(
+                    "Model",
+                    app.status
+                        .as_ref()
+                        .and_then(|s| s.model.as_deref())
+                        .unwrap_or("none"),
+                ),
                 info_item("Cost", &format!("${:.4}", app.total_cost)),
                 spacer(),
                 header("Quick Commands"),
@@ -70,8 +82,19 @@ pub fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
         }
         Workspace::Models => {
             let items = vec![
-                info_item("Hosted", &app.model_count.map(|c| c.to_string()).unwrap_or("...".into())),
-                info_item("Active", app.status.as_ref().and_then(|s| s.model.as_deref()).unwrap_or("none")),
+                info_item(
+                    "Hosted",
+                    &app.model_count
+                        .map(|c| c.to_string())
+                        .unwrap_or("...".into()),
+                ),
+                info_item(
+                    "Active",
+                    app.status
+                        .as_ref()
+                        .and_then(|s| s.model.as_deref())
+                        .unwrap_or("none"),
+                ),
                 spacer(),
                 header("Actions"),
                 cmd_item("/models list", "Browse all"),
@@ -83,8 +106,18 @@ pub fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
         }
         Workspace::Mesh => {
             let items = vec![
-                info_item("Peers", &app.peer_count.map(|c| c.to_string()).unwrap_or("...".into())),
-                info_item("Nodes", &app.node_count.map(|c| c.to_string()).unwrap_or("...".into())),
+                info_item(
+                    "Peers",
+                    &app.peer_count
+                        .map(|c| c.to_string())
+                        .unwrap_or("...".into()),
+                ),
+                info_item(
+                    "Nodes",
+                    &app.node_count
+                        .map(|c| c.to_string())
+                        .unwrap_or("...".into()),
+                ),
                 spacer(),
                 header("Actions"),
                 cmd_item("/mesh discover", "Find peers"),
@@ -98,7 +131,10 @@ pub fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
         }
         Workspace::Compute => {
             let items = vec![
-                info_item("GPUs", &app.gpu_count.map(|c| c.to_string()).unwrap_or("...".into())),
+                info_item(
+                    "GPUs",
+                    &app.gpu_count.map(|c| c.to_string()).unwrap_or("...".into()),
+                ),
                 spacer(),
                 header("Actions"),
                 cmd_item("/deploy list", "Deployments"),
@@ -126,7 +162,12 @@ pub fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
         }
         Workspace::Marketplace => {
             let items = vec![
-                info_item("Resources", &app.marketplace_count.map(|c| c.to_string()).unwrap_or("...".into())),
+                info_item(
+                    "Resources",
+                    &app.marketplace_count
+                        .map(|c| c.to_string())
+                        .unwrap_or("...".into()),
+                ),
                 spacer(),
                 header("Actions"),
                 cmd_item("/marketplace search", "Browse"),
@@ -137,7 +178,12 @@ pub fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
         }
         Workspace::Data => {
             let items = vec![
-                info_item("Corpora", &app.corpus_count.map(|c| c.to_string()).unwrap_or("...".into())),
+                info_item(
+                    "Corpora",
+                    &app.corpus_count
+                        .map(|c| c.to_string())
+                        .unwrap_or("...".into()),
+                ),
                 info_item("Entities", app.entity_count.as_deref().unwrap_or("...")),
                 spacer(),
                 header("Actions"),
@@ -150,7 +196,13 @@ pub fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
         }
         Workspace::Settings => {
             let items = vec![
-                info_item("Provider", app.status.as_ref().and_then(|s| s.model.as_deref()).unwrap_or("none")),
+                info_item(
+                    "Provider",
+                    app.status
+                        .as_ref()
+                        .and_then(|s| s.model.as_deref())
+                        .unwrap_or("none"),
+                ),
                 spacer(),
                 header("Actions"),
                 cmd_item("/config", "View config"),

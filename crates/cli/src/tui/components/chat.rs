@@ -1,8 +1,8 @@
-use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Frame;
 
 use crate::tui::markdown;
 use crate::tui::state::{App, ChatElement};
@@ -41,10 +41,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             }
             ChatElement::ToolStart(ts) => {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "\u{26a1} ",
-                        Style::default().fg(Color::Yellow),
-                    ),
+                    Span::styled("\u{26a1} ", Style::default().fg(Color::Yellow)),
                     Span::styled(
                         format!("Running {}", ts.tool_name),
                         Style::default().fg(Color::Cyan),
@@ -94,9 +91,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Cyan),
         ));
 
-    let p = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
 
     f.render_widget(p, area);
 }

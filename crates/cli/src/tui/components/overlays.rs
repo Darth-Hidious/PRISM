@@ -123,17 +123,11 @@ pub fn draw_approval(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                "  Tool: ",
-                Style::default().fg(Color::Rgb(100, 100, 100)),
-            ),
+            Span::styled("  Tool: ", Style::default().fg(Color::Rgb(100, 100, 100))),
             Span::styled(&prompt.tool_name, Style::default().fg(Color::Cyan)),
         ]),
         Line::from(vec![
-            Span::styled(
-                "  Mode: ",
-                Style::default().fg(Color::Rgb(100, 100, 100)),
-            ),
+            Span::styled("  Mode: ", Style::default().fg(Color::Rgb(100, 100, 100))),
             Span::styled(
                 prompt.permission_mode.as_deref().unwrap_or("unknown"),
                 Style::default().fg(permission_color),

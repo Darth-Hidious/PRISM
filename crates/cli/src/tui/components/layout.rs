@@ -31,12 +31,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         vec![
             Constraint::Length(5),  // Activity bar (icons)
             Constraint::Length(26), // Sidebar panel
-            Constraint::Min(0),    // Main content
+            Constraint::Min(0),     // Main content
         ]
     } else {
         vec![
-            Constraint::Length(5),  // Activity bar always visible
-            Constraint::Length(0),  // Sidebar hidden
+            Constraint::Length(5), // Activity bar always visible
+            Constraint::Length(0), // Sidebar hidden
             Constraint::Min(0),    // Main content
         ]
     };
@@ -84,7 +84,10 @@ pub fn draw(f: &mut Frame, app: &App) {
                 .block(
                     ratatui::widgets::Block::default()
                         .borders(ratatui::widgets::Borders::ALL)
-                        .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::Rgb(50, 50, 50)))
+                        .border_style(
+                            ratatui::style::Style::default()
+                                .fg(ratatui::style::Color::Rgb(50, 50, 50)),
+                        )
                         .title(format!(" {} ", app.current_activity().label())),
                 );
                 f.render_widget(placeholder, main_area);

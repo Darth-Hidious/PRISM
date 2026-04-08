@@ -15,14 +15,14 @@ pub enum ChatElement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Workspace {
     Chat,
-    Explorer,     // Knowledge graph browser
-    Models,       // Model selection + config
-    Compute,      // GPU jobs, deployments
-    Mesh,         // Nodes, peers, federation
-    Workflows,    // Workflow list + runner
-    Marketplace,  // Browse/install resources
-    Data,         // Datasets, corpora, ingest
-    Settings,     // Config, permissions, billing
+    Explorer,    // Knowledge graph browser
+    Models,      // Model selection + config
+    Compute,     // GPU jobs, deployments
+    Mesh,        // Nodes, peers, federation
+    Workflows,   // Workflow list + runner
+    Marketplace, // Browse/install resources
+    Data,        // Datasets, corpora, ingest
+    Settings,    // Config, permissions, billing
 }
 
 /// Activity bar items — like VS Code's left icon strip
@@ -56,57 +56,57 @@ impl Activity {
 
     pub fn icon(&self) -> &'static str {
         match self {
-            Self::Chat       => "\u{25cf}",  // ●  (filled = active by default)
-            Self::Explorer    => "\u{2737}",  // ✷  knowledge graph
-            Self::Models      => "\u{2636}",  // ☶  LLM models
-            Self::Compute     => "\u{2699}",  // ⚙  GPU/compute
-            Self::Mesh        => "\u{2630}",  // ☰  mesh/network
-            Self::Workflows   => "\u{25b7}",  // ▷  play/workflow
-            Self::Marketplace => "\u{229e}",  // ⊞  grid/store
-            Self::Data        => "\u{2261}",  // ≡  data/list
-            Self::Settings    => "\u{2638}",  // ☸  settings
+            Self::Chat => "\u{25cf}",        // ●  (filled = active by default)
+            Self::Explorer => "\u{2737}",    // ✷  knowledge graph
+            Self::Models => "\u{2636}",      // ☶  LLM models
+            Self::Compute => "\u{2699}",     // ⚙  GPU/compute
+            Self::Mesh => "\u{2630}",        // ☰  mesh/network
+            Self::Workflows => "\u{25b7}",   // ▷  play/workflow
+            Self::Marketplace => "\u{229e}", // ⊞  grid/store
+            Self::Data => "\u{2261}",        // ≡  data/list
+            Self::Settings => "\u{2638}",    // ☸  settings
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Chat        => "Chat",
-            Self::Explorer    => "Explorer",
-            Self::Models      => "Models",
-            Self::Compute     => "Compute",
-            Self::Mesh        => "Mesh",
-            Self::Workflows   => "Workflows",
+            Self::Chat => "Chat",
+            Self::Explorer => "Explorer",
+            Self::Models => "Models",
+            Self::Compute => "Compute",
+            Self::Mesh => "Mesh",
+            Self::Workflows => "Workflows",
             Self::Marketplace => "Marketplace",
-            Self::Data        => "Data",
-            Self::Settings    => "Settings",
+            Self::Data => "Data",
+            Self::Settings => "Settings",
         }
     }
 
     pub fn shortcut(&self) -> &'static str {
         match self {
-            Self::Chat        => "1",
-            Self::Explorer    => "2",
-            Self::Models      => "3",
-            Self::Compute     => "4",
-            Self::Mesh        => "5",
-            Self::Workflows   => "6",
+            Self::Chat => "1",
+            Self::Explorer => "2",
+            Self::Models => "3",
+            Self::Compute => "4",
+            Self::Mesh => "5",
+            Self::Workflows => "6",
             Self::Marketplace => "7",
-            Self::Data        => "8",
-            Self::Settings    => "9",
+            Self::Data => "8",
+            Self::Settings => "9",
         }
     }
 
     pub fn to_workspace(&self) -> Workspace {
         match self {
-            Self::Chat        => Workspace::Chat,
-            Self::Explorer    => Workspace::Explorer,
-            Self::Models      => Workspace::Models,
-            Self::Compute     => Workspace::Compute,
-            Self::Mesh        => Workspace::Mesh,
-            Self::Workflows   => Workspace::Workflows,
+            Self::Chat => Workspace::Chat,
+            Self::Explorer => Workspace::Explorer,
+            Self::Models => Workspace::Models,
+            Self::Compute => Workspace::Compute,
+            Self::Mesh => Workspace::Mesh,
+            Self::Workflows => Workspace::Workflows,
             Self::Marketplace => Workspace::Marketplace,
-            Self::Data        => Workspace::Data,
-            Self::Settings    => Workspace::Settings,
+            Self::Data => Workspace::Data,
+            Self::Settings => Workspace::Settings,
         }
     }
 }
@@ -118,9 +118,9 @@ pub struct App {
     pub streaming_text: String,
 
     // Layout — VS Code style
-    pub activity_bar_idx: usize,   // selected activity (0-8)
-    pub sidebar_visible: bool,     // toggle panel open/closed
-    pub workspace: Workspace,      // what the main content shows
+    pub activity_bar_idx: usize, // selected activity (0-8)
+    pub sidebar_visible: bool,   // toggle panel open/closed
+    pub workspace: Workspace,    // what the main content shows
 
     // Backend state
     pub status: Option<UiStatus>,

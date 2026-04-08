@@ -57,17 +57,19 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 .map(|c| c.trim())
                 .collect();
 
-            // Separator row (|---|---|) → render as border
-            if cells.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == ':')) {
-                let border: String = cells
-                    .iter()
-                    .map(|c| {
-                        let width = c.len().max(3);
-                        format!("\u{253c}{}", "\u{2500}".repeat(width + 2))
-                    })
-                    .collect::<String>();
+            // Separator row (|---|---|) → render as horizontal border
+            if cells
+                .iter()
+                .all(|c| c.chars().all(|ch| ch == '-' || ch == ':'))
+            {
+                let mut segments = Vec::new();
+                for c in &cells {
+                    let width = c.len().max(3);
+                    segments.push("\u{2500}".repeat(width + 2));
+                }
+                let border = segments.join("\u{253c}");
                 lines.push(Line::from(Span::styled(
-                    format!("\u{251c}{}\u{2524}", &border[1..]),
+                    format!("\u{251c}{}\u{2524}", border),
                     Style::default().fg(Color::Rgb(60, 60, 60)),
                 )));
                 continue;
@@ -96,10 +98,7 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
         // List items: - item or * item
         if (trimmed.starts_with("- ") || trimmed.starts_with("* ")) && !trimmed.starts_with("**") {
             let content = &trimmed[2..];
-            let mut spans = vec![Span::styled(
-                " \u{2022} ",
-                Style::default().fg(Color::Cyan),
-            )];
+            let mut spans = vec![Span::styled(" \u{2022} ", Style::default().fg(Color::Cyan))];
             spans.extend(parse_inline_markdown(content));
             lines.push(Line::from(spans));
             continue;
