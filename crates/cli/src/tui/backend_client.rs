@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::tui::protocol::RpcNotification;
 use anyhow::{Context, Result};
 use std::path::Path;

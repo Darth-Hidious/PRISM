@@ -79,7 +79,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 }
                 lines.push(Line::from(vec![
                     Span::styled("  \u{26a1} ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{}", ts.verb), Style::default().fg(Color::Cyan)),
+                    Span::styled(ts.verb.clone(), Style::default().fg(Color::Cyan)),
                     Span::styled(
                         if let Some(ref preview) = ts.preview {
                             format!(" ({preview})")

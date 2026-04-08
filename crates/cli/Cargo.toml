@@ -41,3 +41,5 @@ prism-python-bridge = { path = "../python-bridge" }
 prism-runtime = { path = "../runtime" }
 prism-server = { path = "../server" }
 prism-workflows = { path = "../workflows" }
+ratatui = "0.26"
+crossterm = "0.27"

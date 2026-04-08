@@ -1,15 +1,61 @@
-//! LLM client — OpenAI-compatible API for all backends.
+//! LLM client — OpenAI-compatible + MARC27 platform proxy.
 //!
-//! Single wire format: `/v1/chat/completions`, `/v1/embeddings`.
-//! Works with: llama.cpp server, Ollama, vLLM, LiteLLM, OpenAI, Anthropic
-//! (via proxy), MARC27 platform, and any OpenAI-compatible endpoint.
+//! Wire formats:
+//! - OpenAI: `/v1/chat/completions`, `/v1/embeddings`
+//! - MARC27: `/stream` (SSE), text-based tool calling
+//!
+//! Works with: llama.cpp, Ollama, vLLM, LiteLLM, OpenAI, Anthropic,
+//! MARC27 platform, and any OpenAI-compatible endpoint.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::debug;
 
-use crate::LlmConfig;
+// ── Configuration ────────────────────────────────────────────────────
+
+/// Configuration for connecting to an LLM backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmConfig {
+    /// Base URL of the LLM API.
+    pub base_url: String,
+    /// Model name (e.g. "gemma-3-27b", "gpt-4o", "claude-sonnet-4-6").
+    pub model: String,
+    /// API key for authenticated providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Separate embedding model. If not set, uses `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    /// Maximum sample rows for extraction prompts.
+    #[serde(default = "default_max_sample_rows")]
+    pub max_sample_rows: usize,
+    /// Request timeout in seconds.
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_max_sample_rows() -> usize {
+    10
+}
+fn default_timeout_secs() -> u64 {
+    120
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "http://localhost:8080".into(),
+            model: "gemma-3-27b".into(),
+            api_key: None,
+            embedding_model: None,
+            max_sample_rows: 10,
+            timeout_secs: 120,
+        }
+    }
+}
+
+// ── Client ───────────────────────────────────────────────────────────
 
 /// A message in the conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,64 +354,128 @@ impl LlmClient {
                 );
             }
 
+            // Convert OpenAI-format messages to what MARC27 accepts.
+            // MARC27 only understands system/user/assistant with string content.
+            for msg in &mut aug_messages {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if role == "tool" {
+                    // Convert tool results to user messages
+                    let tool_id = msg
+                        .get("tool_call_id")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("tool");
+                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    *msg = serde_json::json!({
+                        "role": "user",
+                        "content": format!("[Tool result from {tool_id}]\n{content}"),
+                    });
+                } else if role == "assistant" {
+                    // Strip tool_calls and ensure content is a string (not null)
+                    if let Some(obj) = msg.as_object_mut() {
+                        obj.remove("tool_calls");
+                        obj.remove("tool_call_id");
+                        // Ensure content is always a string
+                        if obj.get("content").is_none()
+                            || obj.get("content") == Some(&serde_json::Value::Null)
+                        {
+                            obj.insert(
+                                "content".to_string(),
+                                serde_json::Value::String(String::new()),
+                            );
+                        }
+                    }
+                }
+            }
+
             let body = serde_json::json!({
                 "model": self.config.model,
                 "messages": aug_messages,
             });
-            let resp = self.post(&url, &body).await?;
-            let text = resp.text().await.context("failed to read MARC27 stream")?;
+            // Use a direct request (not the retry-wrapper post()) so we control headers
+            let mut req = self
+                .client
+                .post(&url)
+                .json(&body)
+                .header("Accept", "text/event-stream");
+            if let Some(auth) = self.auth_header() {
+                req = req.header("Authorization", auth);
+            }
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("MARC27 stream request to {url} failed"))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                bail!("MARC27 LLM returned HTTP {status}: {text}");
+            }
+            debug!("MARC27 stream response received, reading chunks...");
+
+            // Read SSE stream incrementally — don't use resp.text() which
+            // blocks until the connection closes (SSE keeps it open).
+            use futures_util::StreamExt;
+            let mut stream = resp.bytes_stream();
+            let mut sse_buf = String::new();
             let mut full_text = String::new();
             let mut usage_info = None;
             let mut hit_tool_call = false;
+            let mut done = false;
 
-            for line in text.lines() {
-                let line = line.strip_prefix("data: ").unwrap_or(line).trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
-                        if !delta.is_empty() {
-                            full_text.push_str(delta);
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk.context("error reading SSE chunk")?;
+                sse_buf.push_str(&String::from_utf8_lossy(&bytes));
 
-                            // Stop forwarding deltas to UI once we see a tool_call block
-                            if !hit_tool_call {
-                                if full_text.contains("```tool_call") {
-                                    hit_tool_call = true;
-                                    // Emit only the text BEFORE the first tool_call
-                                    let before = full_text
-                                        .split("```tool_call")
-                                        .next()
-                                        .unwrap_or("")
-                                        .to_string();
-                                    // We already emitted some deltas — the preamble is partial.
-                                    // For simplicity, don't emit this delta (it contains the marker)
-                                } else {
-                                    on_delta(delta);
+                // Process complete lines from the buffer
+                while let Some(nl) = sse_buf.find('\n') {
+                    let line = sse_buf[..nl].trim().to_string();
+                    sse_buf = sse_buf[nl + 1..].to_string();
+
+                    let line = line.strip_prefix("data: ").unwrap_or(&line).trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(line) {
+                        if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
+                            if !delta.is_empty() {
+                                full_text.push_str(delta);
+
+                                if !hit_tool_call {
+                                    if full_text.contains("```tool_call") {
+                                        hit_tool_call = true;
+                                    } else {
+                                        on_delta(delta);
+                                    }
                                 }
                             }
-                            // If we already hit tool_call, skip all further deltas
+                        }
+                        if let Some(u) = chunk.get("usage") {
+                            let pt = u
+                                .get("prompt_tokens")
+                                .or_else(|| u.get("input_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let ct = u
+                                .get("completion_tokens")
+                                .or_else(|| u.get("output_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            if pt > 0 || ct > 0 {
+                                usage_info = Some(UsageInfo {
+                                    prompt_tokens: pt,
+                                    completion_tokens: ct,
+                                    total_tokens: pt + ct,
+                                });
+                            }
+                        }
+                        if chunk.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                            done = true;
+                            break;
                         }
                     }
-                    if let Some(u) = chunk.get("usage") {
-                        let pt = u
-                            .get("prompt_tokens")
-                            .or_else(|| u.get("input_tokens"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let ct = u
-                            .get("completion_tokens")
-                            .or_else(|| u.get("output_tokens"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        if pt > 0 || ct > 0 {
-                            usage_info = Some(UsageInfo {
-                                prompt_tokens: pt,
-                                completion_tokens: ct,
-                                total_tokens: pt + ct,
-                            });
-                        }
-                    }
+                }
+                if done {
+                    break;
                 }
             }
 

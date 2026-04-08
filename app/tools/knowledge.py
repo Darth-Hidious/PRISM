@@ -10,14 +10,81 @@ from app.tools.base import Tool, ToolRegistry
 logger = logging.getLogger(__name__)
 
 
+class _DirectClient:
+    """Fallback HTTP client when marc27 SDK is not installed.
+
+    Uses MARC27_API_KEY and MARC27_API_URL env vars passed by the Rust CLI.
+    """
+    def __init__(self, api_url: str, api_key: str):
+        self.api_url = api_url.rstrip("/")
+        self.api_key = api_key
+        self.knowledge = _DirectKnowledge(self)
+
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        import requests
+        resp = requests.get(
+            f"{self.api_url}{path}",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            params=params or {},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _post(self, path: str, body: dict) -> dict:
+        import requests
+        resp = requests.post(
+            f"{self.api_url}{path}",
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            json=body,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+class _DirectKnowledge:
+    def __init__(self, client: _DirectClient):
+        self._c = client
+
+    def graph_search(self, term: str, limit: int = 20):
+        return self._c._get("/knowledge/graph/search", {"q": term, "limit": str(limit)})
+
+    def graph_entity(self, name: str, limit: int = 10):
+        return self._c._get(f"/knowledge/entity/{name}", {"limit": str(limit)})
+
+    def graph_paths(self, from_entity: str, to_entity: str):
+        return self._c._get("/knowledge/paths", {"from": from_entity, "to": to_entity})
+
+    def graph_stats(self):
+        return self._c._get("/knowledge/graph/stats")
+
+    def semantic_search(self, query: str, limit: int = 10):
+        return self._c._post("/knowledge/search", {"query": query, "limit": limit})
+
+    def list_corpora(self):
+        return self._c._get("/knowledge/catalog")
+
+
 def _get_client():
-    """Get or create a MARC27 PlatformClient."""
+    """Get or create a MARC27 PlatformClient.
+
+    Tries marc27 SDK first, falls back to direct HTTP using env vars.
+    """
     try:
         from marc27 import PlatformClient
         return PlatformClient()
-    except Exception as e:
-        logger.warning(f"MARC27 SDK not available: {e}")
-        return None
+    except Exception:
+        pass
+
+    import os
+    api_key = os.environ.get("MARC27_API_KEY", "")
+    api_url = os.environ.get("MARC27_API_URL", "https://api.marc27.com/api/v1")
+    if api_key:
+        return _DirectClient(api_url, api_key)
+
+    logger.warning("No MARC27 auth — set MARC27_API_KEY or install marc27 SDK")
+    return None
 
 
 def _graph_search(**kwargs) -> dict:

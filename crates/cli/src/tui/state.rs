@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 
 use crate::tui::protocol::{UiCard, UiCost, UiPrompt, UiStatus, UiToolStart, UiView};
@@ -96,7 +98,7 @@ impl Activity {
         }
     }
 
-    pub fn to_workspace(&self) -> Workspace {
+    pub fn to_workspace(self) -> Workspace {
         match self {
             Self::Chat => Workspace::Chat,
             Self::Explorer => Workspace::Explorer,
