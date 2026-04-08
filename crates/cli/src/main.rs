@@ -751,19 +751,18 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            // TUI is currently out of commission — guide user to CLI commands
-            match launch_tui(&paths, &python, &project_root, state.credentials.as_ref()) {
-                Ok(()) => {}
-                Err(_) => {
-                    println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
-                    println!("  The interactive TUI is not available in this build.\n");
-                    println!("  Use CLI commands directly:");
-                    println!("    prism query --platform \"nickel superalloys\"");
-                    println!("    prism research \"high entropy alloys\" --depth 1");
-                    println!("    prism ingest ./data.csv");
-                    println!("    prism models list");
-                    println!("    prism --help\n");
-                }
+            // Skip TUI launch entirely if binary doesn't exist
+            if discover_tui_binary(&paths).is_some() {
+                launch_tui(&paths, &python, &project_root, state.credentials.as_ref())?;
+            } else {
+                println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
+                println!("  The interactive TUI is not available in this build.\n");
+                println!("  Use CLI commands directly:");
+                println!("    prism query --platform \"nickel superalloys\"");
+                println!("    prism research \"high entropy alloys\" --depth 1");
+                println!("    prism ingest ./data.csv");
+                println!("    prism models list");
+                println!("    prism --help\n");
             }
         }
         Commands::Login => {
@@ -1808,11 +1807,6 @@ async fn main() -> Result<()> {
                     } else {
                         println!("Marketplace resources:\n");
                         for t in &tools {
-                            let tags = if t.tags.is_empty() {
-                                String::new()
-                            } else {
-                                format!("  [{}]", t.tags.join(", "))
-                            };
                             let author = t.author.as_deref().unwrap_or("MARC27");
                             println!(
                                 "  {} ({})  by {}  [{}]",
@@ -5321,8 +5315,8 @@ async fn handle_report(
     let user_name = creds
         .and_then(|c| c.display_name.as_deref())
         .unwrap_or("anonymous");
-    let user_id = creds.and_then(|c| c.user_id.as_deref()).unwrap_or("");
-    let project_id = creds.and_then(|c| c.project_id.as_deref()).unwrap_or("");
+    let _user_id = creds.and_then(|c| c.user_id.as_deref()).unwrap_or("");
+    let _project_id = creds.and_then(|c| c.project_id.as_deref()).unwrap_or("");
 
     // 2. Build the report body
     let mut body = format!(
@@ -5387,20 +5381,15 @@ async fn handle_report(
         if !c.access_token.is_empty() {
             print!("Sending to MARC27 platform... ");
             let platform_body = serde_json::json!({
-                "type": "bug_report",
-                "description": description,
-                "prism_version": version,
-                "python_version": python_version,
-                "os": os_info,
-                "cpu_cores": caps.cpu_cores,
-                "ram_gb": caps.ram_gb / 1024,
-                "docker": caps.docker,
-                "log": log_content,
-                "user_id": user_id,
-                "project_id": project_id,
+                "title": format!("bug report: {}", &description[..description.len().min(60)]),
+                "description": format!(
+                    "{description}\n\nPRISM v{version}, Python {python_version}, {os_info}, {} cores, {} GB RAM",
+                    caps.cpu_cores, caps.ram_gb / 1024,
+                ),
+                "severity": "medium",
             });
 
-            let url = format!("{}/api/v1/support/tickets", endpoints.api_base);
+            let url = format!("{}/support/tickets", endpoints.api_base);
             let resp = reqwest::Client::new()
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", c.access_token))
