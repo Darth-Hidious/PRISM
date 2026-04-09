@@ -903,7 +903,7 @@ async fn main() -> Result<()> {
                     cfg_llm
                         .model
                         .clone()
-                        .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+                        .unwrap_or_else(|| "gemini-3.1-flash-lite-preview".to_string())
                 }),
                 api_key,
                 embedding_model: cfg_llm.embedding_model.clone(),

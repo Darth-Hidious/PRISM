@@ -44,9 +44,11 @@ fn default_timeout_secs() -> u64 {
 
 impl Default for LlmConfig {
     fn default() -> Self {
+        // These are fallback defaults only — real values come from prism.toml
+        // or server config on login. Don't hardcode provider-specific values here.
         Self {
-            base_url: "http://localhost:8080".into(),
-            model: "gemma-3-27b".into(),
+            base_url: String::new(), // Must be set from config
+            model: String::new(),    // Must be set from config or server default
             api_key: None,
             embedding_model: None,
             max_sample_rows: 10,

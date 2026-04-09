@@ -63,11 +63,18 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             },
             Style::default().fg(Color::Rgb(180, 180, 100)),
         ),
-        // Shortcuts
-        Span::styled(
-            "  Tab focus \u{2502} Ctrl+E sidebar \u{2502} / commands",
-            Style::default().fg(Color::Rgb(80, 80, 80)),
-        ),
+        // Update notification or shortcuts
+        if let Some(ref ver) = app.update_available {
+            Span::styled(
+                format!("  \u{2191} v{ver} available — prism update"),
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            Span::styled(
+                "  Tab focus \u{2502} Ctrl+E sidebar \u{2502} / commands",
+                Style::default().fg(Color::Rgb(80, 80, 80)),
+            )
+        },
     ]);
 
     f.render_widget(Paragraph::new(line), area);

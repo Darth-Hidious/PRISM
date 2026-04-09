@@ -181,7 +181,9 @@ mod tests {
     #[test]
     fn llm_config_defaults() {
         let cfg = LlmConfig::default();
-        assert_eq!(cfg.base_url, "http://localhost:8080");
+        // Defaults are empty — real values come from prism.toml or server config
+        assert!(cfg.base_url.is_empty());
+        assert!(cfg.model.is_empty());
         assert_eq!(cfg.max_sample_rows, 10);
     }
 
