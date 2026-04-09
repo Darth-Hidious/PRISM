@@ -8,27 +8,28 @@
 
 ---
 
-PRISM is one command. It turns raw materials data into a searchable knowledge
-graph, runs compute jobs on any backend, and connects nodes into a federated
-mesh. Everything happens locally &mdash; your data never leaves your machine
-unless you tell it to.
+PRISM is a single binary that gives you an AI agent for materials science. It searches knowledge graphs, runs compute jobs, orchestrates workflows, and connects to a federated mesh of research nodes.
 
-```
+```bash
+prism                    # Launch interactive TUI
 prism query --platform "nickel superalloys"
-prism research "refractory high-entropy alloys" --depth 1
-prism ingest ./data.csv
-prism models list
+prism research "high-entropy alloys" --depth 1
+prism billing            # Check credit balance
 ```
-
-> **Note:** The interactive TUI is currently out of commission and lives on the
-> [`tui-frontend`](../../tree/tui-frontend) branch. We're looking for contributors
-> to help rebuild it. The CLI and all backend functionality work fully.
 
 ## Install
 
 ```bash
 curl -fsSL https://prism.marc27.com/install.sh | bash
 ```
+
+Or download from [GitHub Releases](../../releases):
+
+| Platform | Archive |
+|----------|---------|
+| Linux x86_64 | `prism-linux-x86_64.tar.gz` |
+| macOS Apple Silicon | `prism-macos-aarch64.tar.gz` |
+| Windows x86_64 | `prism-windows-x86_64.zip` |
 
 Or from source:
 
@@ -38,228 +39,152 @@ cd PRISM && cargo build --release
 cp target/release/prism ~/.local/bin/
 ```
 
-## Commands
+## Interactive TUI
 
-### First run
+Run `prism` to launch the terminal UI with:
+- Workspace tabs (Chat, Explorer, Models, Compute, Mesh, Workflows, Marketplace, Data, Settings)
+- Command palette (type `/` to search 69+ commands)
+- Model picker with 535 hosted models across 4 providers
+- Sidebar browser per workspace (file tree, model catalog, mesh peers, GPU resources)
+- Inline tool cards showing execution results
+- Streaming AI responses with markdown rendering
 
+## CLI Commands
+
+### Setup & Auth
 ```
-prism setup                          # First-time setup + platform login
-prism login                          # Authenticate with MARC27 platform
-prism configure --show               # Show current config
-prism configure --url http://localhost:8080 --model gemma-4-E4B-it
-prism status                         # Runtime paths, endpoints, auth status
-```
-
-### Node lifecycle
-
-```
-prism node up                        # Start Neo4j + Qdrant containers, register with platform
-prism node up --external-neo4j bolt://db:7687   # Use existing infrastructure
-prism node down                      # Graceful shutdown
-prism node status                    # Health check all services
-prism node logs neo4j                # Stream container logs
-prism node probe                     # Probe local machine capabilities
+prism setup              # First-time setup + login
+prism login              # Authenticate with MARC27
+prism configure --show   # Show LLM config
+prism status             # Auth state, paths, endpoints
 ```
 
-### Ingest data
-
+### AI Agent
 ```
-prism ingest ./alloys.csv            # CSV/Parquet -> schema -> LLM -> Neo4j + Qdrant
-prism ingest ./papers/ --watch       # Watch directory for new files
-prism ingest ./data.csv --corpus steel-alloys   # Tag with corpus name
-prism ingest --status                # Show ingest job status
-prism ingest ./data.csv --schema-only           # Schema detection only, skip LLM
-prism ingest ./map.csv --mapping ontology.yaml  # Custom entity/relationship rules
+prism                    # Interactive TUI agent
+prism query --platform "titanium alloys"
+prism query --semantic "creep resistance"
+prism query --cypher "MATCH (a:Alloy) RETURN a"
+prism research "novel refractory alloys" --depth 1
 ```
 
-### Query the knowledge graph
-
+### Knowledge Graph
 ```
-prism query "refractory alloys with hardness above 500 HV"
-prism query --cypher "MATCH (a:Alloy)-[:CONTAINS]->(e:Element) RETURN a.name, e.name"
-prism query --semantic "similar to Ti-6Al-4V"
-prism query --federated "high entropy alloys"   # Queries all mesh peers
-prism query --platform "nickel superalloys"     # Query MARC27 cloud graph
-prism query "..." --json                        # Machine-readable output
-```
-
-### Mesh networking
-
-```
-prism mesh discover                  # Find LAN nodes via mDNS
-prism mesh publish my-dataset        # Publish dataset to mesh
-prism mesh subscribe alloy-db --publisher <node-id>
-prism mesh subscriptions             # Show active subscriptions
+prism ingest ./data.csv              # Ingest data
+prism ingest --schema-only ./data.csv
+prism ingest --watch ./data/
 ```
 
 ### Compute
-
 ```
-prism run python:3.11 --input data=x.csv             # Local Docker job
-prism run marc27/calphad:latest --backend marc27      # MARC27 cloud
-prism run my-image --ssh user@host                    # BYOC via SSH
-prism run my-image --k8s-context prod                 # BYOC via Kubernetes
-prism run my-image --slurm head@cluster               # BYOC via SLURM
-prism job-status <uuid>                               # Check job status
-```
-
-### Workflows
-
-```
-prism workflow list                  # List available YAML workflows
-prism workflow info <name>           # Show workflow details
-prism workflow run <name> [args]     # Execute a workflow
-prism forge --paper arxiv:2106.09685 --dataset materials-project --target runpod:A100
+prism run python:3.11 --input data=x.csv
+prism run --backend marc27 --gpu A100
+prism run --ssh user@host             # BYOC via SSH
+prism run --k8s-context prod          # BYOC via Kubernetes
+prism run --slurm head@cluster        # BYOC via SLURM
+prism deploy create --name my-service --image img:latest
+prism deploy list
+prism job-status <uuid>
 ```
 
-### Research
-
+### Mesh & Nodes
 ```
-prism research "novel refractory high-entropy alloys" --depth 2
+prism node up            # Start local node (Neo4j + Qdrant)
+prism node status
+prism mesh discover      # Find LAN peers via mDNS
+prism mesh publish       # Share dataset to mesh
 ```
 
 ### Models
-
 ```
-prism models list                    # List hosted LLM models for active project
-prism models info <model-id>         # Show model details
-```
-
-### Discourse (multi-agent)
-
-```
-prism discourse create --spec spec.yaml           # Create a discourse
-prism discourse list                               # List discourses
-prism discourse status <id>                        # Check discourse status
-prism discourse turns <id>                         # View discourse turns
+prism models list        # 535 hosted LLMs
+prism models search "claude"
 ```
 
-### Deploy
-
+### Workflows
 ```
-prism deploy create --name my-service --image img:latest
-prism deploy list
-prism deploy status <id>
-prism deploy health <id>
+prism workflow list
+prism workflow run explore --space "Ni-Cr-Co" --target "yield_strength > 900"
+prism forge --paper arxiv:2106.09685 --dataset materials-project --target runpod:A100
 ```
 
-### Marketplace
-
+### Billing
 ```
-prism marketplace search "calphad"   # Search tools and workflows
-prism marketplace install <id>       # Install to ~/.prism/tools/ or ~/.prism/workflows/
-```
-
-### Publish
-
-```
-prism publish ./model-checkpoint --to marc27 --repo my-org/my-model
-prism publish ./dataset/ --to huggingface --repo username/dataset --private
+prism billing            # Credit balance
+prism billing usage      # Usage breakdown
+prism billing topup      # Buy credits (Stripe)
+prism billing prices     # Pricing table
 ```
 
 ### Other
-
 ```
-prism tools                          # List all available Python tools
-prism agent                          # Print agent-friendly command catalog
-prism report "bug description"       # File a bug report with system context
-prism serve                          # Start as MCP server
-prism backend                        # Start JSON-RPC backend (for IDE/TUI integration)
+prism tools              # List 108 available tools
+prism marketplace search # Browse datasets, models, plugins
+prism discourse list     # Multi-agent debate workflows
+prism report "bug"       # File support ticket
 ```
 
 ## Architecture
 
-PRISM compiles to a single Rust binary backed by a Python tool layer:
-
 ```
-prism (Rust binary)
-  |-- prism-cli          Command routing, auth, config
-  |-- prism-agent        TAOR agent loop, sessions, OPA policy, streaming
-  |-- prism-node         Daemon, probe, executor, E2EE key exchange
-  |-- prism-ingest       LLM ontology extraction -> Neo4j + Qdrant
-  |-- prism-server       Axum REST API + WebSocket + dashboard
-  |-- prism-mesh         mDNS + Kafka pub/sub + federation
-  |-- prism-compute      Docker / MARC27 / SSH / K8s / SLURM jobs
-  |-- prism-policy       OPA/Rego policy engine
-  |-- prism-workflows    YAML workflow engine
-  |-- prism-core         RBAC, audit, sessions, config
-  |-- prism-client       MARC27 platform API client + device-flow auth
-  |-- prism-runtime      Credential storage, paths, endpoints
-  |-- prism-proto        Wire types (node capabilities, mesh messages)
+prism (single Rust binary)
+  prism-cli      Command routing, auth, TUI
+  prism-llm      LLM client (OpenAI + MARC27 proxy)
+  prism-agent    TAOR agent loop, tool calling, OPA policy
+  prism-node     Daemon, probe, E2EE key exchange
+  prism-ingest   Schema detection, ontology extraction
+  prism-server   Axum REST API + dashboard
+  prism-mesh     mDNS + Kafka pub/sub + federation
+  prism-compute  Docker / MARC27 / SSH / K8s / SLURM
+  prism-policy   OPA/Rego policy engine
+  prism-workflows YAML workflow engine (8 step types)
 
-Python tools (49 tools, JSON stdio)
-  |-- Search: OPTIMADE (20+ providers), arXiv, Semantic Scholar, web
-  |-- Predict: property prediction, structure prediction, ML models
-  |-- Simulate: CALPHAD thermodynamics, phase diagrams
-  |-- Visualize: scatter, histogram, correlation matrix
-  |-- Execute: sandboxed Python, Spark ETL
-  |-- MARC27: knowledge graph, compute, marketplace
-  |-- Custom: drop any .py in ~/.prism/tools/
+Python tools (108 tools via JSON stdio)
+  Search: OPTIMADE (20+ providers), arXiv, Semantic Scholar
+  Predict: property prediction, structure prediction
+  Simulate: CALPHAD, DFT planning
+  Execute: Python, Bash (sandboxed)
+  Platform: knowledge graph, compute, marketplace
+  Custom: drop .py in ~/.prism/tools/
 ```
-
-Managed services (Docker containers spun up by `prism node up`):
-
-- **Neo4j** &mdash; knowledge graph
-- **Qdrant** &mdash; vector embeddings
-- **Kafka** &mdash; mesh data sync (optional)
 
 ## Configuration
 
-All config lives in `~/.prism/prism.toml`:
+All config in `~/.prism/prism.toml`:
 
 ```toml
+[llm]
+provider = "marc27"
+url = "https://api.marc27.com/api/v1/projects/{id}/llm"
+model = "gemini-3.1-flash-lite-preview"
+
 [node]
 name = "lab-alpha"
 port = 7327
-
-[llm]
-provider = "llamacpp"          # llamacpp | ollama | openai | marc27 | anthropic
-url = "http://localhost:8080"
-model = "gemma-4-E4B-it"
-embedding_model = "nomic-embed-text"
-api_key_env = "LLM_API_KEY"
-
-[services]
-mode = "managed"               # managed (Docker) or external
-neo4j_uri = "bolt://localhost:7687"
 
 [mesh]
 discovery = ["mdns", "platform"]
 ```
 
-CLI flags always override config values. Use `prism configure` to set defaults.
-
 ## Security
 
-- **OPA/Rego policy engine** &mdash; every tool call checked against role-based rules
-- **E2EE** &mdash; X25519 key agreement + ChaCha20-Poly1305 for node-to-node data
-- **RBAC** &mdash; 4-tier roles (admin, operator, agent, viewer)
-- **Audit logging** &mdash; every action logged to SQLite
-- **Rate limiting** &mdash; per-endpoint (sessions: 10/s, API: 100/s)
-
-## Testing
-
-```bash
-cargo test --workspace           # Rust tests
-cargo clippy --workspace -- -D warnings
-```
+- **OPA/Rego policy engine** — every tool call checked
+- **E2EE** — X25519 + ChaCha20-Poly1305 for node-to-node data
+- **RBAC** — 4-tier roles (admin, operator, agent, viewer)
+- **Audit logging** — every action logged
 
 ## Contributing
 
-We're actively looking for help with:
-
-- **TUI Frontend** &mdash; The interactive terminal UI (Ink/React) needs work. The backend JSON-RPC protocol is stable and documented in [`docs/FRONTEND_PROTOCOL.md`](docs/FRONTEND_PROTOCOL.md). Code is on the [`tui-frontend`](../../tree/tui-frontend) branch.
-- **VSX Extension** &mdash; A VS Code / VSCodium extension that connects to `prism backend` via JSON-RPC.
-- **Materials science tools** &mdash; New Python tools for specific simulation codes, databases, or analysis workflows.
-
-See [`docs/FRONTEND_PROTOCOL.md`](docs/FRONTEND_PROTOCOL.md) for the full backend wire protocol reference.
+- **TUI** — built with Ratatui, protocol documented in `docs/FRONTEND_PROTOCOL.md`
+- **Tools** — new Python tools in `app/tools/`, custom tools in `~/.prism/tools/`
+- **Workflows** — YAML in `~/.prism/workflows/`, auto-discovered as CLI commands
 
 ## License
 
 | Component | License |
 |-----------|---------|
 | Python tools, tool server, config, plugins | [MIT](LICENSE-MIT) |
-| Rust crates, frontend, agent, workflows | [MARC27 Source-Available](LICENSE-MARC27) |
+| Rust crates, TUI, agent, workflows | [MARC27 Source-Available](LICENSE-MARC27) |
 
 Commercial licensing: team@marc27.com
 

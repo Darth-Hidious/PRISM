@@ -4,7 +4,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Tabs};
 use ratatui::Frame;
 
-use super::{chat, command_palette, input_bar, login_modal, model_picker, overlays, sidebar, status_bar};
+use super::{
+    chat, command_palette, input_bar, login_modal, model_picker, overlays, sidebar, status_bar,
+};
 use crate::tui::state::{Activity, App, Workspace};
 
 pub fn draw(f: &mut Frame, app: &App) {
