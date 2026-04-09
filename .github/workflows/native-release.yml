@@ -67,6 +67,11 @@ jobs:
           else
             cp target/${{ matrix.rust_target }}/release/prism package/
             cp target/${{ matrix.rust_target }}/release/prism-node package/
+            # macOS: ad-hoc sign binaries so users only need to clear quarantine
+            if [[ "${{ matrix.label }}" == *"macos"* ]]; then
+              codesign -s - -f package/prism
+              codesign -s - -f package/prism-node
+            fi
             tar -C package -czf ${{ matrix.archive }} .
           fi
 
