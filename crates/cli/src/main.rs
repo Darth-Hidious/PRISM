@@ -1156,7 +1156,8 @@ async fn main() -> Result<()> {
                     let wants_managed_services = svc_config.neo4j.is_some()
                         || svc_config.vector_db.is_some()
                         || svc_config.kafka.is_some()
-                        || svc_config.spark.is_some();
+                        || svc_config.spark.is_some()
+                        || svc_config.firecrawl.is_some();
 
                     if wants_managed_services {
                         println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
