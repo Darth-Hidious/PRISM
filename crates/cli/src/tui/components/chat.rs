@@ -214,10 +214,21 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ));
 
+    // Clamp scroll: content stays at top until it overflows the viewport,
+    // then follows new content. inner_area height = area minus borders (2 lines).
+    let viewport_height = area.height.saturating_sub(2) as usize;
+    let total_lines = lines.len();
+    let max_scroll = if total_lines > viewport_height {
+        (total_lines - viewport_height) as u16
+    } else {
+        0
+    };
+    let clamped_scroll = app.chat_scroll.min(max_scroll);
+
     let p = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: true })
-        .scroll((app.chat_scroll, 0));
+        .scroll((clamped_scroll, 0));
 
     f.render_widget(p, area);
 }
