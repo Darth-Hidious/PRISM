@@ -293,8 +293,29 @@ enum Commands {
         #[arg(long)]
         show: bool,
     },
+    /// View credit balance, usage, and top up.
+    Billing {
+        #[command(subcommand)]
+        command: Option<BillingCommands>,
+    },
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Debug, Subcommand)]
+enum BillingCommands {
+    /// Show usage breakdown by service.
+    Usage,
+    /// Show transaction history.
+    History,
+    /// Show credit pricing table.
+    Prices,
+    /// Buy credits (opens Stripe checkout in browser).
+    Topup {
+        /// Package slug: starter, standard, pro, enterprise.
+        #[arg(default_value = "starter")]
+        package: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2139,6 +2160,152 @@ async fn main() -> Result<()> {
                 tracing::debug!(error = %e, "splash skipped");
             }
             tui::run_tui_app(&project_root, &python).await?;
+        }
+        Commands::Billing { command } => {
+            let (api_base, auth) = resolve_agent_auth()?;
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()?;
+
+            match command {
+                None => {
+                    // Default: show balance
+                    let resp: serde_json::Value = auth
+                        .apply(client.get(format!("{api_base}/billing/balance")))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    println!("\nMARC27 Credits");
+                    println!("\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}");
+                    println!(
+                        "  Balance:  {:.1} credits (${:.2})",
+                        resp["credits"].as_f64().unwrap_or(0.0),
+                        resp["dollar_value"].as_f64().unwrap_or(0.0),
+                    );
+                    println!(
+                        "  Org:      {}",
+                        resp["org_name"].as_str().unwrap_or("unknown")
+                    );
+                    println!("\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\n");
+                }
+                Some(BillingCommands::Usage) => {
+                    let resp: serde_json::Value = auth
+                        .apply(client.get(format!("{api_base}/billing/usage?period=monthly")))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    println!("\nUsage (current period)\n");
+                    if let Some(services) = resp["by_service"].as_array() {
+                        for svc in services {
+                            println!(
+                                "  {:<30} {:.2} credits  {} calls",
+                                svc["metric"].as_str().unwrap_or("?"),
+                                svc["credits_spent"].as_f64().unwrap_or(0.0),
+                                svc["request_count"].as_u64().unwrap_or(0),
+                            );
+                        }
+                    }
+                    println!(
+                        "\n  Total: {:.2} credits\n",
+                        resp["total"].as_f64().unwrap_or(0.0)
+                    );
+                }
+                Some(BillingCommands::History) => {
+                    let resp: serde_json::Value = auth
+                        .apply(client.get(format!("{api_base}/billing/history?page=1&per_page=20")))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    println!("\nTransaction History\n");
+                    if let Some(txns) = resp["transactions"].as_array() {
+                        for tx in txns {
+                            println!(
+                                "  {} {:+.2} credits  {}",
+                                tx["created_at"].as_str().unwrap_or("?"),
+                                tx["amount_credits"].as_f64().unwrap_or(0.0),
+                                tx["description"].as_str().unwrap_or(""),
+                            );
+                        }
+                        if txns.is_empty() {
+                            println!("  No transactions yet.");
+                        }
+                    }
+                    println!();
+                }
+                Some(BillingCommands::Prices) => {
+                    let resp: serde_json::Value = client
+                        .get(format!("{api_base}/billing/prices"))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    println!("\nCredit Prices\n");
+                    if let Some(prices) = resp["prices"].as_array() {
+                        for p in prices {
+                            println!(
+                                "  {:<30} {:.4} credits/{}  ({}% markup)",
+                                p["metric"].as_str().unwrap_or("?"),
+                                p["credits_per_unit"].as_f64().unwrap_or(0.0),
+                                p["unit_label"].as_str().unwrap_or("unit"),
+                                p["markup_pct"].as_f64().unwrap_or(0.0),
+                            );
+                        }
+                    }
+                    println!();
+                }
+                Some(BillingCommands::Topup { package }) => {
+                    // First show packages
+                    let pkgs: serde_json::Value = client
+                        .get(format!("{api_base}/billing/packages"))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    println!("\nAvailable packages:\n");
+                    if let Some(packages) = pkgs["packages"].as_array() {
+                        for (i, p) in packages.iter().enumerate() {
+                            println!(
+                                "  {}. {:<12} \u{2014} {} credits  ${:.2}",
+                                i + 1,
+                                p["slug"].as_str().unwrap_or("?"),
+                                p["credits"].as_u64().unwrap_or(0),
+                                p["price_usd"].as_f64().unwrap_or(0.0),
+                            );
+                        }
+                    }
+
+                    println!("\nOpening Stripe checkout for '{package}'...");
+                    let resp: serde_json::Value = auth
+                        .apply(client.post(format!("{api_base}/billing/topup")))
+                        .json(&serde_json::json!({"package": package}))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+
+                    if let Some(url) = resp["checkout_url"].as_str() {
+                        println!("Checkout: {url}\n");
+                        if let Err(e) = open_browser(url) {
+                            eprintln!("Could not open browser: {e}");
+                            println!("Open the URL above manually.");
+                        }
+                    } else {
+                        eprintln!(
+                            "Error: {}",
+                            resp["error"]["message"].as_str().unwrap_or("unknown error")
+                        );
+                    }
+                }
+            }
         }
         Commands::External(args) => {
             if try_run_workflow_alias(&project_root, &args).await? {
