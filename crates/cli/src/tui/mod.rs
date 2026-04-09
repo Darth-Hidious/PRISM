@@ -379,6 +379,25 @@ pub async fn run_tui_app(
 
     let mut app = state::App::new(project_root.to_path_buf());
 
+    // Check for updates (non-blocking)
+    let current_version = env!("CARGO_PKG_VERSION");
+    if let Ok(resp) = reqwest::Client::new()
+        .get("https://api.github.com/repos/Darth-Hidious/PRISM/releases/latest")
+        .header("User-Agent", "PRISM")
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    {
+        if let Ok(data) = resp.json::<serde_json::Value>().await {
+            if let Some(tag) = data.get("tag_name").and_then(|t| t.as_str()) {
+                let latest = tag.trim_start_matches('v');
+                if latest != current_version {
+                    app.update_available = Some(latest.to_string());
+                }
+            }
+        }
+    }
+
     // Pre-load model catalog via direct HTTP (don't wait for backend)
     {
         if let Ok(paths) = prism_runtime::PrismPaths::discover() {

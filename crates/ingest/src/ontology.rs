@@ -375,12 +375,11 @@ mod tests {
     }
 
     #[test]
-    fn default_config_points_to_llama_cpp() {
+    fn default_config_is_empty() {
         let cfg = LlmConfig::default();
-        assert!(
-            cfg.base_url.contains("8080"),
-            "default should be llama.cpp port 8080"
-        );
+        // Defaults are empty — real values from prism.toml or server config
+        assert!(cfg.base_url.is_empty());
+        assert!(cfg.model.is_empty());
     }
 
     #[test]
