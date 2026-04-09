@@ -483,11 +483,15 @@ impl LlmClient {
                 }
             }
 
+            debug!("MARC27 full_text ({} chars): {:?}", full_text.len(), &full_text[..full_text.len().min(300)]);
+
             // Parse tool calls — only take the FIRST batch (before any "Results:" hallucination)
             let tool_calls = parse_text_tool_calls(&full_text);
+            debug!("MARC27 parsed {} tool calls", tool_calls.len());
             // Only unique tool calls (LLM sometimes duplicates)
             let tool_calls = dedup_tool_calls(tool_calls);
             let content_text = strip_tool_call_blocks(&full_text);
+            debug!("MARC27 content_text after strip: {:?}", &content_text[..content_text.len().min(200)]);
 
             return Ok(ChatResponse {
                 message: ChatMessage {
