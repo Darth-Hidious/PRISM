@@ -412,6 +412,10 @@ pub async fn run_turn(
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "LLM call failed: {e:#}");
+                // Surface error details in the UI, not just "LLM call failed"
+                emit(AgentEvent::TextDelta {
+                    text: format!("Error: {e:#}\n"),
+                });
                 e
             })
             .context("LLM call failed")?;
