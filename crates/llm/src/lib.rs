@@ -489,19 +489,20 @@ impl LlmClient {
             let tool_calls = dedup_tool_calls(tool_calls);
             let mut content_text = strip_tool_call_blocks(&full_text);
 
-            // If we found tool calls, suppress any remaining JSON fragments
-            // in content_text. Gemini sometimes outputs tool call JSON without
-            // the ``` wrapper, leaving partial JSON as "content".
+            // If we found tool calls, suppress any JSON/code artifacts in content.
+            // Gemini often leaks partial tool call JSON or closing ``` into the
+            // content when it outputs a tool call. Only keep content that looks
+            // like actual natural language prose.
             if !tool_calls.is_empty() && !content_text.is_empty() {
-                // Strip if content is just JSON fragments (starts with { or ")
                 let trimmed = content_text.trim();
-                if trimmed.starts_with('{')
-                    || trimmed.starts_with('"')
-                    || trimmed.ends_with("}}")
-                    || trimmed.ends_with("}")
+                let looks_like_json = trimmed.contains("}}")
                     || trimmed.contains("\"name\":")
                     || trimmed.contains("\"arguments\":")
-                {
+                    || trimmed.starts_with('{')
+                    || trimmed.starts_with('"')
+                    || trimmed.starts_with("```")
+                    || trimmed.ends_with("```");
+                if looks_like_json {
                     content_text.clear();
                 }
             }
