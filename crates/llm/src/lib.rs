@@ -483,15 +483,11 @@ impl LlmClient {
                 }
             }
 
-            debug!("MARC27 full_text ({} chars): {:?}", full_text.len(), &full_text[..full_text.len().min(300)]);
-
             // Parse tool calls — only take the FIRST batch (before any "Results:" hallucination)
             let tool_calls = parse_text_tool_calls(&full_text);
-            debug!("MARC27 parsed {} tool calls", tool_calls.len());
             // Only unique tool calls (LLM sometimes duplicates)
             let tool_calls = dedup_tool_calls(tool_calls);
             let content_text = strip_tool_call_blocks(&full_text);
-            debug!("MARC27 content_text after strip: {:?}", &content_text[..content_text.len().min(200)]);
 
             return Ok(ChatResponse {
                 message: ChatMessage {
@@ -832,8 +828,12 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
     }
 
     block.push_str("\n\
+        ## IMPORTANT: When NOT to call tools\n\n\
+        For greetings, casual conversation, explanations, general knowledge questions, \
+        or anything that does not need live data — respond with plain text. \
+        Do NOT call tools for simple chat like \"hello\", \"what can you do?\", or \"explain X\".\n\n\
         ## How to call tools\n\n\
-        When a task requires data retrieval, computation, or platform interaction, call a tool:\n\n\
+        ONLY when a task explicitly requires data retrieval, computation, search, or platform interaction, call a tool:\n\n\
         ```tool_call\n\
         {\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n\
         ```\n\n\
