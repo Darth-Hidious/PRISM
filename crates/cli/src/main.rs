@@ -864,7 +864,7 @@ async fn main() -> Result<()> {
                     "backbone": {
                         "python_worker": "app.backend",
                         "node_binary": "prism-node",
-                        "tui": "compiled ts/ink binary",
+                        "tui": "native ratatui",
                         "workflow_runtime": "rust",
                     }
                 }))?
