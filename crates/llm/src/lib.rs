@@ -420,7 +420,6 @@ impl LlmClient {
             let mut sse_buf = String::new();
             let mut full_text = String::new();
             let mut usage_info = None;
-            let mut hit_tool_call = false;
             let mut done = false;
 
             while let Some(chunk) = stream.next().await {
@@ -441,16 +440,10 @@ impl LlmClient {
                         if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
                             if !delta.is_empty() {
                                 full_text.push_str(delta);
-
-                                if !hit_tool_call {
-                                    if full_text.contains("```tool_call")
-                                        || full_text.contains("<tool_call>")
-                                    {
-                                        hit_tool_call = true;
-                                    } else {
-                                        on_delta(delta);
-                                    }
-                                }
+                                // Don't call on_delta during streaming for MARC27 path.
+                                // We collect full_text, strip tool calls, then emit clean
+                                // content_text after the response completes. This prevents
+                                // partial tool call JSON from leaking into visible text.
                             }
                         }
                         if let Some(u) = chunk.get("usage") {

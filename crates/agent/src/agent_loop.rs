@@ -403,12 +403,12 @@ pub async fn run_turn(
         }];
         messages.extend(history.iter().cloned());
 
-        // ── 2c. Call LLM (with streaming) ────────────────────────
-        let mut streaming_deltas: Vec<String> = Vec::new();
+        // ── 2c. Call LLM ─────────────────────────────────────────
+        // The on_delta callback is unused for MARC27 (text-based tool calling)
+        // because we collect full_text, strip tool calls, and emit clean content
+        // after the response completes. Kept for future OpenAI-path streaming.
         let response = llm
-            .chat_with_tools_streaming(&messages, tool_catalog.definitions(), |delta| {
-                streaming_deltas.push(delta.to_string());
-            })
+            .chat_with_tools_streaming(&messages, tool_catalog.definitions(), |_delta| {})
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "LLM call failed: {e:#}");
