@@ -487,7 +487,24 @@ impl LlmClient {
             let tool_calls = parse_text_tool_calls(&full_text);
             // Only unique tool calls (LLM sometimes duplicates)
             let tool_calls = dedup_tool_calls(tool_calls);
-            let content_text = strip_tool_call_blocks(&full_text);
+            let mut content_text = strip_tool_call_blocks(&full_text);
+
+            // If we found tool calls, suppress any remaining JSON fragments
+            // in content_text. Gemini sometimes outputs tool call JSON without
+            // the ``` wrapper, leaving partial JSON as "content".
+            if !tool_calls.is_empty() && !content_text.is_empty() {
+                // Strip if content is just JSON fragments (starts with { or ")
+                let trimmed = content_text.trim();
+                if trimmed.starts_with('{')
+                    || trimmed.starts_with('"')
+                    || trimmed.ends_with("}}")
+                    || trimmed.ends_with("}")
+                    || trimmed.contains("\"name\":")
+                    || trimmed.contains("\"arguments\":")
+                {
+                    content_text.clear();
+                }
+            }
 
             return Ok(ChatResponse {
                 message: ChatMessage {
