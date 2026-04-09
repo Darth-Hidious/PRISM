@@ -144,6 +144,11 @@ pub struct App {
     // Approval prompt (modal overlay — blocks everything)
     pub active_prompt: Option<UiPrompt>,
 
+    // Auth state
+    pub auth_error: bool, // true when 401 detected
+    pub login_device_code: Option<String>,
+    pub login_url: Option<String>,
+
     // Input
     pub input_buffer: String,
     pub input_cursor: usize, // byte position in input_buffer
@@ -200,6 +205,9 @@ impl App {
             view_tab_index: 0,
             view_scroll: 0,
             active_prompt: None,
+            auth_error: false,
+            login_device_code: None,
+            login_url: None,
             input_buffer: String::new(),
             input_cursor: 0,
             input_history: Vec::new(),
