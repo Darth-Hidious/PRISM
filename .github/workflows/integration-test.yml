@@ -144,7 +144,7 @@ jobs:
           grep -q "Fe" /tmp/graph.out
 
       - name: Test version flag
-        run: ./target/debug/prism --version 2>&1 | grep "prism 2.6.1"
+        run: ./target/debug/prism --version 2>&1 | grep "prism 2.7.0"
 
       - name: Test node probe
         run: |

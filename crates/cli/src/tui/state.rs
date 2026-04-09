@@ -179,6 +179,10 @@ pub struct App {
     pub project_root: PathBuf,
     pub should_quit: bool,
 
+    // LLM config (editable via sidebar sliders)
+    pub config_temperature: f64,
+    pub config_max_tokens: f64,
+
     // Cached workspace data
     pub tool_count: usize,
     pub model_count: Option<usize>,
@@ -226,6 +230,8 @@ impl App {
             cached_providers: Vec::new(),
             project_root,
             should_quit: false,
+            config_temperature: 0.1,
+            config_max_tokens: 4096.0,
             tool_count: 0,
             model_count: None,
             gpu_count: None,

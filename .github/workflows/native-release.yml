@@ -25,6 +25,10 @@ jobs:
             label: macos-aarch64
             rust_target: aarch64-apple-darwin
             archive: prism-macos-aarch64.tar.gz
+          - os: windows-latest
+            label: windows-x86_64
+            rust_target: x86_64-pc-windows-msvc
+            archive: prism-windows-x86_64.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -56,9 +60,15 @@ jobs:
         shell: bash
         run: |
           mkdir -p package
-          cp target/${{ matrix.rust_target }}/release/prism package/
-          cp target/${{ matrix.rust_target }}/release/prism-node package/
-          tar -C package -czf ${{ matrix.archive }} .
+          if [[ "${{ matrix.label }}" == *"windows"* ]]; then
+            cp target/${{ matrix.rust_target }}/release/prism.exe package/
+            cp target/${{ matrix.rust_target }}/release/prism-node.exe package/
+            cd package && 7z a -tzip ../${{ matrix.archive }} . && cd ..
+          else
+            cp target/${{ matrix.rust_target }}/release/prism package/
+            cp target/${{ matrix.rust_target }}/release/prism-node package/
+            tar -C package -czf ${{ matrix.archive }} .
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
