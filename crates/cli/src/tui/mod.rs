@@ -502,19 +502,26 @@ pub async fn run_tui_app(
                             app.auth_error = true;
                         }
                         app.streaming_text.push_str(&delta.text);
+                        // Auto-scroll on streaming content
+                        if app.chat_auto_scroll {
+                            app.chat_scroll = u16::MAX;
+                        }
                     }
                     protocol::ProtocolNotification::TextFlush(_) => {
                         let text = app.streaming_text.clone();
                         app.streaming_text.clear();
                         if !text.is_empty() {
                             app.chat_history.push(state::ChatElement::Text(text));
+                            if app.chat_auto_scroll { app.chat_scroll = u16::MAX; }
                         }
                     }
                     protocol::ProtocolNotification::ToolStart(ts) => {
                         app.chat_history.push(state::ChatElement::ToolStart(ts));
+                        if app.chat_auto_scroll { app.chat_scroll = u16::MAX; }
                     }
                     protocol::ProtocolNotification::Card(card) => {
                         app.chat_history.push(state::ChatElement::Card(card));
+                        if app.chat_auto_scroll { app.chat_scroll = u16::MAX; }
                     }
                     protocol::ProtocolNotification::Prompt(prompt) => {
                         app.active_prompt = Some(prompt);
@@ -522,6 +529,7 @@ pub async fn run_tui_app(
                     protocol::ProtocolNotification::Cost(cost) => {
                         app.total_cost += cost.turn_cost;
                         app.chat_history.push(state::ChatElement::Cost(cost));
+                        if app.chat_auto_scroll { app.chat_scroll = u16::MAX; }
                     }
                     protocol::ProtocolNotification::TurnComplete(_) => {
                         // Flush any remaining streaming text
@@ -530,6 +538,7 @@ pub async fn run_tui_app(
                             app.streaming_text.clear();
                             app.chat_history.push(state::ChatElement::Text(text));
                         }
+                        if app.chat_auto_scroll { app.chat_scroll = u16::MAX; }
                     }
                     protocol::ProtocolNotification::Welcome(w) => {
                         app.tool_count = w.tool_count;
@@ -594,6 +603,7 @@ pub async fn run_tui_app(
                     KeyCode::Up if app.focus == state::FocusZone::Chat => {
                         if app.chat_scroll > 0 {
                             app.chat_scroll -= 1;
+                            app.chat_auto_scroll = false; // user scrolled up manually
                         }
                     }
                     KeyCode::Down if app.focus == state::FocusZone::Chat => {
@@ -601,6 +611,7 @@ pub async fn run_tui_app(
                     }
                     KeyCode::PageUp if app.focus == state::FocusZone::Chat => {
                         app.chat_scroll = app.chat_scroll.saturating_sub(10);
+                        app.chat_auto_scroll = false; // user scrolled up manually
                     }
                     KeyCode::PageDown if app.focus == state::FocusZone::Chat => {
                         app.chat_scroll += 10;
@@ -608,9 +619,11 @@ pub async fn run_tui_app(
                     // Home goes to top, End goes to bottom
                     KeyCode::Home if app.focus == state::FocusZone::Chat => {
                         app.chat_scroll = 0;
+                        app.chat_auto_scroll = false;
                     }
                     KeyCode::End if app.focus == state::FocusZone::Chat => {
-                        app.chat_scroll = u16::MAX; // will be clamped by Paragraph
+                        app.chat_scroll = u16::MAX;
+                        app.chat_auto_scroll = true; // back to bottom = re-enable auto-scroll
                     }
                     // Up/Down when sidebar is focused → move selection
                     KeyCode::Up if app.focus == state::FocusZone::Sidebar => {
@@ -839,6 +852,8 @@ pub async fn run_tui_app(
                                 app.input_cursor = 0;
 
                             app.chat_history.push(state::ChatElement::UserMessage(text.clone()));
+                            app.chat_auto_scroll = true;
+                            app.chat_scroll = u16::MAX;
 
                             // Special handling for /model — open model picker
                             if text == "/model" || text == "/models" {

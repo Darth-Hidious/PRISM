@@ -165,6 +165,7 @@ pub struct App {
     // Focus & navigation
     pub focus: FocusZone,
     pub chat_scroll: u16,
+    pub chat_auto_scroll: bool, // true = follow new content, false = user scrolled up
     pub sidebar_scroll: u16,
 
     // Background loading flags
@@ -224,6 +225,7 @@ impl App {
             palette_selected: 0,
             focus: FocusZone::Input,
             chat_scroll: 0,
+            chat_auto_scroll: true,
             sidebar_scroll: 0,
             loading_models: false,
             model_picker_visible: false,

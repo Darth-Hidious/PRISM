@@ -1,10 +1,10 @@
-"""Web browsing tools — Firecrawl + Playwright for reading web content.
+"""Web browsing tools — Firecrawl (bundled) + DuckDuckGo for search & scraping.
 
 These are TOOLS the LLM calls, not embedded services. The agent
 decides when to browse, what to read, and what to extract.
 
-Firecrawl: fast, clean text extraction from URLs (API-based)
-Playwright: full browser automation for JS-heavy sites (local)
+Firecrawl: bundled with PRISM — fast, clean text extraction (local or API)
+DuckDuckGo: free search fallback via duckduckgo-search library
 """
 import logging
 import os
@@ -13,47 +13,43 @@ from app.tools.base import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+# Firecrawl config — works with local self-hosted instance OR the API
 FIRECRAWL_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
-FIRECRAWL_URL = "https://api.firecrawl.dev/v1"
+FIRECRAWL_URL = os.environ.get("FIRECRAWL_API_URL", "https://api.firecrawl.dev/v1")
 
 
 def _web_read(**kwargs) -> dict:
     """Read a web page and return clean text content.
 
-    Uses Firecrawl if available (fast, handles JS), falls back to
-    basic HTTP fetch + HTML stripping.
+    Uses Firecrawl (bundled) if configured, falls back to
+    httpx + BeautifulSoup for basic extraction.
     """
     url = kwargs.get("url", "")
     if not url:
         return {"error": "url is required"}
 
-    # Try Firecrawl first (best quality, handles JS rendering)
+    # Try Firecrawl first (best quality — handles JS, returns markdown)
     if FIRECRAWL_KEY:
         try:
-            import httpx
+            from firecrawl import FirecrawlApp
 
-            r = httpx.post(
-                f"{FIRECRAWL_URL}/scrape",
-                headers={
-                    "Authorization": f"Bearer {FIRECRAWL_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={"url": url, "formats": ["markdown"]},
-                timeout=30,
-            )
-            if r.status_code == 200:
-                data = r.json().get("data", {})
-                return {
-                    "url": url,
-                    "title": data.get("metadata", {}).get("title", ""),
-                    "content": data.get("markdown", ""),
-                    "source": "firecrawl",
-                    "content_length": len(data.get("markdown", "")),
-                }
+            app = FirecrawlApp(api_key=FIRECRAWL_KEY, api_url=FIRECRAWL_URL)
+            result = app.scrape_url(url, params={"formats": ["markdown"]})
+            content = result.get("markdown", "") if isinstance(result, dict) else str(result)
+            title = ""
+            if isinstance(result, dict):
+                title = result.get("metadata", {}).get("title", "")
+            return {
+                "url": url,
+                "title": title,
+                "content": content[:15000],
+                "source": "firecrawl",
+                "content_length": len(content),
+            }
         except Exception as e:
             logger.warning(f"Firecrawl failed: {e}, falling back to basic fetch")
 
-    # Fallback: basic HTTP fetch + strip HTML
+    # Fallback: httpx + BeautifulSoup
     try:
         import httpx
 
@@ -61,25 +57,36 @@ def _web_read(**kwargs) -> dict:
             url,
             timeout=15,
             follow_redirects=True,
-            headers={"User-Agent": "PRISM/2.5 (materials science research agent; +https://marc27.com)"},
+            headers={
+                "User-Agent": "PRISM/2.7 (materials science research; +https://marc27.com)"
+            },
         )
-        text = r.text
 
-        # Strip HTML tags (basic)
-        import re
+        try:
+            from bs4 import BeautifulSoup
 
-        text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL)
-        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
+            soup = BeautifulSoup(r.text, "html.parser")
+            # Remove script/style
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            title = soup.title.string if soup.title else ""
+            text = soup.get_text(separator="\n", strip=True)
+        except ImportError:
+            # bs4 not available — basic regex fallback
+            import re
 
-        # Truncate to reasonable size
+            title = ""
+            text = re.sub(r"<script[^>]*>.*?</script>", "", r.text, flags=re.DOTALL)
+            text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+
         if len(text) > 10000:
             text = text[:10000] + "... [truncated]"
 
         return {
             "url": url,
-            "title": "",
+            "title": title,
             "content": text,
             "source": "basic_fetch",
             "content_length": len(text),
@@ -91,67 +98,57 @@ def _web_read(**kwargs) -> dict:
 def _web_search(**kwargs) -> dict:
     """Search the web and return results.
 
-    Uses Firecrawl search if available, falls back to DuckDuckGo.
+    Uses Firecrawl search if available, falls back to DuckDuckGo
+    via the bundled duckduckgo-search library.
     """
     query = kwargs.get("query", "")
     limit = kwargs.get("limit", 5)
     if not query:
         return {"error": "query is required"}
 
-    # Try Firecrawl search
+    # Try Firecrawl search first (if key is set)
     if FIRECRAWL_KEY:
         try:
-            import httpx
+            from firecrawl import FirecrawlApp
 
-            r = httpx.post(
-                f"{FIRECRAWL_URL}/search",
-                headers={
-                    "Authorization": f"Bearer {FIRECRAWL_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={"query": query, "limit": limit},
-                timeout=15,
-            )
-            if r.status_code == 200:
-                results = r.json().get("data", [])
-                return {
-                    "query": query,
-                    "results": [
-                        {
-                            "title": r.get("metadata", {}).get("title", ""),
-                            "url": r.get("url", ""),
-                            "snippet": r.get("markdown", "")[:200],
-                        }
-                        for r in results[:limit]
-                    ],
-                    "count": len(results),
-                    "source": "firecrawl",
-                }
+            app = FirecrawlApp(api_key=FIRECRAWL_KEY, api_url=FIRECRAWL_URL)
+            results = app.search(query, params={"limit": limit})
+            items = results if isinstance(results, list) else results.get("data", [])
+            return {
+                "query": query,
+                "results": [
+                    {
+                        "title": r.get("metadata", {}).get("title", "")
+                        if isinstance(r, dict)
+                        else "",
+                        "url": r.get("url", "") if isinstance(r, dict) else "",
+                        "snippet": (r.get("markdown", "") if isinstance(r, dict) else str(r))[
+                            :200
+                        ],
+                    }
+                    for r in items[:limit]
+                ],
+                "count": len(items),
+                "source": "firecrawl",
+            }
         except Exception as e:
-            logger.warning(f"Firecrawl search failed: {e}")
+            logger.warning(f"Firecrawl search failed: {e}, falling back to DDG")
 
-    # Fallback: DuckDuckGo (no API key needed)
+    # Fallback: DuckDuckGo via bundled duckduckgo-search library
     try:
-        import httpx
+        from duckduckgo_search import DDGS
 
-        r = httpx.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            headers={"User-Agent": "PRISM/2.5"},
-            timeout=10,
-        )
-        # Basic parsing of DDG HTML results
-        import re
+        with DDGS() as ddgs:
+            raw = list(ddgs.text(query, max_results=limit))
 
-        results = []
-        for match in re.finditer(
-            r'<a class="result__a" href="([^"]+)"[^>]*>([^<]+)</a>', r.text
-        ):
-            url, title = match.groups()
-            results.append({"title": title.strip(), "url": url, "snippet": ""})
-            if len(results) >= limit:
-                break
-
+        results = [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("href", ""),
+                "snippet": r.get("body", "")[:200],
+            }
+            for r in raw
+        ]
         return {
             "query": query,
             "results": results,
@@ -159,7 +156,54 @@ def _web_search(**kwargs) -> dict:
             "source": "duckduckgo",
         }
     except Exception as e:
-        return {"error": f"Search failed: {e}"}
+        logger.warning(f"DDG search failed: {e}, trying raw HTTP")
+
+    # Last resort: raw HTTP to DDG (may get rate limited)
+    try:
+        import httpx
+
+        r = httpx.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={
+                "User-Agent": "PRISM/2.7 (materials science research; +https://marc27.com)"
+            },
+            timeout=10,
+        )
+
+        try:
+            from bs4 import BeautifulSoup
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            results = []
+            for a in soup.select("a.result__a"):
+                results.append({
+                    "title": a.get_text(strip=True),
+                    "url": a.get("href", ""),
+                    "snippet": "",
+                })
+                if len(results) >= limit:
+                    break
+        except ImportError:
+            import re
+
+            results = []
+            for match in re.finditer(
+                r'class="result__a"[^>]*href="([^"]+)"[^>]*>([^<]+)', r.text
+            ):
+                url_match, title = match.groups()
+                results.append({"title": title.strip(), "url": url_match, "snippet": ""})
+                if len(results) >= limit:
+                    break
+
+        return {
+            "query": query,
+            "results": results,
+            "count": len(results),
+            "source": "duckduckgo_html",
+        }
+    except Exception as e:
+        return {"error": f"All search methods failed: {e}"}
 
 
 def create_web_tools(registry: ToolRegistry) -> None:
@@ -193,7 +237,7 @@ def create_web_tools(registry: ToolRegistry) -> None:
             description=(
                 "Search the web for information. Returns titles, URLs, and snippets. "
                 "Use to find papers, datasets, documentation, or any web content. "
-                "Searches via Firecrawl (if configured) or DuckDuckGo (always available)."
+                "Searches via Firecrawl (if configured) or DuckDuckGo."
             ),
             input_schema={
                 "type": "object",

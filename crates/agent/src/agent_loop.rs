@@ -42,6 +42,8 @@ pub type SharedApprovalReceiver = Arc<tokio::sync::Mutex<ApprovalReceiver>>;
 
 const MAX_TOOL_RESULT_CHARS: usize = 30_000;
 const DOOM_LOOP_WINDOW: usize = 3;
+/// How many consecutive empty results from the same tool before we stop
+const EMPTY_RESULT_MAX: usize = 2;
 
 // ── Large-result handling ─────────────────────────────────────────
 
@@ -76,6 +78,24 @@ fn check_doom_loop(recent: &VecDeque<String>, sig: &str) -> bool {
         return false;
     }
     recent.iter().rev().take(DOOM_LOOP_WINDOW).all(|s| s == sig)
+}
+
+/// Returns true if a tool result looks like 0/empty results.
+fn is_empty_result(content: &str) -> bool {
+    if let Ok(val) = serde_json::from_str::<Value>(content) {
+        // {"count": 0} or {"results": []}
+        if let Some(count) = val.get("count").and_then(|v| v.as_u64()) {
+            if count == 0 {
+                return true;
+            }
+        }
+        if let Some(results) = val.get("results").and_then(|v| v.as_array()) {
+            if results.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ── Summarize tool result ─────────────────────────────────────────
@@ -349,6 +369,8 @@ pub async fn run_turn(
     let mut total_usage = UsageInfo::default();
     let mut result_store: HashMap<String, String> = HashMap::new();
     let mut recent_sigs: VecDeque<String> = VecDeque::with_capacity(DOOM_LOOP_WINDOW + 1);
+    // Track consecutive empty results per tool name
+    let mut empty_result_streak: HashMap<String, usize> = HashMap::new();
 
     // ── 2. TAOR iteration loop ────────────────────────────────────
     for _iteration in 0..config.max_iterations {
@@ -700,6 +722,40 @@ pub async fn run_turn(
                     tool_call_id: Some(call_id.clone()),
                 });
                 continue;
+            }
+
+            // ── h7b. Empty-result streak detection ───────────────
+            if is_empty_result(&content_after_hooks) {
+                let streak = empty_result_streak
+                    .entry(tool_name.to_string())
+                    .or_insert(0);
+                *streak += 1;
+                if *streak >= EMPTY_RESULT_MAX {
+                    let abort_msg = format!(
+                        "{tool_name} returned empty results {streak} times in a row. \
+                         This tool isn't finding what you need — try a different tool, \
+                         rephrase the query, or answer from your own knowledge.",
+                    );
+                    emit(AgentEvent::ToolCallResult {
+                        call_id: call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        content: abort_msg.clone(),
+                        summary: Some(format!("{tool_name}: empty results, stopping")),
+                        preview: preview.clone(),
+                        elapsed_ms,
+                        is_error: true,
+                    });
+                    history.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: Some(abort_msg),
+                        tool_calls: None,
+                        tool_call_id: Some(call_id.clone()),
+                    });
+                    continue;
+                }
+            } else {
+                // Reset streak on successful result
+                empty_result_streak.remove(tool_name.as_str());
             }
 
             // ── h8. Large-result handling ─────────────────────────

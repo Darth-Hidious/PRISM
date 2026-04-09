@@ -20,6 +20,8 @@ pub struct ServerConfig {
     pub default_model: Option<String>,
     #[serde(default)]
     pub mp_api_key: Option<String>,
+    #[serde(default)]
+    pub firecrawl_api_key: Option<String>,
 }
 
 /// Successful token response (initial or refresh).

@@ -4340,7 +4340,160 @@ fn build_tool_card_payload(
                 );
             }
         }
-        _ => {}
+        _ => {
+            // Generic formatter for Python tool results (web_search, knowledge_search, etc.)
+            if let Some(object) = parsed.as_ref().and_then(|value| value.as_object()) {
+                let mut sections = Vec::new();
+                if let Some(summary) = summary {
+                    sections.push(summary.to_string());
+                } else if let Some(preview) = preview {
+                    sections.push(preview.to_string());
+                }
+
+                // Search-style results: {query, results: [...], count, source}
+                if let Some(results) = object.get("results").and_then(|v| v.as_array()) {
+                    let source = object.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                    let count = object
+                        .get("count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(results.len() as u64);
+
+                    if count == 0 || results.is_empty() {
+                        sections.push(format!(
+                            "0 results{}",
+                            if source.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (via {source})")
+                            }
+                        ));
+                    } else {
+                        if !source.is_empty() {
+                            sections.push(format!("{count} results via {source}"));
+                        }
+                        for (i, r) in results.iter().take(5).enumerate() {
+                            let title = r
+                                .get("title")
+                                .or_else(|| r.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("untitled");
+                            let snippet = r
+                                .get("snippet")
+                                .or_else(|| r.get("description"))
+                                .or_else(|| r.get("abstract"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            let mut line = format!("{}. {}", i + 1, title);
+                            if !url.is_empty() {
+                                line.push_str(&format!("\n   {url}"));
+                            }
+                            if !snippet.is_empty() {
+                                let s = if snippet.len() > 120 {
+                                    format!("{}...", &snippet[..117])
+                                } else {
+                                    snippet.to_string()
+                                };
+                                line.push_str(&format!("\n   {s}"));
+                            }
+                            sections.push(line);
+                        }
+                        if results.len() > 5 {
+                            sections.push(format!("... and {} more", results.len() - 5));
+                        }
+                    }
+
+                    return (
+                        sections.join("\n"),
+                        serde_json::json!({
+                            "count": count,
+                            "source": source,
+                        }),
+                    );
+                }
+
+                // Content-style results: {url, content, source, content_length}
+                if let Some(url) = object.get("url").and_then(|v| v.as_str()) {
+                    let source = object.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                    let content_len = object
+                        .get("content_length")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let title = object.get("title").and_then(|v| v.as_str()).unwrap_or("");
+
+                    sections.push(format!("url: {url}"));
+                    if !title.is_empty() {
+                        sections.push(format!("title: {title}"));
+                    }
+                    if !source.is_empty() {
+                        sections.push(format!("source: {source}"));
+                    }
+                    if content_len > 0 {
+                        sections.push(format!("{content_len} chars"));
+                    }
+
+                    return (
+                        sections.join("\n"),
+                        serde_json::json!({
+                            "url": url,
+                            "source": source,
+                            "content_length": content_len,
+                        }),
+                    );
+                }
+
+                // Count-style results: {count, ...} or {cached, count, providers_queried}
+                if let Some(count) = object.get("count").and_then(|v| v.as_u64()) {
+                    let cached = object.get("cached").and_then(|v| v.as_bool());
+                    let providers = object
+                        .get("providers_queried")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        });
+
+                    let mut line = format!("{count} results");
+                    if let Some(true) = cached {
+                        line.push_str(" (cached)");
+                    }
+                    if let Some(ref p) = providers {
+                        if !p.is_empty() {
+                            line.push_str(&format!(" from {p}"));
+                        }
+                    }
+                    sections.push(line);
+
+                    return (sections.join("\n"), serde_json::json!({ "count": count }));
+                }
+
+                // Error-style: {error: "..."}
+                if let Some(err) = object.get("error").and_then(|v| v.as_str()) {
+                    return (format!("error: {err}"), serde_json::json!({ "error": err }));
+                }
+
+                // Status-style: {status: "...", message: "..."}
+                if let Some(status) = object.get("status").and_then(|v| v.as_str()) {
+                    let msg = object.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    let line = if msg.is_empty() {
+                        format!("status: {status}")
+                    } else {
+                        format!("{status}: {msg}")
+                    };
+                    sections.push(line);
+                    return (sections.join("\n"), serde_json::json!({ "status": status }));
+                }
+            }
+        }
+    }
+
+    // Final fallback: if it's valid JSON, show the summary instead of raw JSON
+    if let Some(summary) = summary {
+        if content.starts_with('{') || content.starts_with('[') {
+            return (summary.to_string(), Value::Object(Default::default()));
+        }
     }
 
     (content.to_string(), Value::Object(Default::default()))

@@ -4821,6 +4821,10 @@ async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredent
         if let Some(ref mp_key) = config.mp_api_key {
             std::env::set_var("MP_API_KEY", mp_key);
         }
+        if let Some(ref fc_key) = config.firecrawl_api_key {
+            std::env::set_var("FIRECRAWL_API_KEY", fc_key);
+            tracing::info!("server config: Firecrawl API key received");
+        }
         // Write default model to prism.toml if user hasn't set one
         if let Some(ref model) = config.default_model {
             let node_config = prism_core::config::NodeConfig::load(None);
