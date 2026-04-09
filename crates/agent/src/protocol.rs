@@ -3774,6 +3774,9 @@ fn emit_agent_event(event: AgentEvent) {
         AgentEvent::TextDelta { text } => {
             emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
         }
+        AgentEvent::TextFlush => {
+            emit_notification("ui.text.flush", serde_json::json!({ "text": "" }));
+        }
         AgentEvent::ToolCallStart {
             tool_name,
             call_id,
