@@ -431,17 +431,17 @@ pub async fn run_turn(
             transcript.record_cost("llm_turn", usage.prompt_tokens, usage.completion_tokens);
         }
 
-        // ── 2e. Emit streamed text deltas ─────────────────────────
-        tracing::debug!(delta_count = streaming_deltas.len(), "emitting streamed text deltas");
-        for delta in &streaming_deltas {
-            emit(AgentEvent::TextDelta {
-                text: delta.clone(),
-            });
-        }
-        if !streaming_deltas.is_empty() {
-            // Flush text so the TUI moves it from streaming buffer to chat history
-            // before cost/turn-complete events arrive.
-            emit(AgentEvent::TextFlush);
+        // ── 2e. Emit text to TUI ─────────────────────────────────
+        // Use the clean content from the response (tool call blocks already
+        // stripped) instead of raw streaming deltas which can leak partial
+        // tool call JSON when SSE chunks split across the ``` boundary.
+        if let Some(content) = &response.message.content {
+            if !content.is_empty() {
+                emit(AgentEvent::TextDelta {
+                    text: content.clone(),
+                });
+                emit(AgentEvent::TextFlush);
+            }
         }
 
         // ── 2f. Push assistant message ────────────────────────────
