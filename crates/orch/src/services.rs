@@ -6,6 +6,7 @@ pub struct ServiceConfig {
     pub vector_db: Option<VectorDbConfig>,
     pub kafka: Option<KafkaConfig>,
     pub spark: Option<SparkConfig>,
+    pub firecrawl: Option<FirecrawlConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +74,24 @@ impl Default for SparkConfig {
     }
 }
 
+/// Firecrawl — open-source web scraping & search engine.
+/// Docker image: `ghcr.io/mendableai/firecrawl`
+/// Default port: 3002 (API)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirecrawlConfig {
+    pub image: String,
+    pub port: u16,
+}
+
+impl Default for FirecrawlConfig {
+    fn default() -> Self {
+        Self {
+            image: "ghcr.io/mendableai/firecrawl:latest".to_string(),
+            port: 3002,
+        }
+    }
+}
+
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
@@ -80,6 +99,7 @@ impl Default for ServiceConfig {
             vector_db: Some(VectorDbConfig::default()),
             kafka: None,
             spark: None,
+            firecrawl: Some(FirecrawlConfig::default()),
         }
     }
 }

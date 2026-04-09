@@ -350,6 +350,49 @@ impl DockerOrchestrator {
         })
     }
 
+    /// Start Firecrawl (open-source web scraper) and return a ServiceHandle.
+    async fn start_firecrawl(
+        &self,
+        config: &crate::services::FirecrawlConfig,
+    ) -> Result<ServiceHandle> {
+        self.ensure_image(&config.image).await?;
+
+        let env = vec![
+            // Firecrawl minimal config — no external dependencies needed
+            format!("PORT={}", config.port),
+            "HOST=0.0.0.0".to_string(),
+            "NUM_WORKERS_PER_QUEUE=2".to_string(),
+        ];
+
+        let mut port_bindings = HashMap::new();
+        port_bindings.insert(
+            format!("{}/tcp", config.port),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some(config.port.to_string()),
+            }]),
+        );
+
+        let container_id = self
+            .run_container("firecrawl", &config.image, env, None, port_bindings, None)
+            .await?;
+
+        Ok(ServiceHandle {
+            name: "firecrawl".to_string(),
+            container_id: Some(container_id),
+            port: config.port,
+            healthy: false,
+        })
+    }
+
+    /// Restart Firecrawl (public, used by health monitor).
+    pub async fn start_firecrawl_public(
+        &self,
+        config: &crate::services::FirecrawlConfig,
+    ) -> Result<ServiceHandle> {
+        self.start_firecrawl(config).await
+    }
+
     /// Restart Spark (public, used by health monitor).
     pub async fn start_spark_public(
         &self,
@@ -477,6 +520,13 @@ impl ServiceOrchestrator for DockerOrchestrator {
             info!("Starting Spark master...");
             let spark = self.start_spark(spark_cfg).await?;
             services.push(spark);
+        }
+
+        // Firecrawl — open-source web scraping (enabled by default)
+        if let Some(ref firecrawl_cfg) = config.firecrawl {
+            info!("Starting Firecrawl...");
+            let firecrawl = self.start_firecrawl(firecrawl_cfg).await?;
+            services.push(firecrawl);
         }
 
         // Wait for services to become healthy

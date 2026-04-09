@@ -13,9 +13,42 @@ from app.tools.base import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-# Firecrawl config — works with local self-hosted instance OR the API
+# Firecrawl config — prefers local self-hosted instance (bundled with PRISM),
+# falls back to cloud API if key is set.
 FIRECRAWL_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
-FIRECRAWL_URL = os.environ.get("FIRECRAWL_API_URL", "https://api.firecrawl.dev/v1")
+FIRECRAWL_LOCAL_URL = os.environ.get("FIRECRAWL_LOCAL_URL", "http://localhost:3002")
+FIRECRAWL_API_URL = os.environ.get("FIRECRAWL_API_URL", "https://api.firecrawl.dev/v1")
+
+
+def _firecrawl_available() -> bool:
+    """Check if local Firecrawl instance is running."""
+    try:
+        import httpx
+
+        r = httpx.get(f"{FIRECRAWL_LOCAL_URL}/", timeout=2)
+        return r.status_code < 500
+    except Exception:
+        return False
+
+
+# Cache the check at import time so we don't hit it on every call
+_LOCAL_FIRECRAWL = _firecrawl_available()
+
+# Resolve which Firecrawl URL and key to use
+if _LOCAL_FIRECRAWL:
+    # Local instance — no API key needed
+    FIRECRAWL_URL = FIRECRAWL_LOCAL_URL
+    FIRECRAWL_ACTIVE = True
+    logger.info(f"Firecrawl: using local instance at {FIRECRAWL_URL}")
+elif FIRECRAWL_KEY:
+    # Cloud API with key
+    FIRECRAWL_URL = FIRECRAWL_API_URL
+    FIRECRAWL_ACTIVE = True
+    logger.info("Firecrawl: using cloud API")
+else:
+    FIRECRAWL_URL = ""
+    FIRECRAWL_ACTIVE = False
+    logger.info("Firecrawl: not available, using DuckDuckGo fallback")
 
 
 def _web_read(**kwargs) -> dict:
@@ -29,11 +62,14 @@ def _web_read(**kwargs) -> dict:
         return {"error": "url is required"}
 
     # Try Firecrawl first (best quality — handles JS, returns markdown)
-    if FIRECRAWL_KEY:
+    if FIRECRAWL_ACTIVE:
         try:
             from firecrawl import FirecrawlApp
 
-            app = FirecrawlApp(api_key=FIRECRAWL_KEY, api_url=FIRECRAWL_URL)
+            app = FirecrawlApp(
+                api_key=FIRECRAWL_KEY or "local",
+                api_url=FIRECRAWL_URL,
+            )
             result = app.scrape_url(url, params={"formats": ["markdown"]})
             content = result.get("markdown", "") if isinstance(result, dict) else str(result)
             title = ""
@@ -106,12 +142,15 @@ def _web_search(**kwargs) -> dict:
     if not query:
         return {"error": "query is required"}
 
-    # Try Firecrawl search first (if key is set)
-    if FIRECRAWL_KEY:
+    # Try Firecrawl search first (local or cloud)
+    if FIRECRAWL_ACTIVE:
         try:
             from firecrawl import FirecrawlApp
 
-            app = FirecrawlApp(api_key=FIRECRAWL_KEY, api_url=FIRECRAWL_URL)
+            app = FirecrawlApp(
+                api_key=FIRECRAWL_KEY or "local",
+                api_url=FIRECRAWL_URL,
+            )
             results = app.search(query, params={"limit": limit})
             items = results if isinstance(results, list) else results.get("data", [])
             return {
