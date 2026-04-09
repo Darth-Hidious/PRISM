@@ -707,7 +707,7 @@ async fn main() -> Result<()> {
         ensure_venv(&prism_dir, &project_root).await?
     };
 
-    match cli.command.unwrap_or(Commands::Setup) {
+    match cli.command.unwrap_or(Commands::Tui) {
         Commands::Setup => {
             let mut state = paths.load_cli_state()?;
             state.preferred_python = Some(python.display().to_string());
