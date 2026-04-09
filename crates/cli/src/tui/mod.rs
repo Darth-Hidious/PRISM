@@ -478,6 +478,10 @@ pub async fn run_tui_app(
                         app.status = Some(status);
                     }
                     protocol::ProtocolNotification::TextDelta(delta) => {
+                        // Detect auth errors in text
+                        if delta.text.contains("unauthorized") || delta.text.contains("401") || delta.text.contains("token expired") {
+                            app.auth_error = true;
+                        }
                         app.streaming_text.push_str(&delta.text);
                     }
                     protocol::ProtocolNotification::TextFlush(_) => {

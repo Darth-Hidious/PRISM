@@ -1,7 +1,10 @@
+pub mod chart_view;
 pub mod chat;
 pub mod command_palette;
+pub mod discourse_view;
 pub mod input_bar;
 pub mod layout;
+pub mod login_modal;
 pub mod model_picker;
 pub mod overlays;
 pub mod sidebar;

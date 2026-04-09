@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Tabs};
 use ratatui::Frame;
 
-use super::{chat, command_palette, input_bar, model_picker, overlays, sidebar, status_bar};
+use super::{chat, command_palette, input_bar, login_modal, model_picker, overlays, sidebar, status_bar};
 use crate::tui::state::{Activity, App, Workspace};
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -142,11 +142,20 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
     }
 
-    // Status bar
-    status_bar::draw(f, app, status_area);
+    // Auth error banner (above status bar)
+    if app.auth_error {
+        login_modal::draw_auth_banner(f, status_area);
+    } else {
+        status_bar::draw(f, app, status_area);
+    }
 
     // Approval modal (overlays everything)
     if app.active_prompt.is_some() {
         overlays::draw_approval(f, app, size);
+    }
+
+    // Login modal (overlays everything when device code is active)
+    if let (Some(ref code), Some(ref url)) = (&app.login_device_code, &app.login_url) {
+        login_modal::draw(f, code, url, size);
     }
 }
