@@ -262,6 +262,11 @@ const INTERACTIVE_PROMPT: &str = r#"You are PRISM, an interactive agent for mate
 - Use discover_capabilities, status, and tools when you need to inspect the current environment before planning.
 - Keep local, MARC27-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
 
+# Tool Use
+- For general conversation, greetings, explanations, and questions that do not require live data, respond with plain text. Do NOT call tools for simple chat.
+- Only call tools when the user explicitly asks to search, compute, query, deploy, ingest, run workflows, or interact with the knowledge graph/platform.
+- When in doubt, respond with text first. The user will ask you to use tools if needed.
+
 # Result Quality
 - Cite providers, data sources, and workflow boundaries when they materially affect the answer.
 - Do not hallucinate materials properties, deployment state, job state, or command outcomes.
@@ -306,6 +311,11 @@ const AUTONOMOUS_PROMPT: &str = r#"You are PRISM, an autonomous agent for materi
 - Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless low-level control is explicitly required by the task.
 - Use discover_capabilities, status, and tools when you need to inspect the current environment before planning.
 - Keep local, MARC27-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
+
+# Tool Use
+- For general conversation, greetings, explanations, and questions that do not require live data, respond with plain text. Do NOT call tools for simple chat.
+- Only call tools when the user explicitly asks to search, compute, query, deploy, ingest, run workflows, or interact with the knowledge graph/platform.
+- When in doubt, respond with text first. The user will ask you to use tools if needed.
 
 # Result Quality
 - Cite providers, data sources, and workflow boundaries when they materially affect the answer.
