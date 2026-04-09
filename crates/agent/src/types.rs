@@ -81,6 +81,8 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
+    /// Signal the frontend to flush accumulated streaming text into chat history.
+    TextFlush,
     ToolCallStart {
         tool_name: String,
         call_id: String,

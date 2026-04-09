@@ -432,10 +432,15 @@ pub async fn run_turn(
         }
 
         // ── 2e. Emit streamed text deltas ─────────────────────────
-        for delta in &streaming_deltas {
-            emit(AgentEvent::TextDelta {
-                text: delta.clone(),
-            });
+        if !streaming_deltas.is_empty() {
+            for delta in &streaming_deltas {
+                emit(AgentEvent::TextDelta {
+                    text: delta.clone(),
+                });
+            }
+            // Flush text so the TUI moves it from streaming buffer to chat history
+            // before cost/turn-complete events arrive.
+            emit(AgentEvent::TextFlush);
         }
 
         // ── 2f. Push assistant message ────────────────────────────
