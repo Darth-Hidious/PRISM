@@ -491,7 +491,16 @@ pub async fn run_tui_app(
 
         tokio::select! {
             notif = client.rx_notifications.recv() => {
-                let Some(notif) = notif else { break; };
+                let Some(notif) = notif else {
+                    // Backend process closed — show error instead of silently exiting
+                    app.chat_history.push(state::ChatElement::Text(
+                        "Backend process exited unexpectedly. Check `prism backend` logs.".to_string()
+                    ));
+                    // Give user a chance to see the error
+                    terminal.draw(|f| components::layout::draw(f, &app))?;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    break;
+                };
                 match notif.notification {
                     protocol::ProtocolNotification::Status(status) => {
                         app.status = Some(status);
