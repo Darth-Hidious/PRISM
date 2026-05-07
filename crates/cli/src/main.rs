@@ -5,10 +5,12 @@
 //! discovery from `~/.prism/workflows/`.
 
 mod boot;
+mod chat_config;
 mod doctor;
 mod forge_chat;
 mod mcp_server_native;
 mod platform_bridge;
+mod use_command;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -270,6 +272,18 @@ enum Commands {
     Discourse {
         #[command(subcommand)]
         command: DiscourseCommands,
+    },
+    /// Pick where chat turns are routed: MARC27 cloud (default), a
+    /// local OpenAI-compatible LLM, or a direct vendor (Anthropic /
+    /// OpenAI / etc). MARC27 platform tools — knowledge graph,
+    /// discourse, marketplace, materials project — stay available
+    /// regardless of which chat target is selected.
+    ///
+    /// Identical to the in-chat `/use` slash command — both write the
+    /// same `~/.prism/config.toml`.
+    Use {
+        #[command(subcommand)]
+        command: UseCommands,
     },
     /// Publish a model, dataset, or workflow to a remote registry.
     Publish {
@@ -689,6 +703,57 @@ enum DiscourseCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Subcommands of `prism use`. See `chat_config::ChatTarget` for what
+/// each variant ends up as in `~/.prism/config.toml`.
+///
+/// `Local` and `Provider` are the two non-default chat targets. `Show`
+/// prints the current state (chat target + tools auth state). `Reset`
+/// goes back to MARC27 cloud (the default).
+#[derive(Debug, Subcommand)]
+enum UseCommands {
+    /// Route chat turns to an OpenAI-compatible local server (Ollama,
+    /// llama.cpp, vLLM, etc.). MARC27 platform tools stay available
+    /// when the user is logged in.
+    Local {
+        /// Base URL of the local server, including `/v1`. Examples:
+        /// `http://localhost:11434/v1`, `http://127.0.0.1:8080/v1`.
+        #[arg(long)]
+        url: String,
+        /// Model name to send in chat requests (whatever the local
+        /// server advertises — `llama-3.1-70b`, `mistral-7b-instruct`,
+        /// `qwen2.5-coder`, etc.).
+        #[arg(long)]
+        model: String,
+        /// Optional API key. Most local servers accept any non-empty
+        /// string or none at all. Stored in plaintext in
+        /// `~/.prism/config.toml` — only set this for trusted local
+        /// servers; never put a cloud-vendor key here (use `provider`
+        /// for that).
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Route chat turns direct to a cloud vendor using the user's own
+    /// API key (read from an env var, never persisted to disk).
+    /// MARC27 platform tools stay available when the user is logged in.
+    Provider {
+        /// Vendor slug: `anthropic`, `openai`, `mistral`, `gemini`,
+        /// `cohere`, …
+        provider: String,
+        /// Model id to send (e.g. `claude-sonnet-4`, `gpt-4o`).
+        #[arg(long)]
+        model: String,
+        /// Override the env var name PRISM reads the API key from.
+        /// Defaults to the vendor's standard env var
+        /// (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …).
+        #[arg(long)]
+        api_key_env: Option<String>,
+    },
+    /// Print the current chat target and the tools-auth state.
+    Show,
+    /// Reset chat target back to MARC27 cloud (the default).
+    Reset,
 }
 
 #[derive(Debug, Clone)]
@@ -1997,6 +2062,9 @@ async fn main() -> Result<()> {
         }
         Commands::Discourse { command } => {
             handle_discourse_command(command).await?;
+        }
+        Commands::Use { command } => {
+            handle_use_command(command).await?;
         }
         Commands::Publish {
             path,
@@ -4336,6 +4404,67 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
     }
 
     Ok(())
+}
+
+/// Translate clap-parsed `UseCommands` into the surface-agnostic
+/// `UseAction` consumed by `use_command::apply`. The CLI surface and
+/// the in-chat `/use` slash command both build `UseAction`s (the
+/// slash command parses raw text into one); keeping the action type
+/// independent of clap means the slash command doesn't pull in any
+/// CLI-only types.
+async fn handle_use_command(command: UseCommands) -> Result<()> {
+    let action = match command {
+        UseCommands::Local {
+            url,
+            model,
+            api_key,
+        } => use_command::UseAction::Local {
+            url,
+            model,
+            api_key,
+        },
+        UseCommands::Provider {
+            provider,
+            model,
+            api_key_env,
+        } => use_command::UseAction::Provider {
+            provider,
+            model,
+            api_key_env,
+        },
+        UseCommands::Show => use_command::UseAction::Show,
+        UseCommands::Reset => use_command::UseAction::Reset,
+    };
+    // We're running before prism boots, so there's no live bridge to
+    // hot-swap — only the persisted config matters. Detect whether the
+    // user has run `prism login` so the message can correctly state
+    // whether platform tools are available.
+    let logged_in = paths_credentials_present();
+    let outcome = use_command::apply(action, None, logged_in).await?;
+    println!("{}", outcome.message);
+    Ok(())
+}
+
+/// Best-effort check for whether `prism login` has been completed and
+/// the credentials file exists with a non-empty token. Used by
+/// `prism use` and the in-chat `/use` to render the "Tools" line
+/// honestly. Doesn't validate the token (no network) — that would
+/// move to a separate `prism status --tools` check if we want it.
+fn paths_credentials_present() -> bool {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => h,
+        None => return false,
+    };
+    let path = std::path::PathBuf::from(home)
+        .join(".prism")
+        .join("credentials.json");
+    if !path.exists() {
+        return false;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => !text.trim().is_empty() && text.contains("access_token"),
+        Err(_) => false,
+    }
 }
 
 async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
