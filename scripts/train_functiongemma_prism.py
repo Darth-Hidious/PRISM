@@ -188,16 +188,19 @@ def main():
         logging_steps=25,
         eval_strategy="steps",
         eval_steps=200,
-        save_strategy="steps",
-        save_steps=200,
-        save_total_limit=3,
+        # save_strategy="no": Unsloth's gradient checkpointing wraps the model
+        # with a `ConfigModuleInstance` object that dill/pickle cannot
+        # serialise, so any TRL save_steps trigger (local or hub) crashes
+        # mid-training. We save once after `trainer.train()` finishes via
+        # `merged.save_pretrained()` — no pickle path involved.
+        save_strategy="no",
         bf16=True,
         optim="adamw_torch_fused",
         report_to="none",
-        push_to_hub=True,
-        hub_model_id=HUB_REPO_LORA,
-        hub_strategy="end",  # avoid mid-training pickle of ConfigModuleInstance
-        hub_private_repo=True,
+        # push_to_hub disabled — TRL's hub push internally tries to save
+        # the model first, which hits the same pickle bug. We push manually
+        # via HfApi after merge_and_unload(); see push_gguf() below.
+        push_to_hub=False,
         seed=42,
         # Critical: mask the prompt so loss only flows through the assistant
         # tool_call output, not the developer/user/tool messages. Without

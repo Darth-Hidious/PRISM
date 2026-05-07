@@ -614,6 +614,42 @@ async fn chat_completions(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        let body_lower = body.to_lowercase();
+
+        // Auth-expired interceptor: convert raw 401 / "unauthorized" /
+        // "expired refresh token" into a friendly chat-embedded message
+        // instead of leaking a 4xx that breaks the user's flow. The next
+        // iteration will attempt silent refresh and inline device-flow
+        // pickup; for now, give the user a clear actionable instruction
+        // so they're not staring at `{"error":"unauthorized:..."}`.
+        let is_auth_error = status == StatusCode::UNAUTHORIZED
+            || body_lower.contains("unauthorized")
+            || body_lower.contains("expired refresh token")
+            || body_lower.contains("invalid token");
+        if is_auth_error {
+            eprintln!(
+                "\x1b[33m[prism]\x1b[0m MARC27 auth expired ({status}) — \
+                 converting to in-chat auth prompt"
+            );
+            let msg = "Your MARC27 session has expired.\n\
+                       \n\
+                       To continue:\n\
+                       \n\
+                       1. Open a new terminal\n\
+                       2. Run: `prism login`\n\
+                       3. Approve in the browser\n\
+                       4. Send your message again — the new session loads automatically.\n\
+                       \n\
+                       (Inline device-flow pickup is on the way — for now, the relogin step is a side trip.)";
+            if stream_requested {
+                return Sse::new(synthetic_text_stream(msg.to_string(), model.clone()))
+                    .into_response();
+            } else {
+                return Json(synthetic_text_full(msg.to_string(), model.clone()))
+                    .into_response();
+            }
+        }
+
         eprintln!(
             "\x1b[31m[prism]\x1b[0m MARC27 returned {status}: {}",
             body.lines().next().unwrap_or("")
@@ -807,6 +843,95 @@ fn sanitise_args_against_schema(
         call.arguments = Value::Object(Default::default());
         true
     }
+}
+
+// ── Synthetic plain-text response ────────────────────────────────────
+
+/// Build a streaming OpenAI chat-completion response that delivers a single
+/// plain-text assistant message. Used to convert MARC27-side errors (auth
+/// expired, etc.) into in-chat messages the user actually reads, instead of
+/// leaking 4xx codes through forge.
+fn synthetic_text_stream(
+    text: String,
+    model: String,
+) -> impl Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
+    let id = format!("chatcmpl-{}", uuid_hex8());
+    let created = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    async_stream::stream! {
+        // 1. role chunk
+        yield Ok(Event::default().data(serde_json::to_string(&json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant" },
+                "finish_reason": null,
+            }],
+        })).unwrap()));
+
+        // 2. content chunk (single delivery; no need to chunk further)
+        yield Ok(Event::default().data(serde_json::to_string(&json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": { "content": text },
+                "finish_reason": null,
+            }],
+        })).unwrap()));
+
+        // 3. finish chunk
+        yield Ok(Event::default().data(serde_json::to_string(&json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }],
+        })).unwrap()));
+
+        // 4. terminator
+        yield Ok(Event::default().data("[DONE]"));
+    }
+}
+
+/// Non-streaming variant — single completion object with the full text.
+fn synthetic_text_full(text: String, model: String) -> Value {
+    let id = format!("chatcmpl-{}", uuid_hex8());
+    let created = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": text,
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    })
 }
 
 // ── Synthetic tool-call response (Stage 2.2) ─────────────────────────
