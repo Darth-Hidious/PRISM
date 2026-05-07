@@ -67,9 +67,12 @@ pub async fn run(
         eprintln!("\x1b[31m[prism] forge UI panic:\x1b[0m {info}");
     }));
 
-    // Try to bring up the semantic tool router (EmbeddingGemma + FunctionGemma).
-    // On any failure the proxy gracefully falls back to FIFO body-budget
-    // trimming so the user can still chat — local routing just gets disabled.
+    // Bring up the semantic tool retriever (EmbeddingGemma only).
+    // FunctionGemma's local-routing path was removed (it caused silent
+    // failures when it picked a tool the chat LLM never got to summarise);
+    // the chat LLM now does selection + arg extraction on the top-K tools.
+    // On any failure the proxy falls back to FIFO body-budget trimming so
+    // the user can still chat — semantic retrieval just gets disabled.
     boot::section("Local intelligence");
     let router: Option<Arc<ToolRouter>> = match start_tool_router().await {
         Ok(r) => Some(r),
@@ -187,38 +190,20 @@ async fn start_tool_router() -> Result<Arc<ToolRouter>> {
         .context("HOME not set")?;
     let config = RouterConfig::default_for_home(&home);
 
-    // First-launch UX: stream GGUFs down from HF Hub if missing. The embedder
-    // is required (router doesn't function without it). FunctionGemma is
-    // optional — without it we still get top-K semantic retrieval, just no
-    // local routing decision.
+    // First-launch UX: stream the embedder GGUF down from HF Hub if missing.
+    // EmbeddingGemma is the only local model the bridge still uses — it
+    // narrows 125 tools → top-K relevant ones before forwarding to the chat
+    // LLM. FunctionGemma is no longer loaded; selection + arg extraction
+    // happen at the chat-LLM layer where the model is best-in-class at it.
     prism_tool_router::ensure_model(&config.embedder_remote, &config.embedder_gguf)
         .await
         .context("download EmbeddingGemma")?;
     boot::status_line("Embedder model", true, &short_path(&config.embedder_gguf));
 
-    if let Some(fp) = config.function_gguf.as_ref() {
-        match prism_tool_router::ensure_model(&config.function_remote, fp).await {
-            Ok(_) => boot::status_line("Router model", true, &short_path(fp)),
-            Err(e) => boot::status_line("Router model", false, &short_error(&e)),
-        }
-    }
-
     let router = Arc::new(ToolRouter::new(config.clone()).await?);
     router.start().await?;
     boot::status_line("Semantic retrieval", true, "online");
 
-    match config.function_gguf.as_ref() {
-        Some(fp) if fp.exists() => match router.start_function_router().await {
-            Ok(()) => boot::status_line("Local tool routing", true, "online"),
-            Err(e) => boot::status_line("Local tool routing", false, &short_error(&e)),
-        },
-        Some(_) => boot::status_line(
-            "Local tool routing",
-            false,
-            "router model missing — chat LLM will pick tools",
-        ),
-        None => {}
-    }
     Ok(router)
 }
 

@@ -1,20 +1,20 @@
-//! PRISM tool router — local semantic retrieval + routing layer.
+//! PRISM tool router — local semantic retrieval layer.
 //!
-//! Sits between forge's agent loop and the chat LLM. Two stages, both
-//! served by `llama-server` subprocesses on free localhost ports:
+//! Sits between forge's agent loop and the chat LLM, served by a
+//! `llama-server` subprocess on a free localhost port:
 //!
-//!   1. **EmbeddingGemma-300M** (GGUF) — embeds tool descriptions and the
-//!      user's latest message into a shared 768-dim space; cosine search
-//!      returns top-K=8 candidate tools per query.
+//!   - **EmbeddingGemma-300M** (GGUF) — embeds tool descriptions and the
+//!     user's latest message into a shared 768-dim space; cosine search
+//!     returns top-K=13 candidate tools per query.
 //!
-//!   2. **FunctionGemma-270M** (GGUF, optionally LoRA-fine-tuned on a
-//!      PRISM-specific corpus) — given (query, top-K tool schemas) emits
-//!      either a concrete tool call or a passthrough signal.
+//! The retained tools[] then go to the chat LLM (Gemini / GPT-4 / Claude),
+//! which does selection + arg extraction + summary in one round. A
+//! frontier model is best-in-class at all three; trying to do them with
+//! a 270M local router (formerly Stage 2.2 FunctionGemma) caused silent
+//! failures and is no longer wired in.
 //!
-//! Stage 2 lands in this order:
-//!   - 2.1: index + retrieval (this crate)
-//!   - 2.2: FunctionGemma routing (this crate, gated by feature later)
-//!   - 2.3: fine-tune workflow (Colab notebook, separate)
+//! The `function` and `routing` modules below are kept compiling for any
+//! future revisit but are not invoked by `platform_bridge`.
 
 pub mod config;
 pub mod download;

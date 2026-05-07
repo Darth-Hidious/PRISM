@@ -22,14 +22,14 @@
 //! MCP servers — those tools shell out directly to MARC27 without going
 //! through this bridge.
 //!
-//! Stage 2.2 will extend this module: instead of just pruning tools, the
-//! router will *route* — emit a tool_call locally via FunctionGemma when
-//! confident, falling through to the chat LLM only for synthesis or
-//! ambiguous cases.
+//! Stage 2.2 (FunctionGemma local routing) was REMOVED — see the long
+//! note in `proxy_chat_completions` for the silent-failure root cause.
+//! The bridge now does retrieval only; the chat LLM does selection +
+//! arg extraction + summary in one round.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
@@ -41,7 +41,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use futures_util::stream::Stream;
-use prism_tool_router::{RoutingDecision, ToolDef, ToolRouter};
+use prism_tool_router::{ToolDef, ToolRouter};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -501,92 +501,26 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
         .to_string();
     let stream_requested = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    // Stage 2.2: FunctionGemma routing.
+    // Stage 2.2 (FunctionGemma local routing) was REMOVED.
     //
-    // Only run on turns whose latest message is from the user — synthesis
-    // turns (where the latest message is a tool result or an assistant
-    // continuation) should pass through to the chat LLM untouched.
+    // Why: a 270M local router that picked the tool AND invented args was
+    // wrong on both counts. It conflated "which tool" with "what arguments"
+    // — two problems with different right answers — and shipped a black-box
+    // decision the user couldn't introspect. In production this manifested
+    // as a silent-failure bug: when the router picked a Python MCP tool,
+    // the synthesised tool_call response routed through the agent loop, the
+    // tool returned, and the second LLM round produced empty content, so
+    // the user saw a blank screen for materials questions like
+    // "what is Inconel 718".
     //
-    // FunctionGemma sees ONLY the post-retrieval tools[] (the top-K already
-    // chosen above), so the router can't pick a tool the chat LLM wouldn't
-    // also have seen. If FunctionGemma emits a parseable call whose name is
-    // in our tool list, we synthesise an OpenAI streaming response with that
-    // tool_call and return it directly — never touching the chat LLM.
-    if let Some(router) = state.router.as_ref() {
-        let last_role = req
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.last())
-            .and_then(|m| m.get("role"))
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        let user_query: Option<String> =
-            req.get("messages")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| {
-                    arr.iter()
-                        .rev()
-                        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                        .map(|s| s.to_string())
-                });
-        let tools_for_routing: Vec<Value> = req
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        if last_role == "user"
-            && !tools_for_routing.is_empty()
-            && let Some(query) = user_query.as_ref()
-        {
-            let decision = router.route(query, &tools_for_routing).await;
-            if let RoutingDecision::Invoke(mut call) = decision {
-                // 1. Validate the chosen tool name is actually in the
-                //    list — guards against hallucinated names.
-                let name_known = tools_for_routing.iter().any(|t| {
-                    t.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|v| v.as_str())
-                        == Some(call.name.as_str())
-                });
-                if !name_known {
-                    eprintln!(
-                        "[platform_bridge] FunctionGemma proposed unknown tool {:?}, falling through",
-                        call.name
-                    );
-                } else {
-                    // 2. Schema-validate args against the tool's
-                    //    declared parameters. Base FunctionGemma picks
-                    //    the right tool but tends to invent extra args
-                    //    — strip those, keep schema-declared ones.
-                    //    If required fields are still unsatisfied,
-                    //    fall through to the chat LLM rather than
-                    //    ship a doomed call.
-                    let schema_ok = sanitise_args_against_schema(&mut call, &tools_for_routing);
-                    if !schema_ok {
-                        eprintln!(
-                            "[platform_bridge] FunctionGemma args invalid against schema for {}, falling through",
-                            call.name
-                        );
-                    } else {
-                        eprintln!(
-                            "[platform_bridge] FunctionGemma routed locally → {} (skipping chat LLM)",
-                            call.name
-                        );
-                        if stream_requested {
-                            let stream = synthetic_tool_call_stream(call, model.clone());
-                            return Sse::new(stream).into_response();
-                        } else {
-                            return Json(synthetic_tool_call_full(call, model.clone()))
-                                .into_response();
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // The new architecture: Stage 2.1 (semantic top-K retrieval, above)
+    // narrows 125 tools → ~13 relevant ones. Those go to the chat LLM
+    // (Gemini / GPT-4 / Claude) as standard OpenAI tools. Frontier chat
+    // LLMs are state-of-the-art at tool selection AND argument extraction,
+    // and they always render a natural-language answer after the tool
+    // result — no "skip chat LLM" path means no silent-failure class of
+    // bugs. Marketplace-native: a new tool ships → embed its description →
+    // it's in the cosine pool. No fine-tune needed.
     // MARC27's chat endpoint only accepts system|user|assistant roles, but
     // OpenAI-style tool dispatch produces messages with role=tool (the tool
     // result) and assistant messages carrying a tool_calls array. Flatten
@@ -616,18 +550,65 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
     // response from the deltas.
     let upstream = format!("{}/stream", state.upstream_base);
 
-    let res = state
-        .http
-        .post(&upstream)
-        .bearer_auth(&state.access_token)
-        .header("Accept", "text/event-stream")
-        .json(&req)
-        .send()
-        .await;
-
-    let resp = match res {
-        Ok(r) => r,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, &format!("upstream: {e}")),
+    // Defensive retry on transient 5xx. The marc27-core retry helper lives
+    // server-side and currently covers 429/502/503/504, but Cloudflare in
+    // front of MARC27 occasionally serves 520-524 (origin connection drops,
+    // handshake timeouts, "unknown error") which fall through to PRISM as
+    // a hard error. Without a client-side retry, forge would log a tracing
+    // event and the TUI would render an empty turn — that's the silent-
+    // failure bug we hit on materials questions. Retry the *initial* POST
+    // up to 4 times with exponential backoff (500ms → 1s → 2s, capped 4s);
+    // once the SSE stream has started, mid-stream failures fall through to
+    // forge's own retry layer.
+    let resp = {
+        const RETRYABLE_STATUS: &[u16] = &[429, 502, 503, 504, 520, 521, 522, 523, 524];
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut last: Option<reqwest::Response> = None;
+        let mut last_err: Option<reqwest::Error> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match state
+                .http
+                .post(&upstream)
+                .bearer_auth(&state.access_token)
+                .header("Accept", "text/event-stream")
+                .json(&req)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    let s = r.status().as_u16();
+                    if r.status().is_success()
+                        || !RETRYABLE_STATUS.contains(&s)
+                        || attempt == MAX_ATTEMPTS
+                    {
+                        last = Some(r);
+                        break;
+                    }
+                    eprintln!(
+                        "\x1b[33m[prism]\x1b[0m MARC27 returned {s}, retrying (attempt {attempt}/{MAX_ATTEMPTS})"
+                    );
+                    let backoff_ms = 500u64 * (1 << (attempt - 1)).min(8);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt == MAX_ATTEMPTS {
+                        break;
+                    }
+                    let backoff_ms = 500u64 * (1 << (attempt - 1)).min(8);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+        match (last, last_err) {
+            (Some(r), _) => r,
+            (None, Some(e)) => {
+                return error_response(StatusCode::BAD_GATEWAY, &format!("upstream: {e}"));
+            }
+            (None, None) => {
+                return error_response(StatusCode::BAD_GATEWAY, "upstream: no response");
+            }
+        }
     };
 
     let status = resp.status();
@@ -672,6 +653,28 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
             "\x1b[31m[prism]\x1b[0m MARC27 returned {status}: {}",
             body.lines().next().unwrap_or("")
         );
+
+        // Visible-failure converter: surface MARC27 5xx as a real chat
+        // message instead of letting forge's tracing-only retry path
+        // render a blank turn. This is the silent-failure mitigation —
+        // when retries above are exhausted on transient 5xx, the user
+        // SEES what happened and what to do, not an empty screen.
+        if status.is_server_error() {
+            let msg = format!(
+                "MARC27 platform briefly unavailable (HTTP {status}).\n\n\
+                 Retried {} times before giving up. This is usually a transient \
+                 Cloudflare or origin issue — try the same message again in a \
+                 moment.\n\n\
+                 If it keeps happening, check status: https://status.marc27.com",
+                4u32
+            );
+            if stream_requested {
+                return Sse::new(synthetic_text_stream(msg, model.clone())).into_response();
+            } else {
+                return Json(synthetic_text_full(msg, model.clone())).into_response();
+            }
+        }
+
         return error_response(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             &body,
@@ -801,73 +804,6 @@ fn flatten_tool_messages_for_marc27(req: &mut Value) {
     }
 }
 
-// ── Schema-aware arg sanitisation (Stage 2.2 quality fix) ────────────
-
-/// Trim `call.arguments` to the keys declared in the matching tool's JSON
-/// schema and verify all required fields are present. Returns true when
-/// the call is safe to ship to the tool dispatcher; false when it should
-/// fall through to the chat LLM.
-///
-/// This is the runtime arg-accuracy guard that makes the un-fine-tuned
-/// FunctionGemma reliable in practice — base model picks correct tool +
-/// emits structurally valid call but invents extra args; we drop those.
-fn sanitise_args_against_schema(call: &mut prism_tool_router::ToolCall, tools: &[Value]) -> bool {
-    let parameters = tools
-        .iter()
-        .find(|t| {
-            t.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-                == Some(call.name.as_str())
-        })
-        .and_then(|t| t.get("function"))
-        .and_then(|f| f.get("parameters"));
-
-    let Some(parameters) = parameters else {
-        // No schema available — best-effort, accept what the model emitted.
-        return true;
-    };
-    let allowed: std::collections::HashSet<String> = parameters
-        .get("properties")
-        .and_then(|p| p.as_object())
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
-    let required: Vec<String> = parameters
-        .get("required")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if let Value::Object(args) = &mut call.arguments {
-        // Always retain only allowed keys. Previously gated on
-        // `!allowed.is_empty()`, which let hallucinated args survive for
-        // tools whose schema is `{"properties": {}}` (e.g. compute_gpus,
-        // knowledge_stats, list_corpora) — Pydantic would then reject the
-        // call with `unexpected_keyword_argument`. Empty `allowed` is the
-        // valid case where the tool takes zero args, so retain() should
-        // still drop everything the LLM hallucinated.
-        args.retain(|k, _| allowed.contains(k));
-        for req in &required {
-            if !args.contains_key(req) {
-                return false;
-            }
-        }
-        true
-    } else {
-        // Args weren't an object — schema almost certainly wants one.
-        // Wrap in empty object and check required.
-        if !required.is_empty() {
-            return false;
-        }
-        call.arguments = Value::Object(Default::default());
-        true
-    }
-}
-
 // ── Synthetic plain-text response ────────────────────────────────────
 
 /// Build a streaming OpenAI chat-completion response that delivers a single
@@ -957,125 +893,6 @@ fn synthetic_text_full(text: String, model: String) -> Value {
     })
 }
 
-// ── Synthetic tool-call response (Stage 2.2) ─────────────────────────
-
-/// Build an OpenAI streaming response that delivers a single tool_call as
-/// if a chat LLM had emitted it. Used when FunctionGemma routes the query
-/// locally — forge consumes this stream, dispatches the tool, and we never
-/// pay a chat LLM round-trip for tool selection.
-fn synthetic_tool_call_stream(
-    call: prism_tool_router::ToolCall,
-    model: String,
-) -> impl Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
-    let id = format!("chatcmpl-{}", uuid_hex8());
-    let call_id = format!("call_{}", uuid_hex8());
-    let created = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let args_json = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string());
-
-    async_stream::stream! {
-        // 1. role-only chunk
-        yield Ok(Event::default().data(serde_json::to_string(&json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": { "role": "assistant" },
-                "finish_reason": null,
-            }],
-        })).unwrap()));
-
-        // 2. tool_call header (id, type, name, empty args)
-        yield Ok(Event::default().data(serde_json::to_string(&json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "id": call_id,
-                        "type": "function",
-                        "function": { "name": call.name, "arguments": "" }
-                    }]
-                },
-                "finish_reason": null,
-            }],
-        })).unwrap()));
-
-        // 3. tool_call args body
-        yield Ok(Event::default().data(serde_json::to_string(&json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "function": { "arguments": args_json }
-                    }]
-                },
-                "finish_reason": null,
-            }],
-        })).unwrap()));
-
-        // 4. finish
-        yield Ok(Event::default().data(serde_json::to_string(&json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "tool_calls",
-            }],
-        })).unwrap()));
-
-        yield Ok(Event::default().data("[DONE]"));
-    }
-}
-
-/// Same as `synthetic_tool_call_stream` but as a single JSON response for
-/// callers that asked for `stream:false`.
-fn synthetic_tool_call_full(call: prism_tool_router::ToolCall, model: String) -> Value {
-    let id = format!("chatcmpl-{}", uuid_hex8());
-    let call_id = format!("call_{}", uuid_hex8());
-    let created = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let args_json = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string());
-    json!({
-        "id": id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": { "name": call.name, "arguments": args_json }
-                }]
-            },
-            "finish_reason": "tool_calls",
-        }],
-        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 },
-    })
-}
-
 // ── SSE translation ──────────────────────────────────────────────────
 
 fn sse_stream(
@@ -1106,6 +923,11 @@ fn sse_stream(
         let mut buf = String::new();
         let mut body = body;
         let mut sent_done = false;
+        // Tracks how many real content characters the upstream actually
+        // sent to us. Used by the silent-failure detector below to decide
+        // whether `completion_tokens > 0` + empty deltas means MARC27
+        // dropped tool_calls.
+        let mut total_emitted_chars: usize = 0;
         while let Some(chunk) = body.next().await {
             let bytes = match chunk {
                 Ok(b) => b,
@@ -1127,13 +949,67 @@ fn sse_stream(
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                    if std::env::var("PRISM_BRIDGE_DUMP").is_ok() {
+                        eprintln!(
+                            "[platform_bridge:dump] {}",
+                            payload.chars().take(500).collect::<String>()
+                        );
+                    }
                     let delta_text = parsed
                         .get("delta")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let done = parsed.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
 
+                    // Silent-failure detector. The MARC27 provider normalizer
+                    // (crates/jobs/.../providers/openai.rs:OaiDelta) only
+                    // captures `content` — when an upstream Gemini/OpenAI
+                    // model emits tool_calls, MARC27 strips them and sends
+                    // delta:"" for every chunk. Forge sees no content and
+                    // no tool_calls, treats the turn as "done with no
+                    // output", and the TUI renders a blank screen. We can
+                    // detect the signature: completion_tokens > 0 AND every
+                    // delta empty up through `done`. When that triggers,
+                    // surface a real error to the user instead of silence.
+                    if done {
+                        let completion_tokens = parsed
+                            .get("usage")
+                            .and_then(|u| u.get("completion_tokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        // Track via a closure-local: any non-empty delta we
+                        // saw before this `done` = real content was rendered.
+                        // We can use total deltas-emitted as a proxy — done
+                        // chunk's delta is empty so total_emitted_chars
+                        // accumulates only real content.
+                        if completion_tokens > 0 && total_emitted_chars == 0 {
+                            let warn = "\n\n\
+                                ⚠️  PRISM detected dropped output from the platform.\n\n\
+                                The upstream LLM generated content (likely a tool_call) \
+                                but the MARC27 provider proxy is configured to forward \
+                                only plain text deltas, so it arrived blank.\n\n\
+                                Workarounds for now:\n\
+                                • Rephrase as a direct question (no tool needed) — that \
+                                path is unaffected.\n\
+                                • Use `/model` to switch to a model that returns text \
+                                directly.\n\n\
+                                Tracking: marc27-core OaiDelta needs tool_calls support.";
+                            yield Ok(Event::default().data(serde_json::to_string(&json!({
+                                "id": id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": { "content": warn },
+                                    "finish_reason": null,
+                                }],
+                            })).unwrap()));
+                        }
+                    }
+
                     if !delta_text.is_empty() {
+                        total_emitted_chars += delta_text.len();
                         yield Ok(Event::default().data(serde_json::to_string(&json!({
                             "id": id,
                             "object": "chat.completion.chunk",

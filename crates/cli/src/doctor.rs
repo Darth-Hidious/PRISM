@@ -32,13 +32,20 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
         "auto-downloads on first `prism tui`",
     ));
 
-    // 3. Function GGUF (optional)
+    // 3. FunctionGemma model — DEPRECATED. The Stage 2.2 local-routing
+    //    path was removed because it caused silent failures (it picked a
+    //    tool the chat LLM never got to summarise). The doctor still
+    //    reports the file's presence as informational so users with a
+    //    cached copy don't get a confusing "missing" warning, but the
+    //    model is no longer required and no longer downloaded.
     let fn_gguf = prism_dir.join("models/functiongemma-270m.gguf");
-    checks.push(check_file(
-        "FunctionGemma model",
-        &fn_gguf,
-        "auto-downloads on first `prism tui` — local routing disabled without it",
-    ));
+    if fn_gguf.exists() {
+        checks.push(check_file(
+            "FunctionGemma model",
+            &fn_gguf,
+            "deprecated — kept on disk but no longer used by PRISM",
+        ));
+    }
 
     // 4. Python venv (used by prism-python MCP server)
     let venv_python = prism_dir.join("venv/bin/python3");
