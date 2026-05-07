@@ -401,8 +401,7 @@ mod tests {
         // The old parser had no `[` branch — the bracket span ran into the
         // bareword reader and Pydantic rejected it with `Input should be a
         // valid list`. This test pins the fix.
-        let text =
-            "call:search_materials{providers:[<escape>nomad<escape>,<escape>mp<escape>]}";
+        let text = "call:search_materials{providers:[<escape>nomad<escape>,<escape>mp<escape>]}";
         let call = parse_function_call(text).expect("parse");
         assert_eq!(call.name, "search_materials");
         let providers = call.arguments["providers"].as_array().expect("array");
