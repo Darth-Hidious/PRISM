@@ -294,6 +294,33 @@ fn read_value(s: &str, bytes: &[u8], start: usize) -> (Value, usize) {
         // No closing escape — take the rest as-is.
         return (Value::String(s[body_start..].to_string()), bytes.len());
     }
+    // Array: [val1, val2, ...] — items can themselves be escape-wrapped
+    // strings, nested objects, lists, or barewords. FunctionGemma emits
+    // arrays this way for tools whose schema accepts a list, e.g.
+    // `search_materials(providers: ["nomad", "mp"])` becomes
+    // `providers:[<escape>nomad<escape>,<escape>mp<escape>]`. Without this
+    // branch the parser fell through to bareword and treated the whole
+    // bracket span as one literal string, which Pydantic then rejected
+    // with `Input should be a valid list`.
+    if i < bytes.len() && bytes[i] == b'[' {
+        let mut items = Vec::new();
+        let mut j = skip_ws(bytes, i + 1);
+        while j < bytes.len() && bytes[j] != b']' {
+            let (val, next) = read_value(s, bytes, j);
+            items.push(val);
+            j = skip_ws(bytes, next);
+            if j < bytes.len() && bytes[j] == b',' {
+                j = skip_ws(bytes, j + 1);
+            }
+        }
+        // Step over the closing ']' if present.
+        let end = if j < bytes.len() && bytes[j] == b']' {
+            j + 1
+        } else {
+            j
+        };
+        return (Value::Array(items), end);
+    }
     // Nested object — pass through to JSON.
     if i < bytes.len() && bytes[i] == b'{' {
         let mut depth = 0usize;
@@ -316,9 +343,9 @@ fn read_value(s: &str, bytes: &[u8], start: usize) -> (Value, usize) {
         let parsed = serde_json::from_str(blob).unwrap_or(Value::String(blob.to_string()));
         return (parsed, j);
     }
-    // Bareword: read until comma at top level.
+    // Bareword: read until comma or closing bracket at top level.
     let mut j = i;
-    while j < bytes.len() && bytes[j] != b',' {
+    while j < bytes.len() && bytes[j] != b',' && bytes[j] != b']' && bytes[j] != b'}' {
         j += 1;
     }
     let raw = s[i..j].trim().to_string();
@@ -365,5 +392,39 @@ mod tests {
     fn returns_none_for_non_call_text() {
         assert!(parse_function_call("I cannot help with that.").is_none());
         assert!(parse_function_call("").is_none());
+    }
+
+    #[test]
+    fn parses_array_of_escaped_strings() {
+        // Caught live in PRISM: FunctionGemma emitted
+        //   call:search_materials{providers:[<escape>nomad<escape>,<escape>mp<escape>]}
+        // The old parser had no `[` branch — the bracket span ran into the
+        // bareword reader and Pydantic rejected it with `Input should be a
+        // valid list`. This test pins the fix.
+        let text =
+            "call:search_materials{providers:[<escape>nomad<escape>,<escape>mp<escape>]}";
+        let call = parse_function_call(text).expect("parse");
+        assert_eq!(call.name, "search_materials");
+        let providers = call.arguments["providers"].as_array().expect("array");
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0], "nomad");
+        assert_eq!(providers[1], "mp");
+    }
+
+    #[test]
+    fn parses_array_of_barewords_and_numbers() {
+        let text = "call:fn{nums:[1,2,3],flags:[true,false]}";
+        let call = parse_function_call(text).expect("parse");
+        let nums = call.arguments["nums"].as_array().expect("nums array");
+        assert_eq!(nums, &vec![Value::from(1), Value::from(2), Value::from(3)]);
+        let flags = call.arguments["flags"].as_array().expect("flags array");
+        assert_eq!(flags, &vec![Value::Bool(true), Value::Bool(false)]);
+    }
+
+    #[test]
+    fn parses_empty_array() {
+        let text = "call:fn{tags:[]}";
+        let call = parse_function_call(text).expect("parse");
+        assert_eq!(call.arguments["tags"], serde_json::json!([]));
     }
 }
