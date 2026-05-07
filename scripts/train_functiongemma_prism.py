@@ -253,6 +253,14 @@ def main(smoke: bool = False, dry_run: bool = False) -> None:
     print("starting training")
     trainer.train()
 
+    if smoke:
+        # Smoke runs validate the full training pipeline (imports, model
+        # load, dataset, trainer construct, train_on_responses_only wrap,
+        # 10 actual training steps) without polluting the target repo
+        # with a 10-step undertrained model.
+        print("SMOKE OK: trained 10 steps without errors, skipping merge/push")
+        return
+
     print(f"merging LoRA into base weights")
     merged = model.merge_and_unload()
     merged_dir = Path("/tmp/functiongemma-prism-merged")
