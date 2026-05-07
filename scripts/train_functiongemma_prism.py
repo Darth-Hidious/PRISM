@@ -186,13 +186,14 @@ def main():
         warmup_ratio=0.05,
         lr_scheduler_type="cosine",
         logging_steps=25,
-        eval_strategy="steps",
-        eval_steps=200,
-        # save_strategy="no": Unsloth's gradient checkpointing wraps the model
-        # with a `ConfigModuleInstance` object that dill/pickle cannot
-        # serialise, so any TRL save_steps trigger (local or hub) crashes
-        # mid-training. We save once after `trainer.train()` finishes via
-        # `merged.save_pretrained()` — no pickle path involved.
+        # eval_strategy="no" + save_strategy="no": Unsloth's gradient
+        # checkpointing wraps the model dict with a torch._dynamo
+        # `ConfigModuleInstance` that dill/pickle cannot serialise, so any
+        # TRL trigger that snapshots accelerator state (eval, save_steps,
+        # hub push) crashes with `cannot pickle 'ConfigModuleInstance'`.
+        # We disable BOTH paths and save once after `trainer.train()` via
+        # `merged.save_pretrained()` — bypasses the pickle bug entirely.
+        eval_strategy="no",
         save_strategy="no",
         bf16=True,
         optim="adamw_torch_fused",
