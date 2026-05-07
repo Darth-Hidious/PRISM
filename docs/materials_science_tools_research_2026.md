@@ -149,9 +149,22 @@ marketplace** stitching.
 
 Ranked by leverage (most impact per unit work first):
 
-### Gap 1 — Foundation NN potential as a tool — TWO-TIER
-Two-tier strategy: **local-built-in** + **cloud-paid**, sharing one MCP
-tool surface from the agent's perspective.
+### Gap 1 — Foundation NN potential as a tool — CLOUD-ONLY (per user direction 2026-05-07)
+
+**Direction correction:** keep PRISM lean. *Do not* ship MACE / large NN
+potentials as local downloads — the user explicitly said "we wanna
+provide them the service sort of, should be available not downloaded
+directly onto their system." All foundation potentials live on
+MARC27's cloud and PRISM calls them as a service.
+
+The two-tier MACE-MP-0-local + MACE-mh-1-cloud split below is
+preserved as historical analysis but DOES NOT ship as written. The
+shipping plan: **all variants (MACE-MP-0b3, MACE-MPA-0, MACE-mh-1)
+hosted server-side; PRISM exposes one MCP tool that forwards to
+MARC27**. Local-side dependency stays at zero.
+
+(The two-tier discussion below is left in place to document the
+analysis; it's not the build plan.)
 
 **Tier 1 — Local, built-in, free (~1-2 days)**
 - Ship `MACE-MP-0b3` + `MACE-MPA-0` (the MPtraj+sAlex SOTA variant).

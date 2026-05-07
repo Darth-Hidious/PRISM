@@ -117,11 +117,16 @@ pub async fn run(
             );
             None
         } else {
+            // Load the user's chat target from ~/.prism/config.toml so
+            // a persisted `prism use ...` choice takes effect on this
+            // launch. Default = MARC27 cloud with no model override.
+            let initial_chat_target = crate::chat_config::load().unwrap_or_default().chat;
             match platform_bridge::start(
                 &creds.platform_url,
                 project_id,
                 &creds.access_token,
                 router.clone(),
+                initial_chat_target,
             )
             .await
             {

@@ -44,7 +44,9 @@ use futures_util::stream::Stream;
 use prism_tool_router::{ToolDef, ToolRouter};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{RwLock, oneshot};
+
+use crate::chat_config::ChatTarget;
 
 #[derive(Clone)]
 struct ProxyState {
@@ -56,12 +58,32 @@ struct ProxyState {
     /// MARC27. When absent, fallback to the FIFO trim heuristic so the
     /// proxy still works without the router (e.g. model not yet downloaded).
     router: Option<Arc<ToolRouter>>,
+    /// Live chat-target selection. Wrapped in `Arc<RwLock<…>>` so the
+    /// in-chat `/use` slash command (and `prism use`) can hot-swap
+    /// where chat turns get routed without tearing down the proxy.
+    /// Each handler reads it at the top of the request, so in-flight
+    /// streams keep using whatever target they started on; only the
+    /// *next* turn picks up the swap.
+    ///
+    /// For now (this commit) we only honour `ChatTarget::Marc27 { model }`
+    /// — when `model` is `Some(x)`, the bridge rewrites the outgoing
+    /// `model` field on chat-completion requests so MARC27 serves
+    /// the user-picked upstream (e.g. `gpt-5.5`) instead of whatever
+    /// forge defaulted to. `Local` and `Provider` URL-resolution land
+    /// in the follow-up commit; their requests still flow through
+    /// `upstream_base` until then.
+    chat_target: Arc<RwLock<ChatTarget>>,
 }
 
 /// Handle returned from `start`. Drop it (or call `shutdown()`) when the
 /// chat session ends to stop the proxy task.
+///
+/// Carries an `Arc<RwLock<ChatTarget>>` so the in-chat `/use` slash
+/// command can swap chat targets at runtime: it grabs `chat_target()`,
+/// writes the new value, and the bridge picks it up on the next turn.
 pub struct ProxyHandle {
     pub url: String, // base URL forge should hit (proxy_url + "/v1")
+    chat_target: Arc<RwLock<ChatTarget>>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -74,6 +96,15 @@ impl ProxyHandle {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
+    }
+
+    /// Hand out the live `ChatTarget` lock so callers (the `/use` slash
+    /// command, in particular) can hot-swap the chat upstream without
+    /// restarting the proxy. The lock is the single source of truth
+    /// the bridge reads at the top of every chat-completion handler.
+    #[allow(dead_code)]
+    pub fn chat_target(&self) -> Arc<RwLock<ChatTarget>> {
+        self.chat_target.clone()
     }
 }
 
@@ -97,12 +128,15 @@ pub async fn start(
     project_id: &str,
     access_token: &str,
     router: Option<Arc<ToolRouter>>,
+    initial_chat_target: ChatTarget,
 ) -> Result<ProxyHandle> {
     let upstream_base = format!(
         "{}/api/v1/projects/{}/llm",
         platform_url.trim_end_matches('/'),
         project_id
     );
+
+    let chat_target = Arc::new(RwLock::new(initial_chat_target));
 
     let state = ProxyState {
         upstream_base,
@@ -113,6 +147,7 @@ pub async fn start(
             .build()
             .context("build reqwest client")?,
         router,
+        chat_target: chat_target.clone(),
     };
 
     let app = Router::new()
@@ -142,6 +177,7 @@ pub async fn start(
 
     Ok(ProxyHandle {
         url,
+        chat_target,
         shutdown: Some(tx),
     })
 }
@@ -385,6 +421,27 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
             return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {e}"));
         }
     };
+
+    // Honour the user's chat-target preference. Right now this only
+    // rewrites the `model` field for `ChatTarget::Marc27 { model: Some(x) }`
+    // — everything else still flows to MARC27 over `upstream_base`.
+    // Local/Provider URL routing lands in the follow-up commit; for
+    // now, picking a model still requires `prism use marc27 --model x`
+    // so the user controls *which* model MARC27 serves.
+    {
+        let target = state.chat_target.read().await.clone();
+        if let ChatTarget::Marc27 {
+            model: Some(picked),
+        } = target
+        {
+            // Forge always sends a `model` field (the one in
+            // .forge.toml's ModelConfig). Override it so MARC27 picks
+            // the user's chosen upstream (e.g. `gpt-5.5`).
+            if let Some(obj) = req.as_object_mut() {
+                obj.insert("model".to_string(), Value::String(picked));
+            }
+        }
+    }
 
     // Stage 2.1: semantic top-K tool retrieval.
     //
