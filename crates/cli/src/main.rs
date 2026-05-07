@@ -4003,7 +4003,15 @@ fn print_discourse_run_events(events: &[serde_json::Value]) {
             "started" => {
                 let instance_id = value_string(event, &["instance_id"]).unwrap_or("?");
                 let spec_name = value_string(event, &["spec_name", "name"]).unwrap_or("?");
-                println!("started: {spec_name} ({instance_id})");
+                let total_rounds = event
+                    .get("total_rounds")
+                    .and_then(|value| value.as_i64())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                println!(
+                    "\n  \u{2501}\u{2501}\u{2501} {spec_name} \u{2501}\u{2501}\u{2501} {total_rounds} round(s) \u{2501}\u{2501}\u{2501}"
+                );
+                println!("  instance: {instance_id}\n");
             }
             "round_started" => {
                 let round = event
@@ -4011,18 +4019,47 @@ fn print_discourse_run_events(events: &[serde_json::Value]) {
                     .and_then(|value| value.as_i64())
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "?".to_string());
-                let round_type = value_string(event, &["type"]).unwrap_or("?");
-                println!("round_started: round {round} [{round_type}]");
+                // Engine emits the round category under `round_type`,
+                // not `type` — earlier code looked up the wrong key
+                // and rendered `[?]` for every round.
+                let round_type = value_string(event, &["round_type", "type"]).unwrap_or("?");
+                let agents: Vec<String> = event
+                    .get("agents")
+                    .and_then(|value| value.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let agents_label = if agents.is_empty() {
+                    "(all agents)".to_string()
+                } else {
+                    agents.join(", ")
+                };
+                println!(
+                    "\n  \u{25BC} Round {round} \u{2014} {round_type} \u{2014} {agents_label}\n"
+                );
             }
             "agent_turn" => {
                 let agent = value_string(event, &["agent_id"]).unwrap_or("?");
                 let content = value_string(event, &["content"]).unwrap_or("");
-                let preview = if content.len() > 140 {
-                    format!("{}...", &content[..140])
-                } else {
-                    content.to_string()
-                };
-                println!("agent_turn: {agent}: {}", preview.replace('\n', " "));
+                let turn_num = event
+                    .get("turn_num")
+                    .and_then(|value| value.as_i64())
+                    .map(|value| format!("turn {value}"))
+                    .unwrap_or_default();
+                // Indent every line of the agent's reply by 4 spaces so
+                // the reader's eye groups it under the agent header. No
+                // truncation — the whole point of a discourse is to read
+                // what the agents actually said.
+                let indented: String = content
+                    .lines()
+                    .map(|line| format!("    {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                println!("  \u{2022} {agent}  {turn_num}");
+                println!("{indented}\n");
             }
             "round_complete" => {
                 let round = event
@@ -4030,7 +4067,21 @@ fn print_discourse_run_events(events: &[serde_json::Value]) {
                     .and_then(|value| value.as_i64())
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "?".to_string());
-                println!("round_complete: round {round}");
+                println!("  \u{2514} round {round} complete\n");
+            }
+            "gate_check" => {
+                let metric = value_string(event, &["metric"]).unwrap_or("?");
+                let value = event
+                    .get("value")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "?".to_string());
+                let passed = event
+                    .get("passed")
+                    .and_then(|v| v.as_bool())
+                    .map(|v| if v { "PASS" } else { "FAIL" })
+                    .unwrap_or("?");
+                println!("  gate: {metric}={value} \u{2192} {passed}\n");
             }
             "complete" => {
                 let turns = event
@@ -4043,10 +4094,16 @@ fn print_discourse_run_events(events: &[serde_json::Value]) {
                     .and_then(|value| value.as_f64())
                     .map(|value| format!("${value:.4}"))
                     .unwrap_or_else(|| "?".to_string());
-                println!("complete: turns={turns} cost={cost}");
+                println!(
+                    "  \u{2501}\u{2501}\u{2501} complete \u{2501} {turns} turn(s) \u{2501} {cost} \u{2501}\u{2501}\u{2501}\n"
+                );
+            }
+            "error" => {
+                let msg = value_string(event, &["message"]).unwrap_or("(no detail)");
+                println!("  \u{26A0}  error: {msg}\n");
             }
             other => {
-                println!("{other}: {}", event);
+                println!("  ? {other}: {}", event);
             }
         }
     }
