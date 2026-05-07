@@ -18,4 +18,5 @@ ignore = [
     # hickory-proto 0.25.2 (transitive via gix → forge_repo):
     # we don't terminate untrusted DNS — system resolver only.
     "RUSTSEC-2026-0118", # NSEC3 unbounded-loop on cross-zone responses
+    "RUSTSEC-2026-0119", # CPU exhaustion via O(n²) name compression — same crate, same path
 ]
