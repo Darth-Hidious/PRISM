@@ -21,7 +21,11 @@ pub struct EventData<P: Send + Sync> {
 impl<P: Send + Sync> EventData<P> {
     /// Creates a new event with the given agent, model ID, and payload
     pub fn new(agent: Agent, model_id: ModelId, payload: P) -> Self {
-        Self { agent, model_id, payload }
+        Self {
+            agent,
+            model_id,
+            payload,
+        }
     }
 }
 

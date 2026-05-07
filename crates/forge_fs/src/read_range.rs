@@ -30,7 +30,11 @@ impl crate::ForgeFS {
 
         // Basic validation
         if start_line > end_line {
-            return Err(Error::StartGreaterThanEnd { start: start_line, end: end_line }.into());
+            return Err(Error::StartGreaterThanEnd {
+                start: start_line,
+                end: end_line,
+            }
+            .into());
         }
 
         // Open and check if file is binary
@@ -39,7 +43,11 @@ impl crate::ForgeFS {
             .with_context(|| format!("Failed to open file {}", path_ref.display()))?;
 
         if start_line == 0 || end_line == 0 {
-            return Err(Error::IndexStartingWithZero { start: start_line, end: end_line }.into());
+            return Err(Error::IndexStartingWithZero {
+                start: start_line,
+                end: end_line,
+            }
+            .into());
         }
 
         let (is_text, file_type) = Self::is_binary(&mut file).await?;
@@ -74,9 +82,11 @@ impl crate::ForgeFS {
 
         // Validate start position
         if start_pos >= total_lines {
-            return Err(
-                Error::StartBeyondFileSize { start: start_line, total: total_lines }.into(),
-            );
+            return Err(Error::StartBeyondFileSize {
+                start: start_line,
+                total: total_lines,
+            }
+            .into());
         }
 
         // Cap end position at last line

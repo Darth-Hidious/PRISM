@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 
 use crate::config::Config;
@@ -61,12 +61,18 @@ impl FunctionServer {
         // batch size and what counts for the "input N too large" error;
         // bump it just enough to swallow long single-tool schemas.
         let child = Command::new(&config.llama_server_bin)
-            .arg("--model").arg(model)
-            .arg("--port").arg(port.to_string())
-            .arg("--host").arg("127.0.0.1")
-            .arg("--ctx-size").arg("8192")
-            .arg("--batch-size").arg("8192")
-            .arg("--ubatch-size").arg("2048")
+            .arg("--model")
+            .arg(model)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--ctx-size")
+            .arg("8192")
+            .arg("--batch-size")
+            .arg("8192")
+            .arg("--ubatch-size")
+            .arg("2048")
             .arg("--no-webui")
             .arg("--log-disable")
             .stdin(std::process::Stdio::null())
@@ -82,7 +88,11 @@ impl FunctionServer {
             .build()
             .context("build http client")?;
 
-        let server = Self { child, base_url, http };
+        let server = Self {
+            child,
+            base_url,
+            http,
+        };
         server.wait_ready().await?;
         Ok(server)
     }
@@ -114,11 +124,7 @@ impl FunctionServer {
     ///
     /// `tools` is the OpenAI-shape array forge would normally send to a chat
     /// model: `[{ "type": "function", "function": { name, description, parameters } }, ...]`.
-    pub async fn route(
-        &self,
-        user_query: &str,
-        tools: &[Value],
-    ) -> Result<Option<ToolCall>> {
+    pub async fn route(&self, user_query: &str, tools: &[Value]) -> Result<Option<ToolCall>> {
         if tools.is_empty() {
             return Ok(None);
         }
@@ -173,7 +179,9 @@ fn pick_free_port() -> Result<u16> {
 }
 
 fn is_on_path(bin: &std::path::Path) -> bool {
-    bin.parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true)
+    bin.parent()
+        .map(|p| p.as_os_str().is_empty())
+        .unwrap_or(true)
 }
 
 /// Parse FunctionGemma's native call format:
@@ -218,7 +226,10 @@ pub fn parse_function_call(text: &str) -> Option<ToolCall> {
     }
     let inner = if depth == 0 { &body[..end] } else { body };
     let args = parse_args(inner);
-    Some(ToolCall { name, arguments: args })
+    Some(ToolCall {
+        name,
+        arguments: args,
+    })
 }
 
 /// Parse the comma-separated key:value list inside the braces.
@@ -324,7 +335,8 @@ mod tests {
 
     #[test]
     fn parses_basic_call() {
-        let text = "<start_function_call>call:get_weather{city:<escape>Paris<escape>}<end_function_call>";
+        let text =
+            "<start_function_call>call:get_weather{city:<escape>Paris<escape>}<end_function_call>";
         let call = parse_function_call(text).expect("parse");
         assert_eq!(call.name, "get_weather");
         assert_eq!(call.arguments["city"], "Paris");
@@ -332,7 +344,8 @@ mod tests {
 
     #[test]
     fn parses_multi_arg_with_number() {
-        let text = "call:book_table{party_size:2,city:<escape>Seattle<escape>,time:<escape>19:00<escape>}";
+        let text =
+            "call:book_table{party_size:2,city:<escape>Seattle<escape>,time:<escape>19:00<escape>}";
         let call = parse_function_call(text).expect("parse");
         assert_eq!(call.name, "book_table");
         assert_eq!(call.arguments["party_size"], 2);

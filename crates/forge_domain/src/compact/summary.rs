@@ -54,7 +54,10 @@ impl ContextSummary {
 impl SummaryBlock {
     /// Creates a new SummaryMessage with the given role and blocks
     pub fn new(role: Role, blocks: Vec<SummaryMessage>) -> Self {
-        Self { role, contents: blocks }
+        Self {
+            role,
+            contents: blocks,
+        }
     }
 }
 
@@ -101,7 +104,9 @@ impl SummaryToolCall {
     pub fn shell(command: impl Into<String>) -> Self {
         Self {
             id: None,
-            tool: SummaryTool::Shell { command: command.into() },
+            tool: SummaryTool::Shell {
+                command: command.into(),
+            },
             is_success: true,
         }
     }
@@ -111,7 +116,9 @@ impl SummaryToolCall {
     pub fn search(pattern: impl Into<String>) -> Self {
         Self {
             id: None,
-            tool: SummaryTool::Search { pattern: pattern.into() },
+            tool: SummaryTool::Search {
+                pattern: pattern.into(),
+            },
             is_success: true,
         }
     }
@@ -151,7 +158,9 @@ impl SummaryToolCall {
     pub fn followup(question: impl Into<String>) -> Self {
         Self {
             id: None,
-            tool: SummaryTool::Followup { question: question.into() },
+            tool: SummaryTool::Followup {
+                question: question.into(),
+            },
             is_success: true,
         }
     }
@@ -161,7 +170,9 @@ impl SummaryToolCall {
     pub fn plan(plan_name: impl Into<String>) -> Self {
         Self {
             id: None,
-            tool: SummaryTool::Plan { plan_name: plan_name.into() },
+            tool: SummaryTool::Plan {
+                plan_name: plan_name.into(),
+            },
             is_success: true,
         }
     }
@@ -280,8 +291,10 @@ impl From<&Context> for ContextSummary {
 
         // Insert the last chunk if buffer is not empty
         if !buffer.is_empty() {
-            messages
-                .push(SummaryBlock { role: current_role, contents: std::mem::take(&mut buffer) });
+            messages.push(SummaryBlock {
+                role: current_role,
+                contents: std::mem::take(&mut buffer),
+            });
         }
 
         // Update tool call success status based on results
@@ -339,28 +352,38 @@ fn extract_tool_info(call: &ToolCallFull, current_todos: &[Todo]) -> Option<Summ
     // Try to parse as a Tools enum variant
     if let Ok(tool) = ToolCatalog::try_from(call.clone()) {
         return match tool {
-            ToolCatalog::Read(input) => Some(SummaryTool::FileRead { path: input.file_path }),
-            ToolCatalog::Write(input) => Some(SummaryTool::FileUpdate { path: input.file_path }),
-            ToolCatalog::Patch(input) => Some(SummaryTool::FileUpdate { path: input.file_path }),
-            ToolCatalog::MultiPatch(input) => {
-                Some(SummaryTool::FileUpdate { path: input.file_path })
-            }
+            ToolCatalog::Read(input) => Some(SummaryTool::FileRead {
+                path: input.file_path,
+            }),
+            ToolCatalog::Write(input) => Some(SummaryTool::FileUpdate {
+                path: input.file_path,
+            }),
+            ToolCatalog::Patch(input) => Some(SummaryTool::FileUpdate {
+                path: input.file_path,
+            }),
+            ToolCatalog::MultiPatch(input) => Some(SummaryTool::FileUpdate {
+                path: input.file_path,
+            }),
             ToolCatalog::Remove(input) => Some(SummaryTool::FileRemove { path: input.path }),
-            ToolCatalog::Shell(input) => Some(SummaryTool::Shell { command: input.command }),
+            ToolCatalog::Shell(input) => Some(SummaryTool::Shell {
+                command: input.command,
+            }),
             ToolCatalog::FsSearch(input) => {
                 // Use glob, file_type, or pattern as the search identifier
                 let pattern = input.glob.or(input.file_type).unwrap_or(input.pattern);
                 Some(SummaryTool::Search { pattern })
             }
-            ToolCatalog::SemSearch(input) => {
-                Some(SummaryTool::SemSearch { queries: input.queries })
-            }
+            ToolCatalog::SemSearch(input) => Some(SummaryTool::SemSearch {
+                queries: input.queries,
+            }),
             ToolCatalog::Undo(input) => Some(SummaryTool::Undo { path: input.path }),
             ToolCatalog::Fetch(input) => Some(SummaryTool::Fetch { url: input.url }),
-            ToolCatalog::Followup(input) => {
-                Some(SummaryTool::Followup { question: input.question })
-            }
-            ToolCatalog::Plan(input) => Some(SummaryTool::Plan { plan_name: input.plan_name }),
+            ToolCatalog::Followup(input) => Some(SummaryTool::Followup {
+                question: input.question,
+            }),
+            ToolCatalog::Plan(input) => Some(SummaryTool::Plan {
+                plan_name: input.plan_name,
+            }),
             ToolCatalog::Skill(input) => Some(SummaryTool::Skill { name: input.name }),
             ToolCatalog::TodoWrite(input) => {
                 let before_map: HashMap<&str, &Todo> = current_todos
@@ -406,12 +429,16 @@ fn extract_tool_info(call: &ToolCallFull, current_todos: &[Todo]) -> Option<Summ
                 Some(SummaryTool::TodoWrite { changes })
             }
             ToolCatalog::TodoRead(_) => Some(SummaryTool::TodoRead),
-            ToolCatalog::Task(input) => Some(SummaryTool::Task { agent_id: input.agent_id }),
+            ToolCatalog::Task(input) => Some(SummaryTool::Task {
+                agent_id: input.agent_id,
+            }),
         };
     }
 
     // If not a known tool catalog item, treat as MCP tool
-    Some(SummaryTool::Mcp { name: call.name.to_string() })
+    Some(SummaryTool::Mcp {
+        name: call.name.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -460,7 +487,9 @@ mod tests {
 
         let expected = Block::ToolCall(SummaryToolCall {
             id: None,
-            tool: SummaryTool::FileRead { path: "/path/to/file.rs".to_string() },
+            tool: SummaryTool::FileRead {
+                path: "/path/to/file.rs".to_string(),
+            },
             is_success: true,
         });
 
@@ -473,7 +502,9 @@ mod tests {
 
         let expected = Block::ToolCall(SummaryToolCall {
             id: None,
-            tool: SummaryTool::FileUpdate { path: "/path/to/file.rs".to_string() },
+            tool: SummaryTool::FileUpdate {
+                path: "/path/to/file.rs".to_string(),
+            },
             is_success: true,
         });
 
@@ -486,7 +517,9 @@ mod tests {
 
         let expected = Block::ToolCall(SummaryToolCall {
             id: None,
-            tool: SummaryTool::FileRemove { path: "/path/to/file.rs".to_string() },
+            tool: SummaryTool::FileRemove {
+                path: "/path/to/file.rs".to_string(),
+            },
             is_success: true,
         });
 
@@ -906,7 +939,9 @@ mod tests {
 
         assert_eq!(
             actual,
-            Some(SummaryTool::Mcp { name: "mcp_github_create_issue".to_string() })
+            Some(SummaryTool::Mcp {
+                name: "mcp_github_create_issue".to_string()
+            })
         );
     }
 
@@ -916,7 +951,9 @@ mod tests {
 
         let expected = Block::ToolCall(SummaryToolCall {
             id: None,
-            tool: SummaryTool::Shell { command: "cargo build".to_string() },
+            tool: SummaryTool::Shell {
+                command: "cargo build".to_string(),
+            },
             is_success: true,
         });
 
@@ -1017,7 +1054,9 @@ mod tests {
 
         let expected = Block::ToolCall(SummaryToolCall {
             id: None,
-            tool: SummaryTool::Search { pattern: "/project/src".to_string() },
+            tool: SummaryTool::Search {
+                pattern: "/project/src".to_string(),
+            },
             is_success: true,
         });
 
@@ -1148,7 +1187,9 @@ mod tests {
 
         let expected = Block::ToolCall(SummaryToolCall {
             id: None,
-            tool: SummaryTool::Undo { path: "/test/file.rs".to_string() },
+            tool: SummaryTool::Undo {
+                path: "/test/file.rs".to_string(),
+            },
             is_success: true,
         });
 
@@ -1161,7 +1202,9 @@ mod tests {
 
         let expected = Block::ToolCall(SummaryToolCall {
             id: None,
-            tool: SummaryTool::Fetch { url: "https://example.com".to_string() },
+            tool: SummaryTool::Fetch {
+                url: "https://example.com".to_string(),
+            },
             is_success: true,
         });
 
@@ -1174,7 +1217,9 @@ mod tests {
 
         let expected = Block::ToolCall(SummaryToolCall {
             id: None,
-            tool: SummaryTool::Followup { question: "What should I do next?".to_string() },
+            tool: SummaryTool::Followup {
+                question: "What should I do next?".to_string(),
+            },
             is_success: true,
         });
 
@@ -1187,7 +1232,9 @@ mod tests {
 
         let expected = Block::ToolCall(SummaryToolCall {
             id: None,
-            tool: SummaryTool::Plan { plan_name: "feature-implementation".to_string() },
+            tool: SummaryTool::Plan {
+                plan_name: "feature-implementation".to_string(),
+            },
             is_success: true,
         });
 
@@ -1451,7 +1498,9 @@ mod tests {
 
         let expected = Block::ToolCall(SummaryToolCall {
             id: None,
-            tool: SummaryTool::Mcp { name: "mcp_github_create_issue".to_string() },
+            tool: SummaryTool::Mcp {
+                name: "mcp_github_create_issue".to_string(),
+            },
             is_success: true,
         });
 

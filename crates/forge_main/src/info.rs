@@ -75,7 +75,7 @@ impl Section {
 /// # Output Format
 ///
 /// ```text
-/// 
+///
 /// CONFIGURATION
 ///   model gpt-4
 /// provider openai
@@ -92,7 +92,9 @@ pub struct Info {
 
 impl Info {
     pub fn new() -> Self {
-        Info { sections: Vec::new() }
+        Info {
+            sections: Vec::new(),
+        }
     }
 
     /// Returns a reference to the sections

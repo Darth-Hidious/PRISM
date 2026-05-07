@@ -21,6 +21,9 @@ pub struct ModelConfig {
 impl ModelConfig {
     /// Creates a new ModelConfig with the given provider and model IDs.
     pub fn new(provider_id: impl Into<String>, model_id: impl Into<String>) -> Self {
-        Self { provider_id: provider_id.into(), model_id: model_id.into() }
+        Self {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+        }
     }
 }

@@ -51,7 +51,11 @@ pub struct ZshStyled<'a> {
 impl<'a> ZshStyled<'a> {
     /// Creates a new styled string with the given text.
     pub fn new(text: &'a str) -> Self {
-        Self { text, fg: None, bold: false }
+        Self {
+            text,
+            fg: None,
+            bold: false,
+        }
     }
 
     /// Sets the foreground color.

@@ -265,12 +265,14 @@ fn classify_callback_request(
             status_code: StatusCode(404),
             message: "Received a request for an unexpected callback path.".to_string(),
         },
-        OAuthCallbackParseResult::InvalidRequest(message) => {
-            CallbackRequestDisposition::Continue { status_code: StatusCode(400), message }
-        }
-        OAuthCallbackParseResult::OAuthError(message) => {
-            CallbackRequestDisposition::Fail { status_code: StatusCode(400), message }
-        }
+        OAuthCallbackParseResult::InvalidRequest(message) => CallbackRequestDisposition::Continue {
+            status_code: StatusCode(400),
+            message,
+        },
+        OAuthCallbackParseResult::OAuthError(message) => CallbackRequestDisposition::Fail {
+            status_code: StatusCode(400),
+            message,
+        },
         OAuthCallbackParseResult::Success(payload) => CallbackRequestDisposition::Complete(payload),
     }
 }
@@ -280,10 +282,14 @@ fn respond_to_callback_request(
     disposition: &CallbackRequestDisposition,
 ) -> anyhow::Result<()> {
     let response = match disposition {
-        CallbackRequestDisposition::Continue { status_code, message }
-        | CallbackRequestDisposition::Fail { status_code, message } => {
-            html_response(*status_code, oauth_callback_error_page(message))
+        CallbackRequestDisposition::Continue {
+            status_code,
+            message,
         }
+        | CallbackRequestDisposition::Fail {
+            status_code,
+            message,
+        } => html_response(*status_code, oauth_callback_error_page(message)),
         CallbackRequestDisposition::Complete(_) => {
             html_response(StatusCode(200), oauth_callback_success_page())
         }

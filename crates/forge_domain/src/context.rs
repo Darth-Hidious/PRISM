@@ -63,7 +63,10 @@ fn filter_base64_images_from_tool_output(output: &ToolOutput) -> ToolOutput {
         })
         .collect();
 
-    ToolOutput { is_error: output.is_error, values: filtered_values }
+    ToolOutput {
+        is_error: output.is_error,
+        values: filtered_values,
+    }
 }
 
 impl ContextMessage {
@@ -376,7 +379,10 @@ pub struct MessageEntry {
 
 impl From<ContextMessage> for MessageEntry {
     fn from(value: ContextMessage) -> Self {
-        MessageEntry { message: value, usage: Default::default() }
+        MessageEntry {
+            message: value,
+            usage: Default::default(),
+        }
     }
 }
 
@@ -1052,14 +1058,20 @@ mod tests {
         assert_eq!(actual, expected);
 
         // case 2: context with usage - since total_tokens present return that.
-        let usage = Usage { total_tokens: TokenCount::Actual(100), ..Default::default() };
+        let usage = Usage {
+            total_tokens: TokenCount::Actual(100),
+            ..Default::default()
+        };
         let mut wrapper = MessageEntry::from(ContextMessage::user("Hello", None));
         wrapper.usage = Some(usage);
         let fixture = Context::default().messages(vec![wrapper]);
         assert_eq!(fixture.token_count(), TokenCount::Actual(100));
 
         // case 3: context with usage - since total_tokens present return that.
-        let usage = Usage { total_tokens: TokenCount::Actual(80), ..Default::default() };
+        let usage = Usage {
+            total_tokens: TokenCount::Actual(80),
+            ..Default::default()
+        };
         let mut wrapper = MessageEntry::from(ContextMessage::user("Hello", None));
         wrapper.usage = Some(usage);
         let fixture = Context::default().messages(vec![wrapper]);
@@ -1083,11 +1095,17 @@ mod tests {
     #[test]
     fn test_context_token_count_uses_last_message_usage() {
         // Setup: Create multiple messages with different usage values
-        let first_usage = Usage { total_tokens: TokenCount::Actual(100), ..Default::default() };
+        let first_usage = Usage {
+            total_tokens: TokenCount::Actual(100),
+            ..Default::default()
+        };
         let mut first_message = MessageEntry::from(ContextMessage::user("First message", None));
         first_message.usage = Some(first_usage);
 
-        let second_usage = Usage { total_tokens: TokenCount::Actual(200), ..Default::default() };
+        let second_usage = Usage {
+            total_tokens: TokenCount::Actual(200),
+            ..Default::default()
+        };
         let mut second_message = MessageEntry::from(ContextMessage::assistant(
             "Second message",
             None,
@@ -1096,7 +1114,10 @@ mod tests {
         ));
         second_message.usage = Some(second_usage);
 
-        let third_usage = Usage { total_tokens: TokenCount::Actual(300), ..Default::default() };
+        let third_usage = Usage {
+            total_tokens: TokenCount::Actual(300),
+            ..Default::default()
+        };
         let mut third_message = MessageEntry::from(ContextMessage::user("Third message", None));
         third_message.usage = Some(third_usage);
 
@@ -1115,8 +1136,10 @@ mod tests {
 
     #[test]
     fn test_context_is_reasoning_supported_when_enabled() {
-        let fixture = Context::default()
-            .reasoning(crate::ReasoningConfig { enabled: Some(true), ..Default::default() });
+        let fixture = Context::default().reasoning(crate::ReasoningConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
 
         let actual = fixture.is_reasoning_supported();
         let expected = true;
@@ -1139,8 +1162,10 @@ mod tests {
 
     #[test]
     fn test_context_is_reasoning_supported_when_max_tokens_positive() {
-        let fixture = Context::default()
-            .reasoning(crate::ReasoningConfig { max_tokens: Some(1024), ..Default::default() });
+        let fixture = Context::default().reasoning(crate::ReasoningConfig {
+            max_tokens: Some(1024),
+            ..Default::default()
+        });
 
         let actual = fixture.is_reasoning_supported();
         let expected = true;
@@ -1150,8 +1175,10 @@ mod tests {
 
     #[test]
     fn test_context_is_reasoning_not_supported_when_max_tokens_zero() {
-        let fixture = Context::default()
-            .reasoning(crate::ReasoningConfig { max_tokens: Some(0), ..Default::default() });
+        let fixture = Context::default().reasoning(crate::ReasoningConfig {
+            max_tokens: Some(0),
+            ..Default::default()
+        });
 
         let actual = fixture.is_reasoning_supported();
         let expected = false;
@@ -1161,8 +1188,10 @@ mod tests {
 
     #[test]
     fn test_context_is_reasoning_not_supported_when_disabled() {
-        let fixture = Context::default()
-            .reasoning(crate::ReasoningConfig { enabled: Some(false), ..Default::default() });
+        let fixture = Context::default().reasoning(crate::ReasoningConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
 
         let actual = fixture.is_reasoning_supported();
         let expected = false;
@@ -1317,9 +1346,18 @@ mod tests {
             path: "/test/mydir".to_string(),
             content: AttachmentContent::DirectoryListing {
                 entries: vec![
-                    DirectoryEntry { path: "/test/mydir/file1.txt".to_string(), is_dir: false },
-                    DirectoryEntry { path: "/test/mydir/file2.rs".to_string(), is_dir: false },
-                    DirectoryEntry { path: "/test/mydir/subdir".to_string(), is_dir: true },
+                    DirectoryEntry {
+                        path: "/test/mydir/file1.txt".to_string(),
+                        is_dir: false,
+                    },
+                    DirectoryEntry {
+                        path: "/test/mydir/file2.rs".to_string(),
+                        is_dir: false,
+                    },
+                    DirectoryEntry {
+                        path: "/test/mydir/subdir".to_string(),
+                        is_dir: true,
+                    },
                 ],
             },
         }];
@@ -1411,12 +1449,30 @@ mod tests {
             path: "/test/root".to_string(),
             content: AttachmentContent::DirectoryListing {
                 entries: vec![
-                    DirectoryEntry { path: "apple_dir".to_string(), is_dir: true },
-                    DirectoryEntry { path: "berry_dir".to_string(), is_dir: true },
-                    DirectoryEntry { path: "zoo_dir".to_string(), is_dir: true },
-                    DirectoryEntry { path: "banana.txt".to_string(), is_dir: false },
-                    DirectoryEntry { path: "cherry.txt".to_string(), is_dir: false },
-                    DirectoryEntry { path: "zebra.txt".to_string(), is_dir: false },
+                    DirectoryEntry {
+                        path: "apple_dir".to_string(),
+                        is_dir: true,
+                    },
+                    DirectoryEntry {
+                        path: "berry_dir".to_string(),
+                        is_dir: true,
+                    },
+                    DirectoryEntry {
+                        path: "zoo_dir".to_string(),
+                        is_dir: true,
+                    },
+                    DirectoryEntry {
+                        path: "banana.txt".to_string(),
+                        is_dir: false,
+                    },
+                    DirectoryEntry {
+                        path: "cherry.txt".to_string(),
+                        is_dir: false,
+                    },
+                    DirectoryEntry {
+                        path: "zebra.txt".to_string(),
+                        is_dir: false,
+                    },
                 ],
             },
         }];

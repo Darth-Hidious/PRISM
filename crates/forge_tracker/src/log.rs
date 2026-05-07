@@ -31,7 +31,9 @@ pub fn init_tracing(log_path: PathBuf, _tracker: Tracker) -> anyhow::Result<Guar
     // installed (e.g. when forge_tracker is called from inside a host CLI
     // like prism that sets up its own tracing-subscriber first).
     let _ = tracing_subscriber::registry()
-        .with(EnvFilter::try_from_env("FORGE_LOG").unwrap_or_else(|_| EnvFilter::new("forge=debug")))
+        .with(
+            EnvFilter::try_from_env("FORGE_LOG").unwrap_or_else(|_| EnvFilter::new("forge=debug")),
+        )
         .with(fmt_layer)
         .try_init();
 

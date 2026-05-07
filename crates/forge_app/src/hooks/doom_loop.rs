@@ -39,7 +39,9 @@ impl DoomLoopDetector {
 
     /// Creates a new doom loop detector with the default threshold
     pub fn new() -> Self {
-        Self { threshold: Self::DEFAULT_THRESHOLD }
+        Self {
+            threshold: Self::DEFAULT_THRESHOLD,
+        }
     }
 
     /// Checks conversation history for doom loops using already-recorded tool

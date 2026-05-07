@@ -525,7 +525,9 @@ mod tests {
                 reasoning_opaque: None,
                 reasoning_content: None,
                 extra_content: Some(ExtraContent {
-                    google: Some(GoogleMetadata { thought_signature: Some("sig123".to_string()) }),
+                    google: Some(GoogleMetadata {
+                        thought_signature: Some("sig123".to_string()),
+                    }),
                 }),
             }]);
 
@@ -566,7 +568,9 @@ mod tests {
                 reasoning_opaque: None,
                 reasoning_content: None,
                 extra_content: Some(ExtraContent {
-                    google: Some(GoogleMetadata { thought_signature: Some("sig123".to_string()) }),
+                    google: Some(GoogleMetadata {
+                        thought_signature: Some("sig123".to_string()),
+                    }),
                 }),
             }]);
 
@@ -714,7 +718,9 @@ mod tests {
                 reasoning_opaque: None,
                 reasoning_content: None,
                 extra_content: Some(ExtraContent {
-                    google: Some(GoogleMetadata { thought_signature: Some("sig123".to_string()) }),
+                    google: Some(GoogleMetadata {
+                        thought_signature: Some("sig123".to_string()),
+                    }),
                 }),
             }]);
 

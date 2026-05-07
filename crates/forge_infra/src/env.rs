@@ -35,7 +35,10 @@ fn apply_config_op(fc: &mut ForgeConfig, op: ConfigOperation) {
         ConfigOperation::SetSessionConfig(mc) => {
             let pid_str = mc.provider.as_ref().to_string();
             let mid_str = mc.model.to_string();
-            fc.session = Some(ModelConfig { provider_id: pid_str, model_id: mid_str });
+            fc.session = Some(ModelConfig {
+                provider_id: pid_str,
+                model_id: mid_str,
+            });
         }
         ConfigOperation::SetCommitConfig(mc) => {
             fc.commit = mc.map(|m| ModelConfig {
@@ -88,7 +91,10 @@ impl ForgeEnvironmentInfra {
     /// * `cwd` - The working directory path; used to resolve `.env` files
     /// * `config` - The pre-read [`ForgeConfig`] to seed the in-memory cache
     pub fn new(cwd: PathBuf, config: ForgeConfig) -> Self {
-        Self { cwd, cache: Arc::new(std::sync::Mutex::new(Some(config))) }
+        Self {
+            cwd,
+            cache: Arc::new(std::sync::Mutex::new(Some(config))),
+        }
     }
 
     /// Returns the cached [`ForgeConfig`], re-reading from disk if the cache

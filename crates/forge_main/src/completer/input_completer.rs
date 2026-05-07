@@ -16,7 +16,10 @@ pub struct InputCompleter {
 
 impl InputCompleter {
     pub fn new(cwd: PathBuf, command_manager: Arc<ForgeCommandManager>) -> Self {
-        Self { cwd, command: CommandCompleter::new(command_manager) }
+        Self {
+            cwd,
+            command: CommandCompleter::new(command_manager),
+        }
     }
 }
 

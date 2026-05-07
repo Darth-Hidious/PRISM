@@ -110,7 +110,10 @@ impl EventHandle<EventData<EndPayload>> for PendingTodosHandler {
                     TodoStatus::InProgress => "IN_PROGRESS",
                     _ => return None,
                 };
-                Some(TodoReminderItem { status, content: todo.content.clone() })
+                Some(TodoReminderItem {
+                    status,
+                    content: todo.content.clone(),
+                })
             })
             .collect();
 

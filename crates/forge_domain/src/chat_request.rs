@@ -12,6 +12,9 @@ pub struct ChatRequest {
 
 impl ChatRequest {
     pub fn new(content: Event, conversation_id: ConversationId) -> Self {
-        Self { event: content, conversation_id }
+        Self {
+            event: content,
+            conversation_id,
+        }
     }
 }

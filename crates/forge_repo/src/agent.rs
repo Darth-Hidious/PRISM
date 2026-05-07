@@ -277,7 +277,10 @@ tools:
 ---
 Body keeps {{tool_names.read}} untouched.
 "#;
-        let config = ForgeConfig { subagents: true, ..Default::default() };
+        let config = ForgeConfig {
+            subagents: true,
+            ..Default::default()
+        };
 
         let actual =
             apply_subagent_tool_config(parse_agent_file(fixture).unwrap(), &config).unwrap();
@@ -302,7 +305,10 @@ tools:
 ---
 Body keeps {{tool_names.read}} untouched.
 "#;
-        let config = ForgeConfig { subagents: false, ..Default::default() };
+        let config = ForgeConfig {
+            subagents: false,
+            ..Default::default()
+        };
 
         let actual =
             apply_subagent_tool_config(parse_agent_file(fixture).unwrap(), &config).unwrap();
@@ -343,7 +349,10 @@ Body keeps {{tool_names.read}} untouched.
             "parse_agent_file_preserves_runtime_user_prompt_variables_tools",
             apply_subagent_tool_config(
                 actual,
-                &ForgeConfig { subagents: true, ..Default::default() }
+                &ForgeConfig {
+                    subagents: true,
+                    ..Default::default()
+                }
             )
             .unwrap()
             .tools

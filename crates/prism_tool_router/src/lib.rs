@@ -105,9 +105,7 @@ impl ToolRouter {
             Ok(Some(call)) => RoutingDecision::Invoke(call),
             Ok(None) => RoutingDecision::Passthrough,
             Err(e) => {
-                eprintln!(
-                    "[prism_tool_router] function-router error: {e:#}"
-                );
+                eprintln!("[prism_tool_router] function-router error: {e:#}");
                 RoutingDecision::Passthrough
             }
         }
@@ -203,12 +201,7 @@ impl ToolRouter {
     /// to the names in `available` so callers can pass forge's per-turn
     /// tool list and get back a subset of names from THAT list (not from
     /// the global index).
-    pub async fn search(
-        &self,
-        query: &str,
-        available: &[String],
-        k: usize,
-    ) -> Result<Vec<String>> {
+    pub async fn search(&self, query: &str, available: &[String], k: usize) -> Result<Vec<String>> {
         let g = self.inner.lock().await;
         let server = g
             .embedder

@@ -141,7 +141,10 @@ mod tests {
 
     impl ToolCallBuilder {
         fn new(name: &str) -> Self {
-            Self { name: name.to_string(), args: Default::default() }
+            Self {
+                name: name.to_string(),
+                args: Default::default(),
+            }
         }
 
         fn arg(mut self, key: &str, value: &str) -> Self {
@@ -234,7 +237,10 @@ mod tests {
             .arg("arg2", "value2");
 
         let action = parse_tool_call(&tool.build_xml()).unwrap().1;
-        let expected = ToolCallParsed { name: "tool_name".to_string(), args: tool.args };
+        let expected = ToolCallParsed {
+            name: "tool_name".to_string(),
+            args: tool.args,
+        };
         assert_eq!(action, expected);
     }
 

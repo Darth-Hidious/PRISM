@@ -12,7 +12,10 @@ pub struct TitleDisplay {
 
 impl TitleDisplay {
     pub fn new(title: TitleFormat) -> Self {
-        Self { inner: title, with_colors: true }
+        Self {
+            inner: title,
+            with_colors: true,
+        }
     }
 
     pub fn with_colors(mut self, with_colors: bool) -> Self {

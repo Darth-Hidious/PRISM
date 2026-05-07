@@ -25,6 +25,9 @@ impl ModelConfig {
     /// * `provider` - The provider identifier
     /// * `model` - The model identifier
     pub fn new(provider: impl Into<ProviderId>, model: impl Into<ModelId>) -> Self {
-        Self { provider: provider.into(), model: model.into() }
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
     }
 }

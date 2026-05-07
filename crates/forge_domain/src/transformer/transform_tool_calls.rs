@@ -95,7 +95,11 @@ mod tests {
 
     impl TransformationSnapshot {
         fn new(transformation: &str, before: Context, after: Context) -> Self {
-            Self { transformation: transformation.to_string(), before, after }
+            Self {
+                transformation: transformation.to_string(),
+                before,
+                after,
+            }
         }
     }
 
@@ -182,7 +186,9 @@ mod tests {
     #[test]
     fn test_transform_tool_calls_with_model() {
         let fixture = create_context_with_tool_calls();
-        let mut transformer = TransformToolCalls { model: Some(ModelId::new("gpt-4")) };
+        let mut transformer = TransformToolCalls {
+            model: Some(ModelId::new("gpt-4")),
+        };
         let actual = transformer.transform(fixture.clone());
 
         let snapshot =
@@ -205,7 +211,10 @@ mod tests {
         let fixture = Context::default().add_tool_results(vec![ToolResult {
             name: ToolName::new("empty_tool"),
             call_id: Some(ToolCallId::new("call_empty")),
-            output: ToolOutput { values: vec![ToolValue::Empty], is_error: false },
+            output: ToolOutput {
+                values: vec![ToolValue::Empty],
+                is_error: false,
+            },
         }]);
 
         let mut transformer = TransformToolCalls::new();

@@ -16,7 +16,10 @@ pub struct MigrationResult {
 impl MigrationResult {
     /// Creates a result indicating successful migration
     pub fn new(credentials_path: PathBuf, migrated_providers: Vec<ProviderId>) -> Self {
-        Self { credentials_path, migrated_providers }
+        Self {
+            credentials_path,
+            migrated_providers,
+        }
     }
 }
 

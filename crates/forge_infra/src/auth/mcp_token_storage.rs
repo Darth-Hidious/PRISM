@@ -29,7 +29,11 @@ impl McpTokenStorage {
     /// * `server_url` - The URL of the MCP server (used as credential key)
     /// * `env` - The environment for file system paths
     pub fn new(server_url: String, env: Environment) -> Self {
-        Self { server_url, env, store: Arc::new(Mutex::new(None)) }
+        Self {
+            server_url,
+            env,
+            store: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Get the credential store, loading it if necessary

@@ -5,20 +5,16 @@ pub enum Error {
     #[error("model file missing at {0}")]
     ModelMissing(std::path::PathBuf),
 
-    #[error("llama-server binary missing at {0}; install llama.cpp (`brew install llama.cpp`) or set the path explicitly")]
+    #[error(
+        "llama-server binary missing at {0}; install llama.cpp (`brew install llama.cpp`) or set the path explicitly"
+    )]
     LlamaServerMissing(std::path::PathBuf),
 
     #[error("llama-server failed to become ready within {timeout_ms}ms: {detail}")]
-    ServerTimeout {
-        timeout_ms: u64,
-        detail: String,
-    },
+    ServerTimeout { timeout_ms: u64, detail: String },
 
     #[error("embedder dimension mismatch: expected {expected}, got {actual}")]
-    DimensionMismatch {
-        expected: usize,
-        actual: usize,
-    },
+    DimensionMismatch { expected: usize, actual: usize },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

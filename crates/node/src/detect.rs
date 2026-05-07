@@ -712,9 +712,11 @@ mod tests {
             size_gb: Some(0.5),
         }];
         let services = detect_services(&[], 50, &models);
-        assert!(services
-            .iter()
-            .any(|s| s.kind == "inference" && s.model.as_deref() == Some("predictor")));
+        assert!(
+            services
+                .iter()
+                .any(|s| s.kind == "inference" && s.model.as_deref() == Some("predictor"))
+        );
     }
 
     #[test]

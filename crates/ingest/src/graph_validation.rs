@@ -278,10 +278,12 @@ mod tests {
         };
         let report = validate_graph(&es);
         assert!(report.passed);
-        assert!(report
-            .issues
-            .iter()
-            .all(|i| i.severity != GraphSeverity::Error));
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| i.severity != GraphSeverity::Error)
+        );
     }
 
     #[test]

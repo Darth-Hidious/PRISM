@@ -316,7 +316,10 @@ impl From<Context> for Request {
             .collect();
 
         let system_instruction = if !system_parts.is_empty() {
-            Some(Content { role: None, parts: system_parts })
+            Some(Content {
+                role: None,
+                parts: system_parts,
+            })
         } else {
             None
         };
@@ -357,7 +360,10 @@ impl From<Context> for Request {
 
         // Flush any remaining tool results
         if !pending_tool_parts.is_empty() {
-            contents.push(Content { role: Some(Role::User), parts: pending_tool_parts });
+            contents.push(Content {
+                role: Some(Role::User),
+                parts: pending_tool_parts,
+            });
         }
 
         // Convert tools
@@ -516,7 +522,10 @@ impl From<forge_domain::ToolResult> for Content {
 
 impl From<forge_domain::Image> for Content {
     fn from(image: forge_domain::Image) -> Self {
-        Content { role: Some(Role::User), parts: vec![Part::from(image)] }
+        Content {
+            role: Some(Role::User),
+            parts: vec![Part::from(image)],
+        }
     }
 }
 
@@ -860,7 +869,11 @@ mod tests {
         let content = Content::from(msg);
         assert_eq!(content.role, Some(self::Role::Model));
         match &content.parts[0] {
-            Part::Text { text, thought_signature, .. } => {
+            Part::Text {
+                text,
+                thought_signature,
+                ..
+            } => {
                 assert_eq!(text, "Hi");
                 assert_eq!(thought_signature.as_deref(), Some("sig"));
             }

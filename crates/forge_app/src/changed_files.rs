@@ -138,7 +138,10 @@ mod tests {
         }
 
         fn get_config(&self) -> anyhow::Result<forge_config::ForgeConfig> {
-            Ok(forge_config::ForgeConfig { max_parallel_file_reads: 4, ..Default::default() })
+            Ok(forge_config::ForgeConfig {
+                max_parallel_file_reads: 4,
+                ..Default::default()
+            })
         }
 
         async fn update_environment(

@@ -49,7 +49,11 @@ impl<'a> ParsedLine<'a> {
             return None;
         }
 
-        Some(Self { path, line_num, content })
+        Some(Self {
+            path,
+            line_num,
+            content,
+        })
     }
 }
 
@@ -189,7 +193,11 @@ mod tests {
 
             let output = strip_ansi_escapes::strip_str(formatter.format()).to_string();
 
-            Self { description: description.to_string(), input, output }
+            Self {
+                description: description.to_string(),
+                input,
+                output,
+            }
         }
     }
 

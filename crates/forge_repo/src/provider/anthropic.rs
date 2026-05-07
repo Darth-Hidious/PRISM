@@ -31,7 +31,12 @@ struct Anthropic<T> {
 
 impl<H: HttpInfra> Anthropic<H> {
     pub fn new(http: Arc<H>, provider: Provider<Url>, version: String, use_oauth: bool) -> Self {
-        Self { http, provider, anthropic_version: version, use_oauth }
+        Self {
+            http,
+            provider,
+            anthropic_version: version,
+            use_oauth,
+        }
     }
 
     fn get_headers(&self, model: Option<&ModelId>) -> Vec<(String, String)> {
@@ -404,7 +409,9 @@ mod tests {
 
     impl MockHttpClient {
         fn new() -> Self {
-            Self { client: reqwest::Client::new() }
+            Self {
+                client: reqwest::Client::new(),
+            }
         }
     }
 

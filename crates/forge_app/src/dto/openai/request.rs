@@ -55,13 +55,17 @@ pub enum MessageContent {
 
 impl MessageContent {
     pub fn cached(self, enable_cache: bool) -> Self {
-        let cache_control =
-            enable_cache.then_some(CacheControl { type_: CacheControlType::Ephemeral });
+        let cache_control = enable_cache.then_some(CacheControl {
+            type_: CacheControlType::Ephemeral,
+        });
 
         match self {
             MessageContent::Text(text) => {
                 if let Some(cc) = cache_control {
-                    MessageContent::Parts(vec![ContentPart::Text { text, cache_control: Some(cc) }])
+                    MessageContent::Parts(vec![ContentPart::Text {
+                        text,
+                        cache_control: Some(cc),
+                    }])
                 } else {
                     MessageContent::Text(text)
                 }
@@ -124,8 +128,9 @@ impl ContentPart {
     }
 
     pub fn cached(&mut self, enable_cache: bool) {
-        let src_cache_control =
-            enable_cache.then_some(CacheControl { type_: CacheControlType::Ephemeral });
+        let src_cache_control = enable_cache.then_some(CacheControl {
+            type_: CacheControlType::Ephemeral,
+        });
         match self {
             ContentPart::Text { cache_control, .. } => {
                 *cache_control = src_cache_control;
@@ -402,7 +407,9 @@ impl From<Context> for Request {
             provider: Default::default(),
             parallel_tool_calls: Some(true), /* Default to true, transformers will adjust based
                                               * on model capabilities */
-            stream_options: Some(StreamOptions { include_usage: Some(true) }),
+            stream_options: Some(StreamOptions {
+                include_usage: Some(true),
+            }),
             session_id: context.conversation_id.map(|id| id.to_string()),
             initiator: context.initiator,
             reasoning: context.reasoning,
@@ -436,7 +443,10 @@ impl From<ToolCallFull> for ToolCall {
         Self {
             id: value.call_id,
             r#type: FunctionType,
-            function: FunctionCall { arguments, name: Some(value.name) },
+            function: FunctionCall {
+                arguments,
+                name: Some(value.name),
+            },
             extra_content,
         }
     }
@@ -488,7 +498,10 @@ impl From<ContextMessage> for Message {
             },
             ContextMessage::Image(img) => {
                 let content = vec![ContentPart::ImageUrl {
-                    image_url: ImageUrl { url: img.url().clone(), detail: None },
+                    image_url: ImageUrl {
+                        url: img.url().clone(),
+                        detail: None,
+                    },
                     cache_control: None,
                 }];
                 Message {
@@ -519,11 +532,17 @@ impl From<ToolResult> for MessageContent {
         for value in result.output.values.into_iter() {
             match value {
                 ToolValue::Text(text) => {
-                    parts.push(ContentPart::Text { text, cache_control: None });
+                    parts.push(ContentPart::Text {
+                        text,
+                        cache_control: None,
+                    });
                 }
                 ToolValue::Image(img) => {
                     let content = ContentPart::ImageUrl {
-                        image_url: ImageUrl { url: img.url().clone(), detail: None },
+                        image_url: ImageUrl {
+                            url: img.url().clone(),
+                            detail: None,
+                        },
                         cache_control: None,
                     };
                     parts.push(content);
@@ -531,9 +550,10 @@ impl From<ToolResult> for MessageContent {
                 ToolValue::Empty => {
                     // Handle empty case if needed
                 }
-                ToolValue::AI { value, .. } => {
-                    parts.push(ContentPart::Text { text: value, cache_control: None })
-                }
+                ToolValue::AI { value, .. } => parts.push(ContentPart::Text {
+                    text: value,
+                    cache_control: None,
+                }),
             }
         }
 
@@ -572,7 +592,9 @@ mod tests {
         let actual = fixture.cached(true);
         let expected = MessageContent::Parts(vec![ContentPart::Text {
             text: "hello".to_string(),
-            cache_control: Some(CacheControl { type_: CacheControlType::Ephemeral }),
+            cache_control: Some(CacheControl {
+                type_: CacheControlType::Ephemeral,
+            }),
         }]);
         assert_eq!(actual, expected);
     }
@@ -588,18 +610,34 @@ mod tests {
     #[test]
     fn test_cached_parts_true() {
         let fixture = MessageContent::Parts(vec![
-            ContentPart::Text { text: "a".to_string(), cache_control: None },
+            ContentPart::Text {
+                text: "a".to_string(),
+                cache_control: None,
+            },
             ContentPart::ImageUrl {
-                image_url: ImageUrl { url: "http://example.com/a.png".to_string(), detail: None },
-                cache_control: Some(CacheControl { type_: CacheControlType::Ephemeral }),
+                image_url: ImageUrl {
+                    url: "http://example.com/a.png".to_string(),
+                    detail: None,
+                },
+                cache_control: Some(CacheControl {
+                    type_: CacheControlType::Ephemeral,
+                }),
             },
         ]);
         let actual = fixture.cached(true);
         let expected = MessageContent::Parts(vec![
-            ContentPart::Text { text: "a".to_string(), cache_control: None },
+            ContentPart::Text {
+                text: "a".to_string(),
+                cache_control: None,
+            },
             ContentPart::ImageUrl {
-                image_url: ImageUrl { url: "http://example.com/a.png".to_string(), detail: None },
-                cache_control: Some(CacheControl { type_: CacheControlType::Ephemeral }),
+                image_url: ImageUrl {
+                    url: "http://example.com/a.png".to_string(),
+                    detail: None,
+                },
+                cache_control: Some(CacheControl {
+                    type_: CacheControlType::Ephemeral,
+                }),
             },
         ]);
         assert_eq!(actual, expected);
@@ -610,23 +648,41 @@ mod tests {
         let fixture = MessageContent::Parts(vec![
             ContentPart::Text {
                 text: "a".to_string(),
-                cache_control: Some(CacheControl { type_: CacheControlType::Ephemeral }),
+                cache_control: Some(CacheControl {
+                    type_: CacheControlType::Ephemeral,
+                }),
             },
             ContentPart::Text {
                 text: "b".to_string(),
-                cache_control: Some(CacheControl { type_: CacheControlType::Ephemeral }),
+                cache_control: Some(CacheControl {
+                    type_: CacheControlType::Ephemeral,
+                }),
             },
             ContentPart::ImageUrl {
-                image_url: ImageUrl { url: "http://example.com/a.png".to_string(), detail: None },
-                cache_control: Some(CacheControl { type_: CacheControlType::Ephemeral }),
+                image_url: ImageUrl {
+                    url: "http://example.com/a.png".to_string(),
+                    detail: None,
+                },
+                cache_control: Some(CacheControl {
+                    type_: CacheControlType::Ephemeral,
+                }),
             },
         ]);
         let actual = fixture.cached(false);
         let expected = MessageContent::Parts(vec![
-            ContentPart::Text { text: "a".to_string(), cache_control: None },
-            ContentPart::Text { text: "b".to_string(), cache_control: None },
+            ContentPart::Text {
+                text: "a".to_string(),
+                cache_control: None,
+            },
+            ContentPart::Text {
+                text: "b".to_string(),
+                cache_control: None,
+            },
             ContentPart::ImageUrl {
-                image_url: ImageUrl { url: "http://example.com/a.png".to_string(), detail: None },
+                image_url: ImageUrl {
+                    url: "http://example.com/a.png".to_string(),
+                    detail: None,
+                },
                 cache_control: None,
             },
         ]);
@@ -638,21 +694,40 @@ mod tests {
         let fixture = MessageContent::Parts(vec![
             ContentPart::Text {
                 text: "a".to_string(),
-                cache_control: Some(CacheControl { type_: CacheControlType::Ephemeral }),
+                cache_control: Some(CacheControl {
+                    type_: CacheControlType::Ephemeral,
+                }),
             },
-            ContentPart::Text { text: "b".to_string(), cache_control: None },
+            ContentPart::Text {
+                text: "b".to_string(),
+                cache_control: None,
+            },
             ContentPart::ImageUrl {
-                image_url: ImageUrl { url: "http://example.com/a.png".to_string(), detail: None },
+                image_url: ImageUrl {
+                    url: "http://example.com/a.png".to_string(),
+                    detail: None,
+                },
                 cache_control: None,
             },
         ]);
         let actual = fixture.cached(true);
         let expected = MessageContent::Parts(vec![
-            ContentPart::Text { text: "a".to_string(), cache_control: None },
-            ContentPart::Text { text: "b".to_string(), cache_control: None },
+            ContentPart::Text {
+                text: "a".to_string(),
+                cache_control: None,
+            },
+            ContentPart::Text {
+                text: "b".to_string(),
+                cache_control: None,
+            },
             ContentPart::ImageUrl {
-                image_url: ImageUrl { url: "http://example.com/a.png".to_string(), detail: None },
-                cache_control: Some(CacheControl { type_: CacheControlType::Ephemeral }),
+                image_url: ImageUrl {
+                    url: "http://example.com/a.png".to_string(),
+                    detail: None,
+                },
+                cache_control: Some(CacheControl {
+                    type_: CacheControlType::Ephemeral,
+                }),
             },
         ]);
         assert_eq!(actual, expected);
@@ -661,20 +736,40 @@ mod tests {
     #[test]
     fn test_cached_parts_multi_true() {
         let fixture = MessageContent::Parts(vec![
-            ContentPart::Text { text: "a".to_string(), cache_control: None },
-            ContentPart::Text { text: "b".to_string(), cache_control: None },
+            ContentPart::Text {
+                text: "a".to_string(),
+                cache_control: None,
+            },
+            ContentPart::Text {
+                text: "b".to_string(),
+                cache_control: None,
+            },
             ContentPart::ImageUrl {
-                image_url: ImageUrl { url: "http://example.com/a.png".to_string(), detail: None },
+                image_url: ImageUrl {
+                    url: "http://example.com/a.png".to_string(),
+                    detail: None,
+                },
                 cache_control: None,
             },
         ]);
         let actual = fixture.cached(true);
         let expected = MessageContent::Parts(vec![
-            ContentPart::Text { text: "a".to_string(), cache_control: None },
-            ContentPart::Text { text: "b".to_string(), cache_control: None },
+            ContentPart::Text {
+                text: "a".to_string(),
+                cache_control: None,
+            },
+            ContentPart::Text {
+                text: "b".to_string(),
+                cache_control: None,
+            },
             ContentPart::ImageUrl {
-                image_url: ImageUrl { url: "http://example.com/a.png".to_string(), detail: None },
-                cache_control: Some(CacheControl { type_: CacheControlType::Ephemeral }),
+                image_url: ImageUrl {
+                    url: "http://example.com/a.png".to_string(),
+                    detail: None,
+                },
+                cache_control: Some(CacheControl {
+                    type_: CacheControlType::Ephemeral,
+                }),
             },
         ]);
         assert_eq!(actual, expected);
@@ -683,17 +778,29 @@ mod tests {
     #[test]
     fn test_cached_parts_false() {
         let fixture = MessageContent::Parts(vec![
-            ContentPart::Text { text: "a".to_string(), cache_control: None },
+            ContentPart::Text {
+                text: "a".to_string(),
+                cache_control: None,
+            },
             ContentPart::ImageUrl {
-                image_url: ImageUrl { url: "http://example.com/a.png".to_string(), detail: None },
+                image_url: ImageUrl {
+                    url: "http://example.com/a.png".to_string(),
+                    detail: None,
+                },
                 cache_control: None,
             },
         ]);
         let actual = fixture.cached(false);
         let expected = MessageContent::Parts(vec![
-            ContentPart::Text { text: "a".to_string(), cache_control: None },
+            ContentPart::Text {
+                text: "a".to_string(),
+                cache_control: None,
+            },
             ContentPart::ImageUrl {
-                image_url: ImageUrl { url: "http://example.com/a.png".to_string(), detail: None },
+                image_url: ImageUrl {
+                    url: "http://example.com/a.png".to_string(),
+                    detail: None,
+                },
                 cache_control: None,
             },
         ]);

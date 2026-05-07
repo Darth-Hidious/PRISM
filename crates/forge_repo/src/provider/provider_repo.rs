@@ -135,7 +135,10 @@ impl From<forge_config::ProviderUrlParam> for UrlParamVarConfig {
         if param.options.is_empty() {
             UrlParamVarConfig::Plain(param.name)
         } else {
-            UrlParamVarConfig::WithOptions { name: param.name, options: param.options }
+            UrlParamVarConfig::WithOptions {
+                name: param.name,
+                options: param.options,
+            }
         }
     }
 }
@@ -1720,7 +1723,10 @@ mod env_tests {
             }
         }
 
-        let infra = Arc::new(CustomMockInfra { env_vars, base_path });
+        let infra = Arc::new(CustomMockInfra {
+            env_vars,
+            base_path,
+        });
         let registry = ForgeProviderRepository::new(infra);
 
         // Get merged configs

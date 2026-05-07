@@ -301,8 +301,10 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                             model = %model_id,
                             "Retry attempt due to error"
                         );
-                        let retry_event =
-                            ChatResponse::RetryAttempt { cause: error.into(), duration };
+                        let retry_event = ChatResponse::RetryAttempt {
+                            cause: error.into(),
+                            duration,
+                        };
                         let _ = sender.try_send(Ok(retry_event));
                     }
                 }),

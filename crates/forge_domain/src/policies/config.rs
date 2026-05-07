@@ -20,7 +20,9 @@ pub struct PolicyConfig {
 impl PolicyConfig {
     /// Create a new empty policies collection
     pub fn new() -> Self {
-        Self { policies: BTreeSet::new() }
+        Self {
+            policies: BTreeSet::new(),
+        }
     }
 
     /// Add a policy to the collection
@@ -80,11 +82,17 @@ mod tests {
         let fixture = PolicyConfig::new()
             .add_policy(Policy::Simple {
                 permission: Permission::Allow,
-                rule: Rule::Write(WriteRule { write: "src/**/*.rs".to_string(), dir: None }),
+                rule: Rule::Write(WriteRule {
+                    write: "src/**/*.rs".to_string(),
+                    dir: None,
+                }),
             })
             .add_policy(Policy::Simple {
                 permission: Permission::Deny,
-                rule: Rule::Write(WriteRule { write: "**/*.py".to_string(), dir: None }),
+                rule: Rule::Write(WriteRule {
+                    write: "**/*.py".to_string(),
+                    dir: None,
+                }),
             });
         let operation = fixture_write_operation();
 

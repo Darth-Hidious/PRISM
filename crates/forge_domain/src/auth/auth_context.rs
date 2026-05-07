@@ -115,14 +115,19 @@ impl AuthContextResponse {
 
     /// Creates a device code authentication context
     pub fn device_code(request: DeviceCodeRequest) -> Self {
-        Self::DeviceCode(AuthContext { request, response: DeviceCodeResponse })
+        Self::DeviceCode(AuthContext {
+            request,
+            response: DeviceCodeResponse,
+        })
     }
 
     /// Creates an authorization code authentication context
     pub fn code(request: CodeRequest, code: impl ToString) -> Self {
         Self::Code(AuthContext {
             request,
-            response: CodeResponse { code: code.to_string().into() },
+            response: CodeResponse {
+                code: code.to_string().into(),
+            },
         })
     }
 }

@@ -207,12 +207,7 @@ impl ToolIndex {
     /// Top-K cosine over the index, restricted to the given names. Returns
     /// names ordered most-similar-first. Names not present in the index are
     /// silently dropped (they should be added via index_tools first).
-    pub fn top_k_filtered(
-        &self,
-        query: &[f32],
-        available: &[String],
-        k: usize,
-    ) -> Vec<String> {
+    pub fn top_k_filtered(&self, query: &[f32], available: &[String], k: usize) -> Vec<String> {
         if query.len() != self.embed_dim || self.rows.is_empty() {
             return Vec::new();
         }
@@ -228,7 +223,11 @@ impl ToolIndex {
             .collect();
         // descending by score
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.into_iter().take(k).map(|(_, n)| n.to_string()).collect()
+        scored
+            .into_iter()
+            .take(k)
+            .map(|(_, n)| n.to_string())
+            .collect()
     }
 }
 
@@ -287,11 +286,7 @@ mod tests {
         assert!(idx2.has_current(&t2));
 
         let q = vec![0.9, 0.1, 0.0];
-        let top = idx2.top_k_filtered(
-            &q,
-            &["alpha".into(), "beta".into()],
-            2,
-        );
+        let top = idx2.top_k_filtered(&q, &["alpha".into(), "beta".into()], 2);
         assert_eq!(top, vec!["alpha".to_string(), "beta".to_string()]);
     }
 

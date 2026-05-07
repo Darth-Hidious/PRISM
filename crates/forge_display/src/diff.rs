@@ -58,7 +58,11 @@ impl DiffFormat {
         if ops.is_empty() {
             output.push_str(&format!("{}\n", style("No changes applied").dim()));
 
-            return DiffResult { result: output, lines_added, lines_removed };
+            return DiffResult {
+                result: output,
+                lines_added,
+                lines_removed,
+            };
         }
 
         // First pass: Calculate dynamic width based on max line numbers in actual
@@ -118,7 +122,11 @@ impl DiffFormat {
             }
         }
 
-        DiffResult { result: output, lines_added, lines_removed }
+        DiffResult {
+            result: output,
+            lines_added,
+            lines_removed,
+        }
     }
 }
 

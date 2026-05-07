@@ -36,7 +36,11 @@ impl AuthCredential {
     ) -> Self {
         Self {
             id,
-            auth_details: AuthDetails::OAuthWithApiKey { tokens, api_key, config },
+            auth_details: AuthDetails::OAuthWithApiKey {
+                tokens,
+                api_key,
+                config,
+            },
             url_params: HashMap::new(),
         }
     }

@@ -42,8 +42,9 @@ impl Transformer for EnforceStrictObjectSchema {
 
                 // Convert back to RootSchema
                 if let Ok(normalized_schema) = serde_json::from_value(schema_value) {
-                    request.output_format =
-                        Some(OutputFormat::JsonSchema { schema: normalized_schema });
+                    request.output_format = Some(OutputFormat::JsonSchema {
+                        schema: normalized_schema,
+                    });
                 } else {
                     // If deserialization fails, keep the original schema
                     request.output_format = Some(OutputFormat::JsonSchema { schema });

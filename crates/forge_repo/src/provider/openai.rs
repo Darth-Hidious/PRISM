@@ -468,7 +468,9 @@ mod tests {
 
     impl MockHttpClient {
         fn new() -> Self {
-            Self { client: reqwest::Client::new() }
+            Self {
+                client: reqwest::Client::new(),
+            }
         }
     }
 

@@ -96,12 +96,18 @@ impl URLParamSpec {
     /// Creates a `URLParamSpec` with only a name, rendering as a free-text
     /// input.
     pub fn new(name: impl Into<URLParam>) -> Self {
-        Self { name: name.into(), options: None }
+        Self {
+            name: name.into(),
+            options: None,
+        }
     }
 
     /// Creates a `URLParamSpec` with preset options, rendering as a dropdown.
     pub fn with_options(name: impl Into<URLParam>, options: Vec<String>) -> Self {
-        Self { name: name.into(), options: Some(options) }
+        Self {
+            name: name.into(),
+            options: Some(options),
+        }
     }
 }
 

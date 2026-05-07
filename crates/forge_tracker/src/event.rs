@@ -61,7 +61,10 @@ pub struct ToolCallPayload {
 
 impl ToolCallPayload {
     pub fn new(tool_name: String) -> Self {
-        Self { tool_name, cause: None }
+        Self {
+            tool_name,
+            cause: None,
+        }
     }
 
     pub fn with_cause(mut self, cause: String) -> Self {

@@ -19,8 +19,14 @@ async fn test_system_prompt() {
 async fn test_system_prompt_tool_supported() {
     let mut ctx = TestContext::default()
         .files(vec![
-            forge_domain::File { path: "/users/john/foo.txt".to_string(), is_dir: false },
-            forge_domain::File { path: "/users/jason/bar.txt".to_string(), is_dir: false },
+            forge_domain::File {
+                path: "/users/john/foo.txt".to_string(),
+                is_dir: false,
+            },
+            forge_domain::File {
+                path: "/users/jason/bar.txt".to_string(),
+                is_dir: false,
+            },
         ])
         .mock_assistant_responses(vec![
             ChatCompletionMessage::assistant(Content::full("Sure"))

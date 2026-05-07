@@ -55,7 +55,9 @@ mod tests {
     #[test]
     fn test_when_model_matches() {
         // Fixture
-        let transformer = TestTransformer { prefix: "prefix-".to_string() };
+        let transformer = TestTransformer {
+            prefix: "prefix-".to_string(),
+        };
         let request = Request::default().model(ModelId::new("anthropic/claude-3"));
 
         // Apply transformation with condition that should match
@@ -70,7 +72,9 @@ mod tests {
     #[test]
     fn test_when_model_no_match() {
         // Fixture
-        let transformer = TestTransformer { prefix: "prefix-".to_string() };
+        let transformer = TestTransformer {
+            prefix: "prefix-".to_string(),
+        };
         let request = Request::default().model(ModelId::new("openai/gpt-4"));
 
         // Apply transformation with condition that should not match
@@ -85,7 +89,9 @@ mod tests {
     #[test]
     fn test_when_model_no_model() {
         // Fixture
-        let transformer = TestTransformer { prefix: "prefix-".to_string() };
+        let transformer = TestTransformer {
+            prefix: "prefix-".to_string(),
+        };
         let request = Request::default(); // No model set
 
         // Apply transformation with when_model
@@ -107,7 +113,9 @@ mod tests {
     #[test]
     fn test_complex_regex_patterns() {
         // Fixture
-        let transformer = TestTransformer { prefix: "prefix-".to_string() };
+        let transformer = TestTransformer {
+            prefix: "prefix-".to_string(),
+        };
 
         // Test with complex regex pattern
         let request = Request::default().model(ModelId::new("anthropic/claude-3-sonnet"));
@@ -125,7 +133,9 @@ mod tests {
     #[test]
     fn test_case_sensitive_matching() {
         // Fixture
-        let transformer = TestTransformer { prefix: "prefix-".to_string() };
+        let transformer = TestTransformer {
+            prefix: "prefix-".to_string(),
+        };
 
         // Test case sensitivity
         let request = Request::default().model(ModelId::new("anthropic/Claude-3"));

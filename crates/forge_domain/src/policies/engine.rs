@@ -96,35 +96,50 @@ mod tests {
     fn fixture_workflow_with_read_policy() -> PolicyConfig {
         PolicyConfig::new().add_policy(Policy::Simple {
             permission: Permission::Allow,
-            rule: Rule::Read(ReadRule { read: "src/**/*.rs".to_string(), dir: None }),
+            rule: Rule::Read(ReadRule {
+                read: "src/**/*.rs".to_string(),
+                dir: None,
+            }),
         })
     }
 
     fn fixture_workflow_with_write_policy() -> PolicyConfig {
         PolicyConfig::new().add_policy(Policy::Simple {
             permission: Permission::Deny,
-            rule: Rule::Write(WriteRule { write: "**/*.rs".to_string(), dir: None }),
+            rule: Rule::Write(WriteRule {
+                write: "**/*.rs".to_string(),
+                dir: None,
+            }),
         })
     }
 
     fn fixture_workflow_with_execute_policy() -> PolicyConfig {
         PolicyConfig::new().add_policy(Policy::Simple {
             permission: Permission::Allow,
-            rule: Rule::Execute(ExecuteRule { command: "cargo *".to_string(), dir: None }),
+            rule: Rule::Execute(ExecuteRule {
+                command: "cargo *".to_string(),
+                dir: None,
+            }),
         })
     }
 
     fn fixture_workflow_with_write_policy_confirm() -> PolicyConfig {
         PolicyConfig::new().add_policy(Policy::Simple {
             permission: Permission::Confirm,
-            rule: Rule::Write(WriteRule { write: "src/**/*.rs".to_string(), dir: None }),
+            rule: Rule::Write(WriteRule {
+                write: "src/**/*.rs".to_string(),
+                dir: None,
+            }),
         })
     }
 
     fn fixture_workflow_with_net_fetch_policy() -> PolicyConfig {
         PolicyConfig::new().add_policy(Policy::Simple {
             permission: Permission::Allow,
-            rule: Rule::Fetch(Fetch { url: "https://api.example.com/*".to_string(), dir: None }),
+            rule: Rule::Fetch(Fetch {
+                url: "https://api.example.com/*".to_string(),
+                dir: None,
+            }),
         })
     }
 

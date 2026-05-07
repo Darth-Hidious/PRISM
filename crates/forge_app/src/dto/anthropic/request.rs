@@ -138,9 +138,13 @@ impl TryFrom<forge_domain::Context> for Request {
             };
 
             let thinking = if let Some(budget) = reasoning.max_tokens {
-                Thinking::Enabled { budget_tokens: budget as u64 }
+                Thinking::Enabled {
+                    budget_tokens: budget as u64,
+                }
             } else {
-                Thinking::Adaptive { display: adaptive_display }
+                Thinking::Adaptive {
+                    display: adaptive_display,
+                }
             };
 
             // `Effort::None` is an explicit opt-out; `is_reasoning_supported`
@@ -155,7 +159,9 @@ impl TryFrom<forge_domain::Context> for Request {
                     forge_domain::Effort::XHigh => OutputEffort::XHigh,
                     forge_domain::Effort::Max => OutputEffort::Max,
                 };
-                Some(OutputConfig { effort: output_effort })
+                Some(OutputConfig {
+                    effort: output_effort,
+                })
             });
 
             (Some(thinking), output_config)
@@ -243,12 +249,18 @@ impl TryFrom<ContextMessage> for Message {
                         }
                     })
                 {
-                    content.push(Content::Thinking { signature: Some(sig), thinking: Some(text) });
+                    content.push(Content::Thinking {
+                        signature: Some(sig),
+                        thinking: Some(text),
+                    });
                 }
 
                 if !chat_message.content.is_empty() {
                     // NOTE: Anthropic does not allow empty text content.
-                    content.push(Content::Text { text: chat_message.content, cache_control: None });
+                    content.push(Content::Text {
+                        text: chat_message.content,
+                        cache_control: None,
+                    });
                 }
                 if let Some(tool_calls) = chat_message.tool_calls {
                     for tool_call in tool_calls {
@@ -257,8 +269,14 @@ impl TryFrom<ContextMessage> for Message {
                 }
 
                 match chat_message.role {
-                    forge_domain::Role::User => Message { role: Role::User, content },
-                    forge_domain::Role::Assistant => Message { role: Role::Assistant, content },
+                    forge_domain::Role::User => Message {
+                        role: Role::User,
+                        content,
+                    },
+                    forge_domain::Role::Assistant => Message {
+                        role: Role::Assistant,
+                        content,
+                    },
                     forge_domain::Role::System => {
                         // note: Anthropic doesn't support system role messages and they're already
                         // filtered out. so this state is unreachable.
@@ -268,12 +286,14 @@ impl TryFrom<ContextMessage> for Message {
                     }
                 }
             }
-            ContextMessage::Tool(tool_result) => {
-                Message { role: Role::User, content: vec![tool_result.try_into()?] }
-            }
-            ContextMessage::Image(img) => {
-                Message { content: vec![Content::from(img)], role: Role::User }
-            }
+            ContextMessage::Tool(tool_result) => Message {
+                role: Role::User,
+                content: vec![tool_result.try_into()?],
+            },
+            ContextMessage::Image(img) => Message {
+                content: vec![Content::from(img)],
+                role: Role::User,
+            },
         })
     }
 }
@@ -314,7 +334,10 @@ impl Message {
 
 impl Default for Message {
     fn default() -> Self {
-        Message { content: vec![], role: Role::User }
+        Message {
+            content: vec![],
+            role: Role::User,
+        }
     }
 }
 
@@ -383,7 +406,10 @@ pub enum Content {
 
 impl Default for Content {
     fn default() -> Self {
-        Content::Thinking { signature: None, thinking: None }
+        Content::Thinking {
+            signature: None,
+            thinking: None,
+        }
     }
 }
 
@@ -392,16 +418,41 @@ impl Content {
         let cache_control = enable_cache.then_some(CacheControl::Ephemeral);
 
         match self {
-            Content::Text { text, .. } => Content::Text { text, cache_control },
-            Content::ToolUse { id, input, name, .. } => {
-                Content::ToolUse { id, input, name, cache_control }
-            }
-            Content::ToolResult { tool_use_id, content, is_error, .. } => {
-                Content::ToolResult { tool_use_id, content, is_error, cache_control }
-            }
-            Content::Image { source, .. } => Content::Image { source, cache_control },
+            Content::Text { text, .. } => Content::Text {
+                text,
+                cache_control,
+            },
+            Content::ToolUse {
+                id, input, name, ..
+            } => Content::ToolUse {
+                id,
+                input,
+                name,
+                cache_control,
+            },
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                cache_control,
+            },
+            Content::Image { source, .. } => Content::Image {
+                source,
+                cache_control,
+            },
             // TODO: verify this Thinking variants don't support cache control
-            Content::Thinking { signature, thinking } => Content::Thinking { signature, thinking },
+            Content::Thinking {
+                signature,
+                thinking,
+            } => Content::Thinking {
+                signature,
+                thinking,
+            },
         }
     }
 
@@ -489,14 +540,19 @@ pub enum ToolChoice {
 impl From<forge_domain::ToolChoice> for ToolChoice {
     fn from(value: forge_domain::ToolChoice) -> Self {
         match value {
-            forge_domain::ToolChoice::Auto => ToolChoice::Auto { disable_parallel_tool_use: None },
-            forge_domain::ToolChoice::Call(tool_name) => {
-                ToolChoice::Tool { name: tool_name.to_string(), disable_parallel_tool_use: None }
-            }
-            forge_domain::ToolChoice::Required => {
-                ToolChoice::Any { disable_parallel_tool_use: None }
-            }
-            forge_domain::ToolChoice::None => ToolChoice::Auto { disable_parallel_tool_use: None },
+            forge_domain::ToolChoice::Auto => ToolChoice::Auto {
+                disable_parallel_tool_use: None,
+            },
+            forge_domain::ToolChoice::Call(tool_name) => ToolChoice::Tool {
+                name: tool_name.to_string(),
+                disable_parallel_tool_use: None,
+            },
+            forge_domain::ToolChoice::Required => ToolChoice::Any {
+                disable_parallel_tool_use: None,
+            },
+            forge_domain::ToolChoice::None => ToolChoice::Auto {
+                disable_parallel_tool_use: None,
+            },
         }
     }
 }
@@ -532,7 +588,9 @@ mod tests {
 
     #[test]
     fn test_thinking_enabled_serializes_with_budget() {
-        let thinking = Thinking::Enabled { budget_tokens: 5000 };
+        let thinking = Thinking::Enabled {
+            budget_tokens: 5000,
+        };
         let actual = serde_json::to_value(&thinking).unwrap();
         let expected = serde_json::json!({
             "type": "enabled",
@@ -553,7 +611,9 @@ mod tests {
 
     #[test]
     fn test_thinking_adaptive_serializes_with_summarized_display() {
-        let thinking = Thinking::Adaptive { display: Some(ThinkingDisplay::Summarized) };
+        let thinking = Thinking::Adaptive {
+            display: Some(ThinkingDisplay::Summarized),
+        };
         let actual = serde_json::to_value(&thinking).unwrap();
         let expected = serde_json::json!({
             "type": "adaptive",
@@ -585,7 +645,9 @@ mod tests {
 
         assert_eq!(
             actual.thinking,
-            Some(Thinking::Enabled { budget_tokens: 8000 })
+            Some(Thinking::Enabled {
+                budget_tokens: 8000
+            })
         );
         assert_eq!(actual.output_config, None);
     }
@@ -604,11 +666,15 @@ mod tests {
 
         assert_eq!(
             actual.thinking,
-            Some(Thinking::Enabled { budget_tokens: 8000 })
+            Some(Thinking::Enabled {
+                budget_tokens: 8000
+            })
         );
         assert_eq!(
             actual.output_config,
-            Some(OutputConfig { effort: OutputEffort::Low })
+            Some(OutputConfig {
+                effort: OutputEffort::Low
+            })
         );
     }
 
@@ -625,7 +691,9 @@ mod tests {
 
         assert_eq!(
             actual.thinking,
-            Some(Thinking::Enabled { budget_tokens: 8000 })
+            Some(Thinking::Enabled {
+                budget_tokens: 8000
+            })
         );
         assert_eq!(actual.output_config, None);
     }
@@ -643,11 +711,15 @@ mod tests {
 
         assert_eq!(
             actual.output_config,
-            Some(OutputConfig { effort: OutputEffort::Low })
+            Some(OutputConfig {
+                effort: OutputEffort::Low
+            })
         );
         assert_eq!(
             actual.thinking,
-            Some(Thinking::Adaptive { display: Some(ThinkingDisplay::Summarized) })
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
         );
     }
 
@@ -664,7 +736,9 @@ mod tests {
 
         assert_eq!(
             actual.thinking,
-            Some(Thinking::Adaptive { display: Some(ThinkingDisplay::Omitted) })
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Omitted)
+            })
         );
     }
 
@@ -681,7 +755,9 @@ mod tests {
 
         assert_eq!(
             actual.output_config,
-            Some(OutputConfig { effort: OutputEffort::XHigh })
+            Some(OutputConfig {
+                effort: OutputEffort::XHigh
+            })
         );
     }
 
@@ -698,7 +774,9 @@ mod tests {
 
         assert_eq!(
             actual.thinking,
-            Some(Thinking::Adaptive { display: Some(ThinkingDisplay::Summarized) })
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
         );
     }
 
@@ -715,7 +793,9 @@ mod tests {
 
         assert_eq!(
             actual.thinking,
-            Some(Thinking::Adaptive { display: Some(ThinkingDisplay::Omitted) })
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Omitted)
+            })
         );
     }
 
@@ -749,7 +829,9 @@ mod tests {
 
         assert_eq!(
             actual.thinking,
-            Some(Thinking::Enabled { budget_tokens: 8000 })
+            Some(Thinking::Enabled {
+                budget_tokens: 8000
+            })
         );
     }
 
@@ -766,11 +848,15 @@ mod tests {
 
         assert_eq!(
             actual.output_config,
-            Some(OutputConfig { effort: OutputEffort::High })
+            Some(OutputConfig {
+                effort: OutputEffort::High
+            })
         );
         assert_eq!(
             actual.thinking,
-            Some(Thinking::Adaptive { display: Some(ThinkingDisplay::Summarized) })
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
         );
     }
 

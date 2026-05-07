@@ -272,7 +272,10 @@ mod tests {
 
         let expected = FileTag {
             path: "/path/to/file.txt".to_string(),
-            loc: Some(Location { start: Some(10), end: Some(20) }),
+            loc: Some(Location {
+                start: Some(10),
+                end: Some(20),
+            }),
             symbol: None,
         };
         let actual = paths.first().unwrap();
@@ -302,7 +305,10 @@ mod tests {
 
         let expected = FileTag {
             path: "/src/main.rs".to_string(),
-            loc: Some(Location { start: Some(5), end: Some(15) }),
+            loc: Some(Location {
+                start: Some(5),
+                end: Some(15),
+            }),
             symbol: Some("main_function".to_string()),
         };
         let actual = paths.first().unwrap();
@@ -318,10 +324,17 @@ mod tests {
         assert_eq!(paths.len(), 4);
 
         let expected = vec![
-            FileTag { path: "/file1.txt".to_string(), loc: None, symbol: None },
+            FileTag {
+                path: "/file1.txt".to_string(),
+                loc: None,
+                symbol: None,
+            },
             FileTag {
                 path: "/file2.rs".to_string(),
-                loc: Some(Location { start: Some(10), end: Some(20) }),
+                loc: Some(Location {
+                    start: Some(10),
+                    end: Some(20),
+                }),
                 symbol: None,
             },
             FileTag {
@@ -331,7 +344,10 @@ mod tests {
             },
             FileTag {
                 path: "/file4.js".to_string(),
-                loc: Some(Location { start: Some(1), end: Some(5) }),
+                loc: Some(Location {
+                    start: Some(1),
+                    end: Some(5),
+                }),
                 symbol: Some("init".to_string()),
             },
         ];
@@ -364,7 +380,10 @@ mod tests {
 
         let expected = FileTag {
             path: "/file.txt".to_string(),
-            loc: Some(Location { start: Some(0), end: Some(999999) }),
+            loc: Some(Location {
+                start: Some(0),
+                end: Some(999999),
+            }),
             symbol: None,
         };
         let actual = paths.first().unwrap();
@@ -379,7 +398,10 @@ mod tests {
 
         let expected = FileTag {
             path: "/file.txt".to_string(),
-            loc: Some(Location { start: Some(12), end: None }),
+            loc: Some(Location {
+                start: Some(12),
+                end: None,
+            }),
             symbol: Some("main()".to_string()),
         };
         let actual = paths.first().unwrap();
@@ -394,7 +416,10 @@ mod tests {
 
         let expected = FileTag {
             path: "/file.txt".to_string(),
-            loc: Some(Location { start: Some(12), end: None }),
+            loc: Some(Location {
+                start: Some(12),
+                end: None,
+            }),
             symbol: Some("main()".to_string()),
         };
         let actual = paths.first().unwrap();
@@ -409,7 +434,10 @@ mod tests {
 
         let expected = FileTag {
             path: "C:\\Users\\test\\file.txt".to_string(),
-            loc: Some(Location { start: Some(10), end: Some(20) }),
+            loc: Some(Location {
+                start: Some(10),
+                end: Some(20),
+            }),
             symbol: None,
         };
         let actual = paths.first().unwrap();
@@ -422,7 +450,11 @@ mod tests {
         let paths = Attachment::parse_all(text);
         assert_eq!(paths.len(), 1);
 
-        let expected = FileTag { path: "D:\\file.txt".to_string(), loc: None, symbol: None };
+        let expected = FileTag {
+            path: "D:\\file.txt".to_string(),
+            loc: None,
+            symbol: None,
+        };
         let actual = paths.first().unwrap();
         assert_eq!(actual, &expected);
     }
@@ -450,7 +482,10 @@ mod tests {
 
         let expected = FileTag {
             path: "F:\\project\\lib.rs".to_string(),
-            loc: Some(Location { start: Some(42), end: None }),
+            loc: Some(Location {
+                start: Some(42),
+                end: None,
+            }),
             symbol: None,
         };
         let actual = paths.first().unwrap();
@@ -465,7 +500,10 @@ mod tests {
 
         let expected = FileTag {
             path: "G:\\code\\test.rs".to_string(),
-            loc: Some(Location { start: Some(5), end: Some(15) }),
+            loc: Some(Location {
+                start: Some(5),
+                end: Some(15),
+            }),
             symbol: Some("test_function".to_string()),
         };
         let actual = paths.first().unwrap();
@@ -480,7 +518,10 @@ mod tests {
 
         let expected = FileTag {
             path: "/home/user/project/file.rs".to_string(),
-            loc: Some(Location { start: Some(25), end: Some(30) }),
+            loc: Some(Location {
+                start: Some(25),
+                end: Some(30),
+            }),
             symbol: None,
         };
         let actual = paths.first().unwrap();
@@ -495,7 +536,10 @@ mod tests {
 
         let expected = FileTag {
             path: "/var/log/app.log".to_string(),
-            loc: Some(Location { start: Some(100), end: None }),
+            loc: Some(Location {
+                start: Some(100),
+                end: None,
+            }),
             symbol: None,
         };
         let actual = paths.first().unwrap();
@@ -540,7 +584,10 @@ mod tests {
 
         let expected = FileTag {
             path: "/tmp/script.sh".to_string(),
-            loc: Some(Location { start: Some(10), end: None }),
+            loc: Some(Location {
+                start: Some(10),
+                end: None,
+            }),
             symbol: Some("setup_function".to_string()),
         };
         let actual = paths.first().unwrap();
@@ -553,7 +600,11 @@ mod tests {
         let paths = Attachment::parse_all(text);
         assert_eq!(paths.len(), 2);
 
-        let expected_unix = FileTag { path: "/unix/path.txt".to_string(), loc: None, symbol: None };
+        let expected_unix = FileTag {
+            path: "/unix/path.txt".to_string(),
+            loc: None,
+            symbol: None,
+        };
         let expected_windows = FileTag {
             path: "C:\\windows\\path.txt".to_string(),
             loc: None,

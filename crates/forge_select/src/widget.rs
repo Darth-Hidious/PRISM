@@ -27,7 +27,10 @@ impl ForgeWidget {
 
     /// Convenience method for confirm (yes/no).
     pub fn confirm(message: impl Into<String>) -> ConfirmBuilder {
-        ConfirmBuilder { message: message.into(), default: None }
+        ConfirmBuilder {
+            message: message.into(),
+            default: None,
+        }
     }
 
     /// Prompt a question and get text input.
@@ -42,6 +45,9 @@ impl ForgeWidget {
 
     /// Multi-select prompt.
     pub fn multi_select<T>(message: impl Into<String>, options: Vec<T>) -> MultiSelectBuilder<T> {
-        MultiSelectBuilder { message: message.into(), options }
+        MultiSelectBuilder {
+            message: message.into(),
+            options,
+        }
     }
 }

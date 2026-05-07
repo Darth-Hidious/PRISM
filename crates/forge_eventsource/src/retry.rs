@@ -38,7 +38,12 @@ impl ExponentialBackoff {
         max_duration: Option<Duration>,
         max_retries: Option<usize>,
     ) -> Self {
-        Self { start, factor, max_duration, max_retries }
+        Self {
+            start,
+            factor,
+            max_duration,
+            max_retries,
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use prism_ingest::llm::{FunctionDef, ToolDefinition};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::permissions::{get_tool_permission, PermissionMode};
+use crate::permissions::{PermissionMode, get_tool_permission};
 
 /// Full metadata for one loaded tool. Rust keeps this alongside the OpenAI
 /// function definition so command views, permission logic, and approval UI all

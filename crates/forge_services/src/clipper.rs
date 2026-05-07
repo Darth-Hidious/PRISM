@@ -91,7 +91,11 @@ impl Clipper {
     pub fn clip(self, content: &str) -> ClipperResult<'_> {
         // If content is empty, return as is
         if content.is_empty() {
-            return ClipperResult { prefix: None, suffix: None, actual: content };
+            return ClipperResult {
+                prefix: None,
+                suffix: None,
+                actual: content,
+            };
         }
 
         // Get character count (not byte count)
@@ -115,7 +119,11 @@ impl Clipper {
         limit: usize,
     ) -> ClipperResult<'a> {
         if char_count <= limit {
-            return ClipperResult { prefix: None, suffix: None, actual: content };
+            return ClipperResult {
+                prefix: None,
+                suffix: None,
+                actual: content,
+            };
         }
 
         // Find the byte index corresponding to the character limit
@@ -124,7 +132,11 @@ impl Clipper {
             .nth(limit)
             .map_or(content.len(), |(idx, _)| idx);
 
-        ClipperResult { prefix: Some(0..byte_idx), suffix: None, actual: content }
+        ClipperResult {
+            prefix: Some(0..byte_idx),
+            suffix: None,
+            actual: content,
+        }
     }
 
     /// Helper method to truncate content from the end
@@ -135,7 +147,11 @@ impl Clipper {
         limit: usize,
     ) -> ClipperResult<'a> {
         if char_count <= limit {
-            return ClipperResult { prefix: None, suffix: None, actual: content };
+            return ClipperResult {
+                prefix: None,
+                suffix: None,
+                actual: content,
+            };
         }
 
         // Find the byte index corresponding to where the suffix starts
@@ -162,7 +178,11 @@ impl Clipper {
         // If the combined limits exceed or equal content length, return the whole
         // content
         if prefix_limit + suffix_limit >= char_count {
-            return ClipperResult { prefix: None, suffix: None, actual: content };
+            return ClipperResult {
+                prefix: None,
+                suffix: None,
+                actual: content,
+            };
         }
 
         // Find the byte index for prefix

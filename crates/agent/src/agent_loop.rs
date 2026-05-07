@@ -989,11 +989,13 @@ mod tests {
 
         assert_eq!(history.len(), 3);
         assert_eq!(history[0].role, "system");
-        assert!(history[0]
-            .content
-            .as_deref()
-            .unwrap_or_default()
-            .contains("summary text"));
+        assert!(
+            history[0]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("summary text")
+        );
         assert_eq!(history[1].content.as_deref(), Some("three"));
         assert_eq!(history[2].content.as_deref(), Some("four"));
     }

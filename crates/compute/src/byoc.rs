@@ -4,7 +4,7 @@
 //! Kubernetes clusters, or SLURM schedulers. The BYOC backend translates
 //! PRISM job specs into the target system's native submission format.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

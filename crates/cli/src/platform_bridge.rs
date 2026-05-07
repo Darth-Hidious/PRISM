@@ -39,10 +39,10 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::stream::Stream;
 use futures_util::StreamExt;
+use futures_util::stream::Stream;
 use prism_tool_router::{RoutingDecision, ToolDef, ToolRouter};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -136,7 +136,10 @@ pub async fn start(
             .await;
     });
 
-    Ok(ProxyHandle { url, shutdown: Some(tx) })
+    Ok(ProxyHandle {
+        url,
+        shutdown: Some(tx),
+    })
 }
 
 // ── Routes ───────────────────────────────────────────────────────────
@@ -189,7 +192,11 @@ async fn list_models(State(state): State<Arc<ProxyState>>) -> Response {
     let data: Vec<Value> = arr
         .into_iter()
         .map(|m| {
-            let id = m.get("model_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = m
+                .get("model_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let owned_by = m
                 .get("provider")
                 .and_then(|v| v.as_str())
@@ -244,12 +251,16 @@ fn fifo_trim(req: &mut Value, tools: &mut Vec<Value>) {
     kept.extend(other);
     let mut size = {
         req["tools"] = Value::Array(kept.clone());
-        serde_json::to_vec(req).map(|b| b.len()).unwrap_or(usize::MAX)
+        serde_json::to_vec(req)
+            .map(|b| b.len())
+            .unwrap_or(usize::MAX)
     };
     while size > MARC27_BODY_BUDGET && !kept.is_empty() {
         kept.pop();
         req["tools"] = Value::Array(kept.clone());
-        size = serde_json::to_vec(req).map(|b| b.len()).unwrap_or(usize::MAX);
+        size = serde_json::to_vec(req)
+            .map(|b| b.len())
+            .unwrap_or(usize::MAX);
     }
     if kept.len() != original {
         eprintln!(
@@ -269,7 +280,9 @@ fn fifo_trim(req: &mut Value, tools: &mut Vec<Value>) {
 /// after one no-progress pass to avoid infinite loops on pathological input.
 fn truncate_oversized_messages(req: &mut Value) {
     fn body_size(req: &Value) -> usize {
-        serde_json::to_vec(req).map(|b| b.len()).unwrap_or(usize::MAX)
+        serde_json::to_vec(req)
+            .map(|b| b.len())
+            .unwrap_or(usize::MAX)
     }
 
     let mut size = body_size(req);
@@ -360,10 +373,7 @@ fn truncate_oversized_messages(req: &mut Value) {
 
 /// `POST /v1/chat/completions` — accept OpenAI request, forward to MARC27's
 /// `/stream`, translate SSE deltas into OpenAI delta chunks.
-async fn chat_completions(
-    State(state): State<Arc<ProxyState>>,
-    body: Bytes,
-) -> Response {
+async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> Response {
     tracing::debug!(target: "platform_bridge", body_len = body.len(), "chat/completions hit");
     let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -406,9 +416,11 @@ async fn chat_completions(
             .and_then(|v| v.as_array())
             .map(|a| a.to_vec());
 
-        if let (Some(tools), Some(query), Some(router)) =
-            (tools_owned.as_ref(), last_user_msg.as_ref(), state.router.as_ref())
-        {
+        if let (Some(tools), Some(query), Some(router)) = (
+            tools_owned.as_ref(),
+            last_user_msg.as_ref(),
+            state.router.as_ref(),
+        ) {
             let original = tools.len();
 
             // Build the (name, ToolDef) catalog forge sent us so the router
@@ -420,10 +432,17 @@ async fn chat_completions(
                 .filter_map(|t| {
                     let f = t.get("function")?;
                     let name = f.get("name")?.as_str()?.to_string();
-                    let description =
-                        f.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let description = f
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let args_schema = f.get("parameters").cloned().unwrap_or(json!({}));
-                    Some(ToolDef { name, description, args_schema })
+                    Some(ToolDef {
+                        name,
+                        description,
+                        args_schema,
+                    })
                 })
                 .collect();
             let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
@@ -433,8 +452,7 @@ async fn chat_completions(
 
             match router.search(query, &names, TOP_K).await {
                 Ok(top) => {
-                    let mut keep_set: std::collections::HashSet<String> =
-                        top.into_iter().collect();
+                    let mut keep_set: std::collections::HashSet<String> = top.into_iter().collect();
                     for k in ALWAYS_KEEP {
                         if names.iter().any(|n| n == k) {
                             keep_set.insert(k.to_string());
@@ -454,8 +472,7 @@ async fn chat_completions(
                     let kept_count = kept.len();
                     req["tools"] = Value::Array(kept);
                     if kept_count != original {
-                        let final_size =
-                            serde_json::to_vec(&req).map(|b| b.len()).unwrap_or(0);
+                        let final_size = serde_json::to_vec(&req).map(|b| b.len()).unwrap_or(0);
                         eprintln!(
                             "[platform_bridge] semantic top-K: {} → {} tools (body {} bytes)",
                             original, kept_count, final_size
@@ -499,17 +516,17 @@ async fn chat_completions(
             .and_then(|m| m.get("role"))
             .and_then(|r| r.as_str())
             .unwrap_or("");
-        let user_query: Option<String> = req
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                arr.iter()
-                    .rev()
-                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
-                    .map(|s| s.to_string())
-            });
+        let user_query: Option<String> =
+            req.get("messages")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .rev()
+                        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string())
+                });
         let tools_for_routing: Vec<Value> = req
             .get("tools")
             .and_then(|v| v.as_array())
@@ -541,10 +558,7 @@ async fn chat_completions(
                         //    If required fields are still unsatisfied,
                         //    fall through to the chat LLM rather than
                         //    ship a doomed call.
-                        let schema_ok = sanitise_args_against_schema(
-                            &mut call,
-                            &tools_for_routing,
-                        );
+                        let schema_ok = sanitise_args_against_schema(&mut call, &tools_for_routing);
                         if !schema_ok {
                             eprintln!(
                                 "[platform_bridge] FunctionGemma args invalid against schema for {}, falling through",
@@ -645,8 +659,7 @@ async fn chat_completions(
                 return Sse::new(synthetic_text_stream(msg.to_string(), model.clone()))
                     .into_response();
             } else {
-                return Json(synthetic_text_full(msg.to_string(), model.clone()))
-                    .into_response();
+                return Json(synthetic_text_full(msg.to_string(), model.clone())).into_response();
             }
         }
 
@@ -694,7 +707,11 @@ fn flatten_tool_messages_for_marc27(req: &mut Value) {
     for msg in messages.iter() {
         if let Some(calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
             for c in calls {
-                let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = c
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let name = c
                     .get("function")
                     .and_then(|f| f.get("name"))
@@ -717,7 +734,10 @@ fn flatten_tool_messages_for_marc27(req: &mut Value) {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let tool_name = id_to_name.get(&id).cloned().unwrap_or_else(|| "tool".into());
+                let tool_name = id_to_name
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "tool".into());
                 let result = msg
                     .get("content")
                     .and_then(|v| v.as_str())
@@ -785,10 +805,7 @@ fn flatten_tool_messages_for_marc27(req: &mut Value) {
 /// This is the runtime arg-accuracy guard that makes the un-fine-tuned
 /// FunctionGemma reliable in practice — base model picks correct tool +
 /// emits structurally valid call but invents extra args; we drop those.
-fn sanitise_args_against_schema(
-    call: &mut prism_tool_router::ToolCall,
-    tools: &[Value],
-) -> bool {
+fn sanitise_args_against_schema(call: &mut prism_tool_router::ToolCall, tools: &[Value]) -> bool {
     let parameters = tools
         .iter()
         .find(|t| {
@@ -1229,4 +1246,3 @@ fn error_response(status: StatusCode, body: &str) -> Response {
     });
     (status, Json(json_body)).into_response()
 }
-

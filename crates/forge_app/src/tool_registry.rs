@@ -365,7 +365,10 @@ impl<S> ToolRegistry<S> {
                 .map(|t| t.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(Error::NotAllowed { name: tool_name.clone(), supported_tools });
+            return Err(Error::NotAllowed {
+                name: tool_name.clone(),
+                supported_tools,
+            });
         }
         Ok(())
     }
@@ -819,7 +822,10 @@ fn test_template_rendering_in_tool_descriptions() {
     use fake::{Fake, Faker};
 
     let env: Environment = Faker.fake();
-    let template_config = TemplateConfig { max_line_length: 2000, ..Default::default() };
+    let template_config = TemplateConfig {
+        max_line_length: 2000,
+        ..Default::default()
+    };
 
     let actual = ToolRegistry::<()>::get_system_tools(
         true,

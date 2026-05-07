@@ -45,7 +45,11 @@ impl ForgeWalkerService {
         let files = walker.get().await?;
         let walked_files = files
             .into_iter()
-            .map(|f| WalkedFile { path: f.path, file_name: f.file_name, size: f.size })
+            .map(|f| WalkedFile {
+                path: f.path,
+                file_name: f.file_name,
+                size: f.size,
+            })
             .collect();
 
         Ok(walked_files)

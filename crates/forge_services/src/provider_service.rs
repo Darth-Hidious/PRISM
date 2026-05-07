@@ -152,7 +152,10 @@ mod tests {
 
     impl MockProviderRepository {
         fn new(models: Vec<Model>) -> Self {
-            Self { models, providers: vec![] }
+            Self {
+                models,
+                providers: vec![],
+            }
         }
 
         fn with_providers(mut self, providers: Vec<AnyProvider>) -> Self {
@@ -278,7 +281,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_all_providers_renders_configured_providers() {
         let configured = test_template_provider();
-        let unconfigured = Provider { credential: None, ..test_template_provider() };
+        let unconfigured = Provider {
+            credential: None,
+            ..test_template_provider()
+        };
 
         let repository = Arc::new(MockProviderRepository::new(vec![]).with_providers(vec![
             AnyProvider::Template(configured),

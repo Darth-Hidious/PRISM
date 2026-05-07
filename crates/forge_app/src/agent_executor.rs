@@ -20,7 +20,10 @@ pub struct AgentExecutor<S> {
 
 impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentExecutor<S> {
     pub fn new(services: Arc<S>) -> Self {
-        Self { services, tool_agents: Arc::new(RwLock::new(None)) }
+        Self {
+            services,
+            tool_agents: Arc::new(RwLock::new(None)),
+        }
     }
 
     /// Returns a list of tool definitions for all available agents.
@@ -61,7 +64,9 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> AgentEx
                 .conversation_service()
                 .find_conversation(&conversation_id)
                 .await?
-                .ok_or(Error::ConversationNotFound { id: conversation_id })?
+                .ok_or(Error::ConversationNotFound {
+                    id: conversation_id,
+                })?
         } else {
             // Create context with agent initiator since it's spawned by a parent agent
             // This is crucial for GitHub Copilot billing optimization

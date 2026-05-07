@@ -77,7 +77,10 @@ impl<F: FsReadService> FileChangeDetector<F> {
                             current_hash = ?current_hash,
                             "Detected file change"
                         );
-                        Some(FileChange { path: file_path, content_hash: current_hash })
+                        Some(FileChange {
+                            path: file_path,
+                            content_hash: current_hash,
+                        })
                     } else {
                         None
                     }
@@ -125,7 +128,10 @@ mod tests {
 
     impl MockFsReadService {
         fn new() -> Self {
-            Self { files: HashMap::new(), not_found_files: Vec::new() }
+            Self {
+                files: HashMap::new(),
+                not_found_files: Vec::new(),
+            }
         }
 
         /// Adds a file where displayed content equals raw content (no
@@ -134,7 +140,10 @@ mod tests {
             let content = content.into();
             self.files.insert(
                 path.into(),
-                MockFile { raw_content: content.clone(), displayed_content: content },
+                MockFile {
+                    raw_content: content.clone(),
+                    displayed_content: content,
+                },
             );
             self
         }

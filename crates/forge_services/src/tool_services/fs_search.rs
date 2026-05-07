@@ -593,7 +593,11 @@ mod test {
                         let file_name = path.file_name().map(|n| n.to_string_lossy().to_string());
                         let size = entry.metadata().await?.len();
 
-                        files.push(WalkedFile { path: relative_path, file_name, size });
+                        files.push(WalkedFile {
+                            path: relative_path,
+                            file_name,
+                            size,
+                        });
                     }
                 }
             }
@@ -801,7 +805,13 @@ mod test {
                 .matches
                 .iter()
                 .filter_map(|m| m.result.as_ref())
-                .all(|r| matches!(r, MatchResult::Found { line_number: Some(_), .. }))
+                .all(|r| matches!(
+                    r,
+                    MatchResult::Found {
+                        line_number: Some(_),
+                        ..
+                    }
+                ))
         );
     }
 
@@ -829,7 +839,13 @@ mod test {
                 .matches
                 .iter()
                 .filter_map(|m| m.result.as_ref())
-                .all(|r| matches!(r, MatchResult::Found { line_number: None, .. }))
+                .all(|r| matches!(
+                    r,
+                    MatchResult::Found {
+                        line_number: None,
+                        ..
+                    }
+                ))
         );
     }
 
@@ -972,7 +988,12 @@ mod test {
         assert_eq!(result.matches.len(), 1);
 
         match &result.matches[0].result {
-            Some(MatchResult::ContextMatch { line, before_context, after_context, .. }) => {
+            Some(MatchResult::ContextMatch {
+                line,
+                before_context,
+                after_context,
+                ..
+            }) => {
                 assert_eq!(line, "MATCH HERE");
                 assert_eq!(before_context.len(), 2);
                 assert_eq!(before_context[0], "line 2");
@@ -1011,7 +1032,12 @@ mod test {
         assert_eq!(result.matches.len(), 1);
 
         match &result.matches[0].result {
-            Some(MatchResult::ContextMatch { line, before_context, after_context, .. }) => {
+            Some(MatchResult::ContextMatch {
+                line,
+                before_context,
+                after_context,
+                ..
+            }) => {
                 assert_eq!(line, "MATCH HERE");
                 assert_eq!(before_context.len(), 0); // No before context
                 assert_eq!(after_context.len(), 2);

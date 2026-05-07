@@ -22,7 +22,9 @@ fn deprecated_tool_aliases() -> HashMap<&'static str, ToolName> {
 impl ToolResolver {
     /// Creates a new ToolResolver with all available tool definitions
     pub fn new(all_tool_definitions: Vec<ToolDefinition>) -> Self {
-        Self { all_tool_definitions }
+        Self {
+            all_tool_definitions,
+        }
     }
 
     /// Resolves the tool definitions for a specific agent by filtering

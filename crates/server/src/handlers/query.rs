@@ -6,15 +6,15 @@
 //! - `graph` — Entity neighbor traversal by name
 //! - `semantic` — Vector similarity search via Qdrant
 
+use axum::Extension;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
-use axum::Extension;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::middleware::AuthenticatedUser;
 use crate::NodeState;
+use crate::middleware::AuthenticatedUser;
 
 #[derive(Deserialize)]
 pub struct QueryRequest {

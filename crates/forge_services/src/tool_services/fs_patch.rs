@@ -398,7 +398,9 @@ async fn apply_replace_operation<F: TextPatchRepository>(
             let patch = infra
                 .build_text_patch(&current_content, &normalized_search, &normalized_content)
                 .await
-                .map_err(|error| Error::PatchBuild { message: error.to_string() })?;
+                .map_err(|error| Error::PatchBuild {
+                    message: error.to_string(),
+                })?;
             Ok(build_fuzzy_patch(
                 &current_content,
                 &search_text,
@@ -560,7 +562,10 @@ mod tests {
     fn test_range_from_search_match_single_line() {
         let source = "line1\nline2\nline3";
         // 0-based: line 1 (the second line, "line2")
-        let search_match = SearchMatch { start_line: 1, end_line: 1 };
+        let search_match = SearchMatch {
+            start_line: 1,
+            end_line: 1,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -573,7 +578,10 @@ mod tests {
     fn test_range_from_search_match_multi_line() {
         let source = "line1\nline2\nline3\nline4";
         // 0-based: lines 1-2 (second and third lines, "line2\nline3")
-        let search_match = SearchMatch { start_line: 1, end_line: 2 };
+        let search_match = SearchMatch {
+            start_line: 1,
+            end_line: 2,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -586,7 +594,10 @@ mod tests {
     fn test_range_from_search_match_first_line() {
         let source = "line1\nline2\nline3";
         // 0-based: line 0 (first line, "line1")
-        let search_match = SearchMatch { start_line: 0, end_line: 0 };
+        let search_match = SearchMatch {
+            start_line: 0,
+            end_line: 0,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -599,7 +610,10 @@ mod tests {
     fn test_range_from_search_match_last_line() {
         let source = "line1\nline2\nline3";
         // 0-based: line 2 (third line, "line3")
-        let search_match = SearchMatch { start_line: 2, end_line: 2 };
+        let search_match = SearchMatch {
+            start_line: 2,
+            end_line: 2,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -612,7 +626,10 @@ mod tests {
     fn test_range_from_search_match_last_line_without_newline() {
         let source = "line1\nline2\nline3"; // No trailing newline
         // 0-based: line 2 (third line, "line3")
-        let search_match = SearchMatch { start_line: 2, end_line: 2 };
+        let search_match = SearchMatch {
+            start_line: 2,
+            end_line: 2,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -625,7 +642,10 @@ mod tests {
     fn test_range_from_search_match_all_lines() {
         let source = "line1\nline2\nline3";
         // 0-based: lines 0-2 (all three lines)
-        let search_match = SearchMatch { start_line: 0, end_line: 2 };
+        let search_match = SearchMatch {
+            start_line: 0,
+            end_line: 2,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -638,7 +658,10 @@ mod tests {
     fn test_range_from_search_match_empty_source() {
         let source = "";
         // 0-based: line 0 (but source is empty)
-        let search_match = SearchMatch { start_line: 0, end_line: 0 };
+        let search_match = SearchMatch {
+            start_line: 0,
+            end_line: 0,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -651,7 +674,10 @@ mod tests {
     fn test_range_from_search_match_single_line_source() {
         let source = "single line";
         // 0-based: line 0 (the only line)
-        let search_match = SearchMatch { start_line: 0, end_line: 0 };
+        let search_match = SearchMatch {
+            start_line: 0,
+            end_line: 0,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -1097,7 +1123,10 @@ mod tests {
     fn test_range_from_search_match_crlf_single_line() {
         let source = "line1\r\nline2\r\nline3";
         // 0-based: line 1 (the second line, "line2")
-        let search_match = SearchMatch { start_line: 1, end_line: 1 };
+        let search_match = SearchMatch {
+            start_line: 1,
+            end_line: 1,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -1110,7 +1139,10 @@ mod tests {
     fn test_range_from_search_match_crlf_multi_line() {
         let source = "line1\r\nline2\r\nline3\r\nline4";
         // 0-based: lines 1-2 (second and third lines, "line2\r\nline3")
-        let search_match = SearchMatch { start_line: 1, end_line: 2 };
+        let search_match = SearchMatch {
+            start_line: 1,
+            end_line: 2,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -1123,7 +1155,10 @@ mod tests {
     fn test_range_from_search_match_crlf_first_line() {
         let source = "line1\r\nline2\r\nline3";
         // 0-based: line 0 (first line, "line1")
-        let search_match = SearchMatch { start_line: 0, end_line: 0 };
+        let search_match = SearchMatch {
+            start_line: 0,
+            end_line: 0,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -1136,7 +1171,10 @@ mod tests {
     fn test_range_from_search_match_crlf_all_lines() {
         let source = "line1\r\nline2\r\nline3";
         // 0-based: lines 0-2 (all three lines)
-        let search_match = SearchMatch { start_line: 0, end_line: 2 };
+        let search_match = SearchMatch {
+            start_line: 0,
+            end_line: 2,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         let actual = &source[range.start..range.end()];
@@ -1204,7 +1242,10 @@ mod tests {
     fn test_range_from_search_match_out_of_bounds_start_line() {
         let source = "line1\nline2\nline3";
         // start_line way past end of file
-        let search_match = SearchMatch { start_line: 100, end_line: 200 };
+        let search_match = SearchMatch {
+            start_line: 100,
+            end_line: 200,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         // Should not panic; range should be clamped so it doesn't exceed source
@@ -1215,7 +1256,10 @@ mod tests {
     fn test_range_from_search_match_end_line_past_eof() {
         let source = "line1\nline2\nline3";
         // start_line valid, end_line past end
-        let search_match = SearchMatch { start_line: 1, end_line: 100 };
+        let search_match = SearchMatch {
+            start_line: 1,
+            end_line: 100,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         assert!(range.end() <= source.len());
@@ -1228,7 +1272,10 @@ mod tests {
     #[test]
     fn test_range_from_search_match_trailing_newline() {
         let source = "line1\nline2\nline3\n"; // trailing newline
-        let search_match = SearchMatch { start_line: 2, end_line: 2 };
+        let search_match = SearchMatch {
+            start_line: 2,
+            end_line: 2,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         assert!(range.end() <= source.len());
@@ -1239,7 +1286,10 @@ mod tests {
     #[test]
     fn test_range_from_search_match_unicode_content() {
         let source = "héllo\nwørld\n🌍";
-        let search_match = SearchMatch { start_line: 1, end_line: 1 };
+        let search_match = SearchMatch {
+            start_line: 1,
+            end_line: 1,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         assert!(range.end() <= source.len());
@@ -1250,7 +1300,10 @@ mod tests {
     #[test]
     fn test_range_from_search_match_unicode_multiline() {
         let source = "héllo\nwørld\n🌍";
-        let search_match = SearchMatch { start_line: 0, end_line: 2 };
+        let search_match = SearchMatch {
+            start_line: 0,
+            end_line: 2,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         assert!(range.end() <= source.len());
@@ -1261,7 +1314,10 @@ mod tests {
     #[test]
     fn test_range_from_search_match_mixed_line_endings() {
         let source = "line1\r\nline2\nline3";
-        let search_match = SearchMatch { start_line: 1, end_line: 1 };
+        let search_match = SearchMatch {
+            start_line: 1,
+            end_line: 1,
+        };
 
         let range = super::Range::from_search_match(source, &search_match);
         assert!(range.end() <= source.len());

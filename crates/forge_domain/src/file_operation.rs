@@ -20,6 +20,11 @@ impl FileOperation {
     /// Creates a new FileChangeMetrics with the specified tool
     /// Other fields default to zero/None and can be set using setters
     pub fn new(tool: ToolKind) -> Self {
-        Self { lines_added: 0, lines_removed: 0, content_hash: None, tool }
+        Self {
+            lines_added: 0,
+            lines_removed: 0,
+            content_hash: None,
+            tool,
+        }
     }
 }

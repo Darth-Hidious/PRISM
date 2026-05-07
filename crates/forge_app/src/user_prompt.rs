@@ -26,7 +26,12 @@ impl<S: AttachmentService + EnvironmentInfra<Config = forge_config::ForgeConfig>
         event: Event,
         current_time: chrono::DateTime<chrono::Local>,
     ) -> Self {
-        Self { services: service, agent, event, current_time }
+        Self {
+            services: service,
+            agent,
+            event,
+            current_time,
+        }
     }
 
     /// Sets the user prompt in the context based on agent configuration and

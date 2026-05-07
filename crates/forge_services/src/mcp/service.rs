@@ -310,7 +310,9 @@ mod tests {
                 ServerName::from("test-server".to_string()),
                 McpServerConfig::new_stdio("echo", vec![], None),
             );
-            Ok(McpConfig { mcp_servers: servers })
+            Ok(McpConfig {
+                mcp_servers: servers,
+            })
         }
 
         async fn write_mcp_config(

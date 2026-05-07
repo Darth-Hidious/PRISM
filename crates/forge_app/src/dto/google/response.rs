@@ -101,7 +101,10 @@ impl TryFrom<EventData> for ChatCompletionMessage {
                     StringOrF64::Number(n) => n,
                     StringOrF64::String(s) => s.parse().unwrap_or(0.0),
                 };
-                let usage = forge_domain::Usage { cost: Some(cost), ..Default::default() };
+                let usage = forge_domain::Usage {
+                    cost: Some(cost),
+                    ..Default::default()
+                };
                 Ok(ChatCompletionMessage::assistant(forge_domain::Content::part("")).usage(usage))
             }
             EventData::Unknown(_) => {
@@ -424,7 +427,10 @@ impl TryFrom<Part> for ChatCompletionMessage {
                     Ok(msg)
                 }
             }
-            Part::FunctionCall { function_call, thought_signature } => Ok(
+            Part::FunctionCall {
+                function_call,
+                thought_signature,
+            } => Ok(
                 ChatCompletionMessage::assistant(forge_domain::Content::part("")).add_tool_call(
                     ToolCallPart {
                         call_id: Some(ToolCallId::generate()),
@@ -566,10 +572,15 @@ mod tests {
 
     #[test]
     fn test_chat_completion_message_from_part_function_call_generates_id() {
-        let function_call =
-            FunctionCall { name: "test_tool".to_string(), args: json!({"arg": "value"}) };
+        let function_call = FunctionCall {
+            name: "test_tool".to_string(),
+            args: json!({"arg": "value"}),
+        };
 
-        let part = Part::FunctionCall { function_call, thought_signature: None };
+        let part = Part::FunctionCall {
+            function_call,
+            thought_signature: None,
+        };
 
         let message = ChatCompletionMessage::try_from(part).unwrap();
 
@@ -618,8 +629,12 @@ mod tests {
         assert!(matches!(event_data, EventData::Ping(_)));
 
         let actual = ChatCompletionMessage::try_from(event_data).unwrap();
-        let expected = ChatCompletionMessage::assistant(forge_domain::Content::part(""))
-            .usage(forge_domain::Usage { cost: Some(0.028894), ..Default::default() });
+        let expected = ChatCompletionMessage::assistant(forge_domain::Content::part("")).usage(
+            forge_domain::Usage {
+                cost: Some(0.028894),
+                ..Default::default()
+            },
+        );
         assert_eq!(actual, expected);
     }
 

@@ -13,18 +13,18 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use prism_client::api::{OrgInfo, PlatformClient, ProjectInfo};
-use prism_client::{auth::DeviceCodeResponse, auth::TokenResponse, DeviceFlowAuth};
-use prism_ingest::llm::{ChatMessage, LlmClient};
+use prism_client::{DeviceFlowAuth, auth::DeviceCodeResponse, auth::TokenResponse};
 use prism_ingest::LlmConfig;
+use prism_ingest::llm::{ChatMessage, LlmClient};
 use prism_python_bridge::tool_server::{ToolServer, ToolServerHandle};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
-    discover_workflows, execute_workflow_with_policy, find_workflow, parse_workflow_command_args,
-    WorkflowRunResult, WorkflowSpec,
+    WorkflowRunResult, WorkflowSpec, discover_workflows, execute_workflow_with_policy,
+    find_workflow, parse_workflow_command_args,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -32,7 +32,7 @@ use tokio::time::timeout;
 use crate::agent_loop;
 use crate::command_tools::{self, CommandToolRuntime};
 use crate::commands::{builtin_help_text, is_cli_backed_slash_root};
-use crate::hooks::{build_default_hooks, HookRegistry};
+use crate::hooks::{HookRegistry, build_default_hooks};
 use crate::permissions::{
     PermissionMode, PermissionOverrides, SharedPermissionOverrides, ToolPermissionContext,
 };
@@ -41,7 +41,7 @@ use crate::scratchpad::Scratchpad;
 use crate::session::{RuntimeSessionState, SessionStore};
 use crate::tool_catalog::ToolCatalog;
 use crate::transcript::{
-    extract_key_files, extract_pending_work, TranscriptEntry, TranscriptStore,
+    TranscriptEntry, TranscriptStore, extract_key_files, extract_pending_work,
 };
 use crate::types::{AgentConfig, AgentEvent};
 
@@ -445,29 +445,47 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
     ];
 
     if let Some(creds) = creds {
-        unsafe { std::env::set_var("MARC27_TOKEN", &creds.access_token); }
-        unsafe { std::env::set_var("MARC27_PLATFORM_URL", &creds.platform_url); }
+        unsafe {
+            std::env::set_var("MARC27_TOKEN", &creds.access_token);
+        }
+        unsafe {
+            std::env::set_var("MARC27_PLATFORM_URL", &creds.platform_url);
+        }
         if let Some(project_id) = &creds.project_id {
-            unsafe { std::env::set_var("MARC27_PROJECT_ID", project_id); }
+            unsafe {
+                std::env::set_var("MARC27_PROJECT_ID", project_id);
+            }
         }
         if let Some(user_id) = &creds.user_id {
-            unsafe { std::env::set_var("PRISM_ACCOUNT_USER_ID", user_id); }
+            unsafe {
+                std::env::set_var("PRISM_ACCOUNT_USER_ID", user_id);
+            }
         }
         if let Some(display_name) = &creds.display_name {
-            unsafe { std::env::set_var("PRISM_ACCOUNT_DISPLAY_NAME", display_name); }
+            unsafe {
+                std::env::set_var("PRISM_ACCOUNT_DISPLAY_NAME", display_name);
+            }
         }
         if let Some(org_id) = &creds.org_id {
-            unsafe { std::env::set_var("PRISM_ACCOUNT_ORG_ID", org_id); }
+            unsafe {
+                std::env::set_var("PRISM_ACCOUNT_ORG_ID", org_id);
+            }
         }
         if let Some(org_name) = &creds.org_name {
-            unsafe { std::env::set_var("PRISM_ACCOUNT_ORG_NAME", org_name); }
+            unsafe {
+                std::env::set_var("PRISM_ACCOUNT_ORG_NAME", org_name);
+            }
         }
         if let Some(project_name) = &creds.project_name {
-            unsafe { std::env::set_var("PRISM_ACCOUNT_PROJECT_NAME", project_name); }
+            unsafe {
+                std::env::set_var("PRISM_ACCOUNT_PROJECT_NAME", project_name);
+            }
         }
     } else {
         for key in KEYS {
-            unsafe { std::env::remove_var(key); }
+            unsafe {
+                std::env::remove_var(key);
+            }
         }
     }
 }
@@ -604,12 +622,12 @@ fn parse_bash_slash_action(command: &str) -> Result<BashSlashAction> {
         "read" if args.len() == 3 => {
             return Ok(BashSlashAction::Read {
                 task_id: args[2].clone(),
-            })
+            });
         }
         "stop" if args.len() == 3 => {
             return Ok(BashSlashAction::Stop {
                 task_id: args[2].clone(),
-            })
+            });
         }
         _ => {}
     }
@@ -1140,7 +1158,9 @@ fn format_cli_output(
                 format!("`{invocation}` failed with exit code {exit_code}.\n\n{stderr}")
             }
             (false, false) => {
-                format!("`{invocation}` failed with exit code {exit_code}.\n\n{stdout}\n\n[stderr]\n{stderr}")
+                format!(
+                    "`{invocation}` failed with exit code {exit_code}.\n\n{stdout}\n\n[stderr]\n{stderr}"
+                )
             }
         }
     }
@@ -1188,7 +1208,7 @@ async fn run_cli_backed_slash_command_raw(
         return Ok(RawCliSlashOutput {
             invocation: format!("prism {}", args.join(" ")),
             stdout: format!(
-            "`/{root}` is not available inside the embedded REPL. Run `prism {root}` from your shell."
+                "`/{root}` is not available inside the embedded REPL. Run `prism {root}` from your shell."
             ),
             stderr: String::new(),
             success: true,
@@ -2182,7 +2202,10 @@ fn format_usage_report(transcript: &TranscriptStore, session_store: &SessionStor
             transcript.cost.events.len(),
             budget_warning,
             transcript.turn_count,
-            session_store.meta().map(|meta| meta.turn_count).unwrap_or(0),
+            session_store
+                .meta()
+                .map(|meta| meta.turn_count)
+                .unwrap_or(0),
             session_store
                 .meta()
                 .map(|meta| meta.compaction_count)
@@ -2755,7 +2778,10 @@ fn emit_current_session_screen(
         llm_config.model,
         session_mode.as_str(),
         plan_state.status.unwrap_or(PlanStatus::None).as_str(),
-        session_store.meta().map(|meta| meta.turn_count).unwrap_or(0),
+        session_store
+            .meta()
+            .map(|meta| meta.turn_count)
+            .unwrap_or(0),
         transcript.entries.len(),
     );
     let transcript_body = format!(
@@ -4972,8 +4998,7 @@ async fn handle_command(
                     "Approve Login",
                     &format!(
                         "Open this URL in your browser and approve the device.\n\n{}\n\nCode\n  {}\n\nIf the browser did not open automatically, copy the URL above.",
-                        start.verification_uri,
-                        start.user_code,
+                        start.verification_uri, start.user_code,
                     ),
                     "accent",
                 );
@@ -5058,8 +5083,7 @@ async fn handle_command(
                 "Approve Login",
                 &format!(
                     "Open this URL in your browser and approve the device.\n\n{}\n\nCode\n  {}\n\nIf the browser did not open automatically, copy the URL above.",
-                    start.verification_uri,
-                    start.user_code,
+                    start.verification_uri, start.user_code,
                 ),
                 "accent",
             );
@@ -6471,13 +6495,14 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
 #[cfg(test)]
 mod tests {
     use super::{
-        build_effective_permission_context, build_tool_card_payload, inline_list,
-        load_plan_snapshot, parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
-        parse_edit_slash_action, parse_python_slash_action, parse_read_slash_path,
-        parse_slash_command, parse_write_slash_action, persist_plan_snapshot, pick_organization,
-        pick_project, plan_snapshot_path, project_api_history, shell_command_join,
-        summarize_api_view, truncate_for_ui, BashSlashAction, DiffSlashAction, EditSlashAction,
-        PythonSlashAction, SessionMode, SlashCommandContext, WriteSlashAction,
+        BashSlashAction, DiffSlashAction, EditSlashAction, PythonSlashAction, SessionMode,
+        SlashCommandContext, WriteSlashAction, build_effective_permission_context,
+        build_tool_card_payload, inline_list, load_plan_snapshot, parse_bash_slash_action,
+        parse_command_tail, parse_diff_slash_action, parse_edit_slash_action,
+        parse_python_slash_action, parse_read_slash_path, parse_slash_command,
+        parse_write_slash_action, persist_plan_snapshot, pick_organization, pick_project,
+        plan_snapshot_path, project_api_history, shell_command_join, summarize_api_view,
+        truncate_for_ui,
     };
     use crate::commands::is_cli_backed_slash_root;
     use crate::permissions::PermissionOverrides;
@@ -6747,10 +6772,12 @@ mod tests {
         assert_eq!(summary.tool_call_count, 1);
         assert_eq!(summary.assistant_messages, 1);
         assert_eq!(summary.tool_messages, 1);
-        assert!(summary
-            .visible_previews
-            .iter()
-            .any(|preview| preview.contains("tool calls: read_file")));
+        assert!(
+            summary
+                .visible_previews
+                .iter()
+                .any(|preview| preview.contains("tool calls: read_file"))
+        );
         assert_eq!(
             summary.compact_boundary_preview.as_deref(),
             Some("Conversation summary Key files: src/main.rs")

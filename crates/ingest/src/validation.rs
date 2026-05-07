@@ -137,10 +137,12 @@ mod tests {
         let df = DataFrame::empty();
         let report = validate(&df);
         assert!(!report.passed);
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| i.severity == Severity::Error && i.message.contains("empty")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("empty"))
+        );
     }
 
     #[test]
@@ -182,15 +184,19 @@ mod tests {
         .unwrap();
         let report = validate(&df);
         assert!(report.passed); // Info doesn't fail
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| i.severity == Severity::Info && i.column.as_deref() == Some("constant")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.severity == Severity::Info && i.column.as_deref() == Some("constant"))
+        );
         // varying column should NOT appear as zero-variance
-        assert!(!report
-            .issues
-            .iter()
-            .any(|i| i.column.as_deref() == Some("varying")));
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.column.as_deref() == Some("varying"))
+        );
     }
 
     #[test]
@@ -199,9 +205,11 @@ mod tests {
         let df = DataFrame::new(vec![s.into()]).unwrap();
         let report = validate(&df);
         // 50% is not >50%, so no warning
-        assert!(!report
-            .issues
-            .iter()
-            .any(|i| i.severity == Severity::Warning));
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.severity == Severity::Warning)
+        );
     }
 }

@@ -30,7 +30,13 @@ impl<H: HttpInfra> Google<H> {
         models: forge_domain::ModelSource<Url>,
         use_api_key_header: bool,
     ) -> Self {
-        Self { http, api_key, chat_url, models, use_api_key_header }
+        Self {
+            http,
+            api_key,
+            chat_url,
+            models,
+            use_api_key_header,
+        }
     }
 
     fn get_headers(&self) -> Vec<(String, String)> {
@@ -247,7 +253,9 @@ mod tests {
 
     impl MockHttpClient {
         fn new() -> Self {
-            Self { client: reqwest::Client::new() }
+            Self {
+                client: reqwest::Client::new(),
+            }
         }
     }
 

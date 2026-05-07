@@ -69,7 +69,12 @@ impl BedrockProvider {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "us-east-1".to_string());
 
-        Ok(Self { provider, region, auth_mode, client: OnceCell::new() })
+        Ok(Self {
+            provider,
+            region,
+            auth_mode,
+            client: OnceCell::new(),
+        })
     }
 
     /// Initializes and returns the AWS Bedrock client

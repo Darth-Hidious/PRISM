@@ -7,8 +7,8 @@
 mod boot;
 mod doctor;
 mod forge_chat;
-mod platform_bridge;
 mod mcp_server_native;
+mod platform_bridge;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -16,18 +16,18 @@ use std::path::{Path, PathBuf};
 // std::process::Stdio removed — old Ink TUI launcher no longer needed
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
+use prism_client::DeviceFlowAuth;
 use prism_client::api::PlatformClient;
 use prism_client::auth::{DeviceCodeResponse, TokenResponse};
-use prism_client::DeviceFlowAuth;
 use prism_proto::NodeCapabilities;
-use prism_python_bridge::{ensure_venv, ToolServer};
+use prism_python_bridge::{ToolServer, ensure_venv};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
-    discover_workflows, execute_workflow, find_workflow, parse_workflow_command_args,
-    WorkflowRunResult, WorkflowSpec,
+    WorkflowRunResult, WorkflowSpec, discover_workflows, execute_workflow, find_workflow,
+    parse_workflow_command_args,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -783,7 +783,9 @@ async fn main() -> Result<()> {
                                 tracing::info!("access token refreshed");
                             }
                             Err(e) => {
-                                eprintln!("warning: token refresh failed ({e}), you may need to run `prism login`");
+                                eprintln!(
+                                    "warning: token refresh failed ({e}), you may need to run `prism login`"
+                                );
                             }
                         }
                     }
@@ -1122,7 +1124,9 @@ async fn main() -> Result<()> {
                     } else {
                         format!("{},{}", existing, data_paths.join(","))
                     };
-                    unsafe { std::env::set_var("PRISM_DATA_PATHS", combined); }
+                    unsafe {
+                        std::env::set_var("PRISM_DATA_PATHS", combined);
+                    }
                 }
                 if !model_paths.is_empty() {
                     let existing = std::env::var("PRISM_MODEL_PATHS").unwrap_or_default();
@@ -1131,7 +1135,9 @@ async fn main() -> Result<()> {
                     } else {
                         format!("{},{}", existing, model_paths.join(","))
                     };
-                    unsafe { std::env::set_var("PRISM_MODEL_PATHS", combined); }
+                    unsafe {
+                        std::env::set_var("PRISM_MODEL_PATHS", combined);
+                    }
                 }
 
                 // --serve: check Ollama has the model
@@ -1154,7 +1160,9 @@ async fn main() -> Result<()> {
                             bail!("Ollama not reachable: {e}. Is Ollama running?");
                         }
                     }
-                    unsafe { std::env::set_var("PRISM_NODE_SERVE_MODEL", model); }
+                    unsafe {
+                        std::env::set_var("PRISM_NODE_SERVE_MODEL", model);
+                    }
                 }
 
                 // ── V2: Start managed services (Docker containers) ──
@@ -1350,7 +1358,9 @@ async fn main() -> Result<()> {
                             }
                         }
                     } else {
-                        eprintln!("  Warning: No credentials — run `prism setup` first to register with platform.");
+                        eprintln!(
+                            "  Warning: No credentials — run `prism setup` first to register with platform."
+                        );
                     }
                 }
 
@@ -2188,8 +2198,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            let boot_checks =
-                run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             boot::boot_sequence(&boot_checks);
             // Splash skipped — see note in default chat path.
             let _ = &python;
@@ -2212,7 +2221,9 @@ async fn main() -> Result<()> {
                         .json()
                         .await?;
                     println!("\nMARC27 Credits");
-                    println!("\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}");
+                    println!(
+                        "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}"
+                    );
                     println!(
                         "  Balance:  {:.1} credits (${:.2})",
                         resp["credits"].as_f64().unwrap_or(0.0),
@@ -2222,7 +2233,9 @@ async fn main() -> Result<()> {
                         "  Org:      {}",
                         resp["org_name"].as_str().unwrap_or("unknown")
                     );
-                    println!("\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\n");
+                    println!(
+                        "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\n"
+                    );
                 }
                 Some(BillingCommands::Usage) => {
                     let resp: serde_json::Value = auth
@@ -4853,10 +4866,14 @@ async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredent
         }
         // Write config to prism.toml and env for the current process
         if let Some(ref mp_key) = config.mp_api_key {
-            unsafe { std::env::set_var("MP_API_KEY", mp_key); }
+            unsafe {
+                std::env::set_var("MP_API_KEY", mp_key);
+            }
         }
         if let Some(ref fc_key) = config.firecrawl_api_key {
-            unsafe { std::env::set_var("FIRECRAWL_API_KEY", fc_key); }
+            unsafe {
+                std::env::set_var("FIRECRAWL_API_KEY", fc_key);
+            }
             tracing::info!("server config: Firecrawl API key received");
         }
         // Write default model to prism.toml if user hasn't set one
@@ -5296,9 +5313,9 @@ async fn handle_run(
     slurm_partition: &str,
     json: bool,
 ) -> Result<()> {
+    use prism_compute::ExperimentPlan;
     use prism_compute::backend::ComputeRouter;
     use prism_compute::byoc::ByocTarget;
-    use prism_compute::ExperimentPlan;
 
     // Parse key=value inputs into JSON
     let mut input_map = serde_json::Map::new();
@@ -5884,13 +5901,21 @@ mod tests {
 
     #[test]
     fn env_project_override_ignores_empty_values() {
-        unsafe { std::env::remove_var("MARC27_PROJECT_ID"); }
+        unsafe {
+            std::env::remove_var("MARC27_PROJECT_ID");
+        }
         assert_eq!(env_project_override(), None);
-        unsafe { std::env::set_var("MARC27_PROJECT_ID", "   "); }
+        unsafe {
+            std::env::set_var("MARC27_PROJECT_ID", "   ");
+        }
         assert_eq!(env_project_override(), None);
-        unsafe { std::env::set_var("MARC27_PROJECT_ID", "project-123"); }
+        unsafe {
+            std::env::set_var("MARC27_PROJECT_ID", "project-123");
+        }
         assert_eq!(env_project_override(), Some("project-123".to_string()));
-        unsafe { std::env::remove_var("MARC27_PROJECT_ID"); }
+        unsafe {
+            std::env::remove_var("MARC27_PROJECT_ID");
+        }
     }
 
     #[test]
@@ -5902,13 +5927,21 @@ mod tests {
 
     #[test]
     fn default_ssh_user_ignores_empty_values() {
-        unsafe { std::env::remove_var("USER"); }
+        unsafe {
+            std::env::remove_var("USER");
+        }
         assert_eq!(default_ssh_user(), None);
-        unsafe { std::env::set_var("USER", "   "); }
+        unsafe {
+            std::env::set_var("USER", "   ");
+        }
         assert_eq!(default_ssh_user(), None);
-        unsafe { std::env::set_var("USER", "sid"); }
+        unsafe {
+            std::env::set_var("USER", "sid");
+        }
         assert_eq!(default_ssh_user(), Some("sid".to_string()));
-        unsafe { std::env::remove_var("USER"); }
+        unsafe {
+            std::env::remove_var("USER");
+        }
     }
 
     #[test]

@@ -25,6 +25,9 @@ impl Image {
     pub fn new_base64(base64_encoded: String, mime_type: impl ToString) -> Self {
         let mime_type = mime_type.to_string();
         let content = format!("data:{mime_type};base64,{base64_encoded}");
-        Self { url: content, mime_type }
+        Self {
+            url: content,
+            mime_type,
+        }
     }
 }

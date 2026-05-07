@@ -503,7 +503,9 @@ mod tests {
             output_tokens: 50,
             total_tokens: 150,
             input_tokens_details: oai::InputTokenDetails { cached_tokens: 20 },
-            output_tokens_details: oai::OutputTokenDetails { reasoning_tokens: 0 },
+            output_tokens_details: oai::OutputTokenDetails {
+                reasoning_tokens: 0,
+            },
         }
     }
 
@@ -1305,7 +1307,10 @@ mod tests {
     #[tokio::test]
     async fn test_stream_with_response_completed() -> anyhow::Result<()> {
         let response = fixture_response_with_text("Final message");
-        let completed = oai::ResponseCompletedEvent { sequence_number: 2, response };
+        let completed = oai::ResponseCompletedEvent {
+            sequence_number: 2,
+            response,
+        };
 
         let stream: ResponseStream = Box::pin(tokio_stream::iter([event(
             oai::ResponseStreamEvent::ResponseCompleted(completed),
@@ -1324,7 +1329,10 @@ mod tests {
     #[tokio::test]
     async fn test_stream_with_response_incomplete() -> anyhow::Result<()> {
         let response = fixture_response_incomplete("Partial message");
-        let incomplete = oai::ResponseIncompleteEvent { sequence_number: 2, response };
+        let incomplete = oai::ResponseIncompleteEvent {
+            sequence_number: 2,
+            response,
+        };
 
         let stream: ResponseStream = Box::pin(tokio_stream::iter([event(
             oai::ResponseStreamEvent::ResponseIncomplete(incomplete),
@@ -1343,7 +1351,10 @@ mod tests {
     #[tokio::test]
     async fn test_stream_with_response_failed() -> anyhow::Result<()> {
         let response = fixture_response_failed();
-        let failed = oai::ResponseFailedEvent { sequence_number: 2, response };
+        let failed = oai::ResponseFailedEvent {
+            sequence_number: 2,
+            response,
+        };
 
         let stream: ResponseStream = Box::pin(tokio_stream::iter([event(
             oai::ResponseStreamEvent::ResponseFailed(failed),
@@ -1369,7 +1380,10 @@ mod tests {
             "server_is_overloaded",
             "Our servers are currently overloaded. Please try again later.",
         );
-        let failed = oai::ResponseFailedEvent { sequence_number: 2, response };
+        let failed = oai::ResponseFailedEvent {
+            sequence_number: 2,
+            response,
+        };
 
         let stream: ResponseStream = Box::pin(tokio_stream::iter([event(
             oai::ResponseStreamEvent::ResponseFailed(failed),
@@ -1414,7 +1428,10 @@ mod tests {
     async fn test_into_chat_completion_message_codex_maps_text_and_finish() -> anyhow::Result<()> {
         let delta = fixture_delta_text("hello");
         let response = fixture_response_base("completed");
-        let completed = oai::ResponseCompletedEvent { sequence_number: 2, response };
+        let completed = oai::ResponseCompletedEvent {
+            sequence_number: 2,
+            response,
+        };
 
         let stream: ResponseStream = Box::pin(tokio_stream::iter([
             event(oai::ResponseStreamEvent::ResponseOutputTextDelta(delta)),
@@ -1498,7 +1515,10 @@ mod tests {
         // Completion event contains the full text that was already streamed
         let response =
             fixture_response_with_text("<commit_message>fix: avoid duplication</commit_message>");
-        let completed = oai::ResponseCompletedEvent { sequence_number: 4, response };
+        let completed = oai::ResponseCompletedEvent {
+            sequence_number: 4,
+            response,
+        };
 
         let stream: ResponseStream = Box::pin(tokio_stream::iter([
             event(oai::ResponseStreamEvent::ResponseOutputTextDelta(delta1)),
@@ -1550,7 +1570,10 @@ mod tests {
             "Analyzing the request... and formulating response.",
             "Summary of analysis",
         );
-        let completed = oai::ResponseCompletedEvent { sequence_number: 4, response };
+        let completed = oai::ResponseCompletedEvent {
+            sequence_number: 4,
+            response,
+        };
 
         let stream: ResponseStream = Box::pin(tokio_stream::iter([
             event(oai::ResponseStreamEvent::ResponseReasoningTextDelta(
@@ -1617,7 +1640,10 @@ mod tests {
         // Completion event contains the full tool call that was already streamed
         let response =
             fixture_response_with_function_call("call_123", "shell", r#"{"cmd":"echo hello"}"#);
-        let completed = oai::ResponseCompletedEvent { sequence_number: 4, response };
+        let completed = oai::ResponseCompletedEvent {
+            sequence_number: 4,
+            response,
+        };
 
         let stream: ResponseStream = Box::pin(tokio_stream::iter([
             event(oai::ResponseStreamEvent::ResponseOutputItemAdded(added)),
@@ -1756,7 +1782,10 @@ mod tests {
                 "output_tokens_details": { "reasoning_tokens": 317 }
             }
         }))?;
-        let completed = oai::ResponseCompletedEvent { sequence_number: 7, response };
+        let completed = oai::ResponseCompletedEvent {
+            sequence_number: 7,
+            response,
+        };
 
         let stream: ResponseStream = Box::pin(tokio_stream::iter([
             event(oai::ResponseStreamEvent::ResponseOutputItemAdded(added)),

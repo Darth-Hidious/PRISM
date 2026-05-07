@@ -14,7 +14,9 @@ pub struct SnapshotService {
 impl SnapshotService {
     /// Create a new FileSystemSnapshotService with a specific home path
     pub fn new(snapshot_base_dir: PathBuf) -> Self {
-        Self { snapshots_directory: snapshot_base_dir }
+        Self {
+            snapshots_directory: snapshot_base_dir,
+        }
     }
 }
 

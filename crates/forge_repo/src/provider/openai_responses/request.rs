@@ -98,9 +98,9 @@ impl FromDomain<ToolChoice> for oai::ToolChoiceParam {
             ToolChoice::None => oai::ToolChoiceParam::Mode(oai::ToolChoiceOptions::None),
             ToolChoice::Auto => oai::ToolChoiceParam::Mode(oai::ToolChoiceOptions::Auto),
             ToolChoice::Required => oai::ToolChoiceParam::Mode(oai::ToolChoiceOptions::Required),
-            ToolChoice::Call(name) => {
-                oai::ToolChoiceParam::Function(oai::ToolChoiceFunction { name: name.to_string() })
-            }
+            ToolChoice::Call(name) => oai::ToolChoiceParam::Function(oai::ToolChoiceFunction {
+                name: name.to_string(),
+            }),
         })
     }
 }

@@ -323,7 +323,9 @@ mod tests {
 
     impl MockFileWriter {
         fn new() -> Self {
-            Self { writes: Arc::new(Mutex::new(Vec::new())) }
+            Self {
+                writes: Arc::new(Mutex::new(Vec::new())),
+            }
         }
 
         async fn get_writes(&self) -> Vec<(PathBuf, Bytes)> {
@@ -360,7 +362,10 @@ mod tests {
     }
 
     fn create_test_config(debug_requests: Option<PathBuf>) -> ForgeConfig {
-        ForgeConfig { debug_requests, ..Default::default() }
+        ForgeConfig {
+            debug_requests,
+            ..Default::default()
+        }
     }
 
     #[tokio::test]

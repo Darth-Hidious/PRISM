@@ -20,7 +20,10 @@ impl ForgeGrpcClient {
     /// # Arguments
     /// * `server_url` - The URL of the gRPC server
     pub fn new(server_url: String) -> Self {
-        Self { server_url, channel: Arc::new(Mutex::new(None)) }
+        Self {
+            server_url,
+            channel: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Returns a clone of the underlying gRPC channel

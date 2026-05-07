@@ -78,7 +78,10 @@ fn process_stream(
     let total_lines = content.lines().count();
     let output = tag_output(lines, truncation_info, total_lines, truncated_lines_count);
 
-    ProcessedStream { output, total_lines }
+    ProcessedStream {
+        output,
+        total_lines,
+    }
 }
 
 /// Helper function to format potentially truncated output for stdout or stderr

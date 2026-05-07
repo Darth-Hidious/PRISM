@@ -16,7 +16,10 @@ pub struct ForgeCustomInstructionsService<F> {
 
 impl<F: EnvironmentInfra + FileReaderInfra + CommandInfra> ForgeCustomInstructionsService<F> {
     pub fn new(infra: Arc<F>) -> Self {
-        Self { infra, cache: Default::default() }
+        Self {
+            infra,
+            cache: Default::default(),
+        }
     }
 
     async fn discover_agents_files(&self) -> Vec<PathBuf> {

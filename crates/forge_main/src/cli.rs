@@ -1299,7 +1299,9 @@ mod tests {
             "550e8400-e29b-41d4-a716-446655440006",
         ]);
         let actual = match fixture.subcommands {
-            Some(TopLevelCommand::Info { conversation_id, .. }) => conversation_id,
+            Some(TopLevelCommand::Info {
+                conversation_id, ..
+            }) => conversation_id,
             _ => None,
         };
         let expected = Some(ConversationId::parse("550e8400-e29b-41d4-a716-446655440006").unwrap());
@@ -1315,7 +1317,9 @@ mod tests {
             "550e8400-e29b-41d4-a716-446655440007",
         ]);
         let actual = match fixture.subcommands {
-            Some(TopLevelCommand::Info { conversation_id, .. }) => conversation_id,
+            Some(TopLevelCommand::Info {
+                conversation_id, ..
+            }) => conversation_id,
             _ => None,
         };
         let expected = Some(ConversationId::parse("550e8400-e29b-41d4-a716-446655440007").unwrap());
@@ -1332,9 +1336,10 @@ mod tests {
             "--porcelain",
         ]);
         let (conversation_id, porcelain) = match fixture.subcommands {
-            Some(TopLevelCommand::Info { conversation_id, porcelain }) => {
-                (conversation_id, porcelain)
-            }
+            Some(TopLevelCommand::Info {
+                conversation_id,
+                porcelain,
+            }) => (conversation_id, porcelain),
             _ => (None, false),
         };
         assert_eq!(

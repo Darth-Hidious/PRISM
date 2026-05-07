@@ -224,7 +224,9 @@ impl ExtraContent {
 impl From<String> for ExtraContent {
     fn from(thought_signature: String) -> Self {
         Self {
-            google: Some(GoogleMetadata { thought_signature: Some(thought_signature) }),
+            google: Some(GoogleMetadata {
+                thought_signature: Some(thought_signature),
+            }),
         }
     }
 }
@@ -323,7 +325,12 @@ impl TryFrom<Response> for ChatCompletionMessage {
 
     fn try_from(res: Response) -> Result<Self, Self::Error> {
         match res {
-            Response::Success { choices, usage, prompt_filter_results, .. } => {
+            Response::Success {
+                choices,
+                usage,
+                prompt_filter_results,
+                ..
+            } => {
                 if let Some(choice) = choices.first() {
                     // Check if the choice has an error first
                     let error = match choice {
@@ -337,14 +344,21 @@ impl TryFrom<Response> for ChatCompletionMessage {
                     }
 
                     let mut response = match choice {
-                        Choice::NonChat { text, finish_reason, .. } => {
-                            ChatCompletionMessage::assistant(Content::full(text)).finish_reason_opt(
+                        Choice::NonChat {
+                            text,
+                            finish_reason,
+                            ..
+                        } => ChatCompletionMessage::assistant(Content::full(text))
+                            .finish_reason_opt(
                                 finish_reason
                                     .clone()
                                     .and_then(|s| FinishReason::from_str(&s).ok()),
-                            )
-                        }
-                        Choice::NonStreaming { message, finish_reason, .. } => {
+                            ),
+                        Choice::NonStreaming {
+                            message,
+                            finish_reason,
+                            ..
+                        } => {
                             let mut resp = ChatCompletionMessage::assistant(Content::full(
                                 message.content.clone().unwrap_or_default(),
                             ))
@@ -411,7 +425,11 @@ impl TryFrom<Response> for ChatCompletionMessage {
                             }
                             resp
                         }
-                        Choice::Streaming { delta, finish_reason, .. } => {
+                        Choice::Streaming {
+                            delta,
+                            finish_reason,
+                            ..
+                        } => {
                             let mut resp = ChatCompletionMessage::assistant(Content::part(
                                 delta.content.clone().unwrap_or_default(),
                             ))
@@ -1056,10 +1074,22 @@ mod tests {
             prompt_filter_results: Some(vec![PromptFilterResult {
                 prompt_index: 0,
                 content_filter_results: ContentFilterResults {
-                    hate: Some(FilterResult { filtered: true, severity: "high".to_string() }),
-                    self_harm: Some(FilterResult { filtered: false, severity: "safe".to_string() }),
-                    sexual: Some(FilterResult { filtered: false, severity: "safe".to_string() }),
-                    violence: Some(FilterResult { filtered: false, severity: "safe".to_string() }),
+                    hate: Some(FilterResult {
+                        filtered: true,
+                        severity: "high".to_string(),
+                    }),
+                    self_harm: Some(FilterResult {
+                        filtered: false,
+                        severity: "safe".to_string(),
+                    }),
+                    sexual: Some(FilterResult {
+                        filtered: false,
+                        severity: "safe".to_string(),
+                    }),
+                    violence: Some(FilterResult {
+                        filtered: false,
+                        severity: "safe".to_string(),
+                    }),
                 },
             }]),
         };

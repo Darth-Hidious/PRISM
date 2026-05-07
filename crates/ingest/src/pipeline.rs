@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing;
@@ -177,8 +177,7 @@ impl IngestPipeline {
         };
 
         // Step 4: Neo4j graph upsert (if configured and entities exist)
-        let graph = if let (Some(neo4j_config), Some(entity_set)) =
-            (&self.config.neo4j, &entities)
+        let graph = if let (Some(neo4j_config), Some(entity_set)) = (&self.config.neo4j, &entities)
         {
             let store = Neo4jGraphStore::new(neo4j_config.clone());
             match store.upsert(entity_set).await {
@@ -200,34 +199,33 @@ impl IngestPipeline {
         };
 
         // Step 5: Qdrant embedding generation + upsert (if configured and entities exist)
-        let embeddings =
-            if let (Some(llm_config), Some(qdrant_config), Some(entity_set)) =
-                (&self.config.llm, &self.config.qdrant, &entities)
-            {
-                let constructor = LlmOntologyConstructor::new(llm_config.clone());
-                match constructor.generate_embeddings(entity_set).await {
-                    Ok(batch) if !batch.vectors.is_empty() => {
-                        let vector_store = QdrantVectorStore::new(qdrant_config.clone());
-                        match vector_store.upsert(&batch).await {
-                            Ok(count) => {
-                                tracing::info!(count, "vectors stored in Qdrant");
-                                Some(batch)
-                            }
-                            Err(e) => {
-                                tracing::error!("Qdrant upsert failed: {e}");
-                                Some(batch) // still return embeddings even if store failed
-                            }
+        let embeddings = if let (Some(llm_config), Some(qdrant_config), Some(entity_set)) =
+            (&self.config.llm, &self.config.qdrant, &entities)
+        {
+            let constructor = LlmOntologyConstructor::new(llm_config.clone());
+            match constructor.generate_embeddings(entity_set).await {
+                Ok(batch) if !batch.vectors.is_empty() => {
+                    let vector_store = QdrantVectorStore::new(qdrant_config.clone());
+                    match vector_store.upsert(&batch).await {
+                        Ok(count) => {
+                            tracing::info!(count, "vectors stored in Qdrant");
+                            Some(batch)
+                        }
+                        Err(e) => {
+                            tracing::error!("Qdrant upsert failed: {e}");
+                            Some(batch) // still return embeddings even if store failed
                         }
                     }
-                    Ok(batch) => Some(batch),
-                    Err(e) => {
-                        tracing::error!("embedding generation failed: {e}");
-                        None
-                    }
                 }
-            } else {
-                None
-            };
+                Ok(batch) => Some(batch),
+                Err(e) => {
+                    tracing::error!("embedding generation failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(IngestResult {
             source,

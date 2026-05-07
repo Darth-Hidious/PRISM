@@ -18,7 +18,10 @@ pub struct ForgeSkillFetch<R> {
 impl<R> ForgeSkillFetch<R> {
     /// Creates a new skill fetch tool
     pub fn new(repository: Arc<R>) -> Self {
-        Self { repository, cache: OnceCell::new() }
+        Self {
+            repository,
+            cache: OnceCell::new(),
+        }
     }
 }
 
@@ -83,7 +86,9 @@ mod tests {
             Skill::new("xlsx", "Handle Excel files", "Excel handling skill")
                 .path("/skills/xlsx.md"),
         ];
-        let repo = MockSkillRepository { skills: skills.clone() };
+        let repo = MockSkillRepository {
+            skills: skills.clone(),
+        };
         let fetch_service = ForgeSkillFetch::new(Arc::new(repo));
 
         // Act
@@ -122,7 +127,9 @@ mod tests {
             Skill::new("xlsx", "Handle Excel files", "Excel handling skill")
                 .path("/skills/xlsx.md"),
         ];
-        let repo = MockSkillRepository { skills: expected.clone() };
+        let repo = MockSkillRepository {
+            skills: expected.clone(),
+        };
         let fetch_service = ForgeSkillFetch::new(Arc::new(repo));
 
         // Act

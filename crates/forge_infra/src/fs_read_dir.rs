@@ -19,7 +19,9 @@ impl ForgeDirectoryReaderService {
     ///
     /// * `parallel_file_reads` - Maximum number of files to read concurrently
     pub fn new(parallel_file_reads: usize) -> Self {
-        Self { parallel_file_reads }
+        Self {
+            parallel_file_reads,
+        }
     }
 
     /// Lists all entries in a directory without reading file contents

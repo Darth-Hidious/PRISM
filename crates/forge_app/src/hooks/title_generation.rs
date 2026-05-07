@@ -27,7 +27,10 @@ pub struct TitleGenerationHandler<S> {
 impl<S> TitleGenerationHandler<S> {
     /// Creates a new title generation handler.
     pub fn new(services: Arc<S>) -> Self {
-        Self { services, title_tasks: Arc::new(DashMap::new()) }
+        Self {
+            services,
+            title_tasks: Arc::new(DashMap::new()),
+        }
     }
 }
 

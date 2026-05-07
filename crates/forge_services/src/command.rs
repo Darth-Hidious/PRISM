@@ -20,7 +20,10 @@ pub struct CommandLoaderService<F> {
 
 impl<F> CommandLoaderService<F> {
     pub fn new(infra: Arc<F>) -> Self {
-        Self { infra, cache: Default::default() }
+        Self {
+            infra,
+            cache: Default::default(),
+        }
     }
 
     /// Load built-in commands that are embedded in the application binary.
@@ -209,7 +212,10 @@ mod tests {
     #[test]
     fn test_init_default_contains_builtin_commands() {
         // Fixture
-        let service = CommandLoaderService::<()> { infra: Arc::new(()), cache: Default::default() };
+        let service = CommandLoaderService::<()> {
+            infra: Arc::new(()),
+            cache: Default::default(),
+        };
 
         // Execute
         let actual = service.init_default().unwrap();

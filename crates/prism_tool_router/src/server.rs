@@ -32,9 +32,7 @@ impl EmbedderServer {
         if !config.embedder_gguf.exists() {
             return Err(Error::ModelMissing(config.embedder_gguf.clone()).into());
         }
-        if !config.llama_server_bin.exists()
-            && !is_on_path(&config.llama_server_bin)
-        {
+        if !config.llama_server_bin.exists() && !is_on_path(&config.llama_server_bin) {
             return Err(Error::LlamaServerMissing(config.llama_server_bin.clone()).into());
         }
 
@@ -47,23 +45,30 @@ impl EmbedderServer {
         );
 
         let child = Command::new(&config.llama_server_bin)
-            .arg("--model").arg(&config.embedder_gguf)
-            .arg("--port").arg(port.to_string())
-            .arg("--host").arg("127.0.0.1")
+            .arg("--model")
+            .arg(&config.embedder_gguf)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--host")
+            .arg("127.0.0.1")
             .arg("--embeddings")
-            .arg("--ctx-size").arg(config.embed_ctx.to_string())
+            .arg("--ctx-size")
+            .arg(config.embed_ctx.to_string())
             // Bump the physical batch size to match ctx-size so we can embed
             // long tool descriptions without "input N tokens too large to
             // process" errors. Some forge built-ins (e.g. tools with full
             // JSON schemas) clear 1000 tokens.
-            .arg("--batch-size").arg(config.embed_ctx.to_string())
-            .arg("--ubatch-size").arg(config.embed_ctx.to_string())
+            .arg("--batch-size")
+            .arg(config.embed_ctx.to_string())
+            .arg("--ubatch-size")
+            .arg(config.embed_ctx.to_string())
             // Quieter logs — llama.cpp is chatty by default.
             .arg("--log-disable")
             .arg("--no-webui")
             // Pooling matters for sentence-style embeddings; mean is a
             // reasonable default for EmbeddingGemma's encoder output.
-            .arg("--pooling").arg("mean")
+            .arg("--pooling")
+            .arg("mean")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -172,5 +177,7 @@ fn pick_free_port(floor: u16) -> Result<u16> {
 
 fn is_on_path(bin: &std::path::Path) -> bool {
     // Treat a relative name (no dir component) as "look on PATH".
-    bin.parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true)
+    bin.parent()
+        .map(|p| p.as_os_str().is_empty())
+        .unwrap_or(true)
 }

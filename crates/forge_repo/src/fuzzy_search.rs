@@ -51,7 +51,10 @@ impl<I: GrpcInfra> FuzzySearchRepository for ForgeFuzzySearchRepository<I> {
         let matches = response
             .matches
             .into_iter()
-            .map(|m| SearchMatch { start_line: m.start_line, end_line: m.end_line })
+            .map(|m| SearchMatch {
+                start_line: m.start_line,
+                end_line: m.end_line,
+            })
             .collect();
 
         Ok(matches)

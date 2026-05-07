@@ -686,7 +686,11 @@ mod tests {
         while let Ok(msg) = rx.try_recv() {
             match msg.unwrap() {
                 ChatResponse::TaskMessage {
-                    content: ChatResponseContent::Markdown { text, partial: true },
+                    content:
+                        ChatResponseContent::Markdown {
+                            text,
+                            partial: true,
+                        },
                     ..
                 } => content_deltas.push(text),
                 ChatResponse::TaskReasoning { content } => reasoning_deltas.push(content),

@@ -36,7 +36,10 @@ impl CacacheStorage {
     /// * `ttl_seconds` - Optional TTL in seconds. If provided, entries older
     ///   than this will be considered expired.
     pub fn new(cache_dir: PathBuf, ttl_seconds: Option<u128>) -> Self {
-        Self { cache_dir, ttl_seconds }
+        Self {
+            cache_dir,
+            ttl_seconds,
+        }
     }
 
     /// Converts a key to a deterministic cache key string using its hash value.
@@ -120,7 +123,10 @@ impl forge_app::KVStore for CacacheStorage {
     {
         let key_str = self.key_to_string(key)?;
 
-        let entry = CachedEntry { value, timestamp: Self::get_current_timestamp() };
+        let entry = CachedEntry {
+            value,
+            timestamp: Self::get_current_timestamp(),
+        };
 
         let data = serde_json::to_vec(&entry).context("Failed to serialize entry for caching")?;
 
@@ -167,7 +173,9 @@ mod tests {
         let cache_dir = test_cache_dir();
         let cache = CacacheStorage::new(cache_dir, None);
 
-        let key = TestKey { id: "test".to_string() };
+        let key = TestKey {
+            id: "test".to_string(),
+        };
         let result: Option<TestValue> = cache.cache_get(&key).await.unwrap();
 
         assert_eq!(result, None);
@@ -178,8 +186,13 @@ mod tests {
         let cache_dir = test_cache_dir();
         let cache = CacacheStorage::new(cache_dir, None);
 
-        let key = TestKey { id: "test".to_string() };
-        let value = TestValue { data: "hello".to_string(), count: 42 };
+        let key = TestKey {
+            id: "test".to_string(),
+        };
+        let value = TestValue {
+            data: "hello".to_string(),
+            count: 42,
+        };
 
         cache.cache_set(&key, &value).await.unwrap();
         let result: Option<TestValue> = cache.cache_get(&key).await.unwrap();
@@ -192,9 +205,16 @@ mod tests {
         let cache_dir = test_cache_dir();
         let cache = CacacheStorage::new(cache_dir, None);
 
-        let key1 = TestKey { id: "test1".to_string() };
-        let key2 = TestKey { id: "test2".to_string() };
-        let value = TestValue { data: "hello".to_string(), count: 42 };
+        let key1 = TestKey {
+            id: "test1".to_string(),
+        };
+        let key2 = TestKey {
+            id: "test2".to_string(),
+        };
+        let value = TestValue {
+            data: "hello".to_string(),
+            count: 42,
+        };
 
         cache.cache_set(&key1, &value).await.unwrap();
         cache.cache_set(&key2, &value).await.unwrap();
@@ -213,8 +233,13 @@ mod tests {
         let cache_dir = test_cache_dir();
         let cache = CacacheStorage::new(cache_dir, Some(60)); // 60 seconds TTL
 
-        let key = TestKey { id: "test".to_string() };
-        let value = TestValue { data: "hello".to_string(), count: 42 };
+        let key = TestKey {
+            id: "test".to_string(),
+        };
+        let value = TestValue {
+            data: "hello".to_string(),
+            count: 42,
+        };
 
         cache.cache_set(&key, &value).await.unwrap();
 
@@ -229,8 +254,13 @@ mod tests {
         let cache_dir = test_cache_dir();
         let cache = CacacheStorage::new(cache_dir, Some(1)); // 1 second TTL
 
-        let key = TestKey { id: "test".to_string() };
-        let value = TestValue { data: "hello".to_string(), count: 42 };
+        let key = TestKey {
+            id: "test".to_string(),
+        };
+        let value = TestValue {
+            data: "hello".to_string(),
+            count: 42,
+        };
 
         cache.cache_set(&key, &value).await.unwrap();
 
@@ -247,8 +277,13 @@ mod tests {
         let cache_dir = test_cache_dir();
         let cache = CacacheStorage::new(cache_dir, None); // No TTL
 
-        let key = TestKey { id: "test".to_string() };
-        let value = TestValue { data: "hello".to_string(), count: 42 };
+        let key = TestKey {
+            id: "test".to_string(),
+        };
+        let value = TestValue {
+            data: "hello".to_string(),
+            count: 42,
+        };
 
         cache.cache_set(&key, &value).await.unwrap();
 

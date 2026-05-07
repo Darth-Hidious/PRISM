@@ -108,7 +108,10 @@ impl<F: 'static + WorkspaceIndexRepository + FileReaderInfra, D: FileDiscovery +
         let local_hashes: Vec<FileHash> = results.into_iter().flatten().collect();
 
         let total_file_count = local_hashes.len() + failed_statuses.len();
-        emit(SyncProgress::FilesDiscovered { count: total_file_count }).await;
+        emit(SyncProgress::FilesDiscovered {
+            count: total_file_count,
+        })
+        .await;
 
         let remote_files = self.fetch_remote_hashes().await?;
 
@@ -145,7 +148,12 @@ impl<F: 'static + WorkspaceIndexRepository + FileReaderInfra, D: FileDiscovery +
 
         // Only emit diff computed event if there are actual changes
         if total_file_changes > 0 {
-            emit(SyncProgress::DiffComputed { added, deleted, modified }).await;
+            emit(SyncProgress::DiffComputed {
+                added,
+                deleted,
+                modified,
+            })
+            .await;
         }
 
         // Derive the exact paths to delete/upload — no file content required

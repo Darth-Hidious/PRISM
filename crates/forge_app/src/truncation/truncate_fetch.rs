@@ -15,5 +15,7 @@ pub fn truncate_fetch_content(content: &str, truncation_limit: usize) -> Truncat
         content.to_string()
     };
 
-    TruncatedFetchOutput { content: truncated_content }
+    TruncatedFetchOutput {
+        content: truncated_content,
+    }
 }

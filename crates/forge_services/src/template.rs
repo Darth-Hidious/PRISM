@@ -16,7 +16,10 @@ pub struct ForgeTemplateService<F> {
 
 impl<F: EnvironmentInfra + FileReaderInfra> ForgeTemplateService<F> {
     pub fn new(infra: Arc<F>) -> Self {
-        Self { hb: Arc::new(OnceCell::new()), infra }
+        Self {
+            hb: Arc::new(OnceCell::new()),
+            infra,
+        }
     }
 
     /// Returns a reference to the lazily-initialized Handlebars RwLock,

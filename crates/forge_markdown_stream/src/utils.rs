@@ -81,7 +81,11 @@ pub(crate) fn wrap_text_preserving_spaces(
     let mut current_line = String::new();
     let mut current_style: Vec<String> = Vec::new();
     let mut current_width = first_width;
-    let layout = WrapLayout { next_width, first_prefix, next_prefix };
+    let layout = WrapLayout {
+        next_width,
+        first_prefix,
+        next_prefix,
+    };
 
     for segment in segments {
         let line_width = visible_length(&current_line);
@@ -251,7 +255,10 @@ fn wrap_segments(text: &str) -> Vec<WrapSegment> {
 
     match (current_is_whitespace, current.is_empty()) {
         (Some(true), false) => separator.push_str(&current),
-        (Some(false), false) => segments.push(WrapSegment { separator, word: current }),
+        (Some(false), false) => segments.push(WrapSegment {
+            separator,
+            word: current,
+        }),
         _ => {}
     }
 

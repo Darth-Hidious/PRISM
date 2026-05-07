@@ -261,7 +261,10 @@ mod tests {
     }
 
     fn todo_item(content: &str, status: TodoStatus) -> TodoItem {
-        TodoItem { content: content.to_string(), status }
+        TodoItem {
+            content: content.to_string(),
+            status,
+        }
     }
 
     #[test]

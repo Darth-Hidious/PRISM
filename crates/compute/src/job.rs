@@ -307,10 +307,12 @@ mod tests {
         assert!(!TrackedStatus::Queued.is_terminal());
         assert!(!TrackedStatus::Running { progress: 0.5 }.is_terminal());
         assert!(TrackedStatus::Completed { duration_secs: 0 }.is_terminal());
-        assert!(TrackedStatus::Failed {
-            error: "boom".into()
-        }
-        .is_terminal());
+        assert!(
+            TrackedStatus::Failed {
+                error: "boom".into()
+            }
+            .is_terminal()
+        );
         assert!(TrackedStatus::Cancelled.is_terminal());
     }
 

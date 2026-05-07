@@ -27,7 +27,12 @@ pub struct FileInfo {
 impl FileInfo {
     /// Creates a new FileInfo with the specified parameters.
     pub fn new(start_line: u64, end_line: u64, total_lines: u64, content_hash: String) -> Self {
-        Self { start_line, end_line, total_lines, content_hash }
+        Self {
+            start_line,
+            end_line,
+            total_lines,
+            content_hash,
+        }
     }
 
     /// Returns true if this represents a partial file read
@@ -49,7 +54,10 @@ pub struct FileHash {
 
 impl From<super::node::FileNode> for FileHash {
     fn from(node: super::node::FileNode) -> Self {
-        Self { path: node.file_path, hash: node.hash }
+        Self {
+            path: node.file_path,
+            hash: node.hash,
+        }
     }
 }
 

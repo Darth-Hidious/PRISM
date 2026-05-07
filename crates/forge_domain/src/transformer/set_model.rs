@@ -46,7 +46,11 @@ mod tests {
 
     impl TransformationSnapshot {
         fn new(transformation: &str, before: Context, after: Context) -> Self {
-            Self { transformation: transformation.to_string(), before, after }
+            Self {
+                transformation: transformation.to_string(),
+                before,
+                after,
+            }
         }
     }
 

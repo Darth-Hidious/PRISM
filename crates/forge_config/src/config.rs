@@ -340,7 +340,10 @@ mod tests {
 
     #[test]
     fn test_f32_temperature_round_trip() {
-        let fixture = ForgeConfig { temperature: Some(Decimal(0.1)), ..Default::default() };
+        let fixture = ForgeConfig {
+            temperature: Some(Decimal(0.1)),
+            ..Default::default()
+        };
 
         let toml = toml_edit::ser::to_string_pretty(&fixture).unwrap();
 
@@ -352,7 +355,10 @@ mod tests {
 
     #[test]
     fn test_f32_top_p_round_trip() {
-        let fixture = ForgeConfig { top_p: Some(Decimal(0.9)), ..Default::default() };
+        let fixture = ForgeConfig {
+            top_p: Some(Decimal(0.9)),
+            ..Default::default()
+        };
 
         let toml = toml_edit::ser::to_string_pretty(&fixture).unwrap();
 
@@ -364,7 +370,10 @@ mod tests {
 
     #[test]
     fn test_f32_temperature_deserialize_round_trip() {
-        let fixture = ForgeConfig { temperature: Some(Decimal(0.1)), ..Default::default() };
+        let fixture = ForgeConfig {
+            temperature: Some(Decimal(0.1)),
+            ..Default::default()
+        };
 
         let toml = toml_edit::ser::to_string_pretty(&fixture).unwrap();
 

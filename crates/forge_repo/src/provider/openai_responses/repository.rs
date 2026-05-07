@@ -57,13 +57,23 @@ impl<H: HttpInfra> OpenAIResponsesProvider<H> {
                 base.set_fragment(None);
                 base
             };
-            Self { provider, http, api_base, responses_url }
+            Self {
+                provider,
+                http,
+                api_base,
+                responses_url,
+            }
         } else {
             // Standard OpenAI pattern: rewrite to /v1/responses
             let api_base = api_base_from_endpoint_url(&provider.url)
                 .expect("Failed to derive API base URL from provider endpoint");
             let responses_url = responses_endpoint_from_api_base(&api_base);
-            Self { provider, http, api_base, responses_url }
+            Self {
+                provider,
+                http,
+                api_base,
+                responses_url,
+            }
         }
     }
 
@@ -301,8 +311,10 @@ impl<T: HttpInfra> OpenAIResponsesProvider<T> {
                         match result {
                             Ok(super::response::ResponsesStreamEvent::Keepalive { .. }) => None,
                             Ok(super::response::ResponsesStreamEvent::Ping { cost }) => {
-                                let usage =
-                                    forge_domain::Usage { cost: Some(cost), ..Default::default() };
+                                let usage = forge_domain::Usage {
+                                    cost: Some(cost),
+                                    ..Default::default()
+                                };
                                 Some(Ok(super::response::StreamItem::Message(Box::new(
                                     ChatCompletionMessage::assistant(forge_domain::Content::part(
                                         "",
@@ -722,15 +734,19 @@ mod tests {
 
     #[test]
     fn test_request_message_count_with_empty_items() {
-        let request =
-            oai::CreateResponse { input: oai::InputParam::Items(vec![]), ..Default::default() };
+        let request = oai::CreateResponse {
+            input: oai::InputParam::Items(vec![]),
+            ..Default::default()
+        };
         assert_eq!(request_message_count(&request), 0);
     }
 
     #[test]
     fn test_openai_responses_provider_new_with_api_key() {
         let provider = openai_responses("test-key", "https://api.openai.com/v1");
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
 
         assert_eq!(provider_impl.api_base.as_str(), "https://api.openai.com/v1");
@@ -753,7 +769,9 @@ mod tests {
             url_params: vec![],
             models: None,
         };
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
 
         assert_eq!(
@@ -779,7 +797,9 @@ mod tests {
             url_params: vec![],
             models: None,
         };
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
 
         assert_eq!(
@@ -828,7 +848,9 @@ mod tests {
             custom_headers: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         assert_eq!(provider_impl.api_base.as_str(), "https://api.openai.com/v1");
     }
@@ -868,7 +890,9 @@ mod tests {
             custom_headers: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         assert_eq!(provider_impl.api_base.as_str(), "https://api.openai.com/v1");
     }
@@ -887,7 +911,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         assert_eq!(provider_impl.api_base.as_str(), "https://api.openai.com/v1");
     }
@@ -895,7 +921,9 @@ mod tests {
     #[test]
     fn test_get_headers_with_api_key() {
         let provider = openai_responses("test-key", "https://api.openai.com/v1");
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
 
         let headers = provider_impl.get_headers();
@@ -935,7 +963,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         let headers = provider_impl.get_headers();
 
@@ -975,7 +1005,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         let headers = provider_impl.get_headers();
 
@@ -1027,7 +1059,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         let headers = provider_impl.get_headers();
 
@@ -1067,7 +1101,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         let headers = provider_impl.get_headers();
 
@@ -1113,7 +1149,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         let actual = provider_impl.get_headers();
 
@@ -1166,7 +1204,9 @@ mod tests {
             custom_headers: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         let actual = provider_impl.get_headers();
 
@@ -1189,7 +1229,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         let actual = provider_impl.get_headers();
 
@@ -1223,7 +1265,9 @@ mod tests {
             custom_headers: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         let actual = provider_impl.get_headers();
 
@@ -1245,7 +1289,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
         let fixture = "conversation_test_123";
 
@@ -1268,7 +1314,9 @@ mod tests {
     #[test]
     fn test_get_headers_non_codex_with_conversation_id_omits_conversation_headers() {
         let provider = openai_responses("test-key", "https://api.openai.com/v1");
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
 
         let actual = provider_impl.get_headers_for_conversation(Some("conversation_test_123"));
@@ -1294,7 +1342,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::<MockHttpClient>::new(provider, infra);
 
         let actual = provider_impl.get_headers_for_conversation(None);
@@ -1308,7 +1358,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_openai_responses_repository_models_returns_empty() -> anyhow::Result<()> {
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let repo = OpenAIResponsesResponseRepository::new(infra);
 
         let provider = openai_responses("test-key", "https://api.openai.com/v1");
@@ -1357,7 +1409,9 @@ mod tests {
             &format!("{}/v1/chat/completions", fixture.url()),
         );
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl: OpenAIResponsesProvider<_> =
             OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
@@ -1435,7 +1489,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))
@@ -1516,7 +1572,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))
@@ -1564,7 +1622,9 @@ mod tests {
             models: None,
         };
 
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))
@@ -1593,7 +1653,9 @@ mod tests {
             "test-api-key",
             &format!("{}/v1/chat/completions", fixture.url()),
         );
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))
@@ -1632,7 +1694,9 @@ mod tests {
             "test-api-key",
             &format!("{}/v1/chat/completions", fixture.url()),
         );
-        let infra = Arc::new(MockHttpClient { client: reqwest::Client::new() });
+        let infra = Arc::new(MockHttpClient {
+            client: reqwest::Client::new(),
+        });
         let provider_impl = OpenAIResponsesProvider::new(provider, infra);
         let context = ChatContext::default()
             .add_message(ContextMessage::user("Hi", None))

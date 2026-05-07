@@ -24,7 +24,10 @@ pub struct ApiKeyStrategy {
 
 impl ApiKeyStrategy {
     pub fn new(provider_id: ProviderId, required_params: Vec<URLParamSpec>) -> Self {
-        Self { provider_id, required_params }
+        Self {
+            provider_id,
+            required_params,
+        }
     }
 }
 
@@ -134,7 +137,11 @@ pub struct OAuthCodeStrategy<T> {
 
 impl<T> OAuthCodeStrategy<T> {
     pub fn new(adapter: T, provider_id: ProviderId, config: OAuthConfig) -> Self {
-        Self { config, provider_id, adapter }
+        Self {
+            config,
+            provider_id,
+            adapter,
+        }
     }
 }
 
@@ -214,7 +221,10 @@ pub struct OAuthDeviceStrategy {
 
 impl OAuthDeviceStrategy {
     pub fn new(provider_id: ProviderId, config: OAuthConfig) -> Self {
-        Self { provider_id, config }
+        Self {
+            provider_id,
+            config,
+        }
     }
 }
 
@@ -318,7 +328,11 @@ impl OAuthWithApiKeyStrategy {
             .clone()
             .ok_or_else(|| AuthError::InitiationFailed("Missing token_refresh_url".to_string()))?;
 
-        Ok(Self { provider_id, oauth_config, api_key_exchange_url })
+        Ok(Self {
+            provider_id,
+            oauth_config,
+            api_key_exchange_url,
+        })
     }
 }
 
@@ -430,7 +444,10 @@ pub struct GoogleAdcStrategy {
 
 impl GoogleAdcStrategy {
     pub fn new(provider_id: ProviderId, required_params: Vec<URLParamSpec>) -> Self {
-        Self { provider_id, required_params }
+        Self {
+            provider_id,
+            required_params,
+        }
     }
 }
 
@@ -538,7 +555,10 @@ impl AwsProfileStrategy {
         if !required_params.iter().any(|p| p.name == profile_param.name) {
             required_params.push(profile_param);
         }
-        Self { provider_id, required_params }
+        Self {
+            provider_id,
+            required_params,
+        }
     }
 }
 
@@ -622,7 +642,10 @@ pub struct CodexDeviceStrategy {
 
 impl CodexDeviceStrategy {
     pub fn new(provider_id: ProviderId, config: OAuthConfig) -> Self {
-        Self { provider_id, config }
+        Self {
+            provider_id,
+            config,
+        }
     }
 }
 
@@ -1053,10 +1076,13 @@ async fn exchange_oauth_for_api_key(
         .into());
     }
 
-    let OAuthTokenResponse { access_token, expires_at, .. } =
-        response.json().await.map_err(|e| {
-            AuthError::CompletionFailed(format!("Failed to parse API key response: {e}"))
-        })?;
+    let OAuthTokenResponse {
+        access_token,
+        expires_at,
+        ..
+    } = response.json().await.map_err(|e| {
+        AuthError::CompletionFailed(format!("Failed to parse API key response: {e}"))
+    })?;
 
     Ok((
         access_token.into(),

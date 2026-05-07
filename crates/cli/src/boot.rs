@@ -83,30 +83,28 @@ pub fn status_line(name: &str, ok: bool, detail: &str) {
 /// called with (ok, final_detail), updates the line in place. Falls back to
 /// a fresh line on terminals that don't support carriage-return overwrites.
 pub fn section(title: &str) {
-    println!(
-        "\n\x1b[38;2;0;255;255m[PRISM]\x1b[0m \x1b[38;2;200;200;200m{title}\x1b[0m"
-    );
+    println!("\n\x1b[38;2;0;255;255m[PRISM]\x1b[0m \x1b[38;2;200;200;200m{title}\x1b[0m");
 }
 
 /// Print a single bullet without a status marker — for plain progress text.
 pub fn bullet(text: &str) {
-    println!(
-        "\x1b[38;2;100;100;255m \u{251c}\u{2500}\u{2500} \x1b[38;2;200;200;200m{text}\x1b[0m"
-    );
+    println!("\x1b[38;2;100;100;255m \u{251c}\u{2500}\u{2500} \x1b[38;2;200;200;200m{text}\x1b[0m");
 }
 
 /// A nicely-coloured warning the user should notice but isn't fatal.
 pub fn warn(text: &str) {
-    println!(
-        "\x1b[38;2;100;100;255m \u{2502}   \x1b[38;2;255;200;100m\u{26A0}  {text}\x1b[0m"
-    );
+    println!("\x1b[38;2;100;100;255m \u{2502}   \x1b[38;2;255;200;100m\u{26A0}  {text}\x1b[0m");
 }
 
 /// A simple inline progress bar that overwrites itself while in a tty.
 /// `done` and `total` are bytes; we render in MB.
 pub fn progress(prefix: &str, done: u64, total: Option<u64>) {
     use std::io::IsTerminal;
-    let cr = if io::stderr().is_terminal() { "\r" } else { "\n" };
+    let cr = if io::stderr().is_terminal() {
+        "\r"
+    } else {
+        "\n"
+    };
     match total {
         Some(t) if t > 0 => {
             let pct = (done as f64 / t as f64).min(1.0);

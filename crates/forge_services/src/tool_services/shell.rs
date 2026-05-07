@@ -61,7 +61,11 @@ impl<I: CommandInfra + EnvironmentInfra> ShellService for ForgeShell<I> {
             output.stderr = strip_ansi(output.stderr);
         }
 
-        Ok(ShellOutput { output, shell: self.env.shell.clone(), description })
+        Ok(ShellOutput {
+            output,
+            shell: self.env.shell.clone(),
+            description,
+        })
     }
 }
 #[cfg(test)]
@@ -160,7 +164,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_shell_service_forwards_no_env_vars() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra {
+            expected_env_vars: None,
+        }));
 
         let actual = fixture
             .execute(
@@ -202,7 +208,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_shell_service_with_description() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra {
+            expected_env_vars: None,
+        }));
 
         let actual = fixture
             .execute(
@@ -226,7 +234,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_shell_service_without_description() {
-        let fixture = ForgeShell::new(Arc::new(MockCommandInfra { expected_env_vars: None }));
+        let fixture = ForgeShell::new(Arc::new(MockCommandInfra {
+            expected_env_vars: None,
+        }));
 
         let actual = fixture
             .execute(

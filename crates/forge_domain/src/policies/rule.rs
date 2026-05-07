@@ -57,7 +57,14 @@ impl Rule {
     /// Check if this rule matches the given operation
     pub fn matches(&self, operation: &PermissionOperation) -> bool {
         match (self, operation) {
-            (Rule::Write(rule), PermissionOperation::Write { path, cwd, message: _ }) => {
+            (
+                Rule::Write(rule),
+                PermissionOperation::Write {
+                    path,
+                    cwd,
+                    message: _,
+                },
+            ) => {
                 let pattern_matches = match_pattern(&rule.write, path);
                 let dir = match &rule.dir {
                     Some(wd_pattern) => match_pattern(wd_pattern, cwd),
@@ -66,7 +73,14 @@ impl Rule {
                 };
                 pattern_matches && dir
             }
-            (Rule::Read(rule), PermissionOperation::Read { path, cwd, message: _ }) => {
+            (
+                Rule::Read(rule),
+                PermissionOperation::Read {
+                    path,
+                    cwd,
+                    message: _,
+                },
+            ) => {
                 let pattern_matches = match_pattern(&rule.read, path);
                 let dir_matches = match &rule.dir {
                     Some(wd_pattern) => match_pattern(wd_pattern, cwd),
@@ -85,7 +99,14 @@ impl Rule {
                 };
                 command_matches && dir_matches
             }
-            (Rule::Fetch(rule), PermissionOperation::Fetch { url, cwd, message: _ }) => {
+            (
+                Rule::Fetch(rule),
+                PermissionOperation::Fetch {
+                    url,
+                    cwd,
+                    message: _,
+                },
+            ) => {
                 let url_matches = match_pattern(&rule.url, url);
                 let dir_matches = match &rule.dir {
                     Some(wd_pattern) => match_pattern(wd_pattern, cwd),
@@ -210,7 +231,10 @@ mod tests {
 
     #[test]
     fn test_rule_matches_write_operation() {
-        let fixture = Rule::Write(WriteRule { write: "src/**/*.rs".to_string(), dir: None });
+        let fixture = Rule::Write(WriteRule {
+            write: "src/**/*.rs".to_string(),
+            dir: None,
+        });
         let operation = fixture_write_operation();
 
         let actual = fixture.matches(&operation);
@@ -220,7 +244,10 @@ mod tests {
 
     #[test]
     fn test_rule_matches_write_operation_with_patch_scenario() {
-        let fixture = Rule::Write(WriteRule { write: "src/**/*.rs".to_string(), dir: None });
+        let fixture = Rule::Write(WriteRule {
+            write: "src/**/*.rs".to_string(),
+            dir: None,
+        });
         let operation = fixture_patch_operation();
 
         let actual = fixture.matches(&operation);
@@ -230,7 +257,10 @@ mod tests {
 
     #[test]
     fn test_rule_does_not_match_different_operation() {
-        let fixture = Rule::Read(ReadRule { read: "config/*.yml".to_string(), dir: None });
+        let fixture = Rule::Read(ReadRule {
+            read: "config/*.yml".to_string(),
+            dir: None,
+        });
         let operation = fixture_write_operation();
 
         let actual = fixture.matches(&operation);
@@ -261,7 +291,10 @@ mod tests {
 
     #[test]
     fn test_execute_command_pattern_match() {
-        let fixture = Rule::Execute(ExecuteRule { command: "cargo *".to_string(), dir: None });
+        let fixture = Rule::Execute(ExecuteRule {
+            command: "cargo *".to_string(),
+            dir: None,
+        });
         let operation = fixture_execute_operation();
 
         let actual = fixture.matches(&operation);
@@ -271,7 +304,10 @@ mod tests {
 
     #[test]
     fn test_read_config_pattern_match() {
-        let fixture = Rule::Read(ReadRule { read: "config/*.yml".to_string(), dir: None });
+        let fixture = Rule::Read(ReadRule {
+            read: "config/*.yml".to_string(),
+            dir: None,
+        });
         let operation = fixture_read_operation();
 
         let actual = fixture.matches(&operation);
@@ -281,8 +317,10 @@ mod tests {
 
     #[test]
     fn test_net_fetch_url_pattern_match() {
-        let fixture =
-            Rule::Fetch(Fetch { url: "https://api.example.com/*".to_string(), dir: None });
+        let fixture = Rule::Fetch(Fetch {
+            url: "https://api.example.com/*".to_string(),
+            dir: None,
+        });
         let operation = fixture_net_fetch_operation();
 
         let actual = fixture.matches(&operation);
@@ -318,7 +356,10 @@ mod tests {
 
     #[test]
     fn test_execute_no_working_directory_pattern_matches_any() {
-        let fixture = Rule::Execute(ExecuteRule { command: "cargo *".to_string(), dir: None });
+        let fixture = Rule::Execute(ExecuteRule {
+            command: "cargo *".to_string(),
+            dir: None,
+        });
         let operation = fixture_execute_operation();
 
         let actual = fixture.matches(&operation);

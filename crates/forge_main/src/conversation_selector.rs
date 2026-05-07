@@ -93,7 +93,10 @@ impl ConversationSelector {
         let mut rows: Vec<ConversationRow> = Vec::with_capacity(all_lines.len());
         // Header row (non-selectable via header_lines=1)
         if let Some(header) = all_lines.first() {
-            rows.push(ConversationRow { conversation: None, display: header.to_string() });
+            rows.push(ConversationRow {
+                conversation: None,
+                display: header.to_string(),
+            });
         }
         // Data rows
         for (i, line) in all_lines.iter().skip(1).enumerate() {
@@ -139,7 +142,10 @@ mod tests {
             title: title.map(|t| t.to_string()),
             context: None,
             metrics: Metrics::default().started_at(now),
-            metadata: MetaData { created_at: now, updated_at: Some(now) },
+            metadata: MetaData {
+                created_at: now,
+                updated_at: Some(now),
+            },
         }
     }
 

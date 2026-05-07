@@ -31,7 +31,9 @@ impl SummaryTransformer {
     ///
     /// * `working_dir` - The working directory path to strip from file paths
     pub fn new(working_dir: impl Into<PathBuf>) -> Self {
-        Self { working_dir: working_dir.into() }
+        Self {
+            working_dir: working_dir.into(),
+        }
     }
 }
 

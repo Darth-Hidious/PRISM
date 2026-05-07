@@ -62,7 +62,9 @@ mod tests {
         let mut transformer = SetZaiThinking;
         let actual = transformer.transform(fixture);
 
-        let expected_thinking = Some(ThinkingConfig { r#type: ThinkingType::Enabled });
+        let expected_thinking = Some(ThinkingConfig {
+            r#type: ThinkingType::Enabled,
+        });
         assert_eq!(actual.thinking, expected_thinking);
         assert_eq!(actual.reasoning, None);
     }
@@ -79,7 +81,9 @@ mod tests {
         let mut transformer = SetZaiThinking;
         let actual = transformer.transform(fixture);
 
-        let expected_thinking = Some(ThinkingConfig { r#type: ThinkingType::Disabled });
+        let expected_thinking = Some(ThinkingConfig {
+            r#type: ThinkingType::Disabled,
+        });
         assert_eq!(actual.thinking, expected_thinking);
         assert_eq!(actual.reasoning, None);
     }
@@ -123,7 +127,9 @@ mod tests {
         let mut transformer = SetZaiThinking;
         let actual = transformer.transform(fixture);
 
-        let expected_thinking = Some(ThinkingConfig { r#type: ThinkingType::Enabled });
+        let expected_thinking = Some(ThinkingConfig {
+            r#type: ThinkingType::Enabled,
+        });
         assert_eq!(actual.thinking, expected_thinking);
         assert_eq!(actual.reasoning, None);
     }
@@ -140,7 +146,9 @@ mod tests {
         let mut transformer = SetZaiThinking;
         let actual = transformer.transform(fixture);
 
-        let expected_thinking = Some(ThinkingConfig { r#type: ThinkingType::Enabled });
+        let expected_thinking = Some(ThinkingConfig {
+            r#type: ThinkingType::Enabled,
+        });
         assert_eq!(actual.thinking, expected_thinking);
         assert_eq!(actual.reasoning, None);
     }
@@ -157,14 +165,18 @@ mod tests {
         let mut transformer = SetZaiThinking;
         let actual = transformer.transform(fixture);
 
-        let expected_thinking = Some(ThinkingConfig { r#type: ThinkingType::Enabled });
+        let expected_thinking = Some(ThinkingConfig {
+            r#type: ThinkingType::Enabled,
+        });
         assert_eq!(actual.thinking, expected_thinking);
         assert_eq!(actual.reasoning, None);
     }
 
     #[test]
     fn test_thinking_config_serialization() {
-        let thinking = ThinkingConfig { r#type: ThinkingType::Enabled };
+        let thinking = ThinkingConfig {
+            r#type: ThinkingType::Enabled,
+        };
         let actual = serde_json::to_string(&thinking).unwrap();
         let expected = r#"{"type":"enabled"}"#;
         assert_eq!(actual, expected);
@@ -174,7 +186,9 @@ mod tests {
     fn test_thinking_config_deserialization() {
         let json = r#"{"type":"disabled"}"#;
         let actual: ThinkingConfig = serde_json::from_str(json).unwrap();
-        let expected = ThinkingConfig { r#type: ThinkingType::Disabled };
+        let expected = ThinkingConfig {
+            r#type: ThinkingType::Disabled,
+        };
         assert_eq!(actual, expected);
     }
 }

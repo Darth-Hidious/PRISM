@@ -24,7 +24,9 @@ impl From<ChatResponseContent> for ChatResponse {
 
 impl From<TitleFormat> for ChatResponse {
     fn from(title: TitleFormat) -> Self {
-        ChatResponse::TaskMessage { content: ChatResponseContent::ToolInput(title) }
+        ChatResponse::TaskMessage {
+            content: ChatResponseContent::ToolInput(title),
+        }
     }
 }
 

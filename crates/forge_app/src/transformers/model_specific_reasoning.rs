@@ -22,7 +22,9 @@ pub(crate) struct ModelSpecificReasoning {
 impl ModelSpecificReasoning {
     /// Creates a model-specific reasoning normalizer for the given model id.
     pub(crate) fn new(model_id: impl Into<String>) -> Self {
-        Self { model_id: model_id.into() }
+        Self {
+            model_id: model_id.into(),
+        }
     }
 
     fn family(&self) -> AnthropicModelFamily {

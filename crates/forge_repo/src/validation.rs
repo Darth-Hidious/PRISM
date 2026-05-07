@@ -38,8 +38,13 @@ impl<I: GrpcInfra> ValidationRepository for ForgeValidationRepository<I> {
         debug!(path = %path_str, "Starting syntax validation");
 
         // Create validation request for single file
-        let proto_file = File { path: path_str.clone(), content: content.to_string() };
-        let request = tonic::Request::new(ValidateFilesRequest { files: vec![proto_file] });
+        let proto_file = File {
+            path: path_str.clone(),
+            content: content.to_string(),
+        };
+        let request = tonic::Request::new(ValidateFilesRequest {
+            files: vec![proto_file],
+        });
 
         // Call gRPC API
         let channel = self.infra.channel()?;
@@ -59,7 +64,9 @@ impl<I: GrpcInfra> ValidationRepository for ForgeValidationRepository<I> {
 
         // Convert proto status to error message
         match result.status {
-            Some(proto_generated::ValidationStatus { status: Some(status) }) => match status {
+            Some(proto_generated::ValidationStatus {
+                status: Some(status),
+            }) => match status {
                 proto_generated::validation_status::Status::Valid(_) => {
                     debug!(path = %path_str, "Syntax validation passed");
                     Ok(vec![])

@@ -21,7 +21,10 @@ impl<F: EnvironmentInfra + WalkerInfra> ForgeDiscoveryService<F> {
         let files = self.service.walk(config).await?;
         Ok(files
             .into_iter()
-            .map(|file| File { path: file.path.clone(), is_dir: file.is_dir() })
+            .map(|file| File {
+                path: file.path.clone(),
+                is_dir: file.is_dir(),
+            })
             .collect())
     }
 }
@@ -41,9 +44,10 @@ impl<F: EnvironmentInfra + WalkerInfra + DirectoryReaderInfra + Send + Sync> Fil
         let mut files: Vec<File> = entries
             .into_iter()
             .filter_map(|(path, is_dir)| {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|path| File { path: path.to_string(), is_dir })
+                path.file_name().and_then(|n| n.to_str()).map(|path| File {
+                    path: path.to_string(),
+                    is_dir,
+                })
             })
             .collect();
 
@@ -160,11 +164,26 @@ mod tests {
 
         // Expected: Directories first (sorted), then files (sorted)
         let expected = vec![
-            File { path: "docs".to_string(), is_dir: true },
-            File { path: "src".to_string(), is_dir: true },
-            File { path: "README.md".to_string(), is_dir: false },
-            File { path: "config.toml".to_string(), is_dir: false },
-            File { path: "file1.txt".to_string(), is_dir: false },
+            File {
+                path: "docs".to_string(),
+                is_dir: true,
+            },
+            File {
+                path: "src".to_string(),
+                is_dir: true,
+            },
+            File {
+                path: "README.md".to_string(),
+                is_dir: false,
+            },
+            File {
+                path: "config.toml".to_string(),
+                is_dir: false,
+            },
+            File {
+                path: "file1.txt".to_string(),
+                is_dir: false,
+            },
         ];
 
         assert_eq!(actual, expected);
@@ -189,9 +208,18 @@ mod tests {
 
         // Expected: Files sorted alphabetically
         let expected = vec![
-            File { path: "alpha.txt".to_string(), is_dir: false },
-            File { path: "middle.txt".to_string(), is_dir: false },
-            File { path: "zebra.txt".to_string(), is_dir: false },
+            File {
+                path: "alpha.txt".to_string(),
+                is_dir: false,
+            },
+            File {
+                path: "middle.txt".to_string(),
+                is_dir: false,
+            },
+            File {
+                path: "zebra.txt".to_string(),
+                is_dir: false,
+            },
         ];
 
         assert_eq!(actual, expected);
@@ -212,9 +240,18 @@ mod tests {
 
         // Expected: Directories sorted alphabetically
         let expected = vec![
-            File { path: "apple".to_string(), is_dir: true },
-            File { path: "berry".to_string(), is_dir: true },
-            File { path: "zoo".to_string(), is_dir: true },
+            File {
+                path: "apple".to_string(),
+                is_dir: true,
+            },
+            File {
+                path: "berry".to_string(),
+                is_dir: true,
+            },
+            File {
+                path: "zoo".to_string(),
+                is_dir: true,
+            },
         ];
 
         assert_eq!(actual, expected);
@@ -258,12 +295,30 @@ mod tests {
 
         // Expected: Directories first (case-sensitive sort), then files
         let expected = vec![
-            File { path: "Apple".to_string(), is_dir: true },
-            File { path: "Zulu".to_string(), is_dir: true },
-            File { path: "_underscore".to_string(), is_dir: true },
-            File { path: ".gitignore".to_string(), is_dir: false },
-            File { path: "apple.txt".to_string(), is_dir: false },
-            File { path: "zebra.txt".to_string(), is_dir: false },
+            File {
+                path: "Apple".to_string(),
+                is_dir: true,
+            },
+            File {
+                path: "Zulu".to_string(),
+                is_dir: true,
+            },
+            File {
+                path: "_underscore".to_string(),
+                is_dir: true,
+            },
+            File {
+                path: ".gitignore".to_string(),
+                is_dir: false,
+            },
+            File {
+                path: "apple.txt".to_string(),
+                is_dir: false,
+            },
+            File {
+                path: "zebra.txt".to_string(),
+                is_dir: false,
+            },
         ];
 
         assert_eq!(actual, expected);

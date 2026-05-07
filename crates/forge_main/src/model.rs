@@ -72,7 +72,9 @@ pub struct ForgeCommandManager {
 impl Default for ForgeCommandManager {
     fn default() -> Self {
         let commands = Self::default_commands();
-        ForgeCommandManager { commands: Arc::new(Mutex::new(commands)) }
+        ForgeCommandManager {
+            commands: Arc::new(Mutex::new(commands)),
+        }
     }
 }
 
@@ -180,7 +182,11 @@ impl ForgeCommandManager {
             let description = format!("⚙ {}", cmd.description);
             let value = cmd.prompt.clone();
 
-            ForgeCommand { name, description, value }
+            ForgeCommand {
+                name,
+                description,
+                value,
+            }
         });
 
         guard.extend(new_commands);
@@ -196,8 +202,10 @@ impl ForgeCommandManager {
         agents: Vec<AgentInfo>,
     ) -> AgentCommandRegistrationResult {
         let mut guard = self.commands.lock().unwrap();
-        let mut result =
-            AgentCommandRegistrationResult { registered_count: 0, skipped_conflicts: Vec::new() };
+        let mut result = AgentCommandRegistrationResult {
+            registered_count: 0,
+            skipped_conflicts: Vec::new(),
+        };
 
         // Remove existing agent commands (commands starting with "agent-")
         guard.retain(|cmd| !cmd.name.starts_with("agent-"));
@@ -324,7 +332,10 @@ impl ForgeCommandManager {
             Ok(mut cmd) => {
                 // Post-process variants that need Vec<String> → concrete type fixup
                 match &mut cmd.sub {
-                    AppCommand::Commit { args, max_diff_size } => {
+                    AppCommand::Commit {
+                        args,
+                        max_diff_size,
+                    } => {
                         *max_diff_size = args.iter().find_map(|p| p.parse::<usize>().ok());
                     }
                     AppCommand::Rename { name } => {
@@ -1564,7 +1575,9 @@ mod tests {
         let actual = fixture.parse("/rename my-session").unwrap();
         assert_eq!(
             actual,
-            AppCommand::Rename { name: vec!["my-session".to_string()] }
+            AppCommand::Rename {
+                name: vec!["my-session".to_string()]
+            }
         );
     }
 
@@ -1598,7 +1611,9 @@ mod tests {
         let actual = fixture.parse("/rn my-session").unwrap();
         assert_eq!(
             actual,
-            AppCommand::Rename { name: vec!["my-session".to_string()] }
+            AppCommand::Rename {
+                name: vec!["my-session".to_string()]
+            }
         );
     }
 
@@ -1608,7 +1623,9 @@ mod tests {
         let actual = fixture.parse("/rename   my title   ").unwrap();
         assert_eq!(
             actual,
-            AppCommand::Rename { name: vec!["my".to_string(), "title".to_string()] }
+            AppCommand::Rename {
+                name: vec!["my".to_string(), "title".to_string()]
+            }
         );
     }
 
@@ -1620,7 +1637,9 @@ mod tests {
 
     #[test]
     fn test_rename_command_name() {
-        let cmd = AppCommand::Rename { name: vec!["test".to_string()] };
+        let cmd = AppCommand::Rename {
+            name: vec!["test".to_string()],
+        };
         assert_eq!(cmd.name(), "rename");
     }
 
@@ -1635,7 +1654,9 @@ mod tests {
         // Verify
         assert_eq!(
             result,
-            AppCommand::Suggest { description: vec!["---".to_string(), "date".to_string()] }
+            AppCommand::Suggest {
+                description: vec!["---".to_string(), "date".to_string()]
+            }
         );
     }
 
@@ -1667,7 +1688,9 @@ mod tests {
         // Verify
         assert_eq!(
             result,
-            AppCommand::Suggest { description: vec!["-v".to_string(), "file.txt".to_string()] }
+            AppCommand::Suggest {
+                description: vec!["-v".to_string(), "file.txt".to_string()]
+            }
         );
     }
 }

@@ -112,7 +112,10 @@ impl CodeBlockParser {
                 } else {
                     // Closing fence
                     result.push_str(&format!("\x00{}\x00\n", blocks.len()));
-                    blocks.push(CodeBlock { code: code_lines.join("\n"), lang: lang.clone() });
+                    blocks.push(CodeBlock {
+                        code: code_lines.join("\n"),
+                        lang: lang.clone(),
+                    });
                     code_lines.clear();
                     in_code = false;
                 }
@@ -126,7 +129,10 @@ impl CodeBlockParser {
             }
         }
 
-        Self { markdown: result, blocks }
+        Self {
+            markdown: result,
+            blocks,
+        }
     }
 
     /// Detect if a line is a code fence marker (```).

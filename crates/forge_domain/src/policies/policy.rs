@@ -83,7 +83,10 @@ impl Policy {
         rules: &mut Vec<&'a Rule>,
     ) {
         match self {
-            Policy::Simple { permission: _, rule } => {
+            Policy::Simple {
+                permission: _,
+                rule,
+            } => {
                 if rule.matches(operation) {
                     rules.push(rule);
                 }
@@ -107,7 +110,10 @@ impl Policy {
     /// Get the permission for this policy if it's a simple policy
     pub fn permission(&self) -> Option<&Permission> {
         match self {
-            Policy::Simple { permission, rule: _ } => Some(permission),
+            Policy::Simple {
+                permission,
+                rule: _,
+            } => Some(permission),
             _ => None,
         }
     }
@@ -154,7 +160,10 @@ mod tests {
     fn fixture_simple_write_policy() -> Policy {
         Policy::Simple {
             permission: Permission::Allow,
-            rule: Rule::Write(WriteRule { write: "src/**/*.rs".to_string(), dir: None }),
+            rule: Rule::Write(WriteRule {
+                write: "src/**/*.rs".to_string(),
+                dir: None,
+            }),
         }
     }
 
@@ -172,7 +181,10 @@ mod tests {
     fn test_policy_eval_simple_not_matching() {
         let fixture = Policy::Simple {
             permission: Permission::Allow,
-            rule: Rule::Write(WriteRule { write: "docs/**/*.md".to_string(), dir: None }),
+            rule: Rule::Write(WriteRule {
+                write: "docs/**/*.md".to_string(),
+                dir: None,
+            }),
         };
         let operation = fixture_write_operation();
 
@@ -187,11 +199,17 @@ mod tests {
             all: vec![
                 Policy::Simple {
                     permission: Permission::Allow,
-                    rule: Rule::Write(WriteRule { write: "src/**/*".to_string(), dir: None }),
+                    rule: Rule::Write(WriteRule {
+                        write: "src/**/*".to_string(),
+                        dir: None,
+                    }),
                 },
                 Policy::Simple {
                     permission: Permission::Allow,
-                    rule: Rule::Write(WriteRule { write: "**/*.rs".to_string(), dir: None }),
+                    rule: Rule::Write(WriteRule {
+                        write: "**/*.rs".to_string(),
+                        dir: None,
+                    }),
                 },
             ],
         };
@@ -208,11 +226,17 @@ mod tests {
             all: vec![
                 Policy::Simple {
                     permission: Permission::Allow,
-                    rule: Rule::Write(WriteRule { write: "src/**/*".to_string(), dir: None }),
+                    rule: Rule::Write(WriteRule {
+                        write: "src/**/*".to_string(),
+                        dir: None,
+                    }),
                 },
                 Policy::Simple {
                     permission: Permission::Allow,
-                    rule: Rule::Write(WriteRule { write: "**/*.py".to_string(), dir: None }),
+                    rule: Rule::Write(WriteRule {
+                        write: "**/*.py".to_string(),
+                        dir: None,
+                    }),
                 },
             ],
         };
@@ -229,11 +253,17 @@ mod tests {
             any: vec![
                 Policy::Simple {
                     permission: Permission::Allow,
-                    rule: Rule::Write(WriteRule { write: "src/**/*.rs".to_string(), dir: None }),
+                    rule: Rule::Write(WriteRule {
+                        write: "src/**/*.rs".to_string(),
+                        dir: None,
+                    }),
                 },
                 Policy::Simple {
                     permission: Permission::Allow,
-                    rule: Rule::Write(WriteRule { write: "**/*.py".to_string(), dir: None }),
+                    rule: Rule::Write(WriteRule {
+                        write: "**/*.py".to_string(),
+                        dir: None,
+                    }),
                 },
             ],
         };
@@ -249,7 +279,10 @@ mod tests {
         let fixture = Policy::Not {
             not: Box::new(Policy::Simple {
                 permission: Permission::Allow,
-                rule: Rule::Write(WriteRule { write: "**/*.py".to_string(), dir: None }),
+                rule: Rule::Write(WriteRule {
+                    write: "**/*.py".to_string(),
+                    dir: None,
+                }),
             }),
         };
         let operation = fixture_write_operation();
@@ -269,18 +302,33 @@ mod tests {
         assert_eq!(actual.len(), 1);
         assert_eq!(
             actual[0],
-            &Rule::Write(WriteRule { write: "src/**/*.rs".to_string(), dir: None })
+            &Rule::Write(WriteRule {
+                write: "src/**/*.rs".to_string(),
+                dir: None
+            })
         );
     }
 
     #[test]
     fn test_policy_find_rules_and_multiple() {
-        let rule1 = Rule::Write(WriteRule { write: "src/**/*".to_string(), dir: None });
-        let rule2 = Rule::Write(WriteRule { write: "**/*.rs".to_string(), dir: None });
+        let rule1 = Rule::Write(WriteRule {
+            write: "src/**/*".to_string(),
+            dir: None,
+        });
+        let rule2 = Rule::Write(WriteRule {
+            write: "**/*.rs".to_string(),
+            dir: None,
+        });
         let fixture = Policy::All {
             all: vec![
-                Policy::Simple { permission: Permission::Allow, rule: rule1.clone() },
-                Policy::Simple { permission: Permission::Allow, rule: rule2.clone() },
+                Policy::Simple {
+                    permission: Permission::Allow,
+                    rule: rule1.clone(),
+                },
+                Policy::Simple {
+                    permission: Permission::Allow,
+                    rule: rule2.clone(),
+                },
             ],
         };
         let operation = fixture_write_operation();

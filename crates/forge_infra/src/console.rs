@@ -22,7 +22,10 @@ pub struct StdConsoleWriter<O = Stdout, E = Stderr> {
 
 impl<O, E> Clone for StdConsoleWriter<O, E> {
     fn clone(&self) -> Self {
-        Self { stdout: self.stdout.clone(), stderr: self.stderr.clone() }
+        Self {
+            stdout: self.stdout.clone(),
+            stderr: self.stderr.clone(),
+        }
     }
 }
 

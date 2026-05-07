@@ -583,7 +583,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     self.handle_mcp_logout(&args.name).await?;
                 }
             },
-            TopLevelCommand::Info { porcelain, conversation_id } => {
+            TopLevelCommand::Info {
+                porcelain,
+                conversation_id,
+            } => {
                 // Only initialize state (agent/provider/model resolution).
                 // Avoid on_new() which also spawns fire-and-forget background
                 // tasks via hydrate_caches() that race with process exit and
@@ -3212,15 +3215,19 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         use colored::Colorize;
 
         if auth_methods.is_empty() {
-            return Err(UIError::NoAuthMethodsAvailable { provider: provider_id.clone() }.into());
+            return Err(UIError::NoAuthMethodsAvailable {
+                provider: provider_id.clone(),
+            }
+            .into());
         }
 
         // If only one auth method, use it directly
         if auth_methods.len() == 1 {
             let Some(method) = auth_methods.first() else {
-                return Err(
-                    UIError::NoAuthMethodsAvailable { provider: provider_id.clone() }.into(),
-                );
+                return Err(UIError::NoAuthMethodsAvailable {
+                    provider: provider_id.clone(),
+                }
+                .into());
             };
             return Ok(Some(method.clone()));
         }
@@ -3411,10 +3418,16 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         let Some(header) = all_lines.first() else {
             return Err(UIError::MissingHeaderLine.into());
         };
-        rows.push(ProviderRow { provider: None, display: header.to_string() });
+        rows.push(ProviderRow {
+            provider: None,
+            display: header.to_string(),
+        });
         // Data rows
         for (i, line) in all_lines.iter().skip(1).enumerate() {
-            rows.push(ProviderRow { provider: sorted.get(i).cloned(), display: line.to_string() });
+            rows.push(ProviderRow {
+                provider: sorted.get(i).cloned(),
+                display: line.to_string(),
+            });
         }
 
         // Find starting cursor for the current provider
@@ -3961,7 +3974,10 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                     writer.write(&text)?;
                 }
             },
-            ChatResponse::ToolCallStart { tool_call, notifier } => {
+            ChatResponse::ToolCallStart {
+                tool_call,
+                notifier,
+            } => {
                 // Scope guard to ensure notification happens even on error.
                 // If writer.finish() or spinner.stop() fails, the guard's drop
                 // will still notify orch, preventing the deadlock.
@@ -4529,9 +4545,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
         // Find the last assistant message
         let message = context.messages.iter().rev().find_map(|msg| match &**msg {
-            ContextMessage::Text(TextMessage { content, role: Role::Assistant, .. }) => {
-                Some(content)
-            }
+            ContextMessage::Text(TextMessage {
+                content,
+                role: Role::Assistant,
+                ..
+            }) => Some(content),
             _ => None,
         });
 

@@ -138,7 +138,9 @@ impl ForgeEditMode {
     /// Creates a new `ForgeEditMode` wrapping an Emacs mode with the given
     /// keybindings.
     fn new(keybindings: reedline::Keybindings) -> Self {
-        Self { inner: Emacs::new(keybindings) }
+        Self {
+            inner: Emacs::new(keybindings),
+        }
     }
 }
 

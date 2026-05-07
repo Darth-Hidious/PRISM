@@ -248,7 +248,10 @@ pub struct ToolErrorTracker {
 
 impl ToolErrorTracker {
     pub fn new(limit: usize) -> Self {
-        Self { errors: Default::default(), limit }
+        Self {
+            errors: Default::default(),
+            limit,
+        }
     }
 
     pub fn adjust_record(&mut self, records: &[(ToolCallFull, ToolResult)]) -> &mut Self {

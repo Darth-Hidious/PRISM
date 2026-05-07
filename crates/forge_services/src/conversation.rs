@@ -15,7 +15,9 @@ pub struct ForgeConversationService<S> {
 impl<S: ConversationRepository> ForgeConversationService<S> {
     /// Creates a new ForgeConversationService with the provided repository
     pub fn new(repo: Arc<S>) -> Self {
-        Self { conversation_repository: repo }
+        Self {
+            conversation_repository: repo,
+        }
     }
 }
 

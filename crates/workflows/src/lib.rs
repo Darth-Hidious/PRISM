@@ -14,7 +14,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -1063,10 +1063,9 @@ async fn run_workflow_step(
 
 fn expected_statuses(value: &serde_json::Value) -> Result<Vec<u16>> {
     match value {
-        serde_json::Value::Number(num) => Ok(vec![num
-            .as_u64()
-            .ok_or_else(|| anyhow!("invalid status code"))?
-            as u16]),
+        serde_json::Value::Number(num) => Ok(vec![
+            num.as_u64().ok_or_else(|| anyhow!("invalid status code"))? as u16,
+        ]),
         serde_json::Value::Array(items) => items
             .iter()
             .map(|item| {

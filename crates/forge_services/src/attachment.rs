@@ -52,7 +52,10 @@ impl<
                 .into_iter()
                 .map(|(entry_path, is_dir)| {
                     let normalized_path = format_display_path(&entry_path, &path);
-                    DirectoryEntry { path: normalized_path, is_dir }
+                    DirectoryEntry {
+                        path: normalized_path,
+                        is_dir,
+                    }
                 })
                 .collect();
 
@@ -169,7 +172,10 @@ pub mod tests {
         }
 
         fn get_config(&self) -> anyhow::Result<forge_config::ForgeConfig> {
-            Ok(forge_config::ForgeConfig { max_read_lines: 2000, ..Default::default() })
+            Ok(forge_config::ForgeConfig {
+                max_read_lines: 2000,
+                ..Default::default()
+            })
         }
 
         async fn update_environment(&self, _ops: Vec<ConfigOperation>) -> anyhow::Result<()> {

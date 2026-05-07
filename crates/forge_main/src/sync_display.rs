@@ -18,12 +18,17 @@ impl SyncProgressDisplay for SyncProgress {
             Self::WorkspaceCreated { workspace_id } => {
                 Some(format!("Created workspace: {}", workspace_id))
             }
-            Self::DiscoveringFiles { path: _, workspace_id } => {
-                Some(format!("Analyzing workspace: {workspace_id}"))
-            }
+            Self::DiscoveringFiles {
+                path: _,
+                workspace_id,
+            } => Some(format!("Analyzing workspace: {workspace_id}")),
             Self::FilesDiscovered { count: _ } => None,
             Self::ComparingFiles { .. } => None,
-            Self::DiffComputed { added, deleted, modified } => {
+            Self::DiffComputed {
+                added,
+                deleted,
+                modified,
+            } => {
                 let total = added + deleted + modified;
                 if total == 0 {
                     Some("Index is up to date".to_string())
@@ -49,7 +54,11 @@ impl SyncProgressDisplay for SyncProgress {
                     current, total, file_word
                 ))
             }
-            Self::Completed { uploaded_files, total_files, failed_files } => {
+            Self::Completed {
+                uploaded_files,
+                total_files,
+                failed_files,
+            } => {
                 if *uploaded_files == 0 && *failed_files == 0 {
                     Some(format!(
                         "Index up to date [{} {}]",
@@ -94,7 +103,11 @@ mod tests {
 
     #[test]
     fn test_diff_computed_no_changes() {
-        let fixture = SyncProgress::DiffComputed { added: 0, deleted: 0, modified: 0 };
+        let fixture = SyncProgress::DiffComputed {
+            added: 0,
+            deleted: 0,
+            modified: 0,
+        };
         let actual = fixture.message();
         let expected = Some("Index is up to date".to_string());
         assert_eq!(actual, expected);
@@ -102,7 +115,11 @@ mod tests {
 
     #[test]
     fn test_diff_computed_with_changes() {
-        let fixture = SyncProgress::DiffComputed { added: 3, deleted: 1, modified: 2 };
+        let fixture = SyncProgress::DiffComputed {
+            added: 3,
+            deleted: 1,
+            modified: 2,
+        };
         let actual = fixture.message();
         let expected = Some("Change scan completed [3 added, 2 modified, 1 removed]".to_string());
         assert_eq!(actual, expected);
@@ -110,7 +127,10 @@ mod tests {
 
     #[test]
     fn test_syncing_single_file() {
-        let fixture = SyncProgress::Syncing { current: 1, total: 1 };
+        let fixture = SyncProgress::Syncing {
+            current: 1,
+            total: 1,
+        };
         let actual = fixture.message();
         let expected = Some("Syncing 1/1 file".to_string());
         assert_eq!(actual, expected);
@@ -118,7 +138,10 @@ mod tests {
 
     #[test]
     fn test_syncing_multiple_files() {
-        let fixture = SyncProgress::Syncing { current: 5, total: 10 };
+        let fixture = SyncProgress::Syncing {
+            current: 5,
+            total: 10,
+        };
         let actual = fixture.message();
         let expected = Some("Syncing  5/10 files".to_string());
         assert_eq!(actual, expected);
@@ -126,8 +149,11 @@ mod tests {
 
     #[test]
     fn test_completed_no_uploads() {
-        let fixture =
-            SyncProgress::Completed { uploaded_files: 0, total_files: 100, failed_files: 0 };
+        let fixture = SyncProgress::Completed {
+            uploaded_files: 0,
+            total_files: 100,
+            failed_files: 0,
+        };
         let actual = fixture.message();
         let expected = Some("Index up to date [100 files]".to_string());
         assert_eq!(actual, expected);
@@ -135,8 +161,11 @@ mod tests {
 
     #[test]
     fn test_completed_with_uploads() {
-        let fixture =
-            SyncProgress::Completed { uploaded_files: 5, total_files: 100, failed_files: 0 };
+        let fixture = SyncProgress::Completed {
+            uploaded_files: 5,
+            total_files: 100,
+            failed_files: 0,
+        };
         let actual = fixture.message();
         let expected = Some("Sync completed successfully [5/100 files updated]".to_string());
         assert_eq!(actual, expected);
@@ -144,8 +173,11 @@ mod tests {
 
     #[test]
     fn test_completed_with_failures() {
-        let fixture =
-            SyncProgress::Completed { uploaded_files: 5, total_files: 100, failed_files: 3 };
+        let fixture = SyncProgress::Completed {
+            uploaded_files: 5,
+            total_files: 100,
+            failed_files: 3,
+        };
         let actual = fixture.message();
         let expected =
             Some("Sync completed with errors [5/100 files updated, 3 failed]".to_string());

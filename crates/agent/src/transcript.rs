@@ -556,9 +556,11 @@ mod tests {
         assert!(summary.contains("assistant"));
         // First entry should be the compacted system message
         assert_eq!(store.entries[0].role, "system");
-        assert!(store.entries[0]
-            .content
-            .contains("[Conversation context compacted]"));
+        assert!(
+            store.entries[0]
+                .content
+                .contains("[Conversation context compacted]")
+        );
         // Should have system + 4 recent entries
         assert_eq!(store.entries.len(), 5);
         assert!(store.compacted);

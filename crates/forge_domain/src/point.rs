@@ -62,6 +62,10 @@ pub struct Query {
 
 impl Query {
     pub fn new(embedding: Vec<f32>) -> Self {
-        Self { embedding, limit: None, distance: None }
+        Self {
+            embedding,
+            limit: None,
+            distance: None,
+        }
     }
 }

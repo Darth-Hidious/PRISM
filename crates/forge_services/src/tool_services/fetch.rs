@@ -23,7 +23,9 @@ impl Default for ForgeFetch {
 
 impl ForgeFetch {
     pub fn new() -> Self {
-        Self { client: Client::new() }
+        Self {
+            client: Client::new(),
+        }
     }
 }
 
@@ -124,7 +126,12 @@ impl ForgeFetch {
 
         if is_page_html && !force_raw {
             let content = html2md::parse_html(&page_raw);
-            Ok(HttpResponse { content, context: ResponseContext::Raw, code, content_type })
+            Ok(HttpResponse {
+                content,
+                context: ResponseContext::Raw,
+                code,
+                content_type,
+            })
         } else {
             Ok(HttpResponse {
                 content: page_raw,

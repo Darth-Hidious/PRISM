@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use prism_proto::{NodeCapabilities, NodeMessage, PlatformMessage};
@@ -14,7 +14,7 @@ use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use serde::Serialize;
 use sysinfo::System;
 use tokio::signal;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -1893,7 +1893,9 @@ mod tests {
             }),
         );
 
-        unsafe { std::env::set_var("PRISM_RUNTIME_URL", runtime_url); }
+        unsafe {
+            std::env::set_var("PRISM_RUNTIME_URL", runtime_url);
+        }
         let tmp = TempDir::new().unwrap();
         let paths = PrismPaths {
             config_dir: tmp.path().join("config"),
@@ -1948,13 +1950,17 @@ mod tests {
                 reason,
             } if id == deployment_id && reason == "user_request"
         ));
-        assert!(state::active_deployments(&paths.state_dir)
-            .unwrap()
-            .is_empty());
+        assert!(
+            state::active_deployments(&paths.state_dir)
+                .unwrap()
+                .is_empty()
+        );
 
         health_server.join().unwrap();
         runtime_server.join().unwrap();
-        unsafe { std::env::remove_var("PRISM_RUNTIME_URL"); }
+        unsafe {
+            std::env::remove_var("PRISM_RUNTIME_URL");
+        }
 
         let requests = runtime_requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);

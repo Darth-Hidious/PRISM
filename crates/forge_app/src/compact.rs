@@ -15,7 +15,10 @@ pub struct Compactor {
 
 impl Compactor {
     pub fn new(compact: Compact, environment: Environment) -> Self {
-        Self { compact, environment }
+        Self {
+            compact,
+            environment,
+        }
     }
 
     /// Applies the standard compaction transformer pipeline to a context

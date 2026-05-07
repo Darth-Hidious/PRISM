@@ -13,7 +13,10 @@ impl SearchTerm {
                 line.len()
             );
         }
-        Self { line: line.to_string(), position }
+        Self {
+            line: line.to_string(),
+            position,
+        }
     }
 
     /// Get the search term from the line based on '@' marker or cursor position
@@ -38,7 +41,10 @@ impl SearchTerm {
         let start_pos = at_pos + 1;
         let term = self.line.get(start_pos..safe_position)?;
 
-        Some(TermResult { span: Span::new(start_pos, safe_position), term })
+        Some(TermResult {
+            span: Span::new(start_pos, safe_position),
+            term,
+        })
     }
 }
 

@@ -400,7 +400,10 @@ impl From<&forge_domain::ToolValue> for ToolValueRecord {
     fn from(value: &forge_domain::ToolValue) -> Self {
         match value {
             forge_domain::ToolValue::Text(text) => Self::Text(text.clone()),
-            forge_domain::ToolValue::AI { value, conversation_id } => Self::AI {
+            forge_domain::ToolValue::AI {
+                value,
+                conversation_id,
+            } => Self::AI {
                 value: value.clone(),
                 conversation_id: conversation_id.into_string(),
             },
@@ -416,7 +419,10 @@ impl TryFrom<ToolValueRecord> for forge_domain::ToolValue {
     fn try_from(record: ToolValueRecord) -> anyhow::Result<Self> {
         Ok(match record {
             ToolValueRecord::Text(text) => Self::Text(text),
-            ToolValueRecord::AI { value, conversation_id } => Self::AI {
+            ToolValueRecord::AI {
+                value,
+                conversation_id,
+            } => Self::AI {
                 value,
                 conversation_id: ConversationId::parse(conversation_id)?,
             },
@@ -457,7 +463,10 @@ impl TryFrom<ToolOutputRecord> for forge_domain::ToolOutput {
 
     fn try_from(record: ToolOutputRecord) -> anyhow::Result<Self> {
         let values: Result<Vec<_>, _> = record.values.into_iter().map(TryInto::try_into).collect();
-        Ok(forge_domain::ToolOutput { is_error: record.is_error, values: values? })
+        Ok(forge_domain::ToolOutput {
+            is_error: record.is_error,
+            values: values?,
+        })
     }
 }
 
@@ -554,9 +563,10 @@ impl<'de> Deserialize<'de> for ContextMessageRecord {
             ContextMessageParser::Wrapper { message, usage } => {
                 Ok(ContextMessageRecord { message, usage })
             }
-            ContextMessageParser::Direct(message) => {
-                Ok(ContextMessageRecord { message, usage: None })
-            }
+            ContextMessageParser::Direct(message) => Ok(ContextMessageRecord {
+                message,
+                usage: None,
+            }),
         }
     }
 }

@@ -101,7 +101,11 @@ impl From<WorkspaceAuth> for crate::AuthDetails {
 impl WorkspaceAuth {
     /// Create a new indexing auth record
     pub fn new(user_id: UserId, token: crate::ApiKey) -> Self {
-        Self { user_id, token, created_at: chrono::Utc::now() }
+        Self {
+            user_id,
+            token,
+            created_at: chrono::Utc::now(),
+        }
     }
 }
 
@@ -133,7 +137,11 @@ pub struct CodeBase<T> {
 
 impl<T> CodeBase<T> {
     pub fn new(user_id: UserId, workspace_id: WorkspaceId, data: T) -> Self {
-        Self { user_id, workspace_id, data }
+        Self {
+            user_id,
+            workspace_id,
+            data,
+        }
     }
 }
 
@@ -307,7 +315,10 @@ impl std::ops::Add for FileUploadInfo {
 impl FileUploadInfo {
     /// Create new upload statistics
     pub fn new(nodes_created: usize, relations_created: usize) -> Self {
-        Self { nodes_created, relations_created }
+        Self {
+            nodes_created,
+            relations_created,
+        }
     }
 }
 

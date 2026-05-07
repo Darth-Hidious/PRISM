@@ -22,7 +22,11 @@ impl TryFrom<CreateApiKeyResponse> for WorkspaceAuth {
         let user_id = UserId::from_string(&user_id).context("Invalid user_id returned from API")?;
         let token: ApiKey = response.key.into();
 
-        Ok(WorkspaceAuth { user_id, token, created_at: Utc::now() })
+        Ok(WorkspaceAuth {
+            user_id,
+            token,
+            created_at: Utc::now(),
+        })
     }
 }
 
@@ -76,7 +80,10 @@ impl TryFrom<FileRefNode> for forge_domain::FileHash {
 
     fn try_from(file_ref_node: FileRefNode) -> Result<Self> {
         let data = file_ref_node.data.context("Missing data in FileRefNode")?;
-        Ok(forge_domain::FileHash { path: data.path, hash: data.file_hash })
+        Ok(forge_domain::FileHash {
+            path: data.path,
+            hash: data.file_hash,
+        })
     }
 }
 
@@ -255,7 +262,9 @@ impl<I: GrpcInfra> WorkspaceIndexRepository for ForgeContextEngineRepository<I> 
                         })
                     }
                     node_data::Kind::Note(note) => {
-                        forge_domain::NodeData::Note(forge_domain::Note { content: note.content })
+                        forge_domain::NodeData::Note(forge_domain::Note {
+                            content: note.content,
+                        })
                     }
                     node_data::Kind::Task(task) => {
                         forge_domain::NodeData::Task(forge_domain::Task { task: task.task })
@@ -302,7 +311,9 @@ impl<I: GrpcInfra> WorkspaceIndexRepository for ForgeContextEngineRepository<I> 
         auth_token: &forge_domain::ApiKey,
     ) -> Result<Option<WorkspaceInfo>> {
         let request = tonic::Request::new(GetWorkspaceInfoRequest {
-            workspace_id: Some(proto_generated::WorkspaceId { id: workspace_id.to_string() }),
+            workspace_id: Some(proto_generated::WorkspaceId {
+                id: workspace_id.to_string(),
+            }),
         });
         let request = self.with_auth(request, auth_token)?;
 
@@ -372,7 +383,9 @@ impl<I: GrpcInfra> WorkspaceIndexRepository for ForgeContextEngineRepository<I> 
         auth_token: &forge_domain::ApiKey,
     ) -> Result<()> {
         let request = tonic::Request::new(DeleteWorkspaceRequest {
-            workspace_id: Some(proto_generated::WorkspaceId { id: workspace_id.to_string() }),
+            workspace_id: Some(proto_generated::WorkspaceId {
+                id: workspace_id.to_string(),
+            }),
         });
 
         let request = self.with_auth(request, auth_token)?;

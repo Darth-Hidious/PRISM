@@ -1,19 +1,19 @@
 use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
-use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
+use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::{middleware, Router};
+use axum::{Router, middleware};
 use rust_embed::Embed;
 use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::NodeState;
 use crate::handlers;
 use crate::middleware::{auth_layer, require_permission, resolve_role_layer};
 use crate::ws;
-use crate::NodeState;
 use prism_core::rbac::Permission;
 
 #[derive(Embed)]

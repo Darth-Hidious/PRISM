@@ -14,8 +14,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use prism_agent::command_tools::{command_tools, execute_command_tool, CommandToolRuntime};
-use serde_json::{json, Value};
+use prism_agent::command_tools::{CommandToolRuntime, command_tools, execute_command_tool};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// JSON-RPC 2.0 protocol version this server advertises.

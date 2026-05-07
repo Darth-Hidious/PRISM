@@ -16,7 +16,10 @@ impl<T> MpscStream<T> {
         S: Future<Output = ()> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        MpscStream { join_handle: tokio::spawn(f(tx)), receiver: rx }
+        MpscStream {
+            join_handle: tokio::spawn(f(tx)),
+            receiver: rx,
+        }
     }
 }
 

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::boot::{boot_sequence, BootCheck};
+use crate::boot::{BootCheck, boot_sequence};
 
 pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -138,9 +138,7 @@ fn check_binary(name: &str, candidates: &[&str]) -> BootCheck {
 
 fn check_file(name: &str, path: &std::path::Path, hint_if_missing: &str) -> BootCheck {
     if path.exists() {
-        let size = std::fs::metadata(path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let result = if size > 1_000_000 {
             format!("{} ({} MB)", path.display(), size / 1_048_576)
         } else {

@@ -302,9 +302,10 @@ impl TryFrom<Event> for ChatCompletionMessage {
     fn try_from(value: Event) -> Result<Self, Self::Error> {
         let result = match value {
             Event::ContentBlockStart { content_block, .. }
-            | Event::ContentBlockDelta { delta: content_block, .. } => {
-                ChatCompletionMessage::try_from(content_block)?
-            }
+            | Event::ContentBlockDelta {
+                delta: content_block,
+                ..
+            } => ChatCompletionMessage::try_from(content_block)?,
             Event::MessageStart { message } => {
                 // Extract usage from MessageStart - this contains input token counts
                 ChatCompletionMessage::assistant(Content::part("")).usage(message.usage)
@@ -323,8 +324,10 @@ impl TryFrom<Event> for ChatCompletionMessage {
                     StringOrF64::Number(n) => n,
                     StringOrF64::String(s) => s.parse().unwrap_or(0.0),
                 };
-                ChatCompletionMessage::assistant(Content::part(""))
-                    .usage(forge_domain::Usage { cost: Some(cost_value), ..Default::default() })
+                ChatCompletionMessage::assistant(Content::part("")).usage(forge_domain::Usage {
+                    cost: Some(cost_value),
+                    ..Default::default()
+                })
             }
             _ => ChatCompletionMessage::assistant(Content::part("")),
         };
@@ -340,7 +343,10 @@ impl TryFrom<ContentBlock> for ChatCompletionMessage {
             ContentBlock::Text { text } | ContentBlock::TextDelta { text } => {
                 ChatCompletionMessage::assistant(Content::part(text))
             }
-            ContentBlock::Thinking { thinking, signature } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
                 if let Some(thinking) = thinking {
                     ChatCompletionMessage::assistant(Content::part(""))
                         .reasoning(Content::part(thinking.clone()))
@@ -428,7 +434,9 @@ mod tests {
                 "error",
                 r#"{"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}"#,
                 Event::Error {
-                    error: Error::OverloadedError { message: "Overloaded".to_string() },
+                    error: Error::OverloadedError {
+                        message: "Overloaded".to_string(),
+                    },
                 },
             ),
             (
@@ -457,7 +465,9 @@ mod tests {
                 r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
                 Event::ContentBlockStart {
                     index: 0,
-                    content_block: ContentBlock::Text { text: "".to_string() },
+                    content_block: ContentBlock::Text {
+                        text: "".to_string(),
+                    },
                 },
             ),
             ("ping", r#"{"type": "ping"}"#, Event::Ping { cost: None }),
@@ -466,7 +476,9 @@ mod tests {
                 r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
                 Event::ContentBlockDelta {
                     index: 0,
-                    delta: ContentBlock::TextDelta { text: "Hello".to_string() },
+                    delta: ContentBlock::TextDelta {
+                        text: "Hello".to_string(),
+                    },
                 },
             ),
             (
@@ -474,7 +486,9 @@ mod tests {
                 r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"!"}}"#,
                 Event::ContentBlockDelta {
                     index: 0,
-                    delta: ContentBlock::TextDelta { text: "!".to_string() },
+                    delta: ContentBlock::TextDelta {
+                        text: "!".to_string(),
+                    },
                 },
             ),
             (
@@ -486,7 +500,10 @@ mod tests {
                 "message_delta",
                 r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":12}}"#,
                 Event::MessageDelta {
-                    delta: MessageDelta { stop_reason: StopReason::EndTurn, stop_sequence: None },
+                    delta: MessageDelta {
+                        stop_reason: StopReason::EndTurn,
+                        stop_sequence: None,
+                    },
                     usage: Usage {
                         input_tokens: None,
                         output_tokens: Some(12),
@@ -797,7 +814,9 @@ mod tests {
 
         let actual: Event = serde_json::from_str(fixture).unwrap();
 
-        let expected = Event::Ping { cost: Some(StringOrF64::String("0.00724710".into())) };
+        let expected = Event::Ping {
+            cost: Some(StringOrF64::String("0.00724710".into())),
+        };
         assert_eq!(actual, expected);
     }
 
@@ -808,18 +827,25 @@ mod tests {
 
         let actual: Event = serde_json::from_str(fixture).unwrap();
 
-        let expected = Event::Ping { cost: Some(StringOrF64::Number(0.05)) };
+        let expected = Event::Ping {
+            cost: Some(StringOrF64::Number(0.05)),
+        };
         assert_eq!(actual, expected);
     }
 
     #[test]
     fn test_ping_event_with_cost_produces_usage() {
         // Fixture: Ping event with cost should produce a usage with cost
-        let fixture = Event::Ping { cost: Some(StringOrF64::Number(0.00724710)) };
+        let fixture = Event::Ping {
+            cost: Some(StringOrF64::Number(0.00724710)),
+        };
 
         let actual = ChatCompletionMessage::try_from(fixture).unwrap();
 
-        let expected_usage = forge_domain::Usage { cost: Some(0.00724710), ..Default::default() };
+        let expected_usage = forge_domain::Usage {
+            cost: Some(0.00724710),
+            ..Default::default()
+        };
         assert_eq!(actual.usage, Some(expected_usage));
     }
 

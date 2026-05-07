@@ -134,7 +134,10 @@ impl Error {
     }
 
     pub fn env_var_not_found(provider: ProviderId, env_var: &str) -> Self {
-        Self::EnvironmentVariableNotFound { provider, env_var: env_var.to_string() }
+        Self::EnvironmentVariableNotFound {
+            provider,
+            env_var: env_var.to_string(),
+        }
     }
 
     pub fn provider_not_available(provider: ProviderId) -> Self {
@@ -142,7 +145,9 @@ impl Error {
     }
 
     pub fn vertex_ai_config(message: impl Into<String>) -> Self {
-        Self::VertexAiConfiguration { message: message.into() }
+        Self::VertexAiConfiguration {
+            message: message.into(),
+        }
     }
 
     pub fn sync_failed(count: usize) -> Self {

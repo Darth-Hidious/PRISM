@@ -111,7 +111,9 @@ pub async fn run(
                         std::env::set_var("OPENAI_URL", &proxy_url);
                         std::env::set_var("OPENAI_API_KEY", &creds.access_token);
                     }
-                    if let Err(e) = upsert_openai_compatible_credential(&proxy_url, &creds.access_token) {
+                    if let Err(e) =
+                        upsert_openai_compatible_credential(&proxy_url, &creds.access_token)
+                    {
                         eprintln!("\x1b[33m[prism]\x1b[0m credential upsert failed: {e:#}");
                     }
                     Some(handle)
@@ -141,8 +143,8 @@ pub async fn run(
         }
     }
 
-    let mut config = ForgeConfig::read()
-        .context("Failed to read Forge configuration from .forge.toml")?;
+    let mut config =
+        ForgeConfig::read().context("Failed to read Forge configuration from .forge.toml")?;
     if config.session.is_none() {
         config.session = Some(ModelConfig {
             provider_id: DEFAULT_PROVIDER_ID.to_string(),
@@ -197,11 +199,7 @@ async fn start_tool_router() -> Result<Arc<ToolRouter>> {
     if let Some(fp) = config.function_gguf.as_ref() {
         match prism_tool_router::ensure_model(&config.function_remote, fp).await {
             Ok(_) => boot::status_line("Router model", true, &short_path(fp)),
-            Err(e) => boot::status_line(
-                "Router model",
-                false,
-                &short_error(&e),
-            ),
+            Err(e) => boot::status_line("Router model", false, &short_error(&e)),
         }
     }
 
@@ -285,10 +283,8 @@ fn upsert_openai_compatible_credential(proxy_url: &str, access_token: &str) -> R
         entries.push(entry);
     }
 
-    let text = serde_json::to_string_pretty(&entries)
-        .context("serialising credentials")?;
-    std::fs::write(&path, text)
-        .with_context(|| format!("writing {}", path.display()))?;
+    let text = serde_json::to_string_pretty(&entries).context("serialising credentials")?;
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -320,11 +316,8 @@ fn register_prism_mcp_servers(project_root: &Path, python_path: &Path) -> Result
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "prism".to_string());
-    let rust_server = McpServerConfig::new_stdio(
-        prism_exe,
-        vec!["mcp-server-native".to_string()],
-        None,
-    );
+    let rust_server =
+        McpServerConfig::new_stdio(prism_exe, vec!["mcp-server-native".to_string()], None);
 
     // prism-python: FastMCP server for the materials-science Python tools.
     // Re-enabled in Stage 2 because the EmbeddingGemma-backed semantic
@@ -357,8 +350,7 @@ fn register_prism_mcp_servers(project_root: &Path, python_path: &Path) -> Result
     }
 
     if needs_write {
-        let text = serde_json::to_string_pretty(&config)
-            .context("serialising MCP config")?;
+        let text = serde_json::to_string_pretty(&config).context("serialising MCP config")?;
         std::fs::write(&mcp_path, text)
             .with_context(|| format!("writing {}", mcp_path.display()))?;
     }

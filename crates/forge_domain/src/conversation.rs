@@ -57,7 +57,10 @@ pub struct MetaData {
 
 impl MetaData {
     pub fn new(created_at: DateTime<Utc>) -> Self {
-        Self { created_at, updated_at: None }
+        Self {
+            created_at,
+            updated_at: None,
+        }
     }
 }
 
@@ -189,7 +192,10 @@ impl Conversation {
                     .filter_map(|msg| msg.as_tool_result())
                     .flat_map(|result| &result.output.values)
                     .filter_map(|value| {
-                        if let crate::ToolValue::AI { conversation_id, .. } = value {
+                        if let crate::ToolValue::AI {
+                            conversation_id, ..
+                        } = value
+                        {
                             Some(conversation_id)
                         } else {
                             None
@@ -287,7 +293,10 @@ mod tests {
 
         // Create main conversation with cost
         // Create main conversation with cost
-        let main_usage = Usage { cost: Some(0.01), ..Usage::default() };
+        let main_usage = Usage {
+            cost: Some(0.01),
+            ..Usage::default()
+        };
         let main_entry: MessageEntry =
             ContextMessage::assistant("Response", None, None, None).into();
         let main_context = Context::default()
@@ -297,7 +306,10 @@ mod tests {
         let main_conv = Conversation::generate().context(main_context);
 
         // Create related conversations with costs
-        let related_usage_1 = Usage { cost: Some(0.02), ..Usage::default() };
+        let related_usage_1 = Usage {
+            cost: Some(0.02),
+            ..Usage::default()
+        };
         let related_entry_1: MessageEntry =
             ContextMessage::assistant("Result 1", None, None, None).into();
         let related_context_1 = Context::default()
@@ -306,7 +318,10 @@ mod tests {
 
         let related_conv_1 = Conversation::generate().context(related_context_1);
 
-        let related_usage_2 = Usage { cost: Some(0.03), ..Usage::default() };
+        let related_usage_2 = Usage {
+            cost: Some(0.03),
+            ..Usage::default()
+        };
         let related_entry_2: MessageEntry =
             ContextMessage::assistant("Result 2", None, None, None).into();
         let related_context_2 = Context::default()
@@ -341,7 +356,10 @@ mod tests {
         let main_conv = Conversation::generate();
 
         // Related conversation has cost
-        let related_usage = Usage { cost: Some(0.05), ..Usage::default() };
+        let related_usage = Usage {
+            cost: Some(0.05),
+            ..Usage::default()
+        };
         let related_entry: MessageEntry =
             ContextMessage::assistant("Result", None, None, None).into();
         let related_context = Context::default()

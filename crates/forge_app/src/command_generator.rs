@@ -218,7 +218,10 @@ mod tests {
             Ok(self
                 .files
                 .iter()
-                .map(|(path, is_dir)| File { path: path.clone(), is_dir: *is_dir })
+                .map(|(path, is_dir)| File {
+                    path: path.clone(),
+                    is_dir: *is_dir,
+                })
                 .collect())
         }
 
@@ -226,7 +229,10 @@ mod tests {
             let mut files: Vec<File> = self
                 .files
                 .iter()
-                .map(|(path, is_dir)| File { path: path.clone(), is_dir: *is_dir })
+                .map(|(path, is_dir)| File {
+                    path: path.clone(),
+                    is_dir: *is_dir,
+                })
                 .collect();
 
             // Sort: directories first (alphabetically), then files (alphabetically)

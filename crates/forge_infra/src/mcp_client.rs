@@ -230,7 +230,10 @@ impl ForgeMcpClient {
             Err(_e) => {
                 let transport = SseClientTransport::start_with_client(
                     client.as_ref().clone(),
-                    SseClientConfig { sse_endpoint: http.url.clone().into(), ..Default::default() },
+                    SseClientConfig {
+                        sse_endpoint: http.url.clone().into(),
+                        ..Default::default()
+                    },
                 )
                 .await?;
                 Ok(self.client_info().serve(transport).await?)

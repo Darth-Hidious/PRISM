@@ -431,7 +431,10 @@ pub struct SearchQuery {
 impl SearchQuery {
     /// Creates a new search query with the given query and use_case
     pub fn new(query: impl Into<String>, use_case: impl Into<String>) -> Self {
-        Self { query: query.into(), use_case: use_case.into() }
+        Self {
+            query: query.into(),
+            use_case: use_case.into(),
+        }
     }
 }
 
@@ -1049,7 +1052,9 @@ impl ToolCatalog {
 
     /// Creates a Remove tool call with the specified path
     pub fn tool_call_remove(path: &str) -> ToolCallFull {
-        ToolCallFull::from(ToolCatalog::Remove(FSRemove { path: path.to_string() }))
+        ToolCallFull::from(ToolCatalog::Remove(FSRemove {
+            path: path.to_string(),
+        }))
     }
 
     /// Creates a Shell tool call with the specified command and working
@@ -1078,7 +1083,9 @@ impl ToolCatalog {
 
     /// Creates an Undo tool call with the specified path
     pub fn tool_call_undo(path: &str) -> ToolCallFull {
-        ToolCallFull::from(ToolCatalog::Undo(FSUndo { path: path.to_string() }))
+        ToolCallFull::from(ToolCatalog::Undo(FSUndo {
+            path: path.to_string(),
+        }))
     }
 
     /// Creates a Fetch tool call with the specified url
@@ -1213,7 +1220,12 @@ impl From<ToolCatalog> for ToolCallFull {
             ToolCallArguments::default()
         };
 
-        ToolCallFull { name, call_id: None, arguments, thought_signature: None }
+        ToolCallFull {
+            name,
+            call_id: None,
+            arguments,
+            thought_signature: None,
+        }
     }
 }
 

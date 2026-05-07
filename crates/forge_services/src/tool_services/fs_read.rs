@@ -205,7 +205,10 @@ impl<F: FileInfoInfra + EnvironmentInfra<Config = forge_config::ForgeConfig> + I
 
         let file_info = FileInfo::new(start_line, end_line, total_lines, hash);
 
-        Ok(ReadOutput { content: Content::file(content), info: file_info })
+        Ok(ReadOutput {
+            content: Content::file(content),
+            info: file_info,
+        })
     }
 }
 

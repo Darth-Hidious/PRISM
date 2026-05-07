@@ -65,7 +65,11 @@ pub async fn ensure_model(remote: &ModelRemote, dest: &Path) -> Result<bool> {
     let prefix = remote.file.clone();
     let print_progress = |done: u64, total: Option<u64>| {
         use std::io::{IsTerminal, Write};
-        let cr = if std::io::stderr().is_terminal() { "\r" } else { "\n" };
+        let cr = if std::io::stderr().is_terminal() {
+            "\r"
+        } else {
+            "\n"
+        };
         match total {
             Some(t) if t > 0 => {
                 let pct = (done as f64 / t as f64).min(1.0);
@@ -131,6 +135,8 @@ fn read_hf_token() -> Option<String> {
     }
     let home = std::env::var_os("HOME")?;
     let p = std::path::PathBuf::from(home).join(".cache/huggingface/token");
-    std::fs::read_to_string(p).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(p)
+        .ok()
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }

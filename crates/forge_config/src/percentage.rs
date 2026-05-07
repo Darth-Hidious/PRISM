@@ -128,7 +128,9 @@ mod tests {
         struct Fixture {
             value: Percentage,
         }
-        let fixture = Fixture { value: Percentage::new(0.2).unwrap() };
+        let fixture = Fixture {
+            value: Percentage::new(0.2).unwrap(),
+        };
         let actual = toml_edit::ser::to_string_pretty(&fixture).unwrap();
         let expected = "value = 0.2\n";
         assert_eq!(actual, expected);

@@ -44,12 +44,27 @@ impl FormatContent for ToolOperation {
             ToolOperation::TodoRead { output } => {
                 Some(ChatResponseContent::ToolOutput(format_todos(output)))
             }
-            ToolOperation::FsRead { input: _, output: _ }
-            | ToolOperation::FsRemove { input: _, output: _ }
-            | ToolOperation::FsSearch { input: _, output: _ }
+            ToolOperation::FsRead {
+                input: _,
+                output: _,
+            }
+            | ToolOperation::FsRemove {
+                input: _,
+                output: _,
+            }
+            | ToolOperation::FsSearch {
+                input: _,
+                output: _,
+            }
             | ToolOperation::CodebaseSearch { output: _ }
-            | ToolOperation::FsUndo { input: _, output: _ }
-            | ToolOperation::NetFetch { input: _, output: _ }
+            | ToolOperation::FsUndo {
+                input: _,
+                output: _,
+            }
+            | ToolOperation::NetFetch {
+                input: _,
+                output: _,
+            }
             | ToolOperation::Shell { output: _ }
             | ToolOperation::FollowUp { output: _ }
             | ToolOperation::Skill { output: _ } => None,
@@ -110,7 +125,10 @@ mod tests {
         let fixture = ToolOperation::FsRead {
             input: forge_domain::FSRead {
                 file_path: "/home/user/test.txt".to_string(),
-                range: Some(forge_domain::FSReadRange { start_line: Some(2), end_line: Some(4) }),
+                range: Some(forge_domain::FSReadRange {
+                    start_line: Some(2),
+                    end_line: Some(4),
+                }),
                 show_line_numbers: true,
             },
             output: ReadOutput {
@@ -209,8 +227,12 @@ mod tests {
     #[test]
     fn test_fs_remove() {
         let fixture = ToolOperation::FsRemove {
-            input: forge_domain::FSRemove { path: "/home/user/project/file.txt".to_string() },
-            output: FsRemoveOutput { content: "".to_string() },
+            input: forge_domain::FSRemove {
+                path: "/home/user/project/file.txt".to_string(),
+            },
+            output: FsRemoveOutput {
+                content: "".to_string(),
+            },
         };
         let env = fixture_environment();
 
@@ -354,7 +376,9 @@ mod tests {
     #[test]
     fn test_fs_undo() {
         let fixture = ToolOperation::FsUndo {
-            input: forge_domain::FSUndo { path: "/home/user/project/test.txt".to_string() },
+            input: forge_domain::FSUndo {
+                path: "/home/user/project/test.txt".to_string(),
+            },
             output: FsUndoOutput {
                 before_undo: Some("ABC".to_string()),
                 after_undo: Some("PQR".to_string()),

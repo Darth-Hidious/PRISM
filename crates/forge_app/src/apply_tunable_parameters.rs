@@ -9,7 +9,10 @@ pub struct ApplyTunableParameters {
 
 impl ApplyTunableParameters {
     pub const fn new(agent: Agent, tool_definitions: Vec<ToolDefinition>) -> Self {
-        Self { agent, tool_definitions }
+        Self {
+            agent,
+            tool_definitions,
+        }
     }
 
     pub fn apply(self, mut conversation: Conversation) -> Conversation {

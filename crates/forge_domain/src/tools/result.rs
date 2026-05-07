@@ -97,12 +97,18 @@ impl ToolOutput {
     pub fn ai(id: ConversationId, output: impl ToString) -> Self {
         ToolOutput {
             is_error: Default::default(),
-            values: vec![ToolValue::AI { value: output.to_string(), conversation_id: id }],
+            values: vec![ToolValue::AI {
+                value: output.to_string(),
+                conversation_id: id,
+            }],
         }
     }
 
     pub fn image(img: Image) -> Self {
-        ToolOutput { is_error: false, values: vec![ToolValue::Image(img)] }
+        ToolOutput {
+            is_error: false,
+            values: vec![ToolValue::Image(img)],
+        }
     }
 
     pub fn combine_mut(&mut self, value: ToolOutput) {
@@ -112,7 +118,10 @@ impl ToolOutput {
     pub fn combine(self, other: ToolOutput) -> Self {
         let mut items = self.values;
         items.extend(other.values);
-        ToolOutput { values: items, is_error: self.is_error || other.is_error }
+        ToolOutput {
+            values: items,
+            is_error: self.is_error || other.is_error,
+        }
     }
 
     /// Returns the first item as a string if it exists

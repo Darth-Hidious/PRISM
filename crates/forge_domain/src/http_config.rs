@@ -265,7 +265,10 @@ mod tests {
 
     #[test]
     fn test_http_config_accept_invalid_certs_custom() {
-        let config = HttpConfig { accept_invalid_certs: true, ..HttpConfig::default() };
+        let config = HttpConfig {
+            accept_invalid_certs: true,
+            ..HttpConfig::default()
+        };
         assert!(config.accept_invalid_certs);
     }
 

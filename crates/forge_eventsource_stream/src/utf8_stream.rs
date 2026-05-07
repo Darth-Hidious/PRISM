@@ -22,7 +22,11 @@ pub struct Utf8Stream<S> {
 
 impl<S> Utf8Stream<S> {
     pub fn new(stream: S) -> Self {
-        Self { stream, buffer: Vec::new(), terminated: false }
+        Self {
+            stream,
+            buffer: Vec::new(),
+            terminated: false,
+        }
     }
 }
 

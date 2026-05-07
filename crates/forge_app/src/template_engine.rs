@@ -129,7 +129,9 @@ pub struct TemplateEngine<'a> {
 
 impl Default for TemplateEngine<'_> {
     fn default() -> Self {
-        Self { handlebar: HANDLEBARS.clone() }
+        Self {
+            handlebar: HANDLEBARS.clone(),
+        }
     }
 }
 
@@ -217,7 +219,10 @@ mod tests {
         let hb = create_handlebar();
         let template = r#"{{#if (contains numbers 42)}}found{{else}}not found{{/if}}"#;
 
-        let fixture = TestData { items: vec![], numbers: vec![10, 20, 42, 50] };
+        let fixture = TestData {
+            items: vec![],
+            numbers: vec![10, 20, 42, 50],
+        };
 
         let actual = hb.render_template(template, &fixture).unwrap();
         let expected = "found";
@@ -230,7 +235,10 @@ mod tests {
         let hb = create_handlebar();
         let template = r#"{{#if (contains numbers 99)}}found{{else}}not found{{/if}}"#;
 
-        let fixture = TestData { items: vec![], numbers: vec![10, 20, 42, 50] };
+        let fixture = TestData {
+            items: vec![],
+            numbers: vec![10, 20, 42, 50],
+        };
 
         let actual = hb.render_template(template, &fixture).unwrap();
         let expected = "not found";
@@ -243,7 +251,10 @@ mod tests {
         let hb = create_handlebar();
         let template = r#"{{#if (contains items "apple")}}found{{else}}not found{{/if}}"#;
 
-        let fixture = TestData { items: vec![], numbers: vec![] };
+        let fixture = TestData {
+            items: vec![],
+            numbers: vec![],
+        };
 
         let actual = hb.render_template(template, &fixture).unwrap();
         let expected = "not found";

@@ -216,7 +216,11 @@ impl<W: Write> Renderer<W> {
                 self.code_buffer.clear();
             }
 
-            ParseEvent::ListItem { indent, bullet, content } => {
+            ParseEvent::ListItem {
+                indent,
+                bullet,
+                content,
+            } => {
                 let margin = self.left_margin();
                 let width = self.current_width();
                 let lines = render_list_item(

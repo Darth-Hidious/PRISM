@@ -14,7 +14,10 @@ pub struct ConversationRepositoryImpl {
 
 impl ConversationRepositoryImpl {
     pub fn new(pool: Arc<DatabasePool>, workspace_id: WorkspaceHash) -> Self {
-        Self { pool, wid: workspace_id }
+        Self {
+            pool,
+            wid: workspace_id,
+        }
     }
 
     async fn run_blocking<F, T>(&self, operation: F) -> anyhow::Result<T>

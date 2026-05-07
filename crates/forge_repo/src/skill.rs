@@ -402,7 +402,9 @@ mod tests {
     #[test]
     fn test_load_builtin_skills() {
         // Fixture
-        let repo = ForgeSkillRepository { infra: Arc::new(()) };
+        let repo = ForgeSkillRepository {
+            infra: Arc::new(()),
+        };
 
         // Act
         let actual = repo.load_builtin_skills();

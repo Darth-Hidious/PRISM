@@ -47,7 +47,9 @@ impl MessagePattern {
     ///   - `'t'` for Assistant with tool call
     ///   - `'r'` for Tool result
     pub fn new(pattern: impl Into<String>) -> Self {
-        Self { pattern: pattern.into() }
+        Self {
+            pattern: pattern.into(),
+        }
     }
 
     /// Builds a Context from the pattern.

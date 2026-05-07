@@ -10,7 +10,11 @@ pub struct JsonRepairParser {
 
 impl JsonRepairParser {
     pub fn new(text: String) -> Self {
-        Self { chars: text.chars().collect(), i: 0, output: String::new() }
+        Self {
+            chars: text.chars().collect(),
+            i: 0,
+            output: String::new(),
+        }
     }
 
     pub fn parse<De: for<'de> Deserialize<'de>>(mut self) -> Result<De> {
@@ -18,7 +22,9 @@ impl JsonRepairParser {
 
         let processed = self.parse_value()?;
         if !processed {
-            return Err(JsonRepairError::UnexpectedEnd { position: self.chars.len() });
+            return Err(JsonRepairError::UnexpectedEnd {
+                position: self.chars.len(),
+            });
         }
 
         self.parse_markdown_code_block(&["```", "```]", "```}"]);

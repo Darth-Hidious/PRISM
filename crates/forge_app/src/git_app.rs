@@ -114,7 +114,10 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> GitApp<
         diff: Option<String>,
         additional_context: Option<String>,
     ) -> Result<CommitResult> {
-        let CommitMessageDetails { message, has_staged_files } = self
+        let CommitMessageDetails {
+            message,
+            has_staged_files,
+        } = self
             .generate_commit_message(max_diff_size, diff, additional_context)
             .await?;
 
@@ -174,7 +177,12 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> GitApp<
             )
         };
 
-        Ok(CommitResult { message, committed: true, has_staged_files, git_output })
+        Ok(CommitResult {
+            message,
+            committed: true,
+            has_staged_files,
+            git_output,
+        })
     }
 
     /// Generates a commit message based on staged git changes and returns

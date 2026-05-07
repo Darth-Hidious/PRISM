@@ -23,7 +23,11 @@ pub struct ForgeCommandExecutorService {
 
 impl ForgeCommandExecutorService {
     pub fn new(env: Environment, output_printer: Arc<StdConsoleWriter>) -> Self {
-        Self { env, output_printer, ready: Arc::new(Mutex::new(())) }
+        Self {
+            env,
+            output_printer,
+            ready: Arc::new(Mutex::new(())),
+        }
     }
 
     fn prepare_command(
@@ -157,11 +161,17 @@ struct OutputPrinterWriter {
 
 impl OutputPrinterWriter {
     fn stdout(printer: Arc<StdConsoleWriter>) -> Self {
-        Self { printer, is_stdout: true }
+        Self {
+            printer,
+            is_stdout: true,
+        }
     }
 
     fn stderr(printer: Arc<StdConsoleWriter>) -> Self {
-        Self { printer, is_stdout: false }
+        Self {
+            printer,
+            is_stdout: false,
+        }
     }
 }
 

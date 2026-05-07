@@ -24,7 +24,11 @@ impl UserCommand {
         value: V,
         parameters: Vec<String>,
     ) -> Self {
-        Self { name: name.to_string(), template: value.into(), parameters }
+        Self {
+            name: name.to_string(),
+            template: value.into(),
+            parameters,
+        }
     }
 }
 
@@ -104,7 +108,10 @@ pub struct EventContextValue {
 
 impl EventContextValue {
     pub fn new<S: Into<String>>(value: S) -> Self {
-        Self { name: String::new(), value: value.into() }
+        Self {
+            name: String::new(),
+            value: value.into(),
+        }
     }
 }
 
