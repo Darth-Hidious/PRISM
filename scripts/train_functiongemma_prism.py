@@ -37,10 +37,31 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from datasets import load_dataset
-from huggingface_hub import HfApi, login
-from trl import SFTConfig, SFTTrainer
-from unsloth import FastLanguageModel
+# Disable torch._dynamo BEFORE importing torch/transformers/unsloth so the
+# patched modules never spin up the Python config singleton that dill/pickle
+# can't serialise. Five prior fine-tune attempts on HF Jobs all crashed with
+# `cannot pickle 'ConfigModuleInstance' object` because TRL's accelerator
+# internals call _save_with_postproc on training-loop state that includes
+# closures capturing torch._dynamo's config. The cleanest workaround is to
+# turn dynamo off entirely — slower training, but stable.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+os.environ.setdefault("UNSLOTH_DISABLE_TORCH_COMPILE", "1")
+
+from datasets import load_dataset  # noqa: E402
+from huggingface_hub import HfApi, login  # noqa: E402
+from trl import SFTConfig, SFTTrainer  # noqa: E402
+from unsloth import FastLanguageModel  # noqa: E402
+
+# Belt and suspenders: also flip the runtime config flags after import in
+# case some deps already imported torch._dynamo before our env flag was read.
+try:
+    import torch._dynamo as _dynamo  # noqa: E402
+
+    _dynamo.config.suppress_errors = True
+    _dynamo.config.disable = True
+except Exception:
+    pass
 
 BASE_MODEL = "unsloth/functiongemma-270m-it"
 HUB_USER = "Darth-Hidious"
