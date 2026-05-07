@@ -2,66 +2,61 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
+#     # Match Unsloth's official FunctionGemma_(270M)-Mobile-Actions notebook.
+#     # Pinning TRL/transformers explicitly overrode Unsloth's bundled compat
+#     # layer and caused 10 failed runs (tokenizer kwarg drift, processing_class
+#     # rename, ConfigModuleInstance pickle, entropy_from_logits, missing rich,
+#     # assistant-only-loss template incompat). Trust Unsloth's pin instead —
+#     # they ship a stack that's been validated against this exact base model.
 #     "unsloth",
 #     "datasets>=3.0.0",
-#     "transformers>=4.46.0",
-#     "trl==0.11.4",
-#     "peft>=0.13.0",
-#     "accelerate>=1.0.0",
 #     "huggingface_hub",
 # ]
 # ///
 """
-Fine-tune FunctionGemma-270M on Google's Mobile Actions corpus.
+Fine-tune FunctionGemma-270M on Google's Mobile Actions corpus, then push
+the merged model + a Q4_K_M GGUF to Darth-Hidious/functiongemma-prism-gguf
+so PRISM picks it up on next launch.
 
-CORRECTNESS NOTES (lessons from a previous local MLX run that overfit):
-  - Dataset rows stay in CHAT FORMAT (`messages` + `tools` fields). NOT
-    pre-rendered to raw text. SFTTrainer applies the tokenizer's chat
-    template internally and gets the assistant token spans right.
-  - `assistant_only_loss=True` in SFTConfig masks the developer/user/tool
-    tokens and only flows loss through the assistant tool_call output.
-    Without this the model learns to predict the dataset's prompts
-    verbatim and inference collapses.
-  - We push the merged HF model + a Q4_K_M GGUF to private repos under
-    `Darth-Hidious/`. PRISM downloads the GGUF on next launch.
+This rewrite tracks the official Unsloth notebook as closely as possible:
+  https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/FunctionGemma_(270M)-Mobile-Actions.ipynb
 
-Submitted via HF Jobs:
+Key correctness commitments (lessons from 10 failed prior runs):
+  - load_in_16bit=True (Unsloth's recommended FunctionGemma path; was False)
+  - Pre-rendering with tokenizer.apply_chat_template + dataset_text_field="text"
+    (was passing raw messages+tools, which only worked under TRL's
+    deprecated assistant_only_loss path)
+  - train_on_responses_only WRAPS the trainer post-construction with
+    explicit instruction_part / response_part markers — this is Unsloth's
+    blessed loss-masking path and replaces TRL's broken
+    assistant_only_loss=True for chat templates without {% generation %}
+  - optim="adamw_8bit" (matches notebook; bitsandbytes optimizer)
+  - learning_rate=2e-4 (matches notebook)
+  - No TRL/transformers/peft pin — let Unsloth bring in versions it tested
+
+Submitted via HF Jobs (one shot, after local --smoke validation):
     hf jobs uv run --flavor a10g-large --timeout 2h --secrets HF_TOKEN \\
-        "https://huggingface.co/Darth-Hidious/functiongemma-prism-train/resolve/main/train.py"
+        scripts/train_functiongemma_prism.py
 """
 
-import json
+import argparse
 import os
 import shutil
 import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 
 # Disable torch._dynamo BEFORE importing torch/transformers/unsloth so the
-# patched modules never spin up the Python config singleton that dill/pickle
-# can't serialise. Five prior fine-tune attempts on HF Jobs all crashed with
-# `cannot pickle 'ConfigModuleInstance' object` because TRL's accelerator
-# internals call _save_with_postproc on training-loop state that includes
-# closures capturing torch._dynamo's config. The cleanest workaround is to
-# turn dynamo off entirely — slower training, but stable.
+# Unsloth gradient-checkpointing wrapper never captures torch._dynamo's
+# config singleton in a closure (multiple early runs failed with
+# "cannot pickle 'ConfigModuleInstance' object" until this).
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 os.environ.setdefault("UNSLOTH_DISABLE_TORCH_COMPILE", "1")
 
 from datasets import load_dataset  # noqa: E402
 from huggingface_hub import HfApi, login  # noqa: E402
-from trl import SFTConfig, SFTTrainer  # noqa: E402
-from unsloth import FastLanguageModel  # noqa: E402
-
-# Belt and suspenders: also flip the runtime config flags after import in
-# case some deps already imported torch._dynamo before our env flag was read.
-try:
-    import torch._dynamo as _dynamo  # noqa: E402
-
-    _dynamo.config.suppress_errors = True
-    _dynamo.config.disable = True
-except Exception:
-    pass
 
 BASE_MODEL = "unsloth/functiongemma-270m-it"
 HUB_USER = "Darth-Hidious"
@@ -75,53 +70,50 @@ LORA_RANK = 16
 LORA_ALPHA = 16
 
 
-def hf_login():
+def hf_login() -> None:
     token = os.environ.get("HF_TOKEN")
     if not token:
         raise RuntimeError("HF_TOKEN not set; pass --secrets HF_TOKEN to hf jobs")
     login(token=token)
 
 
-def normalise_messages(messages):
-    """Mobile Actions stores tool-call args as Python dicts with non-JSON-
-    friendly types (datetime). FunctionGemma's chat template needs string-
-    ifiable JSON in `arguments`; drop None args and json-dump."""
-    out = []
-    for m in messages:
-        role = m["role"]
-        if role == "assistant" and m.get("tool_calls"):
-            calls = []
-            for c in m["tool_calls"]:
-                fn = c["function"]
-                args = fn.get("arguments", {}) or {}
-                if isinstance(args, dict):
-                    args = {k: v for k, v in args.items() if v is not None}
-                calls.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": fn["name"],
-                            "arguments": json.dumps(args, default=str),
-                        },
-                    }
-                )
-            out.append({"role": "assistant", "content": "", "tool_calls": calls})
-        else:
-            out.append({"role": role, "content": m.get("content") or ""})
-    return out
+def build_dataset(tokenizer, smoke: bool = False):
+    """Render Mobile Actions chat-format rows to a flat `text` field via
+    `tokenizer.apply_chat_template`. Matches the Unsloth notebook's
+    `process_dataset` exactly so the assistant-token spans line up with
+    `train_on_responses_only`'s `<start_of_turn>model\\n` marker."""
+    raw = load_dataset(DATASET, split="train")
+
+    def _process(row):
+        text = tokenizer.apply_chat_template(
+            row["messages"],
+            tools=row["tools"],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        return {"text": text}
+
+    train_split = raw.filter(lambda r: r["metadata"] == "train")
+    eval_split = raw.filter(lambda r: r["metadata"] == "eval")
+    if smoke:
+        # Local smoke: take 5 rows from each split to validate end-to-end
+        # without spending real compute.
+        train_split = train_split.select(range(min(5, len(train_split))))
+        eval_split = eval_split.select(range(min(5, len(eval_split))))
+
+    train_rows = train_split.map(
+        _process, remove_columns=raw.column_names, num_proc=1
+    )
+    eval_rows = eval_split.map(
+        _process, remove_columns=raw.column_names, num_proc=1
+    )
+    return train_rows, eval_rows
 
 
-def reformat_row(row):
-    return {
-        "messages": normalise_messages(row["messages"]),
-        "tools": row["tools"],
-    }
-
-
-def push_gguf(merged_dir: Path, work_dir: Path):
+def push_gguf(merged_dir: Path, work_dir: Path) -> None:
     """Convert the merged HF model to GGUF Q4_K_M and push to a private
-    repo so PRISM (and other clients) can pull it. We pin the converter
-    to a llama.cpp tag known to handle gemma3_text without referencing a
+    repo so PRISM (and other clients) can pull it. Pinned converter at
+    llama.cpp b6700 — known to handle gemma3_text without referencing a
     not-yet-released GEMMA4 enum."""
     convert_url = "https://raw.githubusercontent.com/ggml-org/llama.cpp/b6700/convert_hf_to_gguf.py"
     convert_path = work_dir / "convert_hf_to_gguf.py"
@@ -140,9 +132,6 @@ def push_gguf(merged_dir: Path, work_dir: Path):
         check=True,
     )
 
-    # llama-quantize binary: install llama-cpp's CPU build via pip wheel
-    # ("llama-cpp-python" exposes the binary under its bin dir on most jobs).
-    # Fallback: use gguf-py's quantize via Python.
     quantize_bin = shutil.which("llama-quantize") or shutil.which("quantize")
     q4 = work_dir / "functiongemma-prism-Q4_K_M.gguf"
     if quantize_bin:
@@ -157,13 +146,36 @@ def push_gguf(merged_dir: Path, work_dir: Path):
         path_or_fileobj=str(q4),
         path_in_repo=q4.name,
         repo_id=HUB_REPO_GGUF,
-        commit_message="initial fine-tune (Mobile Actions, mask-prompt)",
+        commit_message="initial fine-tune (Mobile Actions, train_on_responses_only)",
     )
     print(f"  ✓ pushed {q4.name} → {HUB_REPO_GGUF}")
 
 
-def main():
-    hf_login()
+def main(smoke: bool = False, dry_run: bool = False) -> None:
+    """Train. With `smoke=True`, take only 5 train + 5 eval rows so the
+    whole pipeline can be exercised on cheap hardware. With `dry_run=True`,
+    skip the actual `trainer.train()` call — useful to confirm the script
+    imports / loads / tokenizes / wraps the trainer cleanly without
+    spending GPU time."""
+
+    if not smoke:
+        hf_login()
+
+    # Imports here (not module-level) so a CPU-only smoke that doesn't
+    # have GPU/CUDA can at least exercise the dataset-prep half of the
+    # pipeline before hitting the unsloth.FastLanguageModel import.
+    print("importing unsloth (requires CUDA)...")
+    from trl import SFTConfig, SFTTrainer  # noqa: E402
+    from unsloth import FastLanguageModel  # noqa: E402
+    from unsloth.chat_templates import train_on_responses_only  # noqa: E402
+
+    # Belt and suspenders against torch._dynamo pickle bug.
+    try:
+        import torch._dynamo as _dynamo  # noqa: E402
+        _dynamo.config.suppress_errors = True
+        _dynamo.config.disable = True
+    except Exception:
+        pass
 
     print(f"loading model: {BASE_MODEL}")
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -171,75 +183,52 @@ def main():
         max_seq_length=MAX_LEN,
         load_in_4bit=False,
         load_in_8bit=False,
+        load_in_16bit=True,         # ← MATCHES NOTEBOOK
         full_finetuning=False,
     )
     model = FastLanguageModel.get_peft_model(
         model,
         r=LORA_RANK,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=0.05,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=0,             # notebook uses 0
         bias="none",
         use_gradient_checkpointing="unsloth",
-        random_state=42,
+        random_state=3407,          # match notebook
+        use_rslora=False,
+        loftq_config=None,
     )
 
-    print(f"loading dataset: {DATASET}")
-    raw = load_dataset(DATASET, split="train")
-    train_rows = raw.filter(lambda r: r["metadata"] == "train").map(
-        reformat_row, remove_columns=raw.column_names
-    )
-    eval_rows = raw.filter(lambda r: r["metadata"] == "eval").map(
-        reformat_row, remove_columns=raw.column_names
-    )
+    print(f"loading dataset: {DATASET} (smoke={smoke})")
+    train_rows, eval_rows = build_dataset(tokenizer, smoke=smoke)
     print(f"  train: {len(train_rows)}, eval: {len(eval_rows)}")
+    print(f"  example text (first 200 chars): {train_rows[0]['text'][:200]!r}")
 
     args = SFTConfig(
         output_dir="/tmp/functiongemma-prism",
+        dataset_text_field="text",
         max_length=MAX_LEN,
-        num_train_epochs=EPOCHS,
+        num_train_epochs=EPOCHS if not smoke else 1,
+        max_steps=10 if smoke else -1,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=2,
-        learning_rate=1e-4,  # conservative — masked loss has higher gradient variance
-        warmup_ratio=0.05,
-        lr_scheduler_type="cosine",
-        logging_steps=25,
-        # eval_strategy="no" + save_strategy="no": Unsloth's gradient
-        # checkpointing wraps the model dict with a torch._dynamo
-        # `ConfigModuleInstance` that dill/pickle cannot serialise, so any
-        # TRL trigger that snapshots accelerator state (eval, save_steps,
-        # hub push) crashes with `cannot pickle 'ConfigModuleInstance'`.
-        # We disable BOTH paths and save once after `trainer.train()` via
-        # `merged.save_pretrained()` — bypasses the pickle bug entirely.
-        eval_strategy="no",
-        save_strategy="no",
+        warmup_steps=5,
+        learning_rate=2e-4,         # ← MATCHES NOTEBOOK
+        logging_steps=1 if smoke else 10,
+        eval_strategy="no",         # eval triggers accelerator.save_state which pickles dynamo state
+        save_strategy="no",         # same; we save manually after train
+        push_to_hub=False,          # same; we push manually after merge
         bf16=True,
-        optim="adamw_torch_fused",
+        optim="adamw_8bit",         # ← MATCHES NOTEBOOK
+        weight_decay=0.001,
+        lr_scheduler_type="linear",
+        seed=3407,
         report_to="none",
-        # push_to_hub disabled — TRL's hub push internally tries to save
-        # the model first, which hits the same pickle bug. We push manually
-        # via HfApi after merge_and_unload(); see push_gguf() below.
-        push_to_hub=False,
-        seed=42,
-        # NOTE: assistant_only_loss disabled. The original design used
-        # masked loss to prevent the model from overfitting to dataset
-        # prompts (the failure mode that broke an earlier MLX run on raw
-        # text). But FunctionGemma's chat template doesn't emit
-        # `{% generation %}` markers, so TRL can't construct an assistant
-        # mask and crashes with:
-        #   "at least one example has no assistant tokens"
-        # The chat-format dataset (messages+tools per row, NOT pre-rendered
-        # text) we now use has structural role separation that mitigates
-        # the original overfit risk. We accept some quality loss vs the
-        # masked-loss target for now; a future run can patch the tokenizer
-        # chat_template to inject `{% generation %}` and re-enable masking.
-        assistant_only_loss=False,
     )
 
-    # TRL 0.11.x: tokenizer kwarg required (predates processing_class rename).
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -248,13 +237,23 @@ def main():
         args=args,
     )
 
+    # Unsloth's blessed loss-masking path. Replaces TRL's
+    # assistant_only_loss=True (which crashed on chat templates without
+    # `{% generation %}` markers — FunctionGemma's template).
+    trainer = train_on_responses_only(
+        trainer,
+        instruction_part="<start_of_turn>user\n",
+        response_part="<start_of_turn>model\n",
+    )
+
+    if dry_run:
+        print("DRY RUN: trainer constructed cleanly, skipping .train()")
+        return
+
     print("starting training")
     trainer.train()
 
-    print(f"pushing LoRA adapter to {HUB_REPO_LORA}")
-    trainer.push_to_hub()
-
-    print("merging LoRA into base weights")
+    print(f"merging LoRA into base weights")
     merged = model.merge_and_unload()
     merged_dir = Path("/tmp/functiongemma-prism-merged")
     merged.save_pretrained(merged_dir)
@@ -265,7 +264,7 @@ def main():
     api.upload_folder(
         folder_path=str(merged_dir),
         repo_id=HUB_REPO_MERGED,
-        commit_message="merged FunctionGemma + Mobile Actions LoRA (mask-prompt run)",
+        commit_message="merged FunctionGemma + Mobile Actions (train_on_responses_only)",
     )
     print(f"  ✓ merged pushed to {HUB_REPO_MERGED}")
 
@@ -280,4 +279,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--smoke", action="store_true",
+                        help="Tiny dataset (5 rows) + 10 max_steps. For local validation.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Build dataset + trainer; skip .train(). Validates imports/data only.")
+    ns = parser.parse_args()
+    main(smoke=ns.smoke, dry_run=ns.dry_run)
