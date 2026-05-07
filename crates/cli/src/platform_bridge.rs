@@ -755,8 +755,8 @@ fn flatten_tool_messages_for_marc27(req: &mut Value) {
                 });
                 *msg = new;
             }
-            "assistant" => {
-                if msg.get("tool_calls").is_some() {
+            "assistant" if msg.get("tool_calls").is_some() => {
+                {
                     // Rewrite assistant-with-tool_calls into a textual
                     // description so MARC27 doesn't see the unsupported
                     // tool_calls field.

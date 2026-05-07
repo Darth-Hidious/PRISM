@@ -125,7 +125,7 @@ impl JobTracker {
         } else {
             jobs.values().cloned().collect()
         };
-        records.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
+        records.sort_by_key(|r| std::cmp::Reverse(r.submitted_at));
         records
     }
 

@@ -153,7 +153,7 @@ impl ToolRouter {
 
         match batch_result {
             Ok(vectors) => {
-                for (tool, vec) in to_embed.into_iter().zip(vectors.into_iter()) {
+                for (tool, vec) in to_embed.into_iter().zip(vectors) {
                     tool_vec_pairs.push((tool, vec));
                 }
             }
