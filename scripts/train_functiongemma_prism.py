@@ -229,9 +229,13 @@ def main(smoke: bool = False, dry_run: bool = False) -> None:
         report_to="none",
     )
 
+    # TRL ≥0.18 renamed `tokenizer=` → `processing_class=`. The Unsloth
+    # notebook screenshot still shows the old kwarg, but the unpinned
+    # latest TRL that Unsloth pulls in rejects it with TypeError. Smoke
+    # run 69fca0f3 caught this at the SFTTrainer construction step.
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=train_rows,
         eval_dataset=eval_rows,
         args=args,
