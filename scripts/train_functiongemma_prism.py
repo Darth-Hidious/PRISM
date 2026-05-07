@@ -224,11 +224,19 @@ def main():
         # via HfApi after merge_and_unload(); see push_gguf() below.
         push_to_hub=False,
         seed=42,
-        # Critical: mask the prompt so loss only flows through the assistant
-        # tool_call output, not the developer/user/tool messages. Without
-        # this the model learns to predict the dataset's prompts verbatim
-        # and inference collapses on out-of-distribution PRISM tools.
-        assistant_only_loss=True,
+        # NOTE: assistant_only_loss disabled. The original design used
+        # masked loss to prevent the model from overfitting to dataset
+        # prompts (the failure mode that broke an earlier MLX run on raw
+        # text). But FunctionGemma's chat template doesn't emit
+        # `{% generation %}` markers, so TRL can't construct an assistant
+        # mask and crashes with:
+        #   "at least one example has no assistant tokens"
+        # The chat-format dataset (messages+tools per row, NOT pre-rendered
+        # text) we now use has structural role separation that mitigates
+        # the original overfit risk. We accept some quality loss vs the
+        # masked-loss target for now; a future run can patch the tokenizer
+        # chat_template to inject `{% generation %}` and re-enable masking.
+        assistant_only_loss=False,
     )
 
     # TRL 0.12.x renamed `tokenizer` to `processing_class` (deprecated in
