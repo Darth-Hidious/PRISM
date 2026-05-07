@@ -149,11 +149,48 @@ marketplace** stitching.
 
 Ranked by leverage (most impact per unit work first):
 
-### Gap 1 — Foundation NN potential as a tool (~1–2 days)
-Add **MACE-MP-0** or **ORB** as an MCP tool: `predict_energy(structure) →
-{energy, forces, stress}`. Both are pip-installable, ASE-compatible. The
-moment this lands, every alloy candidate can be screened in milliseconds
-instead of hours of DFT. The single highest-leverage addition.
+### Gap 1 — Foundation NN potential as a tool — TWO-TIER
+Two-tier strategy: **local-built-in** + **cloud-paid**, sharing one MCP
+tool surface from the agent's perspective.
+
+**Tier 1 — Local, built-in, free (~1-2 days)**
+- Ship `MACE-MP-0b3` + `MACE-MPA-0` (the MPtraj+sAlex SOTA variant).
+- Both are MIT-licensed code + permissive weights, ASE-compatible via
+  `mace.calculators.mace_mp()`. Pip-installable, GPU-optional.
+- MCP tool name: `predict_energy(structure) → {energy, forces, stress}`.
+- Lets a user with no internet get instant energy/force predictions
+  for any structure. The lowest-friction way to feel the product work.
+
+**Tier 2 — Cloud, MARC27-hosted, paid (~1 week)**
+- Ship `MACE-mh-1` (multi-head, non-linear interaction blocks — the
+  smartest current variant; trained on OMAT + RGD1 + MATPES-R2SCAN +
+  MPtraj + OMOL + SPICE + OC20-2M with replay).
+- Hosted on MARC27 GPU pool. New endpoint
+  `/api/v1/projects/{pid}/atomistic/mh1/predict`. Returns same shape
+  as the local tool.
+- Bundled with MARC27-curated dataset access: pre-relaxed Materials
+  Project structures, OMAT slices for licensed users, fine-tuned
+  variants per user's domain (Ni-superalloys, perovskites, etc.).
+- Reasons to put this in the cloud:
+  1. OMAT-derived weights inherit a more restrictive license than
+     MPtraj — cloud-served fits the licensing model better than local
+     redistribution.
+  2. mh-1 with non-linear blocks is real-compute (A100-class) for
+     production-scale screens.
+  3. Continuous fine-tuning server-side — local users get the latest
+     smartness without re-installing.
+  4. Curated datasets are a real paid-tier value-add (something free
+     local mode can't replicate).
+
+**Same MCP tool name** from the agent — the agent's call to
+`predict_energy(...)` resolves to local tier when offline / no
+MARC27 token, and to MARC27 cloud when authed. Cost-aware routing
+(cheap local for screening, MARC27-mh-1 for final ranking) is a
+future optimisation in Stage 2.1's retrieval layer.
+
+This is the moat: nobody else has the local-immediate +
+cloud-smarter-with-data split. Foundation-model papers ship one or
+the other; PRISM ships both behind one prompt.
 
 ### Gap 2 — One CE backend wired (~2–3 days)
 **ICET** as MCP tool: `ce_fit(structures, energies)`, `ce_predict(config)`,
@@ -235,7 +272,8 @@ Once Phase 1 (provider architecture) lands:
 
 | Order | Item | Time | Why first/last |
 |---|---|---|---|
-| 1 | MACE-MP-0 / ORB as MCP tool | 1–2 d | Single biggest leverage; turns chat into "instant atomic-scale prediction" |
+| 1a | MACE-MP-0b3 + MACE-MPA-0 as built-in (local, free) | 1–2 d | Instant offline atomic-scale prediction; the demo moment when a user types and the answer renders |
+| 1b | MACE-mh-1 as MARC27-cloud service (paid, with curated data) | 1 w | The "smarter" tier — multi-head non-linear blocks, OMAT-trained, GPU-hosted, fine-tunable per domain. Same MCP tool name; routing decided by auth state |
 | 2 | pycalphad wrapper | 1 d | Phase stability is in every alloy conversation |
 | 3 | ICET CE wrapper | 2–3 d | User's specific ask; makes alloy thermo accessible |
 | 4 | Iterative discourse | 2 d | Unlocks A-Lab pattern in pure software |
@@ -256,6 +294,15 @@ make the product feel like the dream.
 ### Foundation models / generative materials AI
 - Microsoft MatterGen: [research blog](https://www.microsoft.com/en-us/research/blog/mattergen-a-new-paradigm-of-materials-design-with-generative-ai/), [Nature 2025](https://www.nature.com/articles/s41586-025-08628-5), [GitHub](https://github.com/microsoft/mattergen), [HF](https://huggingface.co/microsoft/mattergen)
 - DeepMind GNoME: [Nature 2023](https://www.nature.com/articles/s41586-023-06735-9), [A-Lab synthesis 41/58](https://www.nature.com/articles/s41586-023-06734-w)
+
+### MACE foundation potential family (from full search 2026-05-07)
+- MACE code: [ACEsuit/mace](https://github.com/ACEsuit/mace) — MIT
+- MACE foundation models: [ACEsuit/mace-foundations](https://github.com/ACEsuit/mace-foundations) — MP / OMAT / mh-0 / mh-1 lineup
+- MACE-MP-0 (1.6M MPtraj crystals, 89 elements): [Matbench Discovery](https://matbench-discovery.materialsproject.org/models/mace-mp-0), [Rowan overview](https://rowansci.com/features/mace-mp-0), [arXiv 2401.00096](https://arxiv.org/abs/2401.00096)
+- MACE-MPA-0 (MPtraj + sAlex, SOTA on Matbench): [Matbench Discovery](https://matbench-discovery.materialsproject.org/models/mace-mpa-0)
+- MACE foundation docs: [mace-docs.readthedocs.io/foundation_models](https://mace-docs.readthedocs.io/en/latest/guide/foundation_models.html)
+- MACE on HF: [mace-foundations](https://huggingface.co/mace-foundations), [cyrusyc/mace-universal](https://huggingface.co/cyrusyc/mace-universal)
+- pip package: [mace-torch](https://pypi.org/project/mace-torch/)
 
 ### Agentic systems
 - MARS multi-agent + robot system, [phys.org Jan 2026](https://phys.org/news/2026-01-multi-agent-ai-robots-automate.html)
