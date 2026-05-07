@@ -961,39 +961,51 @@ fn sse_stream(
                         .unwrap_or("");
                     let done = parsed.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                    // Silent-failure detector. The MARC27 provider normalizer
-                    // (crates/jobs/.../providers/openai.rs:OaiDelta) only
-                    // captures `content` — when an upstream Gemini/OpenAI
-                    // model emits tool_calls, MARC27 strips them and sends
-                    // delta:"" for every chunk. Forge sees no content and
-                    // no tool_calls, treats the turn as "done with no
-                    // output", and the TUI renders a blank screen. We can
-                    // detect the signature: completion_tokens > 0 AND every
-                    // delta empty up through `done`. When that triggers,
-                    // surface a real error to the user instead of silence.
+                    // Forward upstream tool_calls verbatim. After
+                    // marc27-core PR #2, MARC27's StreamChunk carries a
+                    // `tool_calls` array each chunk (default-empty for
+                    // plain text). Translate that into the OpenAI
+                    // streaming shape forge expects:
+                    //   delta: { tool_calls: [...] }
+                    if let Some(tc) = parsed
+                        .get("tool_calls")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                    {
+                        yield Ok(Event::default().data(serde_json::to_string(&json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "tool_calls": tc },
+                                "finish_reason": null,
+                            }],
+                        })).unwrap()));
+                        total_emitted_chars += 1; // count tool_call chunks toward "real output"
+                    }
+
+                    // Silent-failure detector. Kept as defence-in-depth
+                    // for the case where an upstream model emits content
+                    // we still drop. With marc27-core PR #2 deployed, the
+                    // tool_calls path above prevents the original signature
+                    // (completion_tokens > 0 + every delta empty) from
+                    // ever triggering on tool turns. If it ever fires
+                    // again, that's a regression worth surfacing.
                     if done {
                         let completion_tokens = parsed
                             .get("usage")
                             .and_then(|u| u.get("completion_tokens"))
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
-                        // Track via a closure-local: any non-empty delta we
-                        // saw before this `done` = real content was rendered.
-                        // We can use total deltas-emitted as a proxy — done
-                        // chunk's delta is empty so total_emitted_chars
-                        // accumulates only real content.
                         if completion_tokens > 0 && total_emitted_chars == 0 {
                             let warn = "\n\n\
                                 ⚠️  PRISM detected dropped output from the platform.\n\n\
-                                The upstream LLM generated content (likely a tool_call) \
-                                but the MARC27 provider proxy is configured to forward \
-                                only plain text deltas, so it arrived blank.\n\n\
-                                Workarounds for now:\n\
-                                • Rephrase as a direct question (no tool needed) — that \
-                                path is unaffected.\n\
-                                • Use `/model` to switch to a model that returns text \
-                                directly.\n\n\
-                                Tracking: marc27-core OaiDelta needs tool_calls support.";
+                                The upstream LLM generated content but it arrived blank \
+                                — likely a regression in the platform's response \
+                                normalizer. Try the same message again, or switch \
+                                models with /model.";
                             yield Ok(Event::default().data(serde_json::to_string(&json!({
                                 "id": id,
                                 "object": "chat.completion.chunk",
