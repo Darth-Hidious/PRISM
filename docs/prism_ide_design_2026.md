@@ -1,8 +1,41 @@
 # PRISM IDE — Self-Building Canvas Design
 
-**Status:** Phase 4 design draft — supersedes the "VSCodium fork" plan in MEMORY.md
+**Status:** Phase 4 design draft v0.1 — NOT FINAL. User pushback queued (see "Open questions" below).
 **Author:** Claude (research session 2026-05-07)
 **One-line ask from the user:** *"Like Notion, like a blank canvas just building itself."*
+
+> **⚠ Pushback received (2026-05-07 evening):** "If you remove the VSCode platform,
+> we can't use the extensions that come with VSCode — most of the job is just writing
+> code. You also need to research what material scientists actually need in an app."
+>
+> The user is right. This v0.1 over-rotates on the canvas at the expense of:
+> 1. **VSCode's extension ecosystem.** Python, Jupyter, GitLens, language servers,
+>    debuggers, container/Kubernetes, dotenv, Markdown, GitHub PRs — materials
+>    scientists writing simulation code or notebooks lean on these every day.
+>    Walking away from that costs more than it saves.
+> 2. **What materials scientists actually do.** v0.1 was designed without a real
+>    user-needs study. Day-to-day in a wet lab + DFT/MD shop:
+>    - Read/write Python (DFT pipelines, ASE, pymatgen), Fortran (legacy), Bash
+>      (cluster scripts), YAML (workflow specs), .cif/.pwx/.in (structure files)
+>    - Run Jupyter notebooks against compute clusters (SLURM/PBS submission)
+>    - Inspect/diff long log files from VASP/Quantum ESPRESSO/LAMMPS runs
+>    - Plot energy/property vs. composition curves
+>    - Manage millions of structures in datasets (Materials Project, OQMD, JARVIS)
+>    - Write papers / lab notebooks in LaTeX or Markdown
+>
+>    A **canvas-only** UI doesn't serve the "write the simulation script" core loop.
+>    A **VSCode fork or extension** does — and Cursor/Windsurf prove the model works.
+>
+> **Revision direction:** keep the canvas as a *companion* surface for high-level
+> orchestration (discourse, knowledge graph, comparison tables) but pair it with a
+> VSCode-derived editor for the file/code/notebook work. Either:
+>
+> - **(A) VSCode extension** — ships fast, rides upstream, hits the broadest install
+>   base. Bridge the canvas through the extension's webview API.
+> - **(B) VSCodium fork** — own the brand and the boot screen, integrate the canvas
+>   natively into the activity bar. More expensive but gives full Apple-feel.
+>
+> Need user-needs research before picking. See "Phase 4 plan v0.2 needed" below.
 
 ---
 
@@ -156,23 +189,44 @@ Materials research is **non-linear and graph-shaped**:
 ## What I'm NOT recommending
 
 - **Don't write a custom canvas engine.** tldraw is mature, MIT-licensed (kind of — read their license), and exactly fits.
-- **Don't fork VSCodium first.** Build the canvas, validate the bet, then decide.
+- ~~**Don't fork VSCodium first.** Build the canvas, validate the bet, then decide.~~
+  → **Revisit per pushback above.** Materials scientists write code daily; a
+  canvas-only product fights the core workflow.
 - **Don't replace the CLI.** Power users want it; ML-pipeline scripting needs it; SSH-only environments need it.
 - **Don't build a generic agentic IDE.** The product is materials-science-shaped. Lean into that.
 
 ---
 
+## Phase 4 plan v0.2 needed
+
+Before locking the IDE architecture, do this research first:
+
+1. **User-needs interviews / shadowing** — 5-10 materials scientists across sub-fields
+   (DFT, MD, experimental, ML for materials). What's their day look like? Where do they
+   spend hours? What's painful? Which VSCode extensions do they live in?
+2. **Workflow audit** — pick 3 representative end-to-end tasks (e.g. "predict creep
+   resistance of a new alloy", "screen 10K candidates from Materials Project for
+   stability") and map the tool surface they touch.
+3. **Decision** — given (1) and (2), pick: VSCode extension only / VSCodium fork /
+   canvas-only / extension+canvas hybrid. Don't lock in before this.
+
+The v0.1 architecture above (CLI / Canvas / extension) is one plausible answer.
+After research, the answer might be (CLI / VSCodium fork with embedded canvas panel)
+which is what Cursor effectively is for general coding — but materials-science-shaped.
+
+---
+
 ## Sources
 
-- [The 13 Best Agentic IDEs in 2026 — DataCamp](https://www.datacamp.com/blog/best-agentic-ide)
-- [Building the Agentic UI Stack: AG-UI, A2UI, State Sync — DevJournal](https://earezki.com/ai-news/2026-05-01-a-coding-deep-dive-into-agentic-ui-generative-ui-state-synchronization-and-interrupt-driven-approval-flows/)
-- [The Developer's Guide to Generative UI in 2026 — CopilotKit](https://www.copilotkit.ai/blog/the-developer-s-guide-to-generative-ui-in-2026)
+Researched via WebSearch (no EXA — paid tier, skipped per user direction):
+
 - [tldraw infinite canvas SDK](https://tldraw.dev/)
 - [tldraw computer — Visual computing on a canvas](https://computer.tldraw.com/)
-- [tldraw AI integrations](https://tldraw.dev/docs/ai)
 - [tldraw agent starter kit](https://tldraw.dev/starter-kits/agent)
 - [Gemini Powers tldraw's Natural Language Computing — Google AI](https://ai.google.dev/showcase/tldraw)
 - [VSCode February 2026 release (1.110)](https://code.visualstudio.com/updates/v1_110)
 - [Top Agentic AI Tools for VS Code — Visual Studio Magazine](https://visualstudiomagazine.com/articles/2025/10/07/top-agentic-ai-tools-for-vs-code-according-to-installs.aspx)
 - [Coding Agents Showdown: VSCode Forks vs IDE Extensions vs CLI Agents — ForgeCode](https://forgecode.dev/blog/coding-agents-showdown/)
 - [The Accidental AI Canvas — Latent Space podcast with Steve Ruiz of tldraw](https://www.latent.space/p/tldraw)
+- [The 13 Best Agentic IDEs in 2026 — DataCamp](https://www.datacamp.com/blog/best-agentic-ide)
+- [Building the Agentic UI Stack: AG-UI, A2UI, State Sync — DevJournal](https://earezki.com/ai-news/2026-05-01-a-coding-deep-dive-into-agentic-ui-generative-ui-state-synchronization-and-interrupt-driven-approval-flows/)
