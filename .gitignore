@@ -132,3 +132,8 @@ node_modules/
 # PRISM local-dev debris (do NOT commit)
 # Engine debug tooling — committed at project scope on purpose
 # .mcp.json  (committed)
+
+# forge harness needs shell-plugin/lib at compile time (include_dir!)
+# the generic 'lib/' ignore above (Python convention) was matching it
+!shell-plugin/lib/
+!shell-plugin/lib/**
