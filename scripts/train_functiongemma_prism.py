@@ -196,7 +196,7 @@ def main():
         report_to="none",
         push_to_hub=True,
         hub_model_id=HUB_REPO_LORA,
-        hub_strategy="every_save",
+        hub_strategy="end",  # avoid mid-training pickle of ConfigModuleInstance
         hub_private_repo=True,
         seed=42,
         # Critical: mask the prompt so loss only flows through the assistant
@@ -206,10 +206,11 @@ def main():
         assistant_only_loss=True,
     )
 
-    # TRL 0.12.x: tokenizer kwarg required.
+    # TRL 0.12.x renamed `tokenizer` to `processing_class` (deprecated in
+    # 0.12, removed in 0.13). Use the new name for cross-version safety.
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=train_rows,
         eval_dataset=eval_rows,
         args=args,
