@@ -22,7 +22,27 @@ use crate::boot;
 use crate::platform_bridge;
 
 const DEFAULT_PROVIDER_ID: &str = "openai_compatible";
-const DEFAULT_MODEL_ID: &str = "gemini-3.1-flash-lite-preview";
+
+/// Default chat model. Switched from `gemini-3.1-flash-lite-preview`
+/// to `gpt-5.5` because:
+///   1. Gemini's OpenAI-compat shim has a documented year-old bug with
+///      streaming tool_calls (the `index` field is missing from delta
+///      chunks, breaking every parser that follows the OpenAI spec).
+///      Refs:
+///        - https://discuss.ai.google.dev/t/gemini-openai-compatibility-issue-with-tool-call-streaming/59886
+///        - https://github.com/openai/openai-python/issues/2806
+///   2. `gpt-4o*` is being deprecated and the user explicitly asked not
+///      to use it as a default.
+///   3. `gpt-5.5` is OpenAI's reference implementation — clean
+///      streaming + clean tool_calls — and supports `reasoning_effort`
+///      (none / low / medium / high / xhigh) so we can pick fast paths
+///      for chat and deeper reasoning paths for discourse.
+///   4. MARC27 fronts gpt-5.5 at $2/M input, $8/M output — reasonable
+///      for materials-research workloads.
+///
+/// Users override per-session via the upcoming `prism use marc27
+/// --model <name>` (and the in-chat `/use` slash command).
+const DEFAULT_MODEL_ID: &str = "gpt-5.5";
 
 const PRISM_BANNER: &str = "\x1b[38;2;0;255;255m\
 ██████╗ ██████╗ ██╗███████╗███╗   ███╗

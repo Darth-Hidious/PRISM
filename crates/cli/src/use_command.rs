@@ -31,6 +31,12 @@ use crate::chat_config::{self, ChatTarget};
 /// chat input. Identical semantics either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UseAction {
+    /// Stay on MARC27 cloud (the default), but pin a specific model
+    /// MARC27 should serve. Useful when the user wants gpt-5.5 vs
+    /// claude-sonnet-4 vs mistral-large without changing route.
+    Marc27 {
+        model: Option<String>,
+    },
     Local {
         url: String,
         model: String,
@@ -68,6 +74,7 @@ pub async fn apply(
     let mut cfg = chat_config::load().unwrap_or_default();
 
     let next = match action {
+        UseAction::Marc27 { model } => ChatTarget::Marc27 { model },
         UseAction::Local {
             url,
             model,
@@ -135,7 +142,7 @@ pub async fn apply(
                 ),
             });
         }
-        UseAction::Reset => ChatTarget::Marc27,
+        UseAction::Reset => ChatTarget::Marc27 { model: None },
     };
 
     cfg.chat = next.clone();
@@ -214,8 +221,36 @@ mod tests {
     async fn show_default_is_marc27() {
         let _h = isolated_home();
         let out = apply(UseAction::Show, None, true).await.unwrap();
-        assert_eq!(out.new_target, ChatTarget::Marc27);
+        assert_eq!(out.new_target, ChatTarget::Marc27 { model: None });
         assert!(out.message.contains("MARC27 cloud"));
+    }
+
+    #[tokio::test]
+    async fn marc27_with_model_persists() {
+        let _h = isolated_home();
+        let out = apply(
+            UseAction::Marc27 {
+                model: Some("gpt-5.5".to_string()),
+            },
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.new_target,
+            ChatTarget::Marc27 {
+                model: Some("gpt-5.5".to_string())
+            }
+        );
+        assert!(out.message.contains("gpt-5.5"));
+        let reloaded = chat_config::load().unwrap();
+        assert_eq!(
+            reloaded.chat,
+            ChatTarget::Marc27 {
+                model: Some("gpt-5.5".to_string())
+            }
+        );
     }
 
     #[tokio::test]
@@ -292,15 +327,15 @@ mod tests {
         .unwrap();
         // Now reset.
         let out = apply(UseAction::Reset, None, true).await.unwrap();
-        assert_eq!(out.new_target, ChatTarget::Marc27);
+        assert_eq!(out.new_target, ChatTarget::Marc27 { model: None });
         let reloaded = chat_config::load().unwrap();
-        assert_eq!(reloaded.chat, ChatTarget::Marc27);
+        assert_eq!(reloaded.chat, ChatTarget::Marc27 { model: None });
     }
 
     #[tokio::test]
     async fn live_target_swaps() {
         let _h = isolated_home();
-        let live = Arc::new(RwLock::new(ChatTarget::Marc27));
+        let live = Arc::new(RwLock::new(ChatTarget::Marc27 { model: None }));
         apply(
             UseAction::Local {
                 url: "http://localhost:11434/v1".into(),

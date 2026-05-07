@@ -708,11 +708,23 @@ enum DiscourseCommands {
 /// Subcommands of `prism use`. See `chat_config::ChatTarget` for what
 /// each variant ends up as in `~/.prism/config.toml`.
 ///
-/// `Local` and `Provider` are the two non-default chat targets. `Show`
-/// prints the current state (chat target + tools auth state). `Reset`
-/// goes back to MARC27 cloud (the default).
+/// `Marc27` stays on the default route (MARC27 cloud) but pins which
+/// upstream model MARC27 should serve. `Local` and `Provider` are the
+/// two non-MARC27 chat targets. `Show` prints the current state (chat
+/// target + tools auth state). `Reset` goes back to MARC27 cloud
+/// without a pinned model (PRISM's compiled-in default).
 #[derive(Debug, Subcommand)]
 enum UseCommands {
+    /// Stay on MARC27 cloud, but pin a specific upstream model
+    /// (`gpt-5.5`, `claude-sonnet-4`, `mistral-large-latest`, …).
+    /// MARC27's own vendor keys stay on the platform — PRISM only
+    /// passes the model id forward.
+    Marc27 {
+        /// Upstream model id MARC27 should serve. If omitted,
+        /// PRISM uses its compiled-in default.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Route chat turns to an OpenAI-compatible local server (Ollama,
     /// llama.cpp, vLLM, etc.). MARC27 platform tools stay available
     /// when the user is logged in.
@@ -985,7 +997,7 @@ async fn main() -> Result<()> {
                     cfg_llm
                         .model
                         .clone()
-                        .unwrap_or_else(|| "gemini-3.1-flash-lite-preview".to_string())
+                        .unwrap_or_else(|| "gpt-5.5".to_string())
                 }),
                 api_key,
                 embedding_model: cfg_llm.embedding_model.clone(),
@@ -4414,6 +4426,7 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
 /// CLI-only types.
 async fn handle_use_command(command: UseCommands) -> Result<()> {
     let action = match command {
+        UseCommands::Marc27 { model } => use_command::UseAction::Marc27 { model },
         UseCommands::Local {
             url,
             model,

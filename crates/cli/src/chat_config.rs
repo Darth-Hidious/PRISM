@@ -4,11 +4,20 @@
 //! turns get sent). Three first-class options:
 //!
 //!   - **MARC27 cloud** (default) — chat goes through MARC27's platform
-//!     proxy (`api.marc27.com`), which fronts ~590 hosted models.
+//!     proxy (`api.marc27.com`), which fronts ~590 hosted models. The
+//!     user picks WHICH model MARC27 should serve (`gpt-5.5`,
+//!     `claude-sonnet-4`, `mistral-large-latest`, …). **MARC27's own
+//!     internal vendor keys never leave the platform backend.** PRISM
+//!     does not see them.
 //!   - **Local LLM** — chat goes to a user-supplied OpenAI-compatible URL
-//!     (Ollama at `:11434/v1`, llama.cpp `--server`, vLLM, etc.).
-//!   - **Direct provider** — chat goes straight to a vendor (Anthropic /
-//!     OpenAI / Mistral / etc.) using the user's own API key.
+//!     (Ollama at `:11434/v1`, llama.cpp `--server`, vLLM, etc.). No
+//!     keys leave the user's machine — strictly local.
+//!   - **Direct provider** — chat goes straight to a vendor (Anthropic
+//!     / OpenAI / Mistral / …) using **the user's OWN API key**, which
+//!     PRISM reads from a named env var at request time and never
+//!     persists to disk. This is the user's choice; their keys, their
+//!     call. The hygiene rule that matters is that *MARC27's* own
+//!     platform keys stay on MARC27.
 //!
 //! The chat target is **independent** of MARC27 platform tools. MARC27
 //! tools (knowledge graph, discourse, marketplace, materials project,
@@ -30,7 +39,18 @@ pub enum ChatTarget {
     /// Default. Chat routed via MARC27 platform proxy. Token comes from
     /// `~/.prism/credentials.json` written by `prism login` — we don't
     /// store the token in this file (rotation, security).
-    Marc27,
+    ///
+    /// `model` is the upstream model id MARC27 should serve us
+    /// (`gpt-5.5`, `claude-sonnet-4`, `mistral-large-latest`, …). When
+    /// `None`, PRISM falls back to its compiled-in default
+    /// (`forge_chat::DEFAULT_MODEL_ID`). Stored here so the same
+    /// session can be reproduced across restarts and so `/use marc27
+    /// --model x` can swap mid-session without forge needing its own
+    /// model state.
+    Marc27 {
+        #[serde(default)]
+        model: Option<String>,
+    },
 
     /// Chat routed to an OpenAI-compatible local server. The model name
     /// is whatever the local server advertises; we pass it through
@@ -60,7 +80,7 @@ pub enum ChatTarget {
 
 impl Default for ChatTarget {
     fn default() -> Self {
-        Self::Marc27
+        Self::Marc27 { model: None }
     }
 }
 
@@ -69,7 +89,7 @@ impl ChatTarget {
     /// case, no model name (see `human_full` for that).
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Marc27 => "MARC27 cloud",
+            Self::Marc27 { .. } => "MARC27 cloud",
             Self::Local { .. } => "local",
             Self::Provider { .. } => "direct provider",
         }
@@ -79,7 +99,10 @@ impl ChatTarget {
     /// model name and any user-visible target hint.
     pub fn human_full(&self) -> String {
         match self {
-            Self::Marc27 => "MARC27 cloud".to_string(),
+            Self::Marc27 { model } => match model {
+                Some(m) => format!("MARC27 cloud ({m})"),
+                None => "MARC27 cloud".to_string(),
+            },
             Self::Local { url, model, .. } => format!("local ({url}, {model})"),
             Self::Provider {
                 provider, model, ..
@@ -129,8 +152,8 @@ pub fn load() -> Result<PrismConfig> {
     if !path.exists() {
         return Ok(PrismConfig::default());
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     match toml::from_str::<PrismConfig>(&raw) {
         Ok(cfg) => Ok(cfg),
         Err(e) => {
@@ -173,18 +196,23 @@ mod tests {
 
     #[test]
     fn marc27_is_default() {
-        assert_eq!(ChatTarget::default(), ChatTarget::Marc27);
-        assert_eq!(PrismConfig::default().chat, ChatTarget::Marc27);
+        assert_eq!(ChatTarget::default(), ChatTarget::Marc27 { model: None });
+        assert_eq!(
+            PrismConfig::default().chat,
+            ChatTarget::Marc27 { model: None }
+        );
     }
 
     #[test]
     fn marc27_roundtrip() {
         let cfg = PrismConfig {
-            chat: ChatTarget::Marc27,
+            chat: ChatTarget::Marc27 {
+                model: Some("gpt-5.5".to_string()),
+            },
         };
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: PrismConfig = toml::from_str(&raw).unwrap();
-        assert_eq!(back.chat, ChatTarget::Marc27);
+        assert_eq!(back.chat, cfg.chat);
     }
 
     #[test]
@@ -217,7 +245,17 @@ mod tests {
 
     #[test]
     fn human_full_renders() {
-        assert_eq!(ChatTarget::Marc27.human_full(), "MARC27 cloud");
+        assert_eq!(
+            ChatTarget::Marc27 { model: None }.human_full(),
+            "MARC27 cloud"
+        );
+        assert_eq!(
+            ChatTarget::Marc27 {
+                model: Some("gpt-5.5".to_string())
+            }
+            .human_full(),
+            "MARC27 cloud (gpt-5.5)"
+        );
         let local = ChatTarget::Local {
             url: "http://localhost:11434/v1".into(),
             model: "llama-3.1-70b".into(),
