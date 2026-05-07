@@ -5,7 +5,7 @@
 #     "unsloth",
 #     "datasets>=3.0.0",
 #     "transformers>=4.46.0",
-#     "trl>=0.13.0",
+#     "trl==0.11.4",
 #     "peft>=0.13.0",
 #     "accelerate>=1.0.0",
 #     "huggingface_hub",
