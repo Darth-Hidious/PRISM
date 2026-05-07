@@ -239,11 +239,10 @@ def main():
         assistant_only_loss=False,
     )
 
-    # TRL 0.12.x renamed `tokenizer` to `processing_class` (deprecated in
-    # 0.12, removed in 0.13). Use the new name for cross-version safety.
+    # TRL 0.11.x: tokenizer kwarg required (predates processing_class rename).
     trainer = SFTTrainer(
         model=model,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         train_dataset=train_rows,
         eval_dataset=eval_rows,
         args=args,
