@@ -37,6 +37,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev
 
+      - name: Install protoc (vendored forge_repo needs it on all platforms)
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           target: ${{ matrix.rust_target }}

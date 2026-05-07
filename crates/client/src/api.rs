@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use tracing::debug;
 

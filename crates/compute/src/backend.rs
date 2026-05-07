@@ -71,10 +71,10 @@ impl ComputeRouter {
     fn resolve_backend(&self, plan: &ExperimentPlan) -> &dyn ComputeBackend {
         // Simple heuristic: if image contains "marc27", route to platform.
         // Otherwise use default.
-        if plan.image.contains("marc27") || plan.image.contains("platform") {
-            if let Some(ref m) = self.marc27 {
-                return m;
-            }
+        if (plan.image.contains("marc27") || plan.image.contains("platform"))
+            && let Some(ref m) = self.marc27
+        {
+            return m;
         }
 
         match &self.default_backend {

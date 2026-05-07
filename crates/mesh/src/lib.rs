@@ -189,10 +189,10 @@ pub fn start_mesh(
         };
 
         // Announce only if broadcast is enabled
-        if opts.broadcast {
-            if let Err(e) = mdns.announce(node_id, &opts.node_name, &opts.capabilities) {
-                tracing::warn!(error = %e, "mDNS announce failed (continuing without broadcast)");
-            }
+        if opts.broadcast
+            && let Err(e) = mdns.announce(node_id, &opts.node_name, &opts.capabilities)
+        {
+            tracing::warn!(error = %e, "mDNS announce failed (continuing without broadcast)");
         }
 
         let mut interval =

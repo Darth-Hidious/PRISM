@@ -13,18 +13,18 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use prism_client::api::{OrgInfo, PlatformClient, ProjectInfo};
-use prism_client::{auth::DeviceCodeResponse, auth::TokenResponse, DeviceFlowAuth};
-use prism_ingest::llm::{ChatMessage, LlmClient};
+use prism_client::{DeviceFlowAuth, auth::DeviceCodeResponse, auth::TokenResponse};
 use prism_ingest::LlmConfig;
+use prism_ingest::llm::{ChatMessage, LlmClient};
 use prism_python_bridge::tool_server::{ToolServer, ToolServerHandle};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
-    discover_workflows, execute_workflow_with_policy, find_workflow, parse_workflow_command_args,
-    WorkflowRunResult, WorkflowSpec,
+    WorkflowRunResult, WorkflowSpec, discover_workflows, execute_workflow_with_policy,
+    find_workflow, parse_workflow_command_args,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -32,7 +32,7 @@ use tokio::time::timeout;
 use crate::agent_loop;
 use crate::command_tools::{self, CommandToolRuntime};
 use crate::commands::{builtin_help_text, is_cli_backed_slash_root};
-use crate::hooks::{build_default_hooks, HookRegistry};
+use crate::hooks::{HookRegistry, build_default_hooks};
 use crate::permissions::{
     PermissionMode, PermissionOverrides, SharedPermissionOverrides, ToolPermissionContext,
 };
@@ -41,7 +41,7 @@ use crate::scratchpad::Scratchpad;
 use crate::session::{RuntimeSessionState, SessionStore};
 use crate::tool_catalog::ToolCatalog;
 use crate::transcript::{
-    extract_key_files, extract_pending_work, TranscriptEntry, TranscriptStore,
+    TranscriptEntry, TranscriptStore, extract_key_files, extract_pending_work,
 };
 use crate::types::{AgentConfig, AgentEvent};
 
@@ -202,10 +202,10 @@ fn pick_organization(
         return None;
     }
 
-    if let Some(prior_org_id) = prior.and_then(|creds| creds.org_id.as_deref()) {
-        if let Some(org) = orgs.iter().find(|org| org.id == prior_org_id) {
-            return Some((org.clone(), format!("Reused organization {}", org.name)));
-        }
+    if let Some(prior_org_id) = prior.and_then(|creds| creds.org_id.as_deref())
+        && let Some(org) = orgs.iter().find(|org| org.id == prior_org_id)
+    {
+        return Some((org.clone(), format!("Reused organization {}", org.name)));
     }
 
     if orgs.len() == 1 {
@@ -237,13 +237,12 @@ fn pick_project(
         return None;
     }
 
-    if let Some(prior_project_id) = prior.and_then(|creds| creds.project_id.as_deref()) {
-        if let Some(project) = projects
+    if let Some(prior_project_id) = prior.and_then(|creds| creds.project_id.as_deref())
+        && let Some(project) = projects
             .iter()
             .find(|project| project.id == prior_project_id)
-        {
-            return Some((project.clone(), format!("Reused project {}", project.name)));
-        }
+    {
+        return Some((project.clone(), format!("Reused project {}", project.name)));
     }
 
     if let Some(project) = projects
@@ -445,29 +444,47 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
     ];
 
     if let Some(creds) = creds {
-        std::env::set_var("MARC27_TOKEN", &creds.access_token);
-        std::env::set_var("MARC27_PLATFORM_URL", &creds.platform_url);
+        unsafe {
+            std::env::set_var("MARC27_TOKEN", &creds.access_token);
+        }
+        unsafe {
+            std::env::set_var("MARC27_PLATFORM_URL", &creds.platform_url);
+        }
         if let Some(project_id) = &creds.project_id {
-            std::env::set_var("MARC27_PROJECT_ID", project_id);
+            unsafe {
+                std::env::set_var("MARC27_PROJECT_ID", project_id);
+            }
         }
         if let Some(user_id) = &creds.user_id {
-            std::env::set_var("PRISM_ACCOUNT_USER_ID", user_id);
+            unsafe {
+                std::env::set_var("PRISM_ACCOUNT_USER_ID", user_id);
+            }
         }
         if let Some(display_name) = &creds.display_name {
-            std::env::set_var("PRISM_ACCOUNT_DISPLAY_NAME", display_name);
+            unsafe {
+                std::env::set_var("PRISM_ACCOUNT_DISPLAY_NAME", display_name);
+            }
         }
         if let Some(org_id) = &creds.org_id {
-            std::env::set_var("PRISM_ACCOUNT_ORG_ID", org_id);
+            unsafe {
+                std::env::set_var("PRISM_ACCOUNT_ORG_ID", org_id);
+            }
         }
         if let Some(org_name) = &creds.org_name {
-            std::env::set_var("PRISM_ACCOUNT_ORG_NAME", org_name);
+            unsafe {
+                std::env::set_var("PRISM_ACCOUNT_ORG_NAME", org_name);
+            }
         }
         if let Some(project_name) = &creds.project_name {
-            std::env::set_var("PRISM_ACCOUNT_PROJECT_NAME", project_name);
+            unsafe {
+                std::env::set_var("PRISM_ACCOUNT_PROJECT_NAME", project_name);
+            }
         }
     } else {
         for key in KEYS {
-            std::env::remove_var(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
         }
     }
 }
@@ -604,12 +621,12 @@ fn parse_bash_slash_action(command: &str) -> Result<BashSlashAction> {
         "read" if args.len() == 3 => {
             return Ok(BashSlashAction::Read {
                 task_id: args[2].clone(),
-            })
+            });
         }
         "stop" if args.len() == 3 => {
             return Ok(BashSlashAction::Stop {
                 task_id: args[2].clone(),
-            })
+            });
         }
         _ => {}
     }
@@ -950,14 +967,14 @@ fn summarize_manual_tool_result(
     }
 
     if let Ok(value) = serde_json::from_str::<Value>(content) {
-        if let Some(task) = value.get("task") {
-            if let Some(task_id) = task.get("task_id").and_then(|item| item.as_str()) {
-                let status = task
-                    .get("status")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or("unknown");
-                return format!("{tool_name}: {task_id} ({status})");
-            }
+        if let Some(task) = value.get("task")
+            && let Some(task_id) = task.get("task_id").and_then(|item| item.as_str())
+        {
+            let status = task
+                .get("status")
+                .and_then(|item| item.as_str())
+                .unwrap_or("unknown");
+            return format!("{tool_name}: {task_id} ({status})");
         }
         if let Some(tasks) = value.get("tasks").and_then(|item| item.as_array()) {
             return format!("{tool_name}: {} tasks", tasks.len());
@@ -1017,7 +1034,7 @@ async fn execute_manual_tool_call(
         return Ok(());
     }
 
-    if let Some(ref mut pe) = policy_engine {
+    if let Some(pe) = policy_engine.as_mut() {
         let principal = interactive_policy_principal();
         let role = interactive_policy_role();
         let policy_input = prism_policy::PolicyInput {
@@ -1027,28 +1044,28 @@ async fn execute_manual_tool_call(
             resource: tool_name.to_string(),
             context: args.clone(),
         };
-        if let Ok(decision) = pe.evaluate(&policy_input) {
-            if !decision.allowed {
-                let reason = if decision.violations.is_empty() {
-                    decision.reason
-                } else {
-                    decision.violations.join("; ")
-                };
-                let message = format!("Tool '{tool_name}' denied by policy: {reason}");
-                emit_agent_event(AgentEvent::ToolCallResult {
-                    call_id: call_id.clone(),
-                    tool_name: tool_name.to_string(),
-                    content: message.clone(),
-                    summary: Some(format!("{tool_name}: denied by policy")),
-                    preview,
-                    elapsed_ms: 0,
-                    is_error: true,
-                });
-                session_store.append_message("tool", &message, tool_name, &call_id, None);
-                transcript.append(TranscriptEntry::new("tool", &message).with_tool_name(tool_name));
-                emit_notification("ui.turn.complete", serde_json::json!({}));
-                return Ok(());
-            }
+        if let Ok(decision) = pe.evaluate(&policy_input)
+            && !decision.allowed
+        {
+            let reason = if decision.violations.is_empty() {
+                decision.reason
+            } else {
+                decision.violations.join("; ")
+            };
+            let message = format!("Tool '{tool_name}' denied by policy: {reason}");
+            emit_agent_event(AgentEvent::ToolCallResult {
+                call_id: call_id.clone(),
+                tool_name: tool_name.to_string(),
+                content: message.clone(),
+                summary: Some(format!("{tool_name}: denied by policy")),
+                preview,
+                elapsed_ms: 0,
+                is_error: true,
+            });
+            session_store.append_message("tool", &message, tool_name, &call_id, None);
+            transcript.append(TranscriptEntry::new("tool", &message).with_tool_name(tool_name));
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            return Ok(());
         }
     }
 
@@ -1140,7 +1157,9 @@ fn format_cli_output(
                 format!("`{invocation}` failed with exit code {exit_code}.\n\n{stderr}")
             }
             (false, false) => {
-                format!("`{invocation}` failed with exit code {exit_code}.\n\n{stdout}\n\n[stderr]\n{stderr}")
+                format!(
+                    "`{invocation}` failed with exit code {exit_code}.\n\n{stdout}\n\n[stderr]\n{stderr}"
+                )
             }
         }
     }
@@ -1188,7 +1207,7 @@ async fn run_cli_backed_slash_command_raw(
         return Ok(RawCliSlashOutput {
             invocation: format!("prism {}", args.join(" ")),
             stdout: format!(
-            "`/{root}` is not available inside the embedded REPL. Run `prism {root}` from your shell."
+                "`/{root}` is not available inside the embedded REPL. Run `prism {root}` from your shell."
             ),
             stderr: String::new(),
             success: true,
@@ -1601,10 +1620,10 @@ fn restore_history_and_transcript_from_messages(
         });
 
         let mut entry = TranscriptEntry::new(role, content);
-        if let Some(tool_name) = msg.get("tool_name").and_then(|v| v.as_str()) {
-            if !tool_name.is_empty() {
-                entry = entry.with_tool_name(tool_name);
-            }
+        if let Some(tool_name) = msg.get("tool_name").and_then(|v| v.as_str())
+            && !tool_name.is_empty()
+        {
+            entry = entry.with_tool_name(tool_name);
         }
         transcript.append(entry);
     }
@@ -2182,7 +2201,10 @@ fn format_usage_report(transcript: &TranscriptStore, session_store: &SessionStor
             transcript.cost.events.len(),
             budget_warning,
             transcript.turn_count,
-            session_store.meta().map(|meta| meta.turn_count).unwrap_or(0),
+            session_store
+                .meta()
+                .map(|meta| meta.turn_count)
+                .unwrap_or(0),
             session_store
                 .meta()
                 .map(|meta| meta.compaction_count)
@@ -2755,7 +2777,10 @@ fn emit_current_session_screen(
         llm_config.model,
         session_mode.as_str(),
         plan_state.status.unwrap_or(PlanStatus::None).as_str(),
-        session_store.meta().map(|meta| meta.turn_count).unwrap_or(0),
+        session_store
+            .meta()
+            .map(|meta| meta.turn_count)
+            .unwrap_or(0),
         transcript.entries.len(),
     );
     let transcript_body = format!(
@@ -3907,10 +3932,10 @@ fn build_tool_card_payload(
                 if let Some(preview) = preview {
                     sections.push(preview.to_string());
                 }
-                if let Some(summary) = summary {
-                    if Some(summary) != preview {
-                        sections.push(summary.to_string());
-                    }
+                if let Some(summary) = summary
+                    && Some(summary) != preview
+                {
+                    sections.push(summary.to_string());
                 }
                 if !path.is_empty() {
                     sections.push(format!("path: {path}"));
@@ -3951,10 +3976,10 @@ fn build_tool_card_payload(
                 if let Some(preview) = preview {
                     sections.push(preview.to_string());
                 }
-                if let Some(summary) = summary {
-                    if Some(summary) != preview {
-                        sections.push(summary.to_string());
-                    }
+                if let Some(summary) = summary
+                    && Some(summary) != preview
+                {
+                    sections.push(summary.to_string());
                 }
                 if !path.is_empty() {
                     sections.push(format!("path: {path}"));
@@ -3997,10 +4022,10 @@ fn build_tool_card_payload(
                 if let Some(preview) = preview {
                     sections.push(preview.to_string());
                 }
-                if let Some(summary) = summary {
-                    if Some(summary) != preview {
-                        sections.push(summary.to_string());
-                    }
+                if let Some(summary) = summary
+                    && Some(summary) != preview
+                {
+                    sections.push(summary.to_string());
                 }
                 if !path.is_empty() {
                     sections.push(format!("path: {path}"));
@@ -4060,10 +4085,10 @@ fn build_tool_card_payload(
                 if let Some(preview) = preview {
                     sections.push(preview.to_string());
                 }
-                if let Some(summary) = summary {
-                    if Some(summary) != preview {
-                        sections.push(summary.to_string());
-                    }
+                if let Some(summary) = summary
+                    && Some(summary) != preview
+                {
+                    sections.push(summary.to_string());
                 }
                 if !invocation.is_empty() {
                     sections.push(format!("command: {invocation}"));
@@ -4101,10 +4126,10 @@ fn build_tool_card_payload(
                     } else if !stdout.trim().is_empty() {
                         sections.push(format!("stdout\n{}", stdout.trim_end()));
                     }
-                    if !stderr.trim().is_empty() {
-                        if let Some(data_object) = data.as_object_mut() {
-                            data_object.insert("stderr".to_string(), json!(stderr));
-                        }
+                    if !stderr.trim().is_empty()
+                        && let Some(data_object) = data.as_object_mut()
+                    {
+                        data_object.insert("stderr".to_string(), json!(stderr));
                     }
                     return (sections.join("\n\n"), data);
                 }
@@ -4157,10 +4182,10 @@ fn build_tool_card_payload(
                     if let Some(preview) = preview {
                         sections.push(preview.to_string());
                     }
-                    if let Some(summary) = summary {
-                        if Some(summary) != preview {
-                            sections.push(summary.to_string());
-                        }
+                    if let Some(summary) = summary
+                        && Some(summary) != preview
+                    {
+                        sections.push(summary.to_string());
                     }
                     sections.push(format!("task: {task_id}"));
                     sections.push(format!("status: {status}"));
@@ -4222,10 +4247,10 @@ fn build_tool_card_payload(
                 if let Some(preview) = preview {
                     sections.push(preview.to_string());
                 }
-                if let Some(summary) = summary {
-                    if Some(summary) != preview {
-                        sections.push(summary.to_string());
-                    }
+                if let Some(summary) = summary
+                    && Some(summary) != preview
+                {
+                    sections.push(summary.to_string());
                 }
                 if let Some(exit_code) = exit_code {
                     sections.push(format!("exit code: {exit_code}"));
@@ -4462,10 +4487,10 @@ fn build_tool_card_payload(
                     if let Some(true) = cached {
                         line.push_str(" (cached)");
                     }
-                    if let Some(ref p) = providers {
-                        if !p.is_empty() {
-                            line.push_str(&format!(" from {p}"));
-                        }
+                    if let Some(ref p) = providers
+                        && !p.is_empty()
+                    {
+                        line.push_str(&format!(" from {p}"));
                     }
                     sections.push(line);
 
@@ -4493,10 +4518,10 @@ fn build_tool_card_payload(
     }
 
     // Final fallback: if it's valid JSON, show the summary instead of raw JSON
-    if let Some(summary) = summary {
-        if content.starts_with('{') || content.starts_with('[') {
-            return (summary.to_string(), Value::Object(Default::default()));
-        }
+    if let Some(summary) = summary
+        && (content.starts_with('{') || content.starts_with('['))
+    {
+        return (summary.to_string(), Value::Object(Default::default()));
     }
 
     (content.to_string(), Value::Object(Default::default()))
@@ -4572,12 +4597,11 @@ fn spawn_agent_turn(
                     // so resume/accept always point at the latest draft.
                     let plan_body = format_plan_report(&runtime.transcript, &runtime.scratchpad);
                     runtime.plan_state.status = Some(PlanStatus::Draft);
-                    if let Some(session_id) = runtime.session_store.current_id() {
-                        if let Err(error) =
+                    if let Some(session_id) = runtime.session_store.current_id()
+                        && let Err(error) =
                             persist_plan_snapshot(&slash_ctx, session_id, &plan_body)
-                        {
-                            tracing::warn!(error = %error, "failed to persist plan snapshot");
-                        }
+                    {
+                        tracing::warn!(error = %error, "failed to persist plan snapshot");
                     }
                 }
                 persist_runtime_state(
@@ -4972,8 +4996,7 @@ async fn handle_command(
                     "Approve Login",
                     &format!(
                         "Open this URL in your browser and approve the device.\n\n{}\n\nCode\n  {}\n\nIf the browser did not open automatically, copy the URL above.",
-                        start.verification_uri,
-                        start.user_code,
+                        start.verification_uri, start.user_code,
                     ),
                     "accent",
                 );
@@ -5058,8 +5081,7 @@ async fn handle_command(
                 "Approve Login",
                 &format!(
                     "Open this URL in your browser and approve the device.\n\n{}\n\nCode\n  {}\n\nIf the browser did not open automatically, copy the URL above.",
-                    start.verification_uri,
-                    start.user_code,
+                    start.verification_uri, start.user_code,
                 ),
                 "accent",
             );
@@ -6163,42 +6185,40 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                     "session_id": runtime.session_store.current_id().unwrap_or(""),
                 });
 
-                if !resume_ref.is_empty() {
-                    if let Some((sid, messages)) = runtime.session_store.resume_session(resume_ref)
-                    {
-                        restore_history_and_transcript_from_messages(
-                            &mut runtime.history,
-                            &mut runtime.transcript,
-                            &mut runtime.scratchpad,
-                            &messages,
+                if !resume_ref.is_empty()
+                    && let Some((sid, messages)) = runtime.session_store.resume_session(resume_ref)
+                {
+                    restore_history_and_transcript_from_messages(
+                        &mut runtime.history,
+                        &mut runtime.transcript,
+                        &mut runtime.scratchpad,
+                        &messages,
+                    );
+                    welcome["resumed"] = serde_json::json!(true);
+                    welcome["session_id"] = serde_json::json!(sid);
+                    welcome["resumed_messages"] = serde_json::json!(messages.len());
+                    if let Some(runtime_state) = runtime.session_store.load_runtime_state(&sid) {
+                        let (restored_mode, restored_overrides, restored_plan_state) =
+                            restore_runtime_session_state(runtime_state);
+                        runtime.session_mode = restored_mode;
+                        runtime.permission_overrides = restored_overrides;
+                        runtime.plan_state = restored_plan_state;
+                        runtime.permissions = build_effective_permission_context(
+                            runtime.session_mode,
+                            tools.as_ref(),
+                            &runtime.permission_overrides,
                         );
-                        welcome["resumed"] = serde_json::json!(true);
-                        welcome["session_id"] = serde_json::json!(sid);
-                        welcome["resumed_messages"] = serde_json::json!(messages.len());
-                        if let Some(runtime_state) = runtime.session_store.load_runtime_state(&sid)
-                        {
-                            let (restored_mode, restored_overrides, restored_plan_state) =
-                                restore_runtime_session_state(runtime_state);
-                            runtime.session_mode = restored_mode;
-                            runtime.permission_overrides = restored_overrides;
-                            runtime.plan_state = restored_plan_state;
-                            runtime.permissions = build_effective_permission_context(
-                                runtime.session_mode,
-                                tools.as_ref(),
-                                &runtime.permission_overrides,
-                            );
-                            sync_live_permission_overrides(
-                                &live_permission_overrides,
-                                &runtime.permission_overrides,
-                            )
-                            .await;
-                        }
-                        tracing::info!(
-                            session_id = %sid,
-                            messages = messages.len(),
-                            "resumed session"
-                        );
+                        sync_live_permission_overrides(
+                            &live_permission_overrides,
+                            &runtime.permission_overrides,
+                        )
+                        .await;
                     }
+                    tracing::info!(
+                        session_id = %sid,
+                        messages = messages.len(),
+                        "resumed session"
+                    );
                 }
 
                 emit_response(id, serde_json::json!({ "status": "ok" }));
@@ -6447,20 +6467,20 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
     }
 
     tracing::info!("stdin closed, shutting down");
-    if let Some(mut receiver) = pending_turn.take() {
-        if let Ok(mut restored_runtime) = receiver.try_recv() {
-            apply_deferred_runtime_updates(
-                &mut restored_runtime,
-                tools.as_ref(),
-                &mut deferred_updates,
-            );
-            sync_live_permission_overrides(
-                &live_permission_overrides,
-                &restored_runtime.permission_overrides,
-            )
-            .await;
-            runtime = Some(restored_runtime);
-        }
+    if let Some(mut receiver) = pending_turn.take()
+        && let Ok(mut restored_runtime) = receiver.try_recv()
+    {
+        apply_deferred_runtime_updates(
+            &mut restored_runtime,
+            tools.as_ref(),
+            &mut deferred_updates,
+        );
+        sync_live_permission_overrides(
+            &live_permission_overrides,
+            &restored_runtime.permission_overrides,
+        )
+        .await;
+        runtime = Some(restored_runtime);
     }
     if let Some(mut runtime) = runtime {
         let _ = runtime.tool_server.shutdown().await;
@@ -6471,13 +6491,14 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
 #[cfg(test)]
 mod tests {
     use super::{
-        build_effective_permission_context, build_tool_card_payload, inline_list,
-        load_plan_snapshot, parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
-        parse_edit_slash_action, parse_python_slash_action, parse_read_slash_path,
-        parse_slash_command, parse_write_slash_action, persist_plan_snapshot, pick_organization,
-        pick_project, plan_snapshot_path, project_api_history, shell_command_join,
-        summarize_api_view, truncate_for_ui, BashSlashAction, DiffSlashAction, EditSlashAction,
-        PythonSlashAction, SessionMode, SlashCommandContext, WriteSlashAction,
+        BashSlashAction, DiffSlashAction, EditSlashAction, PythonSlashAction, SessionMode,
+        SlashCommandContext, WriteSlashAction, build_effective_permission_context,
+        build_tool_card_payload, inline_list, load_plan_snapshot, parse_bash_slash_action,
+        parse_command_tail, parse_diff_slash_action, parse_edit_slash_action,
+        parse_python_slash_action, parse_read_slash_path, parse_slash_command,
+        parse_write_slash_action, persist_plan_snapshot, pick_organization, pick_project,
+        plan_snapshot_path, project_api_history, shell_command_join, summarize_api_view,
+        truncate_for_ui,
     };
     use crate::commands::is_cli_backed_slash_root;
     use crate::permissions::PermissionOverrides;
@@ -6747,10 +6768,12 @@ mod tests {
         assert_eq!(summary.tool_call_count, 1);
         assert_eq!(summary.assistant_messages, 1);
         assert_eq!(summary.tool_messages, 1);
-        assert!(summary
-            .visible_previews
-            .iter()
-            .any(|preview| preview.contains("tool calls: read_file")));
+        assert!(
+            summary
+                .visible_previews
+                .iter()
+                .any(|preview| preview.contains("tool calls: read_file"))
+        );
         assert_eq!(
             summary.compact_boundary_preview.as_deref(),
             Some("Conversation summary Key files: src/main.rs")

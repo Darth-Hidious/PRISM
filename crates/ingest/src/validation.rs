@@ -98,24 +98,23 @@ pub fn validate(df: &DataFrame) -> ValidationReport {
                     | DataType::UInt16
                     | DataType::UInt32
                     | DataType::UInt64
-            ) {
-                if let Ok(n_unique) = col.n_unique() {
-                    // n_unique counts null as a unique value, so adjust
-                    let non_null_unique = if col.null_count() > 0 {
-                        n_unique.saturating_sub(1)
-                    } else {
-                        n_unique
-                    };
-                    if non_null_unique <= 1 && height > 1 {
-                        issues.push(ValidationIssue {
-                            severity: Severity::Info,
-                            column: Some(col_name.clone()),
-                            message: format!(
-                                "Column '{}' has zero variance (all non-null values are identical)",
-                                col_name
-                            ),
-                        });
-                    }
+            ) && let Ok(n_unique) = col.n_unique()
+            {
+                // n_unique counts null as a unique value, so adjust
+                let non_null_unique = if col.null_count() > 0 {
+                    n_unique.saturating_sub(1)
+                } else {
+                    n_unique
+                };
+                if non_null_unique <= 1 && height > 1 {
+                    issues.push(ValidationIssue {
+                        severity: Severity::Info,
+                        column: Some(col_name.clone()),
+                        message: format!(
+                            "Column '{}' has zero variance (all non-null values are identical)",
+                            col_name
+                        ),
+                    });
                 }
             }
         }
@@ -137,10 +136,12 @@ mod tests {
         let df = DataFrame::empty();
         let report = validate(&df);
         assert!(!report.passed);
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| i.severity == Severity::Error && i.message.contains("empty")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.severity == Severity::Error && i.message.contains("empty"))
+        );
     }
 
     #[test]
@@ -182,15 +183,19 @@ mod tests {
         .unwrap();
         let report = validate(&df);
         assert!(report.passed); // Info doesn't fail
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| i.severity == Severity::Info && i.column.as_deref() == Some("constant")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.severity == Severity::Info && i.column.as_deref() == Some("constant"))
+        );
         // varying column should NOT appear as zero-variance
-        assert!(!report
-            .issues
-            .iter()
-            .any(|i| i.column.as_deref() == Some("varying")));
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.column.as_deref() == Some("varying"))
+        );
     }
 
     #[test]
@@ -199,9 +204,11 @@ mod tests {
         let df = DataFrame::new(vec![s.into()]).unwrap();
         let report = validate(&df);
         // 50% is not >50%, so no warning
-        assert!(!report
-            .issues
-            .iter()
-            .any(|i| i.severity == Severity::Warning));
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.severity == Severity::Warning)
+        );
     }
 }

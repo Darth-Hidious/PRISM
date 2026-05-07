@@ -42,8 +42,8 @@ struct ForbiddenBody {
 pub fn require_permission(
     required: Permission,
 ) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>
-       + Clone
-       + Send {
++ Clone
++ Send {
     move |req: Request, next: Next| {
         let required = required;
         Box::pin(async move {

@@ -1,0 +1,22 @@
+# cargo-audit ignore list. Each entry documents WHY we're carrying the
+# risk. Reviewed every dep bump; either fix or re-justify.
+#
+# All 4 below are transitive deps from the vendored forge_* crates. None
+# are reachable from a PRISM user-facing path that handles UNTRUSTED
+# certs/DNS — PRISM talks to api.marc27.com (controlled host), HF Hub
+# (TLS-pinned), local llama-server (loopback). The fix arrives when
+# upstream forge bumps gix/rustls-webpki/hickory-proto majors.
+
+[advisories]
+ignore = [
+    # rustls-webpki 0.101.7 + 0.103.10 (transitive via gix → forge_repo):
+    # we don't validate untrusted server certs, only api.marc27.com.
+    "RUSTSEC-2026-0098", # name constraints URI names incorrectly accepted
+    "RUSTSEC-2026-0099", # name constraints accepted for wildcard certs
+    "RUSTSEC-2026-0104", # panic in CRL parsing
+
+    # hickory-proto 0.25.2 (transitive via gix → forge_repo):
+    # we don't terminate untrusted DNS — system resolver only.
+    "RUSTSEC-2026-0118", # NSEC3 unbounded-loop on cross-zone responses
+    "RUSTSEC-2026-0119", # CPU exhaustion via O(n²) name compression — same crate, same path
+]

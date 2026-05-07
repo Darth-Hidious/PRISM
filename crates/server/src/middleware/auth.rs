@@ -107,25 +107,25 @@ pub async fn auth_layer(
 /// Try to pull a token string from the request in priority order.
 fn extract_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
     // 1. Authorization: Bearer <token>
-    if let Some(auth) = headers.get("authorization") {
-        if let Ok(val) = auth.to_str() {
-            let val = val.trim();
-            if let Some(token) = val.strip_prefix("Bearer ") {
-                let token = token.trim();
-                if !token.is_empty() {
-                    return Some(token.to_owned());
-                }
+    if let Some(auth) = headers.get("authorization")
+        && let Ok(val) = auth.to_str()
+    {
+        let val = val.trim();
+        if let Some(token) = val.strip_prefix("Bearer ") {
+            let token = token.trim();
+            if !token.is_empty() {
+                return Some(token.to_owned());
             }
         }
     }
 
     // 2. X-Session-Token header
-    if let Some(hdr) = headers.get("x-session-token") {
-        if let Ok(val) = hdr.to_str() {
-            let val = val.trim();
-            if !val.is_empty() {
-                return Some(val.to_owned());
-            }
+    if let Some(hdr) = headers.get("x-session-token")
+        && let Ok(val) = hdr.to_str()
+    {
+        let val = val.trim();
+        if !val.is_empty() {
+            return Some(val.to_owned());
         }
     }
 

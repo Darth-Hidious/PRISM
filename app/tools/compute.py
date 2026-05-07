@@ -159,9 +159,11 @@ def create_compute_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="compute_providers",
         description=(
-            "List registered compute providers in the MARC27 Compute Broker. "
-            "Shows which providers are available (RunPod, PRISM nodes, etc.) "
-            "and what GPU types each offers."
+            "GPU/CPU compute providers registered with the MARC27 Compute Broker — "
+            "RunPod, PRISM mesh nodes, Lambda, etc. Use this to see which "
+            "execution backends are reachable and what hardware tiers they expose. "
+            "NOT for listing LLM models (use models_list / models_search) and NOT "
+            "for ML prediction models (use list_models)."
         ),
         input_schema={"type": "object", "properties": {}},
         func=_list_providers,

@@ -1,14 +1,14 @@
 //! Tool invocation handlers.
 
+use axum::Extension;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Json;
-use axum::Extension;
 use serde::Serialize;
 use std::sync::Arc;
 
-use crate::middleware::AuthenticatedUser;
 use crate::NodeState;
+use crate::middleware::AuthenticatedUser;
 
 #[derive(Serialize)]
 pub struct ToolInfo {
