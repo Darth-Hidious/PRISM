@@ -223,10 +223,10 @@ impl AuditLog {
         let (where_clause, bind_values) = Self::build_where(filter);
         let sql = format!("SELECT COUNT(*) FROM audit_log {where_clause}");
         let mut stmt = self.conn.prepare(&sql)?;
-        let count: u64 = stmt.query_row(rusqlite::params_from_iter(bind_values.iter()), |row| {
+        let count: i64 = stmt.query_row(rusqlite::params_from_iter(bind_values.iter()), |row| {
             row.get(0)
         })?;
-        Ok(count)
+        Ok(count.max(0) as u64)
     }
 
     // -- helpers ------------------------------------------------------------

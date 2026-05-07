@@ -1893,7 +1893,7 @@ mod tests {
             }),
         );
 
-        std::env::set_var("PRISM_RUNTIME_URL", runtime_url);
+        unsafe { std::env::set_var("PRISM_RUNTIME_URL", runtime_url); }
         let tmp = TempDir::new().unwrap();
         let paths = PrismPaths {
             config_dir: tmp.path().join("config"),
@@ -1954,7 +1954,7 @@ mod tests {
 
         health_server.join().unwrap();
         runtime_server.join().unwrap();
-        std::env::remove_var("PRISM_RUNTIME_URL");
+        unsafe { std::env::remove_var("PRISM_RUNTIME_URL"); }
 
         let requests = runtime_requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);

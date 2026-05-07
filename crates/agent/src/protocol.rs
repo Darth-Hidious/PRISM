@@ -445,29 +445,29 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
     ];
 
     if let Some(creds) = creds {
-        std::env::set_var("MARC27_TOKEN", &creds.access_token);
-        std::env::set_var("MARC27_PLATFORM_URL", &creds.platform_url);
+        unsafe { std::env::set_var("MARC27_TOKEN", &creds.access_token); }
+        unsafe { std::env::set_var("MARC27_PLATFORM_URL", &creds.platform_url); }
         if let Some(project_id) = &creds.project_id {
-            std::env::set_var("MARC27_PROJECT_ID", project_id);
+            unsafe { std::env::set_var("MARC27_PROJECT_ID", project_id); }
         }
         if let Some(user_id) = &creds.user_id {
-            std::env::set_var("PRISM_ACCOUNT_USER_ID", user_id);
+            unsafe { std::env::set_var("PRISM_ACCOUNT_USER_ID", user_id); }
         }
         if let Some(display_name) = &creds.display_name {
-            std::env::set_var("PRISM_ACCOUNT_DISPLAY_NAME", display_name);
+            unsafe { std::env::set_var("PRISM_ACCOUNT_DISPLAY_NAME", display_name); }
         }
         if let Some(org_id) = &creds.org_id {
-            std::env::set_var("PRISM_ACCOUNT_ORG_ID", org_id);
+            unsafe { std::env::set_var("PRISM_ACCOUNT_ORG_ID", org_id); }
         }
         if let Some(org_name) = &creds.org_name {
-            std::env::set_var("PRISM_ACCOUNT_ORG_NAME", org_name);
+            unsafe { std::env::set_var("PRISM_ACCOUNT_ORG_NAME", org_name); }
         }
         if let Some(project_name) = &creds.project_name {
-            std::env::set_var("PRISM_ACCOUNT_PROJECT_NAME", project_name);
+            unsafe { std::env::set_var("PRISM_ACCOUNT_PROJECT_NAME", project_name); }
         }
     } else {
         for key in KEYS {
-            std::env::remove_var(key);
+            unsafe { std::env::remove_var(key); }
         }
     }
 }
@@ -1017,7 +1017,7 @@ async fn execute_manual_tool_call(
         return Ok(());
     }
 
-    if let Some(ref mut pe) = policy_engine {
+    if let Some(pe) = policy_engine.as_mut() {
         let principal = interactive_policy_principal();
         let role = interactive_policy_role();
         let policy_input = prism_policy::PolicyInput {

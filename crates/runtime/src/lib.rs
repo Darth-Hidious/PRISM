@@ -183,13 +183,13 @@ mod tests {
 
     #[test]
     fn derives_api_and_ws_endpoints_from_platform_url() {
-        env::set_var("MARC27_PLATFORM_URL", "https://api.marc27.com/");
+        unsafe { env::set_var("MARC27_PLATFORM_URL", "https://api.marc27.com/"); }
         let endpoints = PlatformEndpoints::from_env();
         assert_eq!(endpoints.api_base, "https://api.marc27.com/api/v1");
         assert_eq!(
             endpoints.node_ws,
             "wss://api.marc27.com/api/v1/nodes/connect"
         );
-        env::remove_var("MARC27_PLATFORM_URL");
+        unsafe { env::remove_var("MARC27_PLATFORM_URL"); }
     }
 }

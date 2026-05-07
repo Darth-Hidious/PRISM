@@ -177,7 +177,7 @@ impl IngestPipeline {
         };
 
         // Step 4: Neo4j graph upsert (if configured and entities exist)
-        let graph = if let (Some(ref neo4j_config), Some(ref entity_set)) =
+        let graph = if let (Some(neo4j_config), Some(entity_set)) =
             (&self.config.neo4j, &entities)
         {
             let store = Neo4jGraphStore::new(neo4j_config.clone());
@@ -201,7 +201,7 @@ impl IngestPipeline {
 
         // Step 5: Qdrant embedding generation + upsert (if configured and entities exist)
         let embeddings =
-            if let (Some(ref llm_config), Some(ref qdrant_config), Some(ref entity_set)) =
+            if let (Some(llm_config), Some(qdrant_config), Some(entity_set)) =
                 (&self.config.llm, &self.config.qdrant, &entities)
             {
                 let constructor = LlmOntologyConstructor::new(llm_config.clone());

@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
                 } else {
                     format!("{},{}", existing, data_paths.join(","))
                 };
-                std::env::set_var("PRISM_DATA_PATHS", combined);
+                unsafe { std::env::set_var("PRISM_DATA_PATHS", combined); }
             }
             if !model_paths.is_empty() {
                 let existing = std::env::var("PRISM_MODEL_PATHS").unwrap_or_default();
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
                 } else {
                     format!("{},{}", existing, model_paths.join(","))
                 };
-                std::env::set_var("PRISM_MODEL_PATHS", combined);
+                unsafe { std::env::set_var("PRISM_MODEL_PATHS", combined); }
             }
 
             let paths = prism_runtime::PrismPaths::discover()?;

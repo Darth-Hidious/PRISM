@@ -4,7 +4,11 @@
 //! via device-flow OAuth, Python worker supervision, and dynamic workflow
 //! discovery from `~/.prism/workflows/`.
 
-mod tui;
+mod boot;
+mod doctor;
+mod forge_chat;
+mod platform_bridge;
+mod mcp_server_native;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -64,6 +68,15 @@ enum Commands {
     },
     /// List available Python tools.
     Tools,
+    /// Run the native (Rust) MCP server — exposes PRISM's Rust-side tools
+    /// (query, ingest, mesh, workflow, …) over stdio JSON-RPC. Forge spawns
+    /// this as a subprocess so the LLM can call Rust tools without going
+    /// through Python.
+    #[command(name = "mcp-server-native", hide = true)]
+    McpServerNative,
+    /// Diagnostic snapshot — checks llama-server, models, Python venv, auth,
+    /// MCP config and tool index. Run this first when chat misbehaves.
+    Doctor,
     /// PRISM node lifecycle commands.
     Node {
         #[command(subcommand)]
@@ -778,14 +791,16 @@ async fn main() -> Result<()> {
             }
             // Real API pings for boot sequence
             let boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
-            tui::boot_sequence(&boot_checks);
-            if let Err(e) = tui::run_splash() {
-                tracing::debug!(error = %e, "splash screen skipped");
-            }
-            // Launch interactive TUI
-            if let Err(e) = tui::run_tui_app(&project_root, &python).await {
-                // If TUI fails (e.g. backend spawn error), fall back to help
-                tracing::debug!(error = %e, "TUI failed, showing help");
+            boot::boot_sequence(&boot_checks);
+            // Splash skipped: it used an alternate-screen ratatui animation
+            // that caused a visible screen jump before forge UI loaded.
+            // Boot checklist now flows directly into the forge banner.
+            // `python` is unused here for now; tool integration goes via forge MCP.
+            let _ = &python;
+            if let Err(e) =
+                forge_chat::run(&project_root, state.credentials.as_ref(), &python).await
+            {
+                tracing::debug!(error = %e, "forge chat failed, showing help");
                 println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
                 println!("  Use CLI commands:");
                 println!("    prism query --platform \"nickel superalloys\"");
@@ -864,7 +879,7 @@ async fn main() -> Result<()> {
                     "backbone": {
                         "python_worker": "app.backend",
                         "node_binary": "prism-node",
-                        "tui": "native ratatui",
+                        "chat_surface": "forge",
                         "workflow_runtime": "rust",
                     }
                 }))?
@@ -982,6 +997,12 @@ async fn main() -> Result<()> {
             }
             println!("\n{} tools available", rows.len());
             handle.shutdown().await?;
+        }
+        Commands::McpServerNative => {
+            mcp_server_native::run(project_root.clone(), python.clone()).await?;
+        }
+        Commands::Doctor => {
+            doctor::run(&project_root, &python).await?;
         }
         Commands::Node { command } => match command {
             NodeCommands::Up {
@@ -1101,7 +1122,7 @@ async fn main() -> Result<()> {
                     } else {
                         format!("{},{}", existing, data_paths.join(","))
                     };
-                    std::env::set_var("PRISM_DATA_PATHS", combined);
+                    unsafe { std::env::set_var("PRISM_DATA_PATHS", combined); }
                 }
                 if !model_paths.is_empty() {
                     let existing = std::env::var("PRISM_MODEL_PATHS").unwrap_or_default();
@@ -1110,7 +1131,7 @@ async fn main() -> Result<()> {
                     } else {
                         format!("{},{}", existing, model_paths.join(","))
                     };
-                    std::env::set_var("PRISM_MODEL_PATHS", combined);
+                    unsafe { std::env::set_var("PRISM_MODEL_PATHS", combined); }
                 }
 
                 // --serve: check Ollama has the model
@@ -1133,7 +1154,7 @@ async fn main() -> Result<()> {
                             bail!("Ollama not reachable: {e}. Is Ollama running?");
                         }
                     }
-                    std::env::set_var("PRISM_NODE_SERVE_MODEL", model);
+                    unsafe { std::env::set_var("PRISM_NODE_SERVE_MODEL", model); }
                 }
 
                 // ── V2: Start managed services (Docker containers) ──
@@ -2146,21 +2167,33 @@ async fn main() -> Result<()> {
             handle_configure(llm_provider, url, model, embedding_model, show)?;
         }
         Commands::Tui => {
-            // Direct TUI launch (skips login check — assumes already authed)
-            let boot_checks = run_boot_checks(
-                paths
-                    .load_cli_state()
-                    .ok()
-                    .as_ref()
-                    .and_then(|s| s.credentials.as_ref()),
-                &endpoints,
-            )
-            .await;
-            tui::boot_sequence(&boot_checks);
-            if let Err(e) = tui::run_splash() {
-                tracing::debug!(error = %e, "splash skipped");
+            // Auto-refresh expired token so users don't have to re-login each
+            // time the access token rolls over. Same logic as `prism setup`.
+            let mut state = paths.load_cli_state().ok().unwrap_or_default();
+            if let Some(creds) = state.credentials.as_ref() {
+                if let Some(expires_at) = creds.expires_at {
+                    if chrono::Utc::now() >= expires_at && !creds.refresh_token.is_empty() {
+                        match refresh_access_token(&endpoints, creds).await {
+                            Ok(new_creds) => {
+                                state.credentials = Some(new_creds);
+                                let _ = paths.save_cli_state(&state);
+                                tracing::info!("access token refreshed");
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "warning: token refresh failed ({e}), you may need to run `prism login`"
+                                );
+                            }
+                        }
+                    }
+                }
             }
-            tui::run_tui_app(&project_root, &python).await?;
+            let boot_checks =
+                run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            boot::boot_sequence(&boot_checks);
+            // Splash skipped — see note in default chat path.
+            let _ = &python;
+            forge_chat::run(&project_root, state.credentials.as_ref(), &python).await?;
         }
         Commands::Billing { command } => {
             let (api_base, auth) = resolve_agent_auth()?;
@@ -4820,10 +4853,10 @@ async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredent
         }
         // Write config to prism.toml and env for the current process
         if let Some(ref mp_key) = config.mp_api_key {
-            std::env::set_var("MP_API_KEY", mp_key);
+            unsafe { std::env::set_var("MP_API_KEY", mp_key); }
         }
         if let Some(ref fc_key) = config.firecrawl_api_key {
-            std::env::set_var("FIRECRAWL_API_KEY", fc_key);
+            unsafe { std::env::set_var("FIRECRAWL_API_KEY", fc_key); }
             tracing::info!("server config: Firecrawl API key received");
         }
         // Write default model to prism.toml if user hasn't set one
@@ -5438,7 +5471,7 @@ async fn handle_job_status(job_id_str: &str) -> Result<()> {
 async fn run_boot_checks(
     creds: Option<&StoredCredentials>,
     endpoints: &PlatformEndpoints,
-) -> Vec<tui::BootCheck> {
+) -> Vec<boot::BootCheck> {
     let mut checks = Vec::new();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -5461,7 +5494,7 @@ async fn run_boot_checks(
         .replace("https://", "")
         .replace("http://", "")
         .replace("/api/v1", "");
-    checks.push(tui::BootCheck {
+    checks.push(boot::BootCheck {
         name: "Platform".into(),
         result: if platform_ok {
             format!("{host} connected")
@@ -5498,7 +5531,7 @@ async fn run_boot_checks(
         } else {
             (false, "token expired — run prism login".into())
         };
-        checks.push(tui::BootCheck {
+        checks.push(boot::BootCheck {
             name: "Auth".into(),
             result: auth_msg,
             ok: auth_ok,
@@ -5506,7 +5539,7 @@ async fn run_boot_checks(
             delay_ms: 20,
         });
     } else {
-        checks.push(tui::BootCheck {
+        checks.push(boot::BootCheck {
             name: "Auth".into(),
             result: "not logged in — run prism login".into(),
             ok: false,
@@ -5545,7 +5578,7 @@ async fn run_boot_checks(
         } else {
             (false, "unavailable".into())
         };
-        checks.push(tui::BootCheck {
+        checks.push(boot::BootCheck {
             name: "Knowledge Graph".into(),
             result: kg_msg,
             ok: kg_ok,
@@ -5585,7 +5618,7 @@ async fn run_boot_checks(
             } else {
                 (false, "unavailable".into())
             };
-            checks.push(tui::BootCheck {
+            checks.push(boot::BootCheck {
                 name: "LLM Models".into(),
                 result: m_msg,
                 ok: m_ok,
@@ -5617,7 +5650,7 @@ async fn run_boot_checks(
         } else {
             (false, "unavailable".into())
         };
-        checks.push(tui::BootCheck {
+        checks.push(boot::BootCheck {
             name: "Compute".into(),
             result: c_msg,
             ok: c_ok,
@@ -5648,7 +5681,7 @@ async fn run_boot_checks(
         } else {
             (false, "unavailable".into())
         };
-        checks.push(tui::BootCheck {
+        checks.push(boot::BootCheck {
             name: "Marketplace".into(),
             result: mk_msg,
             ok: mk_ok,
@@ -5664,7 +5697,7 @@ async fn run_boot_checks(
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false);
-    checks.push(tui::BootCheck {
+    checks.push(boot::BootCheck {
         name: "Local Node".into(),
         result: if node_ok {
             "online at :7327".into()
@@ -5677,7 +5710,7 @@ async fn run_boot_checks(
     });
 
     // 8. Policy engine (always local, always OK)
-    checks.push(tui::BootCheck {
+    checks.push(boot::BootCheck {
         name: "Policy Engine".into(),
         result: "OPA/Rego loaded".into(),
         ok: true,
@@ -5851,13 +5884,13 @@ mod tests {
 
     #[test]
     fn env_project_override_ignores_empty_values() {
-        std::env::remove_var("MARC27_PROJECT_ID");
+        unsafe { std::env::remove_var("MARC27_PROJECT_ID"); }
         assert_eq!(env_project_override(), None);
-        std::env::set_var("MARC27_PROJECT_ID", "   ");
+        unsafe { std::env::set_var("MARC27_PROJECT_ID", "   "); }
         assert_eq!(env_project_override(), None);
-        std::env::set_var("MARC27_PROJECT_ID", "project-123");
+        unsafe { std::env::set_var("MARC27_PROJECT_ID", "project-123"); }
         assert_eq!(env_project_override(), Some("project-123".to_string()));
-        std::env::remove_var("MARC27_PROJECT_ID");
+        unsafe { std::env::remove_var("MARC27_PROJECT_ID"); }
     }
 
     #[test]
@@ -5869,13 +5902,13 @@ mod tests {
 
     #[test]
     fn default_ssh_user_ignores_empty_values() {
-        std::env::remove_var("USER");
+        unsafe { std::env::remove_var("USER"); }
         assert_eq!(default_ssh_user(), None);
-        std::env::set_var("USER", "   ");
+        unsafe { std::env::set_var("USER", "   "); }
         assert_eq!(default_ssh_user(), None);
-        std::env::set_var("USER", "sid");
+        unsafe { std::env::set_var("USER", "sid"); }
         assert_eq!(default_ssh_user(), Some("sid".to_string()));
-        std::env::remove_var("USER");
+        unsafe { std::env::remove_var("USER"); }
     }
 
     #[test]

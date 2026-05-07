@@ -289,7 +289,7 @@ async fn sync_dataset_from_peer(
     }
 
     // Write to local Neo4j if configured
-    if let Some(ref cfg) = sync_config {
+    if let Some(cfg) = sync_config {
         let neo4j_url = format!("{}/db/neo4j/tx/commit", cfg.neo4j_url);
         let results = data["results"].as_array().unwrap();
 
