@@ -152,7 +152,7 @@ def _export_results_csv(**kwargs) -> dict:
 def create_data_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="search_materials",
-        description="Search materials databases via PRISM's federated search engine. Queries 20+ providers (NOMAD, MP, OQMD, COD, Alexandria, GNoME, etc.) in parallel with automatic cross-provider fusion.",
+        description="Materials structure search across 20+ external federated databases (NOMAD, Materials Project, OQMD, COD, Alexandria, GNoME). Returns crystal structures, formulas, and metadata. NOT for searching the MARC27 internal knowledge graph (use knowledge_search) and NOT for searching scientific papers (use literature_search).",
         input_schema={"type": "object", "properties": {
             "elements": {"type": "array", "items": {"type": "string"}, "description": "Must contain ALL these elements (e.g., ['Fe', 'O'])"},
             "formula": {"type": "string", "description": "Chemical formula (e.g., 'SiO2')"},

@@ -245,9 +245,11 @@ def create_knowledge_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="knowledge_search",
         description=(
-            "Search the MARC27 knowledge graph (200K+ nodes, 6M+ edges) for "
-            "materials, properties, elements, publications, authors, and topics. "
-            "Returns entity names, types, and labels. Use this to find what the "
+            "MARC27 internal knowledge graph entity lookup (200K+ nodes, 6M+ edges) — "
+            "entity-level search across materials, properties, elements, publications, "
+            "authors, and topics. Returns entity names + types + labels for traversal. "
+            "NOT for raw structure search across external DBs (use search_materials) "
+            "and NOT for scientific paper text (use literature_search). Use this to find what the "
             "platform knows about a material or concept."
         ),
         input_schema={

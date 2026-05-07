@@ -113,9 +113,11 @@ def create_prediction_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="list_models",
         description=(
-            "List all available ML models: trained composition models AND "
-            "pre-trained GNN models (M3GNet, MEGNet). Also shows which feature "
-            "backend is active (matminer or basic)."
+            "ML property-prediction models — trained composition models + "
+            "pre-trained GNN models (M3GNet, MEGNet) for materials property "
+            "prediction. Use this to choose a model BEFORE calling predict_property. "
+            "NOT for hosted chat LLMs (use models_list for those) and NOT for "
+            "compute hardware (use compute_providers for that)."
         ),
         input_schema={"type": "object", "properties": {}},
         func=_list_models,
