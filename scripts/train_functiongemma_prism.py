@@ -68,6 +68,12 @@ from pathlib import Path
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 os.environ.setdefault("UNSLOTH_DISABLE_TORCH_COMPILE", "1")
+# Smoke v3 (69fca477) failed in flex_attention's _validate_sdpa_input
+# with q/k=fp32 vs v=bf16. The Unsloth gemma flex_attention path on
+# torch 2.10 + a10g doesn't reliably keep dtypes in lockstep. SDPA
+# (torch's standard scaled-dot-product) is bf16-clean on the same
+# hardware and Unsloth supports it as the fallback path.
+os.environ.setdefault("UNSLOTH_DISABLE_FLEX_ATTENTION", "1")
 
 from datasets import load_dataset  # noqa: E402
 from huggingface_hub import HfApi, login  # noqa: E402
@@ -199,6 +205,10 @@ def main(smoke: bool = False, dry_run: bool = False) -> None:
         load_in_8bit=False,
         load_in_16bit=True,         # ← MATCHES NOTEBOOK
         full_finetuning=False,
+        # Force SDPA over flex_attention. Smoke v3 hit a dtype mismatch
+        # in flex_attention; SDPA is the bf16-stable fallback that
+        # Unsloth still has fast paths for on Gemma3.
+        attn_implementation="sdpa",
     )
     model = FastLanguageModel.get_peft_model(
         model,
