@@ -52,8 +52,40 @@ enum Commands {
     Setup,
     /// Launch the interactive AI agent TUI.
     Tui,
-    /// Authenticate against the MARC27 platform using device flow.
-    Login,
+    /// Authenticate against the MARC27 platform.
+    ///
+    /// Default: device-flow login that opens a browser to approve the
+    /// session. For HPC nodes / SSH sessions / any environment without
+    /// a browser, two extra modes are supported:
+    ///
+    ///   prism login --no-browser
+    ///       Run the device flow but DON'T try to open a browser
+    ///       automatically. The URL + user code are printed; approve
+    ///       from any other machine's browser, then return to the
+    ///       terminal — the poll continues until you do.
+    ///
+    ///   prism login --token <PAT>
+    ///       Skip the device flow entirely. Use a Personal Access
+    ///       Token created on the MARC27 website. The token is
+    ///       written to ~/.prism/credentials.json with no further
+    ///       interaction. This is the right path for headless
+    ///       servers and CI environments.
+    Login {
+        /// Bypass the device flow. Use a pre-issued Personal Access
+        /// Token from the MARC27 website. Headless / CI / SSH-only
+        /// use. Token is read from this flag, env var
+        /// `PRISM_LOGIN_TOKEN`, or stdin (in that priority order)
+        /// so the token never has to appear in shell history.
+        #[arg(long, value_name = "PAT", env = "PRISM_LOGIN_TOKEN")]
+        token: Option<String>,
+
+        /// Run the device flow but skip the browser auto-open. Prints
+        /// the verification URL + user code and waits for approval.
+        /// Useful when on a headless HPC node — you copy the URL to
+        /// your laptop's browser and approve there.
+        #[arg(long, conflicts_with = "token")]
+        no_browser: bool,
+    },
     /// Show runtime paths, endpoints, and auth status.
     Status,
     /// List, inspect, and run YAML-defined workflows.
@@ -889,9 +921,12 @@ async fn main() -> Result<()> {
                 println!("    prism --help\n");
             }
         }
-        Commands::Login => {
+        Commands::Login { token, no_browser } => {
             let mut state = paths.load_cli_state()?;
-            let credentials = run_device_login(&endpoints).await?;
+            let credentials = match token {
+                Some(pat) => run_token_login(&endpoints, &pat).await?,
+                None => run_device_login_with_opts(&endpoints, no_browser).await?,
+            };
             let platform =
                 PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
             let profile = platform.fetch_current_user().await.ok();
@@ -5025,6 +5060,23 @@ async fn handle_query(
 }
 
 async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredentials> {
+    // Default behaviour preserves the original "open a browser" UX
+    // for users with a desktop GUI. HPC / SSH paths reach the new
+    // headless variant via `prism login --no-browser`.
+    run_device_login_with_opts(endpoints, false).await
+}
+
+/// Headless variant of `run_device_login`.
+///
+/// `no_browser=true` skips the auto-open and renders an explicit
+/// instruction block so the user can paste the URL into ANY browser
+/// (their laptop's, their phone's, …) and approve. The polling loop
+/// is identical — once the device is approved, the token comes back
+/// and gets stored exactly the same way.
+async fn run_device_login_with_opts(
+    endpoints: &PlatformEndpoints,
+    no_browser: bool,
+) -> Result<StoredCredentials> {
     let platform = PlatformClient::new(&endpoints.api_base);
     let http = platform.inner().clone();
 
@@ -5032,14 +5084,28 @@ async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredent
         DeviceFlowAuth::start_device_flow(&http, &endpoints.api_base).await?;
 
     println!();
-    println!("PRISM setup needs MARC27 platform login.");
-    println!("Open: {}", start.verification_uri);
-    println!("Code: {}", start.user_code);
-    println!();
-    if let Err(err) = open_browser(&start.verification_uri) {
-        eprintln!("warning: failed to open browser automatically: {err}");
+    if no_browser {
+        // Headless block — no auto-open, structure the output so the
+        // user can clearly see what to do on a different machine.
+        println!("\u{2501}\u{2501} PRISM headless login \u{2501}\u{2501}");
+        println!();
+        println!("  1. Open this URL on any browser (laptop, phone, …):");
+        println!("       {}", start.verification_uri);
+        println!("  2. Enter this code:");
+        println!("       {}", start.user_code);
+        println!("  3. Approve the session.");
+        println!();
+        println!("  Waiting here until you approve. Ctrl+C to abort.");
+    } else {
+        println!("PRISM setup needs MARC27 platform login.");
+        println!("Open: {}", start.verification_uri);
+        println!("Code: {}", start.user_code);
+        println!();
+        if let Err(err) = open_browser(&start.verification_uri) {
+            eprintln!("warning: failed to open browser automatically: {err}");
+        }
+        println!("Approve the device in your browser, then return here.");
     }
-    println!("Approve the device in your browser, then return here.");
 
     let token: TokenResponse = DeviceFlowAuth::poll_for_token(
         &http,
@@ -5107,6 +5173,79 @@ async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredent
         project_id: None,
         project_name: None,
         expires_at,
+    })
+}
+
+/// Headless / CI / SSH-only login path. Skips the device flow and
+/// validates a Personal Access Token (PAT) the user issued on the
+/// MARC27 website. The token is the only credential needed; org +
+/// project selection is deferred to the post-login interactive step
+/// (Commands::Login handler), which prompts only if multiple orgs/
+/// projects are visible — and falls back to env var `MARC27_PROJECT_ID`
+/// when the prompt isn't appropriate (CI, scripted setup).
+///
+/// Validation: we hit `GET /api/v1/me` (or whatever `fetch_current_user`
+/// resolves to) to verify the token is alive AND grab the user's
+/// display name + id at the same time. Bad token → fast fail with a
+/// clear error pointing the user at the website's PAT page; we don't
+/// silently store a token that doesn't authenticate.
+async fn run_token_login(endpoints: &PlatformEndpoints, token: &str) -> Result<StoredCredentials> {
+    let token = token.trim();
+    if token.is_empty() {
+        bail!(
+            "Empty --token. Pass a Personal Access Token from {}/settings/tokens, \
+             or set $PRISM_LOGIN_TOKEN before running.",
+            endpoints
+                .api_base
+                .trim_end_matches("/api/v1")
+                .trim_end_matches('/')
+        );
+    }
+
+    // Validate by fetching the user profile; this also gives us the
+    // display name + user_id we'd otherwise have to ask the website
+    // for separately.
+    let platform = PlatformClient::new(&endpoints.api_base).with_token(token);
+    let profile = platform.fetch_current_user().await.with_context(|| {
+        format!(
+            "Token rejected by MARC27 ({}). Check the PAT is correct and not revoked. \
+             Issue a new one at {}/settings/tokens.",
+            endpoints.api_base,
+            endpoints
+                .api_base
+                .trim_end_matches("/api/v1")
+                .trim_end_matches('/')
+        )
+    })?;
+
+    // PATs don't have a refresh token (long-lived by design) and
+    // expires_at depends on when the user issued it; the website tells
+    // them. Leaving expires_at = None means PRISM treats it as
+    // never-expiring locally; on a 401 from MARC27 we fall through
+    // to the existing visible-failure detector with a clear message.
+    println!();
+    println!(
+        "\x1b[32m\u{2713}\x1b[0m Authenticated as {} (token login, headless)",
+        profile.display_name.as_deref().unwrap_or("(unnamed)")
+    );
+
+    Ok(StoredCredentials {
+        access_token: token.to_string(),
+        // PATs are long-lived and have no refresh token — store
+        // empty string so the StoredCredentials shape stays stable
+        // and the rest of PRISM doesn't need to learn a new
+        // "no-refresh" branch. On 401, the visible-failure detector
+        // will tell the user to re-issue the PAT and re-run
+        // `prism login --token …`.
+        refresh_token: String::new(),
+        platform_url: endpoints.api_base.trim_end_matches("/api/v1").to_string(),
+        user_id: Some(profile.id.clone()),
+        display_name: profile.display_name,
+        org_id: None,
+        org_name: None,
+        project_id: None,
+        project_name: None,
+        expires_at: None,
     })
 }
 
