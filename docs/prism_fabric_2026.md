@@ -284,6 +284,63 @@ Sharper than the current positioning. Earns the attention.
 
 ---
 
+## Two product properties that don't fit cleanly into "planes" but matter
+
+These aren't part of the five-plane architecture but they're load-bearing
+for what PRISM *is*. Calling them out so they don't get treated as
+optional polish.
+
+### Persistent knowledge graph across sessions
+
+When a user runs `prism research "<question>"`, the multi-step research
+output (answer, sources, citations, intermediate vectors) gets indexed
+into the knowledge graph and **becomes retrievable from later sessions**.
+We proved this is real via `prism query --semantic "creep resistance
+superalloys"` returning cosine-ranked hits like:
+
+```
+[sim=0.793] [research_session] Research question: nickel superalloy creep resistance
+[sim=0.770] [research_session] Research question: what nickel-based superalloys
+                                  have the highest creep resistance at 800 C
+[sim=0.756] [research_session] Research question: creep resistant superalloys
+```
+
+That's the user's prior queries showing up indexed. **Each query makes
+the graph smarter, and the next prompt starts from accumulated knowledge.**
+This is the property that turns PRISM from "a chat-with-tools client"
+into "a research instrument."
+
+Today this is implemented on the **MARC27 side** (per-org/per-project,
+restricted by ACL). The local-PRISM mirror — Kafka-backed
+session-persistence so this works offline / on a private node /
+inside a closed lab — is the **gap**. Kafka primitives exist
+(`crates/mesh/kafka.rs`); the research-session-store pattern needs to
+be wired the way MARC27's is.
+
+### PRISM-as-MCP — the inversion
+
+`prism mcp-server-native` is a real shipped subcommand (see
+`crates/cli/src/mcp_server_native.rs:dispatch`). It exposes PRISM's
+tools, knowledge graph, discourse engine, compute broker, and research
+engine as a Model Context Protocol server.
+
+Translated: **another agent can drive PRISM.** Claude Code, a teammate's
+Cursor, a Jupyter agent, or any MCP-aware client can register PRISM as
+a tool source and invoke `prism_research`, `prism_discourse_run`,
+`prism_query_semantic`, etc., as plain tool calls.
+
+This is a real differentiator. It means PRISM isn't a closed product
+that competes with coding harnesses — it composes with them. A
+researcher writing simulation code in Cursor can spawn a PRISM
+discourse round on the chemistry without leaving their editor.
+
+The reverse is also true (PRISM the agent already eats its own dogfood
+via `register_prism_mcp_servers` in `forge_chat.rs`). So PRISM the
+process can be both an MCP **client** (via forge) and an MCP **server**
+(via mcp-server-native) — fully composable.
+
+---
+
 ## What this doc is NOT
 
 - Not a sprint plan. It's the strategic direction that informs sprints.
