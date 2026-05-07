@@ -2,15 +2,29 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     # Match Unsloth's official FunctionGemma_(270M)-Mobile-Actions notebook.
-#     # Pinning TRL/transformers explicitly overrode Unsloth's bundled compat
-#     # layer and caused 10 failed runs (tokenizer kwarg drift, processing_class
-#     # rename, ConfigModuleInstance pickle, entropy_from_logits, missing rich,
-#     # assistant-only-loss template incompat). Trust Unsloth's pin instead —
-#     # they ship a stack that's been validated against this exact base model.
+#     # PIN to the exact stack from Unsloth's official FunctionGemma notebook
+#     # https://github.com/unslothai/notebooks/blob/main/nb/FunctionGemma_(270M)-Mobile-Actions.ipynb
+#     #
+#     # Smoke runs 69fca0f3 + 69fca240 proved the unpinned path doesn't work:
+#     # left to its own devices uv pulled transformers 5.5.0 + latest TRL,
+#     # which broke at SFTTrainer construction (tokenizer→processing_class
+#     # rename) and then again at trainer.train() (entropy_from_logits hit
+#     # outputs.logits as a function instead of a tensor — TRL 0.23+ lazy
+#     # logits change).
+#     #
+#     # The notebook pins solve both — transformers 4.56.2 still has tensor
+#     # logits, TRL 0.22.2 still accepts the new processing_class kwarg.
+#     "transformers==4.56.2",
+#     "trl==0.22.2",
 #     "unsloth",
-#     "datasets>=3.0.0",
-#     "huggingface_hub",
+#     "datasets==4.3.0",
+#     "huggingface_hub>=0.34.0",
+#     "hf_transfer",
+#     "peft",
+#     "sentencepiece",
+#     "protobuf",
+#     "accelerate",
+#     "bitsandbytes",
 # ]
 # ///
 """
