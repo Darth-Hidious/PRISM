@@ -74,6 +74,14 @@ os.environ.setdefault("UNSLOTH_DISABLE_TORCH_COMPILE", "1")
 # (torch's standard scaled-dot-product) is bf16-clean on the same
 # hardware and Unsloth supports it as the fallback path.
 os.environ.setdefault("UNSLOTH_DISABLE_FLEX_ATTENTION", "1")
+# Smoke v4 (69fca55f) failed at trainer.train() with:
+#   NotImplementedError: Unsloth: Logits are empty from 2024.11 onwards.
+# Unsloth 2026.5.2 deliberately drops logits to save VRAM during the
+# forward pass, but TRL 0.22.2's compute_loss still references them
+# for per-token entropy. The Unsloth error message itself documents
+# the fix: re-enable logit return BEFORE trainer.train(). MUST be set
+# before any unsloth import for the patcher to honour it.
+os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")
 
 from datasets import load_dataset  # noqa: E402
 from huggingface_hub import HfApi, login  # noqa: E402
