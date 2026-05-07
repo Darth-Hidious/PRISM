@@ -87,6 +87,7 @@ pub fn section(title: &str) {
 }
 
 /// Print a single bullet without a status marker — for plain progress text.
+#[allow(dead_code)] // public API surface, used by external boot-step modules
 pub fn bullet(text: &str) {
     println!("\x1b[38;2;100;100;255m \u{251c}\u{2500}\u{2500} \x1b[38;2;200;200;200m{text}\x1b[0m");
 }
@@ -98,6 +99,7 @@ pub fn warn(text: &str) {
 
 /// A simple inline progress bar that overwrites itself while in a tty.
 /// `done` and `total` are bytes; we render in MB.
+#[allow(dead_code)] // public API surface, used by long-running download flows
 pub fn progress(prefix: &str, done: u64, total: Option<u64>) {
     use std::io::IsTerminal;
     let cr = if io::stderr().is_terminal() {
@@ -129,6 +131,7 @@ pub fn progress(prefix: &str, done: u64, total: Option<u64>) {
 }
 
 /// Finish a progress line with a newline so subsequent output starts fresh.
+#[allow(dead_code)] // pairs with `progress()`
 pub fn progress_done() {
     eprintln!();
 }

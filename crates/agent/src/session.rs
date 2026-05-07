@@ -184,21 +184,21 @@ impl SessionStore {
             let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if !role.is_empty() && !content.is_empty() {
                 let mut msg = serde_json::json!({ "role": role, "content": content });
-                if let Some(cid) = entry.get("call_id").and_then(|v| v.as_str()) {
-                    if !cid.is_empty() {
-                        msg["tool_call_id"] = serde_json::Value::String(cid.to_string());
-                    }
+                if let Some(cid) = entry.get("call_id").and_then(|v| v.as_str())
+                    && !cid.is_empty()
+                {
+                    msg["tool_call_id"] = serde_json::Value::String(cid.to_string());
                 }
-                if let Some(tn) = entry.get("tool_name").and_then(|v| v.as_str()) {
-                    if !tn.is_empty() {
-                        msg["tool_name"] = serde_json::Value::String(tn.to_string());
-                    }
+                if let Some(tn) = entry.get("tool_name").and_then(|v| v.as_str())
+                    && !tn.is_empty()
+                {
+                    msg["tool_name"] = serde_json::Value::String(tn.to_string());
                 }
-                if let Some(data) = entry.get("data") {
-                    if let Some(obj) = data.as_object() {
-                        for (k, v) in obj {
-                            msg[k] = v.clone();
-                        }
+                if let Some(data) = entry.get("data")
+                    && let Some(obj) = data.as_object()
+                {
+                    for (k, v) in obj {
+                        msg[k] = v.clone();
                     }
                 }
                 messages.push(msg);
@@ -237,18 +237,18 @@ impl SessionStore {
         }
 
         // Copy non-meta entries from old session
-        if let Some(old) = old_path {
-            if let Ok(text) = fs::read_to_string(&old) {
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
-                        if entry.get("type").and_then(|t| t.as_str()) != Some("meta") {
-                            self.write_raw(line);
-                        }
-                    }
+        if let Some(old) = old_path
+            && let Ok(text) = fs::read_to_string(&old)
+        {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line)
+                    && entry.get("type").and_then(|t| t.as_str()) != Some("meta")
+                {
+                    self.write_raw(line);
                 }
             }
         }

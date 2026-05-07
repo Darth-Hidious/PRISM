@@ -103,11 +103,12 @@ pub async fn execute_query(
     }?;
 
     // If federated=true on any mode, also query peers and merge results
-    if body.federated && body.mode != "federated" {
-        if let Some(peer_results) = query_mesh_peers(&state, &body.query).await {
-            result.results.extend(peer_results);
-            result.count = result.results.len() as u64;
-        }
+    if body.federated
+        && body.mode != "federated"
+        && let Some(peer_results) = query_mesh_peers(&state, &body.query).await
+    {
+        result.results.extend(peer_results);
+        result.count = result.results.len() as u64;
     }
 
     Ok(result)

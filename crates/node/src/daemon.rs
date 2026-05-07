@@ -271,10 +271,10 @@ pub fn stop_daemon(paths: &PrismPaths) -> Result<()> {
 
     #[cfg(unix)]
     {
-        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            }
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = pid_str.trim().parse::<u32>()
+        {
+            let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         }
     }
 
@@ -604,10 +604,10 @@ async fn handle_platform_message(
         PlatformMessage::CancelJob { job_id } => {
             tracing::info!(%job_id, "cancel requested");
             let mut jobs = running_jobs.lock().await;
-            if let Some(job) = jobs.get_mut(&job_id) {
-                if let Some(cancel_tx) = job.cancel_tx.take() {
-                    let _ = cancel_tx.send(());
-                }
+            if let Some(job) = jobs.get_mut(&job_id)
+                && let Some(cancel_tx) = job.cancel_tx.take()
+            {
+                let _ = cancel_tx.send(());
             }
         }
         PlatformMessage::SubmitJob {
@@ -1473,11 +1473,11 @@ async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) ->
         .as_ref()
         .context("not logged in — run `prism login` first")?;
 
-    if let Some(expires_at) = creds.expires_at {
-        if chrono::Utc::now() >= expires_at {
-            tracing::info!("access token expired, refreshing");
-            return refresh_token(paths, endpoints, creds).await;
-        }
+    if let Some(expires_at) = creds.expires_at
+        && chrono::Utc::now() >= expires_at
+    {
+        tracing::info!("access token expired, refreshing");
+        return refresh_token(paths, endpoints, creds).await;
     }
 
     Ok(creds.access_token.clone())
@@ -1564,13 +1564,12 @@ fn strip_paths_for_wire(caps: &NodeCapabilities) -> NodeCapabilities {
         model.path = model.name.clone();
     }
     for svc in &mut wire.services {
-        if let Some(ep) = &svc.endpoint {
-            if !ep.starts_with("http://")
-                && !ep.starts_with("https://")
-                && !ep.starts_with("ssh://")
-            {
-                svc.endpoint = None;
-            }
+        if let Some(ep) = &svc.endpoint
+            && !ep.starts_with("http://")
+            && !ep.starts_with("https://")
+            && !ep.starts_with("ssh://")
+        {
+            svc.endpoint = None;
         }
     }
 

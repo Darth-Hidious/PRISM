@@ -202,10 +202,10 @@ fn pick_organization(
         return None;
     }
 
-    if let Some(prior_org_id) = prior.and_then(|creds| creds.org_id.as_deref()) {
-        if let Some(org) = orgs.iter().find(|org| org.id == prior_org_id) {
-            return Some((org.clone(), format!("Reused organization {}", org.name)));
-        }
+    if let Some(prior_org_id) = prior.and_then(|creds| creds.org_id.as_deref())
+        && let Some(org) = orgs.iter().find(|org| org.id == prior_org_id)
+    {
+        return Some((org.clone(), format!("Reused organization {}", org.name)));
     }
 
     if orgs.len() == 1 {
@@ -237,13 +237,12 @@ fn pick_project(
         return None;
     }
 
-    if let Some(prior_project_id) = prior.and_then(|creds| creds.project_id.as_deref()) {
-        if let Some(project) = projects
+    if let Some(prior_project_id) = prior.and_then(|creds| creds.project_id.as_deref())
+        && let Some(project) = projects
             .iter()
             .find(|project| project.id == prior_project_id)
-        {
-            return Some((project.clone(), format!("Reused project {}", project.name)));
-        }
+    {
+        return Some((project.clone(), format!("Reused project {}", project.name)));
     }
 
     if let Some(project) = projects
@@ -968,14 +967,14 @@ fn summarize_manual_tool_result(
     }
 
     if let Ok(value) = serde_json::from_str::<Value>(content) {
-        if let Some(task) = value.get("task") {
-            if let Some(task_id) = task.get("task_id").and_then(|item| item.as_str()) {
-                let status = task
-                    .get("status")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or("unknown");
-                return format!("{tool_name}: {task_id} ({status})");
-            }
+        if let Some(task) = value.get("task")
+            && let Some(task_id) = task.get("task_id").and_then(|item| item.as_str())
+        {
+            let status = task
+                .get("status")
+                .and_then(|item| item.as_str())
+                .unwrap_or("unknown");
+            return format!("{tool_name}: {task_id} ({status})");
         }
         if let Some(tasks) = value.get("tasks").and_then(|item| item.as_array()) {
             return format!("{tool_name}: {} tasks", tasks.len());
@@ -1045,28 +1044,28 @@ async fn execute_manual_tool_call(
             resource: tool_name.to_string(),
             context: args.clone(),
         };
-        if let Ok(decision) = pe.evaluate(&policy_input) {
-            if !decision.allowed {
-                let reason = if decision.violations.is_empty() {
-                    decision.reason
-                } else {
-                    decision.violations.join("; ")
-                };
-                let message = format!("Tool '{tool_name}' denied by policy: {reason}");
-                emit_agent_event(AgentEvent::ToolCallResult {
-                    call_id: call_id.clone(),
-                    tool_name: tool_name.to_string(),
-                    content: message.clone(),
-                    summary: Some(format!("{tool_name}: denied by policy")),
-                    preview,
-                    elapsed_ms: 0,
-                    is_error: true,
-                });
-                session_store.append_message("tool", &message, tool_name, &call_id, None);
-                transcript.append(TranscriptEntry::new("tool", &message).with_tool_name(tool_name));
-                emit_notification("ui.turn.complete", serde_json::json!({}));
-                return Ok(());
-            }
+        if let Ok(decision) = pe.evaluate(&policy_input)
+            && !decision.allowed
+        {
+            let reason = if decision.violations.is_empty() {
+                decision.reason
+            } else {
+                decision.violations.join("; ")
+            };
+            let message = format!("Tool '{tool_name}' denied by policy: {reason}");
+            emit_agent_event(AgentEvent::ToolCallResult {
+                call_id: call_id.clone(),
+                tool_name: tool_name.to_string(),
+                content: message.clone(),
+                summary: Some(format!("{tool_name}: denied by policy")),
+                preview,
+                elapsed_ms: 0,
+                is_error: true,
+            });
+            session_store.append_message("tool", &message, tool_name, &call_id, None);
+            transcript.append(TranscriptEntry::new("tool", &message).with_tool_name(tool_name));
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            return Ok(());
         }
     }
 
@@ -1621,10 +1620,10 @@ fn restore_history_and_transcript_from_messages(
         });
 
         let mut entry = TranscriptEntry::new(role, content);
-        if let Some(tool_name) = msg.get("tool_name").and_then(|v| v.as_str()) {
-            if !tool_name.is_empty() {
-                entry = entry.with_tool_name(tool_name);
-            }
+        if let Some(tool_name) = msg.get("tool_name").and_then(|v| v.as_str())
+            && !tool_name.is_empty()
+        {
+            entry = entry.with_tool_name(tool_name);
         }
         transcript.append(entry);
     }
@@ -3933,10 +3932,10 @@ fn build_tool_card_payload(
                 if let Some(preview) = preview {
                     sections.push(preview.to_string());
                 }
-                if let Some(summary) = summary {
-                    if Some(summary) != preview {
-                        sections.push(summary.to_string());
-                    }
+                if let Some(summary) = summary
+                    && Some(summary) != preview
+                {
+                    sections.push(summary.to_string());
                 }
                 if !path.is_empty() {
                     sections.push(format!("path: {path}"));
@@ -3977,10 +3976,10 @@ fn build_tool_card_payload(
                 if let Some(preview) = preview {
                     sections.push(preview.to_string());
                 }
-                if let Some(summary) = summary {
-                    if Some(summary) != preview {
-                        sections.push(summary.to_string());
-                    }
+                if let Some(summary) = summary
+                    && Some(summary) != preview
+                {
+                    sections.push(summary.to_string());
                 }
                 if !path.is_empty() {
                     sections.push(format!("path: {path}"));
@@ -4023,10 +4022,10 @@ fn build_tool_card_payload(
                 if let Some(preview) = preview {
                     sections.push(preview.to_string());
                 }
-                if let Some(summary) = summary {
-                    if Some(summary) != preview {
-                        sections.push(summary.to_string());
-                    }
+                if let Some(summary) = summary
+                    && Some(summary) != preview
+                {
+                    sections.push(summary.to_string());
                 }
                 if !path.is_empty() {
                     sections.push(format!("path: {path}"));
@@ -4086,10 +4085,10 @@ fn build_tool_card_payload(
                 if let Some(preview) = preview {
                     sections.push(preview.to_string());
                 }
-                if let Some(summary) = summary {
-                    if Some(summary) != preview {
-                        sections.push(summary.to_string());
-                    }
+                if let Some(summary) = summary
+                    && Some(summary) != preview
+                {
+                    sections.push(summary.to_string());
                 }
                 if !invocation.is_empty() {
                     sections.push(format!("command: {invocation}"));
@@ -4127,10 +4126,10 @@ fn build_tool_card_payload(
                     } else if !stdout.trim().is_empty() {
                         sections.push(format!("stdout\n{}", stdout.trim_end()));
                     }
-                    if !stderr.trim().is_empty() {
-                        if let Some(data_object) = data.as_object_mut() {
-                            data_object.insert("stderr".to_string(), json!(stderr));
-                        }
+                    if !stderr.trim().is_empty()
+                        && let Some(data_object) = data.as_object_mut()
+                    {
+                        data_object.insert("stderr".to_string(), json!(stderr));
                     }
                     return (sections.join("\n\n"), data);
                 }
@@ -4183,10 +4182,10 @@ fn build_tool_card_payload(
                     if let Some(preview) = preview {
                         sections.push(preview.to_string());
                     }
-                    if let Some(summary) = summary {
-                        if Some(summary) != preview {
-                            sections.push(summary.to_string());
-                        }
+                    if let Some(summary) = summary
+                        && Some(summary) != preview
+                    {
+                        sections.push(summary.to_string());
                     }
                     sections.push(format!("task: {task_id}"));
                     sections.push(format!("status: {status}"));
@@ -4248,10 +4247,10 @@ fn build_tool_card_payload(
                 if let Some(preview) = preview {
                     sections.push(preview.to_string());
                 }
-                if let Some(summary) = summary {
-                    if Some(summary) != preview {
-                        sections.push(summary.to_string());
-                    }
+                if let Some(summary) = summary
+                    && Some(summary) != preview
+                {
+                    sections.push(summary.to_string());
                 }
                 if let Some(exit_code) = exit_code {
                     sections.push(format!("exit code: {exit_code}"));
@@ -4488,10 +4487,10 @@ fn build_tool_card_payload(
                     if let Some(true) = cached {
                         line.push_str(" (cached)");
                     }
-                    if let Some(ref p) = providers {
-                        if !p.is_empty() {
-                            line.push_str(&format!(" from {p}"));
-                        }
+                    if let Some(ref p) = providers
+                        && !p.is_empty()
+                    {
+                        line.push_str(&format!(" from {p}"));
                     }
                     sections.push(line);
 
@@ -4519,10 +4518,10 @@ fn build_tool_card_payload(
     }
 
     // Final fallback: if it's valid JSON, show the summary instead of raw JSON
-    if let Some(summary) = summary {
-        if content.starts_with('{') || content.starts_with('[') {
-            return (summary.to_string(), Value::Object(Default::default()));
-        }
+    if let Some(summary) = summary
+        && (content.starts_with('{') || content.starts_with('['))
+    {
+        return (summary.to_string(), Value::Object(Default::default()));
     }
 
     (content.to_string(), Value::Object(Default::default()))
@@ -4598,12 +4597,11 @@ fn spawn_agent_turn(
                     // so resume/accept always point at the latest draft.
                     let plan_body = format_plan_report(&runtime.transcript, &runtime.scratchpad);
                     runtime.plan_state.status = Some(PlanStatus::Draft);
-                    if let Some(session_id) = runtime.session_store.current_id() {
-                        if let Err(error) =
+                    if let Some(session_id) = runtime.session_store.current_id()
+                        && let Err(error) =
                             persist_plan_snapshot(&slash_ctx, session_id, &plan_body)
-                        {
-                            tracing::warn!(error = %error, "failed to persist plan snapshot");
-                        }
+                    {
+                        tracing::warn!(error = %error, "failed to persist plan snapshot");
                     }
                 }
                 persist_runtime_state(
@@ -6187,42 +6185,40 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                     "session_id": runtime.session_store.current_id().unwrap_or(""),
                 });
 
-                if !resume_ref.is_empty() {
-                    if let Some((sid, messages)) = runtime.session_store.resume_session(resume_ref)
-                    {
-                        restore_history_and_transcript_from_messages(
-                            &mut runtime.history,
-                            &mut runtime.transcript,
-                            &mut runtime.scratchpad,
-                            &messages,
+                if !resume_ref.is_empty()
+                    && let Some((sid, messages)) = runtime.session_store.resume_session(resume_ref)
+                {
+                    restore_history_and_transcript_from_messages(
+                        &mut runtime.history,
+                        &mut runtime.transcript,
+                        &mut runtime.scratchpad,
+                        &messages,
+                    );
+                    welcome["resumed"] = serde_json::json!(true);
+                    welcome["session_id"] = serde_json::json!(sid);
+                    welcome["resumed_messages"] = serde_json::json!(messages.len());
+                    if let Some(runtime_state) = runtime.session_store.load_runtime_state(&sid) {
+                        let (restored_mode, restored_overrides, restored_plan_state) =
+                            restore_runtime_session_state(runtime_state);
+                        runtime.session_mode = restored_mode;
+                        runtime.permission_overrides = restored_overrides;
+                        runtime.plan_state = restored_plan_state;
+                        runtime.permissions = build_effective_permission_context(
+                            runtime.session_mode,
+                            tools.as_ref(),
+                            &runtime.permission_overrides,
                         );
-                        welcome["resumed"] = serde_json::json!(true);
-                        welcome["session_id"] = serde_json::json!(sid);
-                        welcome["resumed_messages"] = serde_json::json!(messages.len());
-                        if let Some(runtime_state) = runtime.session_store.load_runtime_state(&sid)
-                        {
-                            let (restored_mode, restored_overrides, restored_plan_state) =
-                                restore_runtime_session_state(runtime_state);
-                            runtime.session_mode = restored_mode;
-                            runtime.permission_overrides = restored_overrides;
-                            runtime.plan_state = restored_plan_state;
-                            runtime.permissions = build_effective_permission_context(
-                                runtime.session_mode,
-                                tools.as_ref(),
-                                &runtime.permission_overrides,
-                            );
-                            sync_live_permission_overrides(
-                                &live_permission_overrides,
-                                &runtime.permission_overrides,
-                            )
-                            .await;
-                        }
-                        tracing::info!(
-                            session_id = %sid,
-                            messages = messages.len(),
-                            "resumed session"
-                        );
+                        sync_live_permission_overrides(
+                            &live_permission_overrides,
+                            &runtime.permission_overrides,
+                        )
+                        .await;
                     }
+                    tracing::info!(
+                        session_id = %sid,
+                        messages = messages.len(),
+                        "resumed session"
+                    );
                 }
 
                 emit_response(id, serde_json::json!({ "status": "ok" }));
@@ -6471,20 +6467,20 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
     }
 
     tracing::info!("stdin closed, shutting down");
-    if let Some(mut receiver) = pending_turn.take() {
-        if let Ok(mut restored_runtime) = receiver.try_recv() {
-            apply_deferred_runtime_updates(
-                &mut restored_runtime,
-                tools.as_ref(),
-                &mut deferred_updates,
-            );
-            sync_live_permission_overrides(
-                &live_permission_overrides,
-                &restored_runtime.permission_overrides,
-            )
-            .await;
-            runtime = Some(restored_runtime);
-        }
+    if let Some(mut receiver) = pending_turn.take()
+        && let Ok(mut restored_runtime) = receiver.try_recv()
+    {
+        apply_deferred_runtime_updates(
+            &mut restored_runtime,
+            tools.as_ref(),
+            &mut deferred_updates,
+        );
+        sync_live_permission_overrides(
+            &live_permission_overrides,
+            &restored_runtime.permission_overrides,
+        )
+        .await;
+        runtime = Some(restored_runtime);
     }
     if let Some(mut runtime) = runtime {
         let _ = runtime.tool_server.shutdown().await;

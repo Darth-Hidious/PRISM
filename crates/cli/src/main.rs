@@ -752,11 +752,11 @@ async fn main() -> Result<()> {
             } else if let Some(creds) = state.credentials.as_mut() {
                 let platform =
                     PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
-                if creds.user_id.is_none() || creds.display_name.is_none() {
-                    if let Ok(profile) = platform.fetch_current_user().await {
-                        creds.user_id = Some(profile.id);
-                        creds.display_name = profile.display_name;
-                    }
+                if (creds.user_id.is_none() || creds.display_name.is_none())
+                    && let Ok(profile) = platform.fetch_current_user().await
+                {
+                    creds.user_id = Some(profile.id);
+                    creds.display_name = profile.display_name;
                 }
                 let env_project_id = env_project_override();
                 if creds.project_id.is_none()
@@ -773,21 +773,21 @@ async fn main() -> Result<()> {
                 paths.save_cli_state(&state)?;
             }
             // Auto-refresh expired token before launching TUI
-            if let Some(creds) = state.credentials.as_ref() {
-                if let Some(expires_at) = creds.expires_at {
-                    if chrono::Utc::now() >= expires_at && !creds.refresh_token.is_empty() {
-                        match refresh_access_token(&endpoints, creds).await {
-                            Ok(new_creds) => {
-                                state.credentials = Some(new_creds);
-                                paths.save_cli_state(&state)?;
-                                tracing::info!("access token refreshed");
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "warning: token refresh failed ({e}), you may need to run `prism login`"
-                                );
-                            }
-                        }
+            if let Some(creds) = state.credentials.as_ref()
+                && let Some(expires_at) = creds.expires_at
+                && chrono::Utc::now() >= expires_at
+                && !creds.refresh_token.is_empty()
+            {
+                match refresh_access_token(&endpoints, creds).await {
+                    Ok(new_creds) => {
+                        state.credentials = Some(new_creds);
+                        paths.save_cli_state(&state)?;
+                        tracing::info!("access token refreshed");
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: token refresh failed ({e}), you may need to run `prism login`"
+                        );
                     }
                 }
             }
@@ -931,11 +931,10 @@ async fn main() -> Result<()> {
             tool_server_env.insert("PRISM_ENABLE_MCP".to_string(), "1".to_string());
 
             // Pass platform auth token to Python tool server so tools can call MARC27 API
-            if let Ok(state) = paths.load_cli_state() {
-                if let Some(creds) = &state.credentials {
-                    tool_server_env
-                        .insert("MARC27_API_KEY".to_string(), creds.access_token.clone());
-                }
+            if let Ok(state) = paths.load_cli_state()
+                && let Some(creds) = &state.credentials
+            {
+                tool_server_env.insert("MARC27_API_KEY".to_string(), creds.access_token.clone());
             }
             tool_server_env.insert("MARC27_API_URL".to_string(), endpoints.api_base.clone());
 
@@ -1251,10 +1250,10 @@ async fn main() -> Result<()> {
 
                 // Scan for tools
                 let tools_dir = paths.config_dir.join("tools");
-                if tools_dir.is_dir() {
-                    if let Ok(mut reg) = server_node_state.tool_registry.write() {
-                        let _ = reg.scan_directory(&tools_dir);
-                    }
+                if tools_dir.is_dir()
+                    && let Ok(mut reg) = server_node_state.tool_registry.write()
+                {
+                    let _ = reg.scan_directory(&tools_dir);
                 }
 
                 // Wire backend configs — CLI flags > prism.toml > defaults
@@ -1973,14 +1972,14 @@ async fn main() -> Result<()> {
                 if let Some(answer) = resp.get("answer").and_then(|a| a.as_str()) {
                     println!("{answer}");
                 }
-                if let Some(sources) = resp.get("sources").and_then(|s| s.as_array()) {
-                    if !sources.is_empty() {
-                        println!("\nSources:");
-                        for src in sources {
-                            if let Some(title) = src.get("title").and_then(|t| t.as_str()) {
-                                let url = src.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                                println!("  - {title} {url}");
-                            }
+                if let Some(sources) = resp.get("sources").and_then(|s| s.as_array())
+                    && !sources.is_empty()
+                {
+                    println!("\nSources:");
+                    for src in sources {
+                        if let Some(title) = src.get("title").and_then(|t| t.as_str()) {
+                            let url = src.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                            println!("  - {title} {url}");
                         }
                     }
                 }
@@ -2180,21 +2179,21 @@ async fn main() -> Result<()> {
             // Auto-refresh expired token so users don't have to re-login each
             // time the access token rolls over. Same logic as `prism setup`.
             let mut state = paths.load_cli_state().ok().unwrap_or_default();
-            if let Some(creds) = state.credentials.as_ref() {
-                if let Some(expires_at) = creds.expires_at {
-                    if chrono::Utc::now() >= expires_at && !creds.refresh_token.is_empty() {
-                        match refresh_access_token(&endpoints, creds).await {
-                            Ok(new_creds) => {
-                                state.credentials = Some(new_creds);
-                                let _ = paths.save_cli_state(&state);
-                                tracing::info!("access token refreshed");
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "warning: token refresh failed ({e}), you may need to run `prism login`"
-                                );
-                            }
-                        }
+            if let Some(creds) = state.credentials.as_ref()
+                && let Some(expires_at) = creds.expires_at
+                && chrono::Utc::now() >= expires_at
+                && !creds.refresh_token.is_empty()
+            {
+                match refresh_access_token(&endpoints, creds).await {
+                    Ok(new_creds) => {
+                        state.credentials = Some(new_creds);
+                        let _ = paths.save_cli_state(&state);
+                        tracing::info!("access token refreshed");
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: token refresh failed ({e}), you may need to run `prism login`"
+                        );
                     }
                 }
             }
@@ -3497,10 +3496,10 @@ async fn handle_ingest_watch(
         if !is_ingestable(&path) {
             continue;
         }
-        if let Ok(meta) = path.metadata() {
-            if let Ok(modified) = meta.modified() {
-                seen.insert(path.clone(), modified);
-            }
+        if let Ok(meta) = path.metadata()
+            && let Ok(modified) = meta.modified()
+        {
+            seen.insert(path.clone(), modified);
         }
         match handle_ingest(
             &path,
@@ -3663,18 +3662,17 @@ EXAMPLES:
 /// Resolve platform auth for the human user (prism login → JWT).
 fn resolve_user_auth() -> Result<(String, String)> {
     // Primary: read from PrismPaths (cli-state.json)
-    if let Ok(paths) = prism_runtime::PrismPaths::discover() {
-        if let Ok(state) = paths.load_cli_state() {
-            if let Some(creds) = &state.credentials {
-                let raw_url = &creds.platform_url;
-                let api_base = if raw_url.ends_with("/api/v1") {
-                    raw_url.clone()
-                } else {
-                    format!("{}/api/v1", raw_url.trim_end_matches('/'))
-                };
-                return Ok((api_base, format!("Bearer {}", creds.access_token)));
-            }
-        }
+    if let Ok(paths) = prism_runtime::PrismPaths::discover()
+        && let Ok(state) = paths.load_cli_state()
+        && let Some(creds) = &state.credentials
+    {
+        let raw_url = &creds.platform_url;
+        let api_base = if raw_url.ends_with("/api/v1") {
+            raw_url.clone()
+        } else {
+            format!("{}/api/v1", raw_url.trim_end_matches('/'))
+        };
+        return Ok((api_base, format!("Bearer {}", creds.access_token)));
     }
 
     // Fallback: legacy ~/.prism/credentials.json
@@ -4467,10 +4465,10 @@ fn parse_research_response_body(body: &str) -> Result<serde_json::Value> {
             } else if answer.is_none() {
                 answer = event_answer;
             }
-            if sources.is_none() {
-                if let Some(found) = obj.get("sources").and_then(|value| value.as_array()) {
-                    sources = Some(serde_json::Value::Array(found.clone()));
-                }
+            if sources.is_none()
+                && let Some(found) = obj.get("sources").and_then(|value| value.as_array())
+            {
+                sources = Some(serde_json::Value::Array(found.clone()));
             }
             if complete.is_none()
                 && obj.get("step").and_then(|value| value.as_str()) == Some("complete")
@@ -4564,13 +4562,13 @@ fn normalize_stream_events(events: Vec<serde_json::Value>) -> Vec<serde_json::Va
         // Some routes hand back transport-level `data: {...}` strings inside a
         // generic `text` field. Unwrap those so downstream code sees the real
         // event objects, not opaque transport wrappers.
-        if let Some(text) = event.get("text").and_then(|value| value.as_str()) {
-            if let Some(payload) = text.trim().strip_prefix("data:") {
-                let payload = payload.trim();
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
-                    normalized.push(value);
-                    continue;
-                }
+        if let Some(text) = event.get("text").and_then(|value| value.as_str())
+            && let Some(payload) = text.trim().strip_prefix("data:")
+        {
+            let payload = payload.trim();
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                normalized.push(value);
+                continue;
             }
         }
 
@@ -4883,16 +4881,16 @@ async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredent
                 // User hasn't set a model — use server default
                 if let Ok(home) = std::env::var("HOME") {
                     let toml_path = format!("{home}/.prism/prism.toml");
-                    if let Ok(existing) = std::fs::read_to_string(&toml_path) {
-                        if !existing.contains("model =") {
-                            let updated = if existing.contains("[llm]") {
-                                existing.replace("[llm]", &format!("[llm]\nmodel = \"{model}\""))
-                            } else {
-                                format!("{existing}\n[llm]\nmodel = \"{model}\"\n")
-                            };
-                            let _ = std::fs::write(&toml_path, updated);
-                            tracing::info!(model = %model, "set default model from server config");
-                        }
+                    if let Ok(existing) = std::fs::read_to_string(&toml_path)
+                        && !existing.contains("model =")
+                    {
+                        let updated = if existing.contains("[llm]") {
+                            existing.replace("[llm]", &format!("[llm]\nmodel = \"{model}\""))
+                        } else {
+                            format!("{existing}\n[llm]\nmodel = \"{model}\"\n")
+                        };
+                        let _ = std::fs::write(&toml_path, updated);
+                        tracing::info!(model = %model, "set default model from server config");
                     }
                 }
             }
@@ -5841,42 +5839,42 @@ async fn handle_report(
     }
 
     // 4. Send to MARC27 platform
-    if let Some(c) = creds {
-        if !c.access_token.is_empty() {
-            print!("Sending to MARC27 platform... ");
-            let platform_body = serde_json::json!({
-                "title": format!("bug report: {}", &description[..description.len().min(60)]),
-                "description": format!(
-                    "{description}\n\nPRISM v{version}, Python {python_version}, {os_info}, {} cores, {} GB RAM",
-                    caps.cpu_cores, caps.ram_gb / 1024,
-                ),
-                "severity": "medium",
-            });
+    if let Some(c) = creds
+        && !c.access_token.is_empty()
+    {
+        print!("Sending to MARC27 platform... ");
+        let platform_body = serde_json::json!({
+            "title": format!("bug report: {}", &description[..description.len().min(60)]),
+            "description": format!(
+                "{description}\n\nPRISM v{version}, Python {python_version}, {os_info}, {} cores, {} GB RAM",
+                caps.cpu_cores, caps.ram_gb / 1024,
+            ),
+            "severity": "medium",
+        });
 
-            let url = format!("{}/support/tickets", endpoints.api_base);
-            let resp = reqwest::Client::new()
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", c.access_token))
-                .json(&platform_body)
-                .send()
-                .await;
+        let url = format!("{}/support/tickets", endpoints.api_base);
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", c.access_token))
+            .json(&platform_body)
+            .send()
+            .await;
 
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    let data: serde_json::Value = r.json().await.unwrap_or_default();
-                    let ticket_id = data["ticket_id"].as_str().unwrap_or("unknown");
-                    println!("done → ticket {ticket_id}");
-                    println!(
-                        "\n  View on dashboard: {}/dashboard/support",
-                        endpoints.api_base.replace("/api/v1", "")
-                    );
-                }
-                Ok(r) => {
-                    println!("failed (HTTP {})", r.status());
-                }
-                Err(e) => {
-                    println!("failed ({e})");
-                }
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let data: serde_json::Value = r.json().await.unwrap_or_default();
+                let ticket_id = data["ticket_id"].as_str().unwrap_or("unknown");
+                println!("done → ticket {ticket_id}");
+                println!(
+                    "\n  View on dashboard: {}/dashboard/support",
+                    endpoints.api_base.replace("/api/v1", "")
+                );
+            }
+            Ok(r) => {
+                println!("failed (HTTP {})", r.status());
+            }
+            Err(e) => {
+                println!("failed ({e})");
             }
         }
     }

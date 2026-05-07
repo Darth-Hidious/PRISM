@@ -84,15 +84,15 @@ fn check_doom_loop(recent: &VecDeque<String>, sig: &str) -> bool {
 fn is_empty_result(content: &str) -> bool {
     if let Ok(val) = serde_json::from_str::<Value>(content) {
         // {"count": 0} or {"results": []}
-        if let Some(count) = val.get("count").and_then(|v| v.as_u64()) {
-            if count == 0 {
-                return true;
-            }
+        if let Some(count) = val.get("count").and_then(|v| v.as_u64())
+            && count == 0
+        {
+            return true;
         }
-        if let Some(results) = val.get("results").and_then(|v| v.as_array()) {
-            if results.is_empty() {
-                return true;
-            }
+        if let Some(results) = val.get("results").and_then(|v| v.as_array())
+            && results.is_empty()
+        {
+            return true;
         }
     }
     false
@@ -188,14 +188,14 @@ fn summarize_tool_result(
         if let Some(count) = val.get("count").and_then(|v| v.as_u64()) {
             return format!("{tool_name}: {count} results");
         }
-        if let Some(task) = val.get("task") {
-            if let Some(task_id) = task.get("task_id").and_then(|value| value.as_str()) {
-                let status = task
-                    .get("status")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown");
-                return format!("{tool_name}: {task_id} ({status})");
-            }
+        if let Some(task) = val.get("task")
+            && let Some(task_id) = task.get("task_id").and_then(|value| value.as_str())
+        {
+            let status = task
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            return format!("{tool_name}: {task_id} ({status})");
         }
         if let Some(arr) = val.get("results").and_then(|v| v.as_array()) {
             return format!("{tool_name}: {} results", arr.len());
@@ -206,81 +206,77 @@ fn summarize_tool_result(
         if let Some(f) = val.get("filename").and_then(|v| v.as_str()) {
             return format!("{tool_name}: saved to {f}");
         }
-        if let Some(root) = val.get("root").and_then(|v| v.as_str()) {
-            if let Some(stdout) = val.get("stdout").and_then(|v| v.as_str()) {
-                if let Ok(parsed_stdout) = serde_json::from_str::<Value>(stdout.trim()) {
-                    match root {
-                        "models" => {
-                            if let Some(items) = parsed_stdout.as_array() {
-                                return format!("{tool_name}: {} models", items.len());
-                            }
-                            if let Some(model_id) = parsed_stdout
-                                .get("model_id")
-                                .and_then(|value| value.as_str())
-                            {
-                                return format!("{tool_name}: {model_id}");
-                            }
-                        }
-                        "deploy" => {
-                            if let Some(items) = parsed_stdout.as_array() {
-                                return format!("{tool_name}: {} deployments", items.len());
-                            }
-                            if let Some(status) =
-                                parsed_stdout.get("status").and_then(|value| value.as_str())
-                            {
-                                let deployment_id = parsed_stdout
-                                    .get("deployment_id")
-                                    .or_else(|| parsed_stdout.get("id"))
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("deployment");
-                                return format!("{tool_name}: {deployment_id} ({status})");
-                            }
-                            if let Some(healthy) = parsed_stdout
-                                .get("healthy")
-                                .and_then(|value| value.as_bool())
-                            {
-                                return format!("{tool_name}: healthy={healthy}");
-                            }
-                        }
-                        "discourse" => {
-                            if let Some(items) = parsed_stdout
-                                .get("specs")
-                                .and_then(|value| value.as_array())
-                            {
-                                return format!("{tool_name}: {} specs", items.len());
-                            }
-                            if let Some(events) = parsed_stdout
-                                .get("events")
-                                .and_then(|value| value.as_array())
-                            {
-                                let instance_id = parsed_stdout
-                                    .get("instance_id")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("instance");
-                                return format!(
-                                    "{tool_name}: {instance_id} ({} events)",
-                                    events.len()
-                                );
-                            }
-                            if let Some(status) =
-                                parsed_stdout.get("status").and_then(|value| value.as_str())
-                            {
-                                let instance_id = parsed_stdout
-                                    .get("instance_id")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("instance");
-                                return format!("{tool_name}: {instance_id} ({status})");
-                            }
-                            if let Some(turns) = parsed_stdout
-                                .get("turns")
-                                .and_then(|value| value.as_array())
-                            {
-                                return format!("{tool_name}: {} turns", turns.len());
-                            }
-                        }
-                        _ => {}
+        if let Some(root) = val.get("root").and_then(|v| v.as_str())
+            && let Some(stdout) = val.get("stdout").and_then(|v| v.as_str())
+            && let Ok(parsed_stdout) = serde_json::from_str::<Value>(stdout.trim())
+        {
+            match root {
+                "models" => {
+                    if let Some(items) = parsed_stdout.as_array() {
+                        return format!("{tool_name}: {} models", items.len());
+                    }
+                    if let Some(model_id) = parsed_stdout
+                        .get("model_id")
+                        .and_then(|value| value.as_str())
+                    {
+                        return format!("{tool_name}: {model_id}");
                     }
                 }
+                "deploy" => {
+                    if let Some(items) = parsed_stdout.as_array() {
+                        return format!("{tool_name}: {} deployments", items.len());
+                    }
+                    if let Some(status) =
+                        parsed_stdout.get("status").and_then(|value| value.as_str())
+                    {
+                        let deployment_id = parsed_stdout
+                            .get("deployment_id")
+                            .or_else(|| parsed_stdout.get("id"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("deployment");
+                        return format!("{tool_name}: {deployment_id} ({status})");
+                    }
+                    if let Some(healthy) = parsed_stdout
+                        .get("healthy")
+                        .and_then(|value| value.as_bool())
+                    {
+                        return format!("{tool_name}: healthy={healthy}");
+                    }
+                }
+                "discourse" => {
+                    if let Some(items) = parsed_stdout
+                        .get("specs")
+                        .and_then(|value| value.as_array())
+                    {
+                        return format!("{tool_name}: {} specs", items.len());
+                    }
+                    if let Some(events) = parsed_stdout
+                        .get("events")
+                        .and_then(|value| value.as_array())
+                    {
+                        let instance_id = parsed_stdout
+                            .get("instance_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("instance");
+                        return format!("{tool_name}: {instance_id} ({} events)", events.len());
+                    }
+                    if let Some(status) =
+                        parsed_stdout.get("status").and_then(|value| value.as_str())
+                    {
+                        let instance_id = parsed_stdout
+                            .get("instance_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("instance");
+                        return format!("{tool_name}: {instance_id} ({status})");
+                    }
+                    if let Some(turns) = parsed_stdout
+                        .get("turns")
+                        .and_then(|value| value.as_array())
+                    {
+                        return format!("{tool_name}: {} turns", turns.len());
+                    }
+                }
+                _ => {}
             }
         }
         if let Some(invocation) = val.get("invocation").and_then(|v| v.as_str()) {
@@ -292,10 +288,10 @@ fn summarize_tool_result(
             if timed_out {
                 return format!("{tool_name}: timed out — {invocation}");
             }
-            if let Some(exit_code) = exit_code {
-                if exit_code != 0 {
-                    return format!("{tool_name}: exit {exit_code} — {invocation}");
-                }
+            if let Some(exit_code) = exit_code
+                && exit_code != 0
+            {
+                return format!("{tool_name}: exit {exit_code} — {invocation}");
             }
             return format!("{tool_name}: {invocation}");
         }
@@ -435,13 +431,13 @@ pub async fn run_turn(
         // Use the clean content from the response (tool call blocks already
         // stripped) instead of raw streaming deltas which can leak partial
         // tool call JSON when SSE chunks split across the ``` boundary.
-        if let Some(content) = &response.message.content {
-            if !content.is_empty() {
-                emit(AgentEvent::TextDelta {
-                    text: content.clone(),
-                });
-                emit(AgentEvent::TextFlush);
-            }
+        if let Some(content) = &response.message.content
+            && !content.is_empty()
+        {
+            emit(AgentEvent::TextDelta {
+                text: content.clone(),
+            });
+            emit(AgentEvent::TextFlush);
         }
 
         // ── 2f. Push assistant message ────────────────────────────
@@ -454,10 +450,10 @@ pub async fn run_turn(
                 // No tool calls → turn complete
 
                 // Auto-compact if needed
-                if transcript.should_compact() {
-                    if let Some(summary) = transcript.compact(6) {
-                        compact_history(history, &summary, 6);
-                    }
+                if transcript.should_compact()
+                    && let Some(summary) = transcript.compact(6)
+                {
+                    compact_history(history, &summary, 6);
                 }
 
                 // Record assistant message in transcript

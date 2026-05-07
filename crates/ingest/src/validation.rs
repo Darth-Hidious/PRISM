@@ -98,24 +98,23 @@ pub fn validate(df: &DataFrame) -> ValidationReport {
                     | DataType::UInt16
                     | DataType::UInt32
                     | DataType::UInt64
-            ) {
-                if let Ok(n_unique) = col.n_unique() {
-                    // n_unique counts null as a unique value, so adjust
-                    let non_null_unique = if col.null_count() > 0 {
-                        n_unique.saturating_sub(1)
-                    } else {
-                        n_unique
-                    };
-                    if non_null_unique <= 1 && height > 1 {
-                        issues.push(ValidationIssue {
-                            severity: Severity::Info,
-                            column: Some(col_name.clone()),
-                            message: format!(
-                                "Column '{}' has zero variance (all non-null values are identical)",
-                                col_name
-                            ),
-                        });
-                    }
+            ) && let Ok(n_unique) = col.n_unique()
+            {
+                // n_unique counts null as a unique value, so adjust
+                let non_null_unique = if col.null_count() > 0 {
+                    n_unique.saturating_sub(1)
+                } else {
+                    n_unique
+                };
+                if non_null_unique <= 1 && height > 1 {
+                    issues.push(ValidationIssue {
+                        severity: Severity::Info,
+                        column: Some(col_name.clone()),
+                        message: format!(
+                            "Column '{}' has zero variance (all non-null values are identical)",
+                            col_name
+                        ),
+                    });
                 }
             }
         }

@@ -25,14 +25,12 @@ pub async fn resolve_role_layer(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if let Some(user) = req.extensions().get::<AuthenticatedUser>().cloned() {
-        if let Some(ref db_path) = state.rbac_db_path {
-            if let Ok(engine) = prism_core::rbac::RbacEngine::new(db_path) {
-                if let Ok(Some(role)) = engine.get_role(&user.user_id) {
-                    req.extensions_mut().insert(UserRole(role));
-                }
-            }
-        }
+    if let Some(user) = req.extensions().get::<AuthenticatedUser>().cloned()
+        && let Some(ref db_path) = state.rbac_db_path
+        && let Ok(engine) = prism_core::rbac::RbacEngine::new(db_path)
+        && let Ok(Some(role)) = engine.get_role(&user.user_id)
+    {
+        req.extensions_mut().insert(UserRole(role));
     }
     next.run(req).await
 }

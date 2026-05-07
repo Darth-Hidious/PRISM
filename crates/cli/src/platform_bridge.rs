@@ -66,6 +66,10 @@ pub struct ProxyHandle {
 }
 
 impl ProxyHandle {
+    /// Explicit shutdown — alternative to letting the handle Drop. Both
+    /// paths fire the oneshot. Public API kept for callers that want to
+    /// shut the proxy down without dropping the handle.
+    #[allow(dead_code)]
     pub fn shutdown(mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
@@ -318,11 +322,11 @@ fn truncate_oversized_messages(req: &mut Value) {
         let mut idx: Option<usize> = None;
         let mut max_len: usize = 0;
         for (i, msg) in messages.iter().enumerate() {
-            if let Some(c) = msg.get("content").and_then(|v| v.as_str()) {
-                if c.len() > max_len {
-                    max_len = c.len();
-                    idx = Some(i);
-                }
+            if let Some(c) = msg.get("content").and_then(|v| v.as_str())
+                && c.len() > max_len
+            {
+                max_len = c.len();
+                idx = Some(i);
             }
         }
         let i = match idx {
@@ -533,49 +537,50 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
             .cloned()
             .unwrap_or_default();
 
-        if last_role == "user" && !tools_for_routing.is_empty() {
-            if let Some(query) = user_query.as_ref() {
-                let decision = router.route(query, &tools_for_routing).await;
-                if let RoutingDecision::Invoke(mut call) = decision {
-                    // 1. Validate the chosen tool name is actually in the
-                    //    list — guards against hallucinated names.
-                    let name_known = tools_for_routing.iter().any(|t| {
-                        t.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|v| v.as_str())
-                            == Some(call.name.as_str())
-                    });
-                    if !name_known {
+        if last_role == "user"
+            && !tools_for_routing.is_empty()
+            && let Some(query) = user_query.as_ref()
+        {
+            let decision = router.route(query, &tools_for_routing).await;
+            if let RoutingDecision::Invoke(mut call) = decision {
+                // 1. Validate the chosen tool name is actually in the
+                //    list — guards against hallucinated names.
+                let name_known = tools_for_routing.iter().any(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        == Some(call.name.as_str())
+                });
+                if !name_known {
+                    eprintln!(
+                        "[platform_bridge] FunctionGemma proposed unknown tool {:?}, falling through",
+                        call.name
+                    );
+                } else {
+                    // 2. Schema-validate args against the tool's
+                    //    declared parameters. Base FunctionGemma picks
+                    //    the right tool but tends to invent extra args
+                    //    — strip those, keep schema-declared ones.
+                    //    If required fields are still unsatisfied,
+                    //    fall through to the chat LLM rather than
+                    //    ship a doomed call.
+                    let schema_ok = sanitise_args_against_schema(&mut call, &tools_for_routing);
+                    if !schema_ok {
                         eprintln!(
-                            "[platform_bridge] FunctionGemma proposed unknown tool {:?}, falling through",
+                            "[platform_bridge] FunctionGemma args invalid against schema for {}, falling through",
                             call.name
                         );
                     } else {
-                        // 2. Schema-validate args against the tool's
-                        //    declared parameters. Base FunctionGemma picks
-                        //    the right tool but tends to invent extra args
-                        //    — strip those, keep schema-declared ones.
-                        //    If required fields are still unsatisfied,
-                        //    fall through to the chat LLM rather than
-                        //    ship a doomed call.
-                        let schema_ok = sanitise_args_against_schema(&mut call, &tools_for_routing);
-                        if !schema_ok {
-                            eprintln!(
-                                "[platform_bridge] FunctionGemma args invalid against schema for {}, falling through",
-                                call.name
-                            );
+                        eprintln!(
+                            "[platform_bridge] FunctionGemma routed locally → {} (skipping chat LLM)",
+                            call.name
+                        );
+                        if stream_requested {
+                            let stream = synthetic_tool_call_stream(call, model.clone());
+                            return Sse::new(stream).into_response();
                         } else {
-                            eprintln!(
-                                "[platform_bridge] FunctionGemma routed locally → {} (skipping chat LLM)",
-                                call.name
-                            );
-                            if stream_requested {
-                                let stream = synthetic_tool_call_stream(call, model.clone());
-                                return Sse::new(stream).into_response();
-                            } else {
-                                return Json(synthetic_tool_call_full(call, model.clone()))
-                                    .into_response();
-                            }
+                            return Json(synthetic_tool_call_full(call, model.clone()))
+                                .into_response();
                         }
                     }
                 }
@@ -694,6 +699,7 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
 ///   - assistant tool_calls → assistant message whose content describes the
 ///     intent ("Calling X with args Y"); tool_calls field dropped
 ///   - tool result → user message prefixed with "[tool <name> result]"
+///
 /// The chat LLM still sees enough context to synthesise a final answer.
 fn flatten_tool_messages_for_marc27(req: &mut Value) {
     let messages = match req.get_mut("messages").and_then(|v| v.as_array_mut()) {

@@ -232,10 +232,10 @@ pub fn get_model_config(model_id: &str) -> ModelConfig {
     }
 
     // 2. Strip OpenRouter-style prefix
-    if let Some(stripped) = model_id.split_once('/').map(|(_, s)| s) {
-        if let Some(cfg) = reg.get(stripped) {
-            return *cfg;
-        }
+    if let Some(stripped) = model_id.split_once('/').map(|(_, s)| s)
+        && let Some(cfg) = reg.get(stripped)
+    {
+        return *cfg;
     }
 
     // 3. Prefix match

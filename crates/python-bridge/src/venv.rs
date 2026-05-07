@@ -91,12 +91,11 @@ async fn find_system_python() -> Result<PathBuf, PythonBridgeError> {
         .args(["python", "find", "--min-version", "3.11"])
         .output()
         .await
+        && output.status.success()
     {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
         }
     }
 

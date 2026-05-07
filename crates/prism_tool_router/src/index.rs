@@ -15,7 +15,6 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -246,7 +245,10 @@ fn cosine(a: &[f32], b: &[f32], a_norm: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::config::ModelRemote;
 
     fn cfg(tmp: &Path) -> Config {
         Config {
@@ -257,6 +259,14 @@ mod tests {
             port_floor: 9000,
             embed_dim: 3,
             embed_ctx: 512,
+            embedder_remote: ModelRemote {
+                repo: "test/embedder".into(),
+                file: "test.gguf".into(),
+            },
+            function_remote: ModelRemote {
+                repo: "test/function".into(),
+                file: "test.gguf".into(),
+            },
         }
     }
 

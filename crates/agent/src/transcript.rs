@@ -251,10 +251,10 @@ impl TranscriptStore {
             let mut seen = HashSet::new();
             let mut tool_names = Vec::new();
             for entry in &tool_calls {
-                if let Some(ref name) = entry.tool_name {
-                    if seen.insert(name.clone()) {
-                        tool_names.push(name.clone());
-                    }
+                if let Some(ref name) = entry.tool_name
+                    && seen.insert(name.clone())
+                {
+                    tool_names.push(name.clone());
                 }
             }
             summary_parts.push(format!("Tools used: {}", tool_names.join(", ")));

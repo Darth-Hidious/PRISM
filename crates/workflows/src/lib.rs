@@ -224,13 +224,12 @@ pub fn build_initial_context(
             None => true,
         };
         if missing {
-            if !argument.env.is_empty() {
-                if let Ok(value) = env::var(&argument.env) {
-                    if !value.is_empty() {
-                        context.insert(argument.name.clone(), serde_json::Value::String(value));
-                        continue;
-                    }
-                }
+            if !argument.env.is_empty()
+                && let Ok(value) = env::var(&argument.env)
+                && !value.is_empty()
+            {
+                context.insert(argument.name.clone(), serde_json::Value::String(value));
+                continue;
             }
             if let Some(default) = &argument.default {
                 context.insert(argument.name.clone(), default.clone());
@@ -365,34 +364,34 @@ pub async fn execute_workflow_with_policy(
 
     for step in &spec.steps {
         // Per-step policy check for tool calls
-        if step.action == "tool" {
-            if let Some(engine) = policy.as_deref_mut() {
-                let tool_name = step
+        if step.action == "tool"
+            && let Some(engine) = policy.as_deref_mut()
+        {
+            let tool_name = step
+                .config
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let input = prism_policy::PolicyInput {
+                action: "tool.call".into(),
+                principal: principal.into(),
+                role: values
+                    .get("role")
+                    .cloned()
+                    .unwrap_or_else(|| "operator".into()),
+                resource: tool_name.into(),
+                context: step
                     .config
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let input = prism_policy::PolicyInput {
-                    action: "tool.call".into(),
-                    principal: principal.into(),
-                    role: values
-                        .get("role")
-                        .cloned()
-                        .unwrap_or_else(|| "operator".into()),
-                    resource: tool_name.into(),
-                    context: step
-                        .config
-                        .get("inputs")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                };
-                engine.require(&input).with_context(|| {
-                    format!(
-                        "policy denied tool '{}' in workflow step '{}'",
-                        tool_name, step.id
-                    )
-                })?;
-            }
+                    .get("inputs")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            };
+            engine.require(&input).with_context(|| {
+                format!(
+                    "policy denied tool '{}' in workflow step '{}'",
+                    tool_name, step.id
+                )
+            })?;
         }
 
         // Retry wrapper — any step can have retry config

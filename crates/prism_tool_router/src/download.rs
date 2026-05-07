@@ -8,7 +8,9 @@
 //! HF's `resolve` URL pattern is what `huggingface-cli download` ends up
 //! hitting too:
 //!
-//!     https://huggingface.co/{repo}/resolve/main/{file}
+//! ```text
+//! https://huggingface.co/{repo}/resolve/main/{file}
+//! ```
 //!
 //! Private repos need a token; we look at HF_TOKEN and ~/.cache/huggingface/token
 //! in that order.
@@ -26,12 +28,11 @@ use crate::config::ModelRemote;
 /// Returns Ok(true) when a download happened, Ok(false) when the file was
 /// already present.
 pub async fn ensure_model(remote: &ModelRemote, dest: &Path) -> Result<bool> {
-    if dest.exists() {
-        if let Ok(meta) = std::fs::metadata(dest) {
-            if meta.len() > 0 {
-                return Ok(false);
-            }
-        }
+    if dest.exists()
+        && let Ok(meta) = std::fs::metadata(dest)
+        && meta.len() > 0
+    {
+        return Ok(false);
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -128,10 +129,10 @@ pub async fn ensure_model(remote: &ModelRemote, dest: &Path) -> Result<bool> {
 }
 
 fn read_hf_token() -> Option<String> {
-    if let Ok(t) = std::env::var("HF_TOKEN") {
-        if !t.is_empty() {
-            return Some(t);
-        }
+    if let Ok(t) = std::env::var("HF_TOKEN")
+        && !t.is_empty()
+    {
+        return Some(t);
     }
     let home = std::env::var_os("HOME")?;
     let p = std::path::PathBuf::from(home).join(".cache/huggingface/token");

@@ -455,11 +455,11 @@ impl NodeConfig {
         // Global: ~/.prism/prism.toml
         if let Some(home) = std::env::var_os("HOME") {
             let global = PathBuf::from(home).join(".prism").join("prism.toml");
-            if global.exists() {
-                if let Ok(gc) = Self::from_file(&global) {
-                    config = gc;
-                    tracing::debug!(path = %global.display(), "loaded global config");
-                }
+            if global.exists()
+                && let Ok(gc) = Self::from_file(&global)
+            {
+                config = gc;
+                tracing::debug!(path = %global.display(), "loaded global config");
             }
         }
 
@@ -468,12 +468,12 @@ impl NodeConfig {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let project = root.join(".prism").join("prism.toml");
-        if project.exists() {
-            if let Ok(pc) = Self::from_file(&project) {
-                // Merge: project overrides global (simple: just replace)
-                config = pc;
-                tracing::debug!(path = %project.display(), "loaded project config");
-            }
+        if project.exists()
+            && let Ok(pc) = Self::from_file(&project)
+        {
+            // Merge: project overrides global (simple: just replace)
+            config = pc;
+            tracing::debug!(path = %project.display(), "loaded project config");
         }
 
         config
@@ -482,18 +482,17 @@ impl NodeConfig {
     /// Resolve the API key for a model service section, checking env vars.
     pub fn resolve_api_key(section: &ModelServiceSection) -> Option<String> {
         // Direct key takes precedence
-        if let Some(ref key) = section.api_key {
-            if !key.is_empty() {
-                return Some(key.clone());
-            }
+        if let Some(ref key) = section.api_key
+            && !key.is_empty()
+        {
+            return Some(key.clone());
         }
         // Fall back to env var
-        if let Some(ref env_name) = section.api_key_env {
-            if let Ok(key) = std::env::var(env_name) {
-                if !key.is_empty() {
-                    return Some(key);
-                }
-            }
+        if let Some(ref env_name) = section.api_key_env
+            && let Ok(key) = std::env::var(env_name)
+            && !key.is_empty()
+        {
+            return Some(key);
         }
         // Fall back to LLM_API_KEY
         std::env::var("LLM_API_KEY").ok().filter(|k| !k.is_empty())

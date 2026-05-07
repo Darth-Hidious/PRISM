@@ -6,7 +6,9 @@
 //! function call. Out of the box it emits its native call format inside the
 //! OpenAI `content` field rather than `tool_calls`:
 //!
-//!     <start_function_call>call:NAME{arg:<escape>value<escape>,...}<end_function_call>
+//! ```text
+//! <start_function_call>call:NAME{arg:<escape>value<escape>,...}<end_function_call>
+//! ```
 //!
 //! We send chat completions through llama-server with stop sequences anchored
 //! on `<end_function_call>` and `<end_of_turn>`, then parse the emitted text
@@ -100,6 +102,12 @@ impl FunctionServer {
     async fn wait_ready(&self) -> Result<()> {
         let url = format!("{}/health", self.base_url);
         let started = std::time::Instant::now();
+        // last_err is overwritten on every loop iteration that fails, then
+        // surfaced via bail!() if the loop times out. Clippy's
+        // unused_assignments fires on the initial value because both arms
+        // of the match always overwrite it; the initial empty is a safety
+        // net for an unreachable code path.
+        #[allow(unused_assignments)]
         let mut last_err = String::new();
         loop {
             match self.http.get(&url).send().await {

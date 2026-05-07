@@ -1,7 +1,7 @@
 //! Configuration for the tool router. Resolves model file paths, ports,
 //! and llama.cpp binary location.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -43,7 +43,7 @@ impl Config {
     ///   ~/.prism/models/functiongemma-270m.gguf
     /// (downloaded by a separate bootstrap step the first time PRISM
     /// launches on this machine).
-    pub fn default_for_home(home: &PathBuf) -> Self {
+    pub fn default_for_home(home: &Path) -> Self {
         let prism_dir = home.join(".prism");
         Self {
             embedder_gguf: prism_dir.join("models/embeddinggemma-300m.gguf"),

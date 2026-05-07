@@ -197,12 +197,11 @@ fn scan_for_datasets(dir: &Path, out: &mut Vec<DatasetInfo>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if DATASET_EXTENSIONS.contains(&ext) {
-                    if let Some(info) = dataset_info_from_file(&path, ext) {
-                        out.push(info);
-                    }
-                }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && DATASET_EXTENSIONS.contains(&ext)
+                && let Some(info) = dataset_info_from_file(&path, ext)
+            {
+                out.push(info);
             }
         } else if path.is_dir() {
             // Check if directory contains dataset files (one level deep)
@@ -316,12 +315,11 @@ fn scan_for_models(dir: &Path, out: &mut Vec<ModelInfo>, depth: u32) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if MODEL_EXTENSIONS.contains(&ext) {
-                    if let Some(info) = model_info_from_file(&path, ext) {
-                        out.push(info);
-                    }
-                }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && MODEL_EXTENSIONS.contains(&ext)
+                && let Some(info) = model_info_from_file(&path, ext)
+            {
+                out.push(info);
             }
         } else if path.is_dir() {
             scan_for_models(&path, out, depth + 1);
@@ -418,74 +416,72 @@ async fn detect_ollama() -> Vec<NodeService> {
     };
 
     // Probe Ollama (localhost:11434)
-    if let Ok(resp) = client.get("http://localhost:11434/api/tags").send().await {
-        if let Ok(data) = resp.json::<serde_json::Value>().await {
-            if let Some(models) = data.get("models").and_then(|m| m.as_array()) {
-                for model in models {
-                    let name = model
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("unknown");
-                    services.push(NodeService {
-                        kind: "llm".to_string(),
-                        name: format!("Ollama: {name}"),
-                        status: "ready".to_string(),
-                        endpoint: Some("http://localhost:11434".to_string()),
-                        model: Some(name.to_string()),
-                    });
-                }
-            }
+    if let Ok(resp) = client.get("http://localhost:11434/api/tags").send().await
+        && let Ok(data) = resp.json::<serde_json::Value>().await
+        && let Some(models) = data.get("models").and_then(|m| m.as_array())
+    {
+        for model in models {
+            let name = model
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown");
+            services.push(NodeService {
+                kind: "llm".to_string(),
+                name: format!("Ollama: {name}"),
+                status: "ready".to_string(),
+                endpoint: Some("http://localhost:11434".to_string()),
+                model: Some(name.to_string()),
+            });
         }
     }
 
     // Probe llama.cpp server (localhost:8080)
-    if let Ok(resp) = client.get("http://localhost:8080/v1/models").send().await {
-        if let Ok(data) = resp.json::<serde_json::Value>().await {
-            if let Some(models) = data.get("data").and_then(|d| d.as_array()) {
-                for model in models {
-                    let name = model
-                        .get("id")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("unknown");
-                    services.push(NodeService {
-                        kind: "llm".to_string(),
-                        name: format!("llama.cpp: {name}"),
-                        status: "ready".to_string(),
-                        endpoint: Some("http://localhost:8080".to_string()),
-                        model: Some(name.to_string()),
-                    });
-                }
-            } else {
-                // llama.cpp is running but /v1/models didn't return expected format
+    if let Ok(resp) = client.get("http://localhost:8080/v1/models").send().await
+        && let Ok(data) = resp.json::<serde_json::Value>().await
+    {
+        if let Some(models) = data.get("data").and_then(|d| d.as_array()) {
+            for model in models {
+                let name = model
+                    .get("id")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown");
                 services.push(NodeService {
                     kind: "llm".to_string(),
-                    name: "llama.cpp".to_string(),
+                    name: format!("llama.cpp: {name}"),
                     status: "ready".to_string(),
                     endpoint: Some("http://localhost:8080".to_string()),
-                    model: None,
+                    model: Some(name.to_string()),
                 });
             }
+        } else {
+            // llama.cpp is running but /v1/models didn't return expected format
+            services.push(NodeService {
+                kind: "llm".to_string(),
+                name: "llama.cpp".to_string(),
+                status: "ready".to_string(),
+                endpoint: Some("http://localhost:8080".to_string()),
+                model: None,
+            });
         }
     }
 
     // Probe vLLM (localhost:8000)
-    if let Ok(resp) = client.get("http://localhost:8000/v1/models").send().await {
-        if let Ok(data) = resp.json::<serde_json::Value>().await {
-            if let Some(models) = data.get("data").and_then(|d| d.as_array()) {
-                for model in models {
-                    let name = model
-                        .get("id")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("unknown");
-                    services.push(NodeService {
-                        kind: "llm".to_string(),
-                        name: format!("vLLM: {name}"),
-                        status: "ready".to_string(),
-                        endpoint: Some("http://localhost:8000".to_string()),
-                        model: Some(name.to_string()),
-                    });
-                }
-            }
+    if let Ok(resp) = client.get("http://localhost:8000/v1/models").send().await
+        && let Ok(data) = resp.json::<serde_json::Value>().await
+        && let Some(models) = data.get("data").and_then(|d| d.as_array())
+    {
+        for model in models {
+            let name = model
+                .get("id")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown");
+            services.push(NodeService {
+                kind: "llm".to_string(),
+                name: format!("vLLM: {name}"),
+                status: "ready".to_string(),
+                endpoint: Some("http://localhost:8000".to_string()),
+                model: Some(name.to_string()),
+            });
         }
     }
 
@@ -516,10 +512,10 @@ fn binary_exists(binary: &str) -> bool {
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs_home() {
-            return home.join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs_home()
+    {
+        return home.join(rest);
     }
     PathBuf::from(path)
 }

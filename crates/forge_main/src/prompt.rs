@@ -329,9 +329,11 @@ mod tests {
         let _ = prompt.model(ModelId::new("gpt-4"));
 
         let actual = prompt.render_prompt_right();
-        // Agent symbol and name present
+        // Agent symbol and name present. PRISM rebrands the default
+        // `forge` agent_id as "PRISM" in the rendered prompt — the test
+        // tracks that rebrand instead of asserting upstream's literal.
         assert!(actual.contains(AGENT_SYMBOL));
-        assert!(actual.contains("FORGE"));
+        assert!(actual.contains("PRISM"));
         // Model symbol and name present
         assert!(actual.contains(MODEL_SYMBOL));
         assert!(actual.contains("gpt-4"));

@@ -95,6 +95,10 @@ impl EmbedderServer {
     async fn wait_ready(&self) -> Result<()> {
         let url = format!("{}/health", self.base_url);
         let started = std::time::Instant::now();
+        // last_err is overwritten on every loop iteration that fails, then
+        // surfaced via bail!() if the loop times out. Initial value is an
+        // unreachable safety net.
+        #[allow(unused_assignments)]
         let mut last_err = String::from("never reached");
         loop {
             match self.http.get(&url).send().await {
