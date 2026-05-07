@@ -602,10 +602,96 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
         "forwarding to MARC27"
     );
 
-    // MARC27 only speaks streaming. If forge asked for non-streaming we still
-    // hit the streaming endpoint upstream and assemble a single completion
-    // response from the deltas.
-    let upstream = format!("{}/stream", state.upstream_base);
+    // Resolve where this chat turn actually goes. The bridge's three
+    // first-class targets all reach this point:
+    //   - Marc27 → MARC27 platform proxy (existing path, custom SSE)
+    //   - Local → user-supplied OpenAI-compatible URL (Ollama, llama.cpp,
+    //     vLLM, friend's PRISM node, …). Standard OpenAI shape.
+    //   - Provider → direct vendor with the user's OWN key. For
+    //     OpenAI-compat vendors (openai, mistral, gemini-openai-shim,
+    //     cohere) we resolve to a known URL and pass through. For
+    //     Anthropic — which uses a non-OpenAI-shape /v1/messages
+    //     endpoint — we surface a clear "not yet supported, use
+    //     `prism use marc27 --model claude-…` instead" rather than
+    //     silently mis-routing.
+    //
+    // Marc27 stays on the SSE-reshape path (`sse_stream`); Local /
+    // Provider get their response piped through more directly because
+    // they already emit OpenAI-shape deltas. We branch *after* the
+    // upstream call so the retry logic + visible-failure detector
+    // still wrap every path.
+    enum UpstreamShape {
+        Marc27Sse,
+        OpenAiCompat,
+    }
+    let (upstream, bearer, shape): (String, Option<String>, UpstreamShape) = {
+        let target = state.chat_target.read().await.clone();
+        match target {
+            ChatTarget::Marc27 { .. } => (
+                format!("{}/stream", state.upstream_base),
+                Some(state.access_token.clone()),
+                UpstreamShape::Marc27Sse,
+            ),
+            ChatTarget::Local { url, api_key, .. } => (
+                format!("{}/chat/completions", url.trim_end_matches('/')),
+                api_key.filter(|k| !k.is_empty()),
+                UpstreamShape::OpenAiCompat,
+            ),
+            ChatTarget::Provider {
+                provider,
+                api_key_env,
+                ..
+            } => {
+                let provider_lc = provider.to_ascii_lowercase();
+                if provider_lc == "anthropic" {
+                    return error_response(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "Anthropic direct-provider mode is not yet supported by the chat bridge. \
+                         Use `prism use marc27 --model claude-sonnet-4` (or another claude-*) to \
+                         route through MARC27 instead, which proxies Anthropic with the platform's \
+                         own key. Direct Anthropic support will land once we wire the /v1/messages \
+                         shape.",
+                    );
+                }
+                let env_name = api_key_env
+                    .unwrap_or_else(|| ChatTarget::default_api_key_env(&provider_lc).to_string());
+                let key = match std::env::var(&env_name) {
+                    Ok(k) if !k.is_empty() => k,
+                    _ => {
+                        return error_response(
+                            StatusCode::UNAUTHORIZED,
+                            &format!(
+                                "Provider chat target needs `{env_name}` env var. Set it and \
+                                 retry, or `prism use reset` to go back to MARC27."
+                            ),
+                        );
+                    }
+                };
+                let url = match provider_lc.as_str() {
+                    "openai" => "https://api.openai.com/v1/chat/completions".to_string(),
+                    "mistral" => "https://api.mistral.ai/v1/chat/completions".to_string(),
+                    "gemini" | "google" => {
+                        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+                            .to_string()
+                    }
+                    "cohere" => {
+                        "https://api.cohere.ai/compatibility/v1/chat/completions".to_string()
+                    }
+                    other => {
+                        return error_response(
+                            StatusCode::NOT_IMPLEMENTED,
+                            &format!(
+                                "Unknown provider `{other}`. Supported direct-provider slugs: \
+                                 openai, mistral, gemini, cohere. For others, use \
+                                 `prism use local --url <openai-compatible-url>` instead."
+                            ),
+                        );
+                    }
+                };
+                (url, Some(key), UpstreamShape::OpenAiCompat)
+            }
+        }
+    };
 
     // Defensive retry on transient 5xx. The marc27-core retry helper lives
     // server-side and currently covers 429/502/503/504, but Cloudflare in
@@ -623,15 +709,19 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
         let mut last: Option<reqwest::Response> = None;
         let mut last_err: Option<reqwest::Error> = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            match state
+            let mut request = state
                 .http
                 .post(&upstream)
-                .bearer_auth(&state.access_token)
                 .header("Accept", "text/event-stream")
-                .json(&req)
-                .send()
-                .await
-            {
+                .json(&req);
+            // Auth header: MARC27 + OpenAI/Mistral/Gemini all use Bearer.
+            // Some local servers (Ollama with no auth) want NO header,
+            // hence Option<String>. (Anthropic's x-api-key shape
+            // diverges and is short-circuited above with NOT_IMPLEMENTED.)
+            if let Some(ref token) = bearer {
+                request = request.bearer_auth(token);
+            }
+            match request.send().await {
                 Ok(r) => {
                     let s = r.status().as_u16();
                     if r.status().is_success()
@@ -738,13 +828,58 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
         );
     }
 
-    if stream_requested {
-        let stream = sse_stream(resp, model);
-        Sse::new(stream).into_response()
-    } else {
-        match collect_full(resp, &model).await {
-            Ok(v) => Json(v).into_response(),
-            Err(e) => error_response(StatusCode::BAD_GATEWAY, &format!("assemble: {e}")),
+    match shape {
+        UpstreamShape::Marc27Sse => {
+            // MARC27's custom JSON+SSE → OpenAI delta reshape (existing
+            // path; handles tool_calls forwarding + silent-failure
+            // detection + retry-exhausted message).
+            if stream_requested {
+                let stream = sse_stream(resp, model);
+                Sse::new(stream).into_response()
+            } else {
+                match collect_full(resp, &model).await {
+                    Ok(v) => Json(v).into_response(),
+                    Err(e) => error_response(StatusCode::BAD_GATEWAY, &format!("assemble: {e}")),
+                }
+            }
+        }
+        UpstreamShape::OpenAiCompat => {
+            // Local + direct-provider OpenAI-compat upstreams already
+            // emit the OpenAI delta format forge expects. Pipe the
+            // bytes through unchanged — no reshape, no tool_calls
+            // injection, no silent-failure detector (those exist to
+            // patch MARC27's response normalizer; OpenAI-compat
+            // sources don't need them).
+            if stream_requested {
+                let body = resp.bytes_stream();
+                use axum::body::Body;
+                let body = Body::from_stream(body);
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .header("cache-control", "no-cache")
+                    .body(body)
+                    .unwrap_or_else(|_| {
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response failed")
+                    })
+            } else {
+                // Non-streaming JSON passthrough.
+                match resp.bytes().await {
+                    Ok(bytes) => axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap_or_else(|_| {
+                            error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "build response failed",
+                            )
+                        }),
+                    Err(e) => {
+                        error_response(StatusCode::BAD_GATEWAY, &format!("read upstream body: {e}"))
+                    }
+                }
+            }
         }
     }
 }
