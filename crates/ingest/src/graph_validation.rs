@@ -170,19 +170,15 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
 
     // Check 8: CONTAINS weights should be 0.0..=1.0
     for r in &entities.relationships {
-        if r.rel_type == "CONTAINS" {
-            if let Some(w) = r.weight {
-                if !(0.0..=1.0).contains(&w) {
-                    issues.push(GraphIssue {
-                        severity: GraphSeverity::Warning,
-                        category: "invalid_weight".into(),
-                        message: format!(
-                            "CONTAINS {} → {}: weight {w} not in [0, 1]",
-                            r.from, r.to
-                        ),
-                    });
-                }
-            }
+        if r.rel_type == "CONTAINS"
+            && let Some(w) = r.weight
+            && !(0.0..=1.0).contains(&w)
+        {
+            issues.push(GraphIssue {
+                severity: GraphSeverity::Warning,
+                category: "invalid_weight".into(),
+                message: format!("CONTAINS {} → {}: weight {w} not in [0, 1]", r.from, r.to),
+            });
         }
     }
 
@@ -200,10 +196,10 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
     // Check 10: CONTAINS weights for an alloy should sum to ~1.0
     let mut alloy_weights: HashMap<&str, f64> = HashMap::new();
     for r in &entities.relationships {
-        if r.rel_type == "CONTAINS" {
-            if let Some(w) = r.weight {
-                *alloy_weights.entry(r.from.as_str()).or_default() += w;
-            }
+        if r.rel_type == "CONTAINS"
+            && let Some(w) = r.weight
+        {
+            *alloy_weights.entry(r.from.as_str()).or_default() += w;
         }
     }
     for (alloy, total) in &alloy_weights {
@@ -278,10 +274,12 @@ mod tests {
         };
         let report = validate_graph(&es);
         assert!(report.passed);
-        assert!(report
-            .issues
-            .iter()
-            .all(|i| i.severity != GraphSeverity::Error));
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| i.severity != GraphSeverity::Error)
+        );
     }
 
     #[test]

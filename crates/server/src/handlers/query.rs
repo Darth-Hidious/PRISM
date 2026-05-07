@@ -6,15 +6,15 @@
 //! - `graph` — Entity neighbor traversal by name
 //! - `semantic` — Vector similarity search via Qdrant
 
+use axum::Extension;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
-use axum::Extension;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::middleware::AuthenticatedUser;
 use crate::NodeState;
+use crate::middleware::AuthenticatedUser;
 
 #[derive(Deserialize)]
 pub struct QueryRequest {
@@ -103,11 +103,12 @@ pub async fn execute_query(
     }?;
 
     // If federated=true on any mode, also query peers and merge results
-    if body.federated && body.mode != "federated" {
-        if let Some(peer_results) = query_mesh_peers(&state, &body.query).await {
-            result.results.extend(peer_results);
-            result.count = result.results.len() as u64;
-        }
+    if body.federated
+        && body.mode != "federated"
+        && let Some(peer_results) = query_mesh_peers(&state, &body.query).await
+    {
+        result.results.extend(peer_results);
+        result.count = result.results.len() as u64;
     }
 
     Ok(result)

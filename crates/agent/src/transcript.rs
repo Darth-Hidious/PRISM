@@ -251,10 +251,10 @@ impl TranscriptStore {
             let mut seen = HashSet::new();
             let mut tool_names = Vec::new();
             for entry in &tool_calls {
-                if let Some(ref name) = entry.tool_name {
-                    if seen.insert(name.clone()) {
-                        tool_names.push(name.clone());
-                    }
+                if let Some(ref name) = entry.tool_name
+                    && seen.insert(name.clone())
+                {
+                    tool_names.push(name.clone());
                 }
             }
             summary_parts.push(format!("Tools used: {}", tool_names.join(", ")));
@@ -556,9 +556,11 @@ mod tests {
         assert!(summary.contains("assistant"));
         // First entry should be the compacted system message
         assert_eq!(store.entries[0].role, "system");
-        assert!(store.entries[0]
-            .content
-            .contains("[Conversation context compacted]"));
+        assert!(
+            store.entries[0]
+                .content
+                .contains("[Conversation context compacted]")
+        );
         // Should have system + 4 recent entries
         assert_eq!(store.entries.len(), 5);
         assert!(store.compacted);

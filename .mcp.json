@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "pty-debug": {
+      "command": "pty-mcp-server",
+      "args": [],
+      "description": "PTY/TUI debug MCP — drives interactive terminal programs (PRISM TUI, llama-server, REPLs) from Claude Code. Used for engine-layer empirical observation per Phase 1 of redesign roadmap. Pair with the tui-use CLI for cross-validation. See memory/project_redesign_roadmap_2026_05.md."
+    }
+  }
+}

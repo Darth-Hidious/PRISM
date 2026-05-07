@@ -4,12 +4,12 @@
 //! and a consumer that deserialises them back into a tokio channel.
 
 use anyhow::{Context, Result};
+use rdkafka::Message;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::Message;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 

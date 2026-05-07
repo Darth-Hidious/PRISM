@@ -3,7 +3,7 @@
 //! Dispatches jobs to platform.marc27.com cloud infrastructure.
 //! Jobs run on managed GPU/CPU clusters with automatic scaling.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -219,9 +219,11 @@ mod tests {
     fn marc27_backend_stores_correct_base_url_and_token() {
         let backend = Marc27Backend::new("https://custom.host.example.com", "tok-abc-123");
         // Verify via public surface (url() and auth_header()).
-        assert!(backend
-            .url("/x")
-            .starts_with("https://custom.host.example.com"));
+        assert!(
+            backend
+                .url("/x")
+                .starts_with("https://custom.host.example.com")
+        );
         assert!(backend.auth_header().ends_with("tok-abc-123"));
     }
 

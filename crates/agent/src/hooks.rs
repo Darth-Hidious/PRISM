@@ -85,21 +85,21 @@ impl HookRegistry {
     /// Panics in individual hooks are caught and logged.
     pub fn fire_before(&self, tool_name: &str, inputs: &Value) -> HookResult {
         for hook in &self.hooks {
-            if let Some(ref before) = hook.before {
-                if hook.matches(tool_name) {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        before(tool_name, inputs)
-                    }));
-                    match result {
-                        Ok(hr) => {
-                            if hr.abort {
-                                info!("Hook '{}' aborted {}: {}", hook.name, tool_name, hr.reason);
-                                return hr;
-                            }
+            if let Some(ref before) = hook.before
+                && hook.matches(tool_name)
+            {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    before(tool_name, inputs)
+                }));
+                match result {
+                    Ok(hr) => {
+                        if hr.abort {
+                            info!("Hook '{}' aborted {}: {}", hook.name, tool_name, hr.reason);
+                            return hr;
                         }
-                        Err(_) => {
-                            warn!("Pre-hook '{}' panicked", hook.name);
-                        }
+                    }
+                    Err(_) => {
+                        warn!("Pre-hook '{}' panicked", hook.name);
                     }
                 }
             }
@@ -118,23 +118,23 @@ impl HookRegistry {
     ) -> Value {
         let mut current = result.clone();
         for hook in &self.hooks {
-            if let Some(ref after) = hook.after {
-                if hook.matches(tool_name) {
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        after(tool_name, inputs, &current, elapsed_ms)
-                    }));
-                    match outcome {
-                        Ok(post_result) => {
-                            if !post_result.log_message.is_empty() {
-                                info!("Post-hook '{}': {}", hook.name, post_result.log_message);
-                            }
-                            if let Some(modified) = post_result.modified_result {
-                                current = modified;
-                            }
+            if let Some(ref after) = hook.after
+                && hook.matches(tool_name)
+            {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    after(tool_name, inputs, &current, elapsed_ms)
+                }));
+                match outcome {
+                    Ok(post_result) => {
+                        if !post_result.log_message.is_empty() {
+                            info!("Post-hook '{}': {}", hook.name, post_result.log_message);
                         }
-                        Err(_) => {
-                            warn!("Post-hook '{}' panicked", hook.name);
+                        if let Some(modified) = post_result.modified_result {
+                            current = modified;
                         }
+                    }
+                    Err(_) => {
+                        warn!("Post-hook '{}' panicked", hook.name);
                     }
                 }
             }

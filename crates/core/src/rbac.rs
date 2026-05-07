@@ -5,7 +5,7 @@
 //! - **Local roles** (`LocalRole`): managed by the node admin, persisted in SQLite
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -377,9 +377,10 @@ mod tests {
         let e = engine();
         e.assign_role("viewer", LocalRole::Viewer).unwrap();
 
-        assert!(e
-            .check_permission("viewer", Permission::ViewDashboard)
-            .unwrap());
+        assert!(
+            e.check_permission("viewer", Permission::ViewDashboard)
+                .unwrap()
+        );
 
         for perm in &[
             Permission::ManageNode,
@@ -401,9 +402,10 @@ mod tests {
     #[test]
     fn no_role_denies_all() {
         let e = engine();
-        assert!(!e
-            .check_permission("nobody", Permission::ViewDashboard)
-            .unwrap());
+        assert!(
+            !e.check_permission("nobody", Permission::ViewDashboard)
+                .unwrap()
+        );
     }
 
     // -- Edge cases and error paths -------------------------------------------

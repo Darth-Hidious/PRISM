@@ -3,7 +3,7 @@
 //! Stores materials entities and relationships as a property graph.
 //! Uses Neo4j's HTTP API (port 7474) — no bolt driver needed.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing;

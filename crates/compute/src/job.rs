@@ -125,7 +125,7 @@ impl JobTracker {
         } else {
             jobs.values().cloned().collect()
         };
-        records.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
+        records.sort_by_key(|r| std::cmp::Reverse(r.submitted_at));
         records
     }
 
@@ -307,10 +307,12 @@ mod tests {
         assert!(!TrackedStatus::Queued.is_terminal());
         assert!(!TrackedStatus::Running { progress: 0.5 }.is_terminal());
         assert!(TrackedStatus::Completed { duration_secs: 0 }.is_terminal());
-        assert!(TrackedStatus::Failed {
-            error: "boom".into()
-        }
-        .is_terminal());
+        assert!(
+            TrackedStatus::Failed {
+                error: "boom".into()
+            }
+            .is_terminal()
+        );
         assert!(TrackedStatus::Cancelled.is_terminal());
     }
 

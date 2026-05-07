@@ -4,11 +4,11 @@
 //! (Ollama, OpenAI, MARC27, vLLM) along with the graph schema, and extracts
 //! a Cypher query that can be executed against Neo4j.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::graph::GraphSchemaInfo;
 use crate::LlmConfig;
+use crate::graph::GraphSchemaInfo;
 
 /// Translates natural language queries to Cypher using an LLM.
 pub struct NlQueryTranslator {

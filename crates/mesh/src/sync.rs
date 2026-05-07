@@ -13,9 +13,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::PeerNode;
 use crate::protocol::MeshMessage;
 use crate::subscription::SubscriptionManager;
-use crate::PeerNode;
 
 /// Configuration for the sync handler.
 #[derive(Debug, Clone)]
@@ -289,7 +289,7 @@ async fn sync_dataset_from_peer(
     }
 
     // Write to local Neo4j if configured
-    if let Some(ref cfg) = sync_config {
+    if let Some(cfg) = sync_config {
         let neo4j_url = format!("{}/db/neo4j/tx/commit", cfg.neo4j_url);
         let results = data["results"].as_array().unwrap();
 

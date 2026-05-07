@@ -245,3 +245,17 @@ def generate_claude_desktop_config() -> dict:
             }
         }
     }
+
+
+def main():
+    """Entrypoint: run the PRISM MCP server over stdio.
+
+    Forge (and any other MCP host such as Claude Desktop) spawns this as a
+    child process and talks JSON-RPC over stdin/stdout.
+    """
+    server = create_mcp_server()
+    server.run()  # FastMCP defaults to stdio transport
+
+
+if __name__ == "__main__":
+    main()

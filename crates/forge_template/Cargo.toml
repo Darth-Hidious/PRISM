@@ -1,0 +1,12 @@
+[package]
+name = "forge_template"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+html-escape = "0.2.13"
+
+[dev-dependencies]
+pretty_assertions.workspace = true

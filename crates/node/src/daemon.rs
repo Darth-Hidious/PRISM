@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use prism_proto::{NodeCapabilities, NodeMessage, PlatformMessage};
@@ -14,7 +14,7 @@ use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use serde::Serialize;
 use sysinfo::System;
 use tokio::signal;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -271,10 +271,10 @@ pub fn stop_daemon(paths: &PrismPaths) -> Result<()> {
 
     #[cfg(unix)]
     {
-        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            }
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = pid_str.trim().parse::<u32>()
+        {
+            let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         }
     }
 
@@ -604,10 +604,10 @@ async fn handle_platform_message(
         PlatformMessage::CancelJob { job_id } => {
             tracing::info!(%job_id, "cancel requested");
             let mut jobs = running_jobs.lock().await;
-            if let Some(job) = jobs.get_mut(&job_id) {
-                if let Some(cancel_tx) = job.cancel_tx.take() {
-                    let _ = cancel_tx.send(());
-                }
+            if let Some(job) = jobs.get_mut(&job_id)
+                && let Some(cancel_tx) = job.cancel_tx.take()
+            {
+                let _ = cancel_tx.send(());
             }
         }
         PlatformMessage::SubmitJob {
@@ -1473,11 +1473,11 @@ async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) ->
         .as_ref()
         .context("not logged in — run `prism login` first")?;
 
-    if let Some(expires_at) = creds.expires_at {
-        if chrono::Utc::now() >= expires_at {
-            tracing::info!("access token expired, refreshing");
-            return refresh_token(paths, endpoints, creds).await;
-        }
+    if let Some(expires_at) = creds.expires_at
+        && chrono::Utc::now() >= expires_at
+    {
+        tracing::info!("access token expired, refreshing");
+        return refresh_token(paths, endpoints, creds).await;
     }
 
     Ok(creds.access_token.clone())
@@ -1564,13 +1564,12 @@ fn strip_paths_for_wire(caps: &NodeCapabilities) -> NodeCapabilities {
         model.path = model.name.clone();
     }
     for svc in &mut wire.services {
-        if let Some(ep) = &svc.endpoint {
-            if !ep.starts_with("http://")
-                && !ep.starts_with("https://")
-                && !ep.starts_with("ssh://")
-            {
-                svc.endpoint = None;
-            }
+        if let Some(ep) = &svc.endpoint
+            && !ep.starts_with("http://")
+            && !ep.starts_with("https://")
+            && !ep.starts_with("ssh://")
+        {
+            svc.endpoint = None;
         }
     }
 
@@ -1893,7 +1892,9 @@ mod tests {
             }),
         );
 
-        std::env::set_var("PRISM_RUNTIME_URL", runtime_url);
+        unsafe {
+            std::env::set_var("PRISM_RUNTIME_URL", runtime_url);
+        }
         let tmp = TempDir::new().unwrap();
         let paths = PrismPaths {
             config_dir: tmp.path().join("config"),
@@ -1948,13 +1949,17 @@ mod tests {
                 reason,
             } if id == deployment_id && reason == "user_request"
         ));
-        assert!(state::active_deployments(&paths.state_dir)
-            .unwrap()
-            .is_empty());
+        assert!(
+            state::active_deployments(&paths.state_dir)
+                .unwrap()
+                .is_empty()
+        );
 
         health_server.join().unwrap();
         runtime_server.join().unwrap();
-        std::env::remove_var("PRISM_RUNTIME_URL");
+        unsafe {
+            std::env::remove_var("PRISM_RUNTIME_URL");
+        }
 
         let requests = runtime_requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);

@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (rdkafka needs libcurl)
-        run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev protobuf-compiler
       - name: Create dashboard dist placeholder (rust-embed needs it)
         run: mkdir -p dashboard/dist && echo '<html><body>placeholder</body></html>' > dashboard/dist/index.html
       - uses: dtolnay/rust-toolchain@stable
@@ -98,7 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (rdkafka needs libcurl)
-        run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev protobuf-compiler
       - name: Create dashboard dist placeholder (rust-embed needs it)
         run: mkdir -p dashboard/dist && echo '<html><body>placeholder</body></html>' > dashboard/dist/index.html
 

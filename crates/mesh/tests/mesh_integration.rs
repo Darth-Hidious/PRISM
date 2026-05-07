@@ -11,9 +11,9 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use prism_mesh::PeerNode;
 use prism_mesh::protocol::MeshMessage;
 use prism_mesh::subscription::{PublishedDataset, SubscriptionManager};
-use prism_mesh::PeerNode;
 
 /// Helper: create a PeerNode for testing.
 fn make_peer(id: Uuid, name: &str, port: u16) -> PeerNode {

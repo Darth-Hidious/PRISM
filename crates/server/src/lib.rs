@@ -142,12 +142,11 @@ impl NodeState {
     /// Write an audit entry AND broadcast it to WebSocket clients.
     pub fn audit_and_broadcast(&self, entry: &prism_core::audit::AuditEntry) {
         // Write to SQLite
-        if let Some(ref db_path) = self.audit_db_path {
-            if let Ok(log) = prism_core::audit::AuditLog::new(db_path) {
-                if let Err(e) = log.log(entry) {
-                    tracing::warn!(error = %e, "failed to write audit entry");
-                }
-            }
+        if let Some(ref db_path) = self.audit_db_path
+            && let Ok(log) = prism_core::audit::AuditLog::new(db_path)
+            && let Err(e) = log.log(entry)
+        {
+            tracing::warn!(error = %e, "failed to write audit entry");
         }
         // Broadcast to WebSocket clients
         self.broadcast(&WsEvent::AuditEntry {

@@ -1,14 +1,14 @@
 //! User management handlers.
 
+use axum::Extension;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
-use axum::Extension;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::middleware::UserRole;
 use crate::NodeState;
+use crate::middleware::UserRole;
 
 #[derive(Serialize)]
 pub struct UserInfo {

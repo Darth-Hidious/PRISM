@@ -41,5 +41,18 @@ prism-python-bridge = { path = "../python-bridge" }
 prism-runtime = { path = "../runtime" }
 prism-server = { path = "../server" }
 prism-workflows = { path = "../workflows" }
-ratatui = "0.26"
-crossterm = "0.27"
+
+# Forge harness — chat UI + agent loop. Apache-2.0, vendored from tailcallhq/forgecode.
+forge_main.workspace = true
+forge_api.workspace = true
+forge_config.workspace = true
+forge_domain.workspace = true
+rustls.workspace = true
+
+# MARC27 ↔ OpenAI proxy
+axum.workspace = true
+async-stream.workspace = true
+futures-util.workspace = true
+
+# Stage 2: semantic tool retrieval
+prism_tool_router = { path = "../prism_tool_router" }

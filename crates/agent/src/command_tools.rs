@@ -3,13 +3,13 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use prism_ingest::llm::ToolDefinition;
 use prism_workflows::{
-    discover_workflows, execute_workflow_with_policy, find_workflow, parse_workflow_command_args,
-    WorkflowRunResult, WorkflowSpec,
+    WorkflowRunResult, WorkflowSpec, discover_workflows, execute_workflow_with_policy,
+    find_workflow, parse_workflow_command_args,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
