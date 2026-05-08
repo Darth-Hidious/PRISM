@@ -22,10 +22,13 @@ class TestMCPServer:
                 return [t.name for t in tools]
 
         tool_names = asyncio.run(run())
-        assert "search_materials" in tool_names
+        # After Round 4-7 collapses:
+        #   search_materials → materials_search (canonical federated)
+        #   export_results_csv → dataset(action='export')
+        #   predict_property → predict(target=...)
+        assert "materials_search" in tool_names
         assert "query_materials_project" in tool_names
-        assert "export_results_csv" in tool_names
-        # `predict_property` was collapsed into the unified `predict(target=...)` tool.
+        assert "dataset" in tool_names
         assert "predict" in tool_names
         assert "list_models" in tool_names
         assert len(tool_names) >= 10
@@ -54,11 +57,12 @@ class TestMCPServer:
                 return {t.name: t.inputSchema for t in tools}
 
         schemas = asyncio.run(run())
-        # search_materials has elements with a description
-        search_schema = schemas["search_materials"]
+        # materials_search has elements with a description (was search_materials
+        # pre-Round 7; canonical federated tool now)
+        search_schema = schemas["materials_search"]
         assert "elements" in search_schema["properties"]
         assert search_schema["properties"]["elements"]["type"] == "array"
-        # elements is optional (no required fields for search_materials)
+        # elements is optional (no required fields for materials_search)
         assert "elements" not in search_schema.get("required", [])
 
     def test_tool_schema_required_optional(self):
@@ -90,7 +94,7 @@ class TestMCPServer:
         result = asyncio.run(run())
         # Result should be parseable JSON with tool names
         text = str(result)
-        assert "search_materials" in text
+        assert "materials_search" in text  # was search_materials pre-Round 7
         assert "list_models" in text
 
     def test_server_has_dataset_and_model_resources(self):

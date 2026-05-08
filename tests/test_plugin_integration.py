@@ -80,12 +80,15 @@ class TestPluginIntegration:
         assert records[0]["formula"] == "H2O"
 
     def test_build_full_registry_without_plugins(self):
-        """build_full_registry with plugins disabled still loads all built-in tools."""
+        """build_full_registry with plugins disabled still loads all built-in tools.
+
+        After Round 7 collapses: search_materials → materials_search,
+        import_dataset → dataset(action='import')."""
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
         # Core tools
-        assert "search_materials" in names
-        assert "import_dataset" in names
+        assert "materials_search" in names  # was search_materials pre-Round 7
+        assert "dataset" in names  # absorbed import_dataset as action='import'
         # Skills as tools
         assert "acquire_materials" in names
         assert "materials_discovery" in names

@@ -11,12 +11,18 @@ class TestBuildFullRegistry:
         # Also verify we got 3 items from the full call
 
     def test_has_core_tools(self):
+        """After Round 7: search_materials was removed (duplicate of
+        materials_search); import_dataset and export_results_csv folded into
+        the unified `dataset` Tool as actions."""
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
-        assert "search_materials" in names
-        assert "query_materials_project" in names
-        assert "export_results_csv" in names
-        assert "import_dataset" in names
+        assert "materials_search" in names  # canonical federated search
+        assert "query_materials_project" in names  # MP-specific deep query
+        assert "dataset" in names  # absorbs import + export
+        # Old names must be gone
+        assert "search_materials" not in names
+        assert "import_dataset" not in names
+        assert "export_results_csv" not in names
 
     def test_has_system_tools(self):
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
@@ -82,10 +88,11 @@ class TestBuildFullRegistry:
         assert "validate_dataset" not in names
         assert "review_dataset" not in names
         assert "visualize_dataset" not in names
-        # The unified tool advertises all three actions
+        # The unified tool advertises all five actions (Round 7 added
+        # import + export by absorbing import_dataset + export_results_csv)
         ds = registry.get("dataset")
         actions = ds.input_schema["properties"]["action"]["enum"]
-        assert set(actions) == {"validate", "review", "visualize"}
+        assert set(actions) == {"validate", "review", "visualize", "import", "export"}
 
     def test_has_correlation_matrix_tool(self):
         """correlation_matrix is now a kind of the unified `plot` tool."""
