@@ -38,31 +38,59 @@ pub fn render_table<S: TableStyler + InlineStyler>(
         }
     }
 
-    // Shrink columns if table exceeds max width
+    // Shrink columns if table exceeds max width.
+    //
+    // Per-column floor = max(MIN_COL_WIDTH, longest single word in that
+    // column, capped at the column's natural width). A flat
+    // MIN_COL_WIDTH=5 forces "Stainless" (9 chars) to character-break
+    // into "Stainl" / "ess" — three lines of word-shrapnel that look
+    // broken. Computing the floor per column means short labels stay
+    // intact and only long descriptive cells absorb the wrap, where
+    // word-boundary wrapping reads naturally.
     const MIN_COL_WIDTH: usize = 5;
+    let min_per_col: Vec<usize> = (0..n)
+        .map(|i| {
+            let longest_word = rendered_rows
+                .iter()
+                .filter_map(|r| r.get(i))
+                .flat_map(|cell| cell.split_whitespace().map(visible_length))
+                .max()
+                .unwrap_or(0);
+            longest_word.max(MIN_COL_WIDTH).min(w[i])
+        })
+        .collect();
+
     let overhead = margin.width() + 1 + 3 * n;
     let total: usize = w.iter().sum();
     if overhead + total > max_width && max_width > overhead {
         let avail = max_width - overhead;
-        // Cap at natural width so narrow columns (e.g. "#") aren't inflated
-        // up to MIN_COL_WIDTH when the proportional share rounds below it.
-        w.iter_mut()
-            .for_each(|x| *x = (*x * avail / total).max(MIN_COL_WIDTH).min(*x));
+        // Cap at natural width so narrow columns (e.g. "#") aren't
+        // inflated when the proportional share rounds below the floor.
+        w.iter_mut().enumerate().for_each(|(i, x)| {
+            let proportional = *x * avail / total;
+            *x = proportional.max(min_per_col[i]).min(*x);
+        });
 
-        // Clamping to MIN_COL_WIDTH can push the new total over `avail` when
-        // tiny columns get bumped up. Trim 1 char at a time from the widest
-        // column (above the minimum) until it fits.
+        // Clamping to per-column floors can push the new total over
+        // `avail` when tight columns get bumped up. Trim 1 char at a
+        // time from the widest column above ITS OWN floor until it
+        // fits. (Previously trimmed against the global MIN_COL_WIDTH,
+        // which would happily compress a "Stainless" column down to 5.)
         let mut excess = w.iter().sum::<usize>().saturating_sub(avail);
         while excess > 0 {
-            let Some(v) = w
-                .iter_mut()
-                .filter(|v| **v > MIN_COL_WIDTH)
-                .max_by_key(|v| **v)
-            else {
-                break;
-            };
-            *v -= 1;
-            excess -= 1;
+            let mut victim: Option<(usize, usize)> = None;
+            for (i, &v) in w.iter().enumerate() {
+                if v > min_per_col[i] && victim.is_none_or(|(_, best)| v > best) {
+                    victim = Some((i, v));
+                }
+            }
+            match victim {
+                Some((i, _)) => {
+                    w[i] -= 1;
+                    excess -= 1;
+                }
+                None => break, // every column is at its floor; can't shrink further
+            }
         }
     }
 
@@ -829,5 +857,97 @@ mod tests {
                 "[Deploy](https://deploy.com)",
             ],
         ]));
+    }
+
+    // ── Per-column floor: long words don't get character-broken ────
+    //
+    // Regression for the real PRISM TUI bug:
+    //   https://github.com/Darth-Hidious/PRISM (cryogenic-alloy turn)
+    // Materials-science queries produce 3-5 column tables where the
+    // first column is short labels ("Stainless 316L", "Inconel 718")
+    // and other columns hold long descriptions. Pre-fix, the shrink
+    // logic forced col 1 to MIN_COL_WIDTH=5, character-breaking
+    // "Stainless" → "Stainl"/"ess" — three lines of word-shrapnel.
+
+    #[test]
+    fn long_word_column_keeps_word_intact() {
+        // Two-column table where col1 has a long single word and
+        // col2 has lots of descriptive text. Even with a tight
+        // max_width, "Stainless" should stay on one line.
+        let out = render_with_width(
+            vec![
+                vec!["Material", "Description"],
+                vec![
+                    "Stainless",
+                    "Best general choice for cryogenic service: \
+                     austenitic stainless steels retain good ductility \
+                     and toughness at liquid-nitrogen temperatures.",
+                ],
+            ],
+            60,
+        );
+        assert!(
+            out.contains("Stainless"),
+            "expected 'Stainless' intact in output, got:\n{out}"
+        );
+        assert!(
+            !out.contains("Stainl ") && !out.contains("Stainl│"),
+            "'Stainless' was character-broken (saw 'Stainl' in output):\n{out}"
+        );
+    }
+
+    #[test]
+    fn short_label_column_keeps_each_label_intact() {
+        // The 3-alloy comparison table from the cryogenic TUI test.
+        // Each material name should appear unbroken on its own line.
+        let out = render_with_width(
+            vec![
+                vec!["Material", "Suitability", "Why"],
+                vec![
+                    "Stainless 316L",
+                    "Best general choice",
+                    "Austenitic stainless retains ductility at 77 K.",
+                ],
+                vec![
+                    "Inconel 718",
+                    "Best for high strength",
+                    "Maintains strength + toughness at cryogenic T.",
+                ],
+                vec![
+                    "Ti-6Al-4V",
+                    "Use with caution",
+                    "Some Ti alloys lose ductility at cryogenic T.",
+                ],
+            ],
+            80,
+        );
+        for label in ["Stainless", "Inconel", "Ti-6Al-4V"] {
+            assert!(
+                out.contains(label),
+                "expected '{label}' intact in output, got:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_narrow_still_renders_long_word_when_room() {
+        // The fix should never INCREASE the table width past
+        // max_width even when col-floors compete. A 3-column table
+        // forced into 30 cols total: the renderer must give long
+        // words their natural width and absorb the squeeze in
+        // descriptive cells. Verify total line width <= 30.
+        let out = render_with_width(
+            vec![
+                vec!["A", "B", "C"],
+                vec!["alpha", "beta gamma delta epsilon zeta", "eta"],
+            ],
+            30,
+        );
+        for line in out.lines() {
+            assert!(
+                line.chars().count() <= 30,
+                "table line wider than max_width=30: {line:?}"
+            );
+        }
     }
 }
