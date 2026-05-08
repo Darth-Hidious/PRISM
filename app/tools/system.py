@@ -127,98 +127,122 @@ def _show_scratchpad(**kwargs) -> dict:
     return {"text": scratchpad.to_text()}
 
 
+_FILE_DISPATCH = {
+    "read":  _read_file,
+    "write": _write_file,
+    "edit":  _edit_file,
+}
+
+
+def _file(**kwargs) -> dict:
+    """Unified file I/O dispatcher.
+
+    Replaces the prior `read_file`, `write_file`, and `edit_file` tools.
+    Each action validates its required args before touching the filesystem.
+    Sandbox enforcement (paths must resolve inside PRISM project root) is
+    inherited from `_is_safe_path`, applied by each handler.
+    """
+    action = kwargs.pop("action", None)
+    if not action:
+        return {
+            "error": f"Missing 'action'. Valid: {list(_FILE_DISPATCH.keys())}",
+            "hint": (
+                "file(action='read', path='./README.md') / "
+                "file(action='write', path=..., content=...) / "
+                "file(action='edit', path=..., old_text=..., new_text=...)"
+            ),
+        }
+    handler = _FILE_DISPATCH.get(action)
+    if not handler:
+        return {"error": f"Unknown action '{action}'. Valid: {list(_FILE_DISPATCH.keys())}"}
+    # Per-action arg validation
+    if action == "read":
+        if not kwargs.get("path"):
+            return {"error": "Action 'read' requires `path`"}
+    elif action == "write":
+        if not kwargs.get("path"):
+            return {"error": "Action 'write' requires `path`"}
+        if kwargs.get("content") is None:
+            return {"error": "Action 'write' requires `content`"}
+    elif action == "edit":
+        if not kwargs.get("path"):
+            return {"error": "Action 'edit' requires `path`"}
+        if kwargs.get("old_text") is None or kwargs.get("new_text") is None:
+            return {"error": "Action 'edit' requires `old_text` and `new_text`"}
+    try:
+        return handler(**kwargs)
+    except Exception as e:
+        return {"error": str(e), "action": action}
+
+
+_FILE_DESCRIPTION = (
+    "Text file I/O inside the current PRISM project. ONE tool, three actions:\n"
+    "  • action='read' — read a text file. Requires `path`. Returns content + size.\n"
+    "  • action='write' — overwrite (or create) a file. Requires `path` + "
+    "`content`. Replaces existing contents completely.\n"
+    "  • action='edit' — targeted in-file replace. Requires `path`, `old_text`, "
+    "`new_text`. Fails if old_text matches multiple locations unless "
+    "`replace_all=true`. Use this when you want a surgical change rather than "
+    "rewriting the whole file with action='write'.\n"
+    "Paths are resolved relative to the project root (CWD); absolute paths "
+    "must still be inside the project tree (sandbox enforced). NOT for binary "
+    "files and NOT for shell access (use execute_bash)."
+)
+
+_FILE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": list(_FILE_DISPATCH.keys()),
+            "description": "Which file operation to perform.",
+        },
+        "path": {
+            "type": "string",
+            "description": (
+                "Project-relative or absolute path inside the PRISM "
+                "project. Required for all actions."
+            ),
+        },
+        "content": {
+            "type": "string",
+            "description": (
+                "Full file content for action='write'. Replaces existing contents."
+            ),
+        },
+        "old_text": {
+            "type": "string",
+            "description": (
+                "Exact text snippet to replace for action='edit'. Must be "
+                "specific enough to match only the intended location."
+            ),
+        },
+        "new_text": {
+            "type": "string",
+            "description": "Replacement text for action='edit'.",
+        },
+        "replace_all": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "For action='edit': replace every match instead of failing "
+                "on multiple matches."
+            ),
+        },
+    },
+    "required": ["action"],
+    "additionalProperties": False,
+}
+
+
 def create_system_tools(registry: ToolRegistry) -> None:
-    # These core coding tools need procedural descriptions because the model
-    # should choose them intentionally instead of falling back to shell habits.
+    # Unified file tool replaces read_file / write_file / edit_file.
     registry.register(Tool(
-        name="read_file",
-        description=(
-            "Read a text file inside the current PRISM project. Use this for "
-            "source files, config files, logs, and other textual project files "
-            "when you need the file contents directly in the model context. Use "
-            "this instead of execute_bash for straightforward file reads."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": (
-                        "Project-relative or absolute path to a text file inside "
-                        "the current PRISM project."
-                    ),
-                }
-            },
-            "required": ["path"],
-        },
-        func=_read_file))
-    registry.register(Tool(
-        name="write_file",
-        description=(
-            "Write text content to a file inside the current PRISM project. "
-            "This overwrites the target file completely, so use it when you want "
-            "to replace a file body or create a new text file directly."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": (
-                        "Project-relative or absolute path to a file inside the "
-                        "current PRISM project."
-                    ),
-                },
-                "content": {
-                    "type": "string",
-                    "description": (
-                        "Full text content to write. This replaces any existing "
-                        "file contents."
-                    ),
-                },
-            },
-            "required": ["path", "content"],
-        },
-        func=_write_file))
-    registry.register(Tool(
-        name="edit_file",
-        description=(
-            "Edit a text file inside the current PRISM project by replacing an "
-            "exact old_text snippet with new_text. Use this when you want a "
-            "targeted in-file change instead of overwriting the whole file with "
-            "write_file or shelling out through execute_bash."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": (
-                        "Project-relative or absolute path to a text file inside "
-                        "the current PRISM project."
-                    ),
-                },
-                "old_text": {
-                    "type": "string",
-                    "description": (
-                        "Exact text snippet to replace. Keep this specific enough "
-                        "to match only the intended location."
-                    ),
-                },
-                "new_text": {
-                    "type": "string",
-                    "description": "Replacement text for the matched snippet.",
-                },
-                "replace_all": {
-                    "type": "boolean",
-                    "description": (
-                        "Replace every exact match instead of failing on multiple matches."
-                    ),
-                },
-            },
-            "required": ["path", "old_text", "new_text"],
-        },
-        func=_edit_file))
+        name="file",
+        description=_FILE_DESCRIPTION,
+        input_schema=_FILE_SCHEMA,
+        func=_file,
+    ))
     registry.register(Tool(
         name="web_search",
         description=(
