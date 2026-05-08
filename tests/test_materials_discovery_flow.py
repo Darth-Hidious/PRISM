@@ -132,21 +132,26 @@ class TestMaterialsDiscoveryFlow:
     # ── Step 7: Tool registry has all needed tools ─────────────────
 
     def test_step7_all_workflow_tools_available(self):
-        """All tools referenced by materials_discovery workflow must exist."""
+        """All tools referenced by materials_discovery workflow must exist.
+
+        Updated for the post-Round-7 tool surface:
+          - `search_materials` (Round 7 dedup)    → `materials_search`
+          - `import_dataset` / `export_results_csv` (Round 6 collapse)
+                                                  → `dataset` (action='import'/'export')
+          - `predict_property` / `predict_structure` (Round 4 batch 2)
+                                                  → `predict` (target=…)
+        """
         from app.plugins.bootstrap import build_full_registry
 
         reg, _, _ = build_full_registry(enable_mcp=False, enable_plugins=False)
         tool_names = {t.name for t in reg.list_tools()}
 
-        # Note: predict_property + predict_structure were collapsed in
-        # Round 4 batch 2 into the unified `predict(target=…)` tool.
         required = [
-            "search_materials",
+            "materials_search",
             "query_materials_project",
             "predict",
             "list_models",
-            "export_results_csv",
-            "import_dataset",
+            "dataset",  # action='import' / action='export'
             "execute_python",
             "discover_capabilities",
         ]

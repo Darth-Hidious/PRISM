@@ -51,10 +51,15 @@ class TestMCPRoundTrip:
                 return [str(r.uri) for r in resources]
 
         uris = asyncio.run(run())
-        assert any("sessions" in u for u in uris)
+        # Resources currently exposed by `app/mcp_server.py::_register_resources`:
+        # tools, datasets, models, capabilities, skills (+ CALPHAD / sim when
+        # those backends are available). The legacy `sessions` resource was
+        # removed; we no longer assert on it.
         assert any("tools" in u for u in uris)
         assert any("datasets" in u for u in uris)
         assert any("models" in u for u in uris)
+        assert any("capabilities" in u for u in uris)
+        assert any("skills" in u for u in uris)
 
     def test_read_tools_resource_content(self):
         """Client can read the tools resource and get valid JSON."""

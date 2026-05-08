@@ -17,18 +17,34 @@ from app.tools.calphad import (
 
 
 class TestCreateCalphadTools:
-    def test_registers_six_tools(self):
+    """Round 5 collapse (PR #23): 6 tools → 2 unified dispatchers.
+
+    The previous 6 standalone tools are now action= subcommands
+    behind the read-only `calphad` and approval-gated
+    `calphad_compute` dispatchers. See
+    tests/test_round5_sim_collapse.py for dispatcher correctness;
+    this test just verifies the registration count + approval gate.
+    """
+
+    def test_registers_two_unified_tools(self):
         registry = ToolRegistry()
         create_calphad_tools(registry)
         tools = registry.list_tools()
-        assert len(tools) == 6
+        assert len(tools) == 2
         names = {t.name for t in tools}
-        assert "calculate_phase_diagram" in names
-        assert "calculate_equilibrium" in names
-        assert "calculate_gibbs_energy" in names
-        assert "list_calphad_databases" in names
-        assert "list_phases" in names
-        assert "import_calphad_database" in names
+        assert names == {"calphad", "calphad_compute"}
+
+    def test_calphad_compute_requires_approval(self):
+        registry = ToolRegistry()
+        create_calphad_tools(registry)
+        # Approval-gated because calculations spend compute budget
+        assert registry.get("calphad_compute").requires_approval is True
+
+    def test_calphad_no_approval(self):
+        registry = ToolRegistry()
+        create_calphad_tools(registry)
+        # Catalog/IO ops are cheap — no approval gate
+        assert registry.get("calphad").requires_approval is False
 
 
 class TestGuardedTools:
