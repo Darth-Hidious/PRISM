@@ -1,15 +1,30 @@
-"""Compute Broker — UNIFIED tool collapsing 6 actions into one entry point.
+"""Compute Broker — unified read-only tool + standalone money-spending submit.
 
-DRAFT for Round 4 collapse work. Will replace app/tools/compute.py once PR #12 merges.
+Two tools:
 
-Replaces:
-  compute_gpus, compute_providers, compute_estimate, compute_submit,
-  compute_status, compute_cancel
-Discriminator: `action` (string enum)
+  - `compute(action=…)` — read-only and idempotent operations:
+    list_gpus, list_providers, estimate, status, cancel.
+    No approval required. Cheap to call repeatedly (estimate is FREE,
+    list_gpus/providers are catalog reads, status is a poll, cancel
+    is idempotent).
 
-Approval semantics: same as today (none). Flag for follow-up:
-  action='submit' is the money-spending one; should arguably set
-  requires_approval=True. Out of scope for the collapse PR.
+  - `compute_submit(...)` — STANDALONE money-spending action.
+    Dispatches a real GPU/CPU job to the MARC27 Compute Broker.
+    `requires_approval=True` — the harness MUST prompt the user before
+    each call. Cost is real, sometimes substantial (~$0.10–$10+ per job).
+
+WHY THE SPLIT
+
+Earlier collapse work folded all 6 compute_* tools into one
+`compute(action=…)` tool. That was clean for surface reduction, but
+collapsed the approval semantics: `requires_approval` is a per-tool
+boolean, not per-action. Either every compute call needed approval
+(annoying for list_gpus / estimate / status polling) or none did
+(unsafe for submit). Splitting submit back out preserves the original
+approval gate for money-spending while keeping the rest collapsed.
+
+Same architectural pattern as bash_task / stop_bash_task: destructive
+or money-spending actions stay isolated for approval.
 """
 import logging
 from app.tools.base import Tool, ToolRegistry
@@ -76,24 +91,40 @@ def _act_cancel(client, **kw) -> dict:
     return {"status": "cancelled", "job_id": kw["job_id"]}
 
 
-# (handler, list-of-required-args)
+# (handler, list-of-required-args) — read-only / idempotent actions ONLY.
+# The money-spending `submit` action is NOT in this dispatch; it lives as
+# a separate standalone tool with requires_approval=True (see below).
 _DISPATCH: dict[str, tuple] = {
     "list_gpus":      (_act_list_gpus,      []),
     "list_providers": (_act_list_providers, []),
     "estimate":       (_act_estimate,       ["image"]),
-    "submit":         (_act_submit,         ["image", "inputs"]),
     "status":         (_act_status,         ["job_id"]),
     "cancel":         (_act_cancel,         ["job_id"]),
 }
 
 
 def _compute(**kwargs) -> dict:
-    """Single entry point dispatched by `action`."""
+    """Read-only dispatcher. Money-spending `submit` is in `compute_submit`."""
     action = kwargs.pop("action", None)
     if not action:
         return {
             "error": f"Missing 'action'. Valid: {list(_DISPATCH.keys())}",
-            "hint": "Call as compute(action='list_gpus') or compute(action='submit', image=..., inputs=...)",
+            "hint": (
+                "compute(action='list_gpus') / compute(action='estimate', image='...') / "
+                "compute(action='status', job_id='...'). For dispatching a real job, "
+                "use the separate compute_submit tool (approval-gated)."
+            ),
+        }
+
+    if action == "submit":
+        # Hard-redirect callers who try the old interface
+        return {
+            "error": (
+                "action='submit' moved to a separate tool `compute_submit` for "
+                "safety. compute_submit requires user approval before each call "
+                "because it spends real money. Call compute_submit(image=..., "
+                "inputs=...) directly."
+            ),
         }
 
     if action not in _DISPATCH:
@@ -119,19 +150,60 @@ def _compute(**kwargs) -> dict:
         return {"error": str(e), "action": action}
 
 
+def _compute_submit(**kwargs) -> dict:
+    """Money-spending dispatcher for compute_submit (approval-gated)."""
+    if not kwargs.get("image"):
+        return {"error": "compute_submit requires `image`"}
+    if "inputs" not in kwargs:
+        return {"error": "compute_submit requires `inputs` (JSON payload, may be empty {})"}
+
+    client = _get_client()
+    if not client:
+        return {"error": "MARC27 platform not connected. Run `prism login` first."}
+
+    try:
+        return _act_submit(client, **kwargs)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 _DESCRIPTION = (
-    "MARC27 Compute Broker — submit, monitor, and cancel containerized "
-    "GPU/CPU jobs across providers (PRISM mesh nodes, RunPod, Lambda). "
-    "ONE tool, six actions selected via `action`:\n"
+    "MARC27 Compute Broker — read-only and idempotent operations across "
+    "providers (PRISM mesh nodes, RunPod, Lambda). For dispatching real "
+    "GPU/CPU jobs, use the separate `compute_submit` tool (approval-gated, "
+    "money-spending).\n"
+    "\n"
+    "ONE tool, five read-only actions selected via `action`:\n"
     "  • action='list_gpus' — show available GPU types + pricing. No other args.\n"
     "  • action='list_providers' — show registered backends. No other args.\n"
     "  • action='estimate' — cost preview, FREE; requires `image`. Optional: `gpu_type`, `timeout_seconds`.\n"
-    "  • action='submit' — DISPATCHES A REAL JOB (money-spending); requires `image` + `inputs`. "
-    "Set `budget_max_usd` to cap spend.\n"
     "  • action='status' — poll one job; requires `job_id`. Cheap, no spend.\n"
     "  • action='cancel' — abort queued/running job; requires `job_id`. Idempotent.\n"
-    "Typical sequence: list_gpus → estimate → submit → status (loop) → [cancel if needed]. "
-    "NOT for listing LLM models (use models_list) and NOT for ML prediction (use predict)."
+    "Typical sequence: list_gpus → estimate → compute_submit → status (loop) → "
+    "[cancel if needed]. NOT for listing LLM models (use models_list) and NOT "
+    "for ML prediction (use predict)."
+)
+
+
+_SUBMIT_DESCRIPTION = (
+    "Dispatch a real containerized GPU/CPU job to the MARC27 Compute Broker. "
+    "MONEY-SPENDING ACTION — requires user approval before each call (the "
+    "harness will prompt you).\n"
+    "\n"
+    "Required args: `image` (Docker tag like 'vasp:6.5.0' or marketplace slug), "
+    "`inputs` (JSON payload for the container). Strongly recommended: "
+    "`budget_max_usd` to hard-cap spend (broker refuses dispatch if estimate "
+    "exceeds).\n"
+    "\n"
+    "Optional: `gpu_type` (A100-80GB, H100-80GB, ...; uses cheapest available "
+    "if omitted), `provider_preference` ('cheapest' default — prefers PRISM "
+    "mesh; 'fastest' = premium cloud; or specific provider name), "
+    "`timeout_seconds` (wall-time cap, default 3600), `env_vars` (API keys, "
+    "license tokens).\n"
+    "\n"
+    "Returns the job_id you can poll with compute(action='status', "
+    "job_id=...). Use compute(action='estimate') first if cost is a concern. "
+    "NOT for atomistic SLURM submission (that goes through pyiron sim_tools)."
 )
 
 
@@ -141,66 +213,33 @@ _SCHEMA = {
         "action": {
             "type": "string",
             "enum": list(_DISPATCH.keys()),
-            "description": "Which compute-broker operation to perform.",
+            "description": "Which read-only compute-broker operation to perform.",
         },
         "image": {
             "type": "string",
             "description": (
                 "Container image (e.g. 'vasp:6.5.0', 'quantum-espresso:7.4') "
-                "or marketplace slug. Required for action='estimate' and action='submit'."
-            ),
-        },
-        "inputs": {
-            "type": "object",
-            "description": (
-                "JSON input payload for the container. Shape depends on the image — "
-                "DFT runners want {structure, kpoints, encut, ...}, training jobs want "
-                "{dataset_uri, hyperparameters, ...}. Required for action='submit'."
+                "or marketplace slug. Required for action='estimate'."
             ),
         },
         "gpu_type": {
             "type": "string",
             "description": (
-                "GPU class (e.g. 'A100-80GB', 'H100-80GB'). Optional for "
-                "action='estimate'/'submit'; uses cheapest available if omitted."
+                "GPU class (e.g. 'A100-80GB', 'H100-80GB') for action='estimate'."
             ),
-        },
-        "budget_max_usd": {
-            "type": "number",
-            "description": (
-                "Hard cap on job cost in USD for action='submit'. The broker "
-                "refuses dispatch if estimated cost exceeds this. Strongly "
-                "recommended for non-trivial jobs."
-            ),
-        },
-        "provider_preference": {
-            "type": "string",
-            "description": (
-                "Routing strategy for action='submit': 'cheapest' (default — "
-                "prefers PRISM mesh nodes), 'fastest' (premium cloud), or an "
-                "explicit provider name."
-            ),
-            "default": "cheapest",
         },
         "timeout_seconds": {
             "type": "integer",
             "description": (
-                "Wall-time cap in seconds for action='estimate'/'submit'. "
+                "Wall-time cap in seconds for action='estimate'. "
                 "Default 3600 (1 hour). Cost = price-per-hour × timeout / 3600."
             ),
             "default": 3600,
         },
-        "env_vars": {
-            "type": "object",
-            "description": (
-                "Environment variables passed to the action='submit' container. "
-                "Use for API keys, license tokens, feature flags."
-            ),
-        },
         "job_id": {
             "type": "string",
             "description": (
-                "Job ID returned by action='submit' (format: 'job_<uuid>' or "
+                "Job ID returned by compute_submit (format: 'job_<uuid>' or "
                 "numeric SLURM ID). Required for action='status' and action='cancel'."
             ),
         },
@@ -210,11 +249,82 @@ _SCHEMA = {
 }
 
 
+_SUBMIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "image": {
+            "type": "string",
+            "description": (
+                "Container image (Docker tag, e.g. 'vasp:6.5.0') or "
+                "marketplace slug registered with the broker."
+            ),
+        },
+        "inputs": {
+            "type": "object",
+            "description": (
+                "JSON input payload for the container. Shape depends on the "
+                "image — DFT runners want {structure, kpoints, encut, ...}; "
+                "training jobs want {dataset_uri, hyperparameters, ...}. "
+                "Pass {} if the image needs no inputs."
+            ),
+        },
+        "gpu_type": {
+            "type": "string",
+            "description": "GPU class (e.g. 'A100-80GB'). Use compute(action='list_gpus') first.",
+        },
+        "budget_max_usd": {
+            "type": "number",
+            "description": (
+                "Hard cap on this job's cost in USD. Broker refuses dispatch "
+                "if estimated cost exceeds this. STRONGLY recommended for "
+                "non-trivial jobs to prevent runaway charges."
+            ),
+        },
+        "provider_preference": {
+            "type": "string",
+            "description": (
+                "Routing strategy: 'cheapest' (default, prefers PRISM mesh "
+                "nodes), 'fastest' (premium cloud), or specific provider name."
+            ),
+            "default": "cheapest",
+        },
+        "timeout_seconds": {
+            "type": "integer",
+            "description": (
+                "Wall-time cap in seconds. Job is killed at the cap even if "
+                "not done. Default 3600 (1 hour)."
+            ),
+            "default": 3600,
+        },
+        "env_vars": {
+            "type": "object",
+            "description": (
+                "Environment variables passed to the container. Use for API "
+                "keys, license tokens, feature flags."
+            ),
+        },
+    },
+    "required": ["image", "inputs"],
+    "additionalProperties": False,
+}
+
+
 def create_compute_tools(registry: ToolRegistry) -> None:
-    """Register the unified `compute` tool (replaces 6 prior tools)."""
+    """Register the read-only `compute` tool + the approval-gated `compute_submit`.
+
+    The split mirrors the bash_task / stop_bash_task pattern: destructive
+    or money-spending actions stay isolated for per-tool approval gating.
+    """
     registry.register(Tool(
         name="compute",
         description=_DESCRIPTION,
         input_schema=_SCHEMA,
         func=_compute,
+    ))
+    registry.register(Tool(
+        name="compute_submit",
+        description=_SUBMIT_DESCRIPTION,
+        input_schema=_SUBMIT_SCHEMA,
+        func=_compute_submit,
+        requires_approval=True,
     ))
