@@ -17,9 +17,11 @@ class TestMCPRoundTrip:
                 return [t.name for t in tools]
 
         tool_names = asyncio.run(run())
-        assert "search_materials" in tool_names
-        assert "predict_property" in tool_names
-        assert "export_results_csv" in tool_names
+        # After Round 4-7 collapses: predict_property → predict, export_results_csv
+        # → dataset(action='export'), search_materials → materials_search.
+        assert "materials_search" in tool_names
+        assert "predict" in tool_names
+        assert "dataset" in tool_names
         assert "list_models" in tool_names
         assert len(tool_names) >= 10
 
@@ -67,5 +69,5 @@ class TestMCPRoundTrip:
         text = asyncio.run(run())
         data = json.loads(text)
         tool_names = [t["name"] for t in data]
-        assert "search_materials" in tool_names
+        assert "materials_search" in tool_names  # was search_materials before Round 7
         assert "list_models" in tool_names

@@ -47,11 +47,32 @@ def _act_visualize(**kwargs) -> dict:
     return _visualize_dataset(**kwargs)
 
 
+def _act_import(**kwargs) -> dict:
+    """Round 7 addition: load a CSV/JSON/Parquet into the DataStore."""
+    from app.tools.data import _import_dataset
+    return _import_dataset(**kwargs)
+
+
+def _act_export(**kwargs) -> dict:
+    """Round 7 addition: write a list of result dicts to a CSV file."""
+    from app.tools.data import _export_results_csv
+    return _export_results_csv(**kwargs)
+
+
 _DISPATCH = {
     "validate":  _act_validate,
     "review":    _act_review,
     "visualize": _act_visualize,
+    "import":    _act_import,
+    "export":    _act_export,
 }
+
+
+# Actions that REQUIRE a `dataset_name` argument (the analysis ops).
+# import + export use different keys (file_path / results), so they're
+# excluded from this gate and validate themselves through the underlying
+# impls.
+_REQUIRES_DATASET_NAME = {"validate", "review", "visualize"}
 
 
 def _dataset(**kwargs) -> dict:
@@ -62,14 +83,20 @@ def _dataset(**kwargs) -> dict:
             "hint": (
                 "dataset(action='validate', dataset_name='...') / "
                 "dataset(action='review', dataset_name='...') / "
-                "dataset(action='visualize', dataset_name='...', kind='...')"
+                "dataset(action='visualize', dataset_name='...') / "
+                "dataset(action='import', file_path='./alloys.csv') / "
+                "dataset(action='export', results=[{...}, ...])"
             ),
         }
     handler = _DISPATCH.get(action)
     if not handler:
         return {"error": f"Unknown action '{action}'. Valid: {list(_DISPATCH.keys())}"}
-    if not kwargs.get("dataset_name"):
+    if action in _REQUIRES_DATASET_NAME and not kwargs.get("dataset_name"):
         return {"error": f"Action '{action}' requires `dataset_name`"}
+    if action == "import" and not kwargs.get("file_path"):
+        return {"error": "Action 'import' requires `file_path`"}
+    if action == "export" and "results" not in kwargs:
+        return {"error": "Action 'export' requires `results` (list of dicts)"}
     try:
         return handler(**kwargs)
     except Exception as e:
@@ -77,27 +104,36 @@ def _dataset(**kwargs) -> dict:
 
 
 _DESCRIPTION = (
-    "Operate on a stored dataset (in the PRISM DataStore — use "
-    "`import_dataset` first if your data lives in a CSV). ONE tool, "
-    "three actions:\n"
+    "Dataset I/O + analysis. ONE tool, five actions:\n"
+    "\n"
+    "I/O actions:\n"
+    "  • action='import' — load a local CSV / JSON / Parquet file into the "
+    "PRISM DataStore. Requires `file_path`. Optional: `dataset_name` "
+    "(default: file stem), `file_format` (default: auto-detect from "
+    "extension). Returns the resolved dataset_name + row/column counts.\n"
+    "  • action='export' — write a list of result dictionaries to a CSV "
+    "file. Requires `results` (list of dicts). Optional: `filename` "
+    "(default: auto-generated). Use after gathering data to save results.\n"
+    "\n"
+    "Analysis actions (require `dataset_name` — use action='import' first "
+    "if your data lives in a file):\n"
     "  • action='validate' — quality audit. Three checks combined: "
-    "(a) Z-score outlier flagging per column (threshold 3.0 default — "
+    "(a) Z-score outlier flagging per column (`z_threshold` default 3.0 — "
     "tighten to 2.0 for curated data, loosen to 4.0+ for wide-scan); "
-    "(b) physical-constraint checks (negative band gaps, density-out-"
-    "of-range, stoichiometric impossibilities); (c) per-column "
-    "completeness scoring. Returns a structured report + a human-"
-    "readable summary. Use before training a model or making a decision "
-    "off the data.\n"
+    "(b) physical-constraint checks (negative band gaps, density "
+    "out-of-range, stoichiometric impossibilities); (c) per-column "
+    "completeness scoring. Returns a structured report + human-readable "
+    "summary. Use before training a model or making a decision off the data.\n"
     "  • action='review' — peer-review-style assessment. Looks for "
-    "structural issues, missing metadata, statistical anomalies. "
-    "Heavier than 'validate'; use when the user asks 'is this dataset "
-    "publishable / ready for analysis?'.\n"
+    "structural issues, missing metadata, statistical anomalies. Heavier "
+    "than 'validate'; use when the user asks 'is this dataset publishable "
+    "/ ready for analysis?'.\n"
     "  • action='visualize' — generate visual summaries. See the "
-    "underlying skill for supported chart types. Use when the user "
+    "visualization skill for supported chart kinds. Use when the user "
     "wants 'show me this dataset's distribution / relationships'.\n"
-    "All three require `dataset_name`. NOT for ad-hoc plots of arbitrary "
-    "data (use `plot` for that) and NOT for searching materials databases "
-    "(use materials_search)."
+    "\n"
+    "NOT for ad-hoc plots of arbitrary data (use `plot` for that) and "
+    "NOT for searching materials databases (use `materials_search`)."
 )
 
 
@@ -109,21 +145,22 @@ _SCHEMA = {
             "enum": list(_DISPATCH.keys()),
             "description": "Which dataset operation to perform.",
         },
+        # Analysis actions
         "dataset_name": {
             "type": "string",
             "description": (
                 "Name of the dataset registered in the PRISM DataStore. "
-                "Use `import_dataset` first if it lives in a CSV. Required "
-                "for all actions."
+                "Required for action='validate'/'review'/'visualize'. "
+                "For action='import', this is the optional name to "
+                "register the file under (defaults to file stem)."
             ),
         },
         "z_threshold": {
             "type": "number",
             "description": (
                 "Z-score threshold for outlier flagging in action='validate'. "
-                "Default 3.0 (≈ outside 99.7%). Tighten to 2.0 for stricter "
-                "review of curated datasets; loosen to 4.0+ for wide-scan "
-                "exploration data."
+                "Default 3.0. Tighten to 2.0 for stricter review of curated "
+                "datasets; loosen to 4.0+ for wide-scan exploration data."
             ),
             "default": 3.0,
         },
@@ -134,8 +171,42 @@ _SCHEMA = {
                 "visualization skill for supported values."
             ),
         },
+        # Import action
+        "file_path": {
+            "type": "string",
+            "description": (
+                "Source file path for action='import'. Absolute or "
+                "working-directory-relative. Glob patterns NOT supported "
+                "— one file per call."
+            ),
+        },
+        "file_format": {
+            "type": "string",
+            "enum": ["csv", "json", "parquet"],
+            "description": (
+                "Format override for action='import'. Pass when the "
+                "extension is wrong or absent. Default: auto-detect."
+            ),
+        },
+        # Export action
+        "results": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": (
+                "List of result dictionaries to export for action='export'. "
+                "All dicts should share the same key shape; missing keys "
+                "become empty cells."
+            ),
+        },
+        "filename": {
+            "type": "string",
+            "description": (
+                "Output CSV path for action='export'. Auto-generated under "
+                "the working directory if omitted."
+            ),
+        },
     },
-    "required": ["action", "dataset_name"],
+    "required": ["action"],
     "additionalProperties": False,
 }
 

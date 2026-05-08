@@ -150,85 +150,43 @@ def _export_results_csv(**kwargs) -> dict:
 
 
 def create_data_tools(registry: ToolRegistry) -> None:
-    registry.register(Tool(
-        name="search_materials",
-        description="Materials structure search across 20+ external federated databases (NOMAD, Materials Project, OQMD, COD, Alexandria, GNoME). Returns crystal structures, formulas, and metadata. NOT for searching the MARC27 internal knowledge graph (use knowledge_search) and NOT for searching scientific papers (use literature_search).",
-        input_schema={"type": "object", "properties": {
-            "elements": {"type": "array", "items": {"type": "string"}, "description": "Must contain ALL these elements (e.g., ['Fe', 'O'])"},
-            "formula": {"type": "string", "description": "Chemical formula (e.g., 'SiO2')"},
-            "n_elements_min": {"type": "integer", "description": "Minimum number of elements"},
-            "n_elements_max": {"type": "integer", "description": "Maximum number of elements"},
-            "band_gap_min": {"type": "number", "description": "Minimum band gap in eV"},
-            "band_gap_max": {"type": "number", "description": "Maximum band gap in eV"},
-            "space_group": {"type": "string", "description": "Space group symbol (e.g., 'Fm-3m')"},
-            "crystal_system": {"type": "string", "enum": ["cubic", "hexagonal", "tetragonal", "orthorhombic", "monoclinic", "triclinic", "trigonal"], "description": "Crystal system"},
-            "providers": {"type": "array", "items": {"type": "string"}, "description": "Optional: only query these provider IDs"},
-            "limit": {"type": "integer", "description": "Max results (default 20)", "default": 20}}},
-        func=_search_materials))
+    """Register data-shaped tools.
+
+    NOTE on Round 7 scope:
+      - `search_materials` registration was REMOVED. It duplicated
+        `materials_search` (in app/tools/search_engine/tools.py); both
+        called the same SearchEngine + ProviderRegistry. The richer
+        `materials_search` is the canonical entry point.
+      - `import_dataset` and `export_results_csv` registrations were
+        REMOVED. Both folded into the unified `dataset` Tool as
+        `dataset(action='import')` / `dataset(action='export')`.
+      - The underlying private helpers (_search_materials,
+        _import_dataset, _export_results_csv) are PRESERVED. They're
+        called by the dataset dispatcher, by Skills, and by tests.
+
+    What's still registered here:
+      - `query_materials_project` — different scope from materials_search.
+        It's the deep-property-detail path (uses mp_api.client.MPRester
+        with explicit field selection); materials_search is the
+        federated catalog-shaped query. Both are useful.
+    """
     registry.register(Tool(
         name="query_materials_project",
-        description="Query Materials Project for detailed material properties like band gap, formation energy, bulk modulus. Requires MP_API_KEY.",
-        input_schema={"type": "object", "properties": {
-            "formula": {"type": "string", "description": "Chemical formula, e.g. 'LiCoO2'"},
-            "material_id": {"type": "string", "description": "Materials Project ID, e.g. 'mp-1234'"},
-            "properties": {"type": "array", "items": {"type": "string"}, "description": "Properties to retrieve."}}},
-        func=_query_materials_project))
-    registry.register(Tool(
-        name="export_results_csv",
-        description="Export a list of result dictionaries to a CSV file. Use after gathering data to save results for the user.",
-        input_schema={"type": "object", "properties": {
-            "results": {"type": "array", "items": {"type": "object"}, "description": "List of result dictionaries to export"},
-            "filename": {"type": "string", "description": "Output CSV filename. Auto-generated if omitted."}},
-            "required": ["results"]},
-        func=_export_results_csv))
-    registry.register(Tool(
-        name="import_dataset",
         description=(
-            "Load a local CSV / JSON / Parquet file into the PRISM "
-            "DataStore so other tools (`validate_dataset`, "
-            "`plot_correlation_matrix`, training pipelines) can refer "
-            "to it by name. Use this whenever the user has data on "
-            "disk they want to analyse — 'I have a CSV with 500 alloy "
-            "compositions, can you check it?'. Format is auto-detected "
-            "from extension (.csv / .json / .parquet); pass file_format "
-            "explicitly only when the extension is wrong or missing. "
-            "Dataset name defaults to the file's stem (e.g. "
-            "`/tmp/alloys.csv` → `alloys`); override with dataset_name "
-            "to avoid clobbering an existing one. Returns the resolved "
-            "dataset_name + row/column counts so the agent can confirm "
-            "the load worked before piping into other tools."
+            "Query Materials Project for detailed material properties — "
+            "band gap, formation energy, bulk modulus, etc. Use this "
+            "when you have a specific material (formula or mp-ID) and "
+            "need rich property data. NOT a substitute for "
+            "materials_search (use that for federated catalog queries "
+            "across 20+ databases). Requires MP_API_KEY."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": (
-                        "Absolute or working-directory-relative path to "
-                        "the source file. Glob patterns NOT supported — "
-                        "one file per call."
-                    ),
-                },
-                "dataset_name": {
-                    "type": "string",
-                    "description": (
-                        "Name to register under in the DataStore. "
-                        "Defaults to the file's stem; override to avoid "
-                        "overwriting an existing dataset of that name."
-                    ),
-                },
-                "file_format": {
-                    "type": "string",
-                    "enum": ["csv", "json", "parquet"],
-                    "description": (
-                        "Format override — pass when the extension is "
-                        "wrong or absent. Default behaviour is to "
-                        "auto-detect from the extension."
-                    ),
-                },
+                "formula": {"type": "string", "description": "Chemical formula, e.g. 'LiCoO2'"},
+                "material_id": {"type": "string", "description": "Materials Project ID, e.g. 'mp-1234'"},
+                "properties": {"type": "array", "items": {"type": "string"}, "description": "Properties to retrieve."},
             },
-            "required": ["file_path"],
-            "additionalProperties": False,
         },
-        func=_import_dataset,
+        func=_query_materials_project,
     ))
