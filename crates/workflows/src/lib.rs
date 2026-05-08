@@ -379,13 +379,14 @@ pub async fn execute_workflow_with_policy(
     };
 
     for step in &spec.steps {
-        // Per-step policy check for tool calls
+        // Per-step policy check for tool calls.
+        // Reads name + inputs through the same aliases the runner uses
+        // so policy sees the same payload regardless of LLM-friendly
+        // spelling: `name`/`tool`, `inputs`/`args`/`with`/`params`.
         if step.action == "tool"
             && let Some(engine) = policy.as_deref_mut()
         {
-            let tool_name = step
-                .config
-                .get("name")
+            let tool_name = config_first(&step.config, &["name", "tool"])
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             let input = prism_policy::PolicyInput {
@@ -396,9 +397,7 @@ pub async fn execute_workflow_with_policy(
                     .cloned()
                     .unwrap_or_else(|| "operator".into()),
                 resource: tool_name.into(),
-                context: step
-                    .config
-                    .get("inputs")
+                context: config_first(&step.config, &["inputs", "args", "with", "params"])
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
             };
@@ -534,14 +533,26 @@ pub async fn execute_workflow_with_policy(
     Ok(result)
 }
 
+/// Look up the first field in `config` that matches one of `keys`.
+///
+/// Used to accept a canonical field name plus LLM-friendly aliases —
+/// e.g. `tool` step accepts `name` (canonical) or `tool`. The first
+/// key in the slice is the canonical one used in errors.
+fn config_first<'a>(
+    config: &'a BTreeMap<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<&'a serde_json::Value> {
+    keys.iter().find_map(|k| config.get(*k))
+}
+
 fn run_set_step(
     step: &WorkflowStep,
     context: &mut BTreeMap<String, serde_json::Value>,
     dry_run: bool,
 ) -> Result<WorkflowStepResult> {
+    // Aliases: `values` (canonical) | `vars` | `data`
     let values = render_value(
-        step.config
-            .get("values")
+        config_first(&step.config, &["values", "vars", "data"])
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
         context,
@@ -569,9 +580,9 @@ fn run_message_step(
     context: &mut BTreeMap<String, serde_json::Value>,
     dry_run: bool,
 ) -> Result<WorkflowStepResult> {
+    // Aliases: `text` (canonical) | `body` | `content` | `msg`
     let text = render_value(
-        step.config
-            .get("text")
+        config_first(&step.config, &["text", "body", "content", "msg"])
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String(String::new())),
         context,
@@ -720,24 +731,23 @@ async fn run_tool_step(
     dry_run: bool,
     client: &reqwest::Client,
 ) -> Result<WorkflowStepResult> {
-    let tool_name = step
-        .config
-        .get("name")
+    // Aliases: `name` (canonical) | `tool`
+    let tool_name = config_first(&step.config, &["name", "tool"])
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("tool step '{}' missing 'name' field", step.id))?
         .to_string();
 
+    // Aliases: `command` (canonical) | `cmd`
     let command = render_value(
-        step.config
-            .get("command")
+        config_first(&step.config, &["command", "cmd"])
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         context,
     )?;
 
+    // Aliases: `inputs` (canonical) | `args` | `with` | `params`
     let inputs = render_value(
-        step.config
-            .get("inputs")
+        config_first(&step.config, &["inputs", "args", "with", "params"])
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
         context,
@@ -829,9 +839,9 @@ async fn run_if_step(
     _policy: Option<&mut prism_policy::PolicyEngine>,
     _principal: &str,
 ) -> Result<WorkflowStepResult> {
+    // Aliases: `condition` (canonical) | `cond` | `when` | `if`
     let condition_raw = render_value(
-        step.config
-            .get("condition")
+        config_first(&step.config, &["condition", "cond", "when", "if"])
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         context,
@@ -913,9 +923,8 @@ async fn run_parallel_step(
     dry_run: bool,
     client: &reqwest::Client,
 ) -> Result<WorkflowStepResult> {
-    let sub_steps: Vec<WorkflowStep> = step
-        .config
-        .get("steps")
+    // Aliases: `steps` (canonical) | `tasks` | `branches`
+    let sub_steps: Vec<WorkflowStep> = config_first(&step.config, &["steps", "tasks", "branches"])
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
@@ -1003,15 +1012,14 @@ async fn run_workflow_step(
     policy: Option<&mut prism_policy::PolicyEngine>,
     principal: &str,
 ) -> Result<WorkflowStepResult> {
-    let workflow_name = step
-        .config
-        .get("name")
+    // Aliases: `name` (canonical) | `workflow`
+    let workflow_name = config_first(&step.config, &["name", "workflow"])
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("workflow step '{}' missing 'name' field", step.id))?;
 
+    // Aliases: `inputs` (canonical) | `args` | `with`
     let inputs = render_value(
-        step.config
-            .get("inputs")
+        config_first(&step.config, &["inputs", "args", "with"])
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
         context,
@@ -1572,5 +1580,236 @@ inputs:
         assert_eq!(suggest_action("Workflow"), Some("workflow"));
         // No close match → None
         assert_eq!(suggest_action("xxxxxxxxxxxxx"), None);
+    }
+
+    // ── Step-level field-alias tests ──────────────────────────────────
+    //
+    // Each test parses + dry-runs a workflow that uses LLM-friendly
+    // alternative field names instead of the canonical ones. The
+    // canonical names are still the ones documented; aliases just
+    // reduce friction when an LLM emits its best-guess YAML.
+
+    fn dry_run(yaml: &str) -> WorkflowRunResult {
+        let spec = load_workflow_from_str(yaml, "inline:test").unwrap();
+        let values = BTreeMap::new();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(execute_workflow(&spec, &values, false))
+            .unwrap()
+    }
+
+    #[test]
+    fn set_step_accepts_vars_alias_for_values() {
+        let result = dry_run(
+            r#"
+name: t
+steps:
+  - id: s
+    action: set
+    vars:
+      hello: world
+"#,
+        );
+        assert_eq!(result.steps[0].status, "planned");
+        // The step result should record the value(s) under vars
+        let data = &result.steps[0].data;
+        assert_eq!(data["values"]["hello"], "world");
+    }
+
+    #[test]
+    fn set_step_accepts_data_alias_for_values() {
+        let result = dry_run(
+            r#"
+name: t
+steps:
+  - id: s
+    action: set
+    data:
+      n: 42
+"#,
+        );
+        assert_eq!(result.steps[0].data["values"]["n"], 42);
+    }
+
+    #[test]
+    fn message_step_accepts_body_alias_for_text() {
+        let result = dry_run(
+            r#"
+name: t
+steps:
+  - id: m
+    action: message
+    body: "hello via body"
+"#,
+        );
+        assert_eq!(result.steps[0].summary, "hello via body");
+    }
+
+    #[test]
+    fn message_step_accepts_content_alias_for_text() {
+        let result = dry_run(
+            r#"
+name: t
+steps:
+  - id: m
+    action: message
+    content: "hello via content"
+"#,
+        );
+        assert_eq!(result.steps[0].summary, "hello via content");
+    }
+
+    #[test]
+    fn tool_step_accepts_tool_alias_for_name() {
+        // dry_run never hits the network — we only verify parse + plan.
+        let result = dry_run(
+            r#"
+name: t
+steps:
+  - id: call
+    action: tool
+    tool: web
+    cmd: search
+    args:
+      q: "hello"
+"#,
+        );
+        assert_eq!(result.steps[0].status, "planned");
+        // Summary format: "tool:<name> <command>"
+        let summary = &result.steps[0].summary;
+        assert!(summary.contains("tool:web"), "summary: {summary}");
+        // The dry-run data echoes the resolved name + inputs
+        assert_eq!(result.steps[0].data["tool"], "web");
+        assert_eq!(result.steps[0].data["command"], "search");
+        assert_eq!(result.steps[0].data["inputs"]["q"], "hello");
+    }
+
+    #[test]
+    fn tool_step_accepts_with_alias_for_inputs() {
+        let result = dry_run(
+            r#"
+name: t
+steps:
+  - id: call
+    action: tool
+    name: ml
+    with:
+      target: hardness
+"#,
+        );
+        assert_eq!(result.steps[0].data["inputs"]["target"], "hardness");
+    }
+
+    #[test]
+    fn if_step_accepts_when_alias_for_condition() {
+        let result = dry_run(
+            r#"
+name: t
+steps:
+  - id: gate
+    action: if
+    when: "true"
+    then:
+      - id: yes
+        action: message
+        text: "branch taken"
+    else:
+      - id: no
+        action: message
+        text: "skipped"
+"#,
+        );
+        // Truthy "true" string → then branch
+        let summary = &result.steps[0].summary;
+        assert!(summary.contains("then"), "summary: {summary}");
+    }
+
+    #[test]
+    fn parallel_step_accepts_tasks_alias_for_steps() {
+        let result = dry_run(
+            r#"
+name: t
+steps:
+  - id: fanout
+    action: parallel
+    tasks:
+      - id: a
+        action: message
+        text: "first"
+      - id: b
+        action: message
+        text: "second"
+"#,
+        );
+        assert_eq!(result.steps[0].status, "planned");
+        // The dry-run path records step_count under data
+        assert_eq!(result.steps[0].data["step_count"], 2);
+    }
+
+    #[test]
+    fn workflow_step_accepts_workflow_alias_for_name() {
+        // dry-run doesn't actually invoke the sub-workflow, so it's
+        // safe to point at a name that won't resolve.
+        let result = dry_run(
+            r#"
+name: parent
+steps:
+  - id: invoke
+    action: workflow
+    workflow: child_wf
+    args:
+      x: 1
+"#,
+        );
+        assert_eq!(result.steps[0].status, "planned");
+        assert_eq!(result.steps[0].data["workflow"], "child_wf");
+        assert_eq!(result.steps[0].data["inputs"]["x"], 1);
+    }
+
+    #[test]
+    fn step_aliases_are_llm_friendly_combo() {
+        // Stack as many aliases as a hypothetical LLM would emit, then
+        // verify the workflow still parses + dry-runs cleanly.
+        let result = dry_run(
+            r#"
+kind: prism_workflow
+name: combo
+inputs:
+  - name: q
+    description: "the query"
+tasks:
+  - action: set
+    data:
+      query: "{{q}}"
+  - action: message
+    body: "running with {{query}}"
+  - action: tool
+    tool: web
+    cmd: search
+    with:
+      q: "{{query}}"
+  - action: if
+    when: "true"
+    then:
+      - id: ok
+        action: message
+        text: "good"
+  - action: parallel
+    tasks:
+      - id: a
+        action: message
+        text: "left"
+      - id: b
+        action: message
+        text: "right"
+"#,
+        );
+        assert_eq!(result.steps.len(), 5);
+        // All five auto-generated step IDs use the action prefix
+        assert_eq!(result.steps[0].id, "set_0");
+        assert_eq!(result.steps[1].id, "message_1");
+        assert_eq!(result.steps[2].id, "tool_2");
+        assert_eq!(result.steps[3].id, "if_3");
+        assert_eq!(result.steps[4].id, "parallel_4");
     }
 }
