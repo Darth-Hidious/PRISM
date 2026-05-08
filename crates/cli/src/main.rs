@@ -88,7 +88,7 @@ enum Commands {
     },
     /// Show runtime paths, endpoints, and auth status.
     Status,
-    /// List, inspect, and run YAML-defined workflows.
+    /// List, show, and run YAML-defined workflows.
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommands,
@@ -566,6 +566,8 @@ enum MeshCommands {
 #[derive(Debug, Subcommand)]
 enum MarketplaceCommands {
     /// Search the MARC27 marketplace for tools and workflows.
+    /// Aliases: `list`, `browse` — shorthand for an empty search.
+    #[command(alias = "list", alias = "browse")]
     Search {
         /// Search query.
         query: Option<String>,
@@ -2327,13 +2329,12 @@ async fn main() -> Result<()> {
             match command {
                 None => {
                     // Default: show balance
-                    let resp: serde_json::Value = auth
+                    let raw = auth
                         .apply(client.get(format!("{api_base}/billing/balance")))
                         .send()
-                        .await?
-                        .error_for_status()?
-                        .json()
                         .await?;
+                    let resp: serde_json::Value =
+                        friendly_status(raw, "view billing balance")?.json().await?;
                     println!("\nMARC27 Credits");
                     println!(
                         "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}"
@@ -2554,6 +2555,33 @@ fn render_workflow_spec(spec: &WorkflowSpec) {
             "--{}\t{}\t{}\t{}",
             argument.name, argument.r#type, required, argument.help
         );
+    }
+
+    // Two valid invocation paths exist for any workflow. Showing only
+    // the `--<arg>` table without the example invocations confused
+    // users into trying `prism workflow run <name> --<arg> <value>`,
+    // which clap rejects (the `run` subcommand takes `--set k=v` for
+    // forwarding). Make both paths visible.
+    let required_args: Vec<&str> = spec
+        .arguments
+        .iter()
+        .filter(|a| a.required)
+        .map(|a| a.name.as_str())
+        .collect();
+    if !required_args.is_empty() {
+        let top_level: String = required_args
+            .iter()
+            .map(|n| format!(" --{n} <{n}>"))
+            .collect();
+        let set_pairs: String = required_args
+            .iter()
+            .map(|n| format!(" --set {n}=<{n}>"))
+            .collect();
+        println!();
+        println!("usage:");
+        println!("  prism {}{}", spec.command_name, top_level);
+        println!("  prism workflow run {}{}", spec.command_name, set_pairs);
+        println!("  add `--execute` to run for real (default is dry-run plan)");
     }
 }
 
@@ -3827,6 +3855,31 @@ impl PlatformAuth {
     }
 }
 
+/// Friendlier replacement for `.error_for_status()` on platform calls.
+///
+/// Default reqwest error on 401 reads "HTTP status client error (401
+/// Unauthorized) for url ...", which leaves the user wondering what
+/// to do. This wrapper replaces that with an actionable message
+/// pointing at `prism login` and `prism status`. Other non-2xx
+/// responses fall through to the normal reqwest error.
+fn friendly_status(resp: reqwest::Response, action: &str) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let url = resp.url().to_string();
+        bail!(
+            "Not authorized to {action}.\n\
+             \n\
+             Your platform token may be expired or missing the required \
+             scope for this endpoint. Try:\n\
+             \x20 prism login              # refresh your platform session\n\
+             \x20 prism status             # check current auth state\n\
+             \n\
+             Endpoint: {url}"
+        );
+    }
+    Ok(resp.error_for_status()?)
+}
+
 /// Resolve platform auth for agents (MARC27_API_KEY env var → X-API-Key header).
 /// Decoupled from user auth — agents use API keys, users use JWT.
 /// Falls back to user auth if no API key is set (backward compat).
@@ -4310,7 +4363,9 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 request = request.query(&[("status", status)]);
             }
             let response: serde_json::Value =
-                request.send().await?.error_for_status()?.json().await?;
+                friendly_status(request.send().await?, "list compute deployments")?
+                    .json()
+                    .await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -4565,13 +4620,12 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
             }
         }
         DiscourseCommands::List { json } => {
-            let response: serde_json::Value = auth
+            let raw = auth
                 .apply(client.get(format!("{api_base}/discourse/specs")))
                 .send()
-                .await?
-                .error_for_status()?
-                .json()
                 .await?;
+            let response: serde_json::Value =
+                friendly_status(raw, "list discourse specs")?.json().await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -5012,10 +5066,36 @@ async fn handle_query(
         })?;
         println!("Generating query embedding...");
         let llm_client = prism_ingest::llm::LlmClient::new(llm_cfg.clone());
-        let query_vec = llm_client
-            .embed_text(text)
-            .await
-            .context("failed to generate query embedding")?;
+        let query_vec = match llm_client.embed_text(text).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Detect the most common misconfiguration: prism.toml's
+                // `[llm].url` points at MARC27's project-scoped LLM proxy
+                // (`/api/v1/projects/{id}/llm`) which doesn't expose
+                // `/v1/embeddings`. Without this hint a real user thinks
+                // the platform is down. Steer them to the working path.
+                let msg = e.to_string();
+                let looks_like_marc27_404 =
+                    msg.contains("404") && msg.contains("/projects/") && msg.contains("/llm/");
+                if looks_like_marc27_404 {
+                    bail!(
+                        "Local --semantic search needs an LLM that exposes \
+                         OpenAI-compatible /v1/embeddings, but the configured \
+                         URL ({}) is the MARC27 project-scoped LLM proxy \
+                         which serves chat-streaming only.\n\n\
+                         For platform knowledge-graph search, use:\n\
+                         \x20 prism query --platform --semantic \"{}\"\n\n\
+                         For local embeddings, run a server like Ollama or \
+                         llama.cpp and point prism at it via:\n\
+                         \x20 prism configure --llm-provider llamacpp\n\n\
+                         Underlying error: {e}",
+                        llm_cfg.base_url,
+                        text
+                    );
+                }
+                return Err(e).context("failed to generate query embedding");
+            }
+        };
 
         let store = QdrantVectorStore::new(qdrant_config);
         let results = store.query(&query_vec, limit).await?;
