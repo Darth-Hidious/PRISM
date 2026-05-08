@@ -225,14 +225,156 @@ def _act_ingest(client, **kw) -> dict:
         return {"error": str(e)}
 
 
+# ---------------------------------------------------------------------------
+# Artifact promotion — closes the loop between local stateful memory and
+# the shared MARC27 KG. Lets the agent take a recall'able local artifact
+# and push its content into the cross-session graph + vector store.
+# ---------------------------------------------------------------------------
+
+def _build_promotion_text(art) -> str:
+    """Assemble a coherent natural-language blob from an artifact for the
+    extractor LLM. The blob includes:
+
+      - the artifact's auto-generated summary
+      - up to N record-level summaries (so per-record entities surface)
+      - provenance metadata so the extractor knows the origin
+
+    The current marc27-core ingest pipeline accepts URL or free-form
+    `query` text and runs the extractor over it. We use the `query` path
+    here because the artifact is in-memory data, not a fetchable URL. A
+    future improvement: a dedicated /graph/ingest call that posts the
+    list-shaped artifact records as structured Entities directly,
+    bypassing the LLM extractor entirely (faster + more accurate for
+    structured data). Out of scope for the first cut.
+    """
+    import json as _json
+    parts: list[str] = []
+
+    parts.append(f"=== ARTIFACT PROMOTED FROM PRISM ===")
+    parts.append(f"Tool: {art.tool_name}")
+    parts.append(f"Session: {art.session_id}")
+    parts.append(f"Created: {art.created_at}")
+    parts.append("")
+    parts.append("Summary:")
+    parts.append(art.summary)
+
+    if art.record_count and art.record_count > 0:
+        parts.append("")
+        parts.append(f"Records ({art.record_count} total, showing up to 20):")
+        # Pull per-record summaries directly from the store
+        from app.tools.memory.recorder import get_store as _get_store
+        store = _get_store()
+        if store is not None:
+            for i in range(min(art.record_count, 20)):
+                try:
+                    rec = store.get_record(art.id, i)
+                    if rec is not None:
+                        parts.append(f"  - {_json.dumps(rec, default=str)[:300]}")
+                except Exception:
+                    pass
+
+    parts.append("")
+    parts.append(f"Args: {_json.dumps(art.args, default=str)[:400]}")
+    return "\n".join(parts)
+
+
+def _act_promote_artifact(client, **kw) -> dict:
+    """Push a local artifact into the MARC27 KG via ingest-job.
+
+    Loads the artifact from the local memory store, builds a coherent
+    text blob (summary + per-record details + provenance), submits to
+    /knowledge/ingest-job with mode='full' (entities + embeddings), and
+    marks the local artifact `promoted_to_kg=1` on successful submission.
+
+    The actual entity extraction happens server-side asynchronously;
+    poll the returned job_id via knowledge(action='ingest_status', ...)
+    when that exists, or check graph stats for growth.
+    """
+    artifact_id = kw.get("artifact_id")
+    if not artifact_id:
+        return {"error": "Action 'promote_artifact' requires `artifact_id`"}
+
+    # Load the artifact from local store
+    try:
+        from app.tools.memory.recorder import get_store as _get_store
+    except ImportError:
+        return {
+            "error": (
+                "Memory subsystem not available. Stateful memory must be "
+                "configured for promote_artifact to work."
+            )
+        }
+    store = _get_store()
+    if store is None:
+        return {
+            "error": (
+                "Memory subsystem not configured (PRISM_DISABLE_MEMORY=1 or "
+                "bootstrap skipped memory). Cannot promote local artifacts."
+            )
+        }
+
+    art = store.get(artifact_id)
+    if art is None:
+        return {"error": f"Artifact '{artifact_id}' not found in local store"}
+
+    if art.promoted_to_kg:
+        return {
+            "status": "already_promoted",
+            "artifact_id": artifact_id,
+            "tool": art.tool_name,
+            "message": "This artifact has already been promoted to the KG.",
+        }
+
+    # Build the promotion blob and submit as a query-mode ingest
+    text_blob = _build_promotion_text(art)
+    body = {
+        "mode": kw.get("mode", "full"),
+        "source": {"type": "query", "query": text_blob},
+    }
+
+    try:
+        if hasattr(client, "_base"):
+            from marc27.api.base import BaseAPI  # type: ignore
+            base: BaseAPI = client._base
+            resp = base.post("/knowledge/ingest-job", json=body)
+            response_data = resp.json()
+        else:
+            response_data = client._post("/knowledge/ingest-job", body)
+    except Exception as e:
+        return {"error": f"failed to submit ingest job: {e}"}
+
+    # Mark promoted only on successful submission (job may still fail
+    # asynchronously, but the local-side promotion intent is recorded)
+    try:
+        store.mark_promoted(artifact_id)
+    except Exception:
+        # Non-fatal — the ingest is already submitted server-side; we
+        # just couldn't update the local flag. Surface but don't fail.
+        pass
+
+    return {
+        "status": "promoted",
+        "artifact_id": artifact_id,
+        "tool": art.tool_name,
+        "ingest_job": response_data,
+        "blob_size_bytes": len(text_blob.encode("utf-8")),
+        "note": (
+            "Ingest job submitted. Entity extraction runs asynchronously "
+            "server-side. Poll graph stats or wait ~30s for entities to "
+            "appear. The local artifact is now flagged promoted_to_kg=true."
+        ),
+    }
+
+
 _DISPATCH = {
-    "search":       _act_search,
-    "entity":       _act_entity,
-    "paths":        _act_paths,
-    "stats":        _act_stats,
-    "semantic":     _act_semantic,
-    "list_corpora": _act_list_corpora,
-    "ingest":       _act_ingest,
+    "search":            _act_search,
+    "entity":            _act_entity,
+    "paths":             _act_paths,
+    "stats":             _act_stats,
+    "semantic":          _act_semantic,
+    "list_corpora":      _act_list_corpora,
+    "ingest":            _act_ingest,
+    "promote_artifact":  _act_promote_artifact,
 }
 
 
@@ -260,7 +402,7 @@ def _knowledge(**kwargs) -> dict:
 _DESCRIPTION = (
     "MARC27 Knowledge Plane — graph + semantic search over the live "
     "knowledge service (200K+ nodes, 6M+ edges, 6K+ vector embeddings, "
-    "200+ corpora catalog). ONE tool, seven actions:\n"
+    "200+ corpora catalog). ONE tool, eight actions:\n"
     "  • action='search' — graph entity lookup by `term` (best for 'find Ti-6Al-4V')\n"
     "  • action='entity' — get one entity + 1-hop neighbors by `name`\n"
     "  • action='paths' — shortest hop-paths from `from_entity` to `to_entity`; "
@@ -272,6 +414,11 @@ _DESCRIPTION = (
     "  • action='list_corpora' — catalog of available datasets (Materials Project, "
     "JARVIS-DFT, QMOF, MatKG…). Filter by `domain`/`kind`.\n"
     "  • action='ingest' — submit background extraction job; requires `url` or `query`.\n"
+    "  • action='promote_artifact' — push a local artifact (from `recall`/"
+    "`fetch_artifact`) into the cross-session MARC27 KG. Requires "
+    "`artifact_id`. Closes the loop between local stateful memory and the "
+    "shared graph: a search/research result that's interesting becomes "
+    "available to all future sessions and other users (subject to RBAC).\n"
     "NOT for raw structure DBs (use materials_search) and NOT for paper text (use prior_art_search)."
 )
 
@@ -297,8 +444,16 @@ _SCHEMA = {
         # list_corpora
         "domain": {"type": "string", "description": "Filter for action='list_corpora': materials/chemistry/biomedical/physics."},
         "kind":   {"type": "string", "description": "Filter for action='list_corpora': structured_db/knowledge_graph/literature/ontology."},
-        # ingest
+        # ingest + promote_artifact
         "url":  {"type": "string", "description": "Source URL for action='ingest'."},
+        "artifact_id": {
+            "type": "string",
+            "description": (
+                "Local artifact ID for action='promote_artifact'. Format: "
+                "'art_<short>'. Get one from `recall` or from the "
+                "`_artifact_id` field auto-injected on tool outputs."
+            ),
+        },
         "mode": {"type": "string", "default": "full",
                  "description": "Extraction mode for action='ingest': graph/embed/full."},
         # shared
