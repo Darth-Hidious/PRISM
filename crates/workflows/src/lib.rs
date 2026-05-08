@@ -1168,7 +1168,9 @@ fn suggest_action(unknown: &str) -> Option<&'static str> {
     let mut best: Option<(&str, usize)> = None;
     for &known in KNOWN_ACTIONS {
         let d = edit_distance(&lc, known);
-        if d <= 2 && best.map_or(true, |(_, bd)| d < bd) {
+        // Note: `is_none_or` (Rust 1.82+) is the clippy-preferred form
+        // over `map_or(true, ...)` for "None or matches predicate" checks.
+        if d <= 2 && best.is_none_or(|(_, bd)| d < bd) {
             best = Some((known, d));
         }
     }
