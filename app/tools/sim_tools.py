@@ -40,11 +40,15 @@ def _create_structure(**kwargs) -> dict:
         repeat_y = kwargs.get("repeat_y", 1)
         repeat_z = kwargs.get("repeat_z", 1)
 
-        bulk_kwargs = {"element": element, "crystalstructure": crystal_structure}
+        # NOTE: pyiron's StructureFactory.bulk() takes the element as the
+        # FIRST positional arg (named `name` in the signature), not as
+        # `element=`. Earlier versions accepted `element=`; newer ones
+        # don't. Pass positionally for forward-compat.
+        bulk_kwargs = {"crystalstructure": crystal_structure}
         if lattice_constant is not None:
             bulk_kwargs["a"] = lattice_constant
 
-        atoms = pr.create.structure.bulk(**bulk_kwargs)
+        atoms = pr.create.structure.bulk(element, **bulk_kwargs)
 
         if any(r > 1 for r in (repeat_x, repeat_y, repeat_z)):
             atoms = atoms.repeat([int(repeat_x), int(repeat_y), int(repeat_z)])
@@ -598,195 +602,383 @@ def _run_workflow(**kwargs) -> dict:
 # Registration
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# Round 5 unified dispatchers
+# ---------------------------------------------------------------------------
+
+def _structure(**kwargs) -> dict:
+    """Unified structure dispatcher. Replaces create/modify/get_structure_info."""
+    action = kwargs.pop("action", None)
+    if not action:
+        return {
+            "error": "Missing 'action'. Valid: create, modify, info",
+            "hint": (
+                "structure(action='create', element='Al') / "
+                "structure(action='modify', structure_id=..., operation=...) / "
+                "structure(action='info', structure_id=...)"
+            ),
+        }
+    if action == "create":
+        if not kwargs.get("element"):
+            return {"error": "Action 'create' requires `element`"}
+        return _create_structure(**kwargs)
+    if action == "modify":
+        if not kwargs.get("structure_id") or not kwargs.get("operation"):
+            return {"error": "Action 'modify' requires `structure_id` and `operation`"}
+        return _modify_structure(**kwargs)
+    if action == "info":
+        if not kwargs.get("structure_id"):
+            return {"error": "Action 'info' requires `structure_id`"}
+        return _get_structure_info(**kwargs)
+    return {"error": f"Unknown action '{action}'. Valid: create, modify, info"}
+
+
+def _sim_run(**kwargs) -> dict:
+    """Unified simulation dispatcher. Replaces run_simulation + submit_hpc_job."""
+    target = kwargs.pop("target", "local")
+    if target not in ("local", "hpc"):
+        return {"error": f"Unknown target '{target}'. Valid: local, hpc"}
+    if not kwargs.get("structure_id"):
+        return {"error": f"Action target='{target}' requires `structure_id`"}
+    if target == "local":
+        return _run_simulation(**kwargs)
+    # target == "hpc"
+    return _submit_hpc_job(**kwargs)
+
+
+def _sim_job(**kwargs) -> dict:
+    """Unified job-mgmt dispatcher. Replaces get_job_status / get_job_results /
+    list_jobs / delete_job."""
+    action = kwargs.pop("action", None)
+    if not action:
+        return {
+            "error": "Missing 'action'. Valid: status, results, list, delete",
+            "hint": (
+                "sim_job(action='status', job_id=...) / "
+                "sim_job(action='results', job_id=..., properties=[...]) / "
+                "sim_job(action='list', status_filter=...) / "
+                "sim_job(action='delete', job_id=..., confirm=true)"
+            ),
+        }
+    if action == "status":
+        if not kwargs.get("job_id"):
+            return {"error": "Action 'status' requires `job_id`"}
+        return _get_job_status(**kwargs)
+    if action == "results":
+        if not kwargs.get("job_id"):
+            return {"error": "Action 'results' requires `job_id`"}
+        return _get_job_results(**kwargs)
+    if action == "list":
+        return _list_jobs(**kwargs)
+    if action == "delete":
+        if not kwargs.get("job_id"):
+            return {"error": "Action 'delete' requires `job_id`"}
+        return _delete_job(**kwargs)
+    return {"error": f"Unknown action '{action}'. Valid: status, results, list, delete"}
+
+
+# ---------------------------------------------------------------------------
+# Tool descriptions
+# ---------------------------------------------------------------------------
+
+_STRUCTURE_DESCRIPTION = (
+    "Build, transform, and inspect atomistic crystal structures (via "
+    "pyiron / ASE). ONE tool, three actions:\n"
+    "  • action='create' — bulk crystal structure from element + crystal type. "
+    "Required: `element`. Optional: `crystal_structure` (fcc default; bcc, "
+    "hcp, diamond, ...), `lattice_constant`, `repeat_x/y/z` for supercells. "
+    "Returns a structure_id used by other sim tools.\n"
+    "  • action='modify' — transform an existing structure. Required: "
+    "`structure_id`, `operation` (supercell / strain / add_vacancy / "
+    "substitute_atom). Operation-specific args go in `params`.\n"
+    "  • action='info' — composition, cell vectors, volume, symmetry of a "
+    "stored structure. Required: `structure_id`.\n"
+    "Structure storage is session-local; IDs are not persisted across runs. "
+    "NOT for searching materials databases (use materials_search) and NOT "
+    "for visualizing structures (no 3D viewer here)."
+)
+
+
+_SIM_RUN_DESCRIPTION = (
+    "Run an atomistic simulation. ONE tool, two targets:\n"
+    "  • target='local' — execute on this machine (fast feedback, small jobs). "
+    "Default if `target` omitted.\n"
+    "  • target='hpc' — submit to an HPC queue (SLURM/PBS/SGE) for large jobs. "
+    "Optional: `queue` (default 'default'), `cores` (default 1), `walltime` "
+    "(default '01:00:00').\n"
+    "Both targets share: `structure_id` (REQUIRED), `code` (lammps default; "
+    "vasp, abinit, gpaw, qe), `potential` (interatomic potential name for "
+    "LAMMPS — use `list_potentials` to discover), `parameters` (calc_type: "
+    "'static'|'minimize'|'md', temperature, pressure, n_ionic_steps, ...).\n"
+    "MONEY/COMPUTE-SPENDING action — requires_approval=True. The harness "
+    "prompts before each call. Use compute_estimate via `compute(action="
+    "'estimate')` first if you need a cost preview for the cloud broker, "
+    "though this tool dispatches via pyiron not the broker."
+)
+
+
+_SIM_JOB_DESCRIPTION = (
+    "Manage atomistic simulation jobs (started by `sim_run`). ONE tool, four "
+    "actions:\n"
+    "  • action='status' — current status of one job (queued / running / "
+    "finished / aborted). Required: `job_id`. Cheap to call repeatedly in a "
+    "polling loop.\n"
+    "  • action='results' — pull energy / forces / stress / volume from a "
+    "FINISHED job. Required: `job_id`. Optional: `properties` (list of "
+    "specific fields to retrieve).\n"
+    "  • action='list' — enumerate jobs. Optional: `status_filter`, "
+    "`code_filter`.\n"
+    "  • action='delete' — destructive. Removes job + output files. "
+    "Required: `job_id`, `confirm=true`. Cannot be undone.\n"
+    "NOT for the MARC27 compute broker (use `compute(action='status')` for "
+    "cloud broker jobs); these are local pyiron jobs."
+)
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
 def create_simulation_tools(registry: ToolRegistry) -> None:
-    """Register all simulation tools (guarded by pyiron availability)."""
+    """Register simulation tools (guarded by pyiron availability).
 
-    # --- C-1: Structure tools ------------------------------------------------
+    Round 5 collapses (13 → 7):
+      structure   ← create_structure + modify_structure + get_structure_info
+      sim_run     ← run_simulation + submit_hpc_job
+      sim_job     ← get_job_status + get_job_results + list_jobs + delete_job
+      list_potentials, run_convergence_test, run_workflow,
+      check_hpc_queue stay standalone (different shapes / specialized concepts)
+    """
+
+    # --- Unified: structure (3 → 1) ----------------------------------------
     registry.register(Tool(
-        name="create_structure",
-        description="Create an atomistic crystal structure. Returns structure ID for use in simulations.",
+        name="structure",
+        description=_STRUCTURE_DESCRIPTION,
         input_schema={
             "type": "object",
             "properties": {
-                "element": {"type": "string", "description": "Chemical element symbol, e.g. 'Fe', 'Al', 'Si'"},
-                "crystal_structure": {"type": "string", "description": "Crystal structure type: fcc, bcc, hcp, diamond, etc. Default: fcc"},
-                "lattice_constant": {"type": "number", "description": "Lattice constant in Angstroms (optional, uses default for element)"},
-                "repeat_x": {"type": "integer", "description": "Supercell repeat in x. Default: 1"},
-                "repeat_y": {"type": "integer", "description": "Supercell repeat in y. Default: 1"},
-                "repeat_z": {"type": "integer", "description": "Supercell repeat in z. Default: 1"},
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "modify", "info"],
+                    "description": "Which structure operation to perform.",
+                },
+                "element": {
+                    "type": "string",
+                    "description": "Chemical element for action='create' (e.g. 'Fe', 'Al', 'Si').",
+                },
+                "crystal_structure": {
+                    "type": "string",
+                    "description": "Crystal structure type for action='create': fcc, bcc, hcp, diamond. Default: fcc.",
+                },
+                "lattice_constant": {
+                    "type": "number",
+                    "description": "Lattice constant in Angstroms for action='create'. Optional.",
+                },
+                "repeat_x": {"type": "integer", "description": "Supercell repeat in x for action='create'. Default 1."},
+                "repeat_y": {"type": "integer", "description": "Supercell repeat in y for action='create'. Default 1."},
+                "repeat_z": {"type": "integer", "description": "Supercell repeat in z for action='create'. Default 1."},
+                "structure_id": {
+                    "type": "string",
+                    "description": "Structure ID for action='modify' or action='info'.",
+                },
+                "operation": {
+                    "type": "string",
+                    "description": "Modification operation for action='modify': supercell, strain, add_vacancy, substitute_atom.",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Operation-specific parameters for action='modify' (e.g. {nx:2,ny:2,nz:2}).",
+                },
             },
-            "required": ["element"],
+            "required": ["action"],
+            "additionalProperties": False,
         },
-        func=_create_structure,
+        func=_structure,
     ))
 
+    # --- Unified: sim_run (2 → 1) ------------------------------------------
     registry.register(Tool(
-        name="modify_structure",
-        description="Modify an existing structure: supercell, strain, add_vacancy, or substitute_atom.",
+        name="sim_run",
+        description=_SIM_RUN_DESCRIPTION,
         input_schema={
             "type": "object",
             "properties": {
-                "structure_id": {"type": "string", "description": "ID of the structure to modify"},
-                "operation": {"type": "string", "description": "Operation: supercell, strain, add_vacancy, substitute_atom"},
-                "params": {"type": "object", "description": "Operation-specific parameters (e.g. {nx:2,ny:2,nz:2} for supercell, {strain:0.01} for strain, {index:0} for vacancy, {index:0,element:'Ni'} for substitution)"},
-            },
-            "required": ["structure_id", "operation"],
-        },
-        func=_modify_structure,
-    ))
-
-    registry.register(Tool(
-        name="get_structure_info",
-        description="Get detailed info about a stored structure: composition, cell, volume, symmetry.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "structure_id": {"type": "string", "description": "ID of the structure"},
+                "target": {
+                    "type": "string",
+                    "enum": ["local", "hpc"],
+                    "default": "local",
+                    "description": "'local' runs on this machine; 'hpc' submits to a SLURM/PBS/SGE queue.",
+                },
+                "structure_id": {
+                    "type": "string",
+                    "description": "Structure to simulate. Required.",
+                },
+                "code": {
+                    "type": "string",
+                    "description": "Simulation code: lammps (default), vasp, abinit, gpaw, qe.",
+                },
+                "potential": {
+                    "type": "string",
+                    "description": "Interatomic potential name (LAMMPS). Use list_potentials to discover.",
+                },
+                "parameters": {
+                    "type": "object",
+                    "description": "Code-specific params: {calc_type, temperature, pressure, n_ionic_steps, ...}.",
+                },
+                "queue": {
+                    "type": "string",
+                    "description": "Queue/partition for target='hpc'. Default 'default'.",
+                },
+                "cores": {
+                    "type": "integer",
+                    "description": "CPU cores for target='hpc'. Default 1.",
+                },
+                "walltime": {
+                    "type": "string",
+                    "description": "Wall-time limit for target='hpc' (e.g. '01:00:00').",
+                },
             },
             "required": ["structure_id"],
+            "additionalProperties": False,
         },
-        func=_get_structure_info,
+        func=_sim_run,
+        requires_approval=True,
     ))
 
+    # --- Unified: sim_job (4 → 1) ------------------------------------------
+    registry.register(Tool(
+        name="sim_job",
+        description=_SIM_JOB_DESCRIPTION,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["status", "results", "list", "delete"],
+                    "description": "Which job-management operation to perform.",
+                },
+                "job_id": {
+                    "type": "string",
+                    "description": "Job ID for action='status'/'results'/'delete'.",
+                },
+                "properties": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Properties to retrieve for action='results' (energy_tot, forces, stress, volume).",
+                },
+                "status_filter": {
+                    "type": "string",
+                    "description": "Filter for action='list': finished, running, aborted.",
+                },
+                "code_filter": {
+                    "type": "string",
+                    "description": "Code filter for action='list': lammps, vasp, etc.",
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Required (true) for action='delete'. Confirms destructive op.",
+                },
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        func=_sim_job,
+    ))
+
+    # --- Standalone (kept) -------------------------------------------------
+    # Catalog query — different concept (database lookup, not action on structure)
     registry.register(Tool(
         name="list_potentials",
-        description="List available interatomic potentials (EAM, MEAM, Tersoff, etc.) for a given element.",
+        description=(
+            "List interatomic potentials (EAM, MEAM, Tersoff, LJ, ...) "
+            "available in the pyiron LAMMPS potential database for a given "
+            "element / type. Use BEFORE sim_run when you need a `potential` "
+            "argument and don't know what's available. NOT for materials "
+            "search (use materials_search) and NOT for ML model listing "
+            "(use list_models)."
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "element": {"type": "string", "description": "Filter by element symbol, e.g. 'Fe'"},
-                "potential_type": {"type": "string", "description": "Filter by potential type: eam, meam, tersoff, lj, etc."},
+                "potential_type": {"type": "string", "description": "Filter by type: eam, meam, tersoff, lj"},
             },
         },
         func=_list_potentials,
     ))
 
-    # --- C-2: Simulation / Job tools -----------------------------------------
-    registry.register(Tool(
-        name="run_simulation",
-        description="Run an atomistic simulation (LAMMPS, VASP, ABINIT, GPAW, QE) on a structure.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "structure_id": {"type": "string", "description": "ID of the structure to simulate"},
-                "code": {"type": "string", "description": "Simulation code: lammps, vasp, abinit, gpaw, qe. Default: lammps"},
-                "potential": {"type": "string", "description": "Interatomic potential name (for LAMMPS)"},
-                "parameters": {"type": "object", "description": "Code-specific parameters: {calc_type: 'static'|'minimize'|'md', temperature: 300, pressure: 0, n_ionic_steps: 1000}"},
-            },
-            "required": ["structure_id"],
-        },
-        func=_run_simulation,
-        requires_approval=True,
-    ))
-
-    registry.register(Tool(
-        name="get_job_status",
-        description="Get the current status of a simulation job.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "job_id": {"type": "string", "description": "Job ID returned by run_simulation"},
-            },
-            "required": ["job_id"],
-        },
-        func=_get_job_status,
-    ))
-
-    registry.register(Tool(
-        name="get_job_results",
-        description="Get results from a completed simulation job: energy, forces, stress, volume.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "job_id": {"type": "string", "description": "Job ID"},
-                "properties": {"type": "array", "items": {"type": "string"}, "description": "Properties to retrieve: energy_tot, forces, stress, volume, etc."},
-            },
-            "required": ["job_id"],
-        },
-        func=_get_job_results,
-    ))
-
-    registry.register(Tool(
-        name="list_jobs",
-        description="List simulation jobs, optionally filtered by status or code.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "status_filter": {"type": "string", "description": "Filter by status: finished, running, aborted, etc."},
-                "code_filter": {"type": "string", "description": "Filter by simulation code: lammps, vasp, etc."},
-            },
-        },
-        func=_list_jobs,
-    ))
-
-    registry.register(Tool(
-        name="delete_job",
-        description="Delete a simulation job and its output files.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "job_id": {"type": "string", "description": "Job ID to delete"},
-                "confirm": {"type": "boolean", "description": "Must be true to confirm deletion"},
-            },
-            "required": ["job_id"],
-        },
-        func=_delete_job,
-    ))
-
-    # --- C-3: HPC + Workflow tools -------------------------------------------
-    registry.register(Tool(
-        name="submit_hpc_job",
-        description="Submit an atomistic simulation to an HPC queue (SLURM/PBS/SGE).",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "structure_id": {"type": "string", "description": "Structure ID"},
-                "code": {"type": "string", "description": "Simulation code: lammps, vasp, etc. Default: lammps"},
-                "potential": {"type": "string", "description": "Potential name"},
-                "parameters": {"type": "object", "description": "Code-specific parameters"},
-                "queue": {"type": "string", "description": "Queue/partition name. Default: default"},
-                "cores": {"type": "integer", "description": "Number of CPU cores. Default: 1"},
-                "walltime": {"type": "string", "description": "Wall time limit, e.g. '01:00:00'. Default: 01:00:00"},
-            },
-            "required": ["structure_id"],
-        },
-        func=_submit_hpc_job,
-        requires_approval=True,
-    ))
-
+    # HPC queue inspection — different concept (queue-level, not job-level)
     registry.register(Tool(
         name="check_hpc_queue",
-        description="Check the HPC queue for running and queued simulation jobs.",
+        description=(
+            "Inspect the HPC queue (SLURM/PBS/SGE) for running and queued "
+            "atomistic simulation jobs. Returns queue-level state across "
+            "all of YOUR jobs. Different from sim_job(action='list') which "
+            "lists pyiron-tracked jobs in your local session — this one "
+            "talks to the actual scheduler. Use to see what's pending in "
+            "the queue, not what you've spawned locally."
+        ),
         input_schema={"type": "object", "properties": {}},
         func=_check_hpc_queue,
     ))
 
+    # Convergence test — different shape (parameter sweep, not single sim)
     registry.register(Tool(
         name="run_convergence_test",
-        description="Run a convergence test: vary one parameter (encut, kpoints) across multiple values and return energies.",
+        description=(
+            "Run an atomistic convergence test: vary one parameter (encut, "
+            "kpoints, ecutwfc, ...) across N values and return energies for "
+            "each. Use to check that simulation parameters are converged "
+            "before running a real production calc. Returns "
+            "{parameter_values, energies} suitable for plotting. Different "
+            "shape from sim_run (which runs ONE simulation); this dispatches "
+            "N simulations in sequence. Money/compute-spending — keep N "
+            "reasonable (3-7 values typically)."
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "structure_id": {"type": "string", "description": "Structure ID"},
                 "code": {"type": "string", "description": "Simulation code. Default: lammps"},
                 "potential": {"type": "string", "description": "Potential name"},
-                "parameter_name": {"type": "string", "description": "Parameter to vary: encut, kpoints, etc."},
-                "parameter_values": {"type": "array", "items": {"type": "number"}, "description": "List of values to test"},
+                "parameter_name": {"type": "string", "description": "Parameter to vary: encut, kpoints, ecutwfc, ..."},
+                "parameter_values": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "List of values to test. Keep length 3-7 to bound compute cost.",
+                },
             },
             "required": ["structure_id", "parameter_name", "parameter_values"],
         },
         func=_run_convergence_test,
     ))
 
+    # Predefined workflow — different shape (multi-step, named)
     registry.register(Tool(
         name="run_workflow",
-        description="Run a predefined workflow: elastic_constants, phonons, equation_of_state, thermal_expansion.",
+        description=(
+            "Run a predefined named workflow on a structure. Available: "
+            "elastic_constants (full elastic tensor), phonons (phonon "
+            "dispersion + DOS), equation_of_state (Murnaghan EoS fit → bulk "
+            "modulus), thermal_expansion (quasi-harmonic approx). Each "
+            "workflow internally dispatches multiple sim_run calls — "
+            "this is the highest-level atomistic-sim entry point. NOT a "
+            "substitute for sim_run (which runs ONE calc); use sim_run when "
+            "you want fine-grained control. Money/compute-spending."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "workflow_type": {"type": "string", "description": "Workflow type: elastic_constants, phonons, equation_of_state, thermal_expansion"},
+                "workflow_type": {
+                    "type": "string",
+                    "enum": ["elastic_constants", "phonons", "equation_of_state", "thermal_expansion"],
+                    "description": "Predefined workflow name.",
+                },
                 "structure_id": {"type": "string", "description": "Structure ID"},
-                "parameters": {"type": "object", "description": "Workflow parameters including 'code' and 'potential' for the reference job"},
+                "parameters": {
+                    "type": "object",
+                    "description": "Workflow params: {code: 'lammps'|'vasp'|..., potential: '...'}",
+                },
             },
             "required": ["workflow_type", "structure_id"],
         },
