@@ -232,13 +232,31 @@ def create_compute_tools(registry: ToolRegistry) -> None:
 
     registry.register(Tool(
         name="compute_cancel",
-        description="Cancel a running compute job.",
+        description=(
+            "Stop a compute job that's currently queued or running on the "
+            "MARC27 compute broker. Use this when a user says 'cancel my "
+            "DFT run', 'kill job X', or you need to abort a job whose "
+            "result is no longer wanted (e.g. an over-broad scan, a "
+            "fix-up after a typo in the input deck). Returns the job's "
+            "final state. Idempotent: cancelling an already-finished or "
+            "already-cancelled job is a no-op. Does NOT clean up output "
+            "artifacts — those persist; use the file-system tools to "
+            "remove them if needed."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "job_id": {"type": "string", "description": "Job ID to cancel"},
+                "job_id": {
+                    "type": "string",
+                    "description": (
+                        "Compute job ID returned by `compute_submit`. "
+                        "Looks like `job_<uuid>` or a numeric SLURM ID "
+                        "depending on the broker backend."
+                    ),
+                },
             },
             "required": ["job_id"],
+            "additionalProperties": False,
         },
         func=_cancel_job,
     ))
