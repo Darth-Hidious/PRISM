@@ -15,6 +15,20 @@ codegen-units = 1
 opt-level = 3
 strip = true
 
+# Faster release profile for CI cross-platform smoke. Drops LTO and
+# unifies codegen-units back to the default so macOS / Windows builds
+# finish in ~10 min instead of 35+ min. Still optimized (opt-level=3)
+# so the resulting binary is representative of "release" behavior; we
+# just don't pay for whole-program optimization on every PR.
+#
+# The shipping macOS / Windows installers should be built with the
+# default `[profile.release]` for maximum runtime perf.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+
 # ─────────────────────────────────────────────────────────────────────
 # Workspace dependencies
 #
