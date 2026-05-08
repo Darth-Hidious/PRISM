@@ -1,13 +1,26 @@
-"""Visualization tools for materials data."""
+"""Visualization tools for materials data.
+
+The unified `plot` tool replaces the prior `plot_materials_comparison`,
+`plot_property_distribution`, and `plot_correlation_matrix` tools with
+a single entry point dispatched by `kind`. Each kind owns its own
+required-args contract, validated up front before any matplotlib work.
+"""
 from app.tools.base import Tool, ToolRegistry
 
 
-def _plot_materials_comparison(**kwargs) -> dict:
-    materials = kwargs["materials"]
-    prop_x = kwargs["property_x"]
-    prop_y = kwargs["property_y"]
-    output_path = kwargs.get("output_path", "comparison.png")
-    title = kwargs.get("title", f"{prop_x} vs {prop_y}")
+# ---------------------------------------------------------------------------
+# Per-kind handlers
+# ---------------------------------------------------------------------------
+
+def _kind_materials_comparison(**kw) -> dict:
+    materials = kw.get("materials")
+    prop_x = kw.get("property_x")
+    prop_y = kw.get("property_y")
+    if not materials or not prop_x or not prop_y:
+        return {"error": "kind='materials_comparison' requires `materials`, `property_x`, `property_y`"}
+
+    output_path = kw.get("output_path", "comparison.png")
+    title = kw.get("title", f"{prop_x} vs {prop_y}")
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -25,17 +38,20 @@ def _plot_materials_comparison(**kwargs) -> dict:
         fig.tight_layout()
         fig.savefig(output_path, dpi=150)
         plt.close(fig)
-        return {"success": True, "path": output_path}
+        return {"success": True, "path": output_path, "kind": "materials_comparison"}
     except ImportError:
-        return {"error": "matplotlib not installed. Install with: pip install matplotlib"}
+        return {"error": "matplotlib not installed"}
     except Exception as e:
         return {"error": str(e)}
 
 
-def _plot_property_distribution(**kwargs) -> dict:
-    values = kwargs["values"]
-    prop_name = kwargs.get("property_name", "property")
-    output_path = kwargs.get("output_path", "distribution.png")
+def _kind_property_distribution(**kw) -> dict:
+    values = kw.get("values")
+    if values is None:
+        return {"error": "kind='property_distribution' requires `values` list"}
+
+    prop_name = kw.get("property_name", "property")
+    output_path = kw.get("output_path", "distribution.png")
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -48,28 +64,27 @@ def _plot_property_distribution(**kwargs) -> dict:
         fig.tight_layout()
         fig.savefig(output_path, dpi=150)
         plt.close(fig)
-        return {"success": True, "path": output_path}
+        return {"success": True, "path": output_path, "kind": "property_distribution"}
     except ImportError:
-        return {"error": "matplotlib not installed. Install with: pip install matplotlib"}
+        return {"error": "matplotlib not installed"}
     except Exception as e:
         return {"error": str(e)}
 
 
-def _plot_correlation_matrix(**kwargs) -> dict:
-    """Plot correlation heatmap for numeric columns in a dataset."""
-    dataset_name = kwargs.get("dataset_name")
+def _kind_correlation_matrix(**kw) -> dict:
+    dataset_name = kw.get("dataset_name")
     if not dataset_name:
-        return {"error": "dataset_name is required"}
-    columns = kwargs.get("columns")
-    output_path = kwargs.get("output_path")
+        return {"error": "kind='correlation_matrix' requires `dataset_name`"}
 
     from app.tools.data_collectors.store import DataStore
-
     store = DataStore()
     try:
         df = store.load(dataset_name)
     except FileNotFoundError:
         return {"error": f"Dataset '{dataset_name}' not found in DataStore"}
+
+    columns = kw.get("columns")
+    output_path = kw.get("output_path") or f"{dataset_name}_correlation.png"
 
     numeric = df.select_dtypes(include=["float64", "float32", "int64", "int32"])
     if columns:
@@ -80,14 +95,10 @@ def _plot_correlation_matrix(**kwargs) -> dict:
 
     corr = numeric.corr()
 
-    if not output_path:
-        output_path = f"{dataset_name}_correlation.png"
-
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-
         fig, ax = plt.subplots(figsize=(max(8, numeric.shape[1]), max(6, numeric.shape[1] * 0.8)))
         im = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
         ax.set_xticks(range(len(corr.columns)))
@@ -95,16 +106,16 @@ def _plot_correlation_matrix(**kwargs) -> dict:
         ax.set_xticklabels(corr.columns, rotation=45, ha="right", fontsize=8)
         ax.set_yticklabels(corr.columns, fontsize=8)
         fig.colorbar(im)
-        ax.set_title(f"Correlation Matrix \u2014 {dataset_name}")
+        ax.set_title(f"Correlation Matrix — {dataset_name}")
         fig.tight_layout()
         fig.savefig(output_path, dpi=150)
         plt.close(fig)
     except ImportError:
-        return {"error": "matplotlib not installed. Install with: pip install matplotlib"}
+        return {"error": "matplotlib not installed"}
     except Exception as e:
         return {"error": str(e)}
 
-    # Return top correlations (excluding self-correlation)
+    # Top correlations excluding self-correlation
     pairs = []
     for i in range(len(corr.columns)):
         for j in range(i + 1, len(corr.columns)):
@@ -118,139 +129,135 @@ def _plot_correlation_matrix(**kwargs) -> dict:
     return {
         "success": True,
         "path": output_path,
+        "kind": "correlation_matrix",
         "dataset_name": dataset_name,
         "n_properties": len(corr.columns),
         "top_correlations": pairs[:10],
     }
 
 
+_DISPATCH = {
+    "materials_comparison":  _kind_materials_comparison,
+    "property_distribution": _kind_property_distribution,
+    "correlation_matrix":    _kind_correlation_matrix,
+}
+
+
+# Internal aliases preserved for tests / skills that import the
+# private helpers directly. Public surface is the unified `plot` tool.
+_plot_materials_comparison = _kind_materials_comparison
+_plot_property_distribution = _kind_property_distribution
+_plot_correlation_matrix = _kind_correlation_matrix
+
+
+def _plot(**kwargs) -> dict:
+    kind = kwargs.pop("kind", None)
+    if not kind:
+        return {
+            "error": f"Missing 'kind'. Valid: {list(_DISPATCH.keys())}",
+            "hint": (
+                "plot(kind='property_distribution', values=[...]) or "
+                "plot(kind='correlation_matrix', dataset_name='alloys')"
+            ),
+        }
+    handler = _DISPATCH.get(kind)
+    if not handler:
+        return {"error": f"Unknown kind '{kind}'. Valid: {list(_DISPATCH.keys())}"}
+    try:
+        return handler(**kwargs)
+    except Exception as e:
+        return {"error": str(e), "kind": kind}
+
+
+# ---------------------------------------------------------------------------
+# Description + schema
+# ---------------------------------------------------------------------------
+
+_DESCRIPTION = (
+    "Generate a PNG plot of materials data. ONE tool, three kinds:\n"
+    "  • kind='materials_comparison' — scatter plot of property_x vs "
+    "property_y across a list of materials. Requires `materials` (list of "
+    "dicts), `property_x`, `property_y`. Use when comparing N materials "
+    "on two properties.\n"
+    "  • kind='property_distribution' — histogram of one property's "
+    "values. Requires `values` (list of numbers). Optional `property_name` "
+    "for labelling. Use to see the spread of one property.\n"
+    "  • kind='correlation_matrix' — heatmap of pairwise correlations "
+    "across numeric columns in a stored dataset. Requires `dataset_name` "
+    "(must already be in the DataStore — use import_dataset first). "
+    "Optional `columns` to restrict to specific fields.\n"
+    "All kinds output a PNG; pass `output_path` to override the default. "
+    "Returns {success, path}. NOT for crystal-structure visualization "
+    "(no 3D viewer here) and NOT for interactive plots."
+)
+
+
+_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": list(_DISPATCH.keys()),
+            "description": "Which chart type to render.",
+        },
+        # materials_comparison
+        "materials": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "List of material dicts for kind='materials_comparison'.",
+        },
+        "property_x": {
+            "type": "string",
+            "description": "X-axis property name for kind='materials_comparison'.",
+        },
+        "property_y": {
+            "type": "string",
+            "description": "Y-axis property name for kind='materials_comparison'.",
+        },
+        # property_distribution
+        "values": {
+            "type": "array",
+            "items": {"type": "number"},
+            "description": "Numeric values for kind='property_distribution'.",
+        },
+        "property_name": {
+            "type": "string",
+            "description": "Property label for kind='property_distribution'.",
+        },
+        # correlation_matrix
+        "dataset_name": {
+            "type": "string",
+            "description": "DataStore dataset name for kind='correlation_matrix'.",
+        },
+        "columns": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Restrict kind='correlation_matrix' to these columns.",
+        },
+        # shared
+        "output_path": {
+            "type": "string",
+            "description": "Output PNG path. Default depends on kind.",
+        },
+        "title": {
+            "type": "string",
+            "description": "Plot title (kind='materials_comparison').",
+        },
+    },
+    "required": ["kind"],
+    "additionalProperties": False,
+}
+
+
 def create_visualization_tools(registry: ToolRegistry) -> None:
+    """Register the unified `plot` tool (replaces 3 prior tools).
+
+    Function name preserved (`create_visualization_tools`) for
+    bootstrap.py backward-compatibility.
+    """
     registry.register(Tool(
-        name="plot_materials_comparison",
-        description=(
-            "Render a scatter plot showing how a list of candidate "
-            "materials compare on two property axes (X vs Y). Use this "
-            "when the user has specific materials they want to visually "
-            "rank — e.g. 'show me the trade-off between bulk modulus "
-            "and density for these 12 alloys' or 'plot Inconel 718 "
-            "vs CMSX-4 vs Haynes 282 on creep_resistance vs cost'. "
-            "Each material becomes one point; labels are drawn from "
-            "name or formula. NOT for plotting a single property's "
-            "shape across many materials (use `plot_property_distribution` "
-            "for that) and NOT for showing correlations between many "
-            "properties (use `plot_correlation_matrix`). Output is a "
-            "PNG file path."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "materials": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                    "description": (
-                        "List of material dicts. Each dict must have the "
-                        "two property keys named in property_x / property_y, "
-                        "plus a 'name' or 'formula' field used as the point label."
-                    ),
-                },
-                "property_x": {
-                    "type": "string",
-                    "description": "Property name plotted on the X axis (must be a key in every material dict).",
-                },
-                "property_y": {
-                    "type": "string",
-                    "description": "Property name plotted on the Y axis.",
-                },
-                "output_path": {
-                    "type": "string",
-                    "description": "Where to save the PNG (defaults to a temp path under ~/.prism/plots/).",
-                },
-                "title": {
-                    "type": "string",
-                    "description": "Optional plot title — defaults to '{property_y} vs {property_x}'.",
-                },
-            },
-            "required": ["materials", "property_x", "property_y"],
-            "additionalProperties": False,
-        },
-        func=_plot_materials_comparison,
-    ))
-    registry.register(Tool(
-        name="plot_property_distribution",
-        description=(
-            "Render a histogram of one property's distribution across a "
-            "set of values. Use this when the user wants to understand "
-            "the SHAPE of a property — 'is the formation energy of these "
-            "candidates centered around zero or skewed?', 'what's the "
-            "spread of band gaps in my dataset?'. Single-property; pass "
-            "the values array directly. NOT for comparing multiple "
-            "materials side-by-side (use `plot_materials_comparison`) "
-            "and NOT for property-vs-property relationships (use "
-            "`plot_correlation_matrix`). Output is a PNG file path."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "values": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "description": "Numeric values whose distribution will be plotted.",
-                },
-                "property_name": {
-                    "type": "string",
-                    "description": "Name of the property — used as X-axis label.",
-                },
-                "output_path": {
-                    "type": "string",
-                    "description": "Where to save the PNG.",
-                },
-            },
-            "required": ["values"],
-            "additionalProperties": False,
-        },
-        func=_plot_property_distribution,
-    ))
-    registry.register(Tool(
-        name="plot_correlation_matrix",
-        description=(
-            "Render a heatmap showing pairwise Pearson correlations "
-            "between every pair of numeric columns in a stored dataset. "
-            "Use this when the user wants to find which properties "
-            "covary — 'which features matter for predicting bulk "
-            "modulus?', 'show me what's correlated with creep "
-            "resistance in my screening data'. Operates on a dataset "
-            "already in the PRISM DataStore (use `import_dataset` "
-            "first if your data lives in a CSV). Pass `columns` to "
-            "restrict to a subset; default is every numeric column. "
-            "NOT for ad-hoc point clouds (use `plot_materials_comparison`) "
-            "and NOT for one-property shape (use `plot_property_distribution`). "
-            "Output is a PNG file path."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "dataset_name": {
-                    "type": "string",
-                    "description": (
-                        "Dataset registered in the PRISM DataStore. "
-                        "Use `import_dataset` first if you need to load a CSV."
-                    ),
-                },
-                "columns": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Optional subset of columns. Omit to use every "
-                        "numeric column in the dataset."
-                    ),
-                },
-                "output_path": {
-                    "type": "string",
-                    "description": "Where to save the PNG.",
-                },
-            },
-            "required": ["dataset_name"],
-            "additionalProperties": False,
-        },
-        func=_plot_correlation_matrix,
+        name="plot",
+        description=_DESCRIPTION,
+        input_schema=_SCHEMA,
+        func=_plot,
     ))
