@@ -135,14 +135,32 @@ pub async fn run(
                     // Point forge at the local proxy. Forge templates
                     // {{OPENAI_URL}}/chat/completions and {{OPENAI_URL}}/models;
                     // the proxy serves both under its `/v1` prefix.
+                    //
+                    // Env-vars only — we deliberately do NOT write to
+                    // `~/.forge/.credentials.json` anymore. That file is
+                    // forge's GLOBAL provider list; previously we
+                    // upserted an `openai_compatible` entry pointing
+                    // at our proxy, but that collided with three real
+                    // user setups:
+                    //
+                    //   1. User has their own Anthropic / OpenAI key in
+                    //      `.credentials.json` already → /model picker
+                    //      tries to GET both providers' /v1/models and
+                    //      crashes on the empty-keyed Anthropic entry.
+                    //   2. User is running their own local llama via
+                    //      forge directly → our entry overwrites theirs.
+                    //   3. Forge's default `.credentials.json` ships
+                    //      with empty-keyed stubs that conflict with
+                    //      our entry on /model.
+                    //
+                    // Env vars (OPENAI_URL + OPENAI_API_KEY) are how
+                    // forge's openai_compatible provider reads its
+                    // config when the file path is missing — same
+                    // mechanism, no global-state pollution. The user's
+                    // forge config stays exactly as they left it.
                     unsafe {
                         std::env::set_var("OPENAI_URL", &proxy_url);
                         std::env::set_var("OPENAI_API_KEY", &creds.access_token);
-                    }
-                    if let Err(e) =
-                        upsert_openai_compatible_credential(&proxy_url, &creds.access_token)
-                    {
-                        eprintln!("\x1b[33m[prism]\x1b[0m credential upsert failed: {e:#}");
                     }
                     Some(handle)
                 }
@@ -257,46 +275,26 @@ fn short_path(p: &std::path::Path) -> String {
     p.display().to_string()
 }
 
-/// Ensure the `openai_compatible` provider credential in
-/// `~/.forge/.credentials.json` points at our local MARC27 proxy. Idempotent:
-/// preserves any other credentials forge has stored.
-fn upsert_openai_compatible_credential(proxy_url: &str, access_token: &str) -> Result<()> {
-    let home = std::env::var_os("HOME").context("HOME not set")?;
-    let forge_dir = std::path::PathBuf::from(home).join(".forge");
-    std::fs::create_dir_all(&forge_dir)
-        .with_context(|| format!("creating {}", forge_dir.display()))?;
-    let path = forge_dir.join(".credentials.json");
-
-    let mut entries: Vec<serde_json::Value> = if path.exists() {
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        serde_json::from_str(&text).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    let entry = serde_json::json!({
-        "id": "openai_compatible",
-        "auth_details": { "api_key": access_token },
-        "url_params": { "OPENAI_URL": proxy_url.trim_end_matches('/') },
-    });
-
-    let mut replaced = false;
-    for e in entries.iter_mut() {
-        if e.get("id").and_then(|v| v.as_str()) == Some("openai_compatible") {
-            *e = entry.clone();
-            replaced = true;
-            break;
-        }
-    }
-    if !replaced {
-        entries.push(entry);
-    }
-
-    let text = serde_json::to_string_pretty(&entries).context("serialising credentials")?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
+// `upsert_openai_compatible_credential` was REMOVED.
+//
+// Previously this function wrote PRISM's local-proxy URL + token into
+// `~/.forge/.credentials.json` (forge's GLOBAL provider config) so that
+// the in-PRISM forge could find the proxy. That collided with three
+// real user setups:
+//
+//   1. User has their own Anthropic / OpenAI key in `.credentials.json`
+//      already — `/model` picker iterates every entry and crashes on
+//      the empty-keyed Anthropic stub forge ships with by default.
+//   2. User runs forge directly outside PRISM with their own
+//      openai_compatible config — our entry overwrites theirs.
+//   3. Forge's default `.credentials.json` has placeholder stubs that
+//      conflict with our entry.
+//
+// Replaced with env-var-only configuration: forge's openai_compatible
+// provider reads `OPENAI_URL` + `OPENAI_API_KEY` from environment when
+// the credentials file lacks an entry. Same wire result, no global
+// state pollution. The user's forge config stays exactly as they
+// left it.
 
 /// Write `~/.forge/.mcp.json` (user scope) registering both the Rust-native
 /// MCP server (`prism-rust`) and the Python MCP server (`prism-python`).
