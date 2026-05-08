@@ -137,3 +137,4 @@ node_modules/
 # the generic 'lib/' ignore above (Python convention) was matching it
 !shell-plugin/lib/
 !shell-plugin/lib/**
+/.mcp-tools/
