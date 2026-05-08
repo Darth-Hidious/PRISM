@@ -24,6 +24,7 @@ def build_full_registry(
     from app.tools.code import create_code_tools
     from app.tools.bash import create_bash_tools
     from app.tools.capabilities import create_capabilities_tools
+    from app.tools.dataset import create_dataset_tool
 
     registry = ToolRegistry()
     create_system_tools(registry)
@@ -35,6 +36,9 @@ def build_full_registry(
     create_code_tools(registry)
     create_bash_tools(registry)
     create_capabilities_tools(registry)
+    # Unified dataset tool — replaces VALIDATE_SKILL / REVIEW_SKILL /
+    # VISUALIZE_SKILL Tool registrations. See app/tools/dataset.py.
+    create_dataset_tool(registry)
 
     # Stateful tool memory — auto-record meaningful tool outputs as artifacts
     # and expose recall/fetch/list as tools. Opt-out via PRISM_DISABLE_MEMORY=1

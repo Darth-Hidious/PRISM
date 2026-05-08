@@ -245,54 +245,71 @@ def _web_search(**kwargs) -> dict:
         return {"error": f"All search methods failed: {e}"}
 
 
+def _web(**kwargs) -> dict:
+    """Unified web dispatcher. Replaces web_read + web_search."""
+    action = kwargs.pop("action", None)
+    if not action:
+        return {
+            "error": "Missing 'action'. Valid: read, search",
+            "hint": (
+                "web(action='read', url='https://...') — fetch one page as clean text. "
+                "web(action='search', query='...') — search the web for relevant URLs."
+            ),
+        }
+    if action == "read":
+        if not kwargs.get("url"):
+            return {"error": "Action 'read' requires `url`"}
+        return _web_read(**kwargs)
+    if action == "search":
+        if not kwargs.get("query"):
+            return {"error": "Action 'search' requires `query`"}
+        return _web_search(**kwargs)
+    return {"error": f"Unknown action '{action}'. Valid: read, search"}
+
+
+_WEB_DESCRIPTION = (
+    "Open-web access. ONE tool, two actions:\n"
+    "  • action='read' — fetch a single URL and return clean text content. "
+    "Handles JavaScript-heavy sites, strips HTML, returns markdown. Requires "
+    "`url`. Use to read papers, docs, Wikipedia articles, blog posts.\n"
+    "  • action='search' — query the open web; returns titles, URLs, snippets. "
+    "Requires `query`. Optional `limit` (default 5). Searches via Firecrawl "
+    "(if configured) or DuckDuckGo.\n"
+    "Typical sequence: action='search' → pick the best URL → action='read' on "
+    "that URL. NOT for scientific papers (use prior_art_search for better "
+    "metadata + DOIs) and NOT for the MARC27 KG (use knowledge(action='search'))."
+)
+
+
 def create_web_tools(registry: ToolRegistry) -> None:
-    """Register web browsing tools."""
-
-    registry.register(
-        Tool(
-            name="web_read",
-            description=(
-                "Read a web page and return clean text content. Handles JavaScript-heavy "
-                "sites, strips HTML, and returns markdown. Use this to read papers, docs, "
-                "Wikipedia articles, or any web page. Returns clean text ready for analysis."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "URL to read (https://...)",
-                    },
+    """Register the unified `web` tool (replaces web_read + web_search)."""
+    registry.register(Tool(
+        name="web",
+        description=_WEB_DESCRIPTION,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["read", "search"],
+                    "description": "Which web operation to perform.",
                 },
-                "required": ["url"],
-            },
-            func=_web_read,
-        )
-    )
-
-    registry.register(
-        Tool(
-            name="web_search",
-            description=(
-                "Search the web for information. Returns titles, URLs, and snippets. "
-                "Use to find papers, datasets, documentation, or any web content. "
-                "Searches via Firecrawl (if configured) or DuckDuckGo."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max results (default 5)",
-                        "default": 5,
-                    },
+                "url": {
+                    "type": "string",
+                    "description": "URL to read for action='read' (https://...).",
                 },
-                "required": ["query"],
+                "query": {
+                    "type": "string",
+                    "description": "Search query for action='search'.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results for action='search' (default 5).",
+                    "default": 5,
+                },
             },
-            func=_web_search,
-        )
-    )
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        func=_web,
+    ))

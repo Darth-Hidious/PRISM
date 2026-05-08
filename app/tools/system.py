@@ -243,33 +243,11 @@ def create_system_tools(registry: ToolRegistry) -> None:
         input_schema=_FILE_SCHEMA,
         func=_file,
     ))
-    registry.register(Tool(
-        name="web_search",
-        description=(
-            "General-purpose web search. Returns titles, URLs, and "
-            "snippets of pages matching the query. Use this when the "
-            "user wants information from the open web — current "
-            "events, vendor docs, blog posts, GitHub repos, anything "
-            "that wouldn't be in a structured database. NOT for "
-            "scientific papers (use `prior_art_search` source='papers' "
-            "— better metadata + DOIs) and NOT for materials "
-            "structures (use `materials_search` for the federated "
-            "DB hits). Typically a fast first-pass tool the agent "
-            "follows up with `web_read` on the most-promising URL."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Free-text web search query.",
-                },
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-        func=_web_search,
-    ))
+    # NOTE: the system.py `web_search` Tool registration was removed in
+    # Round 6 cleanup. It duplicated the richer Firecrawl-or-DuckDuckGo
+    # implementation in app/tools/web.py, which is now exposed as
+    # `web(action='search')`. The `_web_search` function below remains
+    # because internal helpers (and tests) may call it directly.
     registry.register(Tool(
         name="show_scratchpad",
         description=(

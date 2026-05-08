@@ -28,17 +28,16 @@ class TestGetDefaultCollectorRegistry:
 
 
 class TestBuildFullRegistryIncludesSearchTools:
-    def test_has_literature_search(self):
+    def test_has_prior_art_search(self):
+        """Round 6 collapse: literature_search + patent_search aliases
+        were removed; prior_art_search is the canonical entry point."""
         from app.plugins.bootstrap import build_full_registry
         reg, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = [t.name for t in reg.list_tools()]
-        assert "literature_search" in names
-
-    def test_has_patent_search(self):
-        from app.plugins.bootstrap import build_full_registry
-        reg, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
-        names = [t.name for t in reg.list_tools()]
-        assert "patent_search" in names
+        assert "prior_art_search" in names
+        # Old aliases must be gone
+        assert "literature_search" not in names
+        assert "patent_search" not in names
 
 
 class TestOMAT24Integration:

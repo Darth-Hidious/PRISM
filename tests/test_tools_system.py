@@ -16,8 +16,10 @@ class TestSystemTools:
         registry = ToolRegistry()
         create_system_tools(registry)
         names = [t.name for t in registry.list_tools()]
-        # web_search and show_scratchpad still standalone
-        assert "web_search" in names
+        # show_scratchpad standalone; web_search REMOVED in Round 6 cleanup
+        # (web search now lives in app/tools/web.py as web(action='search'))
+        assert "web_search" not in names
+        assert "show_scratchpad" in names
         # Unified file tool replaced read_file/write_file/edit_file
         assert "file" in names
         assert "read_file" not in names

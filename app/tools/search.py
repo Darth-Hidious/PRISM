@@ -172,41 +172,9 @@ def create_search_tools(registry: ToolRegistry) -> None:
     ))
 
     # Backward-compat aliases — same behaviour as before, narrower
-    # descriptions so the retriever prefers the unified tool unless
-    # the user/agent specifically asks for one source. Keeping these
-    # avoids breaking any in-flight workflows or scripts.
-    registry.register(Tool(
-        name="literature_search",
-        description=(
-            "[Alias for prior_art_search source='papers']. Search "
-            "scientific literature (arXiv, Semantic Scholar). Prefer "
-            "`prior_art_search` for new code."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "max_results": {"type": "integer", "default": 20},
-                "sources": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["query"],
-        },
-        func=_literature_search,
-    ))
-    registry.register(Tool(
-        name="patent_search",
-        description=(
-            "[Alias for prior_art_search source='patents']. Search "
-            "patents via Lens.org. Requires LENS_API_TOKEN. Prefer "
-            "`prior_art_search` for new code."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "max_results": {"type": "integer", "default": 20},
-            },
-            "required": ["query"],
-        },
-        func=_patent_search,
-    ))
+    # NOTE: literature_search and patent_search aliases were removed in
+    # Round 6 cleanup. Both functionalities are accessible via
+    # prior_art_search(source='papers'|'patents'). The aliases existed
+    # only to ease migration; keeping them inflated the embedding
+    # retrieval surface (Stage 2.1) without adding capability. Any
+    # callers should switch to prior_art_search.
