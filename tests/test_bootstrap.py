@@ -27,12 +27,12 @@ class TestBuildFullRegistry:
     def test_has_visualization_tools(self):
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
-        assert "plot_materials_comparison" in names or "plot_property_distribution" in names
+        assert "plot" in names  # unified tool replaced plot_materials_comparison + plot_property_distribution + plot_correlation_matrix
 
     def test_has_prediction_tools(self):
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
-        assert "predict_property" in names or "train_model" in names
+        assert "predict" in names or "train_model" in names  # unified `predict(target=...)` replaces predict_property + predict_structure
 
     def test_has_builtin_skills(self):
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
@@ -78,7 +78,9 @@ class TestBuildFullRegistry:
         assert "review_dataset" in names
 
     def test_has_correlation_matrix_tool(self):
-        """plot_correlation_matrix tool is registered."""
+        """correlation_matrix is now a kind of the unified `plot` tool."""
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
-        assert "plot_correlation_matrix" in names
+        assert "plot" in names
+        plot_tool = registry.get("plot")
+        assert "correlation_matrix" in plot_tool.input_schema["properties"]["kind"]["enum"]

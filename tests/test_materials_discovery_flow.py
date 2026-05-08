@@ -71,10 +71,14 @@ class TestMaterialsDiscoveryFlow:
     # ── Step 4: Prediction tool handles missing model gracefully ───
 
     def test_step4_predict_graceful_when_no_model(self):
-        """predict_property should return an error, not crash, when no model."""
-        from app.tools.prediction import _predict_property
+        """predict(target='formula') should return an error, not crash, when no model.
 
-        result = _predict_property(formula="TiAl", target_property="band_gap")
+        After Round 4 batch 2: predict_property/predict_structure were
+        collapsed into the unified `predict(target=…)` tool.
+        """
+        from app.tools.prediction import _predict
+
+        result = _predict(target="formula", formula="TiAl", property_name="band_gap")
         # Should return an error dict, not raise
         assert isinstance(result, dict)
         assert "error" in result
@@ -134,11 +138,12 @@ class TestMaterialsDiscoveryFlow:
         reg, _, _ = build_full_registry(enable_mcp=False, enable_plugins=False)
         tool_names = {t.name for t in reg.list_tools()}
 
+        # Note: predict_property + predict_structure were collapsed in
+        # Round 4 batch 2 into the unified `predict(target=…)` tool.
         required = [
             "search_materials",
             "query_materials_project",
-            "predict_property",
-            "predict_structure",
+            "predict",
             "list_models",
             "export_results_csv",
             "import_dataset",

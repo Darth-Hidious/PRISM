@@ -25,7 +25,8 @@ class TestMCPServer:
         assert "search_materials" in tool_names
         assert "query_materials_project" in tool_names
         assert "export_results_csv" in tool_names
-        assert "predict_property" in tool_names
+        # `predict_property` was collapsed into the unified `predict(target=...)` tool.
+        assert "predict" in tool_names
         assert "list_models" in tool_names
         assert len(tool_names) >= 10
 
@@ -71,11 +72,11 @@ class TestMCPServer:
                 return {t.name: t.inputSchema for t in tools}
 
         schemas = asyncio.run(run())
-        # predict_property: formula is required, property_name and algorithm are optional
-        predict_schema = schemas["predict_property"]
-        assert "formula" in predict_schema.get("required", [])
-        assert "property_name" not in predict_schema.get("required", [])
-        assert predict_schema["properties"]["property_name"]["default"] is None
+        # Unified `predict` tool: target is required; formula/property_name/etc.
+        # are optional (validated by the dispatcher per-target).
+        predict_schema = schemas["predict"]
+        assert "target" in predict_schema.get("required", [])
+        assert "formula" not in predict_schema.get("required", [])
 
     def test_tools_resource_returns_json(self):
         server = create_mcp_server()

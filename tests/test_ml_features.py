@@ -140,14 +140,22 @@ class TestAlgorithmRegistry:
 
 
 class TestPredictStructureTool:
-    def test_tool_registered(self):
+    """After Round 4 batch 2: predict_property + predict_structure were
+    collapsed into a unified `predict(target='formula'|'structure')` tool.
+    """
+
+    def test_unified_predict_tool_registered(self):
         from app.tools.base import ToolRegistry
         from app.tools.prediction import create_prediction_tools
         reg = ToolRegistry()
         create_prediction_tools(reg)
-        tool = reg.get("predict_structure")
-        assert tool.name == "predict_structure"
-        assert "structure" in tool.input_schema["required"]
+        tool = reg.get("predict")
+        assert tool.name == "predict"
+        # target is required; both formula + structure modes are advertised
+        assert "target" in tool.input_schema["required"]
+        targets = tool.input_schema["properties"]["target"]["enum"]
+        assert "structure" in targets
+        assert "formula" in targets
 
     def test_list_models_includes_pretrained(self):
         from app.tools.base import ToolRegistry
@@ -159,10 +167,13 @@ class TestPredictStructureTool:
         assert "pretrained_models" in result
         assert "feature_backend" in result
 
-    def test_predict_structure_in_bootstrap(self):
+    def test_predict_in_bootstrap(self):
         from app.plugins.bootstrap import build_full_registry
         tool_reg, _, _ = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in tool_reg.list_tools()}
-        assert "predict_structure" in names
-        assert "predict_property" in names
+        # Unified `predict` replaces predict_property + predict_structure
+        assert "predict" in names
         assert "list_models" in names
+        # Old names must be gone
+        assert "predict_property" not in names
+        assert "predict_structure" not in names
