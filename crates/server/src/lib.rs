@@ -94,7 +94,7 @@ pub struct NodeState {
     /// This node's unique ID on the mesh (set once after mesh init).
     pub node_id: OnceLock<Uuid>,
     /// Federated query client for dispatching queries to mesh peers.
-    pub federation: OnceLock<prism_mesh::federation::FederatedQuery>,
+    pub federation: OnceLock<prism_mesh::federated_query::FederatedQuery>,
 }
 
 /// A running service tracked by the server.
