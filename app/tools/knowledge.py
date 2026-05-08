@@ -298,22 +298,51 @@ def create_knowledge_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="knowledge_paths",
         description=(
-            "Find shortest paths between two entities in the knowledge graph. "
-            "Shows how materials relate to properties, methods, or applications. "
-            "Example: path from 'Ti-6Al-4V' to 'Fatigue Resistance'."
+            "Find the shortest hop-paths between two named entities in "
+            "the MARC27 knowledge graph. Use this when the user asks "
+            "'how does X relate to Y?' or 'why does this material "
+            "matter for that application?' — the tool walks the graph "
+            "edges and returns each candidate path as an ordered list "
+            "of (entity → relation → entity → ...) hops. Concrete "
+            "example: path from 'Ti-6Al-4V' to 'Fatigue Resistance' "
+            "might return [Ti-6Al-4V — has_property — α-β phase "
+            "structure — enables — high cycle fatigue endurance — "
+            "is_a — Fatigue Resistance]. NOT for finding a single "
+            "entity's neighbors (use `knowledge_entity`) and NOT for "
+            "open-ended search (use `knowledge_search` or "
+            "`semantic_search`). Cap path length with `max_hops` to "
+            "avoid combinatorial blowup."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "from_entity": {"type": "string", "description": "Start entity name"},
-                "to_entity": {"type": "string", "description": "End entity name"},
+                "from_entity": {
+                    "type": "string",
+                    "description": (
+                        "Start entity name. Must match a node in the "
+                        "graph — use `knowledge_search` first if "
+                        "you're not sure of the canonical name."
+                    ),
+                },
+                "to_entity": {
+                    "type": "string",
+                    "description": "End entity name. Same caveat as `from_entity`.",
+                },
                 "max_hops": {
                     "type": "integer",
-                    "description": "Max path length (default 3)",
+                    "description": (
+                        "Maximum path length. Default 3. Higher values "
+                        "find more paths but cost more compute; raise "
+                        "above 5 only when the user explicitly wants "
+                        "deep relational chains."
+                    ),
                     "default": 3,
+                    "minimum": 1,
+                    "maximum": 8,
                 },
             },
             "required": ["from_entity", "to_entity"],
+            "additionalProperties": False,
         },
         func=_graph_paths,
     ))
@@ -321,10 +350,22 @@ def create_knowledge_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="knowledge_stats",
         description=(
-            "Get statistics about the MARC27 knowledge graph — total nodes, "
-            "edges, and entity types. Use to understand the scope of available data."
+            "Get high-level metrics about the MARC27 knowledge graph: "
+            "total node count, edge count, entity-type breakdown "
+            "(materials / properties / methods / authors / "
+            "publications), and last-update timestamp. Use this when "
+            "the user asks 'what's in your knowledge graph?', 'how "
+            "much data do you have?', or before a search to know "
+            "if the graph is even populated. No arguments. Read-only. "
+            "NOT a substitute for actually searching — use "
+            "`knowledge_search` / `semantic_search` to find specific "
+            "entities."
         ),
-        input_schema={"type": "object", "properties": {}},
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
         func=_graph_stats,
     ))
 

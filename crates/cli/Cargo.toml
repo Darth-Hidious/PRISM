@@ -56,3 +56,9 @@ futures-util.workspace = true
 
 # Stage 2: semantic tool retrieval
 prism_tool_router = { path = "../prism_tool_router" }
+
+# URL parsing for `prism use local --url ...` validation
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

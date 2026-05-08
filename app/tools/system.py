@@ -220,11 +220,49 @@ def create_system_tools(registry: ToolRegistry) -> None:
         },
         func=_edit_file))
     registry.register(Tool(
-        name="web_search", description="Search the web for information. Returns relevant results.",
-        input_schema={"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}}, "required": ["query"]},
-        func=_web_search))
+        name="web_search",
+        description=(
+            "General-purpose web search. Returns titles, URLs, and "
+            "snippets of pages matching the query. Use this when the "
+            "user wants information from the open web — current "
+            "events, vendor docs, blog posts, GitHub repos, anything "
+            "that wouldn't be in a structured database. NOT for "
+            "scientific papers (use `prior_art_search` source='papers' "
+            "— better metadata + DOIs) and NOT for materials "
+            "structures (use `materials_search` for the federated "
+            "DB hits). Typically a fast first-pass tool the agent "
+            "follows up with `web_read` on the most-promising URL."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Free-text web search query.",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        func=_web_search,
+    ))
     registry.register(Tool(
         name="show_scratchpad",
-        description="Show the agent's execution log (scratchpad) — lists all actions taken so far in this session.",
-        input_schema={"type": "object", "properties": {}},
-        func=_show_scratchpad))
+        description=(
+            "Print the agent's execution log for this chat session — an "
+            "ordered list of every tool the agent has called so far, "
+            "along with the arguments and a short result summary per "
+            "call. Use this when the user asks 'what have you done so "
+            "far?', 'show me your work', 'what tools did you call to "
+            "get this answer?', or when the agent itself needs to "
+            "remind itself of prior steps before deciding the next "
+            "action. Read-only; does not affect state. Returns a "
+            "structured list, one entry per tool invocation."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        func=_show_scratchpad,
+    ))

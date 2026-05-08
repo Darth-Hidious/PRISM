@@ -53,7 +53,21 @@ def _validate_dataset(**kwargs) -> dict:
 
 VALIDATE_SKILL = Skill(
     name="validate_dataset",
-    description="Validate a dataset: detect outliers, check physical constraints, score completeness.",
+    description=(
+        "Run a quality audit on a stored dataset before training a model "
+        "or making a decision off it. Three checks combined: (a) flag "
+        "statistical outliers per column using Z-scores against a "
+        "user-configurable threshold (default 3.0); (b) check physical "
+        "constraints (negative band gaps, density > water for ceramics, "
+        "stoichiometric impossibilities, …); (c) score completeness "
+        "(per-column null rates and an overall completeness number). "
+        "Returns a structured report PLUS a human-readable summary "
+        "string. Use this when the user says 'is this dataset clean?', "
+        "'should I trust this for training?', or before piping a "
+        "dataset into `plot_correlation_matrix` / training. Operates "
+        "on a dataset already in the PRISM DataStore — use "
+        "`import_dataset` first if your data lives in a CSV."
+    ),
     steps=[
         SkillStep("load_dataset", "Load dataset from DataStore", "internal"),
         SkillStep("detect_outliers", "Flag statistical outliers", "internal"),
@@ -66,14 +80,24 @@ VALIDATE_SKILL = Skill(
         "properties": {
             "dataset_name": {
                 "type": "string",
-                "description": "Name of the dataset in DataStore",
+                "description": (
+                    "Name of the dataset registered in the PRISM "
+                    "DataStore. Use `import_dataset` first if needed."
+                ),
             },
             "z_threshold": {
                 "type": "number",
-                "description": "Z-score threshold for outlier detection (default: 3.0)",
+                "description": (
+                    "Z-score threshold for outlier flagging. Default "
+                    "3.0 (≈ outside 99.7%). Tighten to 2.0 for stricter "
+                    "review of curated datasets; loosen to 4.0+ for "
+                    "wide-scan exploration data."
+                ),
+                "default": 3.0,
             },
         },
         "required": ["dataset_name"],
+        "additionalProperties": False,
     },
     func=_validate_dataset,
     category="validation",

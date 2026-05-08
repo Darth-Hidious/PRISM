@@ -183,10 +183,52 @@ def create_data_tools(registry: ToolRegistry) -> None:
         func=_export_results_csv))
     registry.register(Tool(
         name="import_dataset",
-        description="Import a local CSV, JSON, or Parquet file into the PRISM DataStore as a named dataset.",
-        input_schema={"type": "object", "properties": {
-            "file_path": {"type": "string", "description": "Path to the file to import"},
-            "dataset_name": {"type": "string", "description": "Name for the dataset (defaults to filename stem)"},
-            "file_format": {"type": "string", "description": "File format override (csv, json, parquet). Auto-detected if omitted."}},
-            "required": ["file_path"]},
-        func=_import_dataset))
+        description=(
+            "Load a local CSV / JSON / Parquet file into the PRISM "
+            "DataStore so other tools (`validate_dataset`, "
+            "`plot_correlation_matrix`, training pipelines) can refer "
+            "to it by name. Use this whenever the user has data on "
+            "disk they want to analyse — 'I have a CSV with 500 alloy "
+            "compositions, can you check it?'. Format is auto-detected "
+            "from extension (.csv / .json / .parquet); pass file_format "
+            "explicitly only when the extension is wrong or missing. "
+            "Dataset name defaults to the file's stem (e.g. "
+            "`/tmp/alloys.csv` → `alloys`); override with dataset_name "
+            "to avoid clobbering an existing one. Returns the resolved "
+            "dataset_name + row/column counts so the agent can confirm "
+            "the load worked before piping into other tools."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": (
+                        "Absolute or working-directory-relative path to "
+                        "the source file. Glob patterns NOT supported — "
+                        "one file per call."
+                    ),
+                },
+                "dataset_name": {
+                    "type": "string",
+                    "description": (
+                        "Name to register under in the DataStore. "
+                        "Defaults to the file's stem; override to avoid "
+                        "overwriting an existing dataset of that name."
+                    ),
+                },
+                "file_format": {
+                    "type": "string",
+                    "enum": ["csv", "json", "parquet"],
+                    "description": (
+                        "Format override — pass when the extension is "
+                        "wrong or absent. Default behaviour is to "
+                        "auto-detect from the extension."
+                    ),
+                },
+            },
+            "required": ["file_path"],
+            "additionalProperties": False,
+        },
+        func=_import_dataset,
+    ))

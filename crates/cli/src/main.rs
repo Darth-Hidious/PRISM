@@ -5,10 +5,12 @@
 //! discovery from `~/.prism/workflows/`.
 
 mod boot;
+mod chat_config;
 mod doctor;
 mod forge_chat;
 mod mcp_server_native;
 mod platform_bridge;
+mod use_command;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -50,8 +52,40 @@ enum Commands {
     Setup,
     /// Launch the interactive AI agent TUI.
     Tui,
-    /// Authenticate against the MARC27 platform using device flow.
-    Login,
+    /// Authenticate against the MARC27 platform.
+    ///
+    /// Default: device-flow login that opens a browser to approve the
+    /// session. For HPC nodes / SSH sessions / any environment without
+    /// a browser, two extra modes are supported:
+    ///
+    ///   prism login --no-browser
+    ///       Run the device flow but DON'T try to open a browser
+    ///       automatically. The URL + user code are printed; approve
+    ///       from any other machine's browser, then return to the
+    ///       terminal — the poll continues until you do.
+    ///
+    ///   prism login --token <PAT>
+    ///       Skip the device flow entirely. Use a Personal Access
+    ///       Token created on the MARC27 website. The token is
+    ///       written to ~/.prism/credentials.json with no further
+    ///       interaction. This is the right path for headless
+    ///       servers and CI environments.
+    Login {
+        /// Bypass the device flow. Use a pre-issued Personal Access
+        /// Token from the MARC27 website. Headless / CI / SSH-only
+        /// use. Token is read from this flag, env var
+        /// `PRISM_LOGIN_TOKEN`, or stdin (in that priority order)
+        /// so the token never has to appear in shell history.
+        #[arg(long, value_name = "PAT", env = "PRISM_LOGIN_TOKEN")]
+        token: Option<String>,
+
+        /// Run the device flow but skip the browser auto-open. Prints
+        /// the verification URL + user code and waits for approval.
+        /// Useful when on a headless HPC node — you copy the URL to
+        /// your laptop's browser and approve there.
+        #[arg(long, conflicts_with = "token")]
+        no_browser: bool,
+    },
     /// Show runtime paths, endpoints, and auth status.
     Status,
     /// List, inspect, and run YAML-defined workflows.
@@ -270,6 +304,18 @@ enum Commands {
     Discourse {
         #[command(subcommand)]
         command: DiscourseCommands,
+    },
+    /// Pick where chat turns are routed: MARC27 cloud (default), a
+    /// local OpenAI-compatible LLM, or a direct vendor (Anthropic /
+    /// OpenAI / etc). MARC27 platform tools — knowledge graph,
+    /// discourse, marketplace, materials project — stay available
+    /// regardless of which chat target is selected.
+    ///
+    /// Identical to the in-chat `/use` slash command — both write the
+    /// same `~/.prism/config.toml`.
+    Use {
+        #[command(subcommand)]
+        command: UseCommands,
     },
     /// Publish a model, dataset, or workflow to a remote registry.
     Publish {
@@ -691,6 +737,69 @@ enum DiscourseCommands {
     },
 }
 
+/// Subcommands of `prism use`. See `chat_config::ChatTarget` for what
+/// each variant ends up as in `~/.prism/config.toml`.
+///
+/// `Marc27` stays on the default route (MARC27 cloud) but pins which
+/// upstream model MARC27 should serve. `Local` and `Provider` are the
+/// two non-MARC27 chat targets. `Show` prints the current state (chat
+/// target + tools auth state). `Reset` goes back to MARC27 cloud
+/// without a pinned model (PRISM's compiled-in default).
+#[derive(Debug, Subcommand)]
+enum UseCommands {
+    /// Stay on MARC27 cloud, but pin a specific upstream model
+    /// (`gpt-5.5`, `claude-sonnet-4`, `mistral-large-latest`, …).
+    /// MARC27's own vendor keys stay on the platform — PRISM only
+    /// passes the model id forward.
+    Marc27 {
+        /// Upstream model id MARC27 should serve. If omitted,
+        /// PRISM uses its compiled-in default.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Route chat turns to an OpenAI-compatible local server (Ollama,
+    /// llama.cpp, vLLM, etc.). MARC27 platform tools stay available
+    /// when the user is logged in.
+    Local {
+        /// Base URL of the local server, including `/v1`. Examples:
+        /// `http://localhost:11434/v1`, `http://127.0.0.1:8080/v1`.
+        #[arg(long)]
+        url: String,
+        /// Model name to send in chat requests (whatever the local
+        /// server advertises — `llama-3.1-70b`, `mistral-7b-instruct`,
+        /// `qwen2.5-coder`, etc.).
+        #[arg(long)]
+        model: String,
+        /// Optional API key. Most local servers accept any non-empty
+        /// string or none at all. Stored in plaintext in
+        /// `~/.prism/config.toml` — only set this for trusted local
+        /// servers; never put a cloud-vendor key here (use `provider`
+        /// for that).
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Route chat turns direct to a cloud vendor using the user's own
+    /// API key (read from an env var, never persisted to disk).
+    /// MARC27 platform tools stay available when the user is logged in.
+    Provider {
+        /// Vendor slug: `anthropic`, `openai`, `mistral`, `gemini`,
+        /// `cohere`, …
+        provider: String,
+        /// Model id to send (e.g. `claude-sonnet-4`, `gpt-4o`).
+        #[arg(long)]
+        model: String,
+        /// Override the env var name PRISM reads the API key from.
+        /// Defaults to the vendor's standard env var
+        /// (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …).
+        #[arg(long)]
+        api_key_env: Option<String>,
+    },
+    /// Print the current chat target and the tools-auth state.
+    Show,
+    /// Reset chat target back to MARC27 cloud (the default).
+    Reset,
+}
+
 #[derive(Debug, Clone)]
 struct SelectedContext {
     org_id: Option<String>,
@@ -812,9 +921,12 @@ async fn main() -> Result<()> {
                 println!("    prism --help\n");
             }
         }
-        Commands::Login => {
+        Commands::Login { token, no_browser } => {
             let mut state = paths.load_cli_state()?;
-            let credentials = run_device_login(&endpoints).await?;
+            let credentials = match token {
+                Some(pat) => run_token_login(&endpoints, &pat).await?,
+                None => run_device_login_with_opts(&endpoints, no_browser).await?,
+            };
             let platform =
                 PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
             let profile = platform.fetch_current_user().await.ok();
@@ -920,7 +1032,7 @@ async fn main() -> Result<()> {
                     cfg_llm
                         .model
                         .clone()
-                        .unwrap_or_else(|| "gemini-3.1-flash-lite-preview".to_string())
+                        .unwrap_or_else(|| "gpt-5.5".to_string())
                 }),
                 api_key,
                 embedding_model: cfg_llm.embedding_model.clone(),
@@ -1997,6 +2109,9 @@ async fn main() -> Result<()> {
         }
         Commands::Discourse { command } => {
             handle_discourse_command(command).await?;
+        }
+        Commands::Use { command } => {
+            handle_use_command(command).await?;
         }
         Commands::Publish {
             path,
@@ -4338,6 +4453,68 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
     Ok(())
 }
 
+/// Translate clap-parsed `UseCommands` into the surface-agnostic
+/// `UseAction` consumed by `use_command::apply`. The CLI surface and
+/// the in-chat `/use` slash command both build `UseAction`s (the
+/// slash command parses raw text into one); keeping the action type
+/// independent of clap means the slash command doesn't pull in any
+/// CLI-only types.
+async fn handle_use_command(command: UseCommands) -> Result<()> {
+    let action = match command {
+        UseCommands::Marc27 { model } => use_command::UseAction::Marc27 { model },
+        UseCommands::Local {
+            url,
+            model,
+            api_key,
+        } => use_command::UseAction::Local {
+            url,
+            model,
+            api_key,
+        },
+        UseCommands::Provider {
+            provider,
+            model,
+            api_key_env,
+        } => use_command::UseAction::Provider {
+            provider,
+            model,
+            api_key_env,
+        },
+        UseCommands::Show => use_command::UseAction::Show,
+        UseCommands::Reset => use_command::UseAction::Reset,
+    };
+    // We're running before prism boots, so there's no live bridge to
+    // hot-swap — only the persisted config matters. Detect whether the
+    // user has run `prism login` so the message can correctly state
+    // whether platform tools are available.
+    let logged_in = paths_credentials_present();
+    let outcome = use_command::apply(action, None, logged_in).await?;
+    println!("{}", outcome.message);
+    Ok(())
+}
+
+/// Best-effort check for whether `prism login` has been completed and
+/// the credentials file exists with a non-empty token. Used by
+/// `prism use` and the in-chat `/use` to render the "Tools" line
+/// honestly. Doesn't validate the token (no network) — that would
+/// move to a separate `prism status --tools` check if we want it.
+fn paths_credentials_present() -> bool {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => h,
+        None => return false,
+    };
+    let path = std::path::PathBuf::from(home)
+        .join(".prism")
+        .join("credentials.json");
+    if !path.exists() {
+        return false;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => !text.trim().is_empty() && text.contains("access_token"),
+        Err(_) => false,
+    }
+}
+
 async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
     let (api_base, auth) = resolve_agent_auth()?;
     let client = reqwest::Client::builder()
@@ -4883,6 +5060,23 @@ async fn handle_query(
 }
 
 async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredentials> {
+    // Default behaviour preserves the original "open a browser" UX
+    // for users with a desktop GUI. HPC / SSH paths reach the new
+    // headless variant via `prism login --no-browser`.
+    run_device_login_with_opts(endpoints, false).await
+}
+
+/// Headless variant of `run_device_login`.
+///
+/// `no_browser=true` skips the auto-open and renders an explicit
+/// instruction block so the user can paste the URL into ANY browser
+/// (their laptop's, their phone's, …) and approve. The polling loop
+/// is identical — once the device is approved, the token comes back
+/// and gets stored exactly the same way.
+async fn run_device_login_with_opts(
+    endpoints: &PlatformEndpoints,
+    no_browser: bool,
+) -> Result<StoredCredentials> {
     let platform = PlatformClient::new(&endpoints.api_base);
     let http = platform.inner().clone();
 
@@ -4890,14 +5084,28 @@ async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredent
         DeviceFlowAuth::start_device_flow(&http, &endpoints.api_base).await?;
 
     println!();
-    println!("PRISM setup needs MARC27 platform login.");
-    println!("Open: {}", start.verification_uri);
-    println!("Code: {}", start.user_code);
-    println!();
-    if let Err(err) = open_browser(&start.verification_uri) {
-        eprintln!("warning: failed to open browser automatically: {err}");
+    if no_browser {
+        // Headless block — no auto-open, structure the output so the
+        // user can clearly see what to do on a different machine.
+        println!("\u{2501}\u{2501} PRISM headless login \u{2501}\u{2501}");
+        println!();
+        println!("  1. Open this URL on any browser (laptop, phone, …):");
+        println!("       {}", start.verification_uri);
+        println!("  2. Enter this code:");
+        println!("       {}", start.user_code);
+        println!("  3. Approve the session.");
+        println!();
+        println!("  Waiting here until you approve. Ctrl+C to abort.");
+    } else {
+        println!("PRISM setup needs MARC27 platform login.");
+        println!("Open: {}", start.verification_uri);
+        println!("Code: {}", start.user_code);
+        println!();
+        if let Err(err) = open_browser(&start.verification_uri) {
+            eprintln!("warning: failed to open browser automatically: {err}");
+        }
+        println!("Approve the device in your browser, then return here.");
     }
-    println!("Approve the device in your browser, then return here.");
 
     let token: TokenResponse = DeviceFlowAuth::poll_for_token(
         &http,
@@ -4965,6 +5173,79 @@ async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredent
         project_id: None,
         project_name: None,
         expires_at,
+    })
+}
+
+/// Headless / CI / SSH-only login path. Skips the device flow and
+/// validates a Personal Access Token (PAT) the user issued on the
+/// MARC27 website. The token is the only credential needed; org +
+/// project selection is deferred to the post-login interactive step
+/// (Commands::Login handler), which prompts only if multiple orgs/
+/// projects are visible — and falls back to env var `MARC27_PROJECT_ID`
+/// when the prompt isn't appropriate (CI, scripted setup).
+///
+/// Validation: we hit `GET /api/v1/me` (or whatever `fetch_current_user`
+/// resolves to) to verify the token is alive AND grab the user's
+/// display name + id at the same time. Bad token → fast fail with a
+/// clear error pointing the user at the website's PAT page; we don't
+/// silently store a token that doesn't authenticate.
+async fn run_token_login(endpoints: &PlatformEndpoints, token: &str) -> Result<StoredCredentials> {
+    let token = token.trim();
+    if token.is_empty() {
+        bail!(
+            "Empty --token. Pass a Personal Access Token from {}/settings/tokens, \
+             or set $PRISM_LOGIN_TOKEN before running.",
+            endpoints
+                .api_base
+                .trim_end_matches("/api/v1")
+                .trim_end_matches('/')
+        );
+    }
+
+    // Validate by fetching the user profile; this also gives us the
+    // display name + user_id we'd otherwise have to ask the website
+    // for separately.
+    let platform = PlatformClient::new(&endpoints.api_base).with_token(token);
+    let profile = platform.fetch_current_user().await.with_context(|| {
+        format!(
+            "Token rejected by MARC27 ({}). Check the PAT is correct and not revoked. \
+             Issue a new one at {}/settings/tokens.",
+            endpoints.api_base,
+            endpoints
+                .api_base
+                .trim_end_matches("/api/v1")
+                .trim_end_matches('/')
+        )
+    })?;
+
+    // PATs don't have a refresh token (long-lived by design) and
+    // expires_at depends on when the user issued it; the website tells
+    // them. Leaving expires_at = None means PRISM treats it as
+    // never-expiring locally; on a 401 from MARC27 we fall through
+    // to the existing visible-failure detector with a clear message.
+    println!();
+    println!(
+        "\x1b[32m\u{2713}\x1b[0m Authenticated as {} (token login, headless)",
+        profile.display_name.as_deref().unwrap_or("(unnamed)")
+    );
+
+    Ok(StoredCredentials {
+        access_token: token.to_string(),
+        // PATs are long-lived and have no refresh token — store
+        // empty string so the StoredCredentials shape stays stable
+        // and the rest of PRISM doesn't need to learn a new
+        // "no-refresh" branch. On 401, the visible-failure detector
+        // will tell the user to re-issue the PAT and re-run
+        // `prism login --token …`.
+        refresh_token: String::new(),
+        platform_url: endpoints.api_base.trim_end_matches("/api/v1").to_string(),
+        user_id: Some(profile.id.clone()),
+        display_name: profile.display_name,
+        org_id: None,
+        org_name: None,
+        project_id: None,
+        project_name: None,
+        expires_at: None,
     })
 }
 
