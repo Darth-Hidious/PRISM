@@ -1152,10 +1152,12 @@ fn edit_distance(a: &str, b: &str) -> usize {
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
-            let cost = if a_bytes[i - 1] == b_bytes[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            let cost = if a_bytes[i - 1] == b_bytes[j - 1] {
+                0
+            } else {
+                1
+            };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -1562,7 +1564,10 @@ inputs:
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("skill_workflow") || err.contains("dialect"), "got: {err}");
+        assert!(
+            err.contains("skill_workflow") || err.contains("dialect"),
+            "got: {err}"
+        );
     }
 
     #[test]
