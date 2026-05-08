@@ -314,6 +314,27 @@ def _list_bash_tasks() -> dict:
     return {"tasks": tasks, "count": len(tasks)}
 
 
+def _bash_task(**kwargs) -> dict:
+    """Unified read-only dispatcher for bash task inspection.
+
+    Replaces `list_bash_tasks` + `read_bash_task`. The destructive
+    `stop_bash_task` stays separate because it's approval-gated; collapsing
+    it under this dispatcher would force per-action approval support in
+    the harness, which we don't have yet.
+    """
+    action = kwargs.get("action")
+    if not action:
+        return {"error": "Missing 'action'. Valid: list, read"}
+    if action == "list":
+        return _list_bash_tasks()
+    if action == "read":
+        task_id = kwargs.get("task_id")
+        if not task_id:
+            return {"error": "Action 'read' requires `task_id`"}
+        return _read_bash_task(task_id)
+    return {"error": f"Unknown action '{action}'. Valid: list, read"}
+
+
 def _read_bash_task(task_id: str) -> dict:
     with _BASH_TASKS_LOCK:
         task = _BASH_TASKS.get(task_id)
@@ -828,57 +849,45 @@ def create_bash_tools(registry: ToolRegistry) -> None:
         requires_approval=True,
     ))
     registry.register(Tool(
-        name="list_bash_tasks",
+        name="bash_task",
         description=(
-            "List every session-local background bash task — created "
-            "by `execute_bash` with `run_in_background=true` — that "
-            "is currently in this chat session's task table. Returns "
-            "each task's id, original command, status (`running` / "
-            "`completed` / `failed` / `timed_out` / `stopped`), and "
-            "exit code if terminal. Use when the agent has lost "
-            "track of a task id, when the user asks 'what's still "
-            "running?', or as the first step before "
-            "`read_bash_task` / `stop_bash_task`. Tasks are "
-            "session-scoped: ending the chat ends the tasks."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        },
-        func=_list_bash_tasks,
-    ))
-    registry.register(Tool(
-        name="read_bash_task",
-        description=(
-            "Pull the latest stdout / stderr buffer from a "
-            "background bash task started with `execute_bash "
-            "run_in_background=true`. Returns whatever has been "
-            "written since the previous read (or since launch) plus "
-            "the current status. The right pattern is a polling "
-            "loop: call this every few seconds until status flips "
-            "to `completed` / `failed` / `timed_out` / `stopped`. "
-            "NOT a substitute for `compute_status` (that's for "
-            "MARC27 broker jobs, not local bash); NOT for stopping "
-            "a task (use `stop_bash_task`). Read-only — does not "
-            "consume the buffer; safe to call repeatedly."
+            "Inspect background bash tasks (started by `execute_bash` with "
+            "`run_in_background=true`). ONE tool, two read-only actions:\n"
+            "  • action='list' — list every session-local background bash "
+            "task. No args. Returns each task's id, command, status "
+            "(running / completed / failed / timed_out / stopped), and "
+            "exit code if terminal. Use when the agent lost track of a "
+            "task_id or when the user asks 'what's still running?'.\n"
+            "  • action='read' — pull the latest stdout/stderr buffer "
+            "from one task. Requires `task_id`. Use in a polling loop "
+            "every few seconds until status flips to terminal. Read-only — "
+            "does not consume the buffer; safe to call repeatedly.\n"
+            "Tasks are session-scoped: ending the chat ends the tasks. "
+            "NOT a substitute for compute_status (that's for MARC27 broker "
+            "jobs, not local bash). For STOPPING a task, use the separate "
+            "`stop_bash_task` tool — destructive ops stay isolated for "
+            "approval gating."
         ),
         input_schema={
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "read"],
+                    "description": "Which inspection operation to perform.",
+                },
                 "task_id": {
                     "type": "string",
                     "description": (
-                        "Background bash task ID — returned by "
-                        "`execute_bash` when `run_in_background=true`, "
-                        "or rediscovered via `list_bash_tasks`."
+                        "Background bash task ID. Required for action='read'; "
+                        "ignored for action='list'."
                     ),
                 },
             },
-            "required": ["task_id"],
+            "required": ["action"],
             "additionalProperties": False,
         },
-        func=_read_bash_task,
+        func=_bash_task,
     ))
     registry.register(Tool(
         name="stop_bash_task",
