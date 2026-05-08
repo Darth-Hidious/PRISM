@@ -72,7 +72,7 @@ pub struct PolicyDecision {
 }
 
 impl PolicyDecision {
-    fn allow(reason: impl Into<String>) -> Self {
+    pub(crate) fn allow(reason: impl Into<String>) -> Self {
         Self {
             allowed: true,
             reason: reason.into(),
@@ -81,7 +81,7 @@ impl PolicyDecision {
         }
     }
 
-    fn deny(reason: impl Into<String>, violations: Vec<String>) -> Self {
+    pub(crate) fn deny(reason: impl Into<String>, violations: Vec<String>) -> Self {
         Self {
             allowed: false,
             reason: reason.into(),
@@ -90,6 +90,9 @@ impl PolicyDecision {
         }
     }
 }
+
+pub mod intersect;
+pub use intersect::intersect_decisions;
 
 // ---------------------------------------------------------------------------
 // Engine
