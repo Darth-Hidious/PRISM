@@ -143,18 +143,131 @@ impl ForgeFetch {
     }
 }
 
+/// Coerce LLM-emitted URL strings into something the parser will accept.
+///
+/// Real LLMs in real PRISM sessions emit two recoverable URL shapes
+/// that `url::Url::parse` would otherwise reject:
+///
+/// 1. **Protocol-relative** (`//host/path`) — common when the model
+///    cites a URL from a page that used protocol-relative links;
+///    the leading `//` means "use the same scheme as the parent."
+///    Since we always fetch over HTTPS in this tool, prefix `https:`.
+/// 2. **Scheme-less** (`host.tld/path`) — the model wrote a domain
+///    without `https://`. Prefix `https://`.
+///
+/// We only do this when the input is otherwise unparseable. Inputs
+/// with a recognized scheme go through unchanged.
+fn normalize_url(input: &str) -> String {
+    let trimmed = input.trim();
+
+    // Already parseable as-is → return verbatim.
+    if Url::parse(trimmed).is_ok() {
+        return trimmed.to_string();
+    }
+
+    // Protocol-relative: `//host/path` → `https://host/path`
+    if let Some(rest) = trimmed.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+
+    // Scheme-less domain-shaped: `host.tld[/...]` (no scheme, no
+    // leading slash). Avoid prefixing if the input already starts
+    // with `/`, `?`, `#`, or `mailto:`-style — those aren't URLs we
+    // can safely recover.
+    if !trimmed.is_empty()
+        && !trimmed.starts_with('/')
+        && !trimmed.starts_with('?')
+        && !trimmed.starts_with('#')
+        && !trimmed.contains("://")
+        && trimmed
+            .split(['/', '?', '#'])
+            .next()
+            .is_some_and(|host| host.contains('.'))
+    {
+        return format!("https://{trimmed}");
+    }
+
+    // Give up — return the original so the caller's parse error is
+    // accurate.
+    trimmed.to_string()
+}
+
 #[async_trait::async_trait]
 impl NetFetchService for ForgeFetch {
     async fn fetch(&self, url: String, raw: Option<bool>) -> anyhow::Result<HttpResponse> {
-        let url = Url::parse(&url).with_context(|| format!("Failed to parse URL: {url}"))?;
+        let normalized = normalize_url(&url);
+        let parsed =
+            Url::parse(&normalized).with_context(|| format!("Failed to parse URL: {url}"))?;
 
-        self.fetch_url(&url, raw.unwrap_or(false)).await
+        self.fetch_url(&parsed, raw.unwrap_or(false)).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── normalize_url ────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_url_passes_through_https() {
+        assert_eq!(
+            normalize_url("https://example.com/foo"),
+            "https://example.com/foo"
+        );
+    }
+
+    #[test]
+    fn normalize_url_passes_through_http() {
+        assert_eq!(
+            normalize_url("http://example.com/foo"),
+            "http://example.com/foo"
+        );
+    }
+
+    #[test]
+    fn normalize_url_fixes_protocol_relative() {
+        // Real example from a PRISM TUI session: LLM emitted this
+        // citing an azom.com page; the original parser bailed with
+        // "relative URL without a base". This is the bug fix.
+        assert_eq!(
+            normalize_url("//www.azom.com/spx?ArticleID=1"),
+            "https://www.azom.com/spx?ArticleID=1"
+        );
+    }
+
+    #[test]
+    fn normalize_url_fixes_scheme_less_domain() {
+        assert_eq!(
+            normalize_url("www.example.com/path"),
+            "https://www.example.com/path"
+        );
+        assert_eq!(normalize_url("example.com"), "https://example.com");
+    }
+
+    #[test]
+    fn normalize_url_trims_whitespace() {
+        assert_eq!(
+            normalize_url("  https://example.com  "),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_url_leaves_unrecoverable_inputs_alone() {
+        // Path-only, fragment-only, and query-only inputs aren't
+        // valid stand-alone URLs and we don't try to recover them.
+        // The downstream parser will return a meaningful error.
+        assert_eq!(normalize_url("/just/a/path"), "/just/a/path");
+        assert_eq!(normalize_url("#fragment"), "#fragment");
+        assert_eq!(normalize_url("?query=1"), "?query=1");
+    }
+
+    #[test]
+    fn normalize_url_does_not_prefix_bare_word() {
+        // "hello" has no dot, so we don't pretend it's a domain.
+        assert_eq!(normalize_url("hello"), "hello");
+    }
 
     #[test]
     fn test_is_binary_content_type_text_types_are_not_binary() {
