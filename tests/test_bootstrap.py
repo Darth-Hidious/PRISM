@@ -21,8 +21,10 @@ class TestBuildFullRegistry:
     def test_has_system_tools(self):
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
-        # System tools exist (read_file, write_file, web_search)
-        assert "read_file" in names or len(names) > 3
+        # System tools exist (file unified, show_scratchpad). web search
+        # lives in app/tools/web.py now as web(action='search').
+        assert "file" in names
+        assert "show_scratchpad" in names
 
     def test_has_visualization_tools(self):
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
@@ -70,12 +72,20 @@ class TestBuildFullRegistry:
         names = {t.name for t in registry.list_tools()}
         assert "list_predictable_properties" in names
 
-    def test_has_validate_and_review_skills(self):
-        """validate_dataset and review_dataset skills are registered."""
+    def test_has_dataset_tool(self):
+        """Round 6 collapse: validate_dataset / review_dataset / visualize_dataset
+        Skills were collapsed into the unified `dataset(action=…)` Tool."""
         registry, _prov, _agents = build_full_registry(enable_mcp=False, enable_plugins=False)
         names = {t.name for t in registry.list_tools()}
-        assert "validate_dataset" in names
-        assert "review_dataset" in names
+        assert "dataset" in names
+        # Old Skill names must be gone
+        assert "validate_dataset" not in names
+        assert "review_dataset" not in names
+        assert "visualize_dataset" not in names
+        # The unified tool advertises all three actions
+        ds = registry.get("dataset")
+        actions = ds.input_schema["properties"]["action"]["enum"]
+        assert set(actions) == {"validate", "review", "visualize"}
 
     def test_has_correlation_matrix_tool(self):
         """correlation_matrix is now a kind of the unified `plot` tool."""
