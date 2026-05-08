@@ -830,22 +830,38 @@ def create_bash_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="list_bash_tasks",
         description=(
-            "List session-local background bash tasks created by execute_bash "
-            "with run_in_background=true. Use this when you need to rediscover "
-            "task IDs before calling read_bash_task or stop_bash_task."
+            "List every session-local background bash task — created "
+            "by `execute_bash` with `run_in_background=true` — that "
+            "is currently in this chat session's task table. Returns "
+            "each task's id, original command, status (`running` / "
+            "`completed` / `failed` / `timed_out` / `stopped`), and "
+            "exit code if terminal. Use when the agent has lost "
+            "track of a task id, when the user asks 'what's still "
+            "running?', or as the first step before "
+            "`read_bash_task` / `stop_bash_task`. Tasks are "
+            "session-scoped: ending the chat ends the tasks."
         ),
         input_schema={
             "type": "object",
             "properties": {},
+            "additionalProperties": False,
         },
         func=_list_bash_tasks,
     ))
     registry.register(Tool(
         name="read_bash_task",
         description=(
-            "Read the latest stdout and stderr from a session-local background "
-            "bash task. Call this repeatedly to tail progress until the task "
-            "status becomes completed, failed, timed_out, or stopped."
+            "Pull the latest stdout / stderr buffer from a "
+            "background bash task started with `execute_bash "
+            "run_in_background=true`. Returns whatever has been "
+            "written since the previous read (or since launch) plus "
+            "the current status. The right pattern is a polling "
+            "loop: call this every few seconds until status flips "
+            "to `completed` / `failed` / `timed_out` / `stopped`. "
+            "NOT a substitute for `compute_status` (that's for "
+            "MARC27 broker jobs, not local bash); NOT for stopping "
+            "a task (use `stop_bash_task`). Read-only — does not "
+            "consume the buffer; safe to call repeatedly."
         ),
         input_schema={
             "type": "object",
@@ -853,21 +869,34 @@ def create_bash_tools(registry: ToolRegistry) -> None:
                 "task_id": {
                     "type": "string",
                     "description": (
-                        "Background bash task ID returned by execute_bash or "
-                        "rediscovered via list_bash_tasks."
+                        "Background bash task ID — returned by "
+                        "`execute_bash` when `run_in_background=true`, "
+                        "or rediscovered via `list_bash_tasks`."
                     ),
                 },
             },
             "required": ["task_id"],
+            "additionalProperties": False,
         },
         func=_read_bash_task,
     ))
     registry.register(Tool(
         name="stop_bash_task",
         description=(
-            "Stop a session-local background bash task started by execute_bash. "
-            "Call read_bash_task afterwards if you need the final stdout, stderr, "
-            "status, or exit_code."
+            "Terminate a background bash task started with "
+            "`execute_bash run_in_background=true`. Sends SIGTERM, "
+            "waits briefly, escalates to SIGKILL if it doesn't "
+            "respond. Use when the user says 'cancel that task', "
+            "'kill the build', 'stop monitoring', or when the "
+            "agent's plan has changed and an in-flight task is no "
+            "longer wanted. After this returns, `read_bash_task` "
+            "still works to get the final stdout / stderr / "
+            "exit_code if the agent needs to inspect what the task "
+            "produced before death. NOT for MARC27 broker jobs "
+            "(use `compute_cancel`); NOT for cleaning up artifacts "
+            "(does not remove output files). Marked "
+            "`requires_approval` — harness pauses for explicit "
+            "user consent because killing a task is destructive."
         ),
         input_schema={
             "type": "object",
@@ -875,12 +904,14 @@ def create_bash_tools(registry: ToolRegistry) -> None:
                 "task_id": {
                     "type": "string",
                     "description": (
-                        "Background bash task ID returned by execute_bash or "
-                        "rediscovered via list_bash_tasks."
+                        "Background bash task ID — returned by "
+                        "`execute_bash` or rediscovered via "
+                        "`list_bash_tasks`."
                     ),
                 },
             },
             "required": ["task_id"],
+            "additionalProperties": False,
         },
         func=_stop_bash_task,
         requires_approval=True,

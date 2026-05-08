@@ -1,8 +1,11 @@
-//! Forge harness adapter — launches the forge interactive UI as the PRISM
-//! chat surface. Replaces the broken Ratatui TUI for chat-mode entry.
+//! Chat-surface adapter — launches the in-process chat UI as PRISM's
+//! interactive surface. Replaces the broken Ratatui TUI for chat-mode
+//! entry, and is the integration point between PRISM's CLI dispatch
+//! and the Apache-2.0 vendored forge_* crates from tailcallhq/forgecode.
 //!
-//! This is the integration point between PRISM's CLI dispatch and the
-//! Apache-2.0 forge_* crates vendored from tailcallhq/forgecode.
+//! Companion modules: `chat_config` (target persistence) and
+//! `use_command` (the apply() shared by the CLI + the in-chat
+//! `/use` slash command).
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
@@ -22,7 +25,27 @@ use crate::boot;
 use crate::platform_bridge;
 
 const DEFAULT_PROVIDER_ID: &str = "openai_compatible";
-const DEFAULT_MODEL_ID: &str = "gemini-3.1-flash-lite-preview";
+
+/// Default chat model. Switched from `gemini-3.1-flash-lite-preview`
+/// to `gpt-5.5` because:
+///   1. Gemini's OpenAI-compat shim has a documented year-old bug with
+///      streaming tool_calls (the `index` field is missing from delta
+///      chunks, breaking every parser that follows the OpenAI spec).
+///      Refs:
+///        - https://discuss.ai.google.dev/t/gemini-openai-compatibility-issue-with-tool-call-streaming/59886
+///        - https://github.com/openai/openai-python/issues/2806
+///   2. `gpt-4o*` is being deprecated and the user explicitly asked not
+///      to use it as a default.
+///   3. `gpt-5.5` is OpenAI's reference implementation — clean
+///      streaming + clean tool_calls — and supports `reasoning_effort`
+///      (none / low / medium / high / xhigh) so we can pick fast paths
+///      for chat and deeper reasoning paths for discourse.
+///   4. MARC27 fronts gpt-5.5 at $2/M input, $8/M output — reasonable
+///      for materials-research workloads.
+///
+/// Users override per-session via the upcoming `prism use marc27
+/// --model <name>` (and the in-chat `/use` slash command).
+const DEFAULT_MODEL_ID: &str = "gpt-5.5";
 
 const PRISM_BANNER: &str = "\x1b[38;2;0;255;255m\
 ██████╗ ██████╗ ██╗███████╗███╗   ███╗
@@ -61,10 +84,12 @@ pub async fn run(
         std::env::set_var("FORGE_HIDE_ZSH_TIP", "1");
     }
 
-    // Surface forge UI panics to stderr instead of dying silently after
-    // PRISM's splash teardown clears the alternate screen.
+    // Surface chat-UI panics to stderr instead of dying silently after
+    // PRISM's splash teardown clears the alternate screen. The internal
+    // crate is the vendored forge harness, but the user-visible label
+    // says PRISM — they don't need to know the harness's name.
     std::panic::set_hook(Box::new(|info| {
-        eprintln!("\x1b[31m[prism] forge UI panic:\x1b[0m {info}");
+        eprintln!("\x1b[31m[prism] chat UI panic:\x1b[0m {info}");
     }));
 
     // Bring up the semantic tool retriever (EmbeddingGemma only).
@@ -97,19 +122,34 @@ pub async fn run(
             );
             None
         } else {
+            // Load the user's chat target from ~/.prism/config.toml so
+            // a persisted `prism use ...` choice takes effect on this
+            // launch. Default = MARC27 cloud with no model override.
+            let initial_chat_target = crate::chat_config::load().unwrap_or_default().chat;
             match platform_bridge::start(
                 &creds.platform_url,
                 project_id,
                 &creds.access_token,
                 router.clone(),
+                initial_chat_target,
             )
             .await
             {
                 Ok(handle) => {
                     let proxy_url = handle.url.clone();
-                    // Point forge at the local proxy. Forge templates
-                    // {{OPENAI_URL}}/chat/completions and {{OPENAI_URL}}/models;
-                    // the proxy serves both under its `/v1` prefix.
+                    // Point forge at the local proxy. Two channels:
+                    //
+                    // 1. Env vars (OPENAI_URL + OPENAI_API_KEY) — read
+                    //    by forge's openai_compatible provider when the
+                    //    credentials file lacks an entry.
+                    // 2. ~/.forge/.credentials.json — forge's persistent
+                    //    config; gets read first, env vars are the
+                    //    fallback. We write our entry here so a stale
+                    //    port from a previous PRISM run doesn't
+                    //    override the current process. Yesterday's
+                    //    "drop the credentials write" attempt left
+                    //    stale entries pointing at dead ports — that
+                    //    was a regression, reverted.
                     unsafe {
                         std::env::set_var("OPENAI_URL", &proxy_url);
                         std::env::set_var("OPENAI_API_KEY", &creds.access_token);
@@ -204,6 +244,28 @@ async fn start_tool_router() -> Result<Arc<ToolRouter>> {
     router.start().await?;
     boot::status_line("Semantic retrieval", true, "online");
 
+    // Surface the user's chat target + tools state as their own status
+    // lines so the boot screen tells the user where chat will go BEFORE
+    // they type the first message. Previously the chat target was an
+    // invisible config; users who'd run `prism use marc27 --model gpt-5.5`
+    // had no way to see it'd taken effect until they sent a turn and
+    // looked at the response. Two lines, parallel structure:
+    //
+    //   ├── Chat ........ [OK] (MARC27 cloud (gpt-5.5))
+    //   ├── Tools ....... [OK] (MARC27 cloud)
+    //
+    // When the chat target is local or a direct provider, the line
+    // makes that explicit so the user knows their key/URL is in play.
+    let chat_target = crate::chat_config::load().unwrap_or_default().chat;
+    boot::status_line("Chat", true, &chat_target.human_full());
+    // Tools: always MARC27-fronted regardless of chat target. We
+    // could query knowledge_stats here for tool count, but that's an
+    // extra round-trip on every boot — and the count comes from the
+    // bridge's Stage 2.1 retriever which logs per-turn anyway. Keep
+    // the boot line cheap; the per-turn `[platform_bridge] semantic
+    // top-K: N → K tools` line carries the live number.
+    boot::status_line("Tools", true, "MARC27 cloud");
+
     Ok(router)
 }
 
@@ -233,8 +295,18 @@ fn short_path(p: &std::path::Path) -> String {
 }
 
 /// Ensure the `openai_compatible` provider credential in
-/// `~/.forge/.credentials.json` points at our local MARC27 proxy. Idempotent:
-/// preserves any other credentials forge has stored.
+/// `~/.forge/.credentials.json` points at our local MARC27 proxy with
+/// the current process's port. Idempotent: preserves any user-added
+/// entries, only updates our own.
+///
+/// Also sanitizes empty-keyed stub entries that forge ships with by
+/// default. Those stubs (e.g. `{ id: "anthropic", auth_details: { api_key: "" } }`)
+/// crash `/model` because the picker iterates all entries and hits
+/// the empty Anthropic with a 401. Yesterday I conflated this stub
+/// crash with "our entry pollutes the file" — they're separate bugs.
+/// The fix is: write OUR entry (with the live port), and remove
+/// stub entries with empty keys. Real user-added Anthropic entries
+/// (with non-empty keys) stay untouched.
 fn upsert_openai_compatible_credential(proxy_url: &str, access_token: &str) -> Result<()> {
     let home = std::env::var_os("HOME").context("HOME not set")?;
     let forge_dir = std::path::PathBuf::from(home).join(".forge");
@@ -267,6 +339,28 @@ fn upsert_openai_compatible_credential(proxy_url: &str, access_token: &str) -> R
     if !replaced {
         entries.push(entry);
     }
+
+    // Strip empty-keyed stub entries. forge_config ships a default
+    // .credentials.json with empty Anthropic / OpenAI / etc. stubs
+    // so the user can `forge auth login anthropic` later. Those
+    // stubs are harmless to forge directly (it skips empty keys
+    // when trying to use the provider) but `/model` iterates every
+    // entry and queries each provider's /v1/models endpoint — which
+    // 401s on the empty-keyed Anthropic and dumps a stack trace at
+    // the user. Filter them out: any entry whose api_key is empty,
+    // EXCEPT our just-written openai_compatible entry (which has a
+    // real PRISM-issued JWT in api_key — so it'd never match the
+    // empty filter, this is belt-and-suspenders).
+    entries.retain(|e| {
+        if e.get("id").and_then(|v| v.as_str()) == Some("openai_compatible") {
+            return true;
+        }
+        e.get("auth_details")
+            .and_then(|a| a.get("api_key"))
+            .and_then(|k| k.as_str())
+            .map(|k| !k.is_empty())
+            .unwrap_or(false)
+    });
 
     let text = serde_json::to_string_pretty(&entries).context("serialising credentials")?;
     std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
