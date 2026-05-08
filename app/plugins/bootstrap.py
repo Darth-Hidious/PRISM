@@ -98,6 +98,19 @@ def build_full_registry(
     except Exception:
         provider_reg = ProviderRegistry()
 
+    # Expose the federated SearchEngine as the `materials_search` MCP
+    # tool. The engine + provider registry already exist; this just
+    # wraps them in a shape the in-PRISM agent can call. See
+    # docs/search_consolidation_2026.md for the rationale (collapse
+    # 9 point-tools to 3 unified). No-op if registration fails so
+    # the rest of bootstrap still completes.
+    try:
+        from app.tools.search_engine.tools import create_search_engine_tools
+
+        create_search_engine_tools(registry, provider_reg)
+    except Exception:
+        logger.exception("materials_search tool registration failed")
+
     # Plugins (entry points + local — can register into ANY sub-registry)
     if enable_plugins:
         try:
