@@ -883,27 +883,69 @@ async fn main() -> Result<()> {
                 }
                 paths.save_cli_state(&state)?;
             }
-            // Auto-refresh expired token before launching TUI
+            // Proactive token refresh.
+            //
+            // Two triggers, both attempted silently before the boot
+            // checklist runs:
+            //
+            //   1. **Local expiry** — `expires_at` is in the past.
+            //      The classic case; we know the token is stale.
+            //
+            //   2. **Within 5 min of expiry** — refresh early so the
+            //      user doesn't watch the token expire mid-session.
+            //
+            // 401 from the platform during the boot check is handled
+            // separately below — if /users/me rejects the token but
+            // we have a refresh_token, we try refresh once more before
+            // giving up and showing "run prism login".
             if let Some(creds) = state.credentials.as_ref()
-                && let Some(expires_at) = creds.expires_at
-                && chrono::Utc::now() >= expires_at
                 && !creds.refresh_token.is_empty()
+                && creds
+                    .expires_at
+                    .is_some_and(|exp| chrono::Utc::now() + chrono::Duration::minutes(5) >= exp)
             {
                 match refresh_access_token(&endpoints, creds).await {
                     Ok(new_creds) => {
                         state.credentials = Some(new_creds);
                         paths.save_cli_state(&state)?;
-                        tracing::info!("access token refreshed");
+                        tracing::info!("access token refreshed proactively");
                     }
                     Err(e) => {
-                        eprintln!(
-                            "warning: token refresh failed ({e}), you may need to run `prism login`"
+                        tracing::warn!(error = %e, "proactive token refresh failed");
+                        // Don't yell here — the boot check below will
+                        // surface a precise message if the token is
+                        // actually rejected.
+                    }
+                }
+            }
+            // Boot checklist. If Auth shows "token rejected" and we
+            // still have a refresh_token we haven't tried yet (local
+            // expires_at said fresh but server disagreed → server-side
+            // rotation), try one more refresh + redo the check.
+            let mut boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let auth_rejected = boot_checks
+                .iter()
+                .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
+            if auth_rejected
+                && let Some(creds) = state.credentials.as_ref()
+                && !creds.refresh_token.is_empty()
+            {
+                match refresh_access_token(&endpoints, creds).await {
+                    Ok(new_creds) => {
+                        tracing::info!("access token refreshed after server-side rejection");
+                        state.credentials = Some(new_creds);
+                        paths.save_cli_state(&state)?;
+                        // Redo the boot checks with the new token.
+                        boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "refresh-on-rejection failed; user must re-login"
                         );
                     }
                 }
             }
-            // Real API pings for boot sequence
-            let boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             boot::boot_sequence(&boot_checks);
             // Splash skipped: it used an alternate-screen ratatui animation
             // that caused a visible screen jump before forge UI loaded.
@@ -2293,28 +2335,42 @@ async fn main() -> Result<()> {
             handle_configure(llm_provider, url, model, embedding_model, show)?;
         }
         Commands::Tui => {
-            // Auto-refresh expired token so users don't have to re-login each
-            // time the access token rolls over. Same logic as `prism setup`.
+            // Auto-refresh + refresh-on-rejection. Mirrors the `prism
+            // setup` path — see comments there for design notes.
+            // The two triggers (proactive expiry + reactive 401) keep
+            // users out of the "log in again every session" loop.
             let mut state = paths.load_cli_state().ok().unwrap_or_default();
             if let Some(creds) = state.credentials.as_ref()
-                && let Some(expires_at) = creds.expires_at
-                && chrono::Utc::now() >= expires_at
                 && !creds.refresh_token.is_empty()
+                && creds
+                    .expires_at
+                    .is_some_and(|exp| chrono::Utc::now() + chrono::Duration::minutes(5) >= exp)
             {
                 match refresh_access_token(&endpoints, creds).await {
                     Ok(new_creds) => {
                         state.credentials = Some(new_creds);
                         let _ = paths.save_cli_state(&state);
-                        tracing::info!("access token refreshed");
+                        tracing::info!("access token refreshed proactively");
                     }
                     Err(e) => {
-                        eprintln!(
-                            "warning: token refresh failed ({e}), you may need to run `prism login`"
-                        );
+                        tracing::warn!(error = %e, "proactive token refresh failed");
                     }
                 }
             }
-            let boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let mut boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let auth_rejected = boot_checks
+                .iter()
+                .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
+            if auth_rejected
+                && let Some(creds) = state.credentials.as_ref()
+                && !creds.refresh_token.is_empty()
+                && let Ok(new_creds) = refresh_access_token(&endpoints, creds).await
+            {
+                tracing::info!("access token refreshed after server-side rejection");
+                state.credentials = Some(new_creds);
+                let _ = paths.save_cli_state(&state);
+                boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            }
             boot::boot_sequence(&boot_checks);
             // Splash skipped — see note in default chat path.
             let _ = &python;
@@ -5939,30 +5995,43 @@ async fn run_boot_checks(
         delay_ms: 30,
     });
 
-    // 2. Auth
+    // 2. Auth — distinguish actual expiry from scope/network/server errors.
+    // Previously this said "token expired" on ANY non-2xx, which is
+    // misleading because /users/me can fail for reasons other than
+    // expiry (token scope insufficient, server flap, network blip).
+    // Be honest about which failure mode we actually saw.
     if !token.is_empty() {
-        let user = client
+        let user_resp = client
             .get(format!("{api}/users/me"))
             .header("Authorization", format!("Bearer {token}"))
             .send()
-            .await
-            .ok()
-            .and_then(|r| {
-                if r.status().is_success() {
-                    Some(r)
-                } else {
-                    None
-                }
-            });
-        let (auth_ok, auth_msg) = if let Some(resp) = user {
-            let data: serde_json::Value = resp.json().await.unwrap_or_default();
-            let name = data
-                .get("display_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("authenticated");
-            (true, name.to_string())
-        } else {
-            (false, "token expired — run prism login".into())
+            .await;
+        let (auth_ok, auth_msg) = match user_resp {
+            Ok(r) if r.status().is_success() => {
+                let data: serde_json::Value = r.json().await.unwrap_or_default();
+                let name = data
+                    .get("display_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("authenticated");
+                (true, name.to_string())
+            }
+            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                // Real auth rejection — token expired, revoked, or
+                // missing the /users/me scope.
+                (false, "token rejected — run prism login".into())
+            }
+            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => {
+                // Token authenticates but lacks /users/me scope.
+                // Common with agent / project-scoped keys; do NOT
+                // prompt re-login since chat / research still work.
+                (false, "token lacks user scope (agent key?)".into())
+            }
+            Ok(r) => (
+                false,
+                format!("platform error (HTTP {})", r.status().as_u16()),
+            ),
+            Err(e) if e.is_timeout() => (false, "platform unreachable (timeout)".into()),
+            Err(_) => (false, "platform unreachable".into()),
         };
         checks.push(boot::BootCheck {
             name: "Auth".into(),
