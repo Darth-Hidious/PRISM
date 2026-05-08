@@ -87,6 +87,12 @@ impl Default for ChatTarget {
 impl ChatTarget {
     /// Short label for boot UI / `/use show` / status bar. Always lower-
     /// case, no model name (see `human_full` for that).
+    ///
+    /// `dead_code` allowed: lands in the follow-up native
+    /// `AppCommand::Use` slash-command implementation. Keeping the
+    /// method on the enum so that PR is purely additive (no
+    /// changes to chat_config).
+    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Marc27 { .. } => "MARC27 cloud",

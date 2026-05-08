@@ -58,6 +58,11 @@ pub enum UseAction {
 /// surfaces from drifting.
 #[derive(Debug, Clone)]
 pub struct UseOutcome {
+    /// `dead_code` allowed: read by the native `AppCommand::Use`
+    /// follow-up to update the boot status bar after a hot-swap. The
+    /// CLI surface today only renders `message`; the slash-command
+    /// surface will read both.
+    #[allow(dead_code)]
     pub new_target: ChatTarget,
     pub message: String,
 }
