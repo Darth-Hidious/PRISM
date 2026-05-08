@@ -81,10 +81,12 @@ pub async fn run(
         std::env::set_var("FORGE_HIDE_ZSH_TIP", "1");
     }
 
-    // Surface forge UI panics to stderr instead of dying silently after
-    // PRISM's splash teardown clears the alternate screen.
+    // Surface chat-UI panics to stderr instead of dying silently after
+    // PRISM's splash teardown clears the alternate screen. The internal
+    // crate is the vendored forge harness, but the user-visible label
+    // says PRISM — they don't need to know the harness's name.
     std::panic::set_hook(Box::new(|info| {
-        eprintln!("\x1b[31m[prism] forge UI panic:\x1b[0m {info}");
+        eprintln!("\x1b[31m[prism] chat UI panic:\x1b[0m {info}");
     }));
 
     // Bring up the semantic tool retriever (EmbeddingGemma only).
@@ -246,6 +248,28 @@ async fn start_tool_router() -> Result<Arc<ToolRouter>> {
     let router = Arc::new(ToolRouter::new(config.clone()).await?);
     router.start().await?;
     boot::status_line("Semantic retrieval", true, "online");
+
+    // Surface the user's chat target + tools state as their own status
+    // lines so the boot screen tells the user where chat will go BEFORE
+    // they type the first message. Previously the chat target was an
+    // invisible config; users who'd run `prism use marc27 --model gpt-5.5`
+    // had no way to see it'd taken effect until they sent a turn and
+    // looked at the response. Two lines, parallel structure:
+    //
+    //   ├── Chat ........ [OK] (MARC27 cloud (gpt-5.5))
+    //   ├── Tools ....... [OK] (MARC27 cloud)
+    //
+    // When the chat target is local or a direct provider, the line
+    // makes that explicit so the user knows their key/URL is in play.
+    let chat_target = crate::chat_config::load().unwrap_or_default().chat;
+    boot::status_line("Chat", true, &chat_target.human_full());
+    // Tools: always MARC27-fronted regardless of chat target. We
+    // could query knowledge_stats here for tool count, but that's an
+    // extra round-trip on every boot — and the count comes from the
+    // bridge's Stage 2.1 retriever which logs per-turn anyway. Keep
+    // the boot line cheap; the per-turn `[platform_bridge] semantic
+    // top-K: N → K tools` line carries the live number.
+    boot::status_line("Tools", true, "MARC27 cloud");
 
     Ok(router)
 }
