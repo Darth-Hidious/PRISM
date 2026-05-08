@@ -50,6 +50,15 @@ def build_full_registry(
     except Exception:
         pass
 
+    # MARC27 RLM Research tool — server-side recursive LLM that explores
+    # the knowledge graph + vector store + academic web. Real-money tool.
+    # See app/tools/research.py for the SSE protocol + cost notes.
+    try:
+        from app.tools.research import create_research_tools
+        create_research_tools(registry)
+    except Exception:
+        pass
+
     # MARC27 Compute Broker tools (GPU dispatch, job management)
     try:
         from app.tools.compute import create_compute_tools
