@@ -84,4 +84,9 @@ jobs:
         run: mkdir -p dashboard/dist && echo '<html><body>placeholder</body></html>' > dashboard/dist/index.html
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --release
+      # `release-fast` (defined in Cargo.toml) drops LTO and lifts
+      # codegen-units so cross-platform CI smoke finishes in ~10 min
+      # instead of 35+ min on macOS / Windows. Still opt-level=3, so
+      # the binary is representative for smoke. Production installers
+      # are built from the canonical `[profile.release]` separately.
+      - run: cargo build --workspace --profile release-fast
