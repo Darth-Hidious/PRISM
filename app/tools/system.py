@@ -220,9 +220,32 @@ def create_system_tools(registry: ToolRegistry) -> None:
         },
         func=_edit_file))
     registry.register(Tool(
-        name="web_search", description="Search the web for information. Returns relevant results.",
-        input_schema={"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}}, "required": ["query"]},
-        func=_web_search))
+        name="web_search",
+        description=(
+            "General-purpose web search. Returns titles, URLs, and "
+            "snippets of pages matching the query. Use this when the "
+            "user wants information from the open web — current "
+            "events, vendor docs, blog posts, GitHub repos, anything "
+            "that wouldn't be in a structured database. NOT for "
+            "scientific papers (use `prior_art_search` source='papers' "
+            "— better metadata + DOIs) and NOT for materials "
+            "structures (use `materials_search` for the federated "
+            "DB hits). Typically a fast first-pass tool the agent "
+            "follows up with `web_read` on the most-promising URL."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Free-text web search query.",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        func=_web_search,
+    ))
     registry.register(Tool(
         name="show_scratchpad",
         description=(

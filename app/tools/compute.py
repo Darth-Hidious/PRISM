@@ -172,17 +172,49 @@ def create_compute_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="compute_estimate",
         description=(
-            "Estimate the cost of a compute job before submitting. "
-            "Provide the container image and GPU type to get a cost estimate."
+            "Preview what a compute job would cost BEFORE actually "
+            "submitting it. Free to call; no GPU is reserved. Returns "
+            "estimated cost in USD, GPU options ranked by price, and "
+            "expected wall-time based on similar past jobs. ALWAYS "
+            "call this before `compute_submit` when the user has a "
+            "budget concern, asks 'how much would it cost to...', or "
+            "before any job that might run more than a few minutes. "
+            "Pair: `compute_estimate` (preview, free) → user confirms "
+            "→ `compute_submit` (real spend) → `compute_status` "
+            "(monitor) → optionally `compute_cancel`."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "image": {"type": "string", "description": "Container image to run"},
-                "gpu_type": {"type": "string", "description": "GPU type (e.g. A100-80GB)"},
-                "timeout_seconds": {"type": "integer", "default": 3600},
+                "image": {
+                    "type": "string",
+                    "description": (
+                        "Container image to estimate (e.g. "
+                        "`vasp:6.5.0`, `quantum-espresso:7.4`) or a "
+                        "marketplace slug. Use the same value you "
+                        "intend to pass to `compute_submit`."
+                    ),
+                },
+                "gpu_type": {
+                    "type": "string",
+                    "description": (
+                        "Specific GPU to estimate against (e.g. "
+                        "`A100-80GB`, `H100-80GB`). If omitted, "
+                        "returns estimates across all available GPU "
+                        "types so the agent can pick by cost-vs-speed."
+                    ),
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 3600,
+                    "description": (
+                        "Budget cap on wall-time. Default 1 hour. "
+                        "Cost = price-per-hour × timeout / 3600."
+                    ),
+                },
             },
             "required": ["image"],
+            "additionalProperties": False,
         },
         func=_estimate_cost,
     ))
@@ -190,26 +222,87 @@ def create_compute_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="compute_submit",
         description=(
-            "Submit a compute job to the MARC27 Compute Broker. Dispatches "
-            "to the best available provider (cheapest by default, or fastest). "
-            "Returns a job_id to track progress. Use compute_status to monitor."
+            "Actually run a compute job — this is the MONEY-SPENDING "
+            "action. Dispatches a containerized workload to the "
+            "MARC27 Compute Broker, which picks the best matching "
+            "provider (PRISM mesh node, RunPod, Lambda, etc.) based "
+            "on `provider_preference` ('cheapest' default, 'fastest', "
+            "or a specific provider name). Returns a job_id; poll "
+            "with `compute_status` to track progress, abort with "
+            "`compute_cancel` if needed. ALWAYS prefer running "
+            "`compute_estimate` first when the user is cost-sensitive. "
+            "Use this for: real DFT/MD runs, large training jobs, "
+            "any container the user has authored. Set "
+            "`budget_max_usd` to hard-cap spend per job — the broker "
+            "refuses dispatch if the estimate exceeds it."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "image": {"type": "string", "description": "Container image or marketplace slug"},
-                "inputs": {"type": "object", "description": "JSON input data for the container"},
-                "gpu_type": {"type": "string", "description": "GPU type (e.g. A100-80GB, H100-80GB)"},
-                "budget_max_usd": {"type": "number", "description": "Max budget in USD"},
+                "image": {
+                    "type": "string",
+                    "description": (
+                        "Container image (Docker tag, e.g. "
+                        "`vasp:6.5.0`) or a marketplace slug "
+                        "registered with the broker."
+                    ),
+                },
+                "inputs": {
+                    "type": "object",
+                    "description": (
+                        "JSON input payload for the container. Shape "
+                        "depends on the image — DFT runners typically "
+                        "want {structure, kpoints, encut, ...}, "
+                        "training jobs want {dataset_uri, "
+                        "hyperparameters, ...}."
+                    ),
+                },
+                "gpu_type": {
+                    "type": "string",
+                    "description": (
+                        "GPU class (e.g. `A100-80GB`, `H100-80GB`). "
+                        "Use `compute_gpus` to see what's available."
+                    ),
+                },
+                "budget_max_usd": {
+                    "type": "number",
+                    "description": (
+                        "Hard cap on this job's cost in USD. The "
+                        "broker refuses dispatch if the estimated "
+                        "cost exceeds this. Recommended: always set "
+                        "this for non-trivial jobs to prevent "
+                        "runaway charges."
+                    ),
+                },
                 "provider_preference": {
                     "type": "string",
-                    "description": "'cheapest' (default, prefers PRISM nodes), 'fastest' (prefers cloud), or provider name",
+                    "description": (
+                        "Routing strategy: `cheapest` (default — "
+                        "prefers PRISM mesh nodes, then cloud), "
+                        "`fastest` (prefers premium cloud), or an "
+                        "explicit provider name."
+                    ),
                     "default": "cheapest",
                 },
-                "timeout_seconds": {"type": "integer", "default": 3600},
-                "env_vars": {"type": "object", "description": "Environment variables"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 3600,
+                    "description": (
+                        "Wall-time cap. Job is killed at the cap "
+                        "even if not done. Default 1 hour."
+                    ),
+                },
+                "env_vars": {
+                    "type": "object",
+                    "description": (
+                        "Environment variables passed to the "
+                        "container. Use for API keys, license tokens, "
+                        "feature flags."
+                    ),
+                },
             },
             "required": ["image", "inputs"],
+            "additionalProperties": False,
         },
         func=_submit_job,
     ))
@@ -217,15 +310,32 @@ def create_compute_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="compute_status",
         description=(
-            "Check the status of a compute job. Returns status (queued, running, "
-            "completed, failed), cost, duration, output, and error details."
+            "Poll one compute job's state. Returns: status "
+            "(`queued` / `running` / `completed` / `failed` / "
+            "`cancelled`), elapsed wall-time, cost-incurred-so-far, "
+            "the job's stdout/stderr tail (last few KB), and the "
+            "final output artifact URLs once status=completed. Use "
+            "this in a polling loop after `compute_submit` returned "
+            "a job_id. Cheap to call repeatedly — no spend implied. "
+            "If the user asks 'is my DFT done?', this is the right "
+            "tool. If they want to abort it, follow up with "
+            "`compute_cancel`. NOT for listing all jobs (no such "
+            "tool today; the broker UI handles that)."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "job_id": {"type": "string", "description": "Job ID from compute_submit"},
+                "job_id": {
+                    "type": "string",
+                    "description": (
+                        "Job ID returned by `compute_submit`. "
+                        "Format: `job_<uuid>` or numeric SLURM "
+                        "ID depending on broker backend."
+                    ),
+                },
             },
             "required": ["job_id"],
+            "additionalProperties": False,
         },
         func=_job_status,
     ))
