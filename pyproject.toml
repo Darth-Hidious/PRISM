@@ -67,11 +67,18 @@ ml = [
     "joblib>=1.3.0",
 ]
 simulation = [
-    "pyiron-base>=0.9; python_version<'3.14'",
-    "pyiron-atomistics>=0.6; python_version<'3.14'",
+    # pyiron officially supports Python 3.9–3.14 as of pyiron_atomistics /
+    # atomistics 0.3.6 (released 2026-04-28); requires-python in their
+    # pyproject.toml is `>=3.9, <3.15`. We mirror that window so users on
+    # Python 3.14 (the current default on macOS arm64) get simulation
+    # extras instead of being silently excluded. See docs/pyiron_integration.md
+    # for the architectural boundary between PRISM and pyiron.
+    "pyiron-base>=0.9; python_version<'3.15'",
+    "pyiron-atomistics>=0.6; python_version<'3.15'",
 ]
 calphad = [
-    "pycalphad>=0.10,<0.12; python_version<'3.14'",
+    # pycalphad supports Python 3.9–3.14; same window as pyiron.
+    "pycalphad>=0.10,<0.12; python_version<'3.15'",
 ]
 data = [
     "datasets>=3.0.0",
