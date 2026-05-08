@@ -1,7 +1,15 @@
-"""Compute Broker tools — submit jobs, check GPUs, monitor status.
+"""Compute Broker — UNIFIED tool collapsing 6 actions into one entry point.
 
-These tools connect to the MARC27 Compute Broker API.
-Users can dispatch jobs to RunPod, PRISM nodes, or any registered provider.
+DRAFT for Round 4 collapse work. Will replace app/tools/compute.py once PR #12 merges.
+
+Replaces:
+  compute_gpus, compute_providers, compute_estimate, compute_submit,
+  compute_status, compute_cancel
+Discriminator: `action` (string enum)
+
+Approval semantics: same as today (none). Flag for follow-up:
+  action='submit' is the money-spending one; should arguably set
+  requires_approval=True. Out of scope for the collapse PR.
 """
 import logging
 from app.tools.base import Tool, ToolRegistry
@@ -19,354 +27,194 @@ def _get_client():
         return None
 
 
-def _list_gpus(**kwargs) -> dict:
-    """List available GPU types with pricing across all providers."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
+# --- Per-action handlers (each one stays small; no logic duplicated) -------
 
-    try:
-        gpus = client.compute.list_gpus()
+def _act_list_gpus(client, **_) -> dict:
+    gpus = client.compute.list_gpus()
+    return {"gpus": gpus, "count": len(gpus), "source": "marc27_compute_broker"}
+
+
+def _act_list_providers(client, **_) -> dict:
+    providers = client.compute.list_providers()
+    return {
+        "providers": providers,
+        "count": len(providers),
+        "source": "marc27_compute_broker",
+    }
+
+
+def _act_estimate(client, **kw) -> dict:
+    estimate = client.compute.estimate(
+        image=kw["image"],
+        inputs={},
+        gpu_type=kw.get("gpu_type"),
+        timeout_seconds=kw.get("timeout_seconds", 3600),
+    )
+    return {"estimate": estimate, "source": "marc27_compute_broker"}
+
+
+def _act_submit(client, **kw) -> dict:
+    result = client.compute.submit(
+        image=kw["image"],
+        inputs=kw["inputs"],
+        gpu_type=kw.get("gpu_type"),
+        budget_max_usd=kw.get("budget_max_usd"),
+        provider_preference=kw.get("provider_preference", "cheapest"),
+        timeout_seconds=kw.get("timeout_seconds", 3600),
+        env_vars=kw.get("env_vars", {}),
+    )
+    return {"job": result, "source": "marc27_compute_broker"}
+
+
+def _act_status(client, **kw) -> dict:
+    result = client.compute.status(kw["job_id"])
+    return {"job": result, "source": "marc27_compute_broker"}
+
+
+def _act_cancel(client, **kw) -> dict:
+    client.compute.cancel(kw["job_id"])
+    return {"status": "cancelled", "job_id": kw["job_id"]}
+
+
+# (handler, list-of-required-args)
+_DISPATCH: dict[str, tuple] = {
+    "list_gpus":      (_act_list_gpus,      []),
+    "list_providers": (_act_list_providers, []),
+    "estimate":       (_act_estimate,       ["image"]),
+    "submit":         (_act_submit,         ["image", "inputs"]),
+    "status":         (_act_status,         ["job_id"]),
+    "cancel":         (_act_cancel,         ["job_id"]),
+}
+
+
+def _compute(**kwargs) -> dict:
+    """Single entry point dispatched by `action`."""
+    action = kwargs.pop("action", None)
+    if not action:
         return {
-            "gpus": gpus,
-            "count": len(gpus),
-            "source": "marc27_compute_broker",
+            "error": f"Missing 'action'. Valid: {list(_DISPATCH.keys())}",
+            "hint": "Call as compute(action='list_gpus') or compute(action='submit', image=..., inputs=...)",
         }
-    except Exception as e:
-        return {"error": str(e)}
 
-
-def _list_providers(**kwargs) -> dict:
-    """List registered compute providers."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
-
-    try:
-        providers = client.compute.list_providers()
+    if action not in _DISPATCH:
         return {
-            "providers": providers,
-            "count": len(providers),
-            "source": "marc27_compute_broker",
+            "error": f"Unknown action '{action}'. Valid: {list(_DISPATCH.keys())}",
         }
-    except Exception as e:
-        return {"error": str(e)}
 
-
-def _estimate_cost(**kwargs) -> dict:
-    """Estimate cost of a compute job before submitting."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
-
-    image = kwargs.get("image", "")
-    gpu_type = kwargs.get("gpu_type")
-    timeout = kwargs.get("timeout_seconds", 3600)
-
-    try:
-        estimate = client.compute.estimate(
-            image=image,
-            inputs={},
-            gpu_type=gpu_type,
-            timeout_seconds=timeout,
-        )
+    handler, required = _DISPATCH[action]
+    missing = [r for r in required if r not in kwargs]
+    if missing:
         return {
-            "estimate": estimate,
-            "source": "marc27_compute_broker",
+            "error": f"Action '{action}' requires: {missing}",
+            "provided": list(kwargs.keys()),
         }
-    except Exception as e:
-        return {"error": str(e)}
 
-
-def _submit_job(**kwargs) -> dict:
-    """Submit a compute job to the broker."""
     client = _get_client()
     if not client:
-        return {"error": "MARC27 platform not connected."}
-
-    image = kwargs.get("image", "")
-    inputs = kwargs.get("inputs", {})
-    gpu_type = kwargs.get("gpu_type")
-    budget = kwargs.get("budget_max_usd")
-    preference = kwargs.get("provider_preference", "cheapest")
-    timeout = kwargs.get("timeout_seconds", 3600)
-    env_vars = kwargs.get("env_vars", {})
+        return {"error": "MARC27 platform not connected. Run `prism login` first."}
 
     try:
-        result = client.compute.submit(
-            image=image,
-            inputs=inputs,
-            gpu_type=gpu_type,
-            budget_max_usd=budget,
-            provider_preference=preference,
-            timeout_seconds=timeout,
-            env_vars=env_vars,
-        )
-        return {
-            "job": result,
-            "source": "marc27_compute_broker",
-        }
+        return handler(client, **kwargs)
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "action": action}
 
 
-def _job_status(**kwargs) -> dict:
-    """Check the status of a compute job."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
+_DESCRIPTION = (
+    "MARC27 Compute Broker — submit, monitor, and cancel containerized "
+    "GPU/CPU jobs across providers (PRISM mesh nodes, RunPod, Lambda). "
+    "ONE tool, six actions selected via `action`:\n"
+    "  • action='list_gpus' — show available GPU types + pricing. No other args.\n"
+    "  • action='list_providers' — show registered backends. No other args.\n"
+    "  • action='estimate' — cost preview, FREE; requires `image`. Optional: `gpu_type`, `timeout_seconds`.\n"
+    "  • action='submit' — DISPATCHES A REAL JOB (money-spending); requires `image` + `inputs`. "
+    "Set `budget_max_usd` to cap spend.\n"
+    "  • action='status' — poll one job; requires `job_id`. Cheap, no spend.\n"
+    "  • action='cancel' — abort queued/running job; requires `job_id`. Idempotent.\n"
+    "Typical sequence: list_gpus → estimate → submit → status (loop) → [cancel if needed]. "
+    "NOT for listing LLM models (use models_list) and NOT for ML prediction (use predict)."
+)
 
-    job_id = kwargs.get("job_id", "")
-    try:
-        result = client.compute.status(job_id)
-        return {
-            "job": result,
-            "source": "marc27_compute_broker",
-        }
-    except Exception as e:
-        return {"error": str(e)}
 
-
-def _cancel_job(**kwargs) -> dict:
-    """Cancel a running compute job."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
-
-    job_id = kwargs.get("job_id", "")
-    try:
-        client.compute.cancel(job_id)
-        return {"status": "cancelled", "job_id": job_id}
-    except Exception as e:
-        return {"error": str(e)}
+_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": list(_DISPATCH.keys()),
+            "description": "Which compute-broker operation to perform.",
+        },
+        "image": {
+            "type": "string",
+            "description": (
+                "Container image (e.g. 'vasp:6.5.0', 'quantum-espresso:7.4') "
+                "or marketplace slug. Required for action='estimate' and action='submit'."
+            ),
+        },
+        "inputs": {
+            "type": "object",
+            "description": (
+                "JSON input payload for the container. Shape depends on the image — "
+                "DFT runners want {structure, kpoints, encut, ...}, training jobs want "
+                "{dataset_uri, hyperparameters, ...}. Required for action='submit'."
+            ),
+        },
+        "gpu_type": {
+            "type": "string",
+            "description": (
+                "GPU class (e.g. 'A100-80GB', 'H100-80GB'). Optional for "
+                "action='estimate'/'submit'; uses cheapest available if omitted."
+            ),
+        },
+        "budget_max_usd": {
+            "type": "number",
+            "description": (
+                "Hard cap on job cost in USD for action='submit'. The broker "
+                "refuses dispatch if estimated cost exceeds this. Strongly "
+                "recommended for non-trivial jobs."
+            ),
+        },
+        "provider_preference": {
+            "type": "string",
+            "description": (
+                "Routing strategy for action='submit': 'cheapest' (default — "
+                "prefers PRISM mesh nodes), 'fastest' (premium cloud), or an "
+                "explicit provider name."
+            ),
+            "default": "cheapest",
+        },
+        "timeout_seconds": {
+            "type": "integer",
+            "description": (
+                "Wall-time cap in seconds for action='estimate'/'submit'. "
+                "Default 3600 (1 hour). Cost = price-per-hour × timeout / 3600."
+            ),
+            "default": 3600,
+        },
+        "env_vars": {
+            "type": "object",
+            "description": (
+                "Environment variables passed to the action='submit' container. "
+                "Use for API keys, license tokens, feature flags."
+            ),
+        },
+        "job_id": {
+            "type": "string",
+            "description": (
+                "Job ID returned by action='submit' (format: 'job_<uuid>' or "
+                "numeric SLURM ID). Required for action='status' and action='cancel'."
+            ),
+        },
+    },
+    "required": ["action"],
+    "additionalProperties": False,
+}
 
 
 def create_compute_tools(registry: ToolRegistry) -> None:
-    """Register all Compute Broker tools."""
-
+    """Register the unified `compute` tool (replaces 6 prior tools)."""
     registry.register(Tool(
-        name="compute_gpus",
-        description=(
-            "List available GPU types with pricing across all compute providers "
-            "(RunPod, PRISM nodes, Lambda, etc.). Shows GPU type, VRAM, price "
-            "per hour, and availability. Use before submitting jobs to pick "
-            "the right hardware."
-        ),
-        input_schema={"type": "object", "properties": {}},
-        func=_list_gpus,
-    ))
-
-    registry.register(Tool(
-        name="compute_providers",
-        description=(
-            "GPU/CPU compute providers registered with the MARC27 Compute Broker — "
-            "RunPod, PRISM mesh nodes, Lambda, etc. Use this to see which "
-            "execution backends are reachable and what hardware tiers they expose. "
-            "NOT for listing LLM models (use models_list / models_search) and NOT "
-            "for ML prediction models (use list_models)."
-        ),
-        input_schema={"type": "object", "properties": {}},
-        func=_list_providers,
-    ))
-
-    registry.register(Tool(
-        name="compute_estimate",
-        description=(
-            "Preview what a compute job would cost BEFORE actually "
-            "submitting it. Free to call; no GPU is reserved. Returns "
-            "estimated cost in USD, GPU options ranked by price, and "
-            "expected wall-time based on similar past jobs. ALWAYS "
-            "call this before `compute_submit` when the user has a "
-            "budget concern, asks 'how much would it cost to...', or "
-            "before any job that might run more than a few minutes. "
-            "Pair: `compute_estimate` (preview, free) → user confirms "
-            "→ `compute_submit` (real spend) → `compute_status` "
-            "(monitor) → optionally `compute_cancel`."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "image": {
-                    "type": "string",
-                    "description": (
-                        "Container image to estimate (e.g. "
-                        "`vasp:6.5.0`, `quantum-espresso:7.4`) or a "
-                        "marketplace slug. Use the same value you "
-                        "intend to pass to `compute_submit`."
-                    ),
-                },
-                "gpu_type": {
-                    "type": "string",
-                    "description": (
-                        "Specific GPU to estimate against (e.g. "
-                        "`A100-80GB`, `H100-80GB`). If omitted, "
-                        "returns estimates across all available GPU "
-                        "types so the agent can pick by cost-vs-speed."
-                    ),
-                },
-                "timeout_seconds": {
-                    "type": "integer",
-                    "default": 3600,
-                    "description": (
-                        "Budget cap on wall-time. Default 1 hour. "
-                        "Cost = price-per-hour × timeout / 3600."
-                    ),
-                },
-            },
-            "required": ["image"],
-            "additionalProperties": False,
-        },
-        func=_estimate_cost,
-    ))
-
-    registry.register(Tool(
-        name="compute_submit",
-        description=(
-            "Actually run a compute job — this is the MONEY-SPENDING "
-            "action. Dispatches a containerized workload to the "
-            "MARC27 Compute Broker, which picks the best matching "
-            "provider (PRISM mesh node, RunPod, Lambda, etc.) based "
-            "on `provider_preference` ('cheapest' default, 'fastest', "
-            "or a specific provider name). Returns a job_id; poll "
-            "with `compute_status` to track progress, abort with "
-            "`compute_cancel` if needed. ALWAYS prefer running "
-            "`compute_estimate` first when the user is cost-sensitive. "
-            "Use this for: real DFT/MD runs, large training jobs, "
-            "any container the user has authored. Set "
-            "`budget_max_usd` to hard-cap spend per job — the broker "
-            "refuses dispatch if the estimate exceeds it."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "image": {
-                    "type": "string",
-                    "description": (
-                        "Container image (Docker tag, e.g. "
-                        "`vasp:6.5.0`) or a marketplace slug "
-                        "registered with the broker."
-                    ),
-                },
-                "inputs": {
-                    "type": "object",
-                    "description": (
-                        "JSON input payload for the container. Shape "
-                        "depends on the image — DFT runners typically "
-                        "want {structure, kpoints, encut, ...}, "
-                        "training jobs want {dataset_uri, "
-                        "hyperparameters, ...}."
-                    ),
-                },
-                "gpu_type": {
-                    "type": "string",
-                    "description": (
-                        "GPU class (e.g. `A100-80GB`, `H100-80GB`). "
-                        "Use `compute_gpus` to see what's available."
-                    ),
-                },
-                "budget_max_usd": {
-                    "type": "number",
-                    "description": (
-                        "Hard cap on this job's cost in USD. The "
-                        "broker refuses dispatch if the estimated "
-                        "cost exceeds this. Recommended: always set "
-                        "this for non-trivial jobs to prevent "
-                        "runaway charges."
-                    ),
-                },
-                "provider_preference": {
-                    "type": "string",
-                    "description": (
-                        "Routing strategy: `cheapest` (default — "
-                        "prefers PRISM mesh nodes, then cloud), "
-                        "`fastest` (prefers premium cloud), or an "
-                        "explicit provider name."
-                    ),
-                    "default": "cheapest",
-                },
-                "timeout_seconds": {
-                    "type": "integer",
-                    "default": 3600,
-                    "description": (
-                        "Wall-time cap. Job is killed at the cap "
-                        "even if not done. Default 1 hour."
-                    ),
-                },
-                "env_vars": {
-                    "type": "object",
-                    "description": (
-                        "Environment variables passed to the "
-                        "container. Use for API keys, license tokens, "
-                        "feature flags."
-                    ),
-                },
-            },
-            "required": ["image", "inputs"],
-            "additionalProperties": False,
-        },
-        func=_submit_job,
-    ))
-
-    registry.register(Tool(
-        name="compute_status",
-        description=(
-            "Poll one compute job's state. Returns: status "
-            "(`queued` / `running` / `completed` / `failed` / "
-            "`cancelled`), elapsed wall-time, cost-incurred-so-far, "
-            "the job's stdout/stderr tail (last few KB), and the "
-            "final output artifact URLs once status=completed. Use "
-            "this in a polling loop after `compute_submit` returned "
-            "a job_id. Cheap to call repeatedly — no spend implied. "
-            "If the user asks 'is my DFT done?', this is the right "
-            "tool. If they want to abort it, follow up with "
-            "`compute_cancel`. NOT for listing all jobs (no such "
-            "tool today; the broker UI handles that)."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "job_id": {
-                    "type": "string",
-                    "description": (
-                        "Job ID returned by `compute_submit`. "
-                        "Format: `job_<uuid>` or numeric SLURM "
-                        "ID depending on broker backend."
-                    ),
-                },
-            },
-            "required": ["job_id"],
-            "additionalProperties": False,
-        },
-        func=_job_status,
-    ))
-
-    registry.register(Tool(
-        name="compute_cancel",
-        description=(
-            "Stop a compute job that's currently queued or running on the "
-            "MARC27 compute broker. Use this when a user says 'cancel my "
-            "DFT run', 'kill job X', or you need to abort a job whose "
-            "result is no longer wanted (e.g. an over-broad scan, a "
-            "fix-up after a typo in the input deck). Returns the job's "
-            "final state. Idempotent: cancelling an already-finished or "
-            "already-cancelled job is a no-op. Does NOT clean up output "
-            "artifacts — those persist; use the file-system tools to "
-            "remove them if needed."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "job_id": {
-                    "type": "string",
-                    "description": (
-                        "Compute job ID returned by `compute_submit`. "
-                        "Looks like `job_<uuid>` or a numeric SLURM ID "
-                        "depending on the broker backend."
-                    ),
-                },
-            },
-            "required": ["job_id"],
-            "additionalProperties": False,
-        },
-        func=_cancel_job,
+        name="compute",
+        description=_DESCRIPTION,
+        input_schema=_SCHEMA,
+        func=_compute,
     ))

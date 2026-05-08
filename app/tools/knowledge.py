@@ -1,20 +1,34 @@
-"""Knowledge Plane tools — graph search, semantic search, ingest.
+"""Knowledge Plane — UNIFIED tool collapsing 7 actions into one entry point.
 
-These tools connect to the live MARC27 Knowledge Service API.
-They give the agent access to the 200K+ node knowledge graph,
-semantic search over 6K+ embeddings, and the ingest pipeline.
+DRAFT for Round 4. Replaces app/tools/knowledge.py.
+
+Replaces (7 tools → 1):
+  knowledge_search   → action='search'        (graph entity lookup by term)
+  knowledge_entity   → action='entity'        (entity + 1-hop neighbors)
+  knowledge_paths    → action='paths'         (shortest paths between two entities)
+  knowledge_stats    → action='stats'         (graph metrics; no args)
+  knowledge_ingest   → action='ingest'        (background extract job from URL/query)
+  semantic_search    → action='semantic'      (pgvector similarity over embedded docs)
+  list_corpora       → action='list_corpora'  (catalog of available corpora)
+
+KNOWN BUG (preserved from current code, NOT fixing in this collapse):
+  The semantic-search direct-HTTP fallback class has method `semantic_search`
+  but the call site invokes `client.knowledge.search` — only works with the
+  marc27 SDK, breaks with MARC27_API_KEY-only auth. Flag for follow-up.
 """
 import logging
+import os
 from app.tools.base import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
 
 class _DirectClient:
-    """Fallback HTTP client when marc27 SDK is not installed.
+    """HTTP fallback when marc27 SDK isn't installed.
 
-    Uses MARC27_API_KEY and MARC27_API_URL env vars passed by the Rust CLI.
+    Uses MARC27_API_KEY + MARC27_API_URL env vars.
     """
+
     def __init__(self, api_url: str, api_key: str):
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -35,7 +49,10 @@ class _DirectClient:
         import requests
         resp = requests.post(
             f"{self.api_url}{path}",
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
             json=body,
             timeout=15,
         )
@@ -53,31 +70,38 @@ class _DirectKnowledge:
     def graph_entity(self, name: str, limit: int = 10):
         return self._c._get(f"/knowledge/entity/{name}", {"limit": str(limit)})
 
-    def graph_paths(self, from_entity: str, to_entity: str):
-        return self._c._get("/knowledge/paths", {"from": from_entity, "to": to_entity})
+    def graph_paths(self, from_entity: str, to_entity: str, max_hops: int = 3):
+        return self._c._get(
+            "/knowledge/paths",
+            {"from": from_entity, "to": to_entity, "max_hops": str(max_hops)},
+        )
 
     def graph_stats(self):
         return self._c._get("/knowledge/graph/stats")
 
-    def semantic_search(self, query: str, limit: int = 10):
-        return self._c._post("/knowledge/search", {"query": query, "limit": limit})
+    def semantic_search(self, query: str, limit: int = 10, corpus_id=None):
+        body = {"query": query, "limit": limit}
+        if corpus_id:
+            body["corpus_id"] = corpus_id
+        return self._c._post("/knowledge/search", body)
 
-    def list_corpora(self):
-        return self._c._get("/knowledge/catalog")
+    def list_corpora(self, domain=None, kind=None, limit: int = 50):
+        params = {"limit": str(limit)}
+        if domain:
+            params["domain"] = domain
+        if kind:
+            params["kind"] = kind
+        return self._c._get("/knowledge/catalog", params)
 
 
 def _get_client():
-    """Get or create a MARC27 PlatformClient.
-
-    Tries marc27 SDK first, falls back to direct HTTP using env vars.
-    """
+    """Try marc27 SDK first, fall back to direct HTTP."""
     try:
         from marc27 import PlatformClient
         return PlatformClient()
     except Exception:
         pass
 
-    import os
     api_key = os.environ.get("MARC27_API_KEY", "")
     api_url = os.environ.get("MARC27_API_URL", "https://api.marc27.com/api/v1")
     if api_key:
@@ -87,365 +111,209 @@ def _get_client():
     return None
 
 
-def _graph_search(**kwargs) -> dict:
-    """Search the knowledge graph for entities by name."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected. Run `prism login` first."}
+# --- Per-action handlers ---------------------------------------------------
 
-    term = kwargs.get("term", kwargs.get("query", ""))
-    limit = kwargs.get("limit", 20)
-
-    try:
-        results = client.knowledge.graph_search(term, limit=limit)
-        return {
-            "results": results,
-            "count": len(results),
-            "query": term,
-            "source": "marc27_knowledge_graph",
-        }
-    except Exception as e:
-        return {"error": str(e)}
+def _act_search(client, **kw) -> dict:
+    term = kw.get("term") or kw.get("query", "")
+    if not term:
+        return {"error": "Action 'search' requires `term` (or `query`)"}
+    results = client.knowledge.graph_search(term, limit=kw.get("limit", 20))
+    return {
+        "results": results,
+        "count": len(results) if hasattr(results, "__len__") else None,
+        "query": term,
+        "source": "marc27_knowledge_graph",
+    }
 
 
-def _graph_entity(**kwargs) -> dict:
-    """Get an entity and its neighbors from the knowledge graph."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
-
-    name = kwargs.get("name", kwargs.get("entity", ""))
-    limit = kwargs.get("limit", 10)
-
-    try:
-        result = client.knowledge.graph_entity(name, limit=limit)
-        return {
-            "entity": result.get("entity"),
-            "neighbors": result.get("neighbors", {}),
-            "source": "marc27_knowledge_graph",
-        }
-    except Exception as e:
-        return {"error": str(e)}
+def _act_entity(client, **kw) -> dict:
+    name = kw.get("name") or kw.get("entity", "")
+    if not name:
+        return {"error": "Action 'entity' requires `name`"}
+    result = client.knowledge.graph_entity(name, limit=kw.get("limit", 10))
+    return {
+        "entity": result.get("entity") if isinstance(result, dict) else result,
+        "neighbors": result.get("neighbors", {}) if isinstance(result, dict) else {},
+        "source": "marc27_knowledge_graph",
+    }
 
 
-def _graph_paths(**kwargs) -> dict:
-    """Find shortest paths between two entities in the knowledge graph."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
-
-    from_entity = kwargs.get("from_entity", kwargs.get("from", ""))
-    to_entity = kwargs.get("to_entity", kwargs.get("to", ""))
-    max_hops = kwargs.get("max_hops", 3)
-
-    try:
-        paths = client.knowledge.graph_paths(from_entity, to_entity, max_hops=max_hops)
-        return {
-            "paths": paths,
-            "from": from_entity,
-            "to": to_entity,
-            "source": "marc27_knowledge_graph",
-        }
-    except Exception as e:
-        return {"error": str(e)}
+def _act_paths(client, **kw) -> dict:
+    from_entity = kw.get("from_entity") or kw.get("from", "")
+    to_entity = kw.get("to_entity") or kw.get("to", "")
+    if not from_entity or not to_entity:
+        return {"error": "Action 'paths' requires `from_entity` and `to_entity`"}
+    paths = client.knowledge.graph_paths(
+        from_entity, to_entity, max_hops=kw.get("max_hops", 3),
+    )
+    return {
+        "paths": paths,
+        "from": from_entity,
+        "to": to_entity,
+        "source": "marc27_knowledge_graph",
+    }
 
 
-def _graph_stats(**kwargs) -> dict:
-    """Get knowledge graph statistics."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
-
-    try:
-        stats = client.knowledge.graph_stats()
+def _act_stats(client, **_) -> dict:
+    stats = client.knowledge.graph_stats()
+    if isinstance(stats, dict):
         return {
             "nodes": stats.get("nodes", 0),
             "edges": stats.get("edges", 0),
             "entity_types": stats.get("entity_types", 0),
             "source": "marc27_knowledge_graph",
         }
-    except Exception as e:
-        return {"error": str(e)}
+    return {"raw": stats, "source": "marc27_knowledge_graph"}
 
 
-def _semantic_search(**kwargs) -> dict:
-    """Semantic similarity search over embedded documents."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
-
-    query = kwargs.get("query", "")
-    corpus_id = kwargs.get("corpus_id")
-    limit = kwargs.get("limit", 10)
-
-    try:
-        results = client.knowledge.search(query, corpus_id=corpus_id, limit=limit)
-        return {
-            "results": results,
-            "count": len(results),
-            "query": query,
-            "source": "marc27_pgvector",
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _list_corpora(**kwargs) -> dict:
-    """List available data corpora in the Knowledge Plane."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
-
-    domain = kwargs.get("domain")
-    kind = kwargs.get("kind")
-    limit = kwargs.get("limit", 50)
-
-    try:
-        corpora = client.knowledge.list_corpora(domain=domain, kind=kind, limit=limit)
-        return {
-            "corpora": corpora,
-            "count": len(corpora),
-            "source": "marc27_catalog",
-        }
-    except Exception as e:
-        return {"error": str(e)}
+def _act_semantic(client, **kw) -> dict:
+    query = kw.get("query", "")
+    if not query:
+        return {"error": "Action 'semantic' requires `query`"}
+    # NOTE preserved from existing code: SDK path uses client.knowledge.search,
+    # direct-HTTP path uses client.knowledge.semantic_search. We try both.
+    if hasattr(client.knowledge, "search"):
+        results = client.knowledge.search(
+            query, corpus_id=kw.get("corpus_id"), limit=kw.get("limit", 10),
+        )
+    else:
+        results = client.knowledge.semantic_search(
+            query, corpus_id=kw.get("corpus_id"), limit=kw.get("limit", 10),
+        )
+    return {
+        "results": results,
+        "count": len(results) if hasattr(results, "__len__") else None,
+        "query": query,
+        "source": "marc27_pgvector",
+    }
 
 
-def _knowledge_ingest(**kwargs) -> dict:
-    """Submit a knowledge ingest job (extract entities from URL/text)."""
-    client = _get_client()
-    if not client:
-        return {"error": "MARC27 platform not connected."}
+def _act_list_corpora(client, **kw) -> dict:
+    corpora = client.knowledge.list_corpora(
+        domain=kw.get("domain"), kind=kw.get("kind"), limit=kw.get("limit", 50),
+    )
+    return {
+        "corpora": corpora,
+        "count": len(corpora) if hasattr(corpora, "__len__") else None,
+        "source": "marc27_catalog",
+    }
 
-    source_url = kwargs.get("url", kwargs.get("source_url"))
-    query = kwargs.get("query")
-    mode = kwargs.get("mode", "full")
+
+def _act_ingest(client, **kw) -> dict:
+    source_url = kw.get("url") or kw.get("source_url")
+    query = kw.get("query")
+    mode = kw.get("mode", "full")
+    if not source_url and not query:
+        return {"error": "Action 'ingest' requires `url` or `query`"}
 
     try:
-        from marc27.api.base import BaseAPI
-        base: BaseAPI = client._base
-
+        # SDK path uses base.post; direct path uses _post.
         body = {"mode": mode}
         if source_url:
             body["source"] = {"type": "url", "url": source_url}
-        elif query:
-            body["source"] = {"type": "query", "query": query}
         else:
-            return {"error": "Provide either 'url' or 'query'"}
+            body["source"] = {"type": "query", "query": query}
 
-        resp = base.post("/knowledge/ingest-job", json=body)
-        return resp.json()
+        if hasattr(client, "_base"):
+            from marc27.api.base import BaseAPI  # type: ignore
+            base: BaseAPI = client._base
+            resp = base.post("/knowledge/ingest-job", json=body)
+            return resp.json()
+        # Direct HTTP fallback
+        return client._post("/knowledge/ingest-job", body)
     except Exception as e:
         return {"error": str(e)}
 
 
+_DISPATCH = {
+    "search":       _act_search,
+    "entity":       _act_entity,
+    "paths":        _act_paths,
+    "stats":        _act_stats,
+    "semantic":     _act_semantic,
+    "list_corpora": _act_list_corpora,
+    "ingest":       _act_ingest,
+}
+
+
+def _knowledge(**kwargs) -> dict:
+    action = kwargs.pop("action", None)
+    if not action:
+        return {
+            "error": f"Missing 'action'. Valid: {list(_DISPATCH.keys())}",
+            "hint": "e.g. knowledge(action='search', term='titanium') or knowledge(action='stats')",
+        }
+    handler = _DISPATCH.get(action)
+    if not handler:
+        return {"error": f"Unknown action '{action}'. Valid: {list(_DISPATCH.keys())}"}
+
+    client = _get_client()
+    if not client:
+        return {"error": "MARC27 platform not connected. Run `prism login` first."}
+
+    try:
+        return handler(client, **kwargs)
+    except Exception as e:
+        return {"error": str(e), "action": action}
+
+
+_DESCRIPTION = (
+    "MARC27 Knowledge Plane — graph + semantic search over the live "
+    "knowledge service (200K+ nodes, 6M+ edges, 6K+ vector embeddings, "
+    "200+ corpora catalog). ONE tool, seven actions:\n"
+    "  • action='search' — graph entity lookup by `term` (best for 'find Ti-6Al-4V')\n"
+    "  • action='entity' — get one entity + 1-hop neighbors by `name`\n"
+    "  • action='paths' — shortest hop-paths from `from_entity` to `to_entity`; "
+    "use for 'how does X relate to Y?'\n"
+    "  • action='stats' — graph metrics (nodes/edges/types). No args. Use to "
+    "verify graph is populated.\n"
+    "  • action='semantic' — pgvector similarity by natural-language `query` "
+    "(better than 'search' for conceptual asks like 'high strength alloy for aerospace')\n"
+    "  • action='list_corpora' — catalog of available datasets (Materials Project, "
+    "JARVIS-DFT, QMOF, MatKG…). Filter by `domain`/`kind`.\n"
+    "  • action='ingest' — submit background extraction job; requires `url` or `query`.\n"
+    "NOT for raw structure DBs (use materials_search) and NOT for paper text (use prior_art_search)."
+)
+
+_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": list(_DISPATCH.keys()),
+            "description": "Which knowledge-plane operation to perform.",
+        },
+        # search / entity
+        "term":   {"type": "string", "description": "Search term for action='search'."},
+        "name":   {"type": "string", "description": "Entity name for action='entity'."},
+        # paths
+        "from_entity": {"type": "string", "description": "Path start entity for action='paths'."},
+        "to_entity":   {"type": "string", "description": "Path end entity for action='paths'."},
+        "max_hops":    {"type": "integer", "default": 3, "minimum": 1, "maximum": 8,
+                        "description": "Max path length for action='paths'."},
+        # semantic
+        "query":     {"type": "string", "description": "Natural-language query for action='semantic' or action='ingest'."},
+        "corpus_id": {"type": "string", "description": "Restrict action='semantic' to one corpus."},
+        # list_corpora
+        "domain": {"type": "string", "description": "Filter for action='list_corpora': materials/chemistry/biomedical/physics."},
+        "kind":   {"type": "string", "description": "Filter for action='list_corpora': structured_db/knowledge_graph/literature/ontology."},
+        # ingest
+        "url":  {"type": "string", "description": "Source URL for action='ingest'."},
+        "mode": {"type": "string", "default": "full",
+                 "description": "Extraction mode for action='ingest': graph/embed/full."},
+        # shared
+        "limit": {"type": "integer", "description": "Max results (default varies by action)."},
+    },
+    "required": ["action"],
+    "additionalProperties": False,
+}
+
+
 def create_knowledge_tools(registry: ToolRegistry) -> None:
-    """Register all Knowledge Plane tools."""
-
+    """Register the unified `knowledge` tool (replaces 7 prior tools)."""
     registry.register(Tool(
-        name="knowledge_search",
-        description=(
-            "MARC27 internal knowledge graph entity lookup (200K+ nodes, 6M+ edges) — "
-            "entity-level search across materials, properties, elements, publications, "
-            "authors, and topics. Returns entity names + types + labels for traversal. "
-            "NOT for raw structure search across external DBs (use search_materials) "
-            "and NOT for scientific paper text (use literature_search). Use this to find what the "
-            "platform knows about a material or concept."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "term": {
-                    "type": "string",
-                    "description": "Search term, e.g. 'titanium', 'band gap', 'MOF'",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 20)",
-                    "default": 20,
-                },
-            },
-            "required": ["term"],
-        },
-        func=_graph_search,
-    ))
-
-    registry.register(Tool(
-        name="knowledge_entity",
-        description=(
-            "Get a specific entity and its neighbors from the knowledge graph. "
-            "Shows what's connected — properties, compositions, structures, "
-            "authors, topics. Use after knowledge_search to explore relationships."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Entity name (exact match from knowledge_search)",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max neighbors to return (default 10)",
-                    "default": 10,
-                },
-            },
-            "required": ["name"],
-        },
-        func=_graph_entity,
-    ))
-
-    registry.register(Tool(
-        name="knowledge_paths",
-        description=(
-            "Find the shortest hop-paths between two named entities in "
-            "the MARC27 knowledge graph. Use this when the user asks "
-            "'how does X relate to Y?' or 'why does this material "
-            "matter for that application?' — the tool walks the graph "
-            "edges and returns each candidate path as an ordered list "
-            "of (entity → relation → entity → ...) hops. Concrete "
-            "example: path from 'Ti-6Al-4V' to 'Fatigue Resistance' "
-            "might return [Ti-6Al-4V — has_property — α-β phase "
-            "structure — enables — high cycle fatigue endurance — "
-            "is_a — Fatigue Resistance]. NOT for finding a single "
-            "entity's neighbors (use `knowledge_entity`) and NOT for "
-            "open-ended search (use `knowledge_search` or "
-            "`semantic_search`). Cap path length with `max_hops` to "
-            "avoid combinatorial blowup."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "from_entity": {
-                    "type": "string",
-                    "description": (
-                        "Start entity name. Must match a node in the "
-                        "graph — use `knowledge_search` first if "
-                        "you're not sure of the canonical name."
-                    ),
-                },
-                "to_entity": {
-                    "type": "string",
-                    "description": "End entity name. Same caveat as `from_entity`.",
-                },
-                "max_hops": {
-                    "type": "integer",
-                    "description": (
-                        "Maximum path length. Default 3. Higher values "
-                        "find more paths but cost more compute; raise "
-                        "above 5 only when the user explicitly wants "
-                        "deep relational chains."
-                    ),
-                    "default": 3,
-                    "minimum": 1,
-                    "maximum": 8,
-                },
-            },
-            "required": ["from_entity", "to_entity"],
-            "additionalProperties": False,
-        },
-        func=_graph_paths,
-    ))
-
-    registry.register(Tool(
-        name="knowledge_stats",
-        description=(
-            "Get high-level metrics about the MARC27 knowledge graph: "
-            "total node count, edge count, entity-type breakdown "
-            "(materials / properties / methods / authors / "
-            "publications), and last-update timestamp. Use this when "
-            "the user asks 'what's in your knowledge graph?', 'how "
-            "much data do you have?', or before a search to know "
-            "if the graph is even populated. No arguments. Read-only. "
-            "NOT a substitute for actually searching — use "
-            "`knowledge_search` / `semantic_search` to find specific "
-            "entities."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        },
-        func=_graph_stats,
-    ))
-
-    registry.register(Tool(
-        name="semantic_search",
-        description=(
-            "Semantic similarity search over embedded materials science documents "
-            "using Gemini Embedding 2 (3072-dim). Returns the most semantically "
-            "similar content to your query. Better than keyword search for "
-            "conceptual queries like 'high strength alloy for aerospace'."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Natural language query",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 10)",
-                    "default": 10,
-                },
-            },
-            "required": ["query"],
-        },
-        func=_semantic_search,
-    ))
-
-    registry.register(Tool(
-        name="list_corpora",
-        description=(
-            "List available data corpora in the MARC27 Knowledge Plane. "
-            "Shows datasets like Materials Project (154K materials), JARVIS-DFT "
-            "(80K), QMOF (20K MOFs), MatKG (3.5M triples), and more. "
-            "Filter by domain (materials, chemistry) or kind (structured_db, "
-            "knowledge_graph, literature)."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "domain": {
-                    "type": "string",
-                    "description": "Filter by domain: materials, chemistry, biomedical, physics",
-                },
-                "kind": {
-                    "type": "string",
-                    "description": "Filter by kind: structured_db, knowledge_graph, literature, ontology",
-                },
-                "limit": {"type": "integer", "default": 50},
-            },
-        },
-        func=_list_corpora,
-    ))
-
-    registry.register(Tool(
-        name="knowledge_ingest",
-        description=(
-            "Submit a knowledge ingest job — extract entities from a URL or "
-            "natural language query into the knowledge graph. Uses LLM-powered "
-            "entity extraction. The job runs in the background; check status "
-            "with the returned job_id."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "URL to extract knowledge from (paper, dataset page, etc.)",
-                },
-                "query": {
-                    "type": "string",
-                    "description": "Natural language query to discover and ingest data",
-                },
-                "mode": {
-                    "type": "string",
-                    "description": "Extraction mode: 'graph' (entities only), 'embed' (vectors only), 'full' (both)",
-                    "default": "full",
-                },
-            },
-        },
-        func=_knowledge_ingest,
+        name="knowledge",
+        description=_DESCRIPTION,
+        input_schema=_SCHEMA,
+        func=_knowledge,
     ))
