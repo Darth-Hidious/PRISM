@@ -1,8 +1,11 @@
-//! Forge harness adapter — launches the forge interactive UI as the PRISM
-//! chat surface. Replaces the broken Ratatui TUI for chat-mode entry.
+//! Chat-surface adapter — launches the in-process chat UI as PRISM's
+//! interactive surface. Replaces the broken Ratatui TUI for chat-mode
+//! entry, and is the integration point between PRISM's CLI dispatch
+//! and the Apache-2.0 vendored forge_* crates from tailcallhq/forgecode.
 //!
-//! This is the integration point between PRISM's CLI dispatch and the
-//! Apache-2.0 forge_* crates vendored from tailcallhq/forgecode.
+//! Companion modules: `chat_config` (target persistence) and
+//! `use_command` (the apply() shared by the CLI + the in-chat
+//! `/use` slash command).
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
