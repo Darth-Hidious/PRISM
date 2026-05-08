@@ -1556,7 +1556,7 @@ async fn main() -> Result<()> {
                 // Initialize federated query client for cross-mesh searches
                 let _ = server_state
                     .federation
-                    .set(prism_mesh::federation::FederatedQuery::default());
+                    .set(prism_mesh::federated_query::FederatedQuery::default());
 
                 if broadcast {
                     println!("  \u{2713} Mesh: broadcasting (mDNS + platform discovery)");
