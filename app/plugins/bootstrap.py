@@ -36,6 +36,27 @@ def build_full_registry(
     create_bash_tools(registry)
     create_capabilities_tools(registry)
 
+    # Stateful tool memory — auto-record meaningful tool outputs as artifacts
+    # and expose recall/fetch/list as tools. Opt-out via PRISM_DISABLE_MEMORY=1
+    # for tests or memory-free CLI modes. The artifact store + recorder are
+    # always graceful: any failure inside record_if_enabled is logged and the
+    # original tool result passes through unchanged. See
+    # docs/stateful_tools_2026.md for the architecture.
+    import os as _os
+    if _os.environ.get("PRISM_DISABLE_MEMORY", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        try:
+            from app.tools.memory import (
+                ArtifactStore,
+                configure as _configure_memory,
+                create_memory_tools,
+                default_db_path,
+            )
+            _store = ArtifactStore(default_db_path())
+            _configure_memory(store=_store)
+            create_memory_tools(registry)
+        except Exception as e:
+            logger.warning("memory subsystem disabled: %s", e)
+
     # Web browsing tools (Firecrawl + DuckDuckGo fallback)
     try:
         from app.tools.web import create_web_tools
