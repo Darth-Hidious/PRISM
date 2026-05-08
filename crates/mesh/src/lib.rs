@@ -7,8 +7,14 @@
 //! - **Platform** ([`platform_discovery`]): Cross-org discovery mediated by platform.marc27.com.
 //!
 //! Nodes publish datasets via [`subscription`] and subscribe to remote datasets.
-//! Federated queries across the mesh are handled by [`federation`].
+//! Federated queries across the mesh are handled by [`federated_query`].
+//!
+//! Cross-org **federation primitives** (peer identity, request signing,
+//! transitive root-CA trust via the MARC27 platform) live in
+//! [`federation`]. Used by Fabric v1 for cross-site inference and
+//! cross-org policy intersection.
 
+pub mod federated_query;
 pub mod federation;
 pub mod kafka;
 pub mod mdns;
