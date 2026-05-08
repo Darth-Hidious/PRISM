@@ -768,9 +768,19 @@ mod tests {
         use fake::{Fake, Faker};
         let mut fixture: Environment = Faker.fake();
         fixture = fixture.os(os.to_string());
-        if let Some(home_path) = home {
-            fixture = fixture.home(PathBuf::from(home_path));
-        }
+        // CRITICAL: when the caller passes `None` they mean "no home
+        // configured" — but `Faker.fake()` above just filled `home`
+        // with a random path. Without this branch the field still
+        // holds whatever Faker generated, which causes
+        // `format_path_for_display` to strip a random prefix and the
+        // `_no_home` tests fail non-deterministically on CI.
+        fixture = match home {
+            Some(home_path) => fixture.home(PathBuf::from(home_path)),
+            None => Environment {
+                home: None,
+                ..fixture
+            },
+        };
         fixture
     }
 
