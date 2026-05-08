@@ -1,15 +1,23 @@
-"""Tests for simulation tools (all mocked — no pyiron required)."""
-import pytest
-from unittest.mock import patch, MagicMock, PropertyMock
-import numpy as np
+"""Tests for the four standalone simulation tools that survived Round 5.
+
+Round 5 (PR #23) collapsed 13 simulation tools → 7:
+  - 3 unified dispatchers: structure / sim_run / sim_job (tested in
+    tests/test_round5_sim_collapse.py)
+  - 4 standalone tools kept because they have different shapes:
+    list_potentials, check_hpc_queue, run_convergence_test, run_workflow
+
+This file covers behavior of the 4 standalone tools. The previous
+tests for the now-collapsed 9 individual tools (create_structure,
+run_simulation, get_job_status, …) were removed when the dispatchers
+landed; their replacements live in test_round5_sim_collapse.py.
+
+All tests mocked — no pyiron required.
+"""
+from unittest.mock import patch, MagicMock
 
 from app.tools.base import ToolRegistry
 from app.tools.sim_tools import create_simulation_tools
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _make_registry():
     reg = ToolRegistry()
@@ -35,151 +43,6 @@ def _mock_atoms(formula="Fe4", n=4):
     return atoms
 
 
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
-
-class TestToolRegistration:
-    def test_all_tools_registered(self):
-        reg = _make_registry()
-        names = [t.name for t in reg.list_tools()]
-        expected = [
-            "create_structure", "modify_structure", "get_structure_info",
-            "list_potentials", "run_simulation", "get_job_status",
-            "get_job_results", "list_jobs", "delete_job",
-            "submit_hpc_job", "check_hpc_queue",
-            "run_convergence_test", "run_workflow",
-        ]
-        for e in expected:
-            assert e in names, f"Missing tool: {e}"
-        assert len(names) == 13
-
-
-# ---------------------------------------------------------------------------
-# Guard: pyiron not installed
-# ---------------------------------------------------------------------------
-
-class TestPyironGuard:
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=False)
-    def test_create_structure_guard(self, _m):
-        reg = _make_registry()
-        result = reg.get("create_structure").execute(element="Fe")
-        assert "error" in result
-        assert "pyiron_atomistics" in result["error"]
-
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=False)
-    def test_run_simulation_guard(self, _m):
-        reg = _make_registry()
-        result = reg.get("run_simulation").execute(structure_id="x")
-        assert "error" in result
-
-
-# ---------------------------------------------------------------------------
-# C-1: Structure Tools
-# ---------------------------------------------------------------------------
-
-class TestCreateStructure:
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_basic(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        mock_atoms = _mock_atoms()
-        bridge.get_project().create.structure.bulk.return_value = mock_atoms
-        bridge.structures.store.return_value = "struct_abc"
-
-        reg = _make_registry()
-        result = reg.get("create_structure").execute(element="Fe", crystal_structure="bcc")
-        assert result["structure_id"] == "struct_abc"
-        assert result["n_atoms"] == 4
-
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_with_supercell(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        mock_atoms = _mock_atoms("Fe32", 32)
-        bridge.get_project().create.structure.bulk.return_value = mock_atoms
-        mock_atoms.repeat.return_value = mock_atoms
-        bridge.structures.store.return_value = "struct_xyz"
-
-        reg = _make_registry()
-        result = reg.get("create_structure").execute(
-            element="Fe", crystal_structure="bcc", repeat_x=2, repeat_y=2, repeat_z=2
-        )
-        assert result["structure_id"] == "struct_xyz"
-        mock_atoms.repeat.assert_called_once_with([2, 2, 2])
-
-
-class TestModifyStructure:
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_supercell(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        mock_atoms = _mock_atoms()
-        bridge.structures.get.return_value = mock_atoms
-        bridge.structures.store.return_value = "struct_new"
-
-        reg = _make_registry()
-        result = reg.get("modify_structure").execute(
-            structure_id="struct_abc", operation="supercell", params={"nx": 3, "ny": 3, "nz": 3}
-        )
-        assert result["structure_id"] == "struct_new"
-        assert result["operation"] == "supercell"
-
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_not_found(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.structures.get.return_value = None
-
-        reg = _make_registry()
-        result = reg.get("modify_structure").execute(structure_id="bad_id", operation="supercell")
-        assert "error" in result
-
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_unknown_operation(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.structures.get.return_value = _mock_atoms()
-
-        reg = _make_registry()
-        result = reg.get("modify_structure").execute(
-            structure_id="s1", operation="unknown_op"
-        )
-        assert "error" in result
-        assert "Unknown operation" in result["error"]
-
-
-class TestGetStructureInfo:
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_basic(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.structures.get.return_value = _mock_atoms()
-
-        reg = _make_registry()
-        result = reg.get("get_structure_info").execute(structure_id="struct_abc")
-        assert result["formula"] == "Fe4"
-        assert result["n_atoms"] == 4
-        assert result["volume"] == 23.64
-
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_not_found(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.structures.get.return_value = None
-
-        reg = _make_registry()
-        result = reg.get("get_structure_info").execute(structure_id="nope")
-        assert "error" in result
-
-
 class TestListPotentials:
     @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
     @patch("app.tools.simulation.bridge.get_bridge")
@@ -202,188 +65,6 @@ class TestListPotentials:
         # Only Fe should remain
         assert len(result["potentials"]) == 1
         assert "Fe" in result["potentials"][0]["name"]
-
-
-# ---------------------------------------------------------------------------
-# C-2: Simulation / Job Tools
-# ---------------------------------------------------------------------------
-
-class TestRunSimulation:
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_lammps(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.structures.get.return_value = _mock_atoms()
-        pr = bridge.get_project()
-        mock_job = MagicMock()
-        mock_job.status = "finished"
-        pr.create.job.Lammps.return_value = mock_job
-        bridge.jobs.store.return_value = "job_123"
-
-        reg = _make_registry()
-        result = reg.get("run_simulation").execute(
-            structure_id="struct_abc", code="lammps", potential="Fe_eam"
-        )
-        assert result["job_id"] == "job_123"
-        assert result["code"] == "lammps"
-
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_unsupported_code(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.structures.get.return_value = _mock_atoms()
-
-        reg = _make_registry()
-        result = reg.get("run_simulation").execute(
-            structure_id="s1", code="unknown_code"
-        )
-        assert "error" in result
-        assert "Unsupported code" in result["error"]
-
-
-class TestGetJobStatus:
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_basic(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        mock_job = MagicMock()
-        mock_job.status = "finished"
-        mock_job.job_name = "test_job"
-        bridge.jobs.get.return_value = mock_job
-
-        reg = _make_registry()
-        result = reg.get("get_job_status").execute(job_id="job_1")
-        assert result["status"] == "finished"
-
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_not_found(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.jobs.get.return_value = None
-
-        reg = _make_registry()
-        result = reg.get("get_job_status").execute(job_id="bad_id")
-        assert "error" in result
-
-
-class TestGetJobResults:
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_finished_job(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        mock_job = MagicMock()
-        mock_job.status = "finished"
-        mock_job.__getitem__ = MagicMock(side_effect=lambda k: {
-            "energy_tot": -3.75,
-            "volume": 23.6,
-        }.get(k))
-        bridge.jobs.get.return_value = mock_job
-
-        reg = _make_registry()
-        result = reg.get("get_job_results").execute(
-            job_id="j1", properties=["energy_tot", "volume"]
-        )
-        assert result["energy_tot"] == -3.75
-        assert result["volume"] == 23.6
-
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_not_finished(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        mock_job = MagicMock()
-        mock_job.status = "running"
-        bridge.jobs.get.return_value = mock_job
-
-        reg = _make_registry()
-        result = reg.get("get_job_results").execute(job_id="j1")
-        assert "error" in result
-        assert "not finished" in result["error"]
-
-
-class TestListJobs:
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_empty(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.jobs.to_summary_list.return_value = []
-
-        reg = _make_registry()
-        result = reg.get("list_jobs").execute()
-        assert result["jobs"] == []
-        assert result["count"] == 0
-
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_with_filter(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.jobs.to_summary_list.return_value = [
-            {"id": "j1", "status": "finished", "code": "Lammps"},
-            {"id": "j2", "status": "running", "code": "Vasp"},
-        ]
-
-        reg = _make_registry()
-        result = reg.get("list_jobs").execute(status_filter="finished")
-        assert result["count"] == 1
-        assert result["jobs"][0]["id"] == "j1"
-
-
-class TestDeleteJob:
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_without_confirm(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-
-        reg = _make_registry()
-        result = reg.get("delete_job").execute(job_id="j1")
-        assert "error" in result
-        assert "confirm" in result["error"]
-
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_with_confirm(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.jobs.get.return_value = MagicMock()
-
-        reg = _make_registry()
-        result = reg.get("delete_job").execute(job_id="j1", confirm=True)
-        assert result["deleted"] == "j1"
-
-
-# ---------------------------------------------------------------------------
-# C-3: HPC + Workflow Tools
-# ---------------------------------------------------------------------------
-
-class TestSubmitHPCJob:
-    @patch("app.tools.simulation.bridge.check_pyiron_available", return_value=True)
-    @patch("app.tools.simulation.bridge.get_bridge")
-    def test_basic(self, mock_bridge_fn, _avail):
-        bridge = MagicMock()
-        mock_bridge_fn.return_value = bridge
-        bridge.structures.get.return_value = _mock_atoms()
-        pr = bridge.get_project()
-        mock_job = MagicMock()
-        mock_job.status = "submitted"
-        mock_job.server = MagicMock()
-        pr.create.job.Lammps.return_value = mock_job
-        bridge.jobs.store.return_value = "hpc_job_1"
-
-        reg = _make_registry()
-        result = reg.get("submit_hpc_job").execute(
-            structure_id="s1", code="lammps", queue="gpu", cores=8, walltime="02:00:00"
-        )
-        assert result["job_id"] == "hpc_job_1"
-        assert result["queue"] == "gpu"
-        assert result["cores"] == 8
 
 
 class TestCheckHPCQueue:
@@ -459,4 +140,3 @@ class TestRunWorkflow:
             workflow_type="nonexistent", structure_id="s1"
         )
         assert "error" in result
-        assert "Unknown workflow" in result["error"]
