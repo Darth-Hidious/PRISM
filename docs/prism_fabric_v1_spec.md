@@ -1,149 +1,217 @@
 # PRISM Fabric v1 — Implementation Spec
 
-**Status:** Design draft. **NO CODE until user-approved.**
+**Status:** Decisions locked 2026-05-08 — building.
 **Authors:** Sid + Claude (2026-05-08)
 **Companion to:** [prism_fabric_2026.md](./prism_fabric_2026.md) (strategic thesis)
-**Audience:** PRISM contributors deciding whether to start building
 
-This doc is the **implementation-level companion** to the strategic Fabric thesis. It maps the five planes from that doc onto concrete crates that already exist, identifies exactly what's missing, and proposes an ordered build that gets us to the aerospace-prime use case in ~7 weeks.
+This is the **implementation-level** companion to the Fabric thesis. It maps the strategic planes onto the existing PRISM crates, identifies the gaps, and lays out an ordered build for v1.
 
 ---
 
 ## TL;DR
 
-**Fabric is not greenfield.** PRISM already has the foundation:
-
-| Strategic plane | Existing crate | Status |
-|---|---|---|
-| Compute plane | `crates/node/` | ✅ Hardware probe, E2EE (X25519/ChaCha20/Ed25519), container executor, platform heartbeat, crash-safe state. **Solid.** |
-| Network plane (partial) | `crates/mesh/` | ⚠️ mDNS + platform discovery, dataset pub/sub, federated queries, Kafka. Needs: peer-to-peer overlay (Tailscale-shape) for cross-site WAN. |
-| Control plane | `marc27-platform` + `crates/policy/` | ✅ Orgs / users / projects / nodes / RBAC via OPA-regorus. Per-action policy gating for workflows + tools verified working today. |
-| Agentic layer | All the work merged today | ✅ 31 tools (8 unified + 3 memory + 17 standalone), stateful artifact memory, research(), promote_artifact KG bridge. |
-| ML plane | (mostly green-field) | ❌ Federated training, distributed inference, gradient aggregation. **The remaining work.** |
-
-**Fabric v1 = closing the gap on the network plane (peer-to-peer overlay) + adding cross-org primitives + locality-aware compute placement.** The ML plane (federated training, sharded inference) is **deferred to v2** because it's the boss fight and requires the foundation to be rock-solid first.
+- **Crate strategy: extend `crates/mesh/`.** No new `crates/fabric/` or `crates/federation/`. Less to maintain. The product/marketing name is "PRISM Fabric"; the crate stays `prism-mesh`.
+- **Trust model: transitive root CA = MARC27 platform.** Identity comes from MARC27 login. Tokens carry `org_id`, `project_id`, RBAC. No pairwise MoUs to manage.
+- **Policy intersection: strictest-wins** when multiple orgs are involved in a single workflow. Most restrictive decision applies. Obligations from all parties union.
+- **v1 success criterion: cross-site inference roundtrip.** "I submit an inference request at site A; it runs on a GPU at site B; the result returns to site A. With policy enforcement and a signed audit trail."
+- **P2P overlay: direct + relay nodes.** Platform is the relay-of-record for v1. Direct connections allowed when peers reach each other; libp2p/iroh-net is a v1.5 hardening item, not a blocker.
 
 ---
 
-## Five concrete additions for Fabric v1
+## What's already done (no rewrite needed)
 
-These map to the strategic vision but are scoped as engineering deliverables.
+| Strategic plane | Existing crate | Status |
+|---|---|---|
+| Compute plane | `crates/node/` | ✅ Hardware probe, E2EE (X25519 / ChaCha20 / Ed25519), container executor, platform heartbeat, crash-safe state. |
+| Network plane (partial) | `crates/mesh/` | ⚠️ mDNS + platform discovery, dataset pub/sub, federated queries, Kafka. **Needs:** cross-org peer routing + relay-aware connect logic. |
+| Control plane | `marc27-platform` + `crates/policy/` | ✅ Orgs / users / projects / nodes / RBAC via OPA-regorus. Per-action policy gating verified live. |
+| Agentic layer | (recent rounds) | ✅ ~31 tools, stateful artifact memory, `research()`, `promote_artifact` KG bridge. |
+| Workflow layer | `crates/workflows/` | ✅ Robust schema (top-level + step-level aliases), nested workflows, OPA-gated. |
+| ML plane | (mostly green-field) | ❌ Federated training, sharded inference. **Out of scope for v1** — comes once v1 is solid. |
+
+**Fabric v1 = closing the cross-org gap on the network plane, plus locality-aware compute placement, plus signed cross-org audit. The ML plane is v2.**
+
+---
+
+## Five additions for Fabric v1
+
+All five extend existing crates. No greenfield modules unless justified.
 
 ### F1. **Cross-org federation primitives** — sites compose without merging
 
-**Problem (from the aerospace-prime walkthrough):** A 13-office prime has one MARC27 org per office. Each office has its own mesh, datasets, policies, and HPC. Today, mesh discovery is single-org; cross-org compute requires manual coordination.
+**Where it lives:** `crates/mesh/src/federation.rs` (new module inside the existing crate).
 
-**Build:**
-- New `crates/federation/` crate
-- Three core types:
-  - `OrgIdentity { org_id, public_key, trust_level, contact_url }` — backed by Ed25519 from `crates/node/crypto.rs`
-  - `FederationManifest { trusted_peers: [OrgIdentity], shared_resources: { datasets, compute_targets, policies } }` — declarative YAML in `~/.prism/federation.yaml`
-  - `CrossOrgDecision { allowed_orgs: [OrgIdentity], denied_orgs: [(OrgIdentity, reason)], obligations }`
-- New CLI: `prism federation { list | trust <peer> | revoke <peer> | manifest }`
-- Cross-org peer trust extends `crates/node/crypto.rs` Ed25519 verification: requests from peer orgs must carry signatures verifiable against a key in the federation manifest.
+**Why mesh:** Mesh already owns peer discovery + identity + the WebSocket transport. Federation is "the multi-org generalization of mesh subscriptions" — same shape, more entities.
 
-**Estimate:** ~600 LOC. ~1 week.
+**Design (revised — root-CA model):**
 
-### F2. **Cross-org policy intersection** — both orgs must agree
+The MARC27 platform is the trust anchor. Every PRISM node is logged in to MARC27 via `prism login`. The login token carries:
+- `org_id`
+- `project_id`
+- `user_id`
+- `roles[]` (RBAC scopes)
+- platform-signed `node_pubkey` (Ed25519, set at first node-up)
 
-**Problem:** When org A invokes a workflow that touches org B's resources, today only org A's OPA fires. Org B has no say.
+**Cross-org peer trust = "both peers carry valid platform-signed tokens."** No manual `prism federation trust <peer>`. The platform already knows which orgs exist, who's in them, and what they can do.
 
-**Build:**
-- Extend `prism_policy::PolicyEngine::evaluate()` to take a `&[OrgIdentity]` list. Each org's policy is evaluated; the result is the intersection.
-- New helper: `intersect_decisions(decisions: &[PolicyDecision]) -> PolicyDecision` — takes the most restrictive decision; aggregates obligations from all orgs.
-- Test fixtures: 2-org and 3-org policy scenarios (allow ∩ allow = allow; allow ∩ deny = deny with reason; obligations[A] ∪ obligations[B]).
+```rust
+// crates/mesh/src/federation.rs
+pub struct PeerIdentity {
+    pub org_id: OrgId,
+    pub project_id: Option<ProjectId>,
+    pub node_id: NodeId,
+    pub node_pubkey: Ed25519PublicKey,
+    pub platform_signature: Ed25519Signature,  // platform-signed claim
+    pub roles: Vec<Role>,
+    pub valid_until: chrono::DateTime<Utc>,
+}
+
+pub struct CrossOrgRequest {
+    pub source: PeerIdentity,
+    pub target_org: OrgId,
+    pub action: String,           // e.g. "inference.submit"
+    pub resource: String,         // e.g. "node://munich-01/gpu-cluster"
+    pub payload: serde_json::Value,
+    pub request_signature: Ed25519Signature,  // signed by source.node_pubkey
+}
+
+pub fn verify_peer(
+    request: &CrossOrgRequest,
+    platform_root_pubkey: &Ed25519PublicKey,  // baked-in or fetched once at boot
+) -> Result<(), TrustError> {
+    // 1. Verify platform_signature over the source identity claims
+    // 2. Verify request_signature over the request body
+    // 3. Check valid_until is in the future
+    // 4. Check roles include the requested action's required role
+}
+```
+
+**CLI:** `prism federation peers` (read-only — lists known peer orgs from platform). No mutating commands; trust is managed in the MARC27 platform UI, not in the CLI.
+
+**Estimate:** ~400 LOC. ~4 days.
+
+### F2. **Cross-org policy intersection** — strictest-wins
+
+**Where it lives:** `crates/policy/src/intersect.rs` (new module).
+
+**Design:** When a workflow touches resources owned by ≥2 orgs, every involved org's policy fires. The decisions intersect with most-restrictive-wins semantics:
+
+```rust
+pub fn intersect_decisions(decisions: &[PolicyDecision]) -> PolicyDecision {
+    // allow ∩ allow = allow with union of obligations
+    // allow ∩ deny  = deny with all denying reasons surfaced
+    // deny ∩ deny   = deny with all denying reasons surfaced
+}
+```
+
+`PolicyEngine::evaluate_cross_org(input, &[org_id])` queries each org's policy bundle (cached via mesh), computes per-org decisions, then folds with `intersect_decisions`.
+
+**Why strictest-wins (not weighted or origin-only):**
+- Predictable. No "trust score" tuning.
+- Defaults safe: a single denial blocks the action.
+- Auditable: the denying party + reason is always visible.
+- It's what regulators and contracts expect ("if any party objects, no action").
+
+**Test fixtures:** 2-org `allow ∩ allow`, 2-org `allow ∩ deny`, 3-org with two obligations + one denial, obligations union check.
 
 **Estimate:** ~200 LOC + tests. ~3 days.
 
 ### F3. **Locality-aware compute placement** — "compute near data"
 
-**Problem:** Today's `compute_submit` picks `cheapest` or `fastest` from the GLOBAL provider list. It doesn't know which office "owns" a dataset, so it can't avoid expensive cross-site egress.
+**Where it lives:** `crates/compute/src/broker.rs` (extend) + `crates/mesh/src/subscription.rs` (extend metadata).
 
-**Build:**
-- Add `home_node` field to `crates/mesh/subscription.rs` dataset metadata
-- New `provider_preference: 'co_located'` strategy in the broker. Reads dataset's `home_node`; prefers that node or its same-site peers; falls through to `cheapest` if no co-located capacity.
-- Cost estimate extension: `compute(action='estimate')` returns `egress_factor × cross_site_GB` cost separately so the agent can see when it's burning money on data movement.
+**Design:**
+- Add `home_node: NodeId` to dataset subscription metadata
+- New `provider_preference: 'co_located'` strategy in the broker. Reads `home_node` from the dataset URI's metadata; prefers that node or its same-site peers; falls through to `cheapest` when no co-located capacity is available
+- `compute(action='estimate')` returns a separate `egress_factor × cross_site_GB` line in the cost breakdown so the agent sees egress before dispatch
 
 **Estimate:** ~300 LOC. ~1 week.
 
-### F4. **Capability descriptors + burst routing** — heterogeneous fleet awareness
+### F4. **Capability descriptors + burst routing** — heterogeneous fleets
 
-**Problem:** Office A has a 10K-core SLURM cluster. Office B has a 4-GPU workstation. Office C has 12 MacBooks + a $12K/mo RunPod budget. Today, the agent has to KNOW which office is which.
+**Where it lives:** `crates/node/src/detect.rs` (extend) + `crates/compute/src/broker.rs` (extend).
 
-**Build:**
-- Extend `crates/node/detect.rs` hardware probe to report:
-  ```rust
-  pub struct ComputeCapability {
-      pub slurm_available: bool,
-      pub max_cores_per_job: u32,
-      pub max_walltime_minutes: u32,
-      pub egress_cost_per_gb_usd: f64,
-      pub latency_to_org_kb_ms: u32,
-      // existing fields: cpu_cores, ram_gb, gpus, runtimes
-  }
-  ```
-- Compute target abstraction in the broker: jobs declare `compute_target: 'fast' | 'cheap' | 'large_memory' | 'low_egress' | 'training' | 'interactive'`. The broker maps these symbolic targets to physical providers using the capability descriptors + locality + federated policy.
-- Burst routing: when local mesh is saturated AND federation manifest allows, falls through to public cloud providers (RunPod / Lambda) with cost cap from the federation manifest.
+**Design:**
+```rust
+pub struct ComputeCapability {
+    pub slurm_available: bool,
+    pub max_cores_per_job: u32,
+    pub max_walltime_minutes: u32,
+    pub egress_cost_per_gb_usd: f64,
+    pub latency_to_org_kb_ms: u32,
+    // existing fields: cpu_cores, ram_gb, gpus, runtimes
+}
+```
+
+Symbolic compute targets (`'fast' | 'cheap' | 'large_memory' | 'low_egress' | 'training' | 'interactive'`) map to physical providers via capability descriptors + locality + cross-org policy. Burst to public cloud (RunPod / Lambda) when local mesh is saturated AND federation manifest allows AND budget cap permits.
 
 **Estimate:** ~400 LOC across `crates/node/detect.rs` + `crates/compute/`. ~1.5 weeks.
 
 ### F5. **Signed cross-org audit envelope** — provenance across boundaries
 
-**Problem:** When org A runs a workflow that uses org B's dataset on org C's GPU, who is liable? Today's audit log records the action *within* one org. Cross-org audit needs cryptographic signing replicated to every involved party.
+**Where it lives:** `crates/audit/` (new small crate — single-responsibility, used by mesh + compute + policy).
 
-**Build:**
-- New `crates/audit/` crate
-- `AuditEnvelope { workflow, principal, resources_touched: [(org_id, resource)], timestamp, signatures: [Ed25519Sig] }`
-- Each org's node daemon signs the envelope before passing it on. Stored locally at `~/.prism/audit/<envelope_id>.json`.
-- Mesh subscription topic for audit metadata (NOT payload — just `{envelope_id, workflow, principals, timestamp, sig_count}`). Subscribers replicate. Tampering is detected by signature check.
-- Optional opt-in archival to platform.marc27.com (off by default; all signing orgs must consent).
+**Why a new crate (not a mesh module):** Audit is consumed by mesh, compute, AND policy. Putting it in any one of them creates a circular dep. A small dedicated crate is cleaner.
+
+**Design:**
+```rust
+pub struct AuditEnvelope {
+    pub envelope_id: Uuid,
+    pub workflow: String,
+    pub principal: PeerIdentity,
+    pub resources_touched: Vec<(OrgId, String)>,
+    pub timestamp: DateTime<Utc>,
+    pub signatures: Vec<(OrgId, Ed25519Signature)>,  // each org signs in turn
+}
+```
+
+- Each org's node daemon signs the envelope before passing it on
+- Stored locally at `~/.prism/audit/<envelope_id>.json`
+- Mesh subscription topic for envelope **metadata** (`{envelope_id, workflow, principals, timestamp, sig_count}`); replicated. Tampering is detected by signature check.
+- Optional opt-in archival to platform.marc27.com (off by default; all signing orgs must opt in)
+
+**Why keep F5 in v1 even with platform root CA:** Belt-and-suspenders. The platform CA gives us identity. F5 gives us a tamper-evident execution trail that survives a platform compromise. Customer contracts will ask for it.
 
 **Estimate:** ~500 LOC. ~1.5 weeks.
 
 ---
 
-## What is **explicitly out of scope** for Fabric v1
+## What's explicitly out of scope for v1
 
-These are planned for v2 once v1 is solid:
-
-- **Federated LoRA fine-tuning** (Flower-style) — milestone 6 in the strategic doc
-- **DiLoCo low-communication training** — milestone 7
-- **Petals/SWARM-style sharded inference** — milestone 8
-- **TEE attestation** for confidential compute (Intel TDX / AMD SEV-SNP)
-- **MPC primitives** for sum / argmax / k-NN over distributed datasets
-- **Differential privacy budgets** at the framework level (can be done in workflows for v1)
-- **Tailscale-style WAN overlay**: v1 still relies on platform-mediated discovery + WebSocket relay. A real P2P overlay is v2.
-
-The reason for this scope: F1–F5 give us cross-org RBAC + locality routing + audit, which is enough for the aerospace-prime walkthrough without ML training. Training comes once v1 is demoed and customers ask for it.
+| Item | Why deferred |
+|---|---|
+| Federated LoRA fine-tuning (Flower-style) | ML plane = v2 |
+| DiLoCo low-comm training | ML plane = v2 |
+| Petals/SWARM sharded inference | ML plane = v2; v1's "inference" = single-node remote inference, not sharded |
+| TEE attestation (Intel TDX / AMD SEV-SNP) | Confidential compute = v2 |
+| MPC sum / argmax / k-NN over distributed datasets | Workflow-layer concern; v1 covers it via OPA |
+| Differential privacy budgets (framework-level) | Workflow-layer in v1 |
+| libp2p / iroh-net P2P overlay | Platform-relay floor is sufficient for v1; native overlay is v1.5 |
 
 ---
 
-## Architecture diagram (implementation view)
+## Architecture (revised)
 
 ```
 ┌─ Fabric v1 ──────────────────────────────────────────────────────┐
 │                                                                  │
-│   ┌─ NEW (F1) ──────────────────┐                                │
-│   │ crates/federation/          │                                │
-│   │   OrgIdentity (Ed25519)     │                                │
-│   │   FederationManifest        │                                │
-│   │   CrossOrgDecision          │                                │
-│   └─────────────────────────────┘                                │
-│              │                                                   │
-│              ▼                                                   │
-│   ┌─ EXTENDED (F2, F3, F4) ────────────────────────────────┐     │
-│   │ crates/policy/  ← cross-org intersection               │     │
-│   │ crates/mesh/    ← home_node locality metadata          │     │
-│   │ crates/node/    ← capability descriptor extension      │     │
-│   │ crates/compute/ ← compute_target abstraction + burst   │     │
+│   ┌─ EXTENDED (F1, F3, F4) ────────────────────────────────┐     │
+│   │ crates/mesh/   ← federation.rs module + home_node meta │     │
+│   │ crates/node/   ← capability descriptor extension       │     │
+│   │ crates/compute/← compute_target abstraction + burst    │     │
 │   └────────────────────────────────────────────────────────┘     │
 │              │                                                   │
 │              ▼                                                   │
-│   ┌─ NEW (F5) ──────────────────┐                                │
-│   │ crates/audit/               │                                │
-│   │   AuditEnvelope             │                                │
-│   │   sign / verify / replicate │                                │
-│   └─────────────────────────────┘                                │
+│   ┌─ EXTENDED (F2) ─────────────────┐                            │
+│   │ crates/policy/  ← intersect.rs   │                           │
+│   └─────────────────────────────────┘                            │
+│              │                                                   │
+│              ▼                                                   │
+│   ┌─ NEW (F5) ──────────────────────┐                            │
+│   │ crates/audit/                    │                           │
+│   │   AuditEnvelope                  │                           │
+│   │   sign / verify / replicate      │                           │
+│   └─────────────────────────────────┘                            │
 │              │                                                   │
 │              ▼                                                   │
 │   ┌─ REUSED (no rewrite) ───────────────────────────────────┐    │
@@ -151,68 +219,62 @@ The reason for this scope: F1–F5 give us cross-org RBAC + locality routing + a
 │   │ crates/mesh/      mDNS / platform discovery, pub/sub   │    │
 │   │ crates/policy/    OPA + regorus                        │    │
 │   │ crates/compute/   broker, BYOC                         │    │
-│   │ marc27-platform   orgs, users, projects, nodes         │    │
+│   │ marc27-platform   orgs, users, projects, nodes, RBAC   │    │
 │   └────────────────────────────────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-The blue boxes (NEW/EXTENDED) total **~2000 LOC** for v1. The grey boxes (REUSED) total ~15K+ LOC and don't change.
+**One new crate (`audit`), three extended crates, ~1800 LOC total** for v1.
 
 ---
 
-## Build sequence — milestones with success criteria
+## Build sequence
 
 | # | Milestone | Estimate | Success criterion |
 |---|---|---|---|
-| **F1** | Federation primitives | 1 week | `prism federation trust <peer>` writes a manifest entry; subsequent calls verify peer signatures correctly. Tests cover trust / revoke / verify-fail / verify-pass. |
-| **F2** | Cross-org policy intersection | 3 days | Given two `default.rego` policies with different rules, `evaluate(input, [orgA, orgB])` returns the most restrictive decision; obligations from both orgs are surfaced. |
-| **F3** | Locality metadata | 1 week | `compute_submit(provider_preference='co_located', inputs={dataset_uri: '...'})` routes to the dataset's home node when capacity is available; falls through cleanly when not. |
-| **F4** | Capability descriptors + burst | 1.5 weeks | Hardware probe reports SLURM availability + walltime. `compute_target='training'` maps to SLURM nodes if any peer reports it, else to cloud. Cost estimate visible to agent before dispatch. |
-| **F5** | Signed audit envelope | 1.5 weeks | Three-org workflow execution produces a signed envelope. Each org's node has a copy. Tampering with one copy is detected by the next signature verification. |
-| **F6** | Three-org docker-compose demo | 1.5 weeks | The aerospace-prime walkthrough (Tokyo data + Munich SLURM + San Diego user) runs end-to-end in a docker-compose harness. Cross-org RBAC, locality routing, audit envelope all visible. |
+| **F1** | Federation primitives (root-CA model) | 4 days | A node from org A can submit a signed `CrossOrgRequest` to a node in org B; B verifies via platform pubkey + token expiry + RBAC roles. `prism federation peers` lists known peer orgs. |
+| **F2** | Cross-org policy intersection | 3 days | `evaluate_cross_org(input, &[orgA, orgB])` returns the most-restrictive decision; obligations from both orgs surface; tested over 2-org and 3-org fixtures. |
+| **F3** | Locality metadata | 1 week | `compute_submit(provider_preference='co_located', dataset_uri='...')` routes to the dataset's home node when capacity exists; falls through cleanly when not. Egress shown in cost estimate. |
+| **F4** | Capability descriptors + burst | 1.5 weeks | Hardware probe reports SLURM availability + walltime. `compute_target='training'` maps to SLURM peers when available, else to cloud. Cost estimate visible before dispatch. |
+| **F5** | Signed audit envelope | 1.5 weeks | Three-org workflow execution produces a signed envelope. Each org has a copy. Tampering with one copy is detected by the next signature check. |
+| **F6** | **Cross-site inference demo** (the v1 done bar) | 1 week | User at site A runs `prism infer --model llama-3-70b --prompt "..."`. Routes via F3 to site B's GPU. F1 verifies cross-org request. F2 confirms both orgs' policies allow. F5 envelope signed by both orgs. Result returns to site A. End-to-end docker-compose harness. |
 
-**Total: ~7 weeks for Fabric v1.**
+**Total: ~5–6 weeks for Fabric v1.**
 
-Each milestone is independently shippable. We can stop after any of them and assess.
+Each milestone is independently shippable.
 
 ---
 
-## Use-case walkthrough — the aerospace prime (concrete)
+## v1 success criterion (concrete)
 
-> **Setup:** Tokyo office has the wind-tunnel CFD dataset (800 GB, sensitive). Munich office has the SLURM cluster (50 nodes, 8x A100 each). San Diego office has the user (a propulsion engineer running PRISM CLI) and a 12-MacBook conference room. Three orgs, one prime contractor.
+User runs at their workstation (site A):
 
-**User says:** *"Train a turbulence-closure model on the Tokyo CFD data, run it on Munich's HPC, return the model to my workstation."*
+```bash
+prism infer --model llama-3-70b --prompt "Why is FCC iron stable below 910°C?" \
+  --provider-preference co_located \
+  --budget 0.50
+```
 
-### Today (without Fabric)
+What happens:
 
-1. Engineer manually identifies which office owns the data.
-2. Engineer requests VPN access from Tokyo IT (2-3 days).
-3. Engineer downloads CFD data (800 GB locally → 4 hours).
-4. Engineer re-uploads to Munich SLURM via SCP (4 more hours).
-5. Engineer manually writes SLURM script.
-6. Engineer waits 4 hours for training, downloads model artifacts back to San Diego.
-7. **Total: 2 weeks of coordination, ~$3K of egress, no audit trail.**
+1. **F4** capability descriptors say site B has an A100 reachable with the right runtime.
+2. **F3** locality routing says: site B is the cheapest for this prompt size.
+3. **F1** the request is signed with site A's node key + platform token.
+4. **F1** site B verifies the platform signature, checks the token's `valid_until` and `roles[]`.
+5. **F2** policy intersection: A's policy (budget cap), B's policy (which models it serves), and the project policy all evaluate. Strictest-wins.
+6. Site B runs inference on its GPU.
+7. **F5** envelope signed by A (request) + B (execution); both sites store a copy.
+8. Result streams back over the mesh subscription channel to site A.
 
-### With Fabric v1
+**No VPN. No SCP. No manual SLURM script. Audit trail is cryptographic.**
 
-1. Agent calls `research(question="...")` → MARC27 RLM identifies Tokyo's CFD dataset by metadata (already works today).
-2. Agent calls:
-   ```python
-   compute_submit(
-     image='turbulence-trainer:1.0',
-     inputs={'dataset_uri': 'tokyo://cfd/2024-q3'},
-     compute_target='training',         # F4: symbolic target
-     provider_preference='co_located',  # F3: locality-aware
-     budget_max_usd=500,
-   )
-   ```
-3. **F3 routes:** locality says Tokyo data → Munich compute (lowest egress + has SLURM per F4 capability descriptor).
-4. **F1 + F2 federation:** Tokyo's policy allows Munich access to this dataset under contract X. Munich's policy allows compute consumption ≤ $500. San Diego's policy allows the agent to spend ≤ $500. Cross-org policy intersection (F2) succeeds.
-5. **F5 audit envelope:** signed by Tokyo (data export), Munich (compute consumption), San Diego (job initiation). Each org has a copy.
-6. Munich SLURM trains the model. Tokyo never sees the model artifacts (data sovereignty preserved). San Diego receives signed model + provenance pointer.
-7. **Total: 8 minutes from question to model. Egress: $40 (Munich-to-San-Diego model only, not Tokyo-to-Munich data). Audit trail: cryptographically signed by all three parties.**
+This is what "inference on distributed computers that exist somewhere else in the world, and my place" means in code.
 
-This is what Fabric v1 enables. **Zero new physics; just composing what's already in PRISM with five small additions.**
+---
+
+## v1.5 — the aerospace-prime walkthrough
+
+The 3-office aerospace example (Tokyo CFD data + Munich SLURM + San Diego user) is the **v1.5 demo**, not the v1 done bar. v1 proves the inference roundtrip; v1.5 proves the same primitives compose into a real cross-org *training* job. v1.5 needs the v2 ML plane (federated training), so it's framed as a milestone for after v2 lands.
 
 ---
 
@@ -220,55 +282,47 @@ This is what Fabric v1 enables. **Zero new physics; just composing what's alread
 
 | Risk | Mitigation |
 |---|---|
-| Federation trust sprawl (transitive trust loops) | Pairwise-only trust in v1. No transitive. Documented. |
-| Workflow recursion (workflows-in-workflows infinite loop) | NOT artificially limited. Per user direction: workflows are workflows; depth limits are arbitrary policy that break legit use cases. Loops self-resolve via OPA `obligations` (audit_log makes runaway loops visible) and via per-workflow cost caps in the federation manifest. |
-| Policy intersection deny-by-default blocks legit workflows | `PolicyDecision.reason` always includes WHO denied + WHY. Override path: workflow author bumps `role` in the input with admin sign-off. |
-| Egress cost surprise | Locality routing (F3) + `budget_max_usd` cap + pre-flight cost estimate via `compute(action='estimate')`. Cost is visible to the agent before dispatch. |
-| Multi-org Rego version drift | Federation manifest pins peer's policy version. Drift triggers a warning, not a hard fail. |
-| WAN overlay vaporware | v1 explicitly does NOT promise Tailscale-grade P2P. Uses platform-mediated discovery + WebSocket relay. A real overlay is v2. |
-| Audit envelope log bloat | Audit metadata replicated via mesh (small); full payload only stored at signing orgs. Compaction policy: keep last 90 days local; older envelopes referenced by hash only. |
+| Workflow recursion (workflows-in-workflows) | NOT artificially limited. Per user direction: workflows are workflows. Loops self-resolve via OPA `obligations` (audit_log makes runaway loops visible) and per-workflow cost caps. |
+| Policy intersection deny-by-default blocks legit workflows | `PolicyDecision.reason` always names the denying org + rule. Override path: workflow author bumps `role` in input with admin sign-off (logged in F5 envelope). |
+| Egress cost surprise | F3 locality routing + `budget_max_usd` cap + pre-flight cost estimate via `compute(action='estimate')`. |
+| Platform root-CA single point of failure | Acknowledged. Mitigation: F5 audit envelope is platform-independent (Ed25519 signatures over execution facts). If platform is compromised, audit trail still proves who-did-what-when. |
+| Multi-org Rego version drift | Federation manifest pins peer policy version. Drift triggers a warning, not a hard fail. |
+| WAN P2P overlay vaporware | v1 explicitly relies on platform-mediated relay. Direct connections work when reachable. libp2p / iroh-net upgrade is v1.5. |
+| Audit envelope log bloat | Metadata replicated via mesh (small); full payload only at signing orgs. Compaction: keep last 90 days local; older referenced by hash. |
 
 ---
 
-## Open questions for you
+## Decisions locked (was: open questions)
 
-These are real design choices I want your input on before code:
-
-1. **Federation trust model** — pairwise only (my recommendation, simpler) or transitive with hop limit?
-
-2. **Policy intersection semantics** — strict intersection (most restrictive wins) or weighted (each org has a "trust weight," decisions aggregate)? My recommendation: strict for v1.
-
-3. **Crate naming** — `crates/federation/` for the new crate (technical primitive), reserve "Fabric" as the *product* name? Or `crates/fabric/` as the umbrella? My recommendation: `federation`.
-
-4. **v1 success criterion** — the docker-compose three-org aerospace-prime walkthrough. Yes / no / different?
-
-5. **Should F5 (audit envelope) be in v1?** It's ~1.5 weeks of work. Without it, cross-org actions still happen (F1-F4 sufficient) but provenance is weaker. With it, contracts can rely on the audit trail. My recommendation: include in v1 — the customer story is much weaker without it.
-
-6. **Should we attempt a real P2P overlay in v1?** I said deferred-to-v2 because it's hard. But if we use libp2p or iroh-net, it might be ~2 extra weeks for v1. Your call. My recommendation: defer; platform-mediated discovery is enough for the prime use case.
+| # | Question | Decision |
+|---|---|---|
+| 1 | Trust model | **Transitive root-CA via MARC27 platform.** Identity from `prism login`. Tokens carry `org_id`, `project_id`, `roles[]`. Platform signs the node pubkey at first boot. No pairwise MoUs. |
+| 2 | Policy intersection semantics | **Strictest-wins.** Most restrictive decision applies. Obligations union. Predictable, safe-default, auditable. |
+| 3 | Crate naming | **Extend `crates/mesh/`.** Federation lives in a new module inside mesh, not in a separate crate. Audit gets its own small crate to avoid circular deps. Product name "PRISM Fabric" stays as marketing. |
+| 4 | v1 success criterion | **Cross-site inference roundtrip.** User at site A → GPU at site B → result returns. Aerospace 3-org training walkthrough is v1.5. |
+| 5 | P2P overlay scope | **Direct + relay nodes.** Platform is relay-of-record for v1. Direct connections work when reachable. libp2p/iroh-net hardening is v1.5. |
+| 6 | F5 (audit envelope) in v1 | **Yes — keep.** Belt-and-suspenders against platform CA compromise. Customer contracts will ask for it. |
 
 ---
 
-## What I'd build first if you OK
+## Build phases (concrete order)
 
-**Phase A (3 weeks):** F1 + F2 + F3.
-- Output: agent can run a workflow that requires sign-off from two orgs' policies AND routes co-located.
-- Demo to user, iterate.
+**Phase A (1.5 weeks): F1 + F2 — federation + cross-org policy.**
+- Output: a signed cross-org request between two nodes is verified end-to-end. Two-org policy intersection works.
+- Stop and demo before continuing.
 
-**Phase B (3 weeks):** F4 + F5.
-- Output: capability-aware burst routing + signed audit envelope.
+**Phase B (2.5 weeks): F3 + F4 — locality + capability.**
+- Output: `compute_submit` routes co-located + bursts to cloud when needed; capability descriptors visible.
+- Stop and demo.
 
-**Phase C (1.5 weeks):** F6 docker-compose three-org demo.
-- Output: aerospace-prime walkthrough end-to-end.
+**Phase C (1.5 weeks): F5 — audit envelope.**
+- Output: 3-org execution produces a signed envelope; tampering detected.
 
-Stop after Phase A if the design needs revision. F4–F6 only start when F1–F3 are demoed and approved.
+**Phase D (1 week): F6 — the cross-site inference demo.**
+- Output: docker-compose harness with two sites; end-to-end inference roundtrip with all of F1–F5 visible in the trace.
+
+**Total: ~6.5 weeks.** Each phase is independently shippable.
 
 ---
 
-**No code. Awaiting your review.**
-
-Critical questions you should answer before I touch a Rust file:
-1. Does the use-case framing (aerospace prime, 3 offices, mixed HPC) match what you're targeting?
-2. Are F1–F5 the right scope, or am I missing/over-including?
-3. Trust model: pairwise or transitive?
-4. v1 success criterion: docker-compose three-org demo — or something different?
-5. Is "no ML plane in v1" too restrictive, or right-sized?
+**Going in build order: F1 → F2 → F3 → F4 → F5 → F6.**
