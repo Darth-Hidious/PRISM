@@ -1,4 +1,53 @@
-"""Pyiron bridge layer — lazy init, config management, structure/job stores."""
+"""Pyiron bridge — thin wrapper between PRISM tools and the pyiron stack.
+
+ARCHITECTURAL BOUNDARY (do not violate without discussion)
+==========================================================
+
+This module is the ONLY place PRISM imports from pyiron. Everything else
+goes through `get_bridge()` and the {Structure,Job}Store helpers exposed
+here. That's deliberate. See docs/pyiron_integration.md for the full
+rationale; the short version:
+
+  PRISM is an AI-native research workspace.
+  pyiron is an atomistic-simulation IDE / orchestrator.
+
+They sit at DIFFERENT levels of the stack. pyiron is a tool inside
+PRISM, not a competitor. To keep the boundary clean:
+
+  WE USE
+    - pyiron_atomistics    (LAMMPS / VASP / GPAW / SPHInX wrappers + ASE compat)
+    - pyiron_base          (Project, Job, HDF5/SQL storage, queue submission)
+    - executorlib          (HPC dispatch via SLURM, transitive)
+
+  WE DO NOT USE
+    - pyiron_workflow      (graph-based workflow framework — overlaps with our
+                            skills + YAML workflows; different abstraction)
+    - pyiron_core          (visual GUI for graph workflows — pure UI, irrelevant)
+
+  WE DO NOT DUPLICATE
+    - HDF5 storage of simulation results (pyiron owns this; our artifact
+      store records pointers/summaries, not the bulk data)
+    - The pyiron job database (SQL) — we keep our own JobStore as a
+      session-local cache of references, not a parallel database
+    - SLURM submission for atomistic codes (always go through
+      `pyiron job.server.queue` / executorlib; our compute broker is for
+      generic GPU work — training, inference, container jobs — NOT
+      atomistic sim)
+    - ASE-compatible structure objects (always use pyiron's, never roll
+      our own)
+
+  RESULT-LAYER POSITIONING
+    - pyiron's HDF5 = source of truth for simulation outputs
+    - PRISM's artifact store (Memex layer) = high-level summaries + the
+      pyiron job_id as provenance pointer; the agent recalls the
+      pointer, then dereferences via this bridge if it needs the full
+      HDF5 data
+
+If you find yourself reaching for pyiron_workflow's graph nodes or
+duplicating HDF5 storage, stop and re-read this docstring. The whole
+point of having pyiron as a backend is to NOT solve problems they've
+already solved well.
+"""
 import json
 import uuid
 from pathlib import Path
@@ -6,7 +55,12 @@ from typing import Any, Dict, List, Optional
 
 
 def check_pyiron_available() -> bool:
-    """Return True if pyiron_atomistics is importable."""
+    """Return True if pyiron_atomistics is importable.
+
+    pyiron_atomistics 0.6+ supports Python 3.9–3.14 (atomistics 0.3.6+).
+    Earlier PRISM versions gated this at python_version<'3.14' which
+    excluded macOS arm64 default Python; the gate is now <'3.15'.
+    """
     try:
         import pyiron_atomistics  # noqa: F401
         return True
