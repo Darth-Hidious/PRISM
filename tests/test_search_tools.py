@@ -1,4 +1,10 @@
-"""Tests for literature_search and patent_search tools."""
+"""Tests for the search tools.
+
+After Round 6: the literature_search and patent_search Tool aliases were
+removed. Both functionalities live behind prior_art_search(source=…). The
+private _literature_search / _patent_search helpers are preserved for
+direct testing because prior_art_search dispatches into them.
+"""
 import pytest
 from unittest.mock import patch, MagicMock
 from app.tools.base import ToolRegistry
@@ -6,29 +12,24 @@ from app.tools.search import create_search_tools, _literature_search, _patent_se
 
 
 class TestCreateSearchTools:
-    def test_registers_both_tools(self):
+    def test_registers_prior_art_search(self):
         reg = ToolRegistry()
         create_search_tools(reg)
         names = [t.name for t in reg.list_tools()]
-        assert "literature_search" in names
-        assert "patent_search" in names
+        # Unified entry — replaced the two aliases
+        assert "prior_art_search" in names
+        # Old aliases must be gone (they inflated the retrieval surface
+        # without adding capability)
+        assert "literature_search" not in names
+        assert "patent_search" not in names
 
-    def test_literature_search_tool_schema(self):
+    def test_prior_art_search_schema(self):
         reg = ToolRegistry()
         create_search_tools(reg)
-        tool = reg.get("literature_search")
-        assert tool.input_schema["required"] == ["query"]
+        tool = reg.get("prior_art_search")
+        assert "query" in tool.input_schema["required"]
         assert "query" in tool.input_schema["properties"]
-        assert "max_results" in tool.input_schema["properties"]
-        assert "sources" in tool.input_schema["properties"]
-
-    def test_patent_search_tool_schema(self):
-        reg = ToolRegistry()
-        create_search_tools(reg)
-        tool = reg.get("patent_search")
-        assert tool.input_schema["required"] == ["query"]
-        assert "query" in tool.input_schema["properties"]
-        assert "max_results" in tool.input_schema["properties"]
+        assert "source" in tool.input_schema["properties"]
 
 
 class TestLiteratureSearchFunc:
@@ -40,7 +41,7 @@ class TestLiteratureSearchFunc:
         ]
         result = _literature_search(query="tungsten alloy")
         assert result["count"] == 2
-        assert result["query"] == "tungsten alloy"
+        assert result["source"] == "literature"
         assert len(result["results"]) == 2
 
     @patch("app.tools.data_collectors.literature_collector.LiteratureCollector.collect")
@@ -59,7 +60,7 @@ class TestPatentSearchFunc:
         ]
         result = _patent_search(query="alloy coating")
         assert result["count"] == 1
-        assert result["query"] == "alloy coating"
+        assert result["source"] == "patents"
 
     @patch("app.tools.data_collectors.patent_collector.PatentCollector.collect")
     def test_no_token_empty(self, mock_collect):
