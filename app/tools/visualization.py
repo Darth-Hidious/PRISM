@@ -127,27 +127,130 @@ def _plot_correlation_matrix(**kwargs) -> dict:
 def create_visualization_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="plot_materials_comparison",
-        description="Create a scatter plot comparing materials on two properties. Saves as PNG.",
-        input_schema={"type": "object", "properties": {
-            "materials": {"type": "array", "items": {"type": "object"}, "description": "List of material dicts with property values and name/formula"},
-            "property_x": {"type": "string"}, "property_y": {"type": "string"},
-            "output_path": {"type": "string"}, "title": {"type": "string"}},
-            "required": ["materials", "property_x", "property_y"]},
-        func=_plot_materials_comparison))
+        description=(
+            "Render a scatter plot showing how a list of candidate "
+            "materials compare on two property axes (X vs Y). Use this "
+            "when the user has specific materials they want to visually "
+            "rank — e.g. 'show me the trade-off between bulk modulus "
+            "and density for these 12 alloys' or 'plot Inconel 718 "
+            "vs CMSX-4 vs Haynes 282 on creep_resistance vs cost'. "
+            "Each material becomes one point; labels are drawn from "
+            "name or formula. NOT for plotting a single property's "
+            "shape across many materials (use `plot_property_distribution` "
+            "for that) and NOT for showing correlations between many "
+            "properties (use `plot_correlation_matrix`). Output is a "
+            "PNG file path."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "materials": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        "List of material dicts. Each dict must have the "
+                        "two property keys named in property_x / property_y, "
+                        "plus a 'name' or 'formula' field used as the point label."
+                    ),
+                },
+                "property_x": {
+                    "type": "string",
+                    "description": "Property name plotted on the X axis (must be a key in every material dict).",
+                },
+                "property_y": {
+                    "type": "string",
+                    "description": "Property name plotted on the Y axis.",
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": "Where to save the PNG (defaults to a temp path under ~/.prism/plots/).",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional plot title — defaults to '{property_y} vs {property_x}'.",
+                },
+            },
+            "required": ["materials", "property_x", "property_y"],
+            "additionalProperties": False,
+        },
+        func=_plot_materials_comparison,
+    ))
     registry.register(Tool(
         name="plot_property_distribution",
-        description="Create a histogram showing the distribution of a material property.",
-        input_schema={"type": "object", "properties": {
-            "values": {"type": "array", "items": {"type": "number"}, "description": "Numeric values to plot"},
-            "property_name": {"type": "string"}, "output_path": {"type": "string"}},
-            "required": ["values"]},
-        func=_plot_property_distribution))
+        description=(
+            "Render a histogram of one property's distribution across a "
+            "set of values. Use this when the user wants to understand "
+            "the SHAPE of a property — 'is the formation energy of these "
+            "candidates centered around zero or skewed?', 'what's the "
+            "spread of band gaps in my dataset?'. Single-property; pass "
+            "the values array directly. NOT for comparing multiple "
+            "materials side-by-side (use `plot_materials_comparison`) "
+            "and NOT for property-vs-property relationships (use "
+            "`plot_correlation_matrix`). Output is a PNG file path."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "values": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Numeric values whose distribution will be plotted.",
+                },
+                "property_name": {
+                    "type": "string",
+                    "description": "Name of the property — used as X-axis label.",
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": "Where to save the PNG.",
+                },
+            },
+            "required": ["values"],
+            "additionalProperties": False,
+        },
+        func=_plot_property_distribution,
+    ))
     registry.register(Tool(
         name="plot_correlation_matrix",
-        description="Plot a correlation heatmap for numeric properties in a dataset.",
-        input_schema={"type": "object", "properties": {
-            "dataset_name": {"type": "string", "description": "Dataset name in DataStore"},
-            "columns": {"type": "array", "items": {"type": "string"}, "description": "Columns to include (all numeric if omitted)"},
-            "output_path": {"type": "string", "description": "Output PNG path"}},
-            "required": ["dataset_name"]},
-        func=_plot_correlation_matrix))
+        description=(
+            "Render a heatmap showing pairwise Pearson correlations "
+            "between every pair of numeric columns in a stored dataset. "
+            "Use this when the user wants to find which properties "
+            "covary — 'which features matter for predicting bulk "
+            "modulus?', 'show me what's correlated with creep "
+            "resistance in my screening data'. Operates on a dataset "
+            "already in the PRISM DataStore (use `import_dataset` "
+            "first if your data lives in a CSV). Pass `columns` to "
+            "restrict to a subset; default is every numeric column. "
+            "NOT for ad-hoc point clouds (use `plot_materials_comparison`) "
+            "and NOT for one-property shape (use `plot_property_distribution`). "
+            "Output is a PNG file path."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "dataset_name": {
+                    "type": "string",
+                    "description": (
+                        "Dataset registered in the PRISM DataStore. "
+                        "Use `import_dataset` first if you need to load a CSV."
+                    ),
+                },
+                "columns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional subset of columns. Omit to use every "
+                        "numeric column in the dataset."
+                    ),
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": "Where to save the PNG.",
+                },
+            },
+            "required": ["dataset_name"],
+            "additionalProperties": False,
+        },
+        func=_plot_correlation_matrix,
+    ))

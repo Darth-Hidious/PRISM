@@ -225,6 +225,21 @@ def create_system_tools(registry: ToolRegistry) -> None:
         func=_web_search))
     registry.register(Tool(
         name="show_scratchpad",
-        description="Show the agent's execution log (scratchpad) — lists all actions taken so far in this session.",
-        input_schema={"type": "object", "properties": {}},
-        func=_show_scratchpad))
+        description=(
+            "Print the agent's execution log for this chat session — an "
+            "ordered list of every tool the agent has called so far, "
+            "along with the arguments and a short result summary per "
+            "call. Use this when the user asks 'what have you done so "
+            "far?', 'show me your work', 'what tools did you call to "
+            "get this answer?', or when the agent itself needs to "
+            "remind itself of prior steps before deciding the next "
+            "action. Read-only; does not affect state. Returns a "
+            "structured list, one entry per tool invocation."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        func=_show_scratchpad,
+    ))
