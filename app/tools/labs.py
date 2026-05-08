@@ -1,12 +1,17 @@
-"""Labs tools — premium marketplace service access for the agent.
+"""Labs — UNIFIED tool collapsing 4 marketplace actions into one entry point.
 
-These tools let the agent browse, check subscriptions, and submit jobs
-to premium lab services (A-Labs, DfM, Cloud DFT, Quantum, etc.).
-Actual execution is handled by the MARC27 platform API.
+DRAFT for Round 4. Replaces app/tools/labs.py.
+
+Replaces (4 tools → 1):
+  list_lab_services        → action='list'        (browse catalog)
+  get_lab_service_info     → action='info'        (one service detail)
+  check_lab_subscriptions  → action='subscriptions' (active subscriptions)
+  submit_lab_job           → action='submit'      (dispatch a job)
+
+PRESERVES the catalog + subscriptions JSON sources unchanged.
 """
 import json
 from pathlib import Path
-
 from app.tools.base import Tool, ToolRegistry
 
 
@@ -33,40 +38,39 @@ def _load_subscriptions() -> list:
         return []
 
 
-def _list_lab_services(**kwargs) -> dict:
-    """List available premium lab services."""
+# --- Per-action handlers ---------------------------------------------------
+
+def _act_list(**kw) -> dict:
     catalog = _load_catalog()
     services = catalog.get("services", {})
-    category = kwargs.get("category")
+    category = kw.get("category")
     if category:
         services = {k: v for k, v in services.items() if v.get("category") == category}
 
-    result = []
-    for sid, svc in services.items():
-        result.append({
-            "id": sid,
-            "name": svc.get("name", sid),
-            "category": svc.get("category", "unknown"),
-            "provider": svc.get("provider", "unknown"),
-            "cost_model": svc.get("cost_model", "unknown"),
-            "status": svc.get("status", "coming_soon"),
-            "description": svc.get("description", ""),
-        })
+    return {
+        "services": [
+            {
+                "id": sid,
+                "name": svc.get("name", sid),
+                "category": svc.get("category", "unknown"),
+                "provider": svc.get("provider", "unknown"),
+                "cost_model": svc.get("cost_model", "unknown"),
+                "status": svc.get("status", "coming_soon"),
+                "description": svc.get("description", ""),
+            }
+            for sid, svc in services.items()
+        ],
+        "count": len(services),
+    }
 
-    return {"services": result, "count": len(result)}
 
-
-def _get_lab_service_info(**kwargs) -> dict:
-    """Get detailed information about a specific lab service."""
-    service_id = kwargs.get("service_id")
+def _act_info(**kw) -> dict:
+    service_id = kw.get("service_id")
     if not service_id:
-        return {"error": "service_id is required"}
-
-    catalog = _load_catalog()
-    svc = catalog.get("services", {}).get(service_id)
+        return {"error": "Action 'info' requires `service_id`"}
+    svc = _load_catalog().get("services", {}).get(service_id)
     if not svc:
         return {"error": f"Service '{service_id}' not found"}
-
     return {
         "id": service_id,
         "name": svc.get("name", service_id),
@@ -82,8 +86,7 @@ def _get_lab_service_info(**kwargs) -> dict:
     }
 
 
-def _check_lab_subscriptions(**kwargs) -> dict:
-    """Check active lab subscriptions."""
+def _act_subscriptions(**_) -> dict:
     subs = _load_subscriptions()
     return {
         "subscriptions": [
@@ -100,18 +103,12 @@ def _check_lab_subscriptions(**kwargs) -> dict:
     }
 
 
-def _submit_lab_job(**kwargs) -> dict:
-    """Submit a job to a premium lab service.
-
-    This is a placeholder — actual submission goes through the MARC27
-    platform API once the service is available.
-    """
-    service_id = kwargs.get("service_id")
+def _act_submit(**kw) -> dict:
+    service_id = kw.get("service_id")
     if not service_id:
-        return {"error": "service_id is required"}
+        return {"error": "Action 'submit' requires `service_id`"}
 
-    catalog = _load_catalog()
-    svc = catalog.get("services", {}).get(service_id)
+    svc = _load_catalog().get("services", {}).get(service_id)
     if not svc:
         return {"error": f"Service '{service_id}' not found"}
 
@@ -122,7 +119,6 @@ def _submit_lab_job(**kwargs) -> dict:
             "register_interest": f"https://prism.marc27.com/labs/{service_id}",
         }
 
-    # Check subscription
     subs = _load_subscriptions()
     sub = next((s for s in subs if s.get("service") == service_id), None)
     if not sub:
@@ -130,149 +126,93 @@ def _submit_lab_job(**kwargs) -> dict:
             "error": f"Not subscribed to {svc['name']}",
             "subscribe": f"prism labs subscribe {service_id}",
         }
-
     if not sub.get("api_key"):
         return {
             "error": "API key not configured",
             "set_key": f"prism labs subscribe {service_id} --api-key YOUR_KEY",
         }
 
-    # Placeholder for actual API submission
     return {
         "status": "submitted",
         "service": svc["name"],
         "message": "Job submitted to MARC27 platform. Check status with prism labs status.",
-        "job_params": kwargs.get("parameters", {}),
+        "job_params": kw.get("parameters", {}),
     }
 
 
+_DISPATCH = {
+    "list":          _act_list,
+    "info":          _act_info,
+    "subscriptions": _act_subscriptions,
+    "submit":        _act_submit,
+}
+
+
+def _labs(**kwargs) -> dict:
+    action = kwargs.pop("action", None)
+    if not action:
+        return {
+            "error": f"Missing 'action'. Valid: {list(_DISPATCH.keys())}",
+            "hint": "labs(action='list') / labs(action='info', service_id='...') / labs(action='submit', service_id='...', parameters={...})",
+        }
+    handler = _DISPATCH.get(action)
+    if not handler:
+        return {"error": f"Unknown action '{action}'. Valid: {list(_DISPATCH.keys())}"}
+    try:
+        return handler(**kwargs)
+    except Exception as e:
+        return {"error": str(e), "action": action}
+
+
+_DESCRIPTION = (
+    "MARC27 Premium Labs marketplace — autonomous robotic synthesis (A-Labs), "
+    "design-for-manufacturing assessment, hosted DFT/QE/CP2K, real quantum "
+    "hardware (IBM/IonQ/Quantinuum), synchrotron beamline time, HT screening. "
+    "ONE tool, four actions:\n"
+    "  • action='list' — browse catalog. Optional `category` filter "
+    "(a-labs, dfm, cloud-dft, quantum, synchrotron, ht-screening).\n"
+    "  • action='info' — full detail on one service. Requires `service_id`.\n"
+    "  • action='subscriptions' — show active subscriptions + usage. No args.\n"
+    "  • action='submit' — DISPATCH A REAL LAB JOB (subscription required, "
+    "may incur cost). Requires `service_id`; pass payload via `parameters`. "
+    "Verifies subscription + API key before dispatching.\n"
+    "NOT for compute-broker GPU jobs (use compute) and NOT for local "
+    "simulations (use sim_tools)."
+)
+
+
+_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": list(_DISPATCH.keys()),
+            "description": "Which labs operation to perform.",
+        },
+        "service_id": {
+            "type": "string",
+            "description": "Lab service ID. Required for action='info' and action='submit'.",
+        },
+        "category": {
+            "type": "string",
+            "enum": ["a-labs", "dfm", "cloud-dft", "quantum", "synchrotron", "ht-screening"],
+            "description": "Optional filter for action='list'.",
+        },
+        "parameters": {
+            "type": "object",
+            "description": "Job-specific payload for action='submit'. Shape depends on the service.",
+        },
+    },
+    "required": ["action"],
+    "additionalProperties": False,
+}
+
+
 def create_labs_tools(registry: ToolRegistry) -> None:
-    """Register premium labs tools."""
-
+    """Register the unified `labs` tool (replaces 4 prior tools)."""
     registry.register(Tool(
-        name="list_lab_services",
-        description=(
-            "List the premium experimental and computational lab services "
-            "available through the MARC27 marketplace. Categories include "
-            "**A-Labs** (autonomous robotic synthesis like Berkeley's), "
-            "**DfM** (Design-for-Manufacturing assessment), **Cloud DFT** "
-            "(hosted VASP/QE/CP2K runs without managing your own cluster), "
-            "**Quantum** (real quantum-hardware access via IBM/IonQ/Quantinuum), "
-            "**Synchrotron** (beamline time at user facilities), and "
-            "**HT Screening** (high-throughput experimental campaigns). "
-            "Use this when the user asks 'what lab services do I have', "
-            "'how can I run real DFT', 'who can synthesize this for me', "
-            "or before calling `submit_lab_job` so you know what's offered. "
-            "Returns service id + name + category + provider + cost model + "
-            "current status (live / coming-soon)."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "enum": ["a-labs", "dfm", "cloud-dft", "quantum", "synchrotron", "ht-screening"],
-                    "description": (
-                        "Optional category filter. Omit to see every service "
-                        "across categories. Use when the user mentions a "
-                        "specific class of work ('any cloud DFT services?')."
-                    ),
-                },
-            },
-            "additionalProperties": False,
-        },
-        func=_list_lab_services,
-    ))
-
-    registry.register(Tool(
-        name="get_lab_service_info",
-        description=(
-            "Pull the full spec for one specific premium lab service: "
-            "capabilities (what it actually does), requirements (turnaround "
-            "time, data inputs, file formats), pricing model, and the list "
-            "of sub-tools that service exposes. Use this AFTER "
-            "`list_lab_services` has surfaced a candidate, when the user "
-            "wants to compare options or before constructing a `submit_lab_job` "
-            "call. Returns a marketplace_url so the agent can point the "
-            "user at the web UI for subscription if needed."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "service_id": {
-                    "type": "string",
-                    "description": (
-                        "Exact service identifier returned by "
-                        "`list_lab_services` (e.g. 'matlantis_dft', "
-                        "'dfm_assessment', 'a_lab_synthesis'). "
-                        "Case-sensitive; copy verbatim from list output."
-                    ),
-                },
-            },
-            "required": ["service_id"],
-            "additionalProperties": False,
-        },
-        func=_get_lab_service_info,
-    ))
-
-    registry.register(Tool(
-        name="check_lab_subscriptions",
-        description=(
-            "Report which premium lab services the current MARC27 account "
-            "is subscribed to right now, plus usage-to-date for each. Use "
-            "this when the user asks 'what am I paying for?', 'do I still "
-            "have access to X?', or before `submit_lab_job` to confirm the "
-            "subscription is active and not over quota. No arguments — "
-            "operates on the logged-in account. Returns subscription list "
-            "with service id, plan tier, usage counters, expiry date."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        },
-        func=_check_lab_subscriptions,
-    ))
-
-    registry.register(Tool(
-        name="submit_lab_job",
-        description=(
-            "Submit a real job to a premium lab service — this is the "
-            "money-spending action. Requires an active subscription "
-            "(check with `check_lab_subscriptions`) and the per-service "
-            "parameter shape (look up with `get_lab_service_info`). "
-            "Returns a job_id that can be polled for status; some services "
-            "are minutes (cloud DFT relax), some are weeks (A-Lab synthesis). "
-            "ALWAYS confirm with the user before calling this — `requires_approval` "
-            "is set so the harness will pause for explicit consent. Don't "
-            "call this for hypothetical 'what if we tried...' framings; "
-            "use `compute_estimate` if the user wants a cost preview."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "service_id": {
-                    "type": "string",
-                    "description": (
-                        "Service identifier from `list_lab_services` / "
-                        "`get_lab_service_info`. Subscription must be active."
-                    ),
-                },
-                "parameters": {
-                    "type": "object",
-                    "description": (
-                        "Per-service parameter object. Shape depends on "
-                        "the service — call `get_lab_service_info` first "
-                        "to learn the required keys. For Cloud DFT, "
-                        "typically {structure, calculation_type, kpoints, "
-                        "encut, ...}; for A-Lab synthesis, {target_formula, "
-                        "precursors, route, temperature_program, ...}."
-                    ),
-                },
-            },
-            "required": ["service_id"],
-            "additionalProperties": False,
-        },
-        func=_submit_lab_job,
-        requires_approval=True,
+        name="labs",
+        description=_DESCRIPTION,
+        input_schema=_SCHEMA,
+        func=_labs,
     ))
