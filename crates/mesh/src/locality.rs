@@ -191,7 +191,7 @@ pub fn rank_candidates<'a, T>(
         .filter(|(_, s)| s.0 > 0)
         .collect();
     // Stable sort, descending by score.
-    scored.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    scored.sort_by_key(|(_, s)| std::cmp::Reverse(s.0));
     scored
 }
 
