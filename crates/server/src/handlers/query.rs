@@ -170,6 +170,21 @@ async fn handle_nl_query(
     // Reject with a clear message; the user can switch to a write-aware
     // endpoint if they actually want destructive behavior.
     if let Some(found) = detect_blocked_cypher_keyword(&translation.cypher) {
+        // Audit the LLM-generated denial — distinguishes prompt-injection
+        // attempts from genuine user write requests. See Bug #55.
+        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            user_id: user_id.to_string(),
+            action: prism_core::audit::AuditAction::DataQuery,
+            target: "nl".into(),
+            detail: Some(format!(
+                "LLM emitted blocked keyword: {} (cypher={})",
+                found.trim(),
+                translation.cypher
+            )),
+            outcome: prism_core::audit::AuditOutcome::Denied,
+        });
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -233,6 +248,19 @@ async fn handle_cypher_query(
     };
 
     if let Some(found) = detect_blocked_cypher_keyword(&body.query) {
+        // Audit the denial — failed/blocked operations are at least as
+        // important to log as successes for security review. Without
+        // this, admins reviewing the audit log can't see attack
+        // attempts. See Bug #55.
+        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            user_id: user_id.to_string(),
+            action: prism_core::audit::AuditAction::DataQuery,
+            target: "cypher".into(),
+            detail: Some(format!("blocked keyword: {}", found.trim())),
+            outcome: prism_core::audit::AuditOutcome::Denied,
+        });
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -250,6 +278,19 @@ async fn handle_cypher_query(
 
     let results = store.query_cypher(&body.query, None).await.map_err(|e| {
         tracing::error!(error = %e, "Cypher query failed");
+        // Failed query — log as Failure for the audit trail. Surface to
+        // admins reviewing security: a Cypher syntax error from a real
+        // user is benign noise, but the same error from a probe trying
+        // to fingerprint the schema is signal.
+        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            user_id: user_id.to_string(),
+            action: prism_core::audit::AuditAction::DataQuery,
+            target: "cypher".into(),
+            detail: Some(format!("execution error: {e}")),
+            outcome: prism_core::audit::AuditOutcome::Failure,
+        });
         internal_error("Cypher execution failed.")
     })?;
 
