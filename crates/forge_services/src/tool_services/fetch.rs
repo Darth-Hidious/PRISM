@@ -71,15 +71,11 @@ impl ForgeFetch {
             .get(url.as_str())
             .send()
             .await
-            .map_err(|e| anyhow!("Failed to fetch URL {url}: {e}"))?;
+            .map_err(|e| anyhow!("{}", classify_request_error(url, &e)))?;
         let code = response.status().as_u16();
 
         if !response.status().is_success() {
-            return Err(anyhow!(
-                "Failed to fetch {} - status code {}",
-                url,
-                response.status()
-            ));
+            return Err(anyhow!("{}", classify_status_error(url, response.status())));
         }
 
         let content_type = response
@@ -145,7 +141,7 @@ impl ForgeFetch {
 
 /// Coerce LLM-emitted URL strings into something the parser will accept.
 ///
-/// Real LLMs in real PRISM sessions emit two recoverable URL shapes
+/// Real LLMs in real PRISM sessions emit three recoverable URL shapes
 /// that `url::Url::parse` would otherwise reject:
 ///
 /// 1. **Protocol-relative** (`//host/path`) — common when the model
@@ -154,6 +150,11 @@ impl ForgeFetch {
 ///    Since we always fetch over HTTPS in this tool, prefix `https:`.
 /// 2. **Scheme-less** (`host.tld/path`) — the model wrote a domain
 ///    without `https://`. Prefix `https://`.
+/// 3. **Stray leading dot** (`.host.tld/path`) — observed when the
+///    model is mid-typo or has confused itself in a long fetch retry
+///    loop. The user's intent is plainly the same domain without the
+///    leading dot. Strip a single dot, then fall through to the
+///    scheme-less branch.
 ///
 /// We only do this when the input is otherwise unparseable. Inputs
 /// with a recognized scheme go through unchanged.
@@ -170,19 +171,29 @@ fn normalize_url(input: &str) -> String {
         return format!("https://{rest}");
     }
 
+    // Stray leading dot: `.host.tld/path` → `host.tld/path`. We strip
+    // *one* dot only when followed by a domain-shaped char (alnum or
+    // a dash). `..foo` or `. foo` keep their original shape so the
+    // parser can return a meaningful "this is junk" error to the
+    // caller — better to fail loudly than silently fetch garbage.
+    let trimmed = if let Some(rest) = trimmed.strip_prefix('.')
+        && rest.chars().next().is_some_and(is_domain_lead_char)
+    {
+        rest
+    } else {
+        trimmed
+    };
+
     // Scheme-less domain-shaped: `host.tld[/...]` (no scheme, no
-    // leading slash). Avoid prefixing if the input already starts
-    // with `/`, `?`, `#`, or `mailto:`-style — those aren't URLs we
-    // can safely recover.
+    // leading slash). The host segment must:
+    //   - contain at least one `.` (otherwise it's a bare word, not a domain),
+    //   - start with a domain-lead char (rejects `..foo`, `.foo` already
+    //     handled above, and `?#/` already filtered out).
+    let host = trimmed.split(['/', '?', '#']).next().unwrap_or("");
     if !trimmed.is_empty()
-        && !trimmed.starts_with('/')
-        && !trimmed.starts_with('?')
-        && !trimmed.starts_with('#')
         && !trimmed.contains("://")
-        && trimmed
-            .split(['/', '?', '#'])
-            .next()
-            .is_some_and(|host| host.contains('.'))
+        && host.contains('.')
+        && host.chars().next().is_some_and(is_domain_lead_char)
     {
         return format!("https://{trimmed}");
     }
@@ -192,12 +203,80 @@ fn normalize_url(input: &str) -> String {
     trimmed.to_string()
 }
 
+/// Whether `c` could legitimately start a hostname label. Conservative:
+/// hostnames RFC-allow letters/digits at the start; we additionally
+/// allow underscore (rare but real in dev URLs). Excludes `.` so we
+/// never strip the leading dot of `..foo` and pretend it's recoverable.
+fn is_domain_lead_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Format a `reqwest::Error` for the agent. The agent reads this string
+/// directly, so we phrase the failure mode in a way that nudges it toward
+/// the right next move:
+///   - DNS / connect failures → the host doesn't exist; don't retry with
+///     another guessed URL, fall back to training knowledge.
+///   - Timeouts → the server is slow or unreachable; one retry is fine.
+///   - Other transport errors → generic message.
+fn classify_request_error(url: &Url, e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        return format!(
+            "Request to {url} timed out. The server may be slow or unreachable. \
+             You may retry once; if it fails again, fall back to your training knowledge."
+        );
+    }
+    if e.is_connect() {
+        return format!(
+            "Could not connect to {url}. The host likely does not exist or has no DNS record. \
+             Do not retry with another guessed URL — this often means the URL was hallucinated. \
+             Fall back to your training knowledge or ask the user for the correct URL."
+        );
+    }
+    format!("Failed to fetch URL {url}: {e}")
+}
+
+/// Format a non-2xx HTTP status for the agent.
+///   - 404 / 410 → URL doesn't exist (or no longer does); don't retry,
+///     fall back to training knowledge or ask the user.
+///   - 401 / 403 → auth-walled; the agent has no credentials, fall back.
+///   - 429 → rate-limited; retry-after with backoff is appropriate.
+///   - 5xx → server-side; one retry is fine.
+fn classify_status_error(url: &Url, status: reqwest::StatusCode) -> String {
+    let code = status.as_u16();
+    match code {
+        404 | 410 => format!(
+            "URL {url} returned {code} (not found). The page does not exist. \
+             Do not retry with another guessed URL — fall back to your training knowledge \
+             or ask the user for the correct URL."
+        ),
+        401 | 403 => format!(
+            "URL {url} returned {code} (auth required). The fetch tool has no credentials \
+             for this resource. Fall back to your training knowledge or ask the user for \
+             a public URL."
+        ),
+        429 => format!(
+            "URL {url} returned 429 (rate-limited). Wait briefly before retrying, or use a \
+             different source."
+        ),
+        500..=599 => format!(
+            "URL {url} returned {code} (server error). One retry is appropriate; if it fails \
+             again, fall back to another source or your training knowledge."
+        ),
+        _ => format!("Failed to fetch {url} - status code {status}"),
+    }
+}
+
 #[async_trait::async_trait]
 impl NetFetchService for ForgeFetch {
     async fn fetch(&self, url: String, raw: Option<bool>) -> anyhow::Result<HttpResponse> {
         let normalized = normalize_url(&url);
-        let parsed =
-            Url::parse(&normalized).with_context(|| format!("Failed to parse URL: {url}"))?;
+        let parsed = Url::parse(&normalized).with_context(|| {
+            format!(
+                "URL `{url}` is not parseable. This usually means the URL is malformed or \
+                 hallucinated. Do not retry with another guessed URL — fall back to your \
+                 training knowledge or ask the user for the correct URL."
+            )
+        })?;
 
         self.fetch_url(&parsed, raw.unwrap_or(false)).await
     }
@@ -264,9 +343,116 @@ mod tests {
     }
 
     #[test]
+    fn normalize_url_strips_stray_leading_dot() {
+        // Real example from a PRISM TUI session (Bug #13): the LLM
+        // emitted `.wikipedia.org/Ti-6Al-4V` mid-retry. Pre-fix the
+        // existing scheme-less branch would happily produce
+        // `https://.wikipedia.org/...`, which is also unparseable.
+        assert_eq!(
+            normalize_url(".wikipedia.org/Ti-6Al-4V"),
+            "https://wikipedia.org/Ti-6Al-4V"
+        );
+        assert_eq!(normalize_url(".example.com"), "https://example.com");
+        assert_eq!(
+            normalize_url(".sub.example.com/page"),
+            "https://sub.example.com/page"
+        );
+    }
+
+    #[test]
+    fn normalize_url_does_not_strip_double_dot_or_space_after_dot() {
+        // Double-dot: probably truly broken model output. Don't
+        // pretend we recovered it — let the parser surface the error
+        // so the calling agent can fall back to training knowledge.
+        assert_eq!(normalize_url("..wikipedia.org"), "..wikipedia.org");
+        // Dot followed by space: definitely not a hostname start.
+        assert_eq!(normalize_url(". wikipedia.org"), ". wikipedia.org");
+    }
+
+    #[test]
     fn normalize_url_does_not_prefix_bare_word() {
         // "hello" has no dot, so we don't pretend it's a domain.
         assert_eq!(normalize_url("hello"), "hello");
+    }
+
+    // ── classify_status_error ────────────────────────────────────────
+    //
+    // The agent reads these strings directly. We test the substrings the
+    // agent should see — mainly the "fall back to training knowledge"
+    // nudge, so a refactor doesn't accidentally drop it.
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn classify_404_tells_agent_to_stop_retrying() {
+        let msg = classify_status_error(
+            &url("https://example.com/nope"),
+            reqwest::StatusCode::NOT_FOUND,
+        );
+        assert!(msg.contains("404"));
+        assert!(
+            msg.contains("Do not retry") && msg.contains("training knowledge"),
+            "404 message should nudge fallback, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_410_treats_like_404() {
+        let msg =
+            classify_status_error(&url("https://example.com/gone"), reqwest::StatusCode::GONE);
+        assert!(msg.contains("410"));
+        assert!(msg.contains("training knowledge"));
+    }
+
+    #[test]
+    fn classify_403_acknowledges_auth_wall() {
+        let msg = classify_status_error(
+            &url("https://example.com/x"),
+            reqwest::StatusCode::FORBIDDEN,
+        );
+        assert!(msg.contains("403"));
+        assert!(msg.contains("auth"));
+        assert!(msg.contains("training knowledge"));
+    }
+
+    #[test]
+    fn classify_429_suggests_backoff_not_fallback() {
+        let msg = classify_status_error(
+            &url("https://example.com/x"),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        );
+        assert!(msg.contains("429"));
+        assert!(msg.contains("rate-limited"));
+        // Rate limit ≠ hallucination; we don't ask the agent to bail to
+        // training knowledge here — backoff is the right answer.
+        assert!(
+            !msg.contains("training knowledge"),
+            "429 shouldn't trigger training-knowledge fallback: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_500_allows_one_retry() {
+        let msg = classify_status_error(
+            &url("https://example.com/x"),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert!(msg.contains("500"));
+        assert!(msg.contains("retry"));
+    }
+
+    #[test]
+    fn classify_300_falls_through_to_generic_message() {
+        // Multiple choices: not a hallucination signal, not a rate
+        // limit. The classifier shouldn't impose a behavioural nudge.
+        let msg = classify_status_error(
+            &url("https://example.com/x"),
+            reqwest::StatusCode::MULTIPLE_CHOICES,
+        );
+        assert!(msg.contains("300"));
+        assert!(!msg.contains("training knowledge"));
     }
 
     #[test]

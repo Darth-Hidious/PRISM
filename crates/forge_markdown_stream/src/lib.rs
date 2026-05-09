@@ -230,4 +230,44 @@ mod tests {
 
         assert_eq!(actual, expected);
     }
+
+    // Regression: byte-by-byte streaming of a materials-science table with
+    // en-dashes (U+2013) and superscript-3 (U+00B3, in g/cm³) must produce
+    // intact output. This catches the class of bugs where SSE frame
+    // boundaries land mid-multibyte-char and chars get dropped.
+    //
+    // Context: Bug #15 was reported from a real screenshot showing dropped
+    // characters ("Ti-6Al-V" missing 4, "ainless L" missing prefix). Tests
+    // here proved the markdown_stream layer is not the culprit — keeping
+    // the regression in place so we don't introduce one later.
+    #[test]
+    fn streaming_byte_by_byte_with_endash_table_keeps_chars_intact() {
+        let md = concat!(
+            "| Material | Yield (MPa) | Density (g/cm³) |\n",
+            "|---|---:|---:|\n",
+            "| Ti-6Al-4V | 830–950 | 4.43 |\n",
+            "| Inconel 718 | 819 | 8.19 |\n",
+            "| Stainless 316L | 170–300 | 7.99–8.05 |\n",
+        );
+        let bytes = md.as_bytes();
+        let mut output = Vec::new();
+        let mut renderer = StreamdownRenderer::new(&mut output, 80);
+        let mut buf = Vec::with_capacity(4);
+        for &b in bytes {
+            buf.push(b);
+            if let Ok(s) = std::str::from_utf8(&buf) {
+                renderer.push(s).unwrap();
+                buf.clear();
+            }
+        }
+        renderer.finish().unwrap();
+        let out = String::from_utf8(strip_ansi_escapes::strip(output)).unwrap();
+
+        for label in ["Ti-6Al-4V", "Inconel 718", "Stainless 316L"] {
+            assert!(out.contains(label), "missing '{label}' in:\n{out}");
+        }
+        for value in ["830", "950", "170", "300", "7.99", "8.05", "g/cm³"] {
+            assert!(out.contains(value), "missing '{value}' in:\n{out}");
+        }
+    }
 }
