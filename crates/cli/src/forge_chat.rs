@@ -173,6 +173,25 @@ pub async fn run(
 
     let mut cli = ForgeCli::parse_from(["prism-chat"]);
 
+    // `prism resume <id>` integration: prism CLI sets PRISM_RESUME_ID
+    // before launching forge_chat, we set the parsed conversation_id
+    // here so forge's existing --cid resume path takes over. Mirrors
+    // what `prism tui --cid <id>` would do via the forge CLI.
+    if let Ok(raw_id) = std::env::var("PRISM_RESUME_ID") {
+        match forge_domain::ConversationId::parse(raw_id.trim()) {
+            Ok(parsed) => cli.conversation_id = Some(parsed),
+            Err(e) => {
+                eprintln!(
+                    "\x1b[33m[prism]\x1b[0m PRISM_RESUME_ID isn't a valid conversation id ({e}); starting new conversation"
+                );
+            }
+        }
+        // Clear so a child process / subsequent run doesn't re-resume.
+        unsafe {
+            std::env::remove_var("PRISM_RESUME_ID");
+        }
+    }
+
     // If stdin is piped (non-TTY), forward the contents as a one-shot prompt
     // so callers can drive the chat non-interactively, e.g. for scripted
     // smoke tests:  echo "show prism status" | prism tui
