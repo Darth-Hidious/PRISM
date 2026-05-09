@@ -263,10 +263,33 @@ async fn sync_dataset_from_peer(
     dataset_name: &str,
     sync_config: &Option<SyncConfig>,
 ) -> Result<()> {
-    // Query the peer's graph for all entities in the dataset
+    // Reject malformed dataset names up front — defense-in-depth before
+    // we hand the value to a Cypher parameter binder that *should* be
+    // safe but isn't worth trusting blindly. Marketplace and platform
+    // dataset names are simple identifiers in practice; if a peer
+    // publishes something exotic, refuse to sync rather than send it
+    // through the query pipeline.
+    if !dataset_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        || dataset_name.is_empty()
+        || dataset_name.len() > 128
+    {
+        anyhow::bail!(
+            "refusing to sync dataset with invalid name (must be ASCII alphanumeric + _-., \
+             non-empty, ≤128 chars): {dataset_name:?}"
+        );
+    }
+
+    // Query the peer's graph for all entities in the dataset.
+    // Use a parameterized Cypher query — earlier code interpolated
+    // `dataset_name` straight into the query string, which let a
+    // malicious peer (or a peer with a buggy publish call) inject
+    // Cypher via the dataset name they publish. See Bug #45.
     let query_url = format!("{peer_url}/api/query");
     let body = serde_json::json!({
-        "query": format!("MATCH (n) WHERE n.dataset = '{dataset_name}' RETURN n LIMIT 1000"),
+        "query": "MATCH (n) WHERE n.dataset = $dataset RETURN n LIMIT 1000",
+        "params": { "dataset": dataset_name },
         "mode": "cypher",
     });
 
@@ -291,14 +314,21 @@ async fn sync_dataset_from_peer(
     // Write to local Neo4j if configured
     if let Some(cfg) = sync_config {
         let neo4j_url = format!("{}/db/neo4j/tx/commit", cfg.neo4j_url);
-        let results = data["results"].as_array().unwrap();
+        let Some(results) = data["results"].as_array() else {
+            return Ok(());
+        };
 
-        // Batch-create nodes from peer data using UNWIND
-        let cypher = format!(
-            "UNWIND $rows AS row \
-             MERGE (n:SyncedEntity {{name: row.name, source_dataset: '{dataset_name}'}}) \
-             SET n += row.properties"
-        );
+        // Batch-create nodes from peer data using UNWIND.
+        //
+        // Both `$rows` AND `$source` are passed as parameters — the
+        // earlier version interpolated `dataset_name` into the
+        // statement string, which would have let a malicious peer
+        // execute arbitrary Cypher against our LOCAL Neo4j (e.g. a
+        // dataset named `x' DETACH DELETE n RETURN '` would wipe the
+        // local graph). See Bug #45.
+        let cypher = "UNWIND $rows AS row \
+             MERGE (n:SyncedEntity {name: row.name, source_dataset: $source}) \
+             SET n += row.properties";
 
         let rows: Vec<serde_json::Value> = results
             .iter()
@@ -313,7 +343,7 @@ async fn sync_dataset_from_peer(
         let neo4j_body = serde_json::json!({
             "statements": [{
                 "statement": cypher,
-                "parameters": { "rows": rows },
+                "parameters": { "rows": rows, "source": dataset_name },
             }]
         });
 
