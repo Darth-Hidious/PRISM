@@ -252,8 +252,14 @@ impl Agent {
         const DEFAULT_TOKEN_THRESHOLD: usize = 100_000;
         const DEFAULT_CONTEXT_WINDOW_PERCENTAGE: f64 = 0.7;
 
+        // Use the model's effective context window (platform value if
+        // present, else inferred from id pattern). Without the
+        // pattern fallback, every model with a `context_length: null`
+        // entry — common for newer models the platform hasn't tagged
+        // yet — silently caps at DEFAULT_CONTEXT_WINDOW (128K), even
+        // when the actual model supports 1M (Gemini) or 200K (Claude).
         let context_window = selected_model
-            .and_then(|model| model.context_length)
+            .and_then(|model| model.effective_context_length())
             .and_then(|context_window| usize::try_from(context_window).ok())
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
