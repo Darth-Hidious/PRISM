@@ -384,9 +384,14 @@ impl From<&ForgeConfig> for Info {
                 );
         }
 
+        // Skip the "ForgeCode Service URL" line entirely when PRISM has
+        // disabled it (services_url == ""). Showing an empty value or
+        // the upstream forgecode.dev default would be misleading.
+        info = info.add_title("API CONFIGURATION");
+        if !config.services_url.is_empty() {
+            info = info.add_key_value("Services URL", config.services_url.to_string());
+        }
         info = info
-            .add_title("API CONFIGURATION")
-            .add_key_value("ForgeCode Service URL", config.services_url.to_string())
             .add_title("TOOL CONFIGURATION")
             .add_key_value("Tool Timeout", format!("{}s", config.tool_timeout_secs))
             .add_key_value(
