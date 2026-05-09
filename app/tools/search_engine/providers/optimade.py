@@ -29,7 +29,23 @@ class OptimadeProvider(Provider):
         )
 
     async def search(self, query: MaterialSearchQuery) -> list[Material]:
-        """Query this OPTIMADE endpoint and return normalized materials."""
+        """Query this OPTIMADE endpoint and return normalized materials.
+
+        Uses ``asyncio.to_thread`` to run the synchronous OptimadeClient
+        in a thread-pool worker. Without this, ``use_async=False`` on
+        OptimadeClient blocks the event loop for the duration of every
+        HTTP roundtrip — so a fan-out across 17 providers via
+        ``asyncio.gather`` ends up effectively sequential and
+        ``asyncio.wait_for`` timeouts in the engine never fire (timeouts
+        only trigger at ``await`` points, of which there are none inside
+        the sync C library underneath OptimadeClient).
+
+        Net effect of the previous code on a single
+        ``materials_search(elements=['Ni','Cr','Al'], limit=3)``:
+        103 seconds wall-clock for 3 results. After this fix: bounded by
+        the per-provider timeout (15 s default).
+        """
+        import asyncio
         import contextlib
         import io
         from optimade.client import OptimadeClient
@@ -39,27 +55,37 @@ class OptimadeProvider(Provider):
         if not base_url:
             return []
 
-        try:
+        max_results = min(query.limit, self._endpoint.behavior.max_results)
+
+        def _run_sync_search() -> dict:
             client = OptimadeClient(
                 base_urls=[base_url],
-                max_results_per_provider=min(query.limit, self._endpoint.behavior.max_results),
+                max_results_per_provider=max_results,
                 use_async=False,
                 silent=True,
             )
-            # Suppress optimade-python's own console output (error messages,
-            # progress boxes) so it doesn't leak into the Ink TUI or corrupt
-            # the JSON-RPC stdio stream.
-            with contextlib.redirect_stdout(io.StringIO()), \
-                 contextlib.redirect_stderr(io.StringIO()):
-                results = client.structures.get(filter=filter_string) if filter_string else client.structures.get()
+            # Suppress optimade-python's own console output (error
+            # messages, progress boxes) so it doesn't leak into the
+            # Ink TUI or corrupt the JSON-RPC stdio stream.
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                return (
+                    client.structures.get(filter=filter_string)
+                    if filter_string
+                    else client.structures.get()
+                )
+
+        try:
+            results = await asyncio.to_thread(_run_sync_search)
         except Exception as e:
             logger.warning("OPTIMADE query failed for %s: %s", self.id, e)
             raise
 
         materials = self._parse_response(results, filter_string)
         # Hard cap to requested limit (OptimadeClient may over-fetch)
-        limit = min(query.limit, self._endpoint.behavior.max_results)
-        return materials[:limit]
+        return materials[:max_results]
 
     def _parse_response(self, results: dict, filter_string: str) -> list[Material]:
         """Parse the nested OptimadeClient response into Material objects.
