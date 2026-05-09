@@ -856,14 +856,15 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         - If you need multiple tools, call them one at a time across multiple turns.\n\n\
         ## Quick reference (most common tools)\n\n\
         - `discover_capabilities` — see all available tools, providers, models, corpora\n\
-        - `knowledge_search` — search the MARC27 knowledge graph (211K+ entities)\n\
-        - `search_materials` — search 20+ materials databases (OPTIMADE)\n\
-        - `semantic_search` — vector similarity search over embedded documents\n\
-        - `predict_property` — predict material property from composition\n\
+        - `knowledge` — search/manage the MARC27 knowledge graph (211K+ entities)\n\
+        - `materials_search` — federated search across 20+ materials databases (OPTIMADE)\n\
+        - `predict` — predict a material property from composition (ML)\n\
         - `execute_python` — run Python code for analysis\n\
-        - `web_search` / `web_read` — search or read web pages\n\
-        - `literature_search` — search arXiv, Semantic Scholar\n\
-        - `research_query` — iterative research loop via MARC27 platform\n\
+        - `web` — fetch a URL or search the open web (action='read' / 'search')\n\
+        - `prior_art_search` — search arXiv, Semantic Scholar, and patents (Lens.org)\n\
+        - `research` — iterative research loop via the MARC27 platform\n\n\
+        Names above MUST match the actual registry. If a tool you'd expect \
+        isn't in this list, call `discover_capabilities` instead of guessing.\n\
     ");
 
     block
@@ -1035,5 +1036,64 @@ mod tests {
         let config = LlmConfig::default();
         let client = LlmClient::new(config);
         assert!(client.auth_header().is_none());
+    }
+
+    /// Pin the curated tool names in the system-prompt quick-reference.
+    ///
+    /// Each name below MUST be a real tool registered in `app/tools/*.py`
+    /// (`registry.register(Tool(name=...))`). When a tool is renamed,
+    /// update both this list AND `build_tool_prompt_block` together —
+    /// otherwise the LLM gets a stale name in its system prompt and
+    /// hallucinates calls to it (we shipped this exact bug: the old
+    /// `search_materials` line stayed in the prompt for ~2 rounds after
+    /// the tool was renamed to `materials_search`, and gemini-3.1 dutifully
+    /// called the dead name on every materials request).
+    ///
+    /// This test only proves the strings render into the prompt block.
+    /// A future `boot_checks` entry can run the actual cross-check
+    /// against `tool_server.list_tools()` at startup.
+    const QUICK_REFERENCE_TOOL_NAMES: &[&str] = &[
+        "discover_capabilities",
+        "knowledge",
+        "materials_search",
+        "predict",
+        "execute_python",
+        "web",
+        "prior_art_search",
+        "research",
+    ];
+
+    #[test]
+    fn quick_reference_names_appear_in_prompt() {
+        let block = build_tool_prompt_block(&[]);
+        for name in QUICK_REFERENCE_TOOL_NAMES {
+            assert!(
+                block.contains(&format!("`{name}`")),
+                "tool `{name}` missing from quick-reference block — \
+                 either restore it or remove it from QUICK_REFERENCE_TOOL_NAMES"
+            );
+        }
+    }
+
+    #[test]
+    fn quick_reference_does_not_mention_renamed_tools() {
+        // Belt-and-braces: explicit deny-list of names we've previously
+        // renamed and don't want sneaking back into the prompt.
+        let block = build_tool_prompt_block(&[]);
+        for stale in &[
+            "search_materials",
+            "knowledge_search",
+            "predict_property",
+            "web_search",
+            "web_read",
+            "literature_search",
+            "research_query",
+            "semantic_search",
+        ] {
+            assert!(
+                !block.contains(&format!("`{stale}`")),
+                "stale tool name `{stale}` reappeared in quick-reference block"
+            );
+        }
     }
 }
