@@ -1015,84 +1015,11 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Login { token, no_browser } => {
-            let mut state = paths.load_cli_state()?;
-            let credentials = match token {
-                Some(pat) => run_token_login(&endpoints, &pat).await?,
-                None => run_device_login_with_opts(&endpoints, no_browser).await?,
+            let mode = match token {
+                Some(pat) => LoginMode::Token(pat),
+                None => LoginMode::Device { no_browser },
             };
-            let platform =
-                PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
-            let profile = platform.fetch_current_user().await.ok();
-            let selected = select_project(
-                &platform,
-                profile
-                    .as_ref()
-                    .and_then(|user| user.display_name.as_deref()),
-            )
-            .await?;
-            state.preferred_python = Some(python.display().to_string());
-            state.credentials = Some(StoredCredentials {
-                access_token: credentials.access_token,
-                refresh_token: credentials.refresh_token,
-                platform_url: credentials.platform_url,
-                user_id: profile.as_ref().map(|p| p.id.clone()),
-                display_name: profile.and_then(|p| p.display_name),
-                org_id: selected.org_id,
-                org_name: selected.org_name,
-                project_id: selected.project_id,
-                project_name: selected.project_name,
-                expires_at: credentials.expires_at,
-            });
-            paths.save_cli_state(&state)?;
-
-            // Sync credentials to ~/.prism/credentials.json for Python SDK.
-            //
-            // The file holds an access_token + refresh_token, so it must be
-            // 0600. Plain `fs::write` would inherit the user's umask
-            // (typically 0644 = world-readable on most Linux distros),
-            // which would let any other local user read the tokens.
-            // cli_state.json (saved via PrismPaths::save_cli_state) already
-            // uses 0600 for the same reason; this path just got missed.
-            if let Some(ref creds) = state.credentials {
-                let sdk_creds = serde_json::json!({
-                    "access_token": creds.access_token,
-                    "refresh_token": creds.refresh_token,
-                    "platform_url": creds.platform_url,
-                    "user_id": creds.user_id,
-                    "org_id": creds.org_id,
-                    "project_id": creds.project_id,
-                });
-                if let Some(home) = std::env::var_os("HOME") {
-                    let sdk_path = std::path::PathBuf::from(home)
-                        .join(".prism")
-                        .join("credentials.json");
-                    if let Ok(json) = serde_json::to_string_pretty(&sdk_creds) {
-                        if let Some(parent) = sdk_path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        // 0600 on unix; default ACLs on windows.
-                        #[cfg(unix)]
-                        {
-                            use std::io::Write;
-                            use std::os::unix::fs::OpenOptionsExt;
-                            if let Ok(mut file) = std::fs::OpenOptions::new()
-                                .write(true)
-                                .create(true)
-                                .truncate(true)
-                                .mode(0o600)
-                                .open(&sdk_path)
-                            {
-                                let _ = file.write_all(json.as_bytes());
-                            }
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = std::fs::write(&sdk_path, json);
-                        }
-                    }
-                }
-            }
-
+            perform_full_login(&paths, &endpoints, &python, mode).await?;
             println!("Login complete.");
         }
         Commands::Status => {
@@ -2534,24 +2461,36 @@ async fn main() -> Result<()> {
                     boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
             // Both proactive AND reactive refresh have failed → the
-            // refresh token itself is expired. Launching the TUI on
-            // dead creds drops the user into a 401 mid-chat with the
-            // platform_bridge.rs "open a new terminal" interceptor —
-            // confusing and easy to miss. Fail fast here with a single
-            // actionable message instead.
+            // refresh token itself is expired. Run the full Login
+            // recipe inline so the user doesn't have to abandon the
+            // session. Same code path as `prism login` — device flow,
+            // project picker, state save, SDK creds sync.
             if boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
             {
                 eprintln!();
-                eprintln!("\x1b[33mYour MARC27 session has expired.\x1b[0m");
+                eprintln!("\x1b[33mYour MARC27 session has expired — re-authenticating…\x1b[0m");
                 eprintln!();
-                eprintln!("  To re-authenticate, run:");
-                eprintln!("    \x1b[1mprism login\x1b[0m");
-                eprintln!();
-                eprintln!("  Then start the TUI again with \x1b[1mprism tui\x1b[0m.");
-                eprintln!();
-                return Ok(());
+                if let Err(e) = perform_full_login(
+                    &paths,
+                    &endpoints,
+                    &python,
+                    LoginMode::Device { no_browser: false },
+                )
+                .await
+                {
+                    eprintln!("\x1b[31mInline re-login failed:\x1b[0m {e}");
+                    eprintln!();
+                    eprintln!(
+                        "  Run \x1b[1mprism login\x1b[0m manually, then start \x1b[1mprism tui\x1b[0m again."
+                    );
+                    eprintln!();
+                    return Ok(());
+                }
+                state = paths.load_cli_state().ok().unwrap_or_default();
+                boot_checks =
+                    boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
             boot::boot_sequence(&boot_checks);
             // Splash skipped — see note in default chat path.
@@ -2608,25 +2547,37 @@ async fn main() -> Result<()> {
                 boot_checks =
                     boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
-            // Same fail-fast as the Tui branch — see comment there.
-            // Resuming on dead creds is even more confusing because
-            // the user expects their old conversation to load.
+            // Same inline re-login as the Tui branch — see comment
+            // there. Resuming on dead creds is even more confusing
+            // because the user expects their old conversation to load.
             if boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
             {
                 eprintln!();
-                eprintln!("\x1b[33mYour MARC27 session has expired.\x1b[0m");
+                eprintln!("\x1b[33mYour MARC27 session has expired — re-authenticating…\x1b[0m");
                 eprintln!();
-                eprintln!("  To re-authenticate, run:");
-                eprintln!("    \x1b[1mprism login\x1b[0m");
-                eprintln!();
-                eprintln!(
-                    "  Then resume with \x1b[1mprism resume{}\x1b[0m.",
-                    id.as_deref().map(|s| format!(" {s}")).unwrap_or_default()
-                );
-                eprintln!();
-                return Ok(());
+                if let Err(e) = perform_full_login(
+                    &paths,
+                    &endpoints,
+                    &python,
+                    LoginMode::Device { no_browser: false },
+                )
+                .await
+                {
+                    eprintln!("\x1b[31mInline re-login failed:\x1b[0m {e}");
+                    eprintln!();
+                    eprintln!(
+                        "  Run \x1b[1mprism login\x1b[0m manually, then resume with \
+                         \x1b[1mprism resume{}\x1b[0m.",
+                        id.as_deref().map(|s| format!(" {s}")).unwrap_or_default()
+                    );
+                    eprintln!();
+                    return Ok(());
+                }
+                state = paths.load_cli_state().ok().unwrap_or_default();
+                boot_checks =
+                    boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
             boot::boot_sequence(&boot_checks);
             let _ = &python;
@@ -5568,6 +5519,125 @@ async fn handle_query(
                     name = entity.name,
                     props = props_str,
                 );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Mode flag for [`perform_full_login`] — picks the credential source
+/// (PAT vs interactive device flow) without committing the caller to
+/// the structure of [`Commands::Login`]'s arguments.
+#[allow(dead_code)]
+enum LoginMode {
+    /// Personal Access Token — non-interactive, suitable for headless
+    /// scripts and CI. Skips the device-flow polling step.
+    Token(String),
+    /// Interactive device flow. `no_browser=true` renders a paste-this-
+    /// URL block instead of auto-launching the browser.
+    Device { no_browser: bool },
+}
+
+/// Run the full login recipe used by `prism login` AND by the inline
+/// relogin path in `prism tui` / `prism resume` when both refreshes
+/// fail.
+///
+/// Steps:
+/// 1. Mint fresh credentials (token or device flow).
+/// 2. Fetch the user profile.
+/// 3. Pick org + project (auto-selects when only one exists — see
+///    [`select_project`]).
+/// 4. Persist `StoredCredentials` to `cli_state.json`.
+/// 5. Mirror the access/refresh tokens to `~/.prism/credentials.json`
+///    (0600 on unix) for the Python SDK.
+///
+/// On success, the caller can call `paths.load_cli_state()` to read
+/// the freshly-saved credentials and continue.
+///
+/// Extracted so [`Commands::Tui`] and [`Commands::Resume`] can do
+/// inline relogin instead of dropping the user with "open a new
+/// terminal and run `prism login`" (the previous behaviour, see
+/// [`Commands::Tui`] fail-fast block).
+async fn perform_full_login(
+    paths: &PrismPaths,
+    endpoints: &PlatformEndpoints,
+    python: &std::path::Path,
+    mode: LoginMode,
+) -> Result<()> {
+    let mut state = paths.load_cli_state().unwrap_or_default();
+    let credentials = match mode {
+        LoginMode::Token(pat) => run_token_login(endpoints, &pat).await?,
+        LoginMode::Device { no_browser } => {
+            run_device_login_with_opts(endpoints, no_browser).await?
+        }
+    };
+    let platform = PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
+    let profile = platform.fetch_current_user().await.ok();
+    let selected = select_project(
+        &platform,
+        profile
+            .as_ref()
+            .and_then(|user| user.display_name.as_deref()),
+    )
+    .await?;
+    state.preferred_python = Some(python.display().to_string());
+    state.credentials = Some(StoredCredentials {
+        access_token: credentials.access_token,
+        refresh_token: credentials.refresh_token,
+        platform_url: credentials.platform_url,
+        user_id: profile.as_ref().map(|p| p.id.clone()),
+        display_name: profile.and_then(|p| p.display_name),
+        org_id: selected.org_id,
+        org_name: selected.org_name,
+        project_id: selected.project_id,
+        project_name: selected.project_name,
+        expires_at: credentials.expires_at,
+    });
+    paths.save_cli_state(&state)?;
+
+    // Sync credentials to ~/.prism/credentials.json for the Python SDK.
+    //
+    // 0600 because the file holds an access_token + refresh_token. Plain
+    // `fs::write` would inherit the user's umask (typically 0644 =
+    // world-readable on most Linux distros), which would let any other
+    // local user read the tokens. cli_state.json (saved via
+    // PrismPaths::save_cli_state) already uses 0600 for the same reason.
+    if let Some(ref creds) = state.credentials {
+        let sdk_creds = serde_json::json!({
+            "access_token": creds.access_token,
+            "refresh_token": creds.refresh_token,
+            "platform_url": creds.platform_url,
+            "user_id": creds.user_id,
+            "org_id": creds.org_id,
+            "project_id": creds.project_id,
+        });
+        if let Some(home) = std::env::var_os("HOME") {
+            let sdk_path = std::path::PathBuf::from(home)
+                .join(".prism")
+                .join("credentials.json");
+            if let Ok(json) = serde_json::to_string_pretty(&sdk_creds) {
+                if let Some(parent) = sdk_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&sdk_path)
+                    {
+                        let _ = file.write_all(json.as_bytes());
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = std::fs::write(&sdk_path, json);
+                }
             }
         }
     }
