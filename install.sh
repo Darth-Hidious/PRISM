@@ -62,13 +62,45 @@ if ! curl -fSL "$URL" -o "${TMPDIR}/${ARCHIVE}"; then
 fi
 
 # --- Extract ---
+#
+# Extract to a staging dir inside TMPDIR first, then move ONLY the
+# expected binary names to INSTALL_DIR. This stops a malicious or
+# malformed archive from:
+#   1. Writing outside INSTALL_DIR via `../` paths or absolute paths
+#      (BSD tar on older macOS doesn't reject these by default).
+#   2. Dropping arbitrary files into INSTALL_DIR alongside the
+#      expected binaries (e.g. an extra .sh that gets sourced by
+#      a careless user later).
 echo "Extracting to ${INSTALL_DIR}..."
 mkdir -p "$INSTALL_DIR"
+STAGE="${TMPDIR}/stage"
+mkdir -p "$STAGE"
 
 if [ "$PLATFORM" = "windows" ]; then
-    unzip -o "${TMPDIR}/${ARCHIVE}" -d "$INSTALL_DIR"
+    unzip -o "${TMPDIR}/${ARCHIVE}" -d "$STAGE"
 else
-    tar -xzf "${TMPDIR}/${ARCHIVE}" -C "$INSTALL_DIR"
+    tar -xzf "${TMPDIR}/${ARCHIVE}" -C "$STAGE"
+fi
+
+# Move ONLY the expected binaries — anything else in the archive is
+# silently dropped. Add to this list if a future release legitimately
+# ships more files.
+EXTRACTED_ANY=0
+for bin in prism prism-node; do
+    if [ -f "${STAGE}/${bin}" ]; then
+        mv "${STAGE}/${bin}" "${INSTALL_DIR}/${bin}"
+        EXTRACTED_ANY=1
+    elif [ "$PLATFORM" = "windows" ] && [ -f "${STAGE}/${bin}.exe" ]; then
+        mv "${STAGE}/${bin}.exe" "${INSTALL_DIR}/${bin}.exe"
+        EXTRACTED_ANY=1
+    fi
+done
+
+if [ $EXTRACTED_ANY -eq 0 ]; then
+    echo "Error: archive did not contain expected binary (prism)." >&2
+    echo "Listing what we got:" >&2
+    ls -la "$STAGE" >&2 || true
+    exit 1
 fi
 
 chmod +x "${INSTALL_DIR}/prism" 2>/dev/null || true
