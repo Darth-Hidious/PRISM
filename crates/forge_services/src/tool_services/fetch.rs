@@ -145,7 +145,7 @@ impl ForgeFetch {
 
 /// Coerce LLM-emitted URL strings into something the parser will accept.
 ///
-/// Real LLMs in real PRISM sessions emit two recoverable URL shapes
+/// Real LLMs in real PRISM sessions emit three recoverable URL shapes
 /// that `url::Url::parse` would otherwise reject:
 ///
 /// 1. **Protocol-relative** (`//host/path`) — common when the model
@@ -154,6 +154,11 @@ impl ForgeFetch {
 ///    Since we always fetch over HTTPS in this tool, prefix `https:`.
 /// 2. **Scheme-less** (`host.tld/path`) — the model wrote a domain
 ///    without `https://`. Prefix `https://`.
+/// 3. **Stray leading dot** (`.host.tld/path`) — observed when the
+///    model is mid-typo or has confused itself in a long fetch retry
+///    loop. The user's intent is plainly the same domain without the
+///    leading dot. Strip a single dot, then fall through to the
+///    scheme-less branch.
 ///
 /// We only do this when the input is otherwise unparseable. Inputs
 /// with a recognized scheme go through unchanged.
@@ -170,19 +175,32 @@ fn normalize_url(input: &str) -> String {
         return format!("https://{rest}");
     }
 
+    // Stray leading dot: `.host.tld/path` → `host.tld/path`. We strip
+    // *one* dot only when followed by a domain-shaped char (alnum or
+    // a dash). `..foo` or `. foo` keep their original shape so the
+    // parser can return a meaningful "this is junk" error to the
+    // caller — better to fail loudly than silently fetch garbage.
+    let trimmed = if let Some(rest) = trimmed.strip_prefix('.')
+        && rest.chars().next().is_some_and(is_domain_lead_char)
+    {
+        rest
+    } else {
+        trimmed
+    };
+
     // Scheme-less domain-shaped: `host.tld[/...]` (no scheme, no
-    // leading slash). Avoid prefixing if the input already starts
-    // with `/`, `?`, `#`, or `mailto:`-style — those aren't URLs we
-    // can safely recover.
+    // leading slash). The host segment must:
+    //   - contain at least one `.` (otherwise it's a bare word, not a domain),
+    //   - start with a domain-lead char (rejects `..foo`, `.foo` already
+    //     handled above, and `?#/` already filtered out).
+    let host = trimmed.split(['/', '?', '#']).next().unwrap_or("");
     if !trimmed.is_empty()
-        && !trimmed.starts_with('/')
-        && !trimmed.starts_with('?')
-        && !trimmed.starts_with('#')
         && !trimmed.contains("://")
-        && trimmed
-            .split(['/', '?', '#'])
+        && host.contains('.')
+        && host
+            .chars()
             .next()
-            .is_some_and(|host| host.contains('.'))
+            .is_some_and(is_domain_lead_char)
     {
         return format!("https://{trimmed}");
     }
@@ -190,6 +208,14 @@ fn normalize_url(input: &str) -> String {
     // Give up — return the original so the caller's parse error is
     // accurate.
     trimmed.to_string()
+}
+
+/// Whether `c` could legitimately start a hostname label. Conservative:
+/// hostnames RFC-allow letters/digits at the start; we additionally
+/// allow underscore (rare but real in dev URLs). Excludes `.` so we
+/// never strip the leading dot of `..foo` and pretend it's recoverable.
+fn is_domain_lead_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 #[async_trait::async_trait]
@@ -261,6 +287,33 @@ mod tests {
         assert_eq!(normalize_url("/just/a/path"), "/just/a/path");
         assert_eq!(normalize_url("#fragment"), "#fragment");
         assert_eq!(normalize_url("?query=1"), "?query=1");
+    }
+
+    #[test]
+    fn normalize_url_strips_stray_leading_dot() {
+        // Real example from a PRISM TUI session (Bug #13): the LLM
+        // emitted `.wikipedia.org/Ti-6Al-4V` mid-retry. Pre-fix the
+        // existing scheme-less branch would happily produce
+        // `https://.wikipedia.org/...`, which is also unparseable.
+        assert_eq!(
+            normalize_url(".wikipedia.org/Ti-6Al-4V"),
+            "https://wikipedia.org/Ti-6Al-4V"
+        );
+        assert_eq!(normalize_url(".example.com"), "https://example.com");
+        assert_eq!(
+            normalize_url(".sub.example.com/page"),
+            "https://sub.example.com/page"
+        );
+    }
+
+    #[test]
+    fn normalize_url_does_not_strip_double_dot_or_space_after_dot() {
+        // Double-dot: probably truly broken model output. Don't
+        // pretend we recovered it — let the parser surface the error
+        // so the calling agent can fall back to training knowledge.
+        assert_eq!(normalize_url("..wikipedia.org"), "..wikipedia.org");
+        // Dot followed by space: definitely not a hostname start.
+        assert_eq!(normalize_url(". wikipedia.org"), ". wikipedia.org");
     }
 
     #[test]
