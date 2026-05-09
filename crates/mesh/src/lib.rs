@@ -18,6 +18,7 @@ pub mod federated_query;
 pub mod federation;
 pub mod federation_lookup;
 pub mod kafka;
+pub mod locality;
 pub mod mdns;
 pub mod platform_discovery;
 pub mod protocol;
