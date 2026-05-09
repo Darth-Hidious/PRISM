@@ -303,12 +303,16 @@ fn fifo_trim(req: &mut Value, tools: &mut Vec<Value>) {
             .unwrap_or(usize::MAX);
     }
     if kept.len() != original {
-        eprintln!(
-            "[platform_bridge] FIFO fallback trim: {} → {} (body {} / budget {})",
-            original,
-            kept.len(),
-            size,
-            MARC27_BODY_BUDGET,
+        // Bug #30b: was eprintln! → leaked into the chat panel on
+        // every turn. Demote to tracing::debug! so operators on
+        // RUST_LOG=debug still see it but the user doesn't.
+        tracing::debug!(
+            target: "platform_bridge",
+            original_tools = original,
+            kept_tools = kept.len(),
+            body_bytes = size,
+            budget = MARC27_BODY_BUDGET,
+            "FIFO fallback trim"
         );
     }
 }
@@ -341,10 +345,14 @@ fn truncate_oversized_messages(req: &mut Value) {
             // Safety brake: if we haven't fit after 50 truncations, give up
             // and let MARC27 reject — surfacing the underlying bug is better
             // than silently looping.
-            eprintln!(
-                "[platform_bridge] truncate_oversized_messages: gave up at \
-                 iteration 50 with body {} > {} budget",
-                size, MARC27_BODY_BUDGET
+            // Loud warning — this is a real bailout, operators want to know.
+            // Still tracing rather than eprintln! so it goes to logs not the
+            // user-facing chat panel (Bug #30b).
+            tracing::warn!(
+                target: "platform_bridge",
+                body_bytes = size,
+                budget = MARC27_BODY_BUDGET,
+                "truncate_oversized_messages: gave up at iteration 50"
             );
             break;
         }
@@ -404,9 +412,15 @@ fn truncate_oversized_messages(req: &mut Value) {
     }
 
     if total_truncated_bytes > 0 {
-        eprintln!(
-            "[platform_bridge] truncated {} bytes across {} iteration(s) to fit {} byte budget",
-            total_truncated_bytes, iterations, MARC27_BODY_BUDGET
+        // Bug #30b: was eprintln! → leaked into the chat panel on
+        // turns where the body had to be truncated. Demote to debug
+        // (operators can see it via RUST_LOG=debug).
+        tracing::debug!(
+            target: "platform_bridge",
+            truncated_bytes = total_truncated_bytes,
+            iterations = iterations,
+            budget = MARC27_BODY_BUDGET,
+            "truncated body to fit budget"
         );
     }
 }
@@ -534,9 +548,18 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
                     req["tools"] = Value::Array(kept);
                     if kept_count != original {
                         let final_size = serde_json::to_vec(&req).map(|b| b.len()).unwrap_or(0);
-                        eprintln!(
-                            "[platform_bridge] semantic top-K: {} → {} tools (body {} bytes)",
-                            original, kept_count, final_size
+                        // Bug #30b: was eprintln! → fired EVERY turn,
+                        // dumping operational debug info ('semantic
+                        // top-K: 149 → 12 tools (body 39859 bytes)')
+                        // straight into the user-facing chat panel.
+                        // Demote to tracing::debug! — operators on
+                        // RUST_LOG=debug still see it.
+                        tracing::debug!(
+                            target: "platform_bridge",
+                            original_tools = original,
+                            kept_tools = kept_count,
+                            body_bytes = final_size,
+                            "semantic top-K trim"
                         );
                     }
                 }
