@@ -14,6 +14,7 @@
 //! [`federation`]. Used by Fabric v1 for cross-site inference and
 //! cross-org policy intersection.
 
+pub mod burst_routing;
 pub mod federated_query;
 pub mod federation;
 pub mod federation_lookup;
