@@ -656,7 +656,20 @@ async fn run_http_step(
 
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .with_context(|| format!("invalid HTTP method for workflow step {}", step.id))?;
-    let mut request = client.request(method, url.as_str().unwrap_or_default());
+
+    // SSRF guard — workflows are arbitrary YAML, including marketplace
+    // installs and LLM-generated specs. Without this, a workflow with
+    // url: http://169.254.169.254/... would hit AWS instance metadata
+    // and leak IAM creds; url: http://localhost:7327/api/users would
+    // hit PRISM's own admin API. See Bug #56.
+    let url_str = url.as_str().unwrap_or_default();
+    if let Some(reason) = ssrf_block_reason(url_str) {
+        bail!(
+            "workflow step {} url {url_str:?} rejected by SSRF guard: {reason}",
+            step.id
+        );
+    }
+    let mut request = client.request(method, url_str);
     if let Some(map) = headers.as_object() {
         for (key, value) in map {
             if let Some(value) = value.as_str() {
@@ -1350,6 +1363,85 @@ fn resolve_path(
     Ok(current)
 }
 
+/// SSRF guard for workflow `http` steps. Returns `Some(reason)` when
+/// the URL must be rejected, `None` when it's acceptable.
+///
+/// Blocks:
+///   - non-http(s) schemes (file://, gopher://, dict://, data://, …)
+///   - empty / unparseable URLs
+///   - hostnames that resolve to local / metadata-service contexts:
+///     `localhost`, `0.0.0.0`, RFC1918 / loopback / link-local literals,
+///     and the well-known cloud metadata service IP `169.254.169.254`
+///   - common metadata hostnames: `metadata`, `metadata.google.internal`
+///
+/// What this does NOT do (and why a future allowlist is the right
+/// long-term fix): defend against DNS rebinding (resolves to a public
+/// IP at parse time, then to an internal IP at request time), or any
+/// host that an attacker controls and points at internal infra. Users
+/// running marketplace workflows against sensitive networks should add
+/// a hostname allowlist to their workflow runtime config.
+fn ssrf_block_reason(url: &str) -> Option<&'static str> {
+    // reqwest::Url is the same `url::Url` from the url crate; using it
+    // via reqwest avoids adding a top-level dependency just for parse.
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return Some("URL did not parse");
+    };
+
+    // 1. Scheme: only http(s).
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Some("only http(s) URLs are allowed"),
+    }
+
+    let Some(host) = parsed.host_str() else {
+        return Some("URL has no host");
+    };
+    let host = host.to_ascii_lowercase();
+
+    // 2. Literal hostnames that name local / metadata contexts.
+    const BLOCKED_HOSTS: &[&str] = &[
+        "localhost",
+        "ip6-localhost",
+        "ip6-loopback",
+        "metadata",
+        "metadata.google.internal",
+    ];
+    if BLOCKED_HOSTS.contains(&host.as_str()) {
+        return Some("hostname names a loopback or cloud-metadata service");
+    }
+
+    // 3. Reject literal IPs that fall into private / loopback / link-local
+    // ranges. We don't do DNS lookup here — DNS rebinding still works.
+    // The literal-IP check stops the obvious SSRF payloads.
+    if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
+        if ipv4.is_loopback()
+            || ipv4.is_private()
+            || ipv4.is_link_local()
+            || ipv4.is_unspecified()
+            || ipv4.is_broadcast()
+        {
+            return Some("IPv4 address is in a private / loopback / link-local range");
+        }
+        // 169.254.169.254 is link-local but call it out specifically.
+        if ipv4.octets() == [169, 254, 169, 254] {
+            return Some("address is the cloud instance metadata service");
+        }
+    }
+    // url crate strips the [] from IPv6 hosts, but the host_str() form
+    // returns it WITH the brackets. Strip them before parsing.
+    let ipv6_candidate = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host.as_str());
+    if let Ok(ipv6) = ipv6_candidate.parse::<std::net::Ipv6Addr>()
+        && (ipv6.is_loopback() || ipv6.is_unspecified())
+    {
+        return Some("IPv6 address is loopback / unspecified");
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1818,5 +1910,53 @@ tasks:
         assert_eq!(result.steps[2].id, "tool_2");
         assert_eq!(result.steps[3].id, "if_3");
         assert_eq!(result.steps[4].id, "parallel_4");
+    }
+
+    // ── SSRF guard tests (Bug #56) ──────────────────────────────────
+
+    #[test]
+    fn ssrf_allows_public_https_urls() {
+        assert!(ssrf_block_reason("https://api.materialsproject.org/").is_none());
+        assert!(ssrf_block_reason("https://optimade.org/v1/structures").is_none());
+        assert!(ssrf_block_reason("http://example.com:8080/path").is_none());
+    }
+
+    #[test]
+    fn ssrf_blocks_localhost() {
+        assert!(ssrf_block_reason("http://localhost:7327/api/users").is_some());
+        assert!(ssrf_block_reason("http://127.0.0.1/").is_some());
+        assert!(ssrf_block_reason("http://127.255.255.254/").is_some());
+        assert!(ssrf_block_reason("http://[::1]/").is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_private_ipv4() {
+        assert!(ssrf_block_reason("http://10.0.0.1/").is_some());
+        assert!(ssrf_block_reason("http://172.16.0.1/").is_some());
+        assert!(ssrf_block_reason("http://192.168.1.1/admin").is_some());
+        assert!(ssrf_block_reason("http://0.0.0.0/").is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_link_local_and_metadata() {
+        assert!(ssrf_block_reason("http://169.254.0.1/").is_some());
+        assert!(ssrf_block_reason("http://169.254.169.254/latest/meta-data/").is_some());
+        assert!(ssrf_block_reason("http://metadata.google.internal/").is_some());
+        assert!(ssrf_block_reason("http://metadata/").is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_dangerous_schemes() {
+        assert!(ssrf_block_reason("file:///etc/passwd").is_some());
+        assert!(ssrf_block_reason("gopher://internal:1337/").is_some());
+        assert!(ssrf_block_reason("dict://attacker.com:1337/").is_some());
+        assert!(ssrf_block_reason("data:text/plain,foo").is_some());
+        assert!(ssrf_block_reason("ftp://internal/").is_some());
+    }
+
+    #[test]
+    fn ssrf_blocks_unparseable_urls() {
+        assert!(ssrf_block_reason("not a url").is_some());
+        assert!(ssrf_block_reason("").is_some());
     }
 }
