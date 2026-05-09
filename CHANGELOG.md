@@ -5,6 +5,101 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.1] - 2026-05-10
+
+Bug-bounty + UX cleanup release. 79 commits over v2.7.0 — no breaking changes,
+no new public surface area; all of it sands the rough edges off the 2.7.0
+release.
+
+### Fixed — LLM and tool calling
+- **Stale tool names in the system-prompt quick-reference** caused the LLM
+  to hallucinate calls to tools that no longer existed (e.g.
+  `search_materials` after the Round 7 rename to `materials_search`). The
+  curated list in `crates/llm/src/lib.rs` was 6-of-9 stale; LLM now sees
+  real names. Two pin-tests + a Python-registry cross-check guard
+  against recurrence.
+- **SSE chunk-buffer corruption on the platform LLM proxy** dropped bytes
+  mid-`function.arguments` JSON whenever an SSE event spanned a TCP
+  packet boundary, producing empty assistant messages on tool calls.
+  Fixed in marc27-core with a buffered line assembler (PR #8); 10 unit
+  tests cover the chunk-split scenarios. Verified live in `prism tui`.
+- **MARC27 streaming clean-up** removes a delta-emit echo so chat content
+  no longer renders twice in a single turn.
+
+### Fixed — auth UX
+- **Spurious org/project pickers on fresh login**: `prism login` now
+  auto-selects when the account has exactly one org or one project,
+  printing `Using organization: …` / `Using project: …` so the choice
+  isn't silent.
+- **Refresh-token expiry no longer drops the user mid-chat.** When both
+  proactive and reactive refresh fail, `prism tui` and `prism resume`
+  run the full device-flow login *inline* — the user stays in the same
+  shell, approves in the browser, and the TUI keeps loading. Falls back
+  to a clear `run prism login` message if the inline flow itself errors.
+- **Refresh-token failures surface platform error detail** instead of a
+  generic 401 — easier to tell expired-token from network-down.
+
+### Fixed — security and privacy (bug-bounty round)
+- **PRISM token egress to forgecode.dev blocked** (Bug #35).
+- **`credentials.json` now written 0600**, not world-readable (Bug #39).
+- **`open_browser` refuses non-`http(s)` URLs** (Bug #42, defense-in-depth).
+- **Cypher write-protection blocklist extended** (Bug #47).
+- **Mesh dataset-name Cypher injection** patched (Bug #45).
+- **Kafka `QueryForward` execution disabled** pending peer-verification
+  wiring (Bug #46) — see "Known issues" below.
+- **BYOC SSH shell injection via image / inputs** patched (Bug #54).
+- **Workflow `http` step SSRF-guarded** (Bug #56).
+- **Mesh `Announce` message sizes capped** to prevent DoS (Bug #57).
+- **WebSocket audit broadcasts scoped by user** (Bug #58).
+- **Marketplace install hardened** against silent overwrites and bad
+  downloads (Bug #34).
+- **RBAC: NodeAdmin no longer silently restored** after admin downgrade
+  (Bug #49).
+- **Dataset names validated** at publish/subscribe (Bug #51).
+- **Release archive binary names allowlisted** at install (Bug #59).
+
+### Fixed — TUI / CLI quality
+- **`prism --offline` localhost-only auth** (Bug #21) and **in-memory
+  `SubscriptionManager`** (Bug #20) now actually work without platform
+  connectivity.
+- **`prism resume`** subcommand with a truthful exit hint.
+- **`/update` no longer installs FORGE over PRISM** (Bug #31, critical).
+- **CPR-timeout** in forge_main produces a clear actionable error
+  instead of a silent crash (Bug #22).
+- **Boot status truthful** + stale forge creds cleared (Bug #23).
+- **TUI per-column word floor** stops `Stainless` → `Stainl` /
+  `ess` (Bug #28).
+- **Branding leaks**: dropped user-facing "forge" mentions from the
+  banner, `/info`, init flow, and status command (Bugs #36, #63).
+- **`prism status`** now reports `chat_surface: "prism"`, not `"forge"`.
+- **Workflow discovery** survives one bad YAML instead of crashing
+  the whole list (Bug #37).
+- **Mesh federated query unwrap** removed (Bug #38).
+- **Mesh `SubscriptionManager`** dedupes in memory like it already did
+  on disk (Bug #43).
+- **Mesh mDNS** uses 0.18 + explicit loopback so two `prism` processes
+  on the same host can find each other (Bug #19).
+- **Picker title salvage**: malformed-JSON fallback titles now render
+  human-readable in the conversation picker (Bug #30).
+
+### Changed
+- **Body cap on platform LLM/knowledge proxies** raised from 64 KiB
+  to 32 MiB (marc27-core PR #7), with a 413 PAYLOAD_TOO_LARGE response
+  for over-cap requests instead of silent truncation.
+- **Federation trust anchor**: marc27-core now exposes `/federation/
+  platform-pubkey` and signs cross-org requests with Ed25519
+  (marc27-core PR #6, slice 1 of PRISM Bug #27 path A).
+
+### Known issues
+- **Bug #33 — `verify_peer` not yet wired into the mesh sync path.**
+  The Kafka `QueryForward` consumer is currently disabled for safety
+  (Bug #46 above); re-enabling it requires (a) F1c4 `verify_peer`
+  wiring, (b) a read-only Cypher allow-list, (c) per-org policy
+  gating. Targeted for v2.7.2.
+- **Auth: dashboard "Create API Key" button** still missing (chicken-
+  and-egg for fresh users without a CLI session). Blocked on the
+  marc27-platform route-group refactor in flight; targeted for v2.7.2.
+
 ## [2.6.0] - 2026-04-04
 
 ## [2.6.1] - 2026-04-06
