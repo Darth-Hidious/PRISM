@@ -7548,6 +7548,7 @@ name = "prism-mesh"
 version = "2.7.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "ed25519-dalek",
  "futures-util",
@@ -7565,6 +7566,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tracing",
  "uuid",
 ]
