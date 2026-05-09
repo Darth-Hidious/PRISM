@@ -184,58 +184,41 @@ pub async fn run_sync_handler(
             }
 
             // ── Query forwarding (federated search) ──────────
+            //
+            // **Disabled**: this code path used to execute the peer's
+            // raw Cypher string against the local Neo4j with no
+            // verification, no allow-list, and no auth — any peer in
+            // the Kafka mesh could send an arbitrary `MATCH/DELETE`
+            // statement and our graph would obey. This was
+            // remote-attacker-controlled, full graph-DB compromise of
+            // the receiving node (see Bug #46).
+            //
+            // The Kafka federated-query path was already marked
+            // "direct REST federation preferred" in the result-return
+            // comment below, so wholesale dropping it is consistent
+            // with the architectural direction. Direct REST
+            // federation goes through the server's regular auth and
+            // RBAC layers; this path bypassed both.
+            //
+            // If a future protocol revision wants to re-enable Kafka
+            // query forwarding, the prerequisites are: (a) F1 chunk 4
+            // verify_peer wiring (Bug #33), (b) an allow-list of
+            // read-only Cypher patterns, (c) an explicit per-org
+            // policy gate. Until all three exist, ignore the message.
             MeshMessage::QueryForward {
                 query_id,
-                query,
                 origin_node,
+                ..
             } => {
                 if origin_node == our_node_id {
                     continue;
                 }
-                debug!(
+                warn!(
                     query_id = %query_id,
                     origin = %origin_node,
-                    "received forwarded query from peer"
+                    "ignoring QueryForward — Kafka federated-query path disabled \
+                     pending peer verification (Bug #46)"
                 );
-                // Execute locally and respond — requires Neo4j
-                if let Some(ref cfg) = sync_config {
-                    let neo4j_url = format!("{}/db/neo4j/tx/commit", cfg.neo4j_url);
-                    let neo4j_body = serde_json::json!({
-                        "statements": [{
-                            "statement": query,
-                        }]
-                    });
-                    match client
-                        .post(&neo4j_url)
-                        .basic_auth(&cfg.neo4j_user, Some(&cfg.neo4j_pass))
-                        .json(&neo4j_body)
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => {
-                            let results =
-                                resp.json::<serde_json::Value>().await.unwrap_or_default();
-                            debug!(
-                                query_id = %query_id,
-                                "forwarded query executed, results ready"
-                            );
-                            // Note: QueryResult would be published back via Kafka
-                            // if we had access to the producer here. For now, log it.
-                            info!(
-                                query_id = %query_id,
-                                "query result available (direct REST federation preferred)"
-                            );
-                            let _ = results; // consumed by direct REST federation
-                        }
-                        Err(e) => {
-                            warn!(
-                                query_id = %query_id,
-                                error = %e,
-                                "failed to execute forwarded query"
-                            );
-                        }
-                    }
-                }
             }
 
             MeshMessage::QueryResult { query_id, results } => {
