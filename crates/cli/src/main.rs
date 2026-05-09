@@ -5769,9 +5769,17 @@ async fn select_project(
         });
     }
 
-    let selected_org = prompt_select("Select organization", &orgs, |org| {
-        format!("{} ({})", org.name, org.slug)
-    })?;
+    // Skip the picker when there's only one choice — silent prompts on a
+    // single-org/single-project account were the loudest auth friction.
+    let selected_org = if orgs.len() == 1 {
+        let only = &orgs[0];
+        println!("Using organization: {} ({})", only.name, only.slug);
+        only
+    } else {
+        prompt_select("Select organization", &orgs, |org| {
+            format!("{} ({})", org.name, org.slug)
+        })?
+    };
 
     let projects = platform.list_projects_for_org(&selected_org.id).await?;
 
@@ -5797,9 +5805,15 @@ async fn select_project(
         });
     }
 
-    let selected_project = prompt_select("Select project", &projects, |project| {
-        format!("{} ({})", project.name, project.slug)
-    })?;
+    let selected_project = if projects.len() == 1 {
+        let only = &projects[0];
+        println!("Using project: {} ({})", only.name, only.slug);
+        only
+    } else {
+        prompt_select("Select project", &projects, |project| {
+            format!("{} ({})", project.name, project.slug)
+        })?
+    };
 
     Ok(SelectedContext {
         org_id: Some(selected_org.id.clone()),
