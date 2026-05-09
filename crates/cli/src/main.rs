@@ -52,6 +52,16 @@ enum Commands {
     Setup,
     /// Launch the interactive AI agent TUI.
     Tui,
+    /// Resume a previous conversation.
+    ///
+    /// With no argument, opens the conversation picker (last-N sessions
+    /// shown by title + how-long-ago) so you can pick one. With a
+    /// conversation id, jumps straight back into that conversation.
+    /// The id was printed when you exited the previous session.
+    Resume {
+        /// Conversation UUID to resume directly. Omit to get the picker.
+        id: Option<String>,
+    },
     /// Authenticate against the MARC27 platform.
     ///
     /// Default: device-flow login that opens a browser to approve the
@@ -2412,6 +2422,58 @@ async fn main() -> Result<()> {
             }
             boot::boot_sequence(&boot_checks);
             // Splash skipped — see note in default chat path.
+            let _ = &python;
+            forge_chat::run(&project_root, state.credentials.as_ref(), &python).await?;
+        }
+        Commands::Resume { id } => {
+            // Reuses the same Tui setup path: same auth refresh, same
+            // boot checklist, same forge_chat::run. The only difference
+            // is which conversation the chat lands on, signalled via
+            // env vars (PRISM_RESUME_ID for a direct UUID jump,
+            // PRISM_RESUME_PICKER for the conversation picker). Both
+            // env vars are read + cleared by forge_chat::run /
+            // forge_main::ui — see those for the consumer side.
+            unsafe {
+                match id.as_deref() {
+                    Some(raw_id) => std::env::set_var("PRISM_RESUME_ID", raw_id),
+                    None => std::env::set_var("PRISM_RESUME_PICKER", "1"),
+                }
+            }
+
+            // Same auth-refresh + boot-check flow as the Tui branch.
+            let mut state = paths.load_cli_state().ok().unwrap_or_default();
+            if let Some(creds) = state.credentials.as_ref()
+                && !creds.refresh_token.is_empty()
+                && creds
+                    .expires_at
+                    .is_some_and(|exp| chrono::Utc::now() + chrono::Duration::minutes(5) >= exp)
+            {
+                match refresh_access_token(&endpoints, creds).await {
+                    Ok(new_creds) => {
+                        state.credentials = Some(new_creds);
+                        let _ = paths.save_cli_state(&state);
+                        tracing::info!("access token refreshed proactively");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proactive token refresh failed");
+                    }
+                }
+            }
+            let mut boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let auth_rejected = boot_checks
+                .iter()
+                .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
+            if auth_rejected
+                && let Some(creds) = state.credentials.as_ref()
+                && !creds.refresh_token.is_empty()
+                && let Ok(new_creds) = refresh_access_token(&endpoints, creds).await
+            {
+                tracing::info!("access token refreshed after server-side rejection");
+                state.credentials = Some(new_creds);
+                let _ = paths.save_cli_state(&state);
+                boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            }
+            boot::boot_sequence(&boot_checks);
             let _ = &python;
             forge_chat::run(&project_root, state.credentials.as_ref(), &python).await?;
         }
