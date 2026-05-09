@@ -79,6 +79,23 @@ pub async fn publish_dataset(
 ) -> Result<Json<PublishResponse>, (axum::http::StatusCode, String)> {
     use prism_mesh::subscription::PublishedDataset;
 
+    // Refuse publish requests with malformed names — defence in depth
+    // against the Cypher-injection class fixed in PR #75. The remote
+    // sync path now validates names too, but unvalidated names from
+    // pre-#75 builds (or third-party PRISM-compatible nodes) would
+    // still execute injection. Stop them at the source. Same allowlist:
+    // ASCII alphanumeric + `_-.`, non-empty, ≤128 chars.
+    if !valid_dataset_name(&body.name) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "invalid dataset name {:?}: must be ASCII alphanumeric + _-., \
+                 non-empty, ≤128 chars",
+                body.name
+            ),
+        ));
+    }
+
     {
         let mut subs = state
             .subscriptions
@@ -117,6 +134,16 @@ pub async fn subscribe_dataset(
 ) -> Result<Json<SubscribeResponse>, (axum::http::StatusCode, String)> {
     use prism_mesh::subscription::Subscription;
 
+    if !valid_dataset_name(&body.dataset_name) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "invalid dataset name {:?}: must be ASCII alphanumeric + _-., \
+                 non-empty, ≤128 chars",
+                body.dataset_name
+            ),
+        ));
+    }
     let publisher = uuid::Uuid::parse_str(&body.publisher_node).map_err(|e| {
         (
             axum::http::StatusCode::BAD_REQUEST,
@@ -159,6 +186,16 @@ pub async fn unsubscribe_dataset(
     State(state): State<Arc<NodeState>>,
     Json(body): Json<UnsubscribeRequest>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    if !valid_dataset_name(&body.dataset_name) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "invalid dataset name {:?}: must be ASCII alphanumeric + _-., \
+                 non-empty, ≤128 chars",
+                body.dataset_name
+            ),
+        ));
+    }
     let publisher = uuid::Uuid::parse_str(&body.publisher_node).map_err(|e| {
         (
             axum::http::StatusCode::BAD_REQUEST,
@@ -200,6 +237,19 @@ pub struct PublishRequest {
 
 fn default_schema_version() -> String {
     "1.0".to_string()
+}
+
+/// Allowlist for dataset names, matching the consumer-side check in
+/// `prism_mesh::sync::sync_dataset_from_peer` (Bug #45). Both sides
+/// validate so a name that gets through one is still rejected by the
+/// other; reject early at the publish/subscribe HTTP boundary so the
+/// bad value never makes it onto the Kafka mesh.
+fn valid_dataset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 #[derive(Serialize)]
