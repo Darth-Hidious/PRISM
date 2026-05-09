@@ -2134,10 +2134,38 @@ async fn main() -> Result<()> {
                     }
                 }
                 MarketplaceCommands::Install { name, workflow } => {
+                    // Reject names containing path separators / parent refs.
+                    // Without this, `prism marketplace install ../../../foo`
+                    // would write to ~/.prism/tools/../../../foo.py — a self-
+                    // inflicted path traversal. Marketplace slugs are always
+                    // simple identifiers in practice, so the restriction is
+                    // safe and surfaces typos early.
+                    if name.contains('/')
+                        || name.contains('\\')
+                        || name.contains("..")
+                        || name.starts_with('.')
+                    {
+                        anyhow::bail!(
+                            "Invalid marketplace name '{name}'. Names must be simple slugs \
+                             (no `/`, `\\`, `..`, or leading `.`)."
+                        );
+                    }
+
                     let url = marketplace.install_url(&name).await?;
                     let client = reqwest::Client::new();
-                    let resp = client.get(&url).send().await?;
-                    let content = resp.text().await?;
+                    // error_for_status() converts 4xx/5xx into Err so a 404
+                    // doesn't end up saved as a Python file. Previously the
+                    // download path happily wrote HTML 404 pages as `.py`,
+                    // which then auto-loaded on next launch and crashed the
+                    // tool router with a syntax error.
+                    let content = client
+                        .get(&url)
+                        .send()
+                        .await?
+                        .error_for_status()
+                        .with_context(|| format!("downloading {name} from {url}"))?
+                        .text()
+                        .await?;
 
                     let home = std::env::var("HOME").unwrap_or_default();
                     let dest = if workflow {
@@ -2149,6 +2177,18 @@ async fn main() -> Result<()> {
                         std::fs::create_dir_all(&dir)?;
                         dir.join(format!("{name}.py"))
                     };
+
+                    // Refuse to silently overwrite a local edit. Marketplace
+                    // installs are expected to be additive; if the user
+                    // wants the upstream version they can `rm` the file
+                    // first or pass a future `--force` flag.
+                    if dest.exists() {
+                        anyhow::bail!(
+                            "Refusing to overwrite existing file at {}. \
+                             Remove it first if you want the marketplace version.",
+                            dest.display()
+                        );
+                    }
 
                     std::fs::write(&dest, &content)?;
                     let kind = if workflow { "workflow" } else { "tool" };
