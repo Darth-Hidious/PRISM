@@ -109,7 +109,12 @@ impl<S: AS> TitleGenerator<S> {
 /// `{"title<value>"}` (no `:` separator, value not quoted). Strips the
 /// JSON-object braces, the `"title"` key, residual quotes, and
 /// surrounding whitespace.
-fn salvage_title_from_malformed(content: &str) -> String {
+///
+/// Idempotent — already-clean titles pass through unchanged. Made
+/// pub so the conversation picker can apply the same salvage at
+/// render time, since titles persisted before this fix landed are
+/// still in users' SQLite stores.
+pub fn salvage_title_from_malformed(content: &str) -> String {
     let s = content.trim();
     // 1. Drop leading "{ and trailing }" if present.
     let s = s.trim_start_matches('{').trim_end_matches('}').trim();

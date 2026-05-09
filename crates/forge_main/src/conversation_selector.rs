@@ -44,10 +44,17 @@ impl ConversationSelector {
         let mut info = Info::new();
 
         for conv in &valid_conversations {
+            // Apply title salvage at display time. Pre-PR #60 conversations
+            // have raw `{"title":"..."}` JSON sitting in their `title`
+            // column; the salvager now runs on every render so historical
+            // bad data shows clean text without a DB migration. New
+            // conversations already get salvaged at write time, so applying
+            // here is idempotent. See Bug #60 follow-up.
             let title = conv
                 .title
                 .as_deref()
-                .map(|t| t.to_string())
+                .map(forge_app::title_generator::salvage_title_from_malformed)
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| markers::EMPTY.to_string());
 
             let duration = now.signed_duration_since(
