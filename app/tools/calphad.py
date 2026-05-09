@@ -103,10 +103,50 @@ def _calculate_gibbs_energy(**kwargs) -> dict:
 def _list_databases(**kwargs) -> dict:
     """List available TDB files. No pycalphad needed."""
     try:
-        from app.tools.simulation.calphad_bridge import get_calphad_bridge
+        from app.tools.simulation.calphad_bridge import (
+            check_calphad_available,
+            get_calphad_bridge,
+        )
+
         bridge = get_calphad_bridge()
         databases = bridge.databases.list_databases()
-        return {"databases": databases, "count": len(databases)}
+
+        # Empty-state hint — without this the LLM gets back
+        # `{"databases": [], "count": 0}` and has no idea what to do
+        # next. Spell out the recovery path so the agent can either
+        # ask the user to provide a TDB or skip the calphad step
+        # gracefully instead of hallucinating Gibbs values.
+        result: dict = {"databases": databases, "count": len(databases)}
+        if not databases:
+            result["hint"] = (
+                "No TDB databases installed in ~/.prism/databases/. "
+                "CALPHAD calculations (gibbs / equilibrium / phase_diagram) "
+                "require a thermodynamic database (.tdb file). Options: "
+                "(1) ask the user for a TDB path and call "
+                "calphad(action='import', source_path=<path>); "
+                "(2) check the marketplace via materials_search "
+                "with provider='marketplace' for curated public TDBs "
+                "(e.g. Al-Cu-Ni, Ni-Cr-Al-Co); "
+                "(3) report to the user that CALPHAD is unavailable "
+                "and propose ML-based property prediction instead "
+                "(predict / predict_properties tools)."
+            )
+        # Surface pycalphad availability up-front so the agent can plan.
+        # `list_databases` itself doesn't need pycalphad, but every
+        # downstream compute action does. Without this, the LLM will
+        # plan a multi-step calphad workflow, then crash on the first
+        # compute step.
+        result["pycalphad_available"] = check_calphad_available()
+        if not result["pycalphad_available"]:
+            result.setdefault("hint", "")
+            result["hint"] = (
+                "pycalphad is NOT installed in this PRISM environment — "
+                "calphad_compute(...) actions will return errors. Tell the "
+                "user to install with `pip install prism-platform[calphad]` "
+                "or use ML prediction (predict_properties) instead.\n\n"
+                + result["hint"]
+            )
+        return result
     except Exception as e:
         return {"error": str(e)}
 
