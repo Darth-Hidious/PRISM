@@ -263,6 +263,12 @@ enum Commands {
         #[command(subcommand)]
         command: MeshCommands,
     },
+    /// PRISM Fabric — cross-org federation primitives (read-only). Trust is
+    /// managed in the MARC27 platform UI; the CLI only inspects state.
+    Federation {
+        #[command(subcommand)]
+        command: FederationCommands,
+    },
     /// Report a bug or issue — captures system context and files it automatically.
     Report {
         /// Description of what went wrong.
@@ -560,6 +566,35 @@ enum MeshCommands {
         /// Dashboard URL of the running node.
         #[arg(long, default_value = "http://127.0.0.1:7327")]
         dashboard_url: String,
+    },
+}
+
+/// Read-only commands for inspecting PRISM Fabric state.
+///
+/// **Trust is managed in the MARC27 platform UI, not from this CLI.** The
+/// platform owns org / project / role definitions; PRISM nodes are clients
+/// that use the platform-signed token to make cross-org requests. This
+/// command surface is for *inspecting* what other nodes will see when
+/// they verify your requests, not for granting trust.
+///
+/// See [crates/mesh/src/federation.rs] for the verify_peer() flow.
+#[derive(Debug, Subcommand)]
+enum FederationCommands {
+    /// Print the identity that other nodes see when they verify your
+    /// cross-org requests. Read-only; sourced from your local platform
+    /// credentials.
+    Whoami {
+        /// Emit JSON instead of the human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List known peer organizations the current user can interact with
+    /// across the Fabric. Sourced from the MARC27 platform; trust is
+    /// transitive via the platform root CA.
+    Peers {
+        /// Emit JSON instead of the human-readable summary.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2007,6 +2042,9 @@ async fn main() -> Result<()> {
         Commands::Mesh { command } => {
             handle_mesh_command(command, &paths).await?;
         }
+        Commands::Federation { command } => {
+            handle_federation_command(command, &paths).await?;
+        }
         Commands::Report {
             description,
             log_file,
@@ -2653,6 +2691,119 @@ fn render_workflow_result(spec: &WorkflowSpec, result: &WorkflowRunResult) {
 }
 
 // ── prism mesh ─────────────────────────────────────────────────────────
+
+/// Render the cross-org identity that other Fabric nodes will see
+/// when verifying this user's requests. Sourced from local credentials
+/// — no platform call needed.
+async fn handle_federation_command(
+    command: FederationCommands,
+    paths: &prism_runtime::PrismPaths,
+) -> Result<()> {
+    match command {
+        FederationCommands::Whoami { json } => {
+            let state = paths.load_cli_state().ok().unwrap_or_default();
+            let creds = state.credentials.as_ref().ok_or_else(|| {
+                anyhow!("Not logged in. Run `prism login` to set up your platform identity.")
+            })?;
+
+            let now = chrono::Utc::now();
+            let expired = creds.expires_at.is_some_and(|exp| now >= exp);
+
+            if json {
+                let out = serde_json::json!({
+                    "org_id": creds.org_id,
+                    "org_name": creds.org_name,
+                    "project_id": creds.project_id,
+                    "project_name": creds.project_name,
+                    "user_id": creds.user_id,
+                    "display_name": creds.display_name,
+                    "platform_url": creds.platform_url,
+                    "valid_until": creds.expires_at.map(|d| d.to_rfc3339()),
+                    "expired": expired,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
+
+            // Human-readable. The shape mirrors what
+            // crates/mesh/src/federation.rs::PeerIdentity emits over
+            // the wire so a user inspecting their own identity sees
+            // (roughly) what a remote node verifies.
+            println!("\nFabric identity (this is what peer nodes see)");
+            println!("───────────────────────────────────────────────");
+            println!(
+                "  Display name : {}",
+                creds.display_name.as_deref().unwrap_or("(unset)")
+            );
+            println!(
+                "  User ID      : {}",
+                creds.user_id.as_deref().unwrap_or("(unset)")
+            );
+            println!(
+                "  Org          : {} ({})",
+                creds.org_name.as_deref().unwrap_or("(unset)"),
+                creds.org_id.as_deref().unwrap_or("(unset)")
+            );
+            println!(
+                "  Project      : {} ({})",
+                creds.project_name.as_deref().unwrap_or("(unset)"),
+                creds.project_id.as_deref().unwrap_or("(unset)")
+            );
+            println!("  Platform     : {}", creds.platform_url);
+            match creds.expires_at {
+                Some(exp) => {
+                    let label = if expired { "EXPIRED" } else { "valid until" };
+                    println!("  Token        : {} {}", label, exp.to_rfc3339());
+                }
+                None => println!("  Token        : no expiry set"),
+            }
+            if expired {
+                println!();
+                println!(
+                    "  Token has expired. Run `prism login` to refresh — \
+                     cross-org requests will be rejected by other nodes \
+                     until you re-auth."
+                );
+            }
+            println!();
+        }
+        FederationCommands::Peers { json } => {
+            // Peer-org listing requires a platform endpoint that
+            // returns the orgs THIS user can interact with across
+            // Fabric. The MARC27 platform doesn't expose this yet
+            // — tracked as F1 chunk 3 (platform pubkey fetcher +
+            // peer enumeration). Until that lands, return a clean
+            // empty result rather than fake data.
+            //
+            // The protocol contract is: trust is transitive via the
+            // platform root CA; the platform owns peer enumeration;
+            // PRISM clients only consume that list. Inventing peers
+            // client-side would let an adversarial CLI fork generate
+            // tokens that don't exist platform-side, which is the
+            // exact attack vector the root-CA model prevents.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "peers": [],
+                        "platform_supported": false,
+                        "note": "Peer listing requires platform-side enumeration (F1 chunk 3). Trust is transitive via the platform root CA — see docs/prism_fabric_v1_spec.md."
+                    }))?
+                );
+            } else {
+                println!("\nFabric peers");
+                println!("─────────────");
+                println!("  (no peers — platform enumeration coming in F1 chunk 3)");
+                println!();
+                println!("  Trust is transitive via the MARC27 platform root CA.");
+                println!("  Run `prism federation whoami` to see your own identity.");
+                println!("  See docs/prism_fabric_v1_spec.md for the full design.");
+                println!();
+            }
+        }
+    }
+    Ok(())
+}
 
 async fn handle_mesh_command(
     command: MeshCommands,
