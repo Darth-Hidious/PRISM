@@ -40,6 +40,11 @@ pub struct DaemonOptions {
     pub rbac_db_path: Option<PathBuf>,
     /// Organisation ID for role fetching.
     pub org_id: Option<String>,
+    /// Skip ALL platform connectivity — token refresh, heartbeat, job
+    /// dispatch loop. Dashboard + mesh + Kafka still start. Used for
+    /// `prism node up --offline` and for local two-node mesh tests
+    /// where the platform isn't reachable.
+    pub offline: bool,
 }
 
 impl Default for DaemonOptions {
@@ -56,6 +61,7 @@ impl Default for DaemonOptions {
             platform_node_id: None,
             rbac_db_path: None,
             org_id: None,
+            offline: false,
         }
     }
 }
@@ -211,6 +217,16 @@ pub async fn run_daemon(
     let platform_node_id = options.platform_node_id.clone();
     let rbac_db_path = options.rbac_db_path.clone();
     let rbac_org_id = options.org_id.clone();
+
+    // Offline mode — never touch the platform. The dashboard, mesh,
+    // and Kafka tasks were started by the caller; they keep running.
+    // We just park here until ctrl-c so the caller's mesh/kafka
+    // shutdown logic still fires on signal.
+    if options.offline {
+        tracing::info!("daemon running in offline mode — platform auth skipped");
+        let _ = tokio::signal::ctrl_c().await;
+        return Ok(());
+    }
 
     let mut delay_secs: u64 = 1;
 
