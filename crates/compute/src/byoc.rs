@@ -177,16 +177,32 @@ impl ComputeBackend for ByocBackend {
                 let job_id = Uuid::new_v4();
                 let inputs_json = serde_json::to_string(&plan.inputs)?;
 
-                // SSH to SLURM head node → sbatch a singularity/docker job
+                // Same image validation as the SSH path. The SLURM script
+                // executes `singularity exec docker://{image}` on the head
+                // node — without validation an LLM-controlled image
+                // string would land in the SBATCH script and run on
+                // the cluster. See Bug #54.
+                if !is_valid_docker_image(&plan.image) {
+                    bail!(
+                        "invalid docker image reference {:?}: must match \
+                         [A-Za-z0-9._/:@-]+",
+                        plan.image
+                    );
+                }
+
+                // SSH to SLURM head node → sbatch a singularity/docker job.
+                // PRISM_INPUTS uses the same single-quote-escape helper
+                // as the SSH path so JSON apostrophes can't break out.
                 let sbatch_script = format!(
                     "#!/bin/bash\n\
                      #SBATCH --job-name=prism-{job_id}\n\
                      #SBATCH --partition={partition}\n\
                      #SBATCH --output=/tmp/prism-{job_id}.out\n\
                      export PRISM_JOB_ID={job_id}\n\
-                     export PRISM_INPUTS='{inputs_json}'\n\
+                     export PRISM_INPUTS={inputs_q}\n\
                      singularity exec docker://{image} /entrypoint.sh\n",
                     image = plan.image,
+                    inputs_q = sh_single_quote(&inputs_json),
                 );
 
                 let ssh_cmd = format!("echo '{}' | sbatch", sbatch_script.replace('\'', "'\\''"));
