@@ -958,7 +958,8 @@ async fn main() -> Result<()> {
             // still have a refresh_token we haven't tried yet (local
             // expires_at said fresh but server disagreed → server-side
             // rotation), try one more refresh + redo the check.
-            let mut boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let mut boot_checks =
+                boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             let auth_rejected = boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
@@ -972,7 +973,9 @@ async fn main() -> Result<()> {
                         state.credentials = Some(new_creds);
                         paths.save_cli_state(&state)?;
                         // Redo the boot checks with the new token.
-                        boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                        boot_checks =
+                            boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints)
+                                .await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -2397,7 +2400,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            let mut boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let mut boot_checks =
+                boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             let auth_rejected = boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
@@ -2409,7 +2413,8 @@ async fn main() -> Result<()> {
                 tracing::info!("access token refreshed after server-side rejection");
                 state.credentials = Some(new_creds);
                 let _ = paths.save_cli_state(&state);
-                boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                boot_checks =
+                    boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
             boot::boot_sequence(&boot_checks);
             // Splash skipped — see note in default chat path.
