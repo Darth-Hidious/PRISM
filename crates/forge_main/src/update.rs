@@ -7,13 +7,18 @@ use forge_select::ForgeWidget;
 use forge_tracker::VERSION;
 use update_informer::{Check, Version, registry};
 
-/// Runs the official installation script to update Forge, failing silently.
+/// Runs the official PRISM installation script to update, failing silently.
 /// When `auto_update` is true, exits immediately after a successful update
 /// without prompting the user.
+///
+/// **Important**: this runs PRISM's installer (`prism.marc27.com/install.sh`),
+/// not the upstream Forge installer. The original code path would have
+/// reinstalled forge over the user's prism binary — broken before, now
+/// pointed at the right product.
 async fn execute_update_command(api: Arc<impl API>, auto_update: bool) {
     // Spawn a new task that won't block the main application
     let output = api
-        .execute_shell_command_raw("curl -fsSL https://forgecode.dev/cli | sh")
+        .execute_shell_command_raw("curl -fsSL https://prism.marc27.com/install.sh | bash")
         .await;
 
     match output {
@@ -28,7 +33,7 @@ async fn execute_update_command(api: Arc<impl API>, auto_update: bool) {
                     true
                 } else {
                     let answer = forge_select::ForgeWidget::confirm(
-                        "You need to close forge to complete update. Do you want to close it now?",
+                        "You need to close prism to complete update. Do you want to close it now?",
                     )
                     .with_default(true)
                     .prompt();
@@ -87,7 +92,10 @@ pub async fn on_update(api: Arc<impl API>, update: Option<&Update>) {
         return;
     }
 
-    let informer = update_informer::new(registry::GitHub, "tailcallhq/forgecode", VERSION)
+    // Check PRISM's GitHub releases, not the upstream Forge repo. The
+    // VERSION constant comes from forge_tracker but is bumped per-PRISM
+    // release in our Cargo.toml, so the comparison is apples-to-apples.
+    let informer = update_informer::new(registry::GitHub, "Darth-Hidious/PRISM", VERSION)
         .interval(frequency.into());
 
     if let Some(version) = informer.check_version().ok().flatten()
