@@ -634,7 +634,7 @@ impl From<&ForgeCommandManager> for Info {
         info = info
             .add_title("KEYBOARD SHORTCUTS")
             .add_key_value("<CTRL+C>", "Interrupt current operation")
-            .add_key_value("<CTRL+D>", "Quit Forge interactive shell")
+            .add_key_value("<CTRL+D>", "Quit PRISM interactive shell")
             .add_key_value(multiline_shortcut, "Insert new line (multiline input)");
 
         info
