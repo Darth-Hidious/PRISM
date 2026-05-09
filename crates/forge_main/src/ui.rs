@@ -2051,6 +2051,22 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 on_update(self.api.clone(), None).await;
             }
             AppCommand::Exit => {
+                // Print a resume hint so the user has the UUID + the
+                // exact command to come back. Forge auto-titles
+                // conversations and `/conversation` (no arg) is the
+                // picker; `--cid <id>` jumps straight in.
+                //
+                // Suppressed if there's no conversation_id (the user
+                // exited before sending any turn) — nothing to resume.
+                if let Some(cid) = self.state.conversation_id {
+                    let id_str = cid.into_string();
+                    use std::io::Write as _;
+                    let mut stderr = std::io::stderr();
+                    let _ = writeln!(stderr);
+                    let _ = writeln!(stderr, "Conversation saved · id: {id_str}");
+                    let _ = writeln!(stderr, "  resume:  prism tui --cid {id_str}");
+                    let _ = writeln!(stderr, "  picker:  prism tui   then type  /conversation");
+                }
                 return Ok(true);
             }
 
