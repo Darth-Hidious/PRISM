@@ -56,6 +56,29 @@ pub async fn run_sync_handler(
                 if node_id == our_node_id {
                     continue; // ignore our own announcements
                 }
+                // Reject obviously-abusive announces. Without these caps a
+                // peer with Kafka access could announce themselves with
+                // a 1 MB name (or N fake node_ids) and grow the in-memory
+                // peers list until OOM. See Bug #57.
+                const MAX_NAME_LEN: usize = 256;
+                const MAX_ADDRESS_LEN: usize = 256;
+                const MAX_CAPABILITIES: usize = 64;
+                const MAX_CAPABILITY_LEN: usize = 256;
+                const MAX_PEERS: usize = 10_000;
+                if name.len() > MAX_NAME_LEN
+                    || address.len() > MAX_ADDRESS_LEN
+                    || capabilities.len() > MAX_CAPABILITIES
+                    || capabilities.iter().any(|c| c.len() > MAX_CAPABILITY_LEN)
+                {
+                    warn!(
+                        %node_id,
+                        name_len = name.len(),
+                        address_len = address.len(),
+                        cap_count = capabilities.len(),
+                        "rejecting Announce: field length exceeds caps"
+                    );
+                    continue;
+                }
                 info!(node = %name, id = %node_id, "peer announced");
                 let peer = PeerNode {
                     node_id,
@@ -66,7 +89,21 @@ pub async fn run_sync_handler(
                     capabilities,
                 };
                 let mut list = peers.write().unwrap_or_else(|e| e.into_inner());
-                if !list.iter().any(|p| p.node_id == node_id) {
+                if list.iter().any(|p| p.node_id == node_id) {
+                    // Already known — refresh `last_seen`. Without this an
+                    // honest peer that drops Kafka briefly and rejoins
+                    // would have stale `last_seen` until the next
+                    // announce, while we'd miss the update.
+                    if let Some(existing) = list.iter_mut().find(|p| p.node_id == node_id) {
+                        existing.last_seen = peer.last_seen;
+                    }
+                } else if list.len() >= MAX_PEERS {
+                    warn!(
+                        peer_count = list.len(),
+                        max = MAX_PEERS,
+                        "rejecting Announce: peer list at capacity (Bug #57 DoS guard)"
+                    );
+                } else {
                     list.push(peer);
                 }
             }
