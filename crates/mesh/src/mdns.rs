@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use uuid::Uuid;
 
 use crate::PeerNode;
@@ -39,15 +39,25 @@ impl MdnsDiscovery {
         properties.insert("name".to_string(), name.to_string());
         properties.insert("caps".to_string(), capabilities.join(","));
 
+        // Pass an explicit address list so mdns-sd advertises on BOTH
+        // loopback (so two prism processes on the same machine see
+        // each other) AND the host's primary IPv4 (so cross-machine
+        // discovery works). Empty-string auto-detect in mdns-sd 0.18
+        // omits 127.0.0.1, which broke local two-process discovery —
+        // see `prepare_announce: no valid addrs on interface lo0` in
+        // debug logs and SHIPPED.md / Bug #19.
+        //
+        // Format is space-separated IPs in the address-list slot.
         let service = ServiceInfo::new(
             SERVICE_TYPE,
             &instance_name,
             &format!("{instance_name}.local."),
-            "", // auto-detect IP
+            "127.0.0.1",
             self.port,
             properties,
         )
-        .context("failed to create mDNS service info")?;
+        .context("failed to create mDNS service info")?
+        .enable_addr_auto();
 
         self.daemon
             .register(service)
@@ -108,21 +118,26 @@ impl MdnsDiscovery {
 }
 
 /// Convert a resolved mDNS service into a `PeerNode`.
-fn service_info_to_peer(info: &ServiceInfo) -> Option<PeerNode> {
-    let props = info.get_properties();
-    let node_id_str = props.get_property_val_str("node_id")?;
+///
+/// Takes `&ResolvedService` (mdns-sd 0.18 API) — the old `ServiceInfo`
+/// type was split: `ServiceInfo` is now publisher-side metadata for
+/// `register()`, `ResolvedService` is querier-side plain data emitted
+/// by `ServiceResolved` events. The accessor methods are the same.
+fn service_info_to_peer(info: &ResolvedService) -> Option<PeerNode> {
+    let node_id_str = info.get_property_val_str("node_id")?;
     let node_id = Uuid::parse_str(node_id_str).ok()?;
-    let name = props
+    let name = info
         .get_property_val_str("name")
         .unwrap_or("unknown")
         .to_string();
-    let caps_str = props.get_property_val_str("caps").unwrap_or("");
+    let caps_str = info.get_property_val_str("caps").unwrap_or("");
     let capabilities: Vec<String> = caps_str
         .split(',')
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
 
+    // `addresses` is `HashSet<ScopedIp>` in 0.18; extract any IP.
     let address = info
         .get_addresses()
         .iter()
