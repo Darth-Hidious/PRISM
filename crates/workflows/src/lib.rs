@@ -169,10 +169,34 @@ pub fn discover_workflows(project_root: Option<&Path>) -> Result<BTreeMap<String
             if ext != "yml" && ext != "yaml" {
                 continue;
             }
-            let text = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read workflow file {}", path.display()))?;
-            let spec = load_workflow_from_str(&text, &path.display().to_string())?;
-            specs.insert(spec.name.clone(), spec);
+            // Per-file failures are logged and skipped. One malformed YAML
+            // shouldn't break discovery for the user's other workflows —
+            // previously the `?` here propagated upward and made every
+            // `prism workflow list` (and every chat startup that loads
+            // workflows) fail with the first parse error encountered.
+            let text = match fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "skipping workflow file: read failed"
+                    );
+                    continue;
+                }
+            };
+            match load_workflow_from_str(&text, &path.display().to_string()) {
+                Ok(spec) => {
+                    specs.insert(spec.name.clone(), spec);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %format!("{e:#}"),
+                        "skipping workflow file: parse failed"
+                    );
+                }
+            }
         }
     }
 
