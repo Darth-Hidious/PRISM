@@ -92,19 +92,33 @@ pub async fn ws_upgrade(
         .ws_connections
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    // Look up the connected user's role to scope audit-event broadcasts.
+    // Without this, every WS client (Engineer, Analyst, Viewer) saw every
+    // OTHER user's AuditEntry events — leaking who ran what query, when.
+    // See Bug #58. Default to non-admin if RBAC isn't configured or the
+    // user has no role yet.
+    let is_admin = state
+        .rbac_db_path
+        .as_ref()
+        .and_then(|p| prism_core::rbac::RbacEngine::new(p).ok())
+        .and_then(|e| e.get_role(&user_id).ok().flatten())
+        .map(|role| role == prism_core::rbac::LocalRole::NodeAdmin)
+        .unwrap_or(false);
+
     let rx = state.ws_broadcast.subscribe();
     let ws_state = state.clone();
     ws.max_message_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_socket(socket, user_id, rx, ws_state))
+        .on_upgrade(move |socket| handle_socket(socket, user_id, is_admin, rx, ws_state))
 }
 
 async fn handle_socket(
     mut socket: WebSocket,
     user_id: String,
+    is_admin: bool,
     mut rx: broadcast::Receiver<String>,
     state: Arc<NodeState>,
 ) {
-    debug!(user_id = %user_id, "WebSocket connection established");
+    debug!(user_id = %user_id, is_admin, "WebSocket connection established");
 
     loop {
         tokio::select! {
@@ -112,6 +126,15 @@ async fn handle_socket(
             result = rx.recv() => {
                 match result {
                     Ok(json) => {
+                        // Filter audit events by user — every non-admin
+                        // WS client used to see every other user's
+                        // AuditEntry events (Bug #58). Now: NodeAdmin
+                        // sees all; non-admins see only their own.
+                        // Other event types (NodeStatusUpdate,
+                        // MeshPeerChange) are unfiltered — public.
+                        if !is_admin && audit_event_for_other_user(&json, &user_id) {
+                            continue;
+                        }
                         if socket.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
@@ -148,4 +171,60 @@ async fn handle_socket(
         .ws_connections
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     debug!(user_id = %user_id, "WebSocket connection closed");
+}
+
+/// Returns true when the JSON event is an `AuditEntry` whose `user`
+/// field is set to someone other than `connected_user`. Used to
+/// scope audit broadcasts to non-admin clients.
+///
+/// Non-AuditEntry events (NodeStatusUpdate, MeshPeerChange) always
+/// return false — they're public. Malformed JSON also returns false
+/// (drop nothing extra).
+fn audit_event_for_other_user(json: &str, connected_user: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    if value.get("type").and_then(|v| v.as_str()) != Some("AuditEntry") {
+        return false;
+    }
+    match value.get("user").and_then(|v| v.as_str()) {
+        Some(u) => u != connected_user,
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passes_non_audit_events() {
+        let event = r#"{"type":"NodeStatusUpdate","uptime_secs":42,"services":[]}"#;
+        assert!(!audit_event_for_other_user(event, "alice"));
+    }
+
+    #[test]
+    fn passes_audit_event_for_self() {
+        let event = r#"{"type":"AuditEntry","timestamp":"2026-05-09T00:00:00Z","user":"alice","action":"DataQuery"}"#;
+        assert!(!audit_event_for_other_user(event, "alice"));
+    }
+
+    #[test]
+    fn drops_audit_event_for_other_user() {
+        let event = r#"{"type":"AuditEntry","timestamp":"2026-05-09T00:00:00Z","user":"bob","action":"DataQuery"}"#;
+        assert!(audit_event_for_other_user(event, "alice"));
+    }
+
+    #[test]
+    fn passes_malformed_json() {
+        // Better to forward than to silently drop — malformed events
+        // are a separate bug.
+        assert!(!audit_event_for_other_user("not json", "alice"));
+    }
+
+    #[test]
+    fn passes_audit_event_with_no_user() {
+        let event = r#"{"type":"AuditEntry","timestamp":"2026-05-09T00:00:00Z","action":"DataQuery"}"#;
+        assert!(!audit_event_for_other_user(event, "alice"));
+    }
 }
