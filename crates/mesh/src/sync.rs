@@ -303,7 +303,30 @@ async fn sync_dataset_from_peer(
         );
     }
 
-    let data: serde_json::Value = resp.json().await?;
+    // Body size cap — a malicious or runaway peer could otherwise
+    // return gigabytes and OOM the local node. The peer query has
+    // a `LIMIT 1000` clause, so a well-behaved peer stays well under
+    // any reasonable cap. 32 MiB is far more headroom than the
+    // limit needs but stops the obvious DoS vector. See Bug #52.
+    const MAX_PEER_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+    if let Some(len) = resp.content_length()
+        && len as usize > MAX_PEER_RESPONSE_BYTES
+    {
+        anyhow::bail!(
+            "peer response too large ({} bytes; max {})",
+            len,
+            MAX_PEER_RESPONSE_BYTES
+        );
+    }
+    let body_bytes = resp.bytes().await?;
+    if body_bytes.len() > MAX_PEER_RESPONSE_BYTES {
+        anyhow::bail!(
+            "peer response too large ({} bytes; max {})",
+            body_bytes.len(),
+            MAX_PEER_RESPONSE_BYTES
+        );
+    }
+    let data: serde_json::Value = serde_json::from_slice(&body_bytes)?;
     let result_count = data["results"].as_array().map(|a| a.len()).unwrap_or(0);
 
     if result_count == 0 {
