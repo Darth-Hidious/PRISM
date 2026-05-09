@@ -2006,10 +2006,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 continue;
             }
 
+            // Salvage historical malformed titles at render time (Bug #60
+            // follow-up). New conversations are already clean; applying
+            // here is idempotent for them.
             let title = conv
                 .title
                 .as_deref()
-                .map(|t| t.to_string())
+                .map(forge_app::title_generator::salvage_title_from_malformed)
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| markers::EMPTY.to_string());
 
             // Format time using humantime library (same as conversation_selector.rs)
