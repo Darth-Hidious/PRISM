@@ -1421,12 +1421,33 @@ async fn main() -> Result<()> {
                 // ── V2: Start the embedded dashboard server ──
                 let mut server_node_state = prism_server::NodeState::new(node_name.clone());
 
-                // Wire core databases (RBAC + audit)
+                // Wire core databases (RBAC + audit + sessions).
+                //
+                // Bug #21: in `--offline` mode, leaving session_db_path
+                // configured forces every request to validate against
+                // an empty SessionManager → 401 on /api/mesh/publish,
+                // /api/mesh/subscribe, /api/audit. The middleware in
+                // crates/server/src/middleware/auth.rs already has a
+                // localhost-only fallback path (line 99-104) when no
+                // session DB is configured: any non-empty token is
+                // accepted as the user_id. We use that path in offline
+                // mode so `tests/test_mesh_e2e.sh` and similar scripts
+                // can pass `Authorization: Bearer test-token` (any
+                // value works) and exercise the API surface end-to-end.
                 let state_dir = &paths.state_dir;
                 std::fs::create_dir_all(state_dir)?;
                 server_node_state.audit_db_path = Some(state_dir.join("audit.db"));
-                server_node_state.rbac_db_path = Some(state_dir.join("rbac.db"));
-                server_node_state.session_db_path = Some(state_dir.join("sessions.db"));
+                // Two-layer auth (session + RBAC) is bypassed in
+                // `--offline` mode: any non-empty token works, and
+                // the resolve_role middleware grants synthetic
+                // NodeAdmin. See Bug #21 in docs/SHIPPED.md.
+                if offline {
+                    server_node_state.rbac_db_path = None;
+                    server_node_state.session_db_path = None;
+                } else {
+                    server_node_state.rbac_db_path = Some(state_dir.join("rbac.db"));
+                    server_node_state.session_db_path = Some(state_dir.join("sessions.db"));
+                }
                 server_node_state.subscriptions = std::sync::Arc::new(std::sync::RwLock::new(
                     prism_mesh::subscription::SubscriptionManager::open(
                         &state_dir.join("subscriptions.db"),
