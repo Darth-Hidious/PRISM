@@ -55,6 +55,20 @@ else
     git clone --depth 1 https://github.com/GeorgePearse/mcp-tui-test "$TUI_TEST_DIR"
 fi
 
+# Workaround: upstream pyproject.toml has both `server.py` and
+# `example_tui_app.py` at the top level and doesn't declare which is
+# the package, so setuptools `flat-layout` discovery refuses to build.
+# Pin the package to `server` (the actual MCP entry point) if not
+# already pinned. Idempotent.
+if ! grep -q '\[tool.setuptools\]' "$TUI_TEST_DIR/pyproject.toml"; then
+    cat >> "$TUI_TEST_DIR/pyproject.toml" <<'PATCH'
+
+[tool.setuptools]
+py-modules = ["server"]
+PATCH
+    log "  patched pyproject.toml to constrain py-modules=['server']"
+fi
+
 if ! command -v uv >/dev/null 2>&1; then
     warn "  uv not found — falling back to pip. Install uv for faster setup: https://docs.astral.sh/uv/"
     python3 -m venv "$TUI_TEST_DIR/.venv"
