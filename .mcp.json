@@ -7,8 +7,8 @@
     },
     "terminalcp": {
       "command": "npx",
-      "args": ["-y", "@mariozechner/terminalcp"],
-      "description": "FULL PTY emulation — preserves colors, cursor movement, special keys (better fidelity than pty-debug for visually-rich TUIs). Auto-installs on first use via npx. Use when pty-debug's text dump misses ANSI / color / cursor state."
+      "args": ["-y", "@mariozechner/terminalcp", "--mcp"],
+      "description": "FULL PTY emulation — preserves colors, cursor movement, special keys (better fidelity than pty-debug for visually-rich TUIs). Auto-installs on first use via npx. Use when pty-debug's text dump misses ANSI / color / cursor state. NOTE: requires `--mcp` arg — without it, terminalcp prints a usage banner to stdout and rmcp can't parse it as JSON."
     },
     "iterm-tmux": {
       "command": "npx",
