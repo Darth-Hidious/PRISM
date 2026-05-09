@@ -210,19 +210,36 @@ async fn handle_cypher_query(
         return Err(service_unavailable("Neo4j not configured."));
     };
 
-    // Basic safety: reject write operations in the query endpoint
+    // Substring-based write protection. Imperfect — the only correct
+    // long-term fix is connecting to Neo4j as a READ-ONLY role — but
+    // closes the obvious bypasses. See Bug #47.
+    //
+    // What's caught: any literal occurrence of DELETE / CREATE /
+    // MERGE / SET / REMOVE / DROP / LOAD / USE / CALL anywhere in
+    // the query, after uppercase. Some of these (LOAD, USE, CALL)
+    // weren't on the original blocklist, so a peer or user could
+    // exfiltrate via `LOAD CSV`, switch databases via `USE`, or
+    // run arbitrary procedures via `CALL apoc.*`. CALL is a hard
+    // deny because *any* APOC procedure could be a write.
+    //
+    // What's NOT caught: APOC string concatenation tricks like
+    // `CALL apoc.cypher.run('DEL' + 'ETE n')`. The outer CALL is
+    // already blocked, so the trick is moot today. If a future
+    // change wants to allow specific read-only procedures it
+    // must replace this whole block with a real allowlist.
     let upper = body.query.to_uppercase();
-    if upper.contains("DELETE")
-        || upper.contains("CREATE")
-        || upper.contains("MERGE")
-        || upper.contains("SET ")
-        || upper.contains("REMOVE ")
-        || upper.contains("DROP ")
-    {
+    const BLOCKED_KEYWORDS: &[&str] = &[
+        "DELETE", "CREATE", "MERGE", "SET ", "REMOVE ", "DROP ", "LOAD ", "USE ", "CALL ",
+    ];
+    if let Some(found) = BLOCKED_KEYWORDS.iter().find(|kw| upper.contains(*kw)) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
-                error: "Write operations not allowed via the query API.".into(),
+                error: format!(
+                    "Write/admin operations not allowed via the query API (matched: {}). \
+                     Use the dedicated ingest / admin endpoints instead.",
+                    found.trim()
+                ),
             }),
         ));
     }
