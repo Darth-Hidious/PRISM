@@ -363,7 +363,29 @@ fn upsert_openai_compatible_credential(proxy_url: &str, access_token: &str) -> R
     });
 
     let text = serde_json::to_string_pretty(&entries).context("serialising credentials")?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    // 0600 on unix — file holds the user's MARC27 access_token (as
+    // openai_compatible api_key). Plain fs::write inherits the user's
+    // umask (typically 0644 = world-readable), which would let any
+    // other local user read PRISM tokens. Same fix as Bug #39 for
+    // `~/.prism/credentials.json` — we missed this sibling file path.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    }
     Ok(())
 }
 
