@@ -29,6 +29,33 @@
 | 17 | `install-tui-mcps.sh` failed silently on `mcp-tui-test` because upstream pyproject has flat-layout + 2 top-level modules | PR #46 — script now patches pyproject to constrain `py-modules = ["server"]` | Re-ran the script: clean install, both binaries on disk, `.mcp.json` wired |
 | 18 | `prism node up --offline` still tried to refresh the platform token → 401 crash | PR #50 — added `offline` to `DaemonOptions`, short-circuit `run_daemon` on ctrl-c when offline | **Live verified**: two `prism node up --offline` processes both came up green and served `/api/status` |
 | 19 | mDNS peer discovery between two local prism processes returns `peer_count: 0` on both | ~~**NOT FIXED.** Root cause identified: `mdns-sd` 0.11.5 vs macOS `mDNSResponder` (Bonjour) port-5353 conflict. Three fix paths: (A) Bonjour-native bind 1-2 weeks, (B) static peers.toml 1 day, (C) test on Linux 1-2h.~~ <br><br> **FIXED — PR #52.** Earlier 1-2 week estimate for the "real fix" was wrong; web research surfaced the actual fix in ~30 min. Three layers: (a) bump `mdns-sd` 0.11→0.18 (pre-0.17 didn't enable loopback by default, pre-0.17.1 had no custom-port escape hatch), (b) handle the 0.18 breaking change `ServiceEvent::ServiceResolved(info)` now wraps `Box<ResolvedService>` instead of `ServiceInfo`, (c) **the actual fix:** pass explicit `"127.0.0.1"` + chain `.enable_addr_auto()` to `ServiceInfo::new` instead of empty-string auto-detect, which 0.18 doesn't include loopback in. Lesson learned: **always do real web research on a bug before improvising fix options.** PR #52 also rolls in PR #50 (offline daemon flag) since you can't run two-process tests without `--offline` working. | **Verified live**: two `prism node up --offline --broadcast` processes on the same Mac after a 35s discovery cycle: `peer_count=1` on both. paris saw munich at 192.168.178.145:9200; munich saw paris at 2001:16b8:beb4:b00:...:7603 (IPv6) :9100. macOS native `dns-sd -B _prism._tcp local` now sees the announced instance (returned 0 results before the fix). |
+| 20 | Stale persisted state across `prism node up` runs — phantom `smoke-dataset` shows up in fresh node's published list. State directory under `~/.prism/` not cleared between runs. | NOT FIXED. v1.5: per-test scratch dir or explicit `--reset-state` flag. | Found 2026-05-09 by running two-process publish/subscribe REST test post-PR #52. Both fresh nodes returned `published: [{name: "smoke-dataset", ...}]` from a previous test run. |
+| 21 | `/api/mesh/publish` + `/api/mesh/subscribe` + `/api/audit` require session token even in `--offline` mode | NOT a bug — correct security posture. But `tests/test_mesh_e2e.sh` as written CAN'T pass because it doesn't pass auth. Either fix the test (pass token) or expose an `--offline-noauth` mode for local dev. | curl POST returns 401 in offline mode |
+| 22 | TUI exits immediately under any headless PTY emulator with `error=The cursor position could not be read within a normal duration`. Reproduced under both `terminalcp` and `mcp-tui-driver`. The TUI sends ANSI cursor-position-query (`ESC[6n`), times out, crashes. | NOT FIXED. Fix: in `forge_main::ui` treat CPR timeout as non-fatal (warn + use a fallback width via `terminal_size` crate). | Reproduced 2x in this session. Works under `iterm-tmux` because real iTerm2 implements CPR. |
+| 23 | When MARC27 auth is rejected at boot, the TUI silently retries chat against `http://127.0.0.1:60029/v1/chat/completions` (a non-existent local llama-server) instead of failing fast with a clear "run prism login" message. Even though `~/.prism/prism.toml` says `provider = "marc27"`. Some session-level state overrides the config. | NOT FIXED. Find the override chain (`~/.prism/sessions/*.json`?) and either honour `prism.toml` or surface the override in the boot-screen status line. | Boot screen lies: shows `Chat …………… [OK] (MARC27 cloud)` while actual POSTs go to `127.0.0.1:60029`. |
+| 24 | Chat panel floods with multi-line ERROR logs on every retry tick. Same UX class as Bug #16 but for fetch errors. | NOT FIXED. Errors should print once, then the spinner shows "retrying — last error: <one-line summary>". Don't paste 9 lines of stack each tick. | Reproduced live — see screenshot in session log. |
+| 25 | The retry spinner advertises "Ctrl+C to interrupt" but Ctrl+C does NOT actually interrupt. Sent SIGINT, waited 90s, retry kept going. The interrupt affordance lies. | NOT FIXED. Either wire Ctrl+C to abort the retry loop (correct), or stop advertising it as an interrupt. | Reproduced live — only `pkill -KILL` worked. |
+
+### Live test results — dashboard API security posture (2026-05-09)
+
+Spun up `prism node up --offline --no-services --no-compute --no-storage` and probed the dashboard at `localhost:9300`:
+
+| Test | Result | Verdict |
+|------|--------|---------|
+| Bind address | `127.0.0.1:9300` only (external interface returns 000) | ✅ correct loopback-only |
+| Path traversal `/api/../etc/passwd` (URL-encoded too) | Returns SPA HTML, not file content | ✅ blocked |
+| Auth wall on `/api/mesh/{publish,subscribe}` and `/api/audit` (POST/PUT/PATCH/DELETE) | All return 401 | ✅ method-agnostic auth |
+| 8 KB query param | 200, no crash | ✅ |
+| 1 MB POST body to write endpoint | 401 (auth before body parse) | ✅ |
+| `/api/mesh/nodes` (GET) | 200 unauth'd JSON: `{node_id, peer_count, peers[]}` | ⚠️ exposes peer enumeration to any local process |
+| `/api/mesh/subscriptions` (GET) | 200 unauth'd JSON | ⚠️ exposes pub/sub state to any local process |
+| `/api/{jobs,datasets,models,metrics,version,status}` | All return SPA HTML (catch-all SPA fallback, NOT the JSON I first guessed) | ✅ no actual leak — but the catch-all means broken-route detection is impossible from a client |
+
+**ECSS implication.** For ESA-grade work, even `/api/mesh/nodes` should be auth'd — local-malware threat model exists at any tier. The two unauth'd reads should require a session token.
+
+### Live test results — chat / multi-turn / code-gen / research
+
+NOT TESTED end-to-end this session because of Bugs #22–#25 stacking up. The TUI either crashed (#22) or silently retried localhost forever (#23) without ever taking input. Chat under iTerm2 was reachable but blocked by auth + Bug #25's broken Ctrl+C. Multi-turn / code-gen / research are gated on fixing #23 + #25 first.
 
 ### Features merged (all on 2026-05-09)
 
