@@ -385,6 +385,37 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
                     match error.downcast::<ReadLineError>() {
                         Ok(error) => {
+                            // Detect the specific CPR-timeout failure that
+                            // happens under headless PTYs (terminalcp,
+                            // mcp-tui-driver, some CI harnesses) — see
+                            // Bug #22 in docs/SHIPPED.md. reedline genuinely
+                            // needs cursor-position-query support to draw,
+                            // but the default error is an opaque rust stack
+                            // that exits silently. Replace with a single
+                            // actionable line so the user knows what to do.
+                            let msg = error.to_string();
+                            if msg.contains("cursor position could not be read") {
+                                let mut stderr = std::io::stderr();
+                                use std::io::Write as _;
+                                let _ = writeln!(
+                                    stderr,
+                                    "\n[prism] this terminal doesn't support cursor-position queries (ESC[6n / DSR)."
+                                );
+                                let _ = writeln!(
+                                    stderr,
+                                    "        The PRISM TUI's input editor (reedline) requires CPR support to render."
+                                );
+                                let _ = writeln!(
+                                    stderr,
+                                    "        Use a real terminal: iTerm2, Wezterm, kitty, gnome-terminal, Terminal.app."
+                                );
+                                let _ = writeln!(
+                                    stderr,
+                                    "        For piped / scripted input use:  echo \"...\" | prism tui"
+                                );
+                                let _ = writeln!(stderr);
+                                std::process::exit(2);
+                            }
                             return Err(error)?;
                         }
                         Err(error) => self.writeln_to_stderr(
