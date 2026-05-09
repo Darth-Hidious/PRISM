@@ -7413,6 +7413,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism-audit"
+version = "2.7.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "prism-cli"
 version = "2.7.0"
 dependencies = [
