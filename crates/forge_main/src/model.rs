@@ -574,8 +574,8 @@ pub enum AppCommand {
     #[strum(props(usage = "Exit the application"))]
     Exit,
 
-    /// Updates the forge version
-    #[strum(props(usage = "Updates to the latest compatible version of forge"))]
+    /// Updates the prism version
+    #[strum(props(usage = "Updates to the latest compatible version of prism"))]
     Update,
 
     /// Switch to "forge" agent.
