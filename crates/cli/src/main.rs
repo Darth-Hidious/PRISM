@@ -5,6 +5,7 @@
 //! discovery from `~/.prism/workflows/`.
 
 mod boot;
+mod boot_checks;
 mod chat_config;
 mod doctor;
 mod forge_chat;
@@ -957,7 +958,7 @@ async fn main() -> Result<()> {
             // still have a refresh_token we haven't tried yet (local
             // expires_at said fresh but server disagreed → server-side
             // rotation), try one more refresh + redo the check.
-            let mut boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let mut boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             let auth_rejected = boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
@@ -971,7 +972,7 @@ async fn main() -> Result<()> {
                         state.credentials = Some(new_creds);
                         paths.save_cli_state(&state)?;
                         // Redo the boot checks with the new token.
-                        boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                        boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -2396,7 +2397,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            let mut boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let mut boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             let auth_rejected = boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
@@ -2408,7 +2409,7 @@ async fn main() -> Result<()> {
                 tracing::info!("access token refreshed after server-side rejection");
                 state.credentials = Some(new_creds);
                 let _ = paths.save_cli_state(&state);
-                boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
             boot::boot_sequence(&boot_checks);
             // Splash skipped — see note in default chat path.
@@ -6105,274 +6106,6 @@ async fn handle_job_status(job_id_str: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-// ── Boot checks (real API pings) ──────────────────────────────────────
-
-async fn run_boot_checks(
-    creds: Option<&StoredCredentials>,
-    endpoints: &PlatformEndpoints,
-) -> Vec<boot::BootCheck> {
-    let mut checks = Vec::new();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
-
-    let token = creds.map(|c| c.access_token.as_str()).unwrap_or("");
-    let api = &endpoints.api_base;
-
-    // 1. Platform connection — use /agent/capabilities (always 200 with auth)
-    let auth_header = format!("Bearer {token}");
-    let platform_ok = client
-        .get(format!("{api}/agent/capabilities"))
-        .header("Authorization", &auth_header)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-    let host = api
-        .replace("https://", "")
-        .replace("http://", "")
-        .replace("/api/v1", "");
-    checks.push(boot::BootCheck {
-        name: "Platform".into(),
-        result: if platform_ok {
-            format!("{host} connected")
-        } else {
-            format!("{host} unreachable")
-        },
-        ok: platform_ok,
-        dots: 8,
-        delay_ms: 30,
-    });
-
-    // 2. Auth — distinguish actual expiry from scope/network/server errors.
-    // Previously this said "token expired" on ANY non-2xx, which is
-    // misleading because /users/me can fail for reasons other than
-    // expiry (token scope insufficient, server flap, network blip).
-    // Be honest about which failure mode we actually saw.
-    if !token.is_empty() {
-        let user_resp = client
-            .get(format!("{api}/users/me"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await;
-        let (auth_ok, auth_msg) = match user_resp {
-            Ok(r) if r.status().is_success() => {
-                let data: serde_json::Value = r.json().await.unwrap_or_default();
-                let name = data
-                    .get("display_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("authenticated");
-                (true, name.to_string())
-            }
-            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                // Real auth rejection — token expired, revoked, or
-                // missing the /users/me scope.
-                (false, "token rejected — run prism login".into())
-            }
-            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => {
-                // Token authenticates but lacks /users/me scope.
-                // Common with agent / project-scoped keys; do NOT
-                // prompt re-login since chat / research still work.
-                (false, "token lacks user scope (agent key?)".into())
-            }
-            Ok(r) => (
-                false,
-                format!("platform error (HTTP {})", r.status().as_u16()),
-            ),
-            Err(e) if e.is_timeout() => (false, "platform unreachable (timeout)".into()),
-            Err(_) => (false, "platform unreachable".into()),
-        };
-        checks.push(boot::BootCheck {
-            name: "Auth".into(),
-            result: auth_msg,
-            ok: auth_ok,
-            dots: 6,
-            delay_ms: 20,
-        });
-    } else {
-        checks.push(boot::BootCheck {
-            name: "Auth".into(),
-            result: "not logged in — run prism login".into(),
-            ok: false,
-            dots: 3,
-            delay_ms: 20,
-        });
-    }
-
-    // 3. Knowledge Graph
-    if !token.is_empty() {
-        let stats = client
-            .get(format!("{api}/knowledge/graph/stats"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| {
-                if r.status().is_success() {
-                    Some(r)
-                } else {
-                    None
-                }
-            });
-        let (kg_ok, kg_msg) = if let Some(resp) = stats {
-            let data: serde_json::Value = resp.json().await.unwrap_or_default();
-            let nodes = data.get("node_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            let edges = data.get("edge_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            if nodes > 0 {
-                (
-                    true,
-                    format!("{}K nodes, {}M edges", nodes / 1000, edges / 1_000_000),
-                )
-            } else {
-                (true, "connected".into())
-            }
-        } else {
-            (false, "unavailable".into())
-        };
-        checks.push(boot::BootCheck {
-            name: "Knowledge Graph".into(),
-            result: kg_msg,
-            ok: kg_ok,
-            dots: 12,
-            delay_ms: 25,
-        });
-    }
-
-    // 4. Models
-    if !token.is_empty() {
-        let project_id = creds.and_then(|c| c.project_id.as_deref()).unwrap_or("");
-        if !project_id.is_empty() {
-            let models = client
-                .get(format!("{api}/projects/{project_id}/llm/models"))
-                .header("Authorization", format!("Bearer {token}"))
-                .send()
-                .await
-                .ok()
-                .and_then(|r| {
-                    if r.status().is_success() {
-                        Some(r)
-                    } else {
-                        None
-                    }
-                });
-            let (m_ok, m_msg) = if let Some(resp) = models {
-                let data: serde_json::Value = resp.json().await.unwrap_or_default();
-                let count = if let Some(arr) = data.as_array() {
-                    arr.len()
-                } else {
-                    data.get("models")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0)
-                };
-                (true, format!("{count} hosted models"))
-            } else {
-                (false, "unavailable".into())
-            };
-            checks.push(boot::BootCheck {
-                name: "LLM Models".into(),
-                result: m_msg,
-                ok: m_ok,
-                dots: 10,
-                delay_ms: 20,
-            });
-        }
-    }
-
-    // 5. Compute
-    if !token.is_empty() {
-        let gpus = client
-            .get(format!("{api}/compute/gpus"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| {
-                if r.status().is_success() {
-                    Some(r)
-                } else {
-                    None
-                }
-            });
-        let (c_ok, c_msg) = if let Some(resp) = gpus {
-            let data: serde_json::Value = resp.json().await.unwrap_or_default();
-            let count = data.as_array().map(|a| a.len()).unwrap_or(0);
-            (true, format!("{count} GPU types available"))
-        } else {
-            (false, "unavailable".into())
-        };
-        checks.push(boot::BootCheck {
-            name: "Compute".into(),
-            result: c_msg,
-            ok: c_ok,
-            dots: 8,
-            delay_ms: 25,
-        });
-    }
-
-    // 6. Marketplace
-    if !token.is_empty() {
-        let mkt = client
-            .get(format!("{api}/marketplace/resources"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| {
-                if r.status().is_success() {
-                    Some(r)
-                } else {
-                    None
-                }
-            });
-        let (mk_ok, mk_msg) = if let Some(resp) = mkt {
-            let data: serde_json::Value = resp.json().await.unwrap_or_default();
-            let count = data.as_array().map(|a| a.len()).unwrap_or(0);
-            (true, format!("{count} resources"))
-        } else {
-            (false, "unavailable".into())
-        };
-        checks.push(boot::BootCheck {
-            name: "Marketplace".into(),
-            result: mk_msg,
-            ok: mk_ok,
-            dots: 6,
-            delay_ms: 30,
-        });
-    }
-
-    // 7. Local node
-    let node_ok = client
-        .get("http://127.0.0.1:7327/api/health")
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-    checks.push(boot::BootCheck {
-        name: "Local Node".into(),
-        result: if node_ok {
-            "online at :7327".into()
-        } else {
-            "offline — run prism node up".into()
-        },
-        ok: node_ok,
-        dots: 4,
-        delay_ms: 20,
-    });
-
-    // 8. Policy engine (always local, always OK)
-    checks.push(boot::BootCheck {
-        name: "Policy Engine".into(),
-        result: "OPA/Rego loaded".into(),
-        ok: true,
-        dots: 4,
-        delay_ms: 15,
-    });
-
-    checks
 }
 
 // ── prism report ───────────────────────────────────────────────────────

@@ -1,18 +1,31 @@
 //! `prism doctor` — diagnostic snapshot of everything PRISM needs to run.
 //!
-//! Lists each runtime dependency with [OK] / [--] / [!] markers. Designed
-//! to be the first thing a user runs when something feels off — gives them
-//! a single screen of what's healthy and what's missing.
+//! Runs in two clearly-labeled sections:
+//!
+//! 1. **Local Setup** — binaries, files, project root, python interpreter.
+//!    The "is your laptop ready?" pass.
+//! 2. **Platform Connectivity** — auth, KG, models, compute, marketplace,
+//!    local node, policy engine. The same checks `prism` runs on startup,
+//!    so a green doctor means a green boot.
+//!
+//! Lists each check with [OK] / [--] markers. Designed to be the first
+//! thing a user runs when something feels off — single screen, full picture.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
+use prism_runtime::{PlatformEndpoints, PrismPaths};
 
-use crate::boot::{BootCheck, boot_sequence};
+use crate::boot::{self, BootCheck, print_check_lines};
+use crate::boot_checks;
 
 pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let prism_dir = PathBuf::from(&home).join(".prism");
+
+    // ── Section 1: local setup ────────────────────────────────────────
+    boot::section("Local Setup");
+
     let mut checks: Vec<BootCheck> = Vec::new();
 
     // 1. llama-server (homebrew or PATH)
@@ -29,7 +42,7 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
     checks.push(check_file(
         "EmbeddingGemma model",
         &embed_gguf,
-        "auto-downloads on first `prism tui`",
+        "auto-downloads on first `prism`",
     ));
 
     // 3. FunctionGemma model — DEPRECATED. The Stage 2.2 local-routing
@@ -75,7 +88,7 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
     checks.push(check_file(
         "forge MCP config",
         &forge_mcp,
-        "auto-generated on first `prism tui`",
+        "auto-generated on first `prism`",
     ));
 
     // 7. Tool router index (rebuilt automatically; informational)
@@ -110,15 +123,25 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
         delay_ms: 0,
     });
 
-    boot_sequence(&checks);
+    print_check_lines(&checks);
+
+    // ── Section 2: platform connectivity (same checks as `prism` boot) ─
+    boot::section("Platform Connectivity");
+
+    let paths = PrismPaths::discover()?;
+    let state = paths.load_cli_state().unwrap_or_default();
+    let endpoints = PlatformEndpoints::from_env();
+    let platform_checks =
+        boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+    print_check_lines(&platform_checks);
 
     println!();
     println!("Anything marked [--] means: not yet present, but PRISM will set it up");
     println!("on demand or via the documented one-liner.");
     println!();
     println!("If chat is misbehaving in unexpected ways, also try:");
-    println!("  rm -rf ~/.prism/tool_router && prism tui    # rebuilds tool index");
-    println!("  rm  ~/.forge/.mcp.json && prism tui          # rewrites MCP config");
+    println!("  rm -rf ~/.prism/tool_router && prism    # rebuilds tool index");
+    println!("  rm  ~/.forge/.mcp.json && prism          # rewrites MCP config");
     Ok(())
 }
 
