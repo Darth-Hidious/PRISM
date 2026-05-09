@@ -211,6 +211,19 @@ pub async fn run(
             .auto_update(false),
     );
 
+    // Block forge_services::auth from POST'ing the user's PRISM token to
+    // https://api.forgecode.dev/auth/user and /auth/usage on every /info
+    // and /usage call. PRISM users authenticate against MARC27, not
+    // ForgeCode — sending their bearer token to a third-party domain
+    // would be a privacy bug, and the call would always 401 anyway.
+    //
+    // Setting services_url to a known-bad value makes the Url::parse in
+    // forge_services::auth fail fast with no network egress. The
+    // forge_main /usage caller already swallows the error gracefully
+    // (REQUEST QUOTA section just doesn't render), so this is a clean
+    // suppression rather than a hard break.
+    config.services_url = String::new();
+
     let cwd = project_root.to_path_buf();
     let mut ui = UI::init(cli, config, move |config| {
         ForgeAPI::init(cwd.clone(), config)
