@@ -266,6 +266,21 @@ impl CrossOrgRequest {
 /// requirement, like `peer.heartbeat`). We **deliberately don't
 /// embed the action→role table here** — that's policy concern, not
 /// trust concern.
+///
+/// **Integration status (2026-05-09)**: this function is fully
+/// implemented and unit-tested but **not yet called from any
+/// production code path**. Cross-org requests currently reach the
+/// server without identity verification. Hooking this in is tracked
+/// as F1 chunk 4 (verification middleware): the server middleware
+/// stack needs to deserialize the [`CrossOrgRequest`] envelope from
+/// an `X-PRISM-Federation` header (or similar), look up the action
+/// → role using [`crate::federation_lookup::ActionRoleTable`], pull
+/// the platform root pubkey from
+/// [`crate::federation_lookup::PlatformPubkeyFetcher`], call this
+/// function, and 401 / 403 on failure. Without that wiring, peer
+/// signatures and platform-signed identities are accepted as truth
+/// without verification — the trust assertions in this file's
+/// header are aspirational, not enforced.
 pub fn verify_peer(
     request: &CrossOrgRequest,
     platform_root_pubkey: &VerifyingKey,
