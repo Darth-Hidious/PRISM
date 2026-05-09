@@ -2533,6 +2533,26 @@ async fn main() -> Result<()> {
                 boot_checks =
                     boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
+            // Both proactive AND reactive refresh have failed → the
+            // refresh token itself is expired. Launching the TUI on
+            // dead creds drops the user into a 401 mid-chat with the
+            // platform_bridge.rs "open a new terminal" interceptor —
+            // confusing and easy to miss. Fail fast here with a single
+            // actionable message instead.
+            if boot_checks
+                .iter()
+                .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
+            {
+                eprintln!();
+                eprintln!("\x1b[33mYour MARC27 session has expired.\x1b[0m");
+                eprintln!();
+                eprintln!("  To re-authenticate, run:");
+                eprintln!("    \x1b[1mprism login\x1b[0m");
+                eprintln!();
+                eprintln!("  Then start the TUI again with \x1b[1mprism tui\x1b[0m.");
+                eprintln!();
+                return Ok(());
+            }
             boot::boot_sequence(&boot_checks);
             // Splash skipped — see note in default chat path.
             let _ = &python;
@@ -2587,6 +2607,26 @@ async fn main() -> Result<()> {
                 let _ = paths.save_cli_state(&state);
                 boot_checks =
                     boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            }
+            // Same fail-fast as the Tui branch — see comment there.
+            // Resuming on dead creds is even more confusing because
+            // the user expects their old conversation to load.
+            if boot_checks
+                .iter()
+                .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
+            {
+                eprintln!();
+                eprintln!("\x1b[33mYour MARC27 session has expired.\x1b[0m");
+                eprintln!();
+                eprintln!("  To re-authenticate, run:");
+                eprintln!("    \x1b[1mprism login\x1b[0m");
+                eprintln!();
+                eprintln!(
+                    "  Then resume with \x1b[1mprism resume{}\x1b[0m.",
+                    id.as_deref().map(|s| format!(" {s}")).unwrap_or_default()
+                );
+                eprintln!();
+                return Ok(());
             }
             boot::boot_sequence(&boot_checks);
             let _ = &python;
