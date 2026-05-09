@@ -1655,10 +1655,21 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         // Fetch default provider (could be different from the set provider)
         let default_provider = self.api.get_default_provider().await.ok();
 
-        // Add agent information
+        // Add agent information.
+        //
+        // The default forge agent has id "forge" — we display it as "PRISM"
+        // so users see the product they're running, not the underlying
+        // engine. Custom agents (anything else) keep their actual id so
+        // /info remains useful for debugging multi-agent setups.
         info = info.add_title("AGENT");
         if let Some(agent) = agent {
-            info = info.add_key_value("ID", agent.as_str().to_uppercase());
+            let raw = agent.as_str();
+            let display = if raw.eq_ignore_ascii_case("forge") {
+                "PRISM".to_string()
+            } else {
+                raw.to_uppercase()
+            };
+            info = info.add_key_value("ID", display);
         }
 
         // Add model information if available
@@ -3275,8 +3286,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         self.api.create_auth_credentials().await?;
         let env = self.api.environment();
         let credentials_path = crate::info::format_path_for_display(&env, &env.credentials_path());
+        // User-facing label: PRISM, not the underlying engine name.
         self.writeln_title(
-            TitleFormat::info("ForgeCode Services enabled").sub_title(&credentials_path),
+            TitleFormat::info("PRISM services enabled").sub_title(&credentials_path),
         )?;
         Ok(())
     }
