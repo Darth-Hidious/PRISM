@@ -2627,7 +2627,7 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "forge_api"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2646,7 +2646,7 @@ dependencies = [
 
 [[package]]
 name = "forge_app"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -2698,7 +2698,7 @@ dependencies = [
 
 [[package]]
 name = "forge_config"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "config",
@@ -2721,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "forge_display"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "console",
  "derive_setters",
@@ -2738,7 +2738,7 @@ dependencies = [
 
 [[package]]
 name = "forge_domain"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "forge_embed"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "handlebars",
@@ -2789,7 +2789,7 @@ dependencies = [
 
 [[package]]
 name = "forge_eventsource"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "forge_eventsource_stream",
  "futures",
@@ -2808,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "forge_eventsource_stream"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "futures",
  "futures-core",
@@ -2822,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "forge_fs"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "bstr",
@@ -2838,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "forge_infra"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2889,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "forge_json_repair"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "pretty_assertions",
  "regex",
@@ -2902,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "forge_main"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "forge_markdown_stream"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "colored",
  "insta",
@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "forge_repo"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -3048,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "forge_select"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "colored",
@@ -3061,7 +3061,7 @@ dependencies = [
 
 [[package]]
 name = "forge_services"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -3120,7 +3120,7 @@ dependencies = [
 
 [[package]]
 name = "forge_snaps"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3135,7 +3135,7 @@ dependencies = [
 
 [[package]]
 name = "forge_spinner"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "colored",
@@ -3151,7 +3151,7 @@ dependencies = [
 
 [[package]]
 name = "forge_stream"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "futures",
  "tokio",
@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "forge_template"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "html-escape",
  "pretty_assertions",
@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "forge_test_kit"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "forge_tool_macros"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "forge_tracker"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3204,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "forge_walker"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "derive_setters",
@@ -7391,7 +7391,7 @@ dependencies = [
 
 [[package]]
 name = "prism-audit"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7409,7 +7409,7 @@ dependencies = [
 
 [[package]]
 name = "prism-cli"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -7454,7 +7454,7 @@ dependencies = [
 
 [[package]]
 name = "prism-client"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -7467,7 +7467,7 @@ dependencies = [
 
 [[package]]
 name = "prism-compute"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7482,7 +7482,7 @@ dependencies = [
 
 [[package]]
 name = "prism-core"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7497,7 +7497,7 @@ dependencies = [
 
 [[package]]
 name = "prism-ingest"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7516,7 +7516,7 @@ dependencies = [
 
 [[package]]
 name = "prism-ipc"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -7527,7 +7527,7 @@ dependencies = [
 
 [[package]]
 name = "prism-llm"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -7540,7 +7540,7 @@ dependencies = [
 
 [[package]]
 name = "prism-mesh"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7570,7 +7570,7 @@ dependencies = [
 
 [[package]]
 name = "prism-node"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -7602,7 +7602,7 @@ dependencies = [
 
 [[package]]
 name = "prism-orch"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7618,7 +7618,7 @@ dependencies = [
 
 [[package]]
 name = "prism-policy"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7631,7 +7631,7 @@ dependencies = [
 
 [[package]]
 name = "prism-proto"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -7640,7 +7640,7 @@ dependencies = [
 
 [[package]]
 name = "prism-python-bridge"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -7651,7 +7651,7 @@ dependencies = [
 
 [[package]]
 name = "prism-runtime"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "chrono",
  "directories",
@@ -7662,7 +7662,7 @@ dependencies = [
 
 [[package]]
 name = "prism-server"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -7684,7 +7684,7 @@ dependencies = [
 
 [[package]]
 name = "prism-workflows"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7699,7 +7699,7 @@ dependencies = [
 
 [[package]]
 name = "prism_tool_router"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
