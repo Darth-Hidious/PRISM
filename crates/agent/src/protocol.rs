@@ -419,7 +419,28 @@ fn sync_sdk_credentials(creds: &StoredCredentials) {
             let _ = fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(&sdk_creds) {
-            let _ = fs::write(sdk_path, json);
+            // 0600 on unix — file holds bearer + refresh tokens. Plain
+            // fs::write inherits the user's umask (typically 0644 = world-
+            // readable on most Linux distros), which would let any other
+            // local user read PRISM tokens.
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                if let Ok(mut file) = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&sdk_path)
+                {
+                    let _ = file.write_all(json.as_bytes());
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = fs::write(&sdk_path, json);
+            }
         }
     }
 }
