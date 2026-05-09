@@ -2572,7 +2572,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            let mut boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let mut boot_checks =
+                boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             let auth_rejected = boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
@@ -2584,7 +2585,8 @@ async fn main() -> Result<()> {
                 tracing::info!("access token refreshed after server-side rejection");
                 state.credentials = Some(new_creds);
                 let _ = paths.save_cli_state(&state);
-                boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                boot_checks =
+                    boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
             boot::boot_sequence(&boot_checks);
             let _ = &python;
