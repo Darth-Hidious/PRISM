@@ -3,7 +3,23 @@
     "pty-debug": {
       "command": "pty-mcp-server",
       "args": [],
-      "description": "PTY/TUI debug MCP — drives interactive terminal programs (PRISM TUI, llama-server, REPLs) from Claude Code. Used for engine-layer empirical observation per Phase 1 of redesign roadmap. Pair with the tui-use CLI for cross-validation. See memory/project_redesign_roadmap_2026_05.md."
+      "description": "PRIMARY TUI MCP — text snapshots. Drives interactive terminal programs (PRISM TUI, llama-server, REPLs). Local, fast, no network. NOTE: needs spawn-helper +x bit (chmod fix shipped). Capabilities: spawn_session, send_input, get_snapshot (text), list_sessions, close_session, resize_terminal."
+    },
+    "terminalcp": {
+      "command": "npx",
+      "args": ["-y", "@mariozechner/terminalcp"],
+      "description": "FULL PTY emulation — preserves colors, cursor movement, special keys (better fidelity than pty-debug for visually-rich TUIs). Auto-installs on first use via npx. Use when pty-debug's text dump misses ANSI / color / cursor state."
+    },
+    "iterm-tmux": {
+      "command": "npx",
+      "args": ["-y", "mcpretentious"],
+      "description": "iTerm2 (macOS native) + tmux session control via WebSocket API. Lets Claude drive a REAL terminal window the user can watch, instead of headless PTY. Use when you want the human to see the agent typing. Auto-installs via npx."
     }
-  }
+  },
+  "_notes_for_installer": [
+    "Two more MCPs are NOT on npm and need a manual install — run scripts/install-tui-mcps.sh:",
+    "  • mcp-tui-driver (Rust, screenshot/PNG capable) — adds tui_screenshot tool for visual TUI verification",
+    "  • mcp-tui-test (Python, Playwright-style snapshot testing) — buffer-mode position assertions",
+    "Plus a CI-grade dev tool: `@microsoft/tui-test` for end-to-end TUI regression coverage in CI."
+  ]
 }
