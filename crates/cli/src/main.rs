@@ -5975,8 +5975,15 @@ async fn handle_federated_query(
         Err(e) => println!("  error: {e}"),
     }
 
-    // Step 3: Query each peer
-    let peers = peer_list.unwrap();
+    // Step 3: Query each peer.
+    //
+    // The early-return on `peer_count == 0` above means peer_list must be
+    // Some(non-empty) here, but expressing that with `unwrap()` is brittle —
+    // a future refactor of the early-return path would crash production. Use
+    // the explicit form so a regression is at most an empty iteration.
+    let Some(peers) = peer_list else {
+        return Ok(());
+    };
     for peer in peers {
         let addr = peer["address"].as_str().unwrap_or("127.0.0.1");
         let port = peer["port"].as_u64().unwrap_or(7327);
