@@ -1096,4 +1096,112 @@ mod tests {
             );
         }
     }
+
+    /// Cross-check the curated list against the actual Python tool registry.
+    ///
+    /// The two earlier tests catch *internal* drift (curated list vs prompt
+    /// text). They DO NOT catch the worst case: someone renames a tool in
+    /// `app/tools/*.py` and forgets to update the prompt — both sides of
+    /// the internal check still agree, but the LLM gets a name that no
+    /// longer matches reality. That's exactly how PR #91's `search_materials`
+    /// bug shipped.
+    ///
+    /// This test reads `app/tools/*.py` directly and confirms every name in
+    /// `QUICK_REFERENCE_TOOL_NAMES` appears as a `name="..."` registration.
+    /// No Python subprocess, no runtime cost — just file IO at test time.
+    ///
+    /// If `app/tools/` is missing (e.g., someone runs the test outside a
+    /// full PRISM checkout), the test soft-skips so it doesn't break
+    /// downstream builds of the crate in isolation.
+    #[test]
+    fn quick_reference_names_are_registered_in_python() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let tools_dir = std::path::Path::new(manifest_dir)
+            .parent() // crates/
+            .and_then(|p| p.parent()) // workspace root
+            .map(|p| p.join("app").join("tools"));
+
+        let Some(tools_dir) = tools_dir else {
+            eprintln!("skipping cross-check: cannot resolve workspace root");
+            return;
+        };
+        if !tools_dir.is_dir() {
+            eprintln!(
+                "skipping cross-check: app/tools/ not found at {}",
+                tools_dir.display()
+            );
+            return;
+        }
+
+        // Recursively scan every .py file under app/tools/ for
+        // `name="..."` (or `name='...'`) tokens. The matcher is
+        // intentionally simple — looking for the exact registration
+        // pattern `name="<identifier>"` on its own line, which is
+        // how every existing tool registers (see e.g.
+        // `app/tools/research.py:6` "        name="research",").
+        let mut registered = std::collections::BTreeSet::<String>::new();
+        let mut stack = vec![tools_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "py") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    // Match either name="x" or name='x'.
+                    for quote in ['"', '\''] {
+                        let prefix = format!("name={quote}");
+                        if let Some(rest) = trimmed.strip_prefix(&prefix)
+                            && let Some(end) = rest.find(quote)
+                        {
+                            let name = &rest[..end];
+                            if !name.is_empty()
+                                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
+                                registered.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if registered.is_empty() {
+            // Defensive: if our matcher ever stops finding any registrations
+            // at all, prefer a clear failure to a silent green.
+            panic!(
+                "cross-check found ZERO tool registrations under {} — \
+                 either the matcher is broken or the file layout changed. \
+                 Update this test before continuing.",
+                tools_dir.display()
+            );
+        }
+
+        let missing: Vec<&str> = QUICK_REFERENCE_TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|n| !registered.contains(*n))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "tool name(s) in quick-reference are NOT registered in app/tools/: {:?}\n\
+             registered names found: {:?}\n\
+             Either restore the registration in Python or remove the name from \
+             both QUICK_REFERENCE_TOOL_NAMES and build_tool_prompt_block.",
+            missing,
+            registered.iter().take(20).collect::<Vec<_>>()
+        );
+    }
 }
