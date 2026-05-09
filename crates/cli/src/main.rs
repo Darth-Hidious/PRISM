@@ -5115,11 +5115,22 @@ async fn create_dashboard_session(
         anyhow::anyhow!("Stored credentials are missing user_id. Run `prism login` again.")
     })?;
 
-    // The local CLI is the node operator on this machine, so it should be able
-    // to manage its own dashboard routes without a separate bootstrap dance.
+    // The local CLI is the node operator on this machine, so the FIRST
+    // user to run it gets bootstrapped as NodeAdmin to manage their
+    // own dashboard routes without a separate bootstrap dance.
+    //
+    // **Only assign if no role already exists** — see Bug #49. The
+    // earlier code unconditionally `assign_role(NodeAdmin)`, which
+    // uses `INSERT ... ON CONFLICT DO UPDATE`, so any explicit
+    // downgrade by an admin (e.g. someone running an admin tool to
+    // demote user-X to Viewer) would be silently undone the next
+    // time user-X ran any CLI command that called this function.
+    // That defeats the RBAC model on shared machines.
     let rbac_db_path = paths.state_dir.join("rbac.db");
     let rbac_engine = prism_core::rbac::RbacEngine::new(&rbac_db_path)?;
-    rbac_engine.assign_role(user_id, prism_core::rbac::LocalRole::NodeAdmin)?;
+    if rbac_engine.get_role(user_id)?.is_none() {
+        rbac_engine.assign_role(user_id, prism_core::rbac::LocalRole::NodeAdmin)?;
+    }
 
     create_dashboard_session_for_user(dashboard_url, user_id, creds.display_name.as_deref()).await
 }
