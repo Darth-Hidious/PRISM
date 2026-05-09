@@ -54,7 +54,7 @@ const PRISM_BANNER: &str = "\x1b[38;2;0;255;255m\
 ██╔═══╝ ██╔══██╗██║╚════██║██║╚██╔╝██║
 ██║     ██║  ██║██║███████║██║ ╚═╝ ██║
 ╚═╝     ╚═╝  ╚═╝╚═╝╚══════╝╚═╝     ╚═╝\x1b[0m\n\
-\x1b[38;2;120;120;120m              · built on Forge ·\x1b[0m";
+\x1b[38;2;120;120;120m         · AI-native materials discovery ·\x1b[0m";
 
 pub async fn run(
     project_root: &Path,
