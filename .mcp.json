@@ -13,13 +13,7 @@
     "iterm-tmux": {
       "command": "npx",
       "args": ["-y", "mcpretentious"],
-      "description": "iTerm2 (macOS native) + tmux session control via WebSocket API. Lets Claude drive a REAL terminal window the user can watch, instead of headless PTY. Use when you want the human to see the agent typing. Auto-installs via npx."
+      "description": "iTerm2 (macOS native) + tmux session control via WebSocket API. Lets Claude drive a REAL terminal window the user can watch, instead of headless PTY. Use when you want the human to see the agent typing. Auto-installs via npx. See .mcp.json.notes.md for the manual-install MCPs (mcp-tui-driver, mcp-tui-test) that scripts/install-tui-mcps.sh handles."
     }
-  },
-  "_notes_for_installer": [
-    "Two more MCPs are NOT on npm and need a manual install — run scripts/install-tui-mcps.sh:",
-    "  • mcp-tui-driver (Rust, screenshot/PNG capable) — adds tui_screenshot tool for visual TUI verification",
-    "  • mcp-tui-test (Python, Playwright-style snapshot testing) — buffer-mode position assertions",
-    "Plus a CI-grade dev tool: `@microsoft/tui-test` for end-to-end TUI regression coverage in CI."
-  ]
+  }
 }
