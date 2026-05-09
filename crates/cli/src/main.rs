@@ -1035,7 +1035,14 @@ async fn main() -> Result<()> {
             });
             paths.save_cli_state(&state)?;
 
-            // Sync credentials to ~/.prism/credentials.json for Python SDK
+            // Sync credentials to ~/.prism/credentials.json for Python SDK.
+            //
+            // The file holds an access_token + refresh_token, so it must be
+            // 0600. Plain `fs::write` would inherit the user's umask
+            // (typically 0644 = world-readable on most Linux distros),
+            // which would let any other local user read the tokens.
+            // cli_state.json (saved via PrismPaths::save_cli_state) already
+            // uses 0600 for the same reason; this path just got missed.
             if let Some(ref creds) = state.credentials {
                 let sdk_creds = serde_json::json!({
                     "access_token": creds.access_token,
@@ -1050,8 +1057,28 @@ async fn main() -> Result<()> {
                         .join(".prism")
                         .join("credentials.json");
                     if let Ok(json) = serde_json::to_string_pretty(&sdk_creds) {
-                        let _ = std::fs::create_dir_all(sdk_path.parent().unwrap());
-                        let _ = std::fs::write(&sdk_path, json);
+                        if let Some(parent) = sdk_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        // 0600 on unix; default ACLs on windows.
+                        #[cfg(unix)]
+                        {
+                            use std::io::Write;
+                            use std::os::unix::fs::OpenOptionsExt;
+                            if let Ok(mut file) = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .mode(0o600)
+                                .open(&sdk_path)
+                            {
+                                let _ = file.write_all(json.as_bytes());
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = std::fs::write(&sdk_path, json);
+                        }
                     }
                 }
             }
