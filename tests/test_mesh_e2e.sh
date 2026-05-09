@@ -24,6 +24,12 @@ NODE_A_PORT=9100
 NODE_B_PORT=9200
 KAFKA_BROKERS="localhost:9092"
 
+# Auth header for write endpoints. In `--offline` mode (used here),
+# the dashboard's auth middleware falls through to localhost-only
+# mode where any non-empty token is accepted as the user_id. We
+# pass a deterministic token so the test is reproducible.
+AUTH_HEADER='Authorization: Bearer test-mesh-e2e'
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -55,10 +61,12 @@ info "Starting multi-node mesh E2E test"
 
 info "Starting Node A on port $NODE_A_PORT..."
 $PRISM_BIN node up \
+    --offline \
+    --no-services \
+    --no-compute \
+    --no-storage \
     --name "node-alpha" \
     --dashboard-port $NODE_A_PORT \
-    --with-kafka \
-    --kafka-brokers "$KAFKA_BROKERS" \
     --broadcast \
     &
 NODE_A_PID=$!
@@ -67,12 +75,13 @@ NODE_A_PID=$!
 
 info "Starting Node B on port $NODE_B_PORT..."
 $PRISM_BIN node up \
+    --offline \
+    --no-services \
+    --no-compute \
+    --no-storage \
     --name "node-beta" \
     --dashboard-port $NODE_B_PORT \
-    --with-kafka \
-    --kafka-brokers "$KAFKA_BROKERS" \
     --broadcast \
-    --no-services \
     &
 NODE_B_PID=$!
 
@@ -91,8 +100,11 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# Give mesh time to discover peers
-sleep 5
+# Give mesh time to discover peers. The mDNS discovery interval is
+# 30s — first scan happens at ~T+30s after each node starts. Wait a
+# bit beyond that so both sides have completed at least one scan.
+info "Waiting for first mDNS discovery cycle (35s)..."
+sleep 35
 
 # ── Test 1: Node discovery ─────────────────────────────────────────
 
@@ -111,6 +123,7 @@ fi
 info "Test 2: Node A publishes a dataset..."
 PUBLISH_RESP=$(curl -sf -X POST "http://localhost:$NODE_A_PORT/api/mesh/publish" \
     -H "Content-Type: application/json" \
+    -H "$AUTH_HEADER" \
     -d '{"name": "titanium-alloys", "schema_version": "1.0"}')
 STATUS=$(echo "$PUBLISH_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
 
@@ -141,6 +154,7 @@ NODE_A_ID=$(curl -sf "http://localhost:$NODE_A_PORT/api/mesh/nodes" | python3 -c
 
 SUB_RESP=$(curl -sf -X POST "http://localhost:$NODE_B_PORT/api/mesh/subscribe" \
     -H "Content-Type: application/json" \
+    -H "$AUTH_HEADER" \
     -d "{\"dataset_name\": \"titanium-alloys\", \"publisher_node\": \"$NODE_A_ID\"}")
 SUB_STATUS=$(echo "$SUB_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
 
@@ -155,6 +169,7 @@ fi
 info "Test 5: Federated query from Node B..."
 FED_RESP=$(curl -sf -X POST "http://localhost:$NODE_B_PORT/api/query" \
     -H "Content-Type: application/json" \
+    -H "$AUTH_HEADER" \
     -d '{"query": "MATCH (n) RETURN n LIMIT 5", "mode": "federated"}' 2>/dev/null || echo '{"error":"expected"}')
 
 # Federated query may return empty if no data ingested yet — that's OK
@@ -170,6 +185,7 @@ fi
 info "Test 6: Node B unsubscribes..."
 UNSUB_RESP=$(curl -sf -X DELETE "http://localhost:$NODE_B_PORT/api/mesh/subscribe" \
     -H "Content-Type: application/json" \
+    -H "$AUTH_HEADER" \
     -d "{\"dataset_name\": \"titanium-alloys\", \"publisher_node\": \"$NODE_A_ID\"}")
 UNSUB_STATUS=$(echo "$UNSUB_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
 

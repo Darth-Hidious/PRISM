@@ -161,6 +161,43 @@ async fn handle_nl_query(
         "NL query translated"
     );
 
+    // Same write protection as direct cypher mode. The LLM can produce
+    // destructive Cypher accidentally (a user asking "delete my old
+    // experiments" politely), or via prompt injection (an entity name
+    // in the corpus reads `MATCH (n) DETACH DELETE n` and the LLM
+    // echoes it). Bug #48 — NL mode bypassed the cypher-mode blocklist.
+    //
+    // Reject with a clear message; the user can switch to a write-aware
+    // endpoint if they actually want destructive behavior.
+    if let Some(found) = detect_blocked_cypher_keyword(&translation.cypher) {
+        // Audit the LLM-generated denial — distinguishes prompt-injection
+        // attempts from genuine user write requests. See Bug #55.
+        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            user_id: user_id.to_string(),
+            action: prism_core::audit::AuditAction::DataQuery,
+            target: "nl".into(),
+            detail: Some(format!(
+                "LLM emitted blocked keyword: {} (cypher={})",
+                found.trim(),
+                translation.cypher
+            )),
+            outcome: prism_core::audit::AuditOutcome::Denied,
+        });
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: format!(
+                    "Generated Cypher contains a write/admin keyword ({}); the query API is \
+                     read-only. Generated: {}",
+                    found.trim(),
+                    translation.cypher
+                ),
+            }),
+        ));
+    }
+
     // Execute the generated Cypher
     let results = store
         .query_cypher(&translation.cypher, None)
@@ -210,19 +247,28 @@ async fn handle_cypher_query(
         return Err(service_unavailable("Neo4j not configured."));
     };
 
-    // Basic safety: reject write operations in the query endpoint
-    let upper = body.query.to_uppercase();
-    if upper.contains("DELETE")
-        || upper.contains("CREATE")
-        || upper.contains("MERGE")
-        || upper.contains("SET ")
-        || upper.contains("REMOVE ")
-        || upper.contains("DROP ")
-    {
+    if let Some(found) = detect_blocked_cypher_keyword(&body.query) {
+        // Audit the denial — failed/blocked operations are at least as
+        // important to log as successes for security review. Without
+        // this, admins reviewing the audit log can't see attack
+        // attempts. See Bug #55.
+        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            user_id: user_id.to_string(),
+            action: prism_core::audit::AuditAction::DataQuery,
+            target: "cypher".into(),
+            detail: Some(format!("blocked keyword: {}", found.trim())),
+            outcome: prism_core::audit::AuditOutcome::Denied,
+        });
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
-                error: "Write operations not allowed via the query API.".into(),
+                error: format!(
+                    "Write/admin operations not allowed via the query API (matched: {}). \
+                     Use the dedicated ingest / admin endpoints instead.",
+                    found.trim()
+                ),
             }),
         ));
     }
@@ -232,6 +278,19 @@ async fn handle_cypher_query(
 
     let results = store.query_cypher(&body.query, None).await.map_err(|e| {
         tracing::error!(error = %e, "Cypher query failed");
+        // Failed query — log as Failure for the audit trail. Surface to
+        // admins reviewing security: a Cypher syntax error from a real
+        // user is benign noise, but the same error from a probe trying
+        // to fingerprint the schema is signal.
+        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            user_id: user_id.to_string(),
+            action: prism_core::audit::AuditAction::DataQuery,
+            target: "cypher".into(),
+            detail: Some(format!("execution error: {e}")),
+            outcome: prism_core::audit::AuditOutcome::Failure,
+        });
         internal_error("Cypher execution failed.")
     })?;
 
@@ -455,6 +514,26 @@ fn service_unavailable(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorResponse { error: msg.into() }),
     )
+}
+
+/// Substring-based write/admin keyword detection. Imperfect — the
+/// only correct long-term fix is connecting to Neo4j as a READ-ONLY
+/// role — but closes the obvious bypasses for both direct cypher
+/// queries and LLM-generated NL→cypher.
+///
+/// Returns the matched keyword (for the error message) when the
+/// query contains any forbidden verb. Tested via cypher-mode unit
+/// tests; reused by NL mode so the LLM can't accidentally — or via
+/// prompt injection — emit destructive Cypher and have it run.
+fn detect_blocked_cypher_keyword(query: &str) -> Option<&'static str> {
+    let upper = query.to_uppercase();
+    const BLOCKED_KEYWORDS: &[&str] = &[
+        "DELETE", "CREATE", "MERGE", "SET ", "REMOVE ", "DROP ", "LOAD ", "USE ", "CALL ",
+    ];
+    BLOCKED_KEYWORDS
+        .iter()
+        .find(|kw| upper.contains(*kw))
+        .copied()
 }
 
 fn internal_error(msg: &str) -> (StatusCode, Json<ErrorResponse>) {

@@ -419,7 +419,28 @@ fn sync_sdk_credentials(creds: &StoredCredentials) {
             let _ = fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(&sdk_creds) {
-            let _ = fs::write(sdk_path, json);
+            // 0600 on unix — file holds bearer + refresh tokens. Plain
+            // fs::write inherits the user's umask (typically 0644 = world-
+            // readable on most Linux distros), which would let any other
+            // local user read PRISM tokens.
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                if let Ok(mut file) = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&sdk_path)
+                {
+                    let _ = file.write_all(json.as_bytes());
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = fs::write(&sdk_path, json);
+            }
         }
     }
 }
@@ -490,14 +511,23 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
 }
 
 fn open_browser(url: &str) -> Result<()> {
+    // Defense-in-depth: only http(s) URLs. See crates/cli/src/main.rs for
+    // the same restriction — protects against a compromised platform
+    // returning `--version`, `file:///`, or a `javascript:` payload that
+    // some browser opener would happily execute.
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err(anyhow::anyhow!("refusing to open non-http(s) URL: {url}"));
+    }
+
     let status = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).status()
+        std::process::Command::new("open").arg(trimmed).status()
     } else if cfg!(target_os = "windows") {
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+            .args(["/C", "start", "", trimmed])
             .status()
     } else {
-        std::process::Command::new("xdg-open").arg(url).status()
+        std::process::Command::new("xdg-open").arg(trimmed).status()
     }
     .context("failed to spawn browser opener")?;
 

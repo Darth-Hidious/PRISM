@@ -323,6 +323,24 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         self.hydrate_caches();
         self.init_conversation().await?;
 
+        // PRISM `prism resume` integration. The prism CLI sets this
+        // env var when the user types `prism resume` with no id, to
+        // auto-launch the conversation picker before the prompt loop.
+        // The `--cid <id>` direct path is handled separately by
+        // forge_chat::run setting cli.conversation_id from
+        // PRISM_RESUME_ID. Reuses the existing list_conversations()
+        // method — no new picker UI here.
+        if std::env::var_os("PRISM_RESUME_PICKER").is_some() {
+            // Best-effort: if it fails (e.g., no conversations), fall
+            // through to a normal new-conversation prompt rather than
+            // bailing out of the whole TUI.
+            let _ = self.list_conversations().await;
+            // Don't re-fire on subsequent runs of the same process.
+            unsafe {
+                std::env::remove_var("PRISM_RESUME_PICKER");
+            }
+        }
+
         // Check for dispatch flag first
         if let Some(dispatch_json) = self.cli.event.clone() {
             return self.handle_dispatch(dispatch_json).await;
@@ -385,6 +403,37 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
 
                     match error.downcast::<ReadLineError>() {
                         Ok(error) => {
+                            // Detect the specific CPR-timeout failure that
+                            // happens under headless PTYs (terminalcp,
+                            // mcp-tui-driver, some CI harnesses) — see
+                            // Bug #22 in docs/SHIPPED.md. reedline genuinely
+                            // needs cursor-position-query support to draw,
+                            // but the default error is an opaque rust stack
+                            // that exits silently. Replace with a single
+                            // actionable line so the user knows what to do.
+                            let msg = error.to_string();
+                            if msg.contains("cursor position could not be read") {
+                                let mut stderr = std::io::stderr();
+                                use std::io::Write as _;
+                                let _ = writeln!(
+                                    stderr,
+                                    "\n[prism] this terminal doesn't support cursor-position queries (ESC[6n / DSR)."
+                                );
+                                let _ = writeln!(
+                                    stderr,
+                                    "        The PRISM TUI's input editor (reedline) requires CPR support to render."
+                                );
+                                let _ = writeln!(
+                                    stderr,
+                                    "        Use a real terminal: iTerm2, Wezterm, kitty, gnome-terminal, Terminal.app."
+                                );
+                                let _ = writeln!(
+                                    stderr,
+                                    "        For piped / scripted input use:  echo \"...\" | prism tui"
+                                );
+                                let _ = writeln!(stderr);
+                                std::process::exit(2);
+                            }
                             return Err(error)?;
                         }
                         Err(error) => self.writeln_to_stderr(
@@ -1655,10 +1704,21 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         // Fetch default provider (could be different from the set provider)
         let default_provider = self.api.get_default_provider().await.ok();
 
-        // Add agent information
+        // Add agent information.
+        //
+        // The default forge agent has id "forge" — we display it as "PRISM"
+        // so users see the product they're running, not the underlying
+        // engine. Custom agents (anything else) keep their actual id so
+        // /info remains useful for debugging multi-agent setups.
         info = info.add_title("AGENT");
         if let Some(agent) = agent {
-            info = info.add_key_value("ID", agent.as_str().to_uppercase());
+            let raw = agent.as_str();
+            let display = if raw.eq_ignore_ascii_case("forge") {
+                "PRISM".to_string()
+            } else {
+                raw.to_uppercase()
+            };
+            info = info.add_key_value("ID", display);
         }
 
         // Add model information if available
@@ -2051,6 +2111,19 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
                 on_update(self.api.clone(), None).await;
             }
             AppCommand::Exit => {
+                // Print a resume hint so the user has the UUID + the
+                // exact command to come back. Suppressed when there's
+                // no conversation_id (user exited before sending any
+                // turn — nothing to resume).
+                if let Some(cid) = self.state.conversation_id {
+                    let id_str = cid.into_string();
+                    use std::io::Write as _;
+                    let mut stderr = std::io::stderr();
+                    let _ = writeln!(stderr);
+                    let _ = writeln!(stderr, "Conversation saved · id: {id_str}");
+                    let _ = writeln!(stderr, "  resume:  prism resume {id_str}");
+                    let _ = writeln!(stderr, "  picker:  prism resume");
+                }
                 return Ok(true);
             }
 
@@ -3275,8 +3348,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
         self.api.create_auth_credentials().await?;
         let env = self.api.environment();
         let credentials_path = crate::info::format_path_for_display(&env, &env.credentials_path());
+        // User-facing label: PRISM, not the underlying engine name.
         self.writeln_title(
-            TitleFormat::info("ForgeCode Services enabled").sub_title(&credentials_path),
+            TitleFormat::info("PRISM services enabled").sub_title(&credentials_path),
         )?;
         Ok(())
     }

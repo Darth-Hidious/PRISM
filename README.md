@@ -11,7 +11,7 @@
 PRISM is a single binary that gives you an AI agent for materials science. It searches knowledge graphs, runs compute jobs, orchestrates workflows, and connects to a federated mesh of research nodes.
 
 ```bash
-prism                    # Launch interactive TUI
+prism                    # Launch interactive chat
 prism query --platform "nickel superalloys"
 prism research "high-entropy alloys" --depth 1
 prism billing            # Check credit balance
@@ -39,15 +39,14 @@ cd PRISM && cargo build --release
 cp target/release/prism ~/.local/bin/
 ```
 
-## Interactive TUI
+## Interactive chat
 
-Run `prism` to launch the terminal UI with:
-- Workspace tabs (Chat, Explorer, Models, Compute, Mesh, Workflows, Marketplace, Data, Settings)
-- Command palette (type `/` to search 69+ commands)
-- Model picker with 535 hosted models across 4 providers
-- Sidebar browser per workspace (file tree, model catalog, mesh peers, GPU resources)
-- Inline tool cards showing execution results
+Run `prism` to launch a slash-command-driven AI agent with:
+- Slash-command palette — type `/` for commands like `/new`, `/info`, `/usage`, `/help`, `/model`, `/agent`, `/update`, `/exit`
+- Model picker via `/model` (hundreds of hosted models routed through MARC27)
+- Inline tool cards showing materials-science tool execution results (CALPHAD, pyiron, OPTIMADE, ML predictions, federated knowledge graph)
 - Streaming AI responses with markdown rendering
+- Boot diagnostics (Platform, Auth, Knowledge Graph, LLM Models, Compute, Marketplace, Local Node, Policy Engine) on every launch — run `prism doctor` for the full report
 
 ## CLI Commands
 
@@ -61,7 +60,7 @@ prism status             # Auth state, paths, endpoints
 
 ### AI Agent
 ```
-prism                    # Interactive TUI agent
+prism                    # Interactive chat agent
 prism query --platform "titanium alloys"
 prism query --semantic "creep resistance"
 prism query --cypher "MATCH (a:Alloy) RETURN a"

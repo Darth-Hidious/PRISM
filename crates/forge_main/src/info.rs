@@ -384,9 +384,14 @@ impl From<&ForgeConfig> for Info {
                 );
         }
 
+        // Skip the "ForgeCode Service URL" line entirely when PRISM has
+        // disabled it (services_url == ""). Showing an empty value or
+        // the upstream forgecode.dev default would be misleading.
+        info = info.add_title("API CONFIGURATION");
+        if !config.services_url.is_empty() {
+            info = info.add_key_value("Services URL", config.services_url.to_string());
+        }
         info = info
-            .add_title("API CONFIGURATION")
-            .add_key_value("ForgeCode Service URL", config.services_url.to_string())
             .add_title("TOOL CONFIGURATION")
             .add_key_value("Tool Timeout", format!("{}s", config.tool_timeout_secs))
             .add_key_value(
@@ -629,7 +634,7 @@ impl From<&ForgeCommandManager> for Info {
         info = info
             .add_title("KEYBOARD SHORTCUTS")
             .add_key_value("<CTRL+C>", "Interrupt current operation")
-            .add_key_value("<CTRL+D>", "Quit Forge interactive shell")
+            .add_key_value("<CTRL+D>", "Quit PRISM interactive shell")
             .add_key_value(multiline_shortcut, "Insert new line (multiline input)");
 
         info
@@ -642,17 +647,12 @@ impl From<&UserUsage> for Info {
 
         let mut info = Info::new().add_title("REQUEST QUOTA");
 
-        if plan.is_upgradeable() {
-            info = info.add_key_value(
-                "Subscription",
-                format!(
-                    "{} [Upgrade https://app.forgecode.dev/app/billing]",
-                    plan.r#type.to_uppercase()
-                ),
-            );
-        } else {
-            info = info.add_key_value("Subscription", plan.r#type.to_uppercase());
-        }
+        // Show plan name. The upstream Forge build appended a forgecode.dev
+        // upgrade link here, but PRISM users are on MARC27 plans (managed
+        // through https://app.marc27.com), so the link would point to the
+        // wrong billing portal. Drop the link for now until PRISM has its
+        // own upgrade-CTA URL to wire in.
+        info = info.add_key_value("Subscription", plan.r#type.to_uppercase());
 
         info = info.add_key_value(
             "Usage",

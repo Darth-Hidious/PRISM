@@ -56,6 +56,29 @@ pub async fn run_sync_handler(
                 if node_id == our_node_id {
                     continue; // ignore our own announcements
                 }
+                // Reject obviously-abusive announces. Without these caps a
+                // peer with Kafka access could announce themselves with
+                // a 1 MB name (or N fake node_ids) and grow the in-memory
+                // peers list until OOM. See Bug #57.
+                const MAX_NAME_LEN: usize = 256;
+                const MAX_ADDRESS_LEN: usize = 256;
+                const MAX_CAPABILITIES: usize = 64;
+                const MAX_CAPABILITY_LEN: usize = 256;
+                const MAX_PEERS: usize = 10_000;
+                if name.len() > MAX_NAME_LEN
+                    || address.len() > MAX_ADDRESS_LEN
+                    || capabilities.len() > MAX_CAPABILITIES
+                    || capabilities.iter().any(|c| c.len() > MAX_CAPABILITY_LEN)
+                {
+                    warn!(
+                        %node_id,
+                        name_len = name.len(),
+                        address_len = address.len(),
+                        cap_count = capabilities.len(),
+                        "rejecting Announce: field length exceeds caps"
+                    );
+                    continue;
+                }
                 info!(node = %name, id = %node_id, "peer announced");
                 let peer = PeerNode {
                     node_id,
@@ -66,7 +89,21 @@ pub async fn run_sync_handler(
                     capabilities,
                 };
                 let mut list = peers.write().unwrap_or_else(|e| e.into_inner());
-                if !list.iter().any(|p| p.node_id == node_id) {
+                if list.iter().any(|p| p.node_id == node_id) {
+                    // Already known — refresh `last_seen`. Without this an
+                    // honest peer that drops Kafka briefly and rejoins
+                    // would have stale `last_seen` until the next
+                    // announce, while we'd miss the update.
+                    if let Some(existing) = list.iter_mut().find(|p| p.node_id == node_id) {
+                        existing.last_seen = peer.last_seen;
+                    }
+                } else if list.len() >= MAX_PEERS {
+                    warn!(
+                        peer_count = list.len(),
+                        max = MAX_PEERS,
+                        "rejecting Announce: peer list at capacity (Bug #57 DoS guard)"
+                    );
+                } else {
                     list.push(peer);
                 }
             }
@@ -154,11 +191,25 @@ pub async fn run_sync_handler(
                     dataset = %dataset_name,
                     "remote node subscribed to our dataset"
                 );
-                // Track the subscriber in our published datasets
+                // Track the subscriber in our published datasets — but cap
+                // the list. Without this a peer could fan in N fake
+                // subscriber_ids per dataset and grow the per-publication
+                // Vec<Uuid> indefinitely. Same DoS class as Bug #57 — the
+                // peer-list cap protects the receiving side, this protects
+                // the publisher side.
+                const MAX_SUBSCRIBERS_PER_DATASET: usize = 10_000;
                 let mut subs = subscriptions.write().unwrap_or_else(|e| e.into_inner());
                 for d in subs.published_mut() {
                     if d.name == dataset_name && !d.subscribers.contains(&subscriber_id) {
-                        d.subscribers.push(subscriber_id);
+                        if d.subscribers.len() >= MAX_SUBSCRIBERS_PER_DATASET {
+                            warn!(
+                                dataset = %dataset_name,
+                                count = d.subscribers.len(),
+                                "rejecting DataSubscribe: subscriber list at cap"
+                            );
+                        } else {
+                            d.subscribers.push(subscriber_id);
+                        }
                     }
                 }
             }
@@ -184,58 +235,41 @@ pub async fn run_sync_handler(
             }
 
             // ── Query forwarding (federated search) ──────────
+            //
+            // **Disabled**: this code path used to execute the peer's
+            // raw Cypher string against the local Neo4j with no
+            // verification, no allow-list, and no auth — any peer in
+            // the Kafka mesh could send an arbitrary `MATCH/DELETE`
+            // statement and our graph would obey. This was
+            // remote-attacker-controlled, full graph-DB compromise of
+            // the receiving node (see Bug #46).
+            //
+            // The Kafka federated-query path was already marked
+            // "direct REST federation preferred" in the result-return
+            // comment below, so wholesale dropping it is consistent
+            // with the architectural direction. Direct REST
+            // federation goes through the server's regular auth and
+            // RBAC layers; this path bypassed both.
+            //
+            // If a future protocol revision wants to re-enable Kafka
+            // query forwarding, the prerequisites are: (a) F1 chunk 4
+            // verify_peer wiring (Bug #33), (b) an allow-list of
+            // read-only Cypher patterns, (c) an explicit per-org
+            // policy gate. Until all three exist, ignore the message.
             MeshMessage::QueryForward {
                 query_id,
-                query,
                 origin_node,
+                ..
             } => {
                 if origin_node == our_node_id {
                     continue;
                 }
-                debug!(
+                warn!(
                     query_id = %query_id,
                     origin = %origin_node,
-                    "received forwarded query from peer"
+                    "ignoring QueryForward — Kafka federated-query path disabled \
+                     pending peer verification (Bug #46)"
                 );
-                // Execute locally and respond — requires Neo4j
-                if let Some(ref cfg) = sync_config {
-                    let neo4j_url = format!("{}/db/neo4j/tx/commit", cfg.neo4j_url);
-                    let neo4j_body = serde_json::json!({
-                        "statements": [{
-                            "statement": query,
-                        }]
-                    });
-                    match client
-                        .post(&neo4j_url)
-                        .basic_auth(&cfg.neo4j_user, Some(&cfg.neo4j_pass))
-                        .json(&neo4j_body)
-                        .send()
-                        .await
-                    {
-                        Ok(resp) => {
-                            let results =
-                                resp.json::<serde_json::Value>().await.unwrap_or_default();
-                            debug!(
-                                query_id = %query_id,
-                                "forwarded query executed, results ready"
-                            );
-                            // Note: QueryResult would be published back via Kafka
-                            // if we had access to the producer here. For now, log it.
-                            info!(
-                                query_id = %query_id,
-                                "query result available (direct REST federation preferred)"
-                            );
-                            let _ = results; // consumed by direct REST federation
-                        }
-                        Err(e) => {
-                            warn!(
-                                query_id = %query_id,
-                                error = %e,
-                                "failed to execute forwarded query"
-                            );
-                        }
-                    }
-                }
             }
 
             MeshMessage::QueryResult { query_id, results } => {
@@ -263,10 +297,33 @@ async fn sync_dataset_from_peer(
     dataset_name: &str,
     sync_config: &Option<SyncConfig>,
 ) -> Result<()> {
-    // Query the peer's graph for all entities in the dataset
+    // Reject malformed dataset names up front — defense-in-depth before
+    // we hand the value to a Cypher parameter binder that *should* be
+    // safe but isn't worth trusting blindly. Marketplace and platform
+    // dataset names are simple identifiers in practice; if a peer
+    // publishes something exotic, refuse to sync rather than send it
+    // through the query pipeline.
+    if !dataset_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        || dataset_name.is_empty()
+        || dataset_name.len() > 128
+    {
+        anyhow::bail!(
+            "refusing to sync dataset with invalid name (must be ASCII alphanumeric + _-., \
+             non-empty, ≤128 chars): {dataset_name:?}"
+        );
+    }
+
+    // Query the peer's graph for all entities in the dataset.
+    // Use a parameterized Cypher query — earlier code interpolated
+    // `dataset_name` straight into the query string, which let a
+    // malicious peer (or a peer with a buggy publish call) inject
+    // Cypher via the dataset name they publish. See Bug #45.
     let query_url = format!("{peer_url}/api/query");
     let body = serde_json::json!({
-        "query": format!("MATCH (n) WHERE n.dataset = '{dataset_name}' RETURN n LIMIT 1000"),
+        "query": "MATCH (n) WHERE n.dataset = $dataset RETURN n LIMIT 1000",
+        "params": { "dataset": dataset_name },
         "mode": "cypher",
     });
 
@@ -280,7 +337,30 @@ async fn sync_dataset_from_peer(
         );
     }
 
-    let data: serde_json::Value = resp.json().await?;
+    // Body size cap — a malicious or runaway peer could otherwise
+    // return gigabytes and OOM the local node. The peer query has
+    // a `LIMIT 1000` clause, so a well-behaved peer stays well under
+    // any reasonable cap. 32 MiB is far more headroom than the
+    // limit needs but stops the obvious DoS vector. See Bug #52.
+    const MAX_PEER_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+    if let Some(len) = resp.content_length()
+        && len as usize > MAX_PEER_RESPONSE_BYTES
+    {
+        anyhow::bail!(
+            "peer response too large ({} bytes; max {})",
+            len,
+            MAX_PEER_RESPONSE_BYTES
+        );
+    }
+    let body_bytes = resp.bytes().await?;
+    if body_bytes.len() > MAX_PEER_RESPONSE_BYTES {
+        anyhow::bail!(
+            "peer response too large ({} bytes; max {})",
+            body_bytes.len(),
+            MAX_PEER_RESPONSE_BYTES
+        );
+    }
+    let data: serde_json::Value = serde_json::from_slice(&body_bytes)?;
     let result_count = data["results"].as_array().map(|a| a.len()).unwrap_or(0);
 
     if result_count == 0 {
@@ -291,14 +371,21 @@ async fn sync_dataset_from_peer(
     // Write to local Neo4j if configured
     if let Some(cfg) = sync_config {
         let neo4j_url = format!("{}/db/neo4j/tx/commit", cfg.neo4j_url);
-        let results = data["results"].as_array().unwrap();
+        let Some(results) = data["results"].as_array() else {
+            return Ok(());
+        };
 
-        // Batch-create nodes from peer data using UNWIND
-        let cypher = format!(
-            "UNWIND $rows AS row \
-             MERGE (n:SyncedEntity {{name: row.name, source_dataset: '{dataset_name}'}}) \
-             SET n += row.properties"
-        );
+        // Batch-create nodes from peer data using UNWIND.
+        //
+        // Both `$rows` AND `$source` are passed as parameters — the
+        // earlier version interpolated `dataset_name` into the
+        // statement string, which would have let a malicious peer
+        // execute arbitrary Cypher against our LOCAL Neo4j (e.g. a
+        // dataset named `x' DETACH DELETE n RETURN '` would wipe the
+        // local graph). See Bug #45.
+        let cypher = "UNWIND $rows AS row \
+             MERGE (n:SyncedEntity {name: row.name, source_dataset: $source}) \
+             SET n += row.properties";
 
         let rows: Vec<serde_json::Value> = results
             .iter()
@@ -313,7 +400,7 @@ async fn sync_dataset_from_peer(
         let neo4j_body = serde_json::json!({
             "statements": [{
                 "statement": cypher,
-                "parameters": { "rows": rows },
+                "parameters": { "rows": rows, "source": dataset_name },
             }]
         });
 

@@ -23,6 +23,9 @@ pub struct BootCheck {
 }
 
 /// Run the boot sequence (raw stdout, ANSI colors only).
+///
+/// Prints the "Initializing..." banner, every check line, and the
+/// "Igniting core..." trailer. Used at `prism` startup.
 pub fn boot_sequence(checks: &[BootCheck]) {
     let print_colored = |text: &str| {
         print!("{text}");
@@ -33,6 +36,23 @@ pub fn boot_sequence(checks: &[BootCheck]) {
         "\x1b[38;2;0;255;255m[PRISM]\x1b[0m \x1b[38;2;200;200;200mInitializing Materials Discovery Node...\x1b[0m\n",
     );
     thread::sleep(Duration::from_millis(200));
+
+    print_check_lines(checks);
+
+    print_colored(
+        "\n\x1b[38;2;0;255;255m[PRISM]\x1b[0m \x1b[38;2;200;200;200mIgniting core...\x1b[0m\n",
+    );
+    thread::sleep(Duration::from_millis(300));
+}
+
+/// Print just the check lines without the "Initializing..." / "Igniting core..."
+/// frame. Used by `prism doctor` so each section under its own [PRISM] header
+/// reads as one continuous tree instead of repeating the boot banner.
+pub fn print_check_lines(checks: &[BootCheck]) {
+    let print_colored = |text: &str| {
+        print!("{text}");
+        let _ = io::stdout().flush();
+    };
 
     for check in checks {
         print_colored(&format!(
@@ -55,11 +75,6 @@ pub fn boot_sequence(checks: &[BootCheck]) {
             ));
         }
     }
-
-    print_colored(
-        "\n\x1b[38;2;0;255;255m[PRISM]\x1b[0m \x1b[38;2;200;200;200mIgniting core...\x1b[0m\n",
-    );
-    thread::sleep(Duration::from_millis(300));
 }
 
 // ── Shared styling for section-style output ──────────────────────────

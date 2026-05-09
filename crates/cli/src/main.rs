@@ -5,6 +5,7 @@
 //! discovery from `~/.prism/workflows/`.
 
 mod boot;
+mod boot_checks;
 mod chat_config;
 mod doctor;
 mod forge_chat;
@@ -52,6 +53,16 @@ enum Commands {
     Setup,
     /// Launch the interactive AI agent TUI.
     Tui,
+    /// Resume a previous conversation.
+    ///
+    /// With no argument, opens the conversation picker (last-N sessions
+    /// shown by title + how-long-ago) so you can pick one. With a
+    /// conversation id, jumps straight back into that conversation.
+    /// The id was printed when you exited the previous session.
+    Resume {
+        /// Conversation UUID to resume directly. Omit to get the picker.
+        id: Option<String>,
+    },
     /// Authenticate against the MARC27 platform.
     ///
     /// Default: device-flow login that opens a browser to approve the
@@ -957,7 +968,8 @@ async fn main() -> Result<()> {
             // still have a refresh_token we haven't tried yet (local
             // expires_at said fresh but server disagreed → server-side
             // rotation), try one more refresh + redo the check.
-            let mut boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let mut boot_checks =
+                boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             let auth_rejected = boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
@@ -971,7 +983,9 @@ async fn main() -> Result<()> {
                         state.credentials = Some(new_creds);
                         paths.save_cli_state(&state)?;
                         // Redo the boot checks with the new token.
-                        boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                        boot_checks =
+                            boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints)
+                                .await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1031,7 +1045,14 @@ async fn main() -> Result<()> {
             });
             paths.save_cli_state(&state)?;
 
-            // Sync credentials to ~/.prism/credentials.json for Python SDK
+            // Sync credentials to ~/.prism/credentials.json for Python SDK.
+            //
+            // The file holds an access_token + refresh_token, so it must be
+            // 0600. Plain `fs::write` would inherit the user's umask
+            // (typically 0644 = world-readable on most Linux distros),
+            // which would let any other local user read the tokens.
+            // cli_state.json (saved via PrismPaths::save_cli_state) already
+            // uses 0600 for the same reason; this path just got missed.
             if let Some(ref creds) = state.credentials {
                 let sdk_creds = serde_json::json!({
                     "access_token": creds.access_token,
@@ -1046,8 +1067,28 @@ async fn main() -> Result<()> {
                         .join(".prism")
                         .join("credentials.json");
                     if let Ok(json) = serde_json::to_string_pretty(&sdk_creds) {
-                        let _ = std::fs::create_dir_all(sdk_path.parent().unwrap());
-                        let _ = std::fs::write(&sdk_path, json);
+                        if let Some(parent) = sdk_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        // 0600 on unix; default ACLs on windows.
+                        #[cfg(unix)]
+                        {
+                            use std::io::Write;
+                            use std::os::unix::fs::OpenOptionsExt;
+                            if let Ok(mut file) = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .mode(0o600)
+                                .open(&sdk_path)
+                            {
+                                let _ = file.write_all(json.as_bytes());
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = std::fs::write(&sdk_path, json);
+                        }
                     }
                 }
             }
@@ -1072,7 +1113,10 @@ async fn main() -> Result<()> {
                     "backbone": {
                         "python_worker": "app.backend",
                         "node_binary": "prism-node",
-                        "chat_surface": "forge",
+                        // User-facing surface is "prism"; the underlying chat
+                        // harness is forge_main but that's an internal detail
+                        // that doesn't belong in machine-readable output.
+                        "chat_surface": "prism",
                         "workflow_runtime": "rust",
                     }
                 }))?
@@ -1421,12 +1465,35 @@ async fn main() -> Result<()> {
                 // ── V2: Start the embedded dashboard server ──
                 let mut server_node_state = prism_server::NodeState::new(node_name.clone());
 
-                // Wire core databases (RBAC + audit)
+                // Wire core databases (RBAC + audit + sessions).
+                //
+                // Bug #21: in `--offline` mode, leaving session_db_path
+                // configured forces every request to validate against
+                // an empty SessionManager → 401 on /api/mesh/publish,
+                // /api/mesh/subscribe, /api/audit. The middleware in
+                // crates/server/src/middleware/auth.rs already has a
+                // localhost-only fallback path (line 99-104) when no
+                // session DB is configured: any non-empty token is
+                // accepted as the user_id. We use that path in offline
+                // mode so `tests/test_mesh_e2e.sh` and similar scripts
+                // can pass `Authorization: Bearer test-token` (any
+                // value works) and exercise the API surface end-to-end.
                 let state_dir = &paths.state_dir;
                 std::fs::create_dir_all(state_dir)?;
                 server_node_state.audit_db_path = Some(state_dir.join("audit.db"));
-                server_node_state.rbac_db_path = Some(state_dir.join("rbac.db"));
-                server_node_state.session_db_path = Some(state_dir.join("sessions.db"));
+
+                // Two-layer auth (session + RBAC) is bypassed in
+                // `--offline` mode: any non-empty token works, and
+                // the resolve_role middleware grants synthetic
+                // NodeAdmin. See Bug #21 in docs/SHIPPED.md.
+                if offline {
+                    server_node_state.rbac_db_path = None;
+                    server_node_state.session_db_path = None;
+                } else {
+                    server_node_state.rbac_db_path = Some(state_dir.join("rbac.db"));
+                    server_node_state.session_db_path = Some(state_dir.join("sessions.db"));
+                }
+
                 // Subscription store: persist when connected to platform,
                 // ephemeral (in-memory) in offline mode.
                 //
@@ -2117,10 +2184,38 @@ async fn main() -> Result<()> {
                     }
                 }
                 MarketplaceCommands::Install { name, workflow } => {
+                    // Reject names containing path separators / parent refs.
+                    // Without this, `prism marketplace install ../../../foo`
+                    // would write to ~/.prism/tools/../../../foo.py — a self-
+                    // inflicted path traversal. Marketplace slugs are always
+                    // simple identifiers in practice, so the restriction is
+                    // safe and surfaces typos early.
+                    if name.contains('/')
+                        || name.contains('\\')
+                        || name.contains("..")
+                        || name.starts_with('.')
+                    {
+                        anyhow::bail!(
+                            "Invalid marketplace name '{name}'. Names must be simple slugs \
+                             (no `/`, `\\`, `..`, or leading `.`)."
+                        );
+                    }
+
                     let url = marketplace.install_url(&name).await?;
                     let client = reqwest::Client::new();
-                    let resp = client.get(&url).send().await?;
-                    let content = resp.text().await?;
+                    // error_for_status() converts 4xx/5xx into Err so a 404
+                    // doesn't end up saved as a Python file. Previously the
+                    // download path happily wrote HTML 404 pages as `.py`,
+                    // which then auto-loaded on next launch and crashed the
+                    // tool router with a syntax error.
+                    let content = client
+                        .get(&url)
+                        .send()
+                        .await?
+                        .error_for_status()
+                        .with_context(|| format!("downloading {name} from {url}"))?
+                        .text()
+                        .await?;
 
                     let home = std::env::var("HOME").unwrap_or_default();
                     let dest = if workflow {
@@ -2132,6 +2227,18 @@ async fn main() -> Result<()> {
                         std::fs::create_dir_all(&dir)?;
                         dir.join(format!("{name}.py"))
                     };
+
+                    // Refuse to silently overwrite a local edit. Marketplace
+                    // installs are expected to be additive; if the user
+                    // wants the upstream version they can `rm` the file
+                    // first or pass a future `--force` flag.
+                    if dest.exists() {
+                        anyhow::bail!(
+                            "Refusing to overwrite existing file at {}. \
+                             Remove it first if you want the marketplace version.",
+                            dest.display()
+                        );
+                    }
 
                     std::fs::write(&dest, &content)?;
                     let kind = if workflow { "workflow" } else { "tool" };
@@ -2410,7 +2517,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            let mut boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let mut boot_checks =
+                boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             let auth_rejected = boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
@@ -2422,10 +2530,63 @@ async fn main() -> Result<()> {
                 tracing::info!("access token refreshed after server-side rejection");
                 state.credentials = Some(new_creds);
                 let _ = paths.save_cli_state(&state);
-                boot_checks = run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                boot_checks =
+                    boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
             boot::boot_sequence(&boot_checks);
             // Splash skipped — see note in default chat path.
+            let _ = &python;
+            forge_chat::run(&project_root, state.credentials.as_ref(), &python).await?;
+        }
+        Commands::Resume { id } => {
+            // Reuses the same Tui setup path: same auth refresh, same
+            // boot checklist, same forge_chat::run. The only difference
+            // is which conversation the chat lands on, signalled via
+            // env vars (PRISM_RESUME_ID for a direct UUID jump,
+            // PRISM_RESUME_PICKER for the conversation picker). Both
+            // env vars are read + cleared by forge_chat::run /
+            // forge_main::ui — see those for the consumer side.
+            unsafe {
+                match id.as_deref() {
+                    Some(raw_id) => std::env::set_var("PRISM_RESUME_ID", raw_id),
+                    None => std::env::set_var("PRISM_RESUME_PICKER", "1"),
+                }
+            }
+
+            // Same auth-refresh + boot-check flow as the Tui branch.
+            let mut state = paths.load_cli_state().ok().unwrap_or_default();
+            if let Some(creds) = state.credentials.as_ref()
+                && !creds.refresh_token.is_empty()
+                && creds
+                    .expires_at
+                    .is_some_and(|exp| chrono::Utc::now() + chrono::Duration::minutes(5) >= exp)
+            {
+                match refresh_access_token(&endpoints, creds).await {
+                    Ok(new_creds) => {
+                        state.credentials = Some(new_creds);
+                        let _ = paths.save_cli_state(&state);
+                        tracing::info!("access token refreshed proactively");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "proactive token refresh failed");
+                    }
+                }
+            }
+            let mut boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            let auth_rejected = boot_checks
+                .iter()
+                .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
+            if auth_rejected
+                && let Some(creds) = state.credentials.as_ref()
+                && !creds.refresh_token.is_empty()
+                && let Ok(new_creds) = refresh_access_token(&endpoints, creds).await
+            {
+                tracing::info!("access token refreshed after server-side rejection");
+                state.credentials = Some(new_creds);
+                let _ = paths.save_cli_state(&state);
+                boot_checks = boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            }
+            boot::boot_sequence(&boot_checks);
             let _ = &python;
             forge_chat::run(&project_root, state.credentials.as_ref(), &python).await?;
         }
@@ -5123,11 +5284,22 @@ async fn create_dashboard_session(
         anyhow::anyhow!("Stored credentials are missing user_id. Run `prism login` again.")
     })?;
 
-    // The local CLI is the node operator on this machine, so it should be able
-    // to manage its own dashboard routes without a separate bootstrap dance.
+    // The local CLI is the node operator on this machine, so the FIRST
+    // user to run it gets bootstrapped as NodeAdmin to manage their
+    // own dashboard routes without a separate bootstrap dance.
+    //
+    // **Only assign if no role already exists** — see Bug #49. The
+    // earlier code unconditionally `assign_role(NodeAdmin)`, which
+    // uses `INSERT ... ON CONFLICT DO UPDATE`, so any explicit
+    // downgrade by an admin (e.g. someone running an admin tool to
+    // demote user-X to Viewer) would be silently undone the next
+    // time user-X ran any CLI command that called this function.
+    // That defeats the RBAC model on shared machines.
     let rbac_db_path = paths.state_dir.join("rbac.db");
     let rbac_engine = prism_core::rbac::RbacEngine::new(&rbac_db_path)?;
-    rbac_engine.assign_role(user_id, prism_core::rbac::LocalRole::NodeAdmin)?;
+    if rbac_engine.get_role(user_id)?.is_none() {
+        rbac_engine.assign_role(user_id, prism_core::rbac::LocalRole::NodeAdmin)?;
+    }
 
     create_dashboard_session_for_user(dashboard_url, user_id, creds.display_name.as_deref()).await
 }
@@ -5713,14 +5885,27 @@ async fn refresh_access_token(
 // Old Ink/TypeScript TUI launcher removed — native Ratatui TUI is in crates/cli/src/tui/
 
 fn open_browser(url: &str) -> Result<()> {
+    // Defense-in-depth: only http(s) URLs.
+    //
+    // The two callers pass `verification_uri` from the OAuth device-flow
+    // response and `checkout_url` from the billing topup response. Both
+    // come from the MARC27 platform and should always be https. Validating
+    // here means a compromised or buggy platform can't slip in
+    // `--version`, `file:///etc/passwd`, or a `javascript:` payload that
+    // some browser opener would happily execute.
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        bail!("refusing to open non-http(s) URL: {url}");
+    }
+
     let status = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).status()
+        std::process::Command::new("open").arg(trimmed).status()
     } else if cfg!(target_os = "windows") {
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+            .args(["/C", "start", "", trimmed])
             .status()
     } else {
-        std::process::Command::new("xdg-open").arg(url).status()
+        std::process::Command::new("xdg-open").arg(trimmed).status()
     }
     .context("failed to spawn browser opener")?;
 
@@ -5892,8 +6077,15 @@ async fn handle_federated_query(
         Err(e) => println!("  error: {e}"),
     }
 
-    // Step 3: Query each peer
-    let peers = peer_list.unwrap();
+    // Step 3: Query each peer.
+    //
+    // The early-return on `peer_count == 0` above means peer_list must be
+    // Some(non-empty) here, but expressing that with `unwrap()` is brittle —
+    // a future refactor of the early-return path would crash production. Use
+    // the explicit form so a regression is at most an empty iteration.
+    let Some(peers) = peer_list else {
+        return Ok(());
+    };
     for peer in peers {
         let addr = peer["address"].as_str().unwrap_or("127.0.0.1");
         let port = peer["port"].as_u64().unwrap_or(7327);
@@ -6119,274 +6311,6 @@ async fn handle_job_status(job_id_str: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-// ── Boot checks (real API pings) ──────────────────────────────────────
-
-async fn run_boot_checks(
-    creds: Option<&StoredCredentials>,
-    endpoints: &PlatformEndpoints,
-) -> Vec<boot::BootCheck> {
-    let mut checks = Vec::new();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
-
-    let token = creds.map(|c| c.access_token.as_str()).unwrap_or("");
-    let api = &endpoints.api_base;
-
-    // 1. Platform connection — use /agent/capabilities (always 200 with auth)
-    let auth_header = format!("Bearer {token}");
-    let platform_ok = client
-        .get(format!("{api}/agent/capabilities"))
-        .header("Authorization", &auth_header)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-    let host = api
-        .replace("https://", "")
-        .replace("http://", "")
-        .replace("/api/v1", "");
-    checks.push(boot::BootCheck {
-        name: "Platform".into(),
-        result: if platform_ok {
-            format!("{host} connected")
-        } else {
-            format!("{host} unreachable")
-        },
-        ok: platform_ok,
-        dots: 8,
-        delay_ms: 30,
-    });
-
-    // 2. Auth — distinguish actual expiry from scope/network/server errors.
-    // Previously this said "token expired" on ANY non-2xx, which is
-    // misleading because /users/me can fail for reasons other than
-    // expiry (token scope insufficient, server flap, network blip).
-    // Be honest about which failure mode we actually saw.
-    if !token.is_empty() {
-        let user_resp = client
-            .get(format!("{api}/users/me"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await;
-        let (auth_ok, auth_msg) = match user_resp {
-            Ok(r) if r.status().is_success() => {
-                let data: serde_json::Value = r.json().await.unwrap_or_default();
-                let name = data
-                    .get("display_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("authenticated");
-                (true, name.to_string())
-            }
-            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                // Real auth rejection — token expired, revoked, or
-                // missing the /users/me scope.
-                (false, "token rejected — run prism login".into())
-            }
-            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => {
-                // Token authenticates but lacks /users/me scope.
-                // Common with agent / project-scoped keys; do NOT
-                // prompt re-login since chat / research still work.
-                (false, "token lacks user scope (agent key?)".into())
-            }
-            Ok(r) => (
-                false,
-                format!("platform error (HTTP {})", r.status().as_u16()),
-            ),
-            Err(e) if e.is_timeout() => (false, "platform unreachable (timeout)".into()),
-            Err(_) => (false, "platform unreachable".into()),
-        };
-        checks.push(boot::BootCheck {
-            name: "Auth".into(),
-            result: auth_msg,
-            ok: auth_ok,
-            dots: 6,
-            delay_ms: 20,
-        });
-    } else {
-        checks.push(boot::BootCheck {
-            name: "Auth".into(),
-            result: "not logged in — run prism login".into(),
-            ok: false,
-            dots: 3,
-            delay_ms: 20,
-        });
-    }
-
-    // 3. Knowledge Graph
-    if !token.is_empty() {
-        let stats = client
-            .get(format!("{api}/knowledge/graph/stats"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| {
-                if r.status().is_success() {
-                    Some(r)
-                } else {
-                    None
-                }
-            });
-        let (kg_ok, kg_msg) = if let Some(resp) = stats {
-            let data: serde_json::Value = resp.json().await.unwrap_or_default();
-            let nodes = data.get("node_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            let edges = data.get("edge_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            if nodes > 0 {
-                (
-                    true,
-                    format!("{}K nodes, {}M edges", nodes / 1000, edges / 1_000_000),
-                )
-            } else {
-                (true, "connected".into())
-            }
-        } else {
-            (false, "unavailable".into())
-        };
-        checks.push(boot::BootCheck {
-            name: "Knowledge Graph".into(),
-            result: kg_msg,
-            ok: kg_ok,
-            dots: 12,
-            delay_ms: 25,
-        });
-    }
-
-    // 4. Models
-    if !token.is_empty() {
-        let project_id = creds.and_then(|c| c.project_id.as_deref()).unwrap_or("");
-        if !project_id.is_empty() {
-            let models = client
-                .get(format!("{api}/projects/{project_id}/llm/models"))
-                .header("Authorization", format!("Bearer {token}"))
-                .send()
-                .await
-                .ok()
-                .and_then(|r| {
-                    if r.status().is_success() {
-                        Some(r)
-                    } else {
-                        None
-                    }
-                });
-            let (m_ok, m_msg) = if let Some(resp) = models {
-                let data: serde_json::Value = resp.json().await.unwrap_or_default();
-                let count = if let Some(arr) = data.as_array() {
-                    arr.len()
-                } else {
-                    data.get("models")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0)
-                };
-                (true, format!("{count} hosted models"))
-            } else {
-                (false, "unavailable".into())
-            };
-            checks.push(boot::BootCheck {
-                name: "LLM Models".into(),
-                result: m_msg,
-                ok: m_ok,
-                dots: 10,
-                delay_ms: 20,
-            });
-        }
-    }
-
-    // 5. Compute
-    if !token.is_empty() {
-        let gpus = client
-            .get(format!("{api}/compute/gpus"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| {
-                if r.status().is_success() {
-                    Some(r)
-                } else {
-                    None
-                }
-            });
-        let (c_ok, c_msg) = if let Some(resp) = gpus {
-            let data: serde_json::Value = resp.json().await.unwrap_or_default();
-            let count = data.as_array().map(|a| a.len()).unwrap_or(0);
-            (true, format!("{count} GPU types available"))
-        } else {
-            (false, "unavailable".into())
-        };
-        checks.push(boot::BootCheck {
-            name: "Compute".into(),
-            result: c_msg,
-            ok: c_ok,
-            dots: 8,
-            delay_ms: 25,
-        });
-    }
-
-    // 6. Marketplace
-    if !token.is_empty() {
-        let mkt = client
-            .get(format!("{api}/marketplace/resources"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| {
-                if r.status().is_success() {
-                    Some(r)
-                } else {
-                    None
-                }
-            });
-        let (mk_ok, mk_msg) = if let Some(resp) = mkt {
-            let data: serde_json::Value = resp.json().await.unwrap_or_default();
-            let count = data.as_array().map(|a| a.len()).unwrap_or(0);
-            (true, format!("{count} resources"))
-        } else {
-            (false, "unavailable".into())
-        };
-        checks.push(boot::BootCheck {
-            name: "Marketplace".into(),
-            result: mk_msg,
-            ok: mk_ok,
-            dots: 6,
-            delay_ms: 30,
-        });
-    }
-
-    // 7. Local node
-    let node_ok = client
-        .get("http://127.0.0.1:7327/api/health")
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-    checks.push(boot::BootCheck {
-        name: "Local Node".into(),
-        result: if node_ok {
-            "online at :7327".into()
-        } else {
-            "offline — run prism node up".into()
-        },
-        ok: node_ok,
-        dots: 4,
-        delay_ms: 20,
-    });
-
-    // 8. Policy engine (always local, always OK)
-    checks.push(boot::BootCheck {
-        name: "Policy Engine".into(),
-        result: "OPA/Rego loaded".into(),
-        ok: true,
-        dots: 4,
-        delay_ms: 15,
-    });
-
-    checks
 }
 
 // ── prism report ───────────────────────────────────────────────────────
