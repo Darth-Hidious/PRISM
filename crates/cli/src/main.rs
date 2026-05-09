@@ -1427,7 +1427,19 @@ async fn main() -> Result<()> {
                 server_node_state.audit_db_path = Some(state_dir.join("audit.db"));
                 server_node_state.rbac_db_path = Some(state_dir.join("rbac.db"));
                 server_node_state.session_db_path = Some(state_dir.join("sessions.db"));
-                server_node_state.subscriptions = std::sync::Arc::new(std::sync::RwLock::new(
+                // Subscription store: persist when connected to platform,
+                // ephemeral (in-memory) in offline mode.
+                //
+                // Bug #20: pre-fix, EVERY `prism node up --offline` opened
+                // the same SQLite file at state_dir/subscriptions.db, so a
+                // dataset published in one test run showed up as a phantom
+                // entry in the next fresh run's `/api/mesh/subscriptions`.
+                // `--offline` now uses an in-memory SubscriptionManager —
+                // each offline run starts clean. Persistent state is only
+                // for runs that are part of an actual federated mesh.
+                let subscription_mgr = if offline {
+                    prism_mesh::subscription::SubscriptionManager::new()
+                } else {
                     prism_mesh::subscription::SubscriptionManager::open(
                         &state_dir.join("subscriptions.db"),
                     )
@@ -1436,8 +1448,10 @@ async fn main() -> Result<()> {
                             "  Warning: Failed to open subscription store: {e} (using in-memory state)"
                         );
                         prism_mesh::subscription::SubscriptionManager::new()
-                    }),
-                ));
+                    })
+                };
+                server_node_state.subscriptions =
+                    std::sync::Arc::new(std::sync::RwLock::new(subscription_mgr));
 
                 // Scan for tools
                 let tools_dir = paths.config_dir.join("tools");
