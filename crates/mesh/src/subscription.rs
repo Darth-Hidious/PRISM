@@ -131,6 +131,12 @@ impl SubscriptionManager {
     }
 
     /// Register a dataset as published by this node.
+    ///
+    /// Idempotent on `name`: re-publishing replaces the existing entry both
+    /// in memory and (if backed by SQLite) on disk. Without the in-memory
+    /// retain, the SQLite path would be correct (`INSERT OR REPLACE`) while
+    /// the Vec accumulated duplicates — `published()` would then return
+    /// stale copies that diverged from the DB.
     pub fn publish(&mut self, dataset: PublishedDataset) {
         if let Some(ref db) = self.db {
             let conn = db.lock().unwrap_or_else(|e| e.into_inner());
@@ -141,6 +147,8 @@ impl SubscriptionManager {
             )
             .ok();
         }
+        // In-memory dedupe — match the SQLite UNIQUE constraint on `name`.
+        self.published.retain(|d| d.name != dataset.name);
         self.published.push(dataset);
     }
 
@@ -158,6 +166,11 @@ impl SubscriptionManager {
     }
 
     /// Track a subscription to a remote dataset.
+    ///
+    /// Idempotent on `(dataset_name, publisher_node)`: re-subscribing
+    /// replaces the existing entry. Same fix as `publish` — the SQLite
+    /// `PRIMARY KEY (dataset_name, publisher_node)` would silently
+    /// drop dup-key rows while the in-memory Vec accumulated copies.
     pub fn subscribe(&mut self, sub: Subscription) {
         if let Some(ref db) = self.db {
             let conn = db.lock().unwrap_or_else(|e| e.into_inner());
@@ -171,6 +184,10 @@ impl SubscriptionManager {
             )
             .ok();
         }
+        // In-memory dedupe — match the SQLite composite PK.
+        self.subscriptions.retain(|s| {
+            !(s.dataset_name == sub.dataset_name && s.publisher_node == sub.publisher_node)
+        });
         self.subscriptions.push(sub);
     }
 
@@ -271,7 +288,14 @@ mod tests {
     }
 
     #[test]
-    fn publish_duplicate_names_both_retained() {
+    fn publish_duplicate_name_replaces_in_memory() {
+        // Publishing the same name twice should replace the in-memory
+        // entry, matching the SQLite `INSERT OR REPLACE` semantics on
+        // the UNIQUE `name` key. Previously the in-memory Vec was
+        // append-only, so the same call sequence would diverge between
+        // a fresh process (one entry in DB, two in memory) and a
+        // re-opened process (one entry in DB, one in memory after
+        // load). See Bug #43.
         let mut mgr = SubscriptionManager::new();
         mgr.publish(PublishedDataset {
             name: "alloy-db".into(),
@@ -283,7 +307,8 @@ mod tests {
             schema_version: "2.0".into(),
             subscribers: vec![],
         });
-        assert_eq!(mgr.published().len(), 2);
+        assert_eq!(mgr.published().len(), 1);
+        assert_eq!(mgr.published()[0].schema_version, "2.0");
         mgr.unpublish("alloy-db");
         assert!(mgr.published().is_empty());
     }
