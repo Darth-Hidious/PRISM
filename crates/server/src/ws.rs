@@ -224,7 +224,8 @@ mod tests {
 
     #[test]
     fn passes_audit_event_with_no_user() {
-        let event = r#"{"type":"AuditEntry","timestamp":"2026-05-09T00:00:00Z","action":"DataQuery"}"#;
+        let event =
+            r#"{"type":"AuditEntry","timestamp":"2026-05-09T00:00:00Z","action":"DataQuery"}"#;
         assert!(!audit_event_for_other_user(event, "alice"));
     }
 }
