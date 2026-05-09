@@ -1072,7 +1072,10 @@ async fn main() -> Result<()> {
                     "backbone": {
                         "python_worker": "app.backend",
                         "node_binary": "prism-node",
-                        "chat_surface": "forge",
+                        // User-facing surface is "prism"; the underlying chat
+                        // harness is forge_main but that's an internal detail
+                        // that doesn't belong in machine-readable output.
+                        "chat_surface": "prism",
                         "workflow_runtime": "rust",
                     }
                 }))?
