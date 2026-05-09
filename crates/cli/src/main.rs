@@ -1596,6 +1596,7 @@ async fn main() -> Result<()> {
                     platform_node_id: daemon_platform_node_id,
                     rbac_db_path: daemon_rbac_db_path,
                     org_id: daemon_org_id,
+                    offline,
                 };
 
                 // ── Start mesh networking (mDNS discovery + optional broadcast) ──

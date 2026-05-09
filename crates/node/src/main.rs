@@ -138,6 +138,7 @@ async fn main() -> Result<()> {
                 platform_node_id: None,
                 rbac_db_path: None,
                 org_id: None,
+                offline: false,
             };
 
             prism_node::daemon::run_daemon(&endpoints, &paths, options).await?;
