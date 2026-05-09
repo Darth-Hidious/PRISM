@@ -490,14 +490,23 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
 }
 
 fn open_browser(url: &str) -> Result<()> {
+    // Defense-in-depth: only http(s) URLs. See crates/cli/src/main.rs for
+    // the same restriction — protects against a compromised platform
+    // returning `--version`, `file:///`, or a `javascript:` payload that
+    // some browser opener would happily execute.
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err(anyhow::anyhow!("refusing to open non-http(s) URL: {url}"));
+    }
+
     let status = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).status()
+        std::process::Command::new("open").arg(trimmed).status()
     } else if cfg!(target_os = "windows") {
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+            .args(["/C", "start", "", trimmed])
             .status()
     } else {
-        std::process::Command::new("xdg-open").arg(url).status()
+        std::process::Command::new("xdg-open").arg(trimmed).status()
     }
     .context("failed to spawn browser opener")?;
 
