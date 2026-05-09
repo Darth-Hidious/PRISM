@@ -16,6 +16,7 @@
 
 pub mod federated_query;
 pub mod federation;
+pub mod federation_lookup;
 pub mod kafka;
 pub mod mdns;
 pub mod platform_discovery;
