@@ -161,6 +161,28 @@ async fn handle_nl_query(
         "NL query translated"
     );
 
+    // Same write protection as direct cypher mode. The LLM can produce
+    // destructive Cypher accidentally (a user asking "delete my old
+    // experiments" politely), or via prompt injection (an entity name
+    // in the corpus reads `MATCH (n) DETACH DELETE n` and the LLM
+    // echoes it). Bug #48 — NL mode bypassed the cypher-mode blocklist.
+    //
+    // Reject with a clear message; the user can switch to a write-aware
+    // endpoint if they actually want destructive behavior.
+    if let Some(found) = detect_blocked_cypher_keyword(&translation.cypher) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: format!(
+                    "Generated Cypher contains a write/admin keyword ({}); the query API is \
+                     read-only. Generated: {}",
+                    found.trim(),
+                    translation.cypher
+                ),
+            }),
+        ));
+    }
+
     // Execute the generated Cypher
     let results = store
         .query_cypher(&translation.cypher, None)
@@ -210,28 +232,7 @@ async fn handle_cypher_query(
         return Err(service_unavailable("Neo4j not configured."));
     };
 
-    // Substring-based write protection. Imperfect — the only correct
-    // long-term fix is connecting to Neo4j as a READ-ONLY role — but
-    // closes the obvious bypasses. See Bug #47.
-    //
-    // What's caught: any literal occurrence of DELETE / CREATE /
-    // MERGE / SET / REMOVE / DROP / LOAD / USE / CALL anywhere in
-    // the query, after uppercase. Some of these (LOAD, USE, CALL)
-    // weren't on the original blocklist, so a peer or user could
-    // exfiltrate via `LOAD CSV`, switch databases via `USE`, or
-    // run arbitrary procedures via `CALL apoc.*`. CALL is a hard
-    // deny because *any* APOC procedure could be a write.
-    //
-    // What's NOT caught: APOC string concatenation tricks like
-    // `CALL apoc.cypher.run('DEL' + 'ETE n')`. The outer CALL is
-    // already blocked, so the trick is moot today. If a future
-    // change wants to allow specific read-only procedures it
-    // must replace this whole block with a real allowlist.
-    let upper = body.query.to_uppercase();
-    const BLOCKED_KEYWORDS: &[&str] = &[
-        "DELETE", "CREATE", "MERGE", "SET ", "REMOVE ", "DROP ", "LOAD ", "USE ", "CALL ",
-    ];
-    if let Some(found) = BLOCKED_KEYWORDS.iter().find(|kw| upper.contains(*kw)) {
+    if let Some(found) = detect_blocked_cypher_keyword(&body.query) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -472,6 +473,26 @@ fn service_unavailable(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorResponse { error: msg.into() }),
     )
+}
+
+/// Substring-based write/admin keyword detection. Imperfect — the
+/// only correct long-term fix is connecting to Neo4j as a READ-ONLY
+/// role — but closes the obvious bypasses for both direct cypher
+/// queries and LLM-generated NL→cypher.
+///
+/// Returns the matched keyword (for the error message) when the
+/// query contains any forbidden verb. Tested via cypher-mode unit
+/// tests; reused by NL mode so the LLM can't accidentally — or via
+/// prompt injection — emit destructive Cypher and have it run.
+fn detect_blocked_cypher_keyword(query: &str) -> Option<&'static str> {
+    let upper = query.to_uppercase();
+    const BLOCKED_KEYWORDS: &[&str] = &[
+        "DELETE", "CREATE", "MERGE", "SET ", "REMOVE ", "DROP ", "LOAD ", "USE ", "CALL ",
+    ];
+    BLOCKED_KEYWORDS
+        .iter()
+        .find(|kw| upper.contains(*kw))
+        .copied()
 }
 
 fn internal_error(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
