@@ -191,11 +191,25 @@ pub async fn run_sync_handler(
                     dataset = %dataset_name,
                     "remote node subscribed to our dataset"
                 );
-                // Track the subscriber in our published datasets
+                // Track the subscriber in our published datasets — but cap
+                // the list. Without this a peer could fan in N fake
+                // subscriber_ids per dataset and grow the per-publication
+                // Vec<Uuid> indefinitely. Same DoS class as Bug #57 — the
+                // peer-list cap protects the receiving side, this protects
+                // the publisher side.
+                const MAX_SUBSCRIBERS_PER_DATASET: usize = 10_000;
                 let mut subs = subscriptions.write().unwrap_or_else(|e| e.into_inner());
                 for d in subs.published_mut() {
                     if d.name == dataset_name && !d.subscribers.contains(&subscriber_id) {
-                        d.subscribers.push(subscriber_id);
+                        if d.subscribers.len() >= MAX_SUBSCRIBERS_PER_DATASET {
+                            warn!(
+                                dataset = %dataset_name,
+                                count = d.subscribers.len(),
+                                "rejecting DataSubscribe: subscriber list at cap"
+                            );
+                        } else {
+                            d.subscribers.push(subscriber_id);
+                        }
                     }
                 }
             }
