@@ -5783,14 +5783,27 @@ async fn refresh_access_token(
 // Old Ink/TypeScript TUI launcher removed — native Ratatui TUI is in crates/cli/src/tui/
 
 fn open_browser(url: &str) -> Result<()> {
+    // Defense-in-depth: only http(s) URLs.
+    //
+    // The two callers pass `verification_uri` from the OAuth device-flow
+    // response and `checkout_url` from the billing topup response. Both
+    // come from the MARC27 platform and should always be https. Validating
+    // here means a compromised or buggy platform can't slip in
+    // `--version`, `file:///etc/passwd`, or a `javascript:` payload that
+    // some browser opener would happily execute.
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        bail!("refusing to open non-http(s) URL: {url}");
+    }
+
     let status = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).status()
+        std::process::Command::new("open").arg(trimmed).status()
     } else if cfg!(target_os = "windows") {
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+            .args(["/C", "start", "", trimmed])
             .status()
     } else {
-        std::process::Command::new("xdg-open").arg(url).status()
+        std::process::Command::new("xdg-open").arg(trimmed).status()
     }
     .context("failed to spawn browser opener")?;
 
