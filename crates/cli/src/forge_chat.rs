@@ -114,17 +114,28 @@ pub async fn run(
     // The proxy lives for the lifetime of this fn (its handle is held until
     // forge UI exits), exposing an OpenAI surface on a free localhost port
     // that translates to MARC27's custom JSON+SSE protocol upstream.
-    let _proxy = if let Some(creds) = credentials {
+    // Result of starting the MARC27 ↔ OpenAI proxy. Drives the boot
+    // status line below + decides whether to clear stale forge creds.
+    enum ProxyState {
+        Ok(platform_bridge::ProxyHandle),
+        NoCreds,
+        NoProject,
+        TokenRejected,
+        StartFailed(String),
+    }
+
+    let proxy_state = if let Some(creds) = credentials {
         let project_id = creds.project_id.as_deref().unwrap_or_default();
         if project_id.is_empty() {
-            eprintln!(
-                "\x1b[33m[prism]\x1b[0m credentials have no project_id — run `prism login` and pick a project"
-            );
-            None
+            ProxyState::NoProject
+        } else if !token_works(&creds.platform_url, &creds.access_token).await {
+            // Token validation BEFORE starting the proxy. Without this,
+            // a rejected/expired token still passes platform_bridge::start
+            // (which only binds a port) and the boot screen lies "Chat
+            // OK" while every chat request 401s and forge infinite-retries.
+            // This is the actual fix for Bug #23.
+            ProxyState::TokenRejected
         } else {
-            // Load the user's chat target from ~/.prism/config.toml so
-            // a persisted `prism use ...` choice takes effect on this
-            // launch. Default = MARC27 cloud with no model override.
             let initial_chat_target = crate::chat_config::load().unwrap_or_default().chat;
             match platform_bridge::start(
                 &creds.platform_url,
@@ -137,19 +148,6 @@ pub async fn run(
             {
                 Ok(handle) => {
                     let proxy_url = handle.url.clone();
-                    // Point forge at the local proxy. Two channels:
-                    //
-                    // 1. Env vars (OPENAI_URL + OPENAI_API_KEY) — read
-                    //    by forge's openai_compatible provider when the
-                    //    credentials file lacks an entry.
-                    // 2. ~/.forge/.credentials.json — forge's persistent
-                    //    config; gets read first, env vars are the
-                    //    fallback. We write our entry here so a stale
-                    //    port from a previous PRISM run doesn't
-                    //    override the current process. Yesterday's
-                    //    "drop the credentials write" attempt left
-                    //    stale entries pointing at dead ports — that
-                    //    was a regression, reverted.
                     unsafe {
                         std::env::set_var("OPENAI_URL", &proxy_url);
                         std::env::set_var("OPENAI_API_KEY", &creds.access_token);
@@ -159,16 +157,65 @@ pub async fn run(
                     {
                         eprintln!("\x1b[33m[prism]\x1b[0m credential upsert failed: {e:#}");
                     }
-                    Some(handle)
+                    ProxyState::Ok(handle)
                 }
-                Err(e) => {
-                    eprintln!("\x1b[31m[prism]\x1b[0m MARC27 proxy failed to start: {e:#}");
-                    None
-                }
+                Err(e) => ProxyState::StartFailed(short_error(&e)),
             }
         }
     } else {
-        None
+        ProxyState::NoCreds
+    };
+
+    // When the proxy doesn't start, scrub any stale openai_compatible
+    // entry from `~/.forge/.credentials.json` AND unset OPENAI_URL/
+    // OPENAI_API_KEY env vars. Without this, forge picks up a dead
+    // localhost port from a previous successful PRISM run and
+    // infinite-retries with "Connection refused" — Bug #23.
+    let proxy_ok = matches!(proxy_state, ProxyState::Ok(_));
+    if !proxy_ok {
+        if let Err(e) = clear_openai_compatible_credential() {
+            eprintln!("\x1b[33m[prism]\x1b[0m couldn't clear stale forge credentials: {e:#}");
+        }
+        unsafe {
+            std::env::remove_var("OPENAI_URL");
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+    }
+
+    // Truthful boot status lines. Two lines, parallel structure —
+    // see Bug #23 in docs/SHIPPED.md for why these moved out of
+    // start_tool_router(). The Chat line tells the user where their
+    // first message will (or won't) actually go BEFORE they type it.
+    let chat_target = crate::chat_config::load().unwrap_or_default().chat;
+    match &proxy_state {
+        ProxyState::Ok(_) => {
+            boot::status_line("Chat", true, &chat_target.human_full());
+            boot::status_line("Tools", true, "MARC27 cloud");
+        }
+        ProxyState::NoCreds => {
+            boot::status_line("Chat", false, "not logged in — run `prism login`");
+            boot::status_line("Tools", false, "platform unavailable until login");
+        }
+        ProxyState::NoProject => {
+            boot::status_line(
+                "Chat",
+                false,
+                "no project selected — run `prism login` and pick a project",
+            );
+            boot::status_line("Tools", false, "platform unavailable until project picked");
+        }
+        ProxyState::TokenRejected => {
+            boot::status_line("Chat", false, "platform token rejected — run `prism login`");
+            boot::status_line("Tools", false, "platform unavailable until login");
+        }
+        ProxyState::StartFailed(reason) => {
+            boot::status_line("Chat", false, &format!("proxy start failed — {reason}"));
+            boot::status_line("Tools", false, "platform unavailable");
+        }
+    }
+    let _proxy = match proxy_state {
+        ProxyState::Ok(h) => Some(h),
+        _ => None,
     };
 
     let mut cli = ForgeCli::parse_from(["prism-chat"]);
@@ -244,27 +291,13 @@ async fn start_tool_router() -> Result<Arc<ToolRouter>> {
     router.start().await?;
     boot::status_line("Semantic retrieval", true, "online");
 
-    // Surface the user's chat target + tools state as their own status
-    // lines so the boot screen tells the user where chat will go BEFORE
-    // they type the first message. Previously the chat target was an
-    // invisible config; users who'd run `prism use marc27 --model gpt-5.5`
-    // had no way to see it'd taken effect until they sent a turn and
-    // looked at the response. Two lines, parallel structure:
-    //
-    //   ├── Chat ........ [OK] (MARC27 cloud (gpt-5.5))
-    //   ├── Tools ....... [OK] (MARC27 cloud)
-    //
-    // When the chat target is local or a direct provider, the line
-    // makes that explicit so the user knows their key/URL is in play.
-    let chat_target = crate::chat_config::load().unwrap_or_default().chat;
-    boot::status_line("Chat", true, &chat_target.human_full());
-    // Tools: always MARC27-fronted regardless of chat target. We
-    // could query knowledge_stats here for tool count, but that's an
-    // extra round-trip on every boot — and the count comes from the
-    // bridge's Stage 2.1 retriever which logs per-turn anyway. Keep
-    // the boot line cheap; the per-turn `[platform_bridge] semantic
-    // top-K: N → K tools` line carries the live number.
-    boot::status_line("Tools", true, "MARC27 cloud");
+    // Note: the Chat + Tools status lines are NOT printed here. They
+    // depend on whether the MARC27 proxy actually started successfully,
+    // which happens later in `run()` after credentials are checked.
+    // Printing "Chat OK" here regardless of proxy state was Bug #23 —
+    // the boot screen lied to the user when auth was rejected, and the
+    // TUI then infinite-retried a dead localhost port from a stale
+    // forge credentials entry. Caller (run) prints those lines.
 
     Ok(router)
 }
@@ -307,6 +340,61 @@ fn short_path(p: &std::path::Path) -> String {
 /// The fix is: write OUR entry (with the live port), and remove
 /// stub entries with empty keys. Real user-added Anthropic entries
 /// (with non-empty keys) stay untouched.
+/// Quick token-validity check against the platform.
+///
+/// Hits `GET {platform_url}/api/v1/users/me` with a short timeout.
+/// Returns true iff status is 2xx — anything else (401, 5xx, network
+/// error, timeout) means we shouldn't trust the token. Used at boot
+/// to decide whether to start the chat proxy or surface
+/// "platform token rejected — run `prism login`" instead of letting
+/// forge infinite-retry against a localhost port whose upstream will
+/// 401 every request (Bug #23).
+async fn token_works(platform_url: &str, access_token: &str) -> bool {
+    if access_token.trim().is_empty() {
+        return false;
+    }
+    let url = format!("{}/api/v1/users/me", platform_url.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client.get(&url).bearer_auth(access_token).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Remove the `openai_compatible` entry from `~/.forge/.credentials.json`.
+///
+/// Used when the MARC27 proxy fails to start (no credentials, expired
+/// token, etc.). Without this, a previous successful run leaves an
+/// entry pointing at a now-dead localhost port; forge keeps trying it
+/// and infinite-retries with `Connection refused` errors flooding the
+/// chat panel — Bug #23.
+///
+/// Idempotent: missing file or missing entry are not errors.
+fn clear_openai_compatible_credential() -> Result<()> {
+    let home = std::env::var_os("HOME").context("HOME not set")?;
+    let path = std::path::PathBuf::from(home).join(".forge/.credentials.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut entries: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
+    let before = entries.len();
+    entries.retain(|e| e.get("id").and_then(|v| v.as_str()) != Some("openai_compatible"));
+    if entries.len() == before {
+        return Ok(()); // nothing to do
+    }
+    let out = serde_json::to_string_pretty(&entries).context("serialising credentials")?;
+    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 fn upsert_openai_compatible_credential(proxy_url: &str, access_token: &str) -> Result<()> {
     let home = std::env::var_os("HOME").context("HOME not set")?;
     let forge_dir = std::path::PathBuf::from(home).join(".forge");
