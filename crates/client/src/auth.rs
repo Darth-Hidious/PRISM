@@ -167,9 +167,42 @@ impl DeviceFlowAuth {
             .json(&serde_json::json!({ "refresh_token": refresh_token }))
             .send()
             .await
-            .context("failed to refresh token")?
-            .error_for_status()
-            .context("token refresh returned error status")?;
+            .context("failed to refresh token")?;
+
+        // Capture the response body whether the status is success OR error.
+        // `error_for_status()` would drop the body, leaving the caller with
+        // an opaque "returned error status" message — useless for the user
+        // (and the agent) trying to figure out why their refresh failed.
+        // Now: if non-2xx, surface the platform's actual error JSON or text.
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            // Try to extract a JSON `error` / `message` field for clean
+            // display; fall back to raw body when the platform isn't
+            // returning structured errors.
+            let detail: String = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .or_else(|| v.get("message"))
+                        .and_then(|f| f.as_str().map(str::to_string))
+                })
+                .unwrap_or_else(|| {
+                    let trimmed = body.trim();
+                    if trimmed.is_empty() {
+                        "(no body)".to_string()
+                    } else {
+                        // Truncate so a giant HTML error page doesn't blow up the log
+                        let max = 400;
+                        if trimmed.len() > max {
+                            format!("{}…", &trimmed[..max])
+                        } else {
+                            trimmed.to_string()
+                        }
+                    }
+                });
+            anyhow::bail!("token refresh failed (HTTP {status}): {detail}");
+        }
 
         resp.json::<TokenResponse>()
             .await
