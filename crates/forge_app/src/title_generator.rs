@@ -85,9 +85,100 @@ impl<S: AS> TitleGenerator<S> {
         match serde_json::from_str::<TitleResponse>(&content) {
             Ok(response) => Ok(Some(response.title)),
             Err(_) => {
-                // Fallback: Some providers don't support structured output, treat as plain text
-                Ok(Some(content.trim().to_string()))
+                // Fallback: some providers' structured-output mode returns
+                // malformed JSON like `{"titleSimple Greeting Test"}` (missing
+                // `":"` between key and value, or stray quotes). Saving that
+                // verbatim leaks JSON syntax into the conversation picker —
+                // titles show up as `{"titleSimple Greeting Test"}` instead
+                // of `Simple Greeting Test`. See PRISM Bug #30.
+                //
+                // Strip JSON-shape leftovers from the raw content so the
+                // human-readable value stays. Conservative: only touches
+                // characters that are clearly JSON syntax + the literal
+                // "title" key; word content is preserved.
+                Ok(Some(salvage_title_from_malformed(&content)))
             }
         }
+    }
+}
+
+/// Best-effort extraction of a human-readable title from a content string
+/// that wasn't valid JSON.
+///
+/// Handles the observed real-world failure shape — the upstream emits
+/// `{"title<value>"}` (no `:` separator, value not quoted). Strips the
+/// JSON-object braces, the `"title"` key, residual quotes, and
+/// surrounding whitespace.
+fn salvage_title_from_malformed(content: &str) -> String {
+    let s = content.trim();
+    // 1. Drop leading "{ and trailing }" if present.
+    let s = s.trim_start_matches('{').trim_end_matches('}').trim();
+    // 2. Drop a single leading or trailing quote (the JSON wrapper).
+    let s = s.trim_start_matches('"').trim_end_matches('"').trim();
+    // 3. Drop the literal `"title"` key + any `:` / `"` / space that follow.
+    //    Variants we've seen: `"title":"X"`, `"titleX"`, `title:"X"`, `titleX`.
+    let s = s.trim_start_matches("\"title\"");
+    let s = s.trim_start_matches("title");
+    let s = s
+        .trim_start_matches(['"', ':', ' ', '\t'])
+        .trim_end_matches(['"', ' ', '\t']);
+    s.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn salvage_handles_well_formed_json_value_substring() {
+        // Already-clean title text passes through unchanged.
+        assert_eq!(salvage_title_from_malformed("Hello"), "Hello");
+        assert_eq!(salvage_title_from_malformed("  Hello  "), "Hello");
+    }
+
+    #[test]
+    fn salvage_strips_full_quoted_string() {
+        assert_eq!(
+            salvage_title_from_malformed("\"Hello World\""),
+            "Hello World"
+        );
+    }
+
+    #[test]
+    fn salvage_handles_real_malformed_output_from_marc27_upstream() {
+        // The actual shape we observed via PRISM_BRIDGE_DUMP: the model's
+        // JSON-mode output came back missing the `":"` between key and
+        // value, which serde_json correctly rejects.
+        // Bug #30 reproduction.
+        assert_eq!(
+            salvage_title_from_malformed("{\"titleSpecific Sentence\"}"),
+            "Specific Sentence"
+        );
+        assert_eq!(
+            salvage_title_from_malformed("{\"titleSimple Greeting Test\"}"),
+            "Simple Greeting Test"
+        );
+    }
+
+    #[test]
+    fn salvage_handles_well_quoted_but_unparseable() {
+        // `"title":"Foo"` is valid JSON-fragment-ish but missing braces;
+        // serde would reject it too. Should still produce a clean title.
+        assert_eq!(salvage_title_from_malformed("\"title\":\"Foo\""), "Foo");
+    }
+
+    #[test]
+    fn salvage_handles_object_with_proper_separator_but_missing_value_quotes() {
+        assert_eq!(
+            salvage_title_from_malformed("{\"title\":Bar Baz}"),
+            "Bar Baz"
+        );
+    }
+
+    #[test]
+    fn salvage_empty_input_returns_empty() {
+        assert_eq!(salvage_title_from_malformed(""), "");
+        assert_eq!(salvage_title_from_malformed("   "), "");
+        assert_eq!(salvage_title_from_malformed("{}"), "");
     }
 }
