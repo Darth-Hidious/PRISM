@@ -1167,12 +1167,24 @@ mod tests {
         let block = build_tool_prompt_block(&[]);
         let required_markers: &[(&str, &str)] = &[
             ("DO NOT GIVE UP", "recovery-rules header from #109"),
-            ("NEVER respond with empty content", "anti-early-termination rule from #109"),
-            ("Tool-composition patterns", "composition cookbook header from #109"),
-            ("Long-horizon discipline", "long-horizon section header from #111"),
+            (
+                "NEVER respond with empty content",
+                "anti-early-termination rule from #109",
+            ),
+            (
+                "Tool-composition patterns",
+                "composition cookbook header from #109",
+            ),
+            (
+                "Long-horizon discipline",
+                "long-horizon section header from #111",
+            ),
             ("Plan first, in writing", "plan-emission rule from #111"),
             ("FINAL ANSWER:", "deliberate-completion marker from #111"),
-            ("research", "research() tool referenced in long-horizon flow"),
+            (
+                "research",
+                "research() tool referenced in long-horizon flow",
+            ),
         ];
         for (marker, why) in required_markers {
             assert!(
