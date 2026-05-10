@@ -26,6 +26,11 @@ def build_full_registry(
     from app.tools.capabilities import create_capabilities_tools
     from app.tools.dataset import create_dataset_tool
     from app.tools.platform_status import create_platform_status_tools
+    from app.tools.agent_capabilities import create_agent_capabilities_tool
+    from app.tools.knowledge_write import create_knowledge_write_tool
+    from app.tools.platform_jobs import create_platform_jobs_tools
+    from app.tools.platform_workflows import create_platform_workflows_tools
+    from app.tools.mcp_services import create_mcp_services_tools
 
     registry = ToolRegistry()
     create_system_tools(registry)
@@ -41,6 +46,20 @@ def build_full_registry(
     # GAP-HIGH endpoints from the v2.7.2 endpoint-coverage audit. All
     # three are read-only — no approval gate.
     create_platform_status_tools(registry)
+    # Self-discovery: GET /agent/capabilities. Read-only.
+    create_agent_capabilities_tool(registry)
+    # Knowledge graph WRITE side (embed/seed/ingest/research-web-search).
+    # Closes the read/write asymmetry. Approval-gated as a single tool.
+    create_knowledge_write_tool(registry)
+    # Platform jobs — generic submit/SSE. Read+cancel in `platform_jobs`,
+    # money-spending submit isolated in `platform_jobs_submit`.
+    create_platform_jobs_tools(registry)
+    # Platform workflows runner. Read+cancel in `platform_workflows`,
+    # money-spending start + spec-register in `platform_workflows_run`.
+    create_platform_workflows_tools(registry)
+    # Platform-hosted MCP service discovery + invocation. Read in
+    # `mcp_services`, proxy/scale state-changes in `mcp_services_invoke`.
+    create_mcp_services_tools(registry)
     # Unified dataset tool — replaces VALIDATE_SKILL / REVIEW_SKILL /
     # VISUALIZE_SKILL Tool registrations. See app/tools/dataset.py.
     create_dataset_tool(registry)
