@@ -25,6 +25,7 @@ def build_full_registry(
     from app.tools.bash import create_bash_tools
     from app.tools.capabilities import create_capabilities_tools
     from app.tools.dataset import create_dataset_tool
+    from app.tools.platform_status import create_platform_status_tools
 
     registry = ToolRegistry()
     create_system_tools(registry)
@@ -36,6 +37,10 @@ def build_full_registry(
     create_code_tools(registry)
     create_bash_tools(registry)
     create_capabilities_tools(registry)
+    # Platform-status tools (policy/usage/billing reads). Closes three
+    # GAP-HIGH endpoints from the v2.7.2 endpoint-coverage audit. All
+    # three are read-only — no approval gate.
+    create_platform_status_tools(registry)
     # Unified dataset tool — replaces VALIDATE_SKILL / REVIEW_SKILL /
     # VISUALIZE_SKILL Tool registrations. See app/tools/dataset.py.
     create_dataset_tool(registry)
