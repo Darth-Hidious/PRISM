@@ -10,8 +10,8 @@ use crate::apply_tunable_parameters::ApplyTunableParameters;
 use crate::changed_files::ChangedFiles;
 use crate::dto::ToolsOverview;
 use crate::hooks::{
-    CompactionHandler, DoomLoopDetector, PendingTodosHandler, TitleGenerationHandler,
-    TracingHandler,
+    CompactionHandler, DoomLoopDetector, PendingTodosHandler, PreflightCompactionHandler,
+    TitleGenerationHandler, TracingHandler,
 };
 use crate::init_conversation_metrics::InitConversationMetrics;
 use crate::orch::Orchestrator;
@@ -164,7 +164,19 @@ impl<S: Services + EnvironmentInfra<Config = forge_config::ForgeConfig>> ForgeAp
 
         let hook = Hook::default()
             .on_start(tracing_handler.clone().and(title_handler))
-            .on_request(tracing_handler.clone().and(DoomLoopDetector::default()))
+            .on_request(
+                tracing_handler
+                    .clone()
+                    .and(DoomLoopDetector::default())
+                    // Pre-flight compaction: shrink the context BEFORE we
+                    // send the next turn, so we don't 413 the LLM. Mirrors
+                    // CompactionHandler on the on_response side, which still
+                    // runs as the post-turn safety net.
+                    .and(PreflightCompactionHandler::new(
+                        agent.clone(),
+                        environment.clone(),
+                    )),
+            )
             .on_response(
                 tracing_handler
                     .clone()
