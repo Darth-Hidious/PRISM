@@ -12,7 +12,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::NodeState;
 use crate::handlers;
-use crate::middleware::{auth_layer, require_permission, resolve_role_layer};
+use crate::middleware::{auth_layer, federation_layer, require_permission, resolve_role_layer};
 use crate::ws;
 use prism_core::rbac::Permission;
 
@@ -59,7 +59,12 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
         );
 
     // ── Auth layer stack (applied to all non-public API routes) ─────
-    // Order: auth_layer extracts token → resolve_role_layer looks up RBAC DB
+    // Order: federation_layer (verifies cross-org peer envelope if
+    // present) → auth_layer (user-session token) → resolve_role_layer
+    // (RBAC DB lookup). Federation runs first so a peer call presents
+    // its own identity before user-session machinery looks for a
+    // session token that won't be there.
+    let federation_stack = middleware::from_fn(federation_layer);
     let auth_stack = middleware::from_fn_with_state(state.clone(), auth_layer);
     let role_stack = middleware::from_fn_with_state(state.clone(), resolve_role_layer);
 
@@ -128,6 +133,10 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
         Router::new().route("/api/sessions", delete(handlers::sessions::destroy_session));
 
     // ── Authenticated API (all permission-gated routes) ─────────────
+    // Layer order is bottom-up at request time: federation_stack runs
+    // first (sees the X-PRISM-Federation header if present and
+    // verifies it), then auth_stack (extracts user-session token),
+    // then role_stack (RBAC lookup).
     let authenticated_api = Router::new()
         .merge(read_routes)
         .merge(query_routes)
@@ -139,7 +148,8 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
         .merge(session_routes)
         .layer(api_rate)
         .layer(role_stack)
-        .layer(auth_stack);
+        .layer(auth_stack)
+        .layer(federation_stack);
 
     // ── WebSocket (auth via query param — token required) ───────────
     let ws_route = Router::new().route("/ws", get(ws::ws_upgrade));
