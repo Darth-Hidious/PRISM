@@ -891,6 +891,14 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         matweb.com, hightempmetals.com, …) are paywalled, robots-blocked, or \
         gated. The `web` tool WILL return 403 / 404 / robots.txt on them. \
         Do not chain guesses at vendor URLs — that loop never converges.\n\
+        - **Search engines + government repos block the `web` tool's User-Agent.** \
+        Do NOT call `web` GET on `google.com/search`, `bing.com/search`, \
+        `duckduckgo.com`, `osti.gov/servlets/*`, `osti.gov/biblio/*` — every one \
+        returns robots.txt or 403. Observed cost in real runs: ~15 wasted tool \
+        calls per question. Use `prior_art_search` (Semantic Scholar / arXiv / \
+        OpenAlex / PubMed) or `research` instead. The CrossRef API \
+        (`api.crossref.org/works`) IS accessible and is the right place for \
+        DOI-based citation lookups.\n\
         - For ANY question of the form \"compare property X of alloys A, B, C\" \
         or \"what is property Y of material Z\", your FIRST tool call should be \
         `materials_search` or `prior_art_search` — never a `web` GET against a \
