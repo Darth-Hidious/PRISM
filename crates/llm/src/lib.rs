@@ -1149,6 +1149,41 @@ mod tests {
         }
     }
 
+    /// Pin the long-horizon orchestration patterns shipped in PRs #109 and #111.
+    ///
+    /// These markers exist because the BimoTech / Fraunhofer end-to-end test
+    /// surfaced two real failure modes: (1) the LLM gave up after one tool
+    /// error, and (2) the LLM wrapped up after 2-3 tool calls on a question
+    /// that needed 8-30. The fixes are SYSTEM PROMPT TEXT — they have no
+    /// other code path. If a future refactor silently drops these strings,
+    /// the regression isn't visible until a customer hits it. This test
+    /// catches the silent-drop case.
+    ///
+    /// Backed by the literature: arxiv 2604.11978 (Long-Horizon Mirage),
+    /// arxiv 2603.29231 (Beyond pass@1), arxiv 2512.24601 (RLM `FINAL()`),
+    /// arxiv 2605.02572 (empirical horizon-length study).
+    #[test]
+    fn long_horizon_orchestration_markers_present() {
+        let block = build_tool_prompt_block(&[]);
+        let required_markers: &[(&str, &str)] = &[
+            ("DO NOT GIVE UP", "recovery-rules header from #109"),
+            ("NEVER respond with empty content", "anti-early-termination rule from #109"),
+            ("Tool-composition patterns", "composition cookbook header from #109"),
+            ("Long-horizon discipline", "long-horizon section header from #111"),
+            ("Plan first, in writing", "plan-emission rule from #111"),
+            ("FINAL ANSWER:", "deliberate-completion marker from #111"),
+            ("research", "research() tool referenced in long-horizon flow"),
+        ];
+        for (marker, why) in required_markers {
+            assert!(
+                block.contains(marker),
+                "long-horizon marker `{marker}` missing from prompt block ({why}). \
+                 If you intentionally removed it, update this test. If not, \
+                 you've silently regressed PR #109 or #111."
+            );
+        }
+    }
+
     #[test]
     fn quick_reference_does_not_mention_renamed_tools() {
         // Belt-and-braces: explicit deny-list of names we've previously
