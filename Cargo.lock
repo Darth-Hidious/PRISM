@@ -3044,6 +3044,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -7666,7 +7667,9 @@ version = "2.7.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
+ "ed25519-dalek",
  "mime_guess",
  "prism-client",
  "prism-core",
