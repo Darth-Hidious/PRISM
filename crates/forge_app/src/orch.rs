@@ -279,6 +279,16 @@ impl<S: AgentService + EnvironmentInfra<Config = forge_config::ForgeConfig>> Orc
                 .handle(&request_event, &mut self.conversation)
                 .await?;
 
+            // Re-read context from the conversation in case a Request hook
+            // mutated it (e.g. PreflightCompactionHandler). The local
+            // `context` snapshot we took at the top of the loop is stale
+            // after compaction; if we kept using it we'd send the
+            // pre-compaction (oversized) context and defeat the point of
+            // running compaction pre-flight.
+            if let Some(updated) = self.conversation.context.clone() {
+                context = updated;
+            }
+
             let message = crate::retry::retry_with_config(
                 &self.config.clone().retry.unwrap_or_default(),
                 || {
