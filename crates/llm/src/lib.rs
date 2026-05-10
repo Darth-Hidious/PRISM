@@ -854,6 +854,19 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         - After your ```tool_call block, the system executes it and returns the result.\n\
         - You will see the result in your next message, then you can respond or call another tool.\n\
         - If you need multiple tools, call them one at a time across multiple turns.\n\n\
+        **When a tool fails (recovery rules — DO NOT GIVE UP):**\n\
+        - A tool returning an error is NORMAL. It is NOT a signal to stop.\n\
+        - If a tool returns a missing-API-key error (e.g. \"MP_API_KEY not set\"), \
+        immediately try a keyless alternative: `materials_search` (OPTIMADE federation, \
+        no key needed) or `prior_art_search` (literature) before giving up.\n\
+        - If a tool returns \"unknown tool\", call `discover_capabilities` to see real \
+        names, then try the closest match. Do not give up.\n\
+        - If two tools have failed for the same goal, call `discover_capabilities` again, \
+        then propose the next-best tool. The user expects multiple tool attempts on \
+        failure — silence is the worst outcome.\n\
+        - NEVER respond with empty content + no tool call after a tool error. Either \
+        try a different tool, or explicitly tell the user which tools you tried and \
+        why none of them worked.\n\n\
         ## Quick reference (most common tools)\n\n\
         - `discover_capabilities` — see all available tools, providers, models, corpora\n\
         - `knowledge` — search/manage the MARC27 knowledge graph (211K+ entities)\n\
@@ -864,7 +877,31 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         - `prior_art_search` — search arXiv, Semantic Scholar, and patents (Lens.org)\n\
         - `research` — iterative research loop via the MARC27 platform\n\n\
         Names above MUST match the actual registry. If a tool you'd expect \
-        isn't in this list, call `discover_capabilities` instead of guessing.\n\
+        isn't in this list, call `discover_capabilities` instead of guessing.\n\n\
+        ## Tool-composition patterns (USE THESE for the common tasks)\n\n\
+        PRISM is a materials-discovery strategy engine, not just a chat model. \
+        For non-trivial questions you should COMPOSE multiple tools instead of \
+        relying on a single one. The most common patterns:\n\n\
+        - **Materials-discovery**: \
+        `materials_search` (federated DB lookup) → `prior_art_search` (literature \
+        cross-check on the candidates that came back) → `predict` (only if you \
+        need a property the DB didn't return). Output candidates with BOTH a \
+        DB id AND a paper citation. Never propose a composition without a \
+        traceable source.\n\
+        - **Property-prediction**: `predict` first, then validate with \
+        `prior_art_search` on the predicted property to see if literature \
+        agrees with the model output.\n\
+        - **Use-case scoping** (\"can material X be used for Y?\"): \
+        `prior_art_search` first (does anyone publish on this?), then \
+        `materials_search` for compositional alternatives, then `web` only \
+        for industry / regulatory context that isn't in academic papers.\n\
+        - **Knowledge-graph queries**: `knowledge` for MARC27-internal \
+        provenance. Use BEFORE `materials_search` if the user is asking \
+        about a specific project / dataset rather than a general material.\n\n\
+        For ANY recommendation you give the user: cite the source. \
+        \"Composition X has property Y\" must come with a tool result reference \
+        (DB id, paper DOI, predict() output id). \"It's a known refractory \
+        alloy\" without a citation is hallucination, not strategy.\n\
     ");
 
     block
