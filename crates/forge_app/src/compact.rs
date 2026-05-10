@@ -45,11 +45,31 @@ impl Compactor {
         let eviction = CompactionStrategy::evict(self.compact.eviction_window);
         let retention = CompactionStrategy::retain(self.compact.retention_window);
 
+        // `to_fixed` on a CompactionStrategy returns "preserve last N
+        // messages" — so `max(a, b)` keeps MORE messages, `min(a, b)`
+        // keeps fewer.
+        //
+        // The auto-trigger path (max=false, called from
+        // `hooks/compaction.rs`) used `eviction.min(retention)`. With
+        // the default `retention_window = 0` and any non-trivial
+        // `eviction_window`, `min(0, evict_at_20%) = 0` meant a single
+        // trigger evicted EVERYTHING rather than the configured 20%.
+        // The `dto/openai/responses.jsonl` snapshots include real
+        // `context_length_exceeded` errors caused by this over-eviction
+        // collapsing the context to nothing. The `Compact` config docs
+        // explicitly say "the more conservative limit (fewer messages
+        // to compact) takes precedence" — i.e. `max`. Aligning code
+        // with docs.
+        //
+        // The `max=true` branch (force-compaction via app.rs) keeps
+        // its existing pure-retention semantic for now — it's the
+        // explicit "compact now, aggressively" call site and only
+        // fires on user request, so behavior changes there need a
+        // separate review.
         let strategy = if max {
-            // TODO: Consider using `eviction.max(retention)`
             retention
         } else {
-            eviction.min(retention)
+            eviction.max(retention)
         };
 
         match strategy.eviction_range(&context) {
@@ -929,5 +949,64 @@ mod tests {
     fn create_large_content(token_count: usize) -> String {
         // 4 chars per token approximation
         "x".repeat(token_count * 4)
+    }
+
+    /// Regression test for the auto-trigger over-eviction bug.
+    ///
+    /// With `eviction_window=0.2` and `retention_window=0` (the default
+    /// `Compact::new()` config), the previous `eviction.min(retention)`
+    /// semantics resolved to `min(evict_at_20%, 0) = 0` — i.e. preserve
+    /// last 0 messages, evict EVERYTHING. After the fix (`eviction.max(
+    /// retention)`), the more conservative limit wins: with 20 ~equal
+    /// messages we'd expect ~4 messages preserved (the 80% of tokens
+    /// outside the eviction window), not 0.
+    ///
+    /// Concrete shape pre-fix: 1 retained-original + 1 summary = 2 msgs.
+    /// Concrete shape post-fix: ~4 retained-originals + 1 summary ≥ 4 msgs.
+    /// Asserting `>= 4` discriminates the two cases.
+    #[test]
+    fn test_auto_compaction_with_default_retention_does_not_evict_everything() {
+        use forge_domain::ContextMessage;
+
+        let environment = test_environment();
+        // Default config: eviction_window=0.2, retention_window=0.
+        // This is the exact shape that produced the bug.
+        let compactor = Compactor::new(Compact::new(), environment);
+
+        // 20 alternating user/assistant messages, ~equal sized.
+        // 20 messages instead of 10 widens the gap between the buggy
+        // and fixed behaviour so the assertion below cleanly separates
+        // them (bug → ~2 msgs, fix → ≥ 4 msgs).
+        let mut context = Context::default();
+        for i in 0..20 {
+            let body = "x".repeat(40); // ~10 tokens each
+            if i % 2 == 0 {
+                context = context.add_message(ContextMessage::user(body, None));
+            } else {
+                context = context.add_message(ContextMessage::assistant(body, None, None, None));
+            }
+        }
+        let original_len = context.messages.len();
+
+        // Auto-trigger path: max=false.
+        let compacted = compactor.compact(context, false).unwrap();
+
+        // With the fix, ~80% of messages survive (everything outside
+        // the 20% eviction window) plus 1 summary. With the bug,
+        // basically nothing survives.
+        assert!(
+            compacted.messages.len() >= 4,
+            "auto compaction with default retention=0 produced only {} message(s) — \
+             the `eviction.min(retention)` over-eviction bug is back. Expected ≥4 \
+             (most of conversation + 1 summary) since `max(retention, eviction)` \
+             should preserve the messages outside the 20% eviction window.",
+            compacted.messages.len()
+        );
+        assert!(
+            compacted.messages.len() < original_len,
+            "compaction did not run at all (got {} messages, started with {})",
+            compacted.messages.len(),
+            original_len
+        );
     }
 }
