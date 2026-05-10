@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
 use diesel::prelude::*;
-use forge_domain::{Conversation, ConversationId, ConversationRepository, WorkspaceHash};
+use forge_domain::{
+    Context, ContextMessage, Conversation, ConversationId, ConversationRepository, WorkspaceHash,
+};
 
 use crate::conversation::conversation_record::ConversationRecord;
-use crate::database::schema::conversations;
+use crate::database::schema::{conversations, messages, sync_outbox};
 use crate::database::{DatabasePool, PooledSqliteConnection};
+use crate::messages::{MessageRecord, MessageRole, NewSyncOutboxRecord};
 
 pub struct ConversationRepositoryImpl {
     pool: Arc<DatabasePool>,
@@ -49,6 +52,11 @@ impl ConversationRepositoryImpl {
 impl ConversationRepository for ConversationRepositoryImpl {
     async fn upsert_conversation(&self, conversation: Conversation) -> anyhow::Result<()> {
         self.run_with_connection(move |connection, wid| {
+            // 1. Existing blob write — unchanged. Stays as the canonical
+            //    hydration source for the TUI until per-message read
+            //    paths land in a follow-up.
+            let conversation_id_str = conversation.id.into_string();
+            let context_snapshot = conversation.context.clone();
             let record = ConversationRecord::new(conversation, wid);
             diesel::insert_into(conversations::table)
                 .values(&record)
@@ -61,6 +69,36 @@ impl ConversationRepository for ConversationRepositoryImpl {
                     conversations::metrics.eq(&record.metrics),
                 ))
                 .execute(connection)?;
+
+            // 2. NEW: dual-write to per-message tables for the
+            //    server-side mirror (Audit A #1+#2+#5).
+            //
+            //    Best-effort. Errors here MUST NOT break the chat —
+            //    the blob above is still the canonical local state.
+            //    A future PR drains the outbox to the platform; for
+            //    now this just gets the data into the local mirror
+            //    so the drain has something to push.
+            //
+            //    Ordinal = position in `Context.messages`. Re-running
+            //    `upsert_conversation` with the same messages assigns
+            //    the same ordinals because positions don't shift in
+            //    the normal (non-compacted) write path. Compaction
+            //    rewrites `Context.messages` and so will produce a
+            //    fresh ordinal sequence — the SERVER side keeps the
+            //    older ordinals for archeology; the client's view
+            //    converges to the latest.
+            if let Some(ctx) = &context_snapshot
+                && let Err(e) = write_message_mirror(connection, &conversation_id_str, ctx)
+            {
+                // Log + continue. Never propagate — the blob write
+                // above succeeded, which is what the TUI cares about.
+                tracing::warn!(
+                    conversation_id = %conversation_id_str,
+                    error = %e,
+                    "failed to dual-write to messages mirror — chat continues with blob storage; \
+                     server sync will retry once outbox drain runs"
+                );
+            }
             Ok(())
         })
         .await
@@ -146,6 +184,135 @@ impl ConversationRepository for ConversationRepositoryImpl {
             Ok(())
         })
         .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-message mirror dual-write
+//
+// Lives below the impl block so the `ConversationRepository` trait code
+// stays small and readable. The helper is intentionally defensive — any
+// failure here is logged-and-swallowed by the caller in
+// `upsert_conversation` because the legacy blob write is still the
+// canonical local state.
+// ---------------------------------------------------------------------------
+
+/// Project a `Context` into per-message rows + an outbox entry for the
+/// server-side mirror. Single SQLite transaction so a partial failure
+/// can't leave the messages table out of sync with the outbox.
+///
+/// Idempotent: re-running with the same context inserts no new
+/// `messages` rows (UNIQUE on `(conversation_id, ordinal)` + ON CONFLICT
+/// DO NOTHING). The outbox row is enqueued unconditionally — duplicate
+/// outbox rows are harmless because the drain worker uses server-side
+/// idempotency.
+fn write_message_mirror(
+    connection: &mut PooledSqliteConnection,
+    conversation_id: &str,
+    ctx: &Context,
+) -> anyhow::Result<()> {
+    if ctx.messages.is_empty() {
+        return Ok(());
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    let mut records: Vec<MessageRecord> = Vec::with_capacity(ctx.messages.len());
+    for (ordinal, msg) in ctx.messages.iter().enumerate() {
+        let Some(record) = context_message_to_record(msg, conversation_id, ordinal as i64, now_ms)
+        else {
+            // Variants with no useful storage (currently: Image — bytes
+            // belong in artifacts, not messages). Skip; next ordinal
+            // will be the position-after, which is fine because the
+            // server stores by `(conversation_id, ordinal)` and the
+            // gap is harmless.
+            continue;
+        };
+        records.push(record);
+    }
+
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    let high_ordinal = ctx.messages.len() as i64 - 1;
+
+    connection.transaction::<_, anyhow::Error, _>(|conn| {
+        // Diesel's SQLite backend doesn't support batch INSERT + ON CONFLICT
+        // in one statement, so we loop. Wrapped in a transaction so the
+        // outbox row is only enqueued if the message inserts succeeded.
+        for record in &records {
+            diesel::insert_into(messages::table)
+                .values(record)
+                .on_conflict_do_nothing()
+                .execute(conn)?;
+        }
+
+        let outbox = NewSyncOutboxRecord {
+            conversation_id: conversation_id.to_string(),
+            low_ordinal: 0,
+            high_ordinal,
+            attempts: 0,
+            last_attempt_at: None,
+            last_error: None,
+            created_at: now_ms,
+        };
+        diesel::insert_into(sync_outbox::table)
+            .values(&outbox)
+            .execute(conn)?;
+
+        Ok(())
+    })
+}
+
+/// Convert one `ContextMessage` to a `MessageRecord`. Returns `None`
+/// for variants that don't map cleanly (currently: `Image`).
+fn context_message_to_record(
+    msg: &ContextMessage,
+    conversation_id: &str,
+    ordinal: i64,
+    created_at_ms: i64,
+) -> Option<MessageRecord> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let conversation_id = conversation_id.to_string();
+
+    match msg {
+        ContextMessage::Text(text) => {
+            let role = match text.role {
+                forge_domain::Role::System => MessageRole::System,
+                forge_domain::Role::User => MessageRole::User,
+                forge_domain::Role::Assistant => MessageRole::Assistant,
+            };
+            let tool_calls_json = text
+                .tool_calls
+                .as_ref()
+                .and_then(|tc| serde_json::to_string(tc).ok());
+            Some(MessageRecord {
+                id,
+                conversation_id,
+                ordinal,
+                role: role.as_str().to_string(),
+                content: Some(text.content.clone()),
+                tool_calls_json,
+                tool_results_json: None,
+                usage_json: None,
+                created_at: created_at_ms,
+            })
+        }
+        ContextMessage::Tool(tool_result) => {
+            let tool_results_json = serde_json::to_string(tool_result).ok();
+            Some(MessageRecord {
+                id,
+                conversation_id,
+                ordinal,
+                role: MessageRole::Tool.as_str().to_string(),
+                content: None,
+                tool_calls_json: None,
+                tool_results_json,
+                usage_json: None,
+                created_at: created_at_ms,
+            })
+        }
+        ContextMessage::Image(_) => None,
     }
 }
 
