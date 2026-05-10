@@ -1207,9 +1207,51 @@ mod tests {
             ),
             ("Plan first, in writing", "plan-emission rule from #111"),
             ("FINAL ANSWER:", "deliberate-completion marker from #111"),
+            // Tightened from a bare `research` substring (which would match
+            // `research`, `prior_art_search`, `research_query`, and 12 other
+            // unrelated occurrences — the previous form was effectively a
+            // no-op). The new pin is the specific guidance string that
+            // PR #111 added to direct the agent at the RLM tool for deep
+            // multi-hop questions.
             (
-                "research",
-                "research() tool referenced in long-horizon flow",
+                "Use `research` for deep multi-hop questions",
+                "RLM-as-default rule from #111",
+            ),
+            // PR #114 — vendor-PDF clarifier. Without these pins, the
+            // entire "where materials data actually lives" block can be
+            // silently deleted with green tests. The end-to-end Test 3
+            // trace (2026-05-10 ODS-alloy prompt) confirmed the agent
+            // genuinely changes behaviour when this section is present.
+            (
+                "where materials data actually lives",
+                "vendor-PDF clarifier section header from #114",
+            ),
+            (
+                "Vendor PDFs",
+                "vendor-PDF do-not-call rule from #114",
+            ),
+            (
+                "Do not chain guesses at vendor URLs",
+                "anti-URL-enumeration rule from #114",
+            ),
+            // PR #115 — search engine + OSTI blacklist. Concrete domain
+            // names are pinned because the rule's effectiveness depends on
+            // the agent reading them verbatim.
+            (
+                "Search engines + government repos block",
+                "search-engine blacklist section header from #115",
+            ),
+            (
+                "google.com/search",
+                "blacklisted Google search URL pattern from #115",
+            ),
+            (
+                "osti.gov",
+                "blacklisted OSTI repo pattern from #115",
+            ),
+            (
+                "CrossRef API",
+                "allowed-fallback CrossRef pointer from #115",
             ),
         ];
         for (marker, why) in required_markers {
@@ -1217,7 +1259,7 @@ mod tests {
                 block.contains(marker),
                 "long-horizon marker `{marker}` missing from prompt block ({why}). \
                  If you intentionally removed it, update this test. If not, \
-                 you've silently regressed PR #109 or #111."
+                 you've silently regressed PR #109, #111, #114, or #115."
             );
         }
     }
