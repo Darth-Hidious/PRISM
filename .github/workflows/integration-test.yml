@@ -144,7 +144,15 @@ jobs:
           grep -q "Fe" /tmp/graph.out
 
       - name: Test version flag
-        run: ./target/debug/prism --version 2>&1 | grep "prism 2.7.0"
+        # Read the expected version from the workspace Cargo.toml so this
+        # check stays correct across patch bumps. Hardcoding to a specific
+        # version (was `prism 2.7.0`) silently broke every PR after the
+        # next release tag.
+        run: |
+          expected=$(grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml \
+            | head -1 | sed -E 's/version = "([^"]+)"/\1/')
+          echo "Expecting: prism $expected"
+          ./target/debug/prism --version 2>&1 | grep -F "prism $expected"
 
       - name: Test node probe
         run: |
