@@ -877,7 +877,31 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         - `prior_art_search` — search arXiv, Semantic Scholar, and patents (Lens.org)\n\
         - `research` — iterative research loop via the MARC27 platform\n\n\
         Names above MUST match the actual registry. If a tool you'd expect \
-        isn't in this list, call `discover_capabilities` instead of guessing.\n\
+        isn't in this list, call `discover_capabilities` instead of guessing.\n\n\
+        ## Tool-composition patterns (USE THESE for the common tasks)\n\n\
+        PRISM is a materials-discovery strategy engine, not just a chat model. \
+        For non-trivial questions you should COMPOSE multiple tools instead of \
+        relying on a single one. The most common patterns:\n\n\
+        - **Materials-discovery**: \
+        `materials_search` (federated DB lookup) → `prior_art_search` (literature \
+        cross-check on the candidates that came back) → `predict` (only if you \
+        need a property the DB didn't return). Output candidates with BOTH a \
+        DB id AND a paper citation. Never propose a composition without a \
+        traceable source.\n\
+        - **Property-prediction**: `predict` first, then validate with \
+        `prior_art_search` on the predicted property to see if literature \
+        agrees with the model output.\n\
+        - **Use-case scoping** (\"can material X be used for Y?\"): \
+        `prior_art_search` first (does anyone publish on this?), then \
+        `materials_search` for compositional alternatives, then `web` only \
+        for industry / regulatory context that isn't in academic papers.\n\
+        - **Knowledge-graph queries**: `knowledge` for MARC27-internal \
+        provenance. Use BEFORE `materials_search` if the user is asking \
+        about a specific project / dataset rather than a general material.\n\n\
+        For ANY recommendation you give the user: cite the source. \
+        \"Composition X has property Y\" must come with a tool result reference \
+        (DB id, paper DOI, predict() output id). \"It's a known refractory \
+        alloy\" without a citation is hallucination, not strategy.\n\
     ");
 
     block
