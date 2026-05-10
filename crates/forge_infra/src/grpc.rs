@@ -58,9 +58,7 @@ impl ForgeGrpcClient {
         }
 
         let mut channel = Channel::from_shared(self.server_url.to_string())
-            .map_err(|e| {
-                anyhow::anyhow!("invalid services URL `{}`: {e}", self.server_url)
-            })?
+            .map_err(|e| anyhow::anyhow!("invalid services URL `{}`: {e}", self.server_url))?
             .concurrency_limit(256);
 
         // Enable TLS for https URLs (webpki-roots is faster than native-roots)
