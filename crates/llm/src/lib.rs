@@ -881,7 +881,25 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         ## Tool-composition patterns (USE THESE for the common tasks)\n\n\
         PRISM is a materials-discovery strategy engine, not just a chat model. \
         For non-trivial questions you should COMPOSE multiple tools instead of \
-        relying on a single one. The most common patterns:\n\n\
+        relying on a single one.\n\n\
+        **CRITICAL — where materials data actually lives:**\n\
+        - Materials property data (creep, modulus, density, band gap, etc.) \
+        lives in `materials_search` (federated DB across MP / OPTIMADE / 18 \
+        others) and in academic papers via `prior_art_search`. NOT on vendor \
+        websites.\n\
+        - Vendor PDFs (specialmetals.com, haynesintl.com, nickelinstitute.org, \
+        matweb.com, hightempmetals.com, …) are paywalled, robots-blocked, or \
+        gated. The `web` tool WILL return 403 / 404 / robots.txt on them. \
+        Do not chain guesses at vendor URLs — that loop never converges.\n\
+        - For ANY question of the form \"compare property X of alloys A, B, C\" \
+        or \"what is property Y of material Z\", your FIRST tool call should be \
+        `materials_search` or `prior_art_search` — never a `web` GET against a \
+        vendor domain.\n\
+        - `research` (the server-side RLM) is the right call when the question \
+        spans multiple alloy systems + multiple properties + needs synthesis. \
+        It already searches Semantic Scholar / arXiv / OpenAlex / the KG \
+        internally; you do not need to do that hop yourself.\n\n\
+        The most common patterns:\n\n\
         - **Materials-discovery**: \
         `materials_search` (federated DB lookup) → `prior_art_search` (literature \
         cross-check on the candidates that came back) → `predict` (only if you \
