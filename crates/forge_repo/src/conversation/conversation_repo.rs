@@ -71,27 +71,11 @@ impl ConversationRepository for ConversationRepositoryImpl {
                 .execute(connection)?;
 
             // 2. NEW: dual-write to per-message tables for the
-            //    server-side mirror (Audit A #1+#2+#5).
-            //
-            //    Best-effort. Errors here MUST NOT break the chat —
-            //    the blob above is still the canonical local state.
-            //    A future PR drains the outbox to the platform; for
-            //    now this just gets the data into the local mirror
-            //    so the drain has something to push.
-            //
-            //    Ordinal = position in `Context.messages`. Re-running
-            //    `upsert_conversation` with the same messages assigns
-            //    the same ordinals because positions don't shift in
-            //    the normal (non-compacted) write path. Compaction
-            //    rewrites `Context.messages` and so will produce a
-            //    fresh ordinal sequence — the SERVER side keeps the
-            //    older ordinals for archeology; the client's view
-            //    converges to the latest.
+            //    server-side mirror (Audit A #1+#2+#5). Best-effort —
+            //    errors are logged and swallowed; chat keeps going.
             if let Some(ctx) = &context_snapshot
                 && let Err(e) = write_message_mirror(connection, &conversation_id_str, ctx)
             {
-                // Log + continue. Never propagate — the blob write
-                // above succeeded, which is what the TUI cares about.
                 tracing::warn!(
                     conversation_id = %conversation_id_str,
                     error = %e,
@@ -101,7 +85,35 @@ impl ConversationRepository for ConversationRepositoryImpl {
             }
             Ok(())
         })
-        .await
+        .await?;
+
+        // 3. Fire-and-forget outbox drain. Reads creds from
+        //    ~/.prism/credentials.json lazily (skips if absent — e.g.
+        //    `--offline`). Server endpoint is idempotent on
+        //    `(conversation_id, ordinal)` so concurrent drain firings
+        //    from rapid chat turns don't corrupt anything; over-sending
+        //    duplicate ranges is just bandwidth, not data risk.
+        //
+        //    Spawned outside `run_with_connection`'s spawn_blocking so
+        //    the chat path returns immediately. Errors stay in tracing
+        //    logs — the TUI never sees them.
+        //
+        //    Gated #[cfg(not(test))] so unit tests with fake conversation
+        //    fixtures don't fire HTTP at the real platform if the dev
+        //    machine has creds. The drain is exercised end-to-end via
+        //    integration tests on the chat path, not these unit tests.
+        //    Also gated by env var `PRISM_DISABLE_OUTBOX_DRAIN=1` for
+        //    operators who want to opt out (e.g. air-gapped deploys
+        //    that nonetheless want the local mirror to populate).
+        #[cfg(not(test))]
+        if std::env::var_os("PRISM_DISABLE_OUTBOX_DRAIN").is_none() {
+            let pool_for_drain = self.pool.clone();
+            tokio::spawn(async move {
+                spawn_drain_attempt(pool_for_drain).await;
+            });
+        }
+
+        Ok(())
     }
 
     async fn get_conversation(
@@ -313,6 +325,98 @@ fn context_message_to_record(
             })
         }
         ContextMessage::Image(_) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drain spawn helper — wired into the chat loop via upsert_conversation.
+// ---------------------------------------------------------------------------
+
+// `spawn_drain_attempt` and its `load_platform_creds` helper are only
+// called from the `#[cfg(not(test))]` block in `upsert_conversation`.
+// Gating their definitions matches so the test build doesn't see them
+// as dead code, and the import that only they use is gated too.
+#[cfg(not(test))]
+use crate::messages::OutboxDrain;
+
+/// Read MARC27 platform creds from `~/.prism/credentials.json`. Returns
+/// `(api_url, access_token)` or `None` if the file is missing /
+/// unreadable / empty (e.g. `--offline` or first-run).
+#[cfg(not(test))]
+fn load_platform_creds() -> Option<(String, String)> {
+    let home = std::env::var_os("HOME")?;
+    let path = std::path::PathBuf::from(home).join(".prism/credentials.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let creds: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let token = creds.get("access_token")?.as_str()?.to_string();
+    if token.is_empty() {
+        return None;
+    }
+    // Default API base if `platform_url` is absent — matches what
+    // `prism status` prints today.
+    let api_base = creds
+        .get("platform_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "https://api.marc27.com/api/v1".to_string());
+    let api_base = if api_base.ends_with("/api/v1") {
+        api_base
+    } else {
+        format!("{api_base}/api/v1")
+    };
+    Some((api_base, token))
+}
+
+/// Run one drain pass against the platform. Best-effort — any failure
+/// is logged at warn level and swallowed; chat continues. Bounded by
+/// `DEFAULT_BATCH` rows per call (currently 5) so a long history of
+/// pending rows takes several chat turns to fully sync, which is fine.
+#[cfg(not(test))]
+async fn spawn_drain_attempt(pool: std::sync::Arc<DatabasePool>) {
+    let Some((api_base, token)) = load_platform_creds() else {
+        tracing::trace!("outbox drain skipped — no creds");
+        return;
+    };
+
+    let drain = OutboxDrain::new(api_base, token);
+
+    // Fetch a connection in a blocking task — Diesel SQLite is sync.
+    // Use `spawn_blocking` so we don't hold up the async runtime.
+    let pool_for_blocking = pool.clone();
+    let drain_result =
+        tokio::task::spawn_blocking(move || pool_for_blocking.get_connection()).await;
+
+    let mut connection = match drain_result {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "outbox drain skipped — connection failed");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "outbox drain skipped — task panicked");
+            return;
+        }
+    };
+
+    // Drain itself. The HTTP calls inside are async, but the Diesel
+    // calls are sync. We hold the sync connection across .await
+    // boundaries — that's fine because we're inside a tokio task that
+    // owns it exclusively. The sync queries don't yield; the HTTP awaits
+    // do, but only between Diesel calls.
+    match drain.drain_once(&mut connection).await {
+        Ok(summary) => {
+            if summary.succeeded + summary.failed + summary.poisoned > 0 {
+                tracing::debug!(
+                    succeeded = summary.succeeded,
+                    failed = summary.failed,
+                    poisoned = summary.poisoned,
+                    "outbox drain pass complete"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "outbox drain pass returned error");
+        }
     }
 }
 
