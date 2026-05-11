@@ -1226,10 +1226,7 @@ mod tests {
                 "where materials data actually lives",
                 "vendor-PDF clarifier section header from #114",
             ),
-            (
-                "Vendor PDFs",
-                "vendor-PDF do-not-call rule from #114",
-            ),
+            ("Vendor PDFs", "vendor-PDF do-not-call rule from #114"),
             (
                 "Do not chain guesses at vendor URLs",
                 "anti-URL-enumeration rule from #114",
@@ -1245,10 +1242,7 @@ mod tests {
                 "google.com/search",
                 "blacklisted Google search URL pattern from #115",
             ),
-            (
-                "osti.gov",
-                "blacklisted OSTI repo pattern from #115",
-            ),
+            ("osti.gov", "blacklisted OSTI repo pattern from #115"),
             (
                 "CrossRef API",
                 "allowed-fallback CrossRef pointer from #115",
