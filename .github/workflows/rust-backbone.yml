@@ -48,6 +48,23 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Bump suffix to invalidate cache when the runner cargo config
+          # changes (e.g. mold linker flag added/removed). The persistent
+          # target dir on a self-hosted runner can otherwise carry stale
+          # link-args baked into crate fingerprints across runs.
+          prefix-key: "v1-rust-linker-fallback-no-mold"
+      - name: Reset poisoned target dir (one-shot via runner-local sentinel)
+        run: |
+          SENTINEL=$HOME/.cache/prism-runner-cache-bust-v1-no-mold
+          if [ ! -f "$SENTINEL" ]; then
+            echo "Cache-bust v1: wiping target/ once for this runner"
+            rm -rf target
+            mkdir -p "$HOME/.cache"
+            touch "$SENTINEL"
+          else
+            echo "Sentinel present — target/ already cache-busted"
+          fi
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 

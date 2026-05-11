@@ -33,6 +33,22 @@ jobs:
         run: mkdir -p dashboard/dist && echo '<html><body>placeholder</body></html>' > dashboard/dist/index.html
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Bump suffix to invalidate cache after the runner cargo config
+          # changed (mold removed in favor of default ld + debuginfo=1).
+          # Self-hosted target dirs otherwise persist stale link-args.
+          prefix-key: "v1-rust-linker-fallback-no-mold"
+      - name: Reset poisoned target dir (one-shot via runner-local sentinel)
+        run: |
+          SENTINEL=$HOME/.cache/prism-runner-cache-bust-v1-no-mold
+          if [ ! -f "$SENTINEL" ]; then
+            echo "Cache-bust v1: wiping target/ once for this runner"
+            rm -rf target
+            mkdir -p "$HOME/.cache"
+            touch "$SENTINEL"
+          else
+            echo "Sentinel present — target/ already cache-busted"
+          fi
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
