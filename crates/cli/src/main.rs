@@ -631,6 +631,30 @@ enum MarketplaceCommands {
         /// Name of the tool or workflow.
         name: String,
     },
+    /// Semantic discovery — find marketplace tools/models/datasets by what
+    /// they do, not by exact name. Wraps `POST /marketplace/find` which
+    /// does RBAC-aware cosine search over the prism-resource-registry
+    /// corpus.
+    ///
+    /// Use this when the curated tool list doesn't have what you need —
+    /// the marketplace has the long tail (custom predictors, vendor MCPs,
+    /// user-uploaded skills) that isn't worth listing in the prompt.
+    Find {
+        /// Natural-language description of what you're looking for.
+        /// E.g. `"predict elastic moduli of a Ti-Al alloy"`.
+        query: String,
+        /// Restrict to specific resource_type values. Pass multiple times
+        /// for an OR. Omit to search every type.
+        #[arg(long = "type", value_name = "TYPE")]
+        types: Vec<String>,
+        /// Max number of hits to return. Typical: 3–10.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Return the raw JSON response instead of the human-readable
+        /// summary. Useful from agent tools.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2171,6 +2195,49 @@ async fn main() -> Result<()> {
                     let kind = if workflow { "workflow" } else { "tool" };
                     println!("Installed {kind} '{name}' to {}", dest.display());
                     println!("It will be auto-discovered on next prism run.");
+                }
+                MarketplaceCommands::Find {
+                    query,
+                    types,
+                    limit,
+                    json,
+                } => {
+                    let hits = marketplace.find_tool(&query, &types, limit).await?;
+                    if json {
+                        // Stable structured output for agent-tool consumption.
+                        println!("{}", serde_json::to_string_pretty(&hits)?);
+                    } else if hits.is_empty() {
+                        println!("No semantic matches for `{query}`.");
+                        println!(
+                            "Try a different phrasing, or `prism marketplace search <query>` for \
+                             lexical search."
+                        );
+                    } else {
+                        println!("Top {} marketplace matches for `{query}`:\n", hits.len());
+                        for hit in &hits {
+                            let display = if hit.display_name.is_empty() {
+                                &hit.canonical_name
+                            } else {
+                                &hit.display_name
+                            };
+                            // score uses 2-decimal width so all rows line up under "score=0.91"
+                            println!(
+                                "  score={:.2}  {}  [{}]  ← {}",
+                                hit.score, hit.canonical_name, hit.category, display,
+                            );
+                            if !hit.description.is_empty() {
+                                println!("    {}", hit.description);
+                            }
+                            if !hit.execution_target.is_empty() {
+                                println!("    execution_target: {}", hit.execution_target);
+                            }
+                            println!();
+                        }
+                        println!(
+                            "Invoke a hit by its canonical_name. Cite both name and score in your \
+                             final answer."
+                        );
+                    }
                 }
                 MarketplaceCommands::Info { name } => {
                     let tool = marketplace.get_tool(&name).await?;
