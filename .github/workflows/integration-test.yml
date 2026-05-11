@@ -24,7 +24,7 @@ concurrency:
 jobs:
   rust-tests:
     name: Rust Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (rdkafka needs libcurl)
@@ -38,7 +38,7 @@ jobs:
 
   dashboard-build:
     name: Dashboard Build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -53,7 +53,7 @@ jobs:
 
   python-tools:
     name: Python Tool Loading
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -79,7 +79,7 @@ jobs:
 
   ingest-pipeline:
     name: Ingest Pipeline (with services)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     needs: [rust-tests]
     services:
       neo4j:
