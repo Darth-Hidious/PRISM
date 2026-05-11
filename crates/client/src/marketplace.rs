@@ -30,6 +30,29 @@ pub struct MarketplaceTool {
     pub license: Option<String>,
 }
 
+/// A single hit from the semantic find_resource search. Mirrors the
+/// JSON shape the platform returns from `POST /marketplace/find`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketplaceFindHit {
+    /// Canonical name the agent invokes (e.g. `predict.elastic_moduli.mace`).
+    pub canonical_name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Resource type (e.g. `model`, `cli_tool`, `procedural_skill`).
+    #[serde(default)]
+    pub category: String,
+    /// How the tool dispatches when invoked: `inference`, `local_shell`,
+    /// `mcp_server`, etc. Empty when not applicable to this resource type.
+    #[serde(default)]
+    pub execution_target: String,
+    /// Cosine similarity in [0, 1]; higher = closer to the query. Used by
+    /// the agent to decide whether to invoke or fall back.
+    #[serde(default)]
+    pub score: f32,
+}
+
 /// Client for the MARC27 marketplace endpoints.
 #[derive(Debug)]
 pub struct MarketplaceClient<'a> {
@@ -59,6 +82,43 @@ impl<'a> MarketplaceClient<'a> {
         let path = format!("/marketplace/resources/{name}");
         debug!(%path, "fetching marketplace resource");
         self.platform.get(&path).await
+    }
+
+    /// Semantic discovery of marketplace resources via the platform's
+    /// `find_resource` cosine-similarity search.
+    ///
+    /// Pairs with `POST /api/v1/marketplace/find` (marc27-core #33). The
+    /// platform side is the same path the research-engine REPL uses
+    /// internally via the injected `find_tool()` function; this client
+    /// wraps it for the PRISM CLI surface so chat-LLM tools can call it
+    /// directly without going through the research-engine REPL.
+    ///
+    /// `types` restricts to specific resource_type values (e.g. `["model",
+    /// "cli_tool"]`); pass `&[]` to search every type. `limit` caps the
+    /// number of hits returned (typical: 3–10).
+    pub async fn find_tool(
+        &self,
+        query: &str,
+        types: &[String],
+        limit: usize,
+    ) -> Result<Vec<MarketplaceFindHit>> {
+        #[derive(Serialize)]
+        struct FindRequest<'a> {
+            query: &'a str,
+            #[serde(skip_serializing_if = "<[String]>::is_empty")]
+            types: &'a [String],
+            limit: usize,
+        }
+        let body = FindRequest {
+            query,
+            types,
+            limit,
+        };
+        debug!(%query, ?types, limit, "POST /marketplace/find");
+        self.platform
+            .post("/marketplace/find", &body)
+            .await
+            .context("marketplace/find request failed")
     }
 
     /// Get the install URL for a resource (used by `prism marketplace install`).
