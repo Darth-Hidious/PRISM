@@ -56,9 +56,18 @@ jobs:
     runs-on: [self-hosted, linux, ARM64]
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # We invoke cargo-audit directly via the ghrunner-owned cargo
+      # toolchain rather than rustsec/audit-check@v2. The action
+      # hardcodes /usr/local/bin/cargo, which is a shim that pins
+      # RUSTUP_HOME=/opt/rust/rustup and CARGO_HOME=/opt/rust/cargo
+      # and writes to a path ghrunner cannot create under.
+      - name: Install cargo-audit via ghrunner cargo
+        run: |
+          if ! /home/ghrunner/.cargo/bin/cargo audit --version >/dev/null 2>&1; then
+            /home/ghrunner/.cargo/bin/cargo install cargo-audit --locked
+          fi
+      - name: Run cargo audit
+        run: /home/ghrunner/.cargo/bin/cargo audit
 
   build-matrix:
     name: Rust Build (${{ matrix.os }})
