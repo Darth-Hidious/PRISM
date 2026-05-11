@@ -54,6 +54,12 @@ jobs:
           # target dir on a self-hosted runner can otherwise carry stale
           # link-args baked into crate fingerprints across runs.
           prefix-key: "v1-rust-linker-fallback-no-mold"
+          # Self-hosted runner shares CARGO_HOME across jobs. rust-cache's
+          # default post-cleanup wipes ~/.cargo/bin to reduce cache size,
+          # which deletes pre-installed cargo-audit and similar binaries.
+          # Disable bin-caching so the Security Audit job (which expects
+          # cargo-audit to persist) can rely on it across runs.
+          cache-bin: "false"
       - name: Reset poisoned target dir (one-shot via runner-local sentinel)
         run: |
           SENTINEL=$HOME/.cache/prism-runner-cache-bust-v1-no-mold
