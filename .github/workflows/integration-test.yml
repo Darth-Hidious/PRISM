@@ -108,7 +108,10 @@ jobs:
       qdrant:
         image: qdrant/qdrant:v1.12.6
         ports:
-          - 6333:6333
+          # Self-hosted runner co-tenants with a long-running user-owned
+          # qdrant container on host port 6333. Remap to 36333 so the CI
+          # service doesn't collide with the existing host binding.
+          - 36333:6333
           - 6334:6334
 
     steps:
@@ -124,8 +127,8 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://localhost:7474 > /dev/null 2>&1 && break || sleep 3; done
           curl -sf http://localhost:7474 > /dev/null && echo "Neo4j ready" || echo "Neo4j not ready (continuing anyway)"
           echo "Waiting for Qdrant..."
-          for i in $(seq 1 30); do curl -sf http://localhost:6333/healthz > /dev/null 2>&1 && break || sleep 3; done
-          curl -sf http://localhost:6333/healthz > /dev/null && echo "Qdrant ready" || echo "Qdrant not ready (continuing anyway)"
+          for i in $(seq 1 30); do curl -sf http://localhost:36333/healthz > /dev/null 2>&1 && break || sleep 3; done
+          curl -sf http://localhost:36333/healthz > /dev/null && echo "Qdrant ready" || echo "Qdrant not ready (continuing anyway)"
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -135,7 +138,7 @@ jobs:
 
       - name: Create Qdrant collection
         run: |
-          curl -X PUT http://localhost:6333/collections/prism_embeddings \
+          curl -X PUT http://localhost:36333/collections/prism_embeddings \
             -H "Content-Type: application/json" \
             -d '{"vectors": {"size": 768, "distance": "Cosine"}}'
 
