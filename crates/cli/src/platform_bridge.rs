@@ -731,6 +731,12 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
         const MAX_ATTEMPTS: u32 = 4;
         let mut last: Option<reqwest::Response> = None;
         let mut last_err: Option<reqwest::Error> = None;
+        // If we detect a *permanent* 429 (plan / quota / billing — i.e. a
+        // 429 that no number of retries will clear) we capture the upstream
+        // body here, break out of the retry loop, and return a friendly
+        // user-facing message at the bottom of this block instead of
+        // hammering the upstream four more times.
+        let mut permanent_429_body: Option<String> = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let mut request = state
                 .http
@@ -754,9 +760,38 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
                         last = Some(r);
                         break;
                     }
-                    eprintln!(
-                        "\x1b[33m[prism]\x1b[0m MARC27 returned {s}, retrying (attempt {attempt}/{MAX_ATTEMPTS})"
-                    );
+                    // Permanent 429 short-circuit. MARC27 returns 429 in
+                    // two distinct flavours: (a) genuine rate-limit /
+                    // upstream congestion (retry helps), and (b) plan-
+                    // level quota / billing exceeded (retry never helps,
+                    // and burning four attempts just spams the user with
+                    // duplicate error lines from concurrent chat +
+                    // metadata requests). For (b) we read the body once,
+                    // stash it for the friendly message below, and exit
+                    // the retry loop early.
+                    if s == 429 {
+                        let body = r.text().await.unwrap_or_default();
+                        let body_lower = body.to_lowercase();
+                        let is_permanent = body_lower.contains("quota_exceeded")
+                            || body_lower.contains("plan_exceeded")
+                            || body_lower.contains("monthly llm token quota")
+                            || body_lower.contains("billing");
+                        if is_permanent {
+                            permanent_429_body = Some(body);
+                            break;
+                        }
+                        // Transient 429 — fall through to the existing
+                        // retry-log + backoff path. Body was consumed,
+                        // but since we're going to retry we don't need
+                        // to surface this response.
+                        eprintln!(
+                            "\x1b[33m[prism]\x1b[0m MARC27 returned 429 (transient), retrying (attempt {attempt}/{MAX_ATTEMPTS})"
+                        );
+                    } else {
+                        eprintln!(
+                            "\x1b[33m[prism]\x1b[0m MARC27 returned {s}, retrying (attempt {attempt}/{MAX_ATTEMPTS})"
+                        );
+                    }
                     let backoff_ms = 500u64 * (1 << (attempt - 1)).min(8);
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 }
@@ -769,6 +804,26 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 }
             }
+        }
+        // Permanent 429 → return a friendly, actionable response instead
+        // of letting forge_main's chat layer render the raw upstream JSON
+        // (which the user can't act on without grepping the docs).
+        if let Some(body) = permanent_429_body {
+            let body_lower = body.to_lowercase();
+            let msg = if body_lower.contains("quota_exceeded")
+                || body_lower.contains("monthly llm token quota")
+            {
+                "MARC27 monthly LLM token quota exceeded. To keep working immediately, switch chat to a local or BYOK target:\n\
+                 \n\
+                 - Local OpenAI-compatible:  prism use local --url http://127.0.0.1:8080 --model <name>\n\
+                 - BYOK provider:            prism use provider <openai|mistral|gemini|cohere> --model <name>\n\
+                 - Or upgrade your plan at https://marc27.com/billing\n\
+                 \n\
+                 Knowledge graph, marketplace, and tool calls keep working regardless of which chat target you pick."
+            } else {
+                "MARC27 plan/billing limit reached. Visit https://marc27.com/billing or switch routing with `prism use local|provider`."
+            };
+            return error_response(StatusCode::PAYMENT_REQUIRED, msg);
         }
         match (last, last_err) {
             (Some(r), _) => r,
