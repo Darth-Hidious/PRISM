@@ -141,6 +141,25 @@ def build_full_registry(
     except Exception:
         pass
 
+    # MACE foundation interatomic-potential tools (optional —
+    # mace-torch + ase + python-ulid required; install via the `[mace]` extra).
+    #
+    # Framework note: MACE-MH-1 is PyTorch-only as of 2026 (mace-jax does not
+    # support the multi-head MH-1 architecture). PRISM's broader stack is
+    # JAX-native by default; MACE is one of the explicit PyTorch holdouts.
+    # See app/tools/mace.py for the 10 registered tools (5 primitives +
+    # 5 control-plane) and app/tools/simulation/mace_bridge.py for the
+    # JobRunner singleton.
+    try:
+        from app.tools.simulation.mace_bridge import check_mace_available
+
+        if check_mace_available():
+            from app.tools.mace import create_mace_tools
+
+            create_mace_tools(registry)
+    except Exception:
+        logger.debug("mace tools not registered", exc_info=True)
+
     # Built-in skills → tools
     try:
         from app.tools.skills.registry import load_builtin_skills
