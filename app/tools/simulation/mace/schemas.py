@@ -34,7 +34,7 @@ Head = Literal[
 ]
 
 Phase = Literal["bcc", "fcc", "hcp", "c14_laves"]
-Backend = Literal["hf_jobs", "local", "fake", "auto", "cache"]
+Backend = Literal["platform", "hf_jobs", "local", "fake", "auto", "cache"]
 JobStatus = Literal[
     "queued",
     "submitted",

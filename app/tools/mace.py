@@ -308,11 +308,16 @@ _PRIMITIVE_OPTIONS_SCHEMA = {
     "properties": {
         "backend": {
             "type": "string",
-            "enum": ["auto", "fake", "local", "hf_jobs"],
+            "enum": ["auto", "fake", "local", "hf_jobs", "platform"],
             "default": "auto",
             "description": (
-                "auto = heuristic (small jobs local, large jobs hf_jobs if HF_TOKEN "
-                "set, else local); override if you know better."
+                "Compute backend selection. 'auto' = heuristic (small + CPU-OK "
+                "jobs local; GPU-bound or large jobs prefer 'platform' if "
+                "PRISM_PROJECT_ID is set, else 'hf_jobs' if HF_TOKEN set, else "
+                "'local'). 'platform' submits to marc27 ml_predict (production "
+                "path; supports relax + md tasks today, others fall back). "
+                "'hf_jobs' is the open-source HF Pro fallback. 'local' runs "
+                "MACE in-process. 'fake' is for tests only."
             ),
         },
         "head": {

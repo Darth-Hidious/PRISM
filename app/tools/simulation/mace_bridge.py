@@ -98,6 +98,7 @@ class MaceBridge:
         )
         from app.tools.simulation.mace.backends.fake import FakeBackend
         from app.tools.simulation.mace.backends.local import LocalBackend
+        from app.tools.simulation.mace.backends.platform import PlatformBackend
         from app.tools.simulation.mace.cache.store import CacheStore
         from app.tools.simulation.mace.jobs.runner import JobRunner
         from app.tools.simulation.mace.jobs.store import JobStore
@@ -108,12 +109,21 @@ class MaceBridge:
         self.cache: "CacheStore" = CacheStore(cache_dir=resolved_cache_dir)
         self.job_store = JobStore(db_path=sqlite_path)
 
-        # Build the default backend set. The hf_jobs backend is added only if
-        # HF_TOKEN is present in the environment — otherwise the user gets
-        # `local` + `fake` only and the `auto` selector will skip hf_jobs.
+        # Build the default backend set.
+        #
+        # Always-on: fake (tests), local (laptop / dev), platform
+        # (marc27 ml_predict). Platform is registered unconditionally —
+        # the runtime check inside `PlatformBackend.execute` raises a
+        # clear error if `PRISM_PROJECT_ID` isn't set, so the agent
+        # picking `platform` without auth gets an actionable error
+        # instead of a silent fallback.
+        #
+        # Optional: hf_jobs (only if HF_TOKEN is in env, to avoid the
+        # huggingface_hub transitive import for users without one).
         backends: dict[str, "Backend"] = {
             "fake": FakeBackend(),
             "local": LocalBackend(),
+            "platform": PlatformBackend(),
         }
 
         # Lazy-import hf_jobs so users without HF_TOKEN don't pay for the
