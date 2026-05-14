@@ -10,7 +10,7 @@ permissions:
 jobs:
   triage:
     name: Auto-Triage
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 2
 
     steps:
