@@ -51,7 +51,12 @@ struct Cli {
 enum Commands {
     /// Run first-time native setup and platform login.
     Setup,
-    /// Launch the interactive AI agent TUI.
+    /// Hidden alias for the default `prism` invocation. Retained internally
+    /// so the no-subcommand dispatch (`prism` with no args) still resolves
+    /// to this variant via `Commands::Tui`. Hidden from `--help` since
+    /// users should just type `prism` — the explicit `prism tui` form is
+    /// a misnomer and is intentionally not surfaced.
+    #[command(hide = true)]
     Tui,
     /// Resume a previous conversation.
     ///
@@ -2550,7 +2555,7 @@ async fn main() -> Result<()> {
                     eprintln!("\x1b[31mInline re-login failed:\x1b[0m {e}");
                     eprintln!();
                     eprintln!(
-                        "  Run \x1b[1mprism login\x1b[0m manually, then start \x1b[1mprism tui\x1b[0m again."
+                        "  Run \x1b[1mprism login\x1b[0m manually, then start \x1b[1mprism\x1b[0m again."
                     );
                     eprintln!();
                     return Ok(());
