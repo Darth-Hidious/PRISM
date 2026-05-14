@@ -158,7 +158,7 @@ def build_full_registry(
 
             create_mace_tools(registry)
     except Exception:
-        logger.debug("mace tools not registered", exc_info=True)
+        logger.exception("mace tools not registered")
 
     # Built-in skills → tools
     try:
@@ -237,5 +237,17 @@ def build_full_registry(
             discover_and_register_mcp_tools(registry)
         except Exception:
             pass
+
+    # Legacy SFT-trained tool-name aliases.
+    # MUST run last so all canonical primitives are present for the aliases to
+    # forward to. See app/tools/legacy_aliases.py for the mapping rationale and
+    # the honest "not_implemented_in_this_build" stubs for names without a
+    # backend (prism_monte_carlo_sensitivity).
+    try:
+        from app.tools.legacy_aliases import create_legacy_aliases
+
+        create_legacy_aliases(registry)
+    except Exception:
+        logger.exception("legacy SFT tool-name aliases not registered")
 
     return registry, provider_reg, None
