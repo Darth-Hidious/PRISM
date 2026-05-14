@@ -358,7 +358,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
 
     # --- Primitives (approval-gated; may spend compute) -------------------
 
-    registry.add(Tool(
+    registry.register(Tool(
         name="mace_relax_structure",
         description=(
             "Build a supercell from composition + phase and relax it to a local "
@@ -385,7 +385,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         source_detail="app.tools.mace",
     ))
 
-    registry.add(Tool(
+    registry.register(Tool(
         name="mace_md_equilibrate",
         description=(
             "Run NVT molecular dynamics on a structure at target temperature "
@@ -413,7 +413,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         source_detail="app.tools.mace",
     ))
 
-    registry.add(Tool(
+    registry.register(Tool(
         name="mace_phonon_harmonic",
         description=(
             "Compute the harmonic phonon spectrum via the finite-displacement "
@@ -447,7 +447,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         source_detail="app.tools.mace",
     ))
 
-    registry.add(Tool(
+    registry.register(Tool(
         name="mace_compute_elastic",
         description=(
             "Compute the second-order elastic-constant tensor via strain-stress "
@@ -479,7 +479,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         source_detail="app.tools.mace",
     ))
 
-    registry.add(Tool(
+    registry.register(Tool(
         name="mace_compute_dilute_solute",
         description=(
             "Compute the dilute solute formation/substitution energy for a single "
@@ -513,7 +513,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
 
     # --- Control plane (read-only; no approval needed) --------------------
 
-    registry.add(Tool(
+    registry.register(Tool(
         name="mace_estimate_cost",
         description=(
             "Estimate wall time, GPU seconds, and USD cost for a MACE primitive "
@@ -545,7 +545,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         source_detail="app.tools.mace",
     ))
 
-    registry.add(Tool(
+    registry.register(Tool(
         name="mace_get_job",
         description=(
             "Fetch the current status + result (if ready) of a MACE job by id. "
@@ -566,7 +566,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         source_detail="app.tools.mace",
     ))
 
-    registry.add(Tool(
+    registry.register(Tool(
         name="mace_list_jobs",
         description=(
             "List MACE jobs in the local job store, filtered by status or tool. "
@@ -591,7 +591,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         source_detail="app.tools.mace",
     ))
 
-    registry.add(Tool(
+    registry.register(Tool(
         name="mace_cancel_job",
         description=(
             "Cancel a queued or running MACE job. No-op if the job already "
@@ -611,7 +611,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         source_detail="app.tools.mace",
     ))
 
-    registry.add(Tool(
+    registry.register(Tool(
         name="mace_get_cached_structure",
         description=(
             "Resolve a cache:// URI returned by a previous MACE primitive into "
