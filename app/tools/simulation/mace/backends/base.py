@@ -71,10 +71,23 @@ def select_backend(
     1. ``MACE_MCP_BACKEND`` env override always wins (e.g. ``"fake"`` in CI).
     2. Caller-supplied ``backend`` other than ``"auto"`` is honoured.
     3. Otherwise:
-       - GPU-bound tool OR ``n_atoms > 30``       -> ``hf_jobs`` if available, else ``local``
-       - else                                     -> ``local`` if available, else ``hf_jobs``
+       - GPU-bound tool OR ``n_atoms > 30``       -> ``platform`` (marc27 ml_predict)
+                                                      if available + project_id set,
+                                                      else ``hf_jobs`` if available,
+                                                      else ``local``
+       - else                                     -> ``local`` if available,
+                                                      else ``platform`` if available,
+                                                      else ``hf_jobs``
        - fallback                                 -> ``fake``
+
+    The ``platform`` backend is preferred over ``hf_jobs`` for GPU-bound work
+    when the user has a marc27 account configured (`PRISM_PROJECT_ID` set in
+    env). It hits the marc27 `ml_predict` job type which runs the production
+    Docker image with full metering/provenance. ``hf_jobs`` is kept as the
+    open-source fallback for users without a marc27 account.
     """
+    import os as _os
+
     override = get_backend_override()
     if override and override in backends:
         return backends[override]
@@ -82,8 +95,18 @@ def select_backend(
     if requested != "auto" and requested in backends:
         return backends[requested]
 
+    # platform is only auto-selectable when project_id is configured;
+    # otherwise the runtime PRISM_PROJECT_ID check inside PlatformBackend
+    # would error every call.
+    platform_ok = (
+        "platform" in backends
+        and bool(_os.environ.get("PRISM_PROJECT_ID"))
+    )
+
     needs_gpu = tool_name in _GPU_BOUND_TOOLS or n_atoms > 30
     if needs_gpu:
+        if platform_ok:
+            return backends["platform"]
         if "hf_jobs" in backends:
             return backends["hf_jobs"]
         if "local" in backends:
@@ -91,6 +114,8 @@ def select_backend(
     else:
         if "local" in backends:
             return backends["local"]
+        if platform_ok:
+            return backends["platform"]
         if "hf_jobs" in backends:
             return backends["hf_jobs"]
     return backends["fake"]

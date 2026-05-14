@@ -120,8 +120,16 @@ data/_system/
 data/vectordb/
 data/viking/
 .openviking.pid
-# Tests (not shipped)
-tests/
+# Test artefacts (not shipped). The bare `tests/` line that used to live
+# here ignored the entire test suite — wrong: test files belong in VCS so
+# the suite is shareable + CI can run it. Setuptools controls packaging
+# via the explicit `packages = [...]` list in pyproject.toml, not via
+# .gitignore. Scoping to just the runtime artefacts the suite produces:
+tests/_generated/
+tests/.snapshot/
+tests/coverage/
+tests/htmlcov/
+tests/.cache/
 # Local clones / vendored deps
 optimade-python-tools/
 # Output artifacts
