@@ -75,19 +75,58 @@ GROUND_STATE_PHASE: dict[str, str] = {
 PHASES = ("bcc", "fcc", "hcp")
 
 
+def _radius_estimate_a(element: str, phase: str) -> float:
+    """Generalisable starting lattice parameter for ANY element.
+
+    These tables only seed the optimizer — this module's own docstring:
+    "Used only as starting guesses; subsequent cell relaxation finds the
+    actual minimum." So instead of a hardcoded ~10-element refractory dict
+    (which made the tool a one-example artefact), derive a physically sane
+    `a` from the element's covalent radius `r` via close-packing geometry.
+    MACE-MH-1 is a periodic-table-wide foundation MLIP; the only real
+    reason Cu/Ni/Si "weren't supported" was a missing dict entry.
+
+        bcc: nn on body diagonal, 2r = a·√3/2  -> a = 4r/√3
+        fcc: nn on face diagonal, 2r = a/√2    -> a = 2√2·r
+        hcp: basal nn,            a = 2r       (c = COA_IDEAL·a)
+    """
+    from ase.data import atomic_numbers, covalent_radii
+
+    z = atomic_numbers.get(element)
+    if not z:
+        raise KeyError(f"{element!r} is not a real chemical element")
+    r = float(covalent_radii[z])  # angstroms, defined for every element
+    if phase == "bcc":
+        return 4.0 * r / (3.0**0.5)
+    if phase == "fcc":
+        return 2.0 * (2.0**0.5) * r
+    if phase == "hcp":
+        return 2.0 * r
+    raise KeyError(f"unknown phase {phase!r}; expected one of {PHASES}")
+
+
 def lookup_a(element: str, phase: str) -> float:
-    """Look up starting lattice parameter for one element in one phase."""
+    """Starting lattice parameter for one element in one phase.
+
+    Curated value if we have one (preserves tuned refractory accuracy);
+    otherwise a covalent-radius estimate so the tool works for the whole
+    periodic table, not one alloy family.
+    """
     table = {"bcc": A_BCC, "fcc": A_FCC, "hcp": A_HCP}[phase]
-    return table[element]
+    a = table.get(element)
+    return a if a is not None else _radius_estimate_a(element, phase)
 
 
 def avg_a(composition: dict[str, int], phase: str) -> float:
-    """Composition-weighted average lattice parameter."""
-    table = {"bcc": A_BCC, "fcc": A_FCC, "hcp": A_HCP}[phase]
+    """Composition-weighted average starting lattice parameter (any elements)."""
     n = sum(composition.values())
-    return sum(table[el] * c for el, c in composition.items()) / n
+    return sum(lookup_a(el, phase) * c for el, c in composition.items()) / n
 
 
 def supported_elements() -> set[str]:
-    """All elements with a starting lattice parameter in at least BCC."""
-    return set(A_BCC) | set(A_FCC) | set(A_HCP)
+    """Every real chemical element — curated or radius-derived. The tool is
+    no longer gated to the refractory subset; MACE-MH-1 spans the periodic
+    table and the starting lattice is now derivable for any element."""
+    from ase.data import chemical_symbols
+
+    return {s for s in chemical_symbols if s and s != "X"}

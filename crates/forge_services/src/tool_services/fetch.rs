@@ -23,9 +23,23 @@ impl Default for ForgeFetch {
 
 impl ForgeFetch {
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
+        // Authoritative research sources (NASA NTRS, journals, Cloudflare-
+        // fronted sites) 403 the default reqwest user-agent. Observed live:
+        // NTRS GRCop-42 PDFs returned 403 to PRISM's mission research. A
+        // realistic browser UA + redirect/timeout policy makes the fetch
+        // tool usable for research-grade sources. Falls back to the bare
+        // client if the builder ever fails (never panics the tool).
+        let client = Client::builder()
+            .user_agent(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                 AppleWebKit/537.36 (KHTML, like Gecko) \
+                 Chrome/124.0.0.0 Safari/537.36",
+            )
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { client }
     }
 }
 
@@ -61,6 +75,78 @@ impl ForgeFetch {
             }
         }
         Ok(())
+    }
+
+    /// PRISM-native research path. Forge's raw `fetch` 403s / binary-rejects
+    /// scholarly hosts and is the wrong tool for literature. For those hosts
+    /// we *retire* the Forge raw path and route through PRISM's platform
+    /// research API (Semantic Scholar / arXiv / PubMed / OpenAlex). PRISM is
+    /// Forge with this organ swapped — not a layer on top. Credentials are
+    /// pipe-through: env first, else the already-present
+    /// `~/.prism/credentials.json`; nothing is persisted here.
+    async fn prism_research(&self, url: &Url) -> anyhow::Result<HttpResponse> {
+        let mut api_url = std::env::var("MARC27_API_URL")
+            .unwrap_or_else(|_| "https://api.marc27.com/api/v1".to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let mut token = std::env::var("MARC27_API_KEY").unwrap_or_default();
+        if token.is_empty() {
+            if let Ok(home) = std::env::var("HOME") {
+                let p = std::path::Path::new(&home).join(".prism/credentials.json");
+                if let Ok(txt) = std::fs::read_to_string(&p) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        token = v
+                            .get("access_token")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if let Some(pu) = v.get("platform_url").and_then(|x| x.as_str()) {
+                            let mut base = pu.trim_end_matches('/').to_string();
+                            if !base.ends_with("/api/v1") {
+                                base.push_str("/api/v1");
+                            }
+                            api_url = base;
+                        }
+                    }
+                }
+            }
+        }
+        if token.is_empty() {
+            return Err(anyhow!(
+                "Scholarly source {url} must go through PRISM's platform research API, \
+                 but no MARC27 credentials are available. Run `prism login`, then retry."
+            ));
+        }
+
+        let query = scholarly_query_from_url(url);
+        let endpoint = format!("{api_url}/knowledge/research/web-search");
+        let resp = self
+            .client
+            .post(&endpoint)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "query": query, "limit": 8 }))
+            .send()
+            .await
+            .map_err(|e| anyhow!("PRISM research API unreachable ({endpoint}): {e}"))?;
+        let code = resp.status().as_u16();
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "PRISM research API returned {code} for query {query:?}. {}",
+                body.chars().take(400).collect::<String>()
+            ));
+        }
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("PRISM research API returned non-JSON: {e}"))?;
+
+        Ok(HttpResponse {
+            content: format_research_results(&query, &data),
+            code,
+            context: ResponseContext::Parsed,
+            content_type: "text/markdown".to_string(),
+        })
     }
 
     async fn fetch_url(&self, url: &Url, force_raw: bool) -> anyhow::Result<HttpResponse> {
@@ -235,6 +321,76 @@ fn classify_request_error(url: &Url, e: &reqwest::Error) -> String {
     format!("Failed to fetch URL {url}: {e}")
 }
 
+/// Derive a research-search query from a URL (filename / last path
+/// segment), since the platform research API is query-based.
+fn scholarly_query_from_url(url: &Url) -> String {
+    let seg = url
+        .path_segments()
+        .and_then(|s| s.filter(|x| !x.is_empty()).last())
+        .unwrap_or("")
+        .to_string();
+    let mut q = seg.replace("%20", " ");
+    for ext in [".pdf", ".html", ".htm", ".abs", ".full", ".epdf"] {
+        if let Some(stripped) = q.strip_suffix(ext) {
+            q = stripped.to_string();
+        }
+    }
+    q = q.replace(['-', '_', '.', '/', '+'], " ");
+    let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
+    if q.is_empty() {
+        url.host_str().unwrap_or("research").to_string()
+    } else {
+        q
+    }
+}
+
+/// Render the platform research payload as citable markdown for the agent.
+fn format_research_results(query: &str, data: &serde_json::Value) -> String {
+    let mut out = format!(
+        "PRISM research search (Semantic Scholar / arXiv / PubMed / OpenAlex) for: {query}\n\
+         Forge's raw fetch was retired for this scholarly source and replaced by \
+         PRISM's platform research path. These are citable search hits — verify and \
+         cite, do not fabricate.\n\n"
+    );
+    let items = data
+        .get("results")
+        .or_else(|| data.get("papers"))
+        .or_else(|| data.get("items"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if items.is_empty() {
+        out.push_str(&format!(
+            "No results array in the platform response. Raw payload (truncated):\n{}\n",
+            serde_json::to_string_pretty(data)
+                .unwrap_or_default()
+                .chars()
+                .take(2000)
+                .collect::<String>()
+        ));
+        return out;
+    }
+    for (i, it) in items.iter().take(8).enumerate() {
+        let g = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let title = if g("title").is_empty() {
+            "(no title)"
+        } else {
+            g("title")
+        };
+        out.push_str(&format!(
+            "{}. {}\n   authors: {}\n   year: {}\n   url/doi: {} {}\n   abstract: {}\n\n",
+            i + 1,
+            title,
+            g("authors"),
+            it.get("year").map(|y| y.to_string()).unwrap_or_default(),
+            g("url"),
+            g("doi"),
+            g("abstract").chars().take(600).collect::<String>()
+        ));
+    }
+    out
+}
+
 /// Format a non-2xx HTTP status for the agent.
 ///   - 404 / 410 → URL doesn't exist (or no longer does); don't retry,
 ///     fall back to training knowledge or ask the user.
@@ -278,7 +434,21 @@ impl NetFetchService for ForgeFetch {
             )
         })?;
 
-        self.fetch_url(&parsed, raw.unwrap_or(false)).await
+        // General rule — NO host allowlist. Try Forge's raw fetch; if it
+        // fails the way Forge structurally cannot recover (auth wall,
+        // binary/PDF, anti-bot block) for ANY source, retire that dead-end
+        // and fall back to PRISM's native research path. Forge stays the
+        // path for everything it can actually deliver.
+        match self.fetch_url(&parsed, raw.unwrap_or(false)).await {
+            Ok(resp) => Ok(resp),
+            Err(forge_err) => match self.prism_research(&parsed).await {
+                Ok(resp) => Ok(resp),
+                Err(prism_err) => Err(anyhow!(
+                    "Forge fetch failed: {forge_err}\n\nPRISM research \
+                     fallback also failed: {prism_err}"
+                )),
+            },
+        }
     }
 }
 
@@ -489,5 +659,26 @@ mod tests {
         assert!(!is_binary_content_type("Application/JSON"));
         assert!(!is_binary_content_type("TEXT/HTML; charset=utf-8"));
         assert!(is_binary_content_type("Application/Gzip"));
+    }
+
+    // ── PRISM-native research query derivation ───────────────────────
+
+    #[test]
+    fn scholarly_query_derived_from_url_filename() {
+        let q = scholarly_query_from_url(
+            &Url::parse(
+                "https://ntrs.nasa.gov/api/citations/20210014640/downloads/\
+                 GRCop-42%20final%20Manuscript%20for%20NASA%20TM.pdf",
+            )
+            .unwrap(),
+        );
+        // %20 decoded, .pdf stripped, separators normalised to spaces.
+        assert_eq!(q, "GRCop 42 final Manuscript for NASA TM");
+    }
+
+    #[test]
+    fn scholarly_query_falls_back_to_host_when_no_path() {
+        let q = scholarly_query_from_url(&Url::parse("https://arxiv.org/").unwrap());
+        assert_eq!(q, "arxiv.org");
     }
 }

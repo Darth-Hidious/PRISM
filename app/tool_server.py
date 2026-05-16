@@ -10,7 +10,34 @@ import json
 import os
 import sys
 
-from app.plugins.bootstrap import build_full_registry
+
+def _install_stdout_firewall():
+    """Reserve the real stdout for the JSON-line protocol ONLY.
+
+    ``build_full_registry()`` (and tool execution) import heavy
+    third-party stacks — mace/torch/e3nn — and some emit a bare
+    ``print()`` at import time (e.g. ``mace.tools.cg`` when
+    cuequivariance is absent). Any byte on the real stdout that is not a
+    protocol line corrupts the wire and breaks every client.
+
+    We dup the real stdout file descriptor, then point BOTH OS fd 1 and
+    ``sys.stdout`` at stderr for the rest of the process; protocol
+    responses are written through the dup'd fd. fd-level (not merely a
+    ``sys.stdout`` swap) so C-extension writes and subprocess-inherited
+    fd 1 are caught too. Returns the line-buffered protocol stream.
+    """
+    sys.stdout.flush()
+    protocol_fd = os.dup(1)            # the real stdout — protocol owns it
+    os.dup2(2, 1)                      # OS fd 1 -> stderr (bare prints, C exts)
+    sys.stdout = sys.stderr           # Python-level prints -> stderr
+    return os.fdopen(protocol_fd, "w", buffering=1)
+
+
+# Firewall BEFORE importing bootstrap: the offending print fires during
+# the mace import that build_full_registry triggers.
+_PROTOCOL_OUT = _install_stdout_firewall()
+
+from app.plugins.bootstrap import build_full_registry  # noqa: E402
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -77,8 +104,8 @@ def main():
         else:
             response = _handle(tool_reg, request)
 
-        sys.stdout.write(json.dumps(response) + "\n")
-        sys.stdout.flush()
+        _PROTOCOL_OUT.write(json.dumps(response) + "\n")
+        _PROTOCOL_OUT.flush()
 
 
 if __name__ == "__main__":

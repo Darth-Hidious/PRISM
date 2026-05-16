@@ -152,5 +152,8 @@ fn service_info_to_peer(info: &ResolvedService) -> Option<PeerNode> {
         port: info.get_port(),
         last_seen: Utc::now(),
         capabilities,
+        // mDNS TXT records are size-constrained — manifest travels the
+        // Kafka `Announce` path, not mDNS.
+        manifest: None,
     })
 }

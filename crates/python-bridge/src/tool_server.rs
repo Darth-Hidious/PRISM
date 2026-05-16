@@ -45,6 +45,24 @@ impl ToolServer {
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
 
+        // Drain child stderr for the process lifetime. stderr is piped (so
+        // it never reaches the operator's terminal and can never corrupt
+        // the stdout JSON-line protocol), but a piped stream that is never
+        // read fills the ~64KB OS pipe buffer and then BLOCKS the Python
+        // process on its next stderr write — hanging the entire tool
+        // layer. The Python side deliberately routes ALL non-protocol
+        // output (heavy import banners, library warnings, tool logs) to
+        // stderr, so this volume is real. Forward each line to tracing so
+        // it stays observable for audit instead of being silently lost.
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "python_tool_server::stderr", "{line}");
+                }
+            });
+        }
+
         tracing::info!(
             cwd = %self.project_root.display(),
             "spawned python tool server"

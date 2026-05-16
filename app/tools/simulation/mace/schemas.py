@@ -48,11 +48,18 @@ DevicePref = Literal["auto", "gpu", "cpu"]
 Dtype = Literal["float32", "float64"]
 
 
-# Allowed alloying elements — defines schema-level validity for compositions.
-# Mirrors mace_core.lattices.A_BCC (the widest table).
-ALLOWED_ELEMENTS = frozenset(
-    {"Al", "Fe", "Hf", "Mo", "Nb", "Ta", "Ti", "V", "W", "Zr"}
-)
+# Schema-level element validity. NOT a hardcoded alloy-family allowlist —
+# that made the tool a one-example artefact and rejected Cu/Ni/Si though
+# MACE-MH-1 spans the periodic table. The only invalid element is a
+# non-element (typo/garbage); every real chemical symbol is accepted, and
+# `mace_core.lattices.lookup_a` derives a starting lattice for any of them.
+def _real_elements() -> frozenset[str]:
+    from ase.data import chemical_symbols
+
+    return frozenset(s for s in chemical_symbols if s and s != "X")
+
+
+ALLOWED_ELEMENTS = _real_elements()
 
 
 class _Base(BaseModel):

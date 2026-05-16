@@ -21,6 +21,7 @@ pub mod federation_lookup;
 pub mod kafka;
 pub mod locality;
 pub mod mdns;
+pub mod node_systems;
 pub mod platform_discovery;
 pub mod protocol;
 pub mod subscription;
@@ -66,6 +67,13 @@ pub struct PeerNode {
     pub port: u16,
     pub last_seen: DateTime<Utc>,
     pub capabilities: Vec<String>,
+    /// Structured federation declaration (slice 1+2). `None` until the
+    /// peer announced one over a transport that carries it (Kafka
+    /// `Announce`); mDNS TXT records are size-constrained and do not.
+    /// A declared manifest is a CLAIM only — it grants nothing until the
+    /// peer is trust-verified (see [`node_systems::manifest_trusted`]).
+    #[serde(default)]
+    pub manifest: Option<node_systems::NodeSystemsManifest>,
 }
 
 // ── Mesh handle ────────────────────────────────────────────────────
@@ -281,6 +289,7 @@ mod tests {
             port: 9100,
             last_seen: Utc::now(),
             capabilities: vec!["compute".into()],
+            manifest: None,
         }
     }
 

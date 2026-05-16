@@ -24,6 +24,7 @@ fn make_peer(id: Uuid, name: &str, port: u16) -> PeerNode {
         port,
         last_seen: Utc::now(),
         capabilities: vec!["compute".into()],
+        manifest: None,
     }
 }
 
@@ -52,6 +53,7 @@ async fn sync_handler_announce_adds_peer() {
         address: "192.168.1.50".into(),
         port: 9100,
         capabilities: vec!["gpu".into()],
+        manifest: None,
     })
     .await
     .unwrap();
@@ -93,6 +95,7 @@ async fn sync_handler_ignores_own_announce() {
         address: "127.0.0.1".into(),
         port: 9100,
         capabilities: vec![],
+        manifest: None,
     })
     .await
     .unwrap();
@@ -294,6 +297,7 @@ async fn sync_handler_full_lifecycle() {
         address: "10.0.0.5".into(),
         port: 9200,
         capabilities: vec!["storage".into()],
+        manifest: None,
     })
     .await
     .unwrap();
@@ -363,6 +367,7 @@ async fn sync_handler_multiple_peers() {
             address: "10.0.0.1".into(),
             port: 9100,
             capabilities: vec![],
+            manifest: None,
         })
         .await
         .unwrap();
@@ -411,6 +416,7 @@ async fn sync_handler_duplicate_announce_ignored() {
             address: "10.0.0.1".into(),
             port: 9100,
             capabilities: vec![],
+            manifest: None,
         })
         .await
         .unwrap();

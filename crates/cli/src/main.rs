@@ -1763,6 +1763,13 @@ async fn main() -> Result<()> {
                                         address: "127.0.0.1".to_string(),
                                         port: dashboard_port,
                                         capabilities: vec![],
+                                        // Local node declares no manifest yet:
+                                        // the source for THIS node's declared
+                                        // systems/tools is an open design
+                                        // question (config? tool registry?).
+                                        // Until decided, emit None — peers
+                                        // fail-closed on it anyway.
+                                        manifest: None,
                                     };
                                     if let Err(e) = announce_producer.publish(&msg).await {
                                         tracing::warn!(error = %e, "failed to announce node via Kafka");

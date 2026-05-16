@@ -82,6 +82,9 @@ impl<'a> PlatformDiscovery<'a> {
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(Utc::now),
                 capabilities,
+                // Platform NodeDetail has no manifest field yet; when it
+                // gains one, populate here (additive).
+                manifest: None,
             });
         }
 

@@ -21,11 +21,12 @@ class TestSkillRegistry:
         assert "materials_discovery" in names
         assert "plan_simulations" in names
         assert "analyze_phases" in names
+        assert "alloy_discovery" in names  # MACE-driven pipeline skill (a9536d2)
         # Dataset-shaped skills GONE — collapsed into the `dataset` Tool
         assert "validate_dataset" not in names
         assert "review_dataset" not in names
         assert "visualize_dataset" not in names
-        assert len(skills) == 7  # 10 - 3 (dataset trio collapsed out)
+        assert len(skills) == 8  # 7 workflow skills + alloy_discovery
 
     def test_all_convert_to_tools(self):
         reg = load_builtin_skills()
@@ -33,7 +34,7 @@ class TestSkillRegistry:
         reg.register_all_as_tools(tool_reg)
 
         tools = tool_reg.list_tools()
-        assert len(tools) == 7
+        assert len(tools) == 8
         for tool in tools:
             assert tool.name
             assert tool.description

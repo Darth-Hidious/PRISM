@@ -94,11 +94,20 @@ class LocalBackend(Backend):
     def _cif_text(self, atoms) -> str:
         from ase.io import write as ase_write
 
-        buf = io.StringIO()
         atoms_clean = atoms.copy()
         atoms_clean.calc = None
-        ase_write(buf, atoms_clean, format="cif")
-        return buf.getvalue()
+        # ASE's CIF writer is text in some versions, bytes in others
+        # (e.g. fd.write(loop.tostring()) emits bytes -> a StringIO
+        # rejects it with "string argument expected, got 'bytes'").
+        # Be version-robust: prefer a text buffer, fall back to binary.
+        try:
+            buf = io.StringIO()
+            ase_write(buf, atoms_clean, format="cif")
+            return buf.getvalue()
+        except TypeError:
+            bbuf = io.BytesIO()
+            ase_write(bbuf, atoms_clean, format="cif")
+            return bbuf.getvalue().decode("utf-8")
 
     # ------------------------------------------------------------------
     def _relax(self, job: BackendJob, progress: ProgressCb | None) -> dict[str, Any]:

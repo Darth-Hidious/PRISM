@@ -20,7 +20,9 @@ when a JAX-native MLIP would do.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
+import threading
 from typing import Any
 
 from app.tools.base import Tool, ToolRegistry
@@ -43,15 +45,93 @@ def _guard() -> dict[str, Any] | None:
     return None
 
 
+class _PersistentLoop:
+    """One asyncio loop on a daemon thread, for the whole process lifetime.
+
+    Why this and not a per-call loop:
+
+    ``JobRunner.submit`` does ``asyncio.create_task(self._run_one(...))``
+    (fire-and-forget worker) and returns a ``JobHandle`` immediately;
+    ``_run_one`` then writes status/result to the disk-backed ``JobStore``
+    as the backend runs. That design *requires* an event loop that
+    OUTLIVES the submit call.
+
+    A per-call loop forces a lose-lose:
+      * ``asyncio.run`` / ``new_event_loop`` tears down right after submit
+        returns → the still-pending ``_run_one`` is cancelled before it
+        runs (the observed ``status:"cancelled"`` ~1ms after start); or
+      * draining the spawned tasks before teardown makes submit BLOCK
+        until the job finishes → every candidate serialises → any real
+        grid (e.g. alloy_discovery) blows its wall-clock deadline.
+
+    One persistent loop dissolves the dilemma: ``submit`` returns at once,
+    ``_run_one`` keeps running on the loop, and independent jobs run
+    concurrently in the runner's ``ThreadPoolExecutor``. The sync
+    Tool.func contract is honoured by scheduling the coroutine onto the
+    loop thread via ``run_coroutine_threadsafe`` and blocking only on the
+    *coroutine's own* result (which, for submit, is the fast handle).
+    """
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def _ensure(self) -> asyncio.AbstractEventLoop:
+        # Double-checked init so the loop/thread are created exactly once
+        # even under concurrent first calls.
+        if self._loop is not None and self._loop.is_running():
+            return self._loop
+        with self._lock:
+            if self._loop is not None and self._loop.is_running():
+                return self._loop
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever,
+                name="mace-jobrunner-loop",
+                daemon=True,
+            )
+            thread.start()
+            self._loop = loop
+            self._thread = thread
+            atexit.register(self._close)
+            return loop
+
+    def run(self, coro: Any, timeout: float = 300.0) -> Any:
+        """Run ``coro`` to completion on the persistent loop and return it.
+
+        For ``JobRunner.submit`` coroutines this returns the JobHandle
+        quickly while the spawned ``_run_one`` task continues running on
+        this same loop — never cancelled, never serialised.
+        """
+        loop = self._ensure()
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result(timeout=timeout)
+
+    def _close(self) -> None:
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+
+
+_PERSISTENT_LOOP = _PersistentLoop()
+
+
 def _run_async(coro: Any) -> Any:
     """Bridge an async primitive call into PRISM's sync Tool.func contract.
 
-    PRISM tool_server.py runs synchronously over stdin/stdout JSON-line. The
-    mace primitives are async because JobRunner submits work to a thread
-    pool. asyncio.run() builds a fresh event loop per call, which is fine
-    for one-shot tool invocations (no outer asyncio context to reuse).
+    PRISM tool_server.py runs synchronously over stdin/stdout JSON-line;
+    the mace primitives are async because JobRunner submits work to a
+    thread pool and returns a handle the agent later polls. All such
+    coroutines run on a single process-lifetime loop (see
+    :class:`_PersistentLoop` for the full rationale) so submit is
+    non-blocking and concurrent jobs stay concurrent.
     """
-    return asyncio.run(coro)
+    return _PERSISTENT_LOOP.run(coro)
 
 
 def _ok_dump(model_obj: Any) -> dict[str, Any]:
@@ -177,7 +257,7 @@ def _mace_estimate_cost(**kwargs: Any) -> dict[str, Any]:
 
         inp = EstimateCostInput(**kwargs)
         bridge = get_mace_bridge()
-        result = estimate_cost(inp, bridge.runner)
+        result = _run_async(estimate_cost(inp, bridge.runner))
         return _ok_dump(result)
     except Exception as e:  # noqa: BLE001
         logger.exception("mace_estimate_cost failed")
@@ -195,7 +275,7 @@ def _mace_get_job(**kwargs: Any) -> dict[str, Any]:
 
         inp = GetJobInput(**kwargs)
         bridge = get_mace_bridge()
-        result = get_job(inp, bridge.runner)
+        result = _run_async(get_job(inp, bridge.runner))
         return _ok_dump(result)
     except Exception as e:  # noqa: BLE001
         logger.exception("mace_get_job failed")
@@ -213,7 +293,7 @@ def _mace_list_jobs(**kwargs: Any) -> dict[str, Any]:
 
         inp = ListJobsInput(**kwargs)
         bridge = get_mace_bridge()
-        result = list_jobs(inp, bridge.runner)
+        result = _run_async(list_jobs(inp, bridge.runner))
         return _ok_dump(result)
     except Exception as e:  # noqa: BLE001
         logger.exception("mace_list_jobs failed")
@@ -231,7 +311,7 @@ def _mace_cancel_job(**kwargs: Any) -> dict[str, Any]:
 
         inp = CancelJobInput(**kwargs)
         bridge = get_mace_bridge()
-        result = cancel_job(inp, bridge.runner)
+        result = _run_async(cancel_job(inp, bridge.runner))
         return _ok_dump(result)
     except Exception as e:  # noqa: BLE001
         logger.exception("mace_cancel_job failed")
@@ -249,7 +329,7 @@ def _mace_get_cached_structure(**kwargs: Any) -> dict[str, Any]:
 
         inp = GetCachedStructureInput(**kwargs)
         bridge = get_mace_bridge()
-        result = get_cached_structure(inp, bridge.cache)
+        result = _run_async(get_cached_structure(inp, bridge.cache))
         return _ok_dump(result)
     except Exception as e:  # noqa: BLE001
         logger.exception("mace_get_cached_structure failed")
@@ -381,6 +461,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         },
         func=_mace_relax_structure,
         requires_approval=True,
+        requires_elicitation=True,
         source="builtin",
         source_detail="app.tools.mace",
     ))
@@ -409,6 +490,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         },
         func=_mace_md_equilibrate,
         requires_approval=True,
+        requires_elicitation=True,
         source="builtin",
         source_detail="app.tools.mace",
     ))
@@ -443,6 +525,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         },
         func=_mace_phonon_harmonic,
         requires_approval=True,
+        requires_elicitation=True,
         source="builtin",
         source_detail="app.tools.mace",
     ))
@@ -475,6 +558,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         },
         func=_mace_compute_elastic,
         requires_approval=True,
+        requires_elicitation=True,
         source="builtin",
         source_detail="app.tools.mace",
     ))
@@ -507,6 +591,7 @@ def create_mace_tools(registry: ToolRegistry) -> None:
         },
         func=_mace_compute_dilute_solute,
         requires_approval=True,
+        requires_elicitation=True,
         source="builtin",
         source_detail="app.tools.mace",
     ))

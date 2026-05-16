@@ -119,6 +119,13 @@ def build_full_registry(
     from app.tools.labs import create_labs_tools
     create_labs_tools(registry)
 
+    # Informed-autonomy elicitation gate. No heavy deps — always register,
+    # BEFORE any simulation tools, so the gate-satisfying pair
+    # (propose_research_spec / confirm_research_spec) always exists when a
+    # gated simulation tool refuses. See app/tools/elicitation.py.
+    from app.tools.elicitation import create_elicitation_tools
+    create_elicitation_tools(registry)
+
     # Simulation tools (optional — pyiron may not be installed)
     try:
         from app.tools.simulation.bridge import check_pyiron_available

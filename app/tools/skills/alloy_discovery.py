@@ -125,19 +125,14 @@ def _alloy_discovery(**kwargs) -> dict[str, Any]:
         "title", f"Alloy discovery: {'-'.join(base_elements)} {phase.upper()}"
     )
 
-    # Import the tool-server side at execution time so the skill module
-    # itself is import-safe even when the registry hasn't been wired yet
-    # (e.g. test collection on a fresh interpreter).
-    from app.tools.simulation.mace_bridge import get_mace_bridge
-    from app.tools.simulation.mace.schemas import (
-        ComputeElasticInput,
-        RelaxStructureInput,
+    # Dispatch through the canonical sync wrappers in app/tools/mace.py. They
+    # already handle asyncio bridging + backends-dict plumbing. Direct Python
+    # imports follow the existing skill pattern (see discovery.py).
+    from app.tools.mace import (
+        _mace_compute_elastic,
+        _mace_get_job,
+        _mace_relax_structure,
     )
-    from app.tools.simulation.mace.control import get_job
-    from app.tools.simulation.mace import primitives
-
-    bridge = get_mace_bridge()
-    runner = bridge.runner
 
     rows: list[dict[str, Any]] = []
     t0 = time.monotonic()
@@ -152,33 +147,30 @@ def _alloy_discovery(**kwargs) -> dict[str, Any]:
         formula = _formula_repr(atoms)
         row: dict[str, Any] = {"index": cand_idx, "formula": formula, "atoms": atoms}
 
-        # Step 1: relax
-        try:
-            relax_inp = RelaxStructureInput(
-                composition={"atoms": atoms},
-                phase=phase,
-                n_atoms=sum(atoms.values()),
-            )
-            relax_handle = primitives.relax_structure(relax_inp, runner)
-            row["relax_job_id"] = relax_handle.job_id
-        except Exception as e:
-            row["relax_error"] = f"{type(e).__name__}: {e}"
+        # Step 1: relax (returns JobHandle dict; status starts at queued)
+        relax_handle = _mace_relax_structure(
+            composition={"atoms": atoms},
+            phase=phase,
+            n_atoms=sum(atoms.values()),
+        )
+        if isinstance(relax_handle, dict) and "error" in relax_handle:
+            row["relax_error"] = relax_handle["error"]
             rows.append(row)
             continue
+        row["relax_job_id"] = relax_handle.get("job_id")
 
-        # Step 2: elastic
-        try:
-            elastic_inp = ComputeElasticInput(
-                structure={
-                    "composition": {"atoms": atoms},
-                    "phase": phase,
-                    "n_atoms": sum(atoms.values()),
-                },
-            )
-            elastic_handle = primitives.compute_elastic(elastic_inp, runner)
-            row["elastic_job_id"] = elastic_handle.job_id
-        except Exception as e:
-            row["elastic_error"] = f"{type(e).__name__}: {e}"
+        # Step 2: elastic (separate job; will wait below)
+        elastic_handle = _mace_compute_elastic(
+            structure={
+                "composition": {"atoms": atoms},
+                "phase": phase,
+                "n_atoms": sum(atoms.values()),
+            },
+        )
+        if isinstance(elastic_handle, dict) and "error" in elastic_handle:
+            row["elastic_error"] = elastic_handle["error"]
+        else:
+            row["elastic_job_id"] = elastic_handle.get("job_id")
 
         rows.append(row)
 
@@ -196,18 +188,14 @@ def _alloy_discovery(**kwargs) -> dict[str, Any]:
         for formula, (relax_jid, elastic_jid) in pending.items():
             row = next(r for r in rows if r.get("formula") == formula)
             if relax_jid and "relax" not in row:
-                from app.tools.simulation.mace.schemas import GetJobInput
-
-                h = get_job(GetJobInput(job_id=relax_jid), runner)
-                if h.status in ("completed", "failed", "cancelled"):
-                    row["relax"] = h.model_dump()
+                h = _mace_get_job(job_id=relax_jid)
+                if isinstance(h, dict) and h.get("status") in ("completed", "failed", "cancelled"):
+                    row["relax"] = h
                     relax_jid = None
             if elastic_jid and "elastic" not in row:
-                from app.tools.simulation.mace.schemas import GetJobInput
-
-                h = get_job(GetJobInput(job_id=elastic_jid), runner)
-                if h.status in ("completed", "failed", "cancelled"):
-                    row["elastic"] = h.model_dump()
+                h = _mace_get_job(job_id=elastic_jid)
+                if isinstance(h, dict) and h.get("status") in ("completed", "failed", "cancelled"):
+                    row["elastic"] = h
                     elastic_jid = None
             if relax_jid or elastic_jid:
                 still_pending[formula] = (relax_jid, elastic_jid)
@@ -327,4 +315,5 @@ ALLOY_DISCOVERY_SKILL = Skill(
     func=_alloy_discovery,
     category="discovery",
     requires_approval=True,
+    requires_elicitation=True,
 )

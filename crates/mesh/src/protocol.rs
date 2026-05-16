@@ -14,6 +14,11 @@ pub enum MeshMessage {
         address: String,
         port: u16,
         capabilities: Vec<String>,
+        /// Structured federation declaration. `#[serde(default)]` keeps
+        /// older announces (no manifest) wire-compatible. A claim only —
+        /// trust is enforced separately (`node_systems::manifest_trusted`).
+        #[serde(default)]
+        manifest: Option<crate::node_systems::NodeSystemsManifest>,
     },
 
     /// A node is leaving the mesh gracefully.
@@ -76,6 +81,13 @@ mod tests {
             address: "192.168.1.10".into(),
             port: 9100,
             capabilities: vec!["compute".into(), "storage".into()],
+            // Carry a real manifest so the new field's wire round-trip
+            // (incl. #[serde(default)] back-compat) is covered.
+            manifest: Some(crate::node_systems::NodeSystemsManifest::new(
+                Uuid::new_v4(),
+                vec!["Cu".into(), "Ni".into()],
+                vec!["mace_relax".into()],
+            )),
         };
         let back = rt(&msg);
         // Compare via JSON since MeshMessage doesn't derive PartialEq
@@ -93,6 +105,7 @@ mod tests {
             address: "127.0.0.1".into(),
             port: 1,
             capabilities: vec![],
+            manifest: None,
         };
         let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "Announce");

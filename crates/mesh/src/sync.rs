@@ -52,6 +52,7 @@ pub async fn run_sync_handler(
                 address,
                 port,
                 capabilities,
+                manifest,
             } => {
                 if node_id == our_node_id {
                     continue; // ignore our own announcements
@@ -65,10 +66,21 @@ pub async fn run_sync_handler(
                 const MAX_CAPABILITIES: usize = 64;
                 const MAX_CAPABILITY_LEN: usize = 256;
                 const MAX_PEERS: usize = 10_000;
+                // Same Bug #57 DoS reasoning extended to the manifest: a
+                // Kafka-reachable peer must not be able to announce an
+                // unbounded declared_systems / tool_names list.
+                const MAX_MANIFEST_ITEMS: usize = 256;
+                let manifest_oversized = manifest.as_ref().is_some_and(|m| {
+                    m.declared_systems.len() > MAX_MANIFEST_ITEMS
+                        || m.tool_names.len() > MAX_MANIFEST_ITEMS
+                        || m.declared_systems.iter().any(|s| s.len() > MAX_CAPABILITY_LEN)
+                        || m.tool_names.iter().any(|t| t.len() > MAX_CAPABILITY_LEN)
+                });
                 if name.len() > MAX_NAME_LEN
                     || address.len() > MAX_ADDRESS_LEN
                     || capabilities.len() > MAX_CAPABILITIES
                     || capabilities.iter().any(|c| c.len() > MAX_CAPABILITY_LEN)
+                    || manifest_oversized
                 {
                     warn!(
                         %node_id,
@@ -87,6 +99,7 @@ pub async fn run_sync_handler(
                     port,
                     last_seen: chrono::Utc::now(),
                     capabilities,
+                    manifest,
                 };
                 let mut list = peers.write().unwrap_or_else(|e| e.into_inner());
                 if list.iter().any(|p| p.node_id == node_id) {

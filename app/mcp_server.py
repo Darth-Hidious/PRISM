@@ -1,15 +1,48 @@
 """PRISM MCP Server — exposes all tools to external MCP hosts."""
+import contextlib
 import json
 import inspect
+import os
+import sys
 from typing import Annotated, Optional
 
 from app.tools.base import Tool, ToolRegistry
 
 
+@contextlib.contextmanager
+def _stdout_to_stderr():
+    """Route stdout → stderr for the duration of the block, then restore.
+
+    FastMCP speaks JSON-RPC over stdout; ``build_full_registry()`` imports
+    heavy third-party stacks (mace/torch/e3nn) and some emit a bare
+    ``print()`` at import time (e.g. ``mace.tools.cg``). That byte would
+    corrupt the MCP frame. We redirect at the fd level (catches
+    C-extension writes too) only while building the registry, then put
+    the real stdout back so FastMCP gets a pristine channel.
+    """
+    sys.stdout.flush()
+    saved_fd = os.dup(1)
+    saved_sys = sys.stdout
+    try:
+        os.dup2(2, 1)
+        sys.stdout = sys.stderr
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved_fd, 1)
+        os.close(saved_fd)
+        sys.stdout = saved_sys
+
+
 def _build_registry() -> ToolRegistry:
-    """Build a full tool registry with all PRISM tools and skills."""
+    """Build a full tool registry with all PRISM tools and skills.
+
+    Registry construction triggers the heavy imports; keep their stdout
+    noise off the MCP wire (see :func:`_stdout_to_stderr`).
+    """
     from app.plugins.bootstrap import build_full_registry
-    tool_reg, _provider_reg, _agent_reg = build_full_registry(enable_mcp=False)
+    with _stdout_to_stderr():
+        tool_reg, _provider_reg, _agent_reg = build_full_registry(enable_mcp=False)
     return tool_reg
 
 

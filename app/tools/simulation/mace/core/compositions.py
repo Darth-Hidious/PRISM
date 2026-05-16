@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .lattices import A_BCC, A_FCC, A_HCP, COA_IDEAL, GROUND_STATE_PHASE
+from .lattices import COA_IDEAL, GROUND_STATE_PHASE, lookup_a
 
 if TYPE_CHECKING:
     pass
@@ -69,14 +69,27 @@ def pure_element_energy(symbol: str, calc, fmax: float = 0.02, steps: int = 80) 
     from ase.filters import FrechetCellFilter
     from ase.optimize import LBFGS
 
-    gs = GROUND_STATE_PHASE[symbol]
+    gs = GROUND_STATE_PHASE.get(symbol)
     if gs == "bcc":
-        atoms = bulk(symbol, "bcc", a=A_BCC[symbol], cubic=True) * (3, 3, 3)
+        atoms = bulk(symbol, "bcc", a=lookup_a(symbol, "bcc"), cubic=True)
     elif gs == "fcc":
-        atoms = bulk(symbol, "fcc", a=A_FCC[symbol], cubic=True) * (3, 3, 3)
-    else:  # hcp
-        a = A_HCP[symbol]
-        atoms = bulk(symbol, "hcp", a=a, c=a * COA_IDEAL) * (3, 3, 3)
+        atoms = bulk(symbol, "fcc", a=lookup_a(symbol, "fcc"), cubic=True)
+    elif gs == "hcp":
+        a = lookup_a(symbol, "hcp")
+        atoms = bulk(symbol, "hcp", a=a, c=a * COA_IDEAL)
+    else:
+        # General path — no curated ground state. ASE's periodic-table
+        # reference states pick the element's real structure for ANY
+        # element (Cu->fcc, Si->diamond, ...). This is why the tool is no
+        # longer a refractory-only artefact.
+        try:
+            atoms = bulk(symbol)
+        except (ValueError, KeyError) as exc:
+            raise KeyError(
+                f"no ground-state reference for {symbol!r}: not curated and "
+                f"ASE has no reference state ({exc})"
+            ) from exc
+    atoms = atoms * (3, 3, 3)
     atoms.calc = calc
     flt = FrechetCellFilter(atoms)
     LBFGS(flt, logfile=None).run(fmax=fmax, steps=steps)
