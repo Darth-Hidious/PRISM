@@ -30,17 +30,10 @@ def load_builtin_skills() -> SkillRegistry:
     registry.register(SIM_PLAN_SKILL)
     registry.register(PHASE_ANALYSIS_SKILL)
 
-    # MACE-driven alloy discovery — pipeline skill. Optional: only loads if
-    # the MACE bridge is available (mace-torch + ase + python-ulid installed).
-    try:
-        from app.tools.simulation.mace_bridge import check_mace_available
-
-        if check_mace_available():
-            from app.tools.skills.alloy_discovery import ALLOY_DISCOVERY_SKILL
-
-            registry.register(ALLOY_DISCOVERY_SKILL)
-    except Exception:  # noqa: BLE001 — never break load_builtin_skills on optional skill
-        import logging
-        logging.getLogger(__name__).exception("alloy_discovery skill not registered")
+    # NOTE: alloy discovery is NOT a client-side Python pipeline skill.
+    # Multi-tool composition is a declarative YAML workflow the agent
+    # orchestrates (app/workflows/), or one the agent synthesizes from
+    # intent (Mission IR). The former imperative ALLOY_DISCOVERY_SKILL
+    # was the anti-pattern and has been retired.
 
     return registry

@@ -31,10 +31,6 @@ class Skill:
     func: Callable
     category: str = "skill"
     requires_approval: bool = False
-    # Informed-autonomy gate — see app.tools.elicitation. Skills that
-    # orchestrate heavy compute set this True so the converted Tool
-    # refuses until a matching ResearchSpec is human-confirmed.
-    requires_elicitation: bool = False
 
     def to_tool(self) -> Tool:
         """Convert this Skill to a Tool for ToolRegistry."""
@@ -44,7 +40,6 @@ class Skill:
             input_schema=self.input_schema,
             func=self.func,
             requires_approval=self.requires_approval,
-            requires_elicitation=self.requires_elicitation,
         )
 
 

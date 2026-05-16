@@ -141,13 +141,14 @@ def _prism_mace_screening_factory(registry: ToolRegistry):
     """Thin alias from SFT-era `prism_mace_screening` to a single MACE primitive.
 
     Per the architecture directive: this is a NAME alias, not an orchestrator.
-    It forwards a single composition to `mace_relax_structure`. For multi-step
-    workflows (relax + elastic + phase analysis + report) use the
-    `alloy_discovery` Skill instead — that's where orchestration lives.
+    It forwards a single composition to `mace_relax_structure`. Multi-step
+    orchestration (relax + elastic + phase analysis + report) is NOT a
+    client-side Python pipeline — express it as a declarative workflow the
+    agent runs (see app/workflows/; PRISM is the client).
 
     Accepts the SFT-shaped args ({compositions, target_properties}) and
     silently uses the first composition. If multiple are passed, returns a
-    structured hint pointing the agent at the `alloy_discovery` skill.
+    structured hint pointing the agent at a workflow.
     """
 
     def _impl(compositions: list[str] | str = None, target_properties: list[str] | str = None, **kwargs):
@@ -161,12 +162,12 @@ def _prism_mace_screening_factory(registry: ToolRegistry):
         if len(comps) > 1:
             return {
                 "error": "alias_scope_exceeded",
-                "alias_canonical_tool": "alloy_discovery (skill)",
+                "alias_canonical_tool": "workflow (declarative)",
                 "reason": (
                     f"prism_mace_screening is a single-composition alias for mace_relax_structure. "
-                    f"You passed {len(comps)} compositions. For multi-composition screening with "
-                    f"relax + elastic + phase analysis + report orchestration, call the "
-                    f"`alloy_discovery` skill instead."
+                    f"You passed {len(comps)} compositions. Multi-composition screening with "
+                    f"relax + elastic + phase analysis + report is a declarative workflow the "
+                    f"agent orchestrates — not a single tool call."
                 ),
             }
 
@@ -227,9 +228,9 @@ def create_legacy_aliases(registry: ToolRegistry) -> None:
                 description=(
                     "[LEGACY ALIAS — canonical: mace_relax_structure] Single-composition "
                     "structural relaxation via MACE-MH-1. Returns a JobHandle; poll via "
-                    "mace_get_job. For multi-composition screening with relax + elastic + "
-                    "phase analysis + report orchestration, use the `alloy_discovery` skill — "
-                    "that's the canonical entry point for full-pipeline discovery."
+                    "mace_get_job. Multi-composition screening with relax + elastic + "
+                    "phase analysis + report is a declarative workflow the agent "
+                    "orchestrates over these tools — not a single call."
                 ),
                 input_schema={
                     "type": "object",
