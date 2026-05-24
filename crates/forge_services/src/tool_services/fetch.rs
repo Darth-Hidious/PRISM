@@ -90,24 +90,24 @@ impl ForgeFetch {
             .trim_end_matches('/')
             .to_string();
         let mut token = std::env::var("MARC27_API_KEY").unwrap_or_default();
-        if token.is_empty() {
-            if let Ok(home) = std::env::var("HOME") {
-                let p = std::path::Path::new(&home).join(".prism/credentials.json");
-                if let Ok(txt) = std::fs::read_to_string(&p) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                        token = v
-                            .get("access_token")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if let Some(pu) = v.get("platform_url").and_then(|x| x.as_str()) {
-                            let mut base = pu.trim_end_matches('/').to_string();
-                            if !base.ends_with("/api/v1") {
-                                base.push_str("/api/v1");
-                            }
-                            api_url = base;
-                        }
+        if token.is_empty()
+            && let Ok(home) = std::env::var("HOME")
+        {
+            let p = std::path::Path::new(&home).join(".prism/credentials.json");
+            if let Ok(txt) = std::fs::read_to_string(&p)
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
+            {
+                token = v
+                    .get("access_token")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(pu) = v.get("platform_url").and_then(|x| x.as_str()) {
+                    let mut base = pu.trim_end_matches('/').to_string();
+                    if !base.ends_with("/api/v1") {
+                        base.push_str("/api/v1");
                     }
+                    api_url = base;
                 }
             }
         }
@@ -326,7 +326,7 @@ fn classify_request_error(url: &Url, e: &reqwest::Error) -> String {
 fn scholarly_query_from_url(url: &Url) -> String {
     let seg = url
         .path_segments()
-        .and_then(|s| s.filter(|x| !x.is_empty()).last())
+        .and_then(|mut s| s.rfind(|x| !x.is_empty()))
         .unwrap_or("")
         .to_string();
     let mut q = seg.replace("%20", " ");

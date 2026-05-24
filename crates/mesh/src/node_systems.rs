@@ -50,11 +50,7 @@ pub struct NodeSystemsManifest {
 
 impl NodeSystemsManifest {
     /// Build a manifest stamped at the current instant.
-    pub fn new(
-        node_id: Uuid,
-        declared_systems: Vec<String>,
-        tool_names: Vec<String>,
-    ) -> Self {
+    pub fn new(node_id: Uuid, declared_systems: Vec<String>, tool_names: Vec<String>) -> Self {
         Self {
             node_id,
             declared_systems,
@@ -73,8 +69,7 @@ impl NodeSystemsManifest {
         if query_scope.is_empty() {
             return true;
         }
-        let declared: HashSet<&str> =
-            self.declared_systems.iter().map(String::as_str).collect();
+        let declared: HashSet<&str> = self.declared_systems.iter().map(String::as_str).collect();
         query_scope.iter().any(|q| declared.contains(q.as_str()))
     }
 }
@@ -187,8 +182,7 @@ mod tests {
                 valid_until: Utc::now() + Duration::hours(1),
             };
             let id_bytes = identity.signing_bytes().unwrap();
-            identity.platform_signature_hex =
-                hex::encode(platform_key.sign(&id_bytes).to_bytes());
+            identity.platform_signature_hex = hex::encode(platform_key.sign(&id_bytes).to_bytes());
             let req = CrossOrgRequest::sign(
                 &node_key,
                 identity,
@@ -207,7 +201,7 @@ mod tests {
             let m = manifest(&["Cu"], &["mace_relax"]);
             let pk = SigningKey::generate(&mut OsRng).verifying_key();
             assert!(!manifest_trusted(&m, None, &pk, None, SystemTime::now()));
-            let got = discoverable_tools(&scope(&["Cu"]), &[m.clone()], |mm| {
+            let got = discoverable_tools(&scope(&["Cu"]), std::slice::from_ref(&m), |mm| {
                 manifest_trusted(mm, None, &pk, None, SystemTime::now())
             });
             assert!(got.is_empty(), "fail-closed must surface nothing");
@@ -217,12 +211,14 @@ mod tests {
         fn verified_request_for_same_node_makes_tools_discoverable() {
             let node = Uuid::new_v4();
             let (pk, req) = signed_for(node);
-            let m = NodeSystemsManifest::new(
-                node,
-                vec!["Cu".into()],
-                vec!["mace_relax".into()],
-            );
-            assert!(manifest_trusted(&m, Some(&req), &pk, None, SystemTime::now()));
+            let m = NodeSystemsManifest::new(node, vec!["Cu".into()], vec!["mace_relax".into()]);
+            assert!(manifest_trusted(
+                &m,
+                Some(&req),
+                &pk,
+                None,
+                SystemTime::now()
+            ));
             let got = discoverable_tools(&scope(&["Cu"]), &[m], |mm| {
                 manifest_trusted(mm, Some(&req), &pk, None, SystemTime::now())
             });
@@ -254,7 +250,13 @@ mod tests {
             let (pk, mut req) = signed_for(node);
             req.payload = serde_json::json!({"k": "EVIL"}); // breaks request sig
             let m = NodeSystemsManifest::new(node, vec!["Cu".into()], vec!["t".into()]);
-            assert!(!manifest_trusted(&m, Some(&req), &pk, None, SystemTime::now()));
+            assert!(!manifest_trusted(
+                &m,
+                Some(&req),
+                &pk,
+                None,
+                SystemTime::now()
+            ));
         }
 
         #[test]
@@ -300,9 +302,7 @@ mod tests {
         let trusted = manifest(&["Cu"], &["tool_a"]);
         let untrusted = manifest(&["Cu"], &["tool_b"]);
         let untrusted_id = untrusted.node_id;
-        let got = discoverable_tools(&[], &[trusted, untrusted], |m| {
-            m.node_id != untrusted_id
-        });
+        let got = discoverable_tools(&[], &[trusted, untrusted], |m| m.node_id != untrusted_id);
         assert_eq!(got, vec!["tool_a".to_string()]);
     }
 

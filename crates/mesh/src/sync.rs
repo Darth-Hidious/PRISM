@@ -73,7 +73,9 @@ pub async fn run_sync_handler(
                 let manifest_oversized = manifest.as_ref().is_some_and(|m| {
                     m.declared_systems.len() > MAX_MANIFEST_ITEMS
                         || m.tool_names.len() > MAX_MANIFEST_ITEMS
-                        || m.declared_systems.iter().any(|s| s.len() > MAX_CAPABILITY_LEN)
+                        || m.declared_systems
+                            .iter()
+                            .any(|s| s.len() > MAX_CAPABILITY_LEN)
                         || m.tool_names.iter().any(|t| t.len() > MAX_CAPABILITY_LEN)
                 });
                 if name.len() > MAX_NAME_LEN
