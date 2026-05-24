@@ -2586,9 +2586,7 @@ async fn main() -> Result<()> {
                                 eprintln!(
                                     "  Check \x1b[1mcurl https://api.marc27.com/health\x1b[0m, then"
                                 );
-                                eprintln!(
-                                    "  run \x1b[1mprism login\x1b[0m from a fresh shell."
-                                );
+                                eprintln!("  run \x1b[1mprism login\x1b[0m from a fresh shell.");
                                 eprintln!();
                                 return Ok(());
                             }
