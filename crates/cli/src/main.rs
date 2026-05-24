@@ -6258,29 +6258,50 @@ async fn run_device_login_with_opts(
     let start: DeviceCodeResponse =
         DeviceFlowAuth::start_device_flow(&http, &endpoints.api_base).await?;
 
+    // Unified login UI — same numbered format in both paths so the URL
+    // and code are always visible regardless of browser-open success.
+    //
+    // The original split (no_browser=true with the clean numbered block,
+    // no_browser=false with prose) caused the "please log in again" UX
+    // failure described in feedback_longhorizon_workflow_and_working_style:
+    // if open_browser() silently fails (no default-browser handler in the
+    // user's terminal context, iTerm/tmux quirk, etc.) the user never saw
+    // the URL clearly, the device flow timed out, and PRISM bounced them
+    // to a manual `prism login` retry loop. Now: clean numbered block
+    // always renders, browser-open is best-effort, and the "where to
+    // open it" hint mirrors the actual outcome.
     println!();
+    println!("\u{2501}\u{2501} PRISM login \u{2501}\u{2501}");
+    println!();
+    println!("  1. Open this URL in a browser:");
+    println!("       {}", start.verification_uri);
+    println!("  2. Enter this code when prompted:");
+    println!("       {}", start.user_code);
+    println!("  3. Approve the session.");
+    println!();
+
     if no_browser {
-        // Headless block — no auto-open, structure the output so the
-        // user can clearly see what to do on a different machine.
-        println!("\u{2501}\u{2501} PRISM headless login \u{2501}\u{2501}");
-        println!();
-        println!("  1. Open this URL on any browser (laptop, phone, …):");
-        println!("       {}", start.verification_uri);
-        println!("  2. Enter this code:");
-        println!("       {}", start.user_code);
-        println!("  3. Approve the session.");
-        println!();
-        println!("  Waiting here until you approve. Ctrl+C to abort.");
+        println!(
+            "  (Headless mode — no auto-open. Use any browser, including a different device.)"
+        );
     } else {
-        println!("PRISM setup needs MARC27 platform login.");
-        println!("Open: {}", start.verification_uri);
-        println!("Code: {}", start.user_code);
-        println!();
-        if let Err(err) = open_browser(&start.verification_uri) {
-            eprintln!("warning: failed to open browser automatically: {err}");
+        // Best-effort browser auto-open. URL is already on screen, so a
+        // failure here is a nuisance not a blocker. Report the outcome
+        // truthfully — "tried and failed" lets the user act; the silent
+        // failure was the old bug.
+        match open_browser(&start.verification_uri) {
+            Ok(_) => println!("  (Tried to open your default browser automatically.)"),
+            Err(err) => {
+                println!(
+                    "  (Couldn't auto-open your browser — please open the URL above manually."
+                );
+                println!("   Reason: {err})");
+            }
         }
-        println!("Approve the device in your browser, then return here.");
     }
+    println!();
+    println!("  Waiting until you approve. Ctrl+C to abort.");
+    println!();
 
     let token: TokenResponse = DeviceFlowAuth::poll_for_token(
         &http,
