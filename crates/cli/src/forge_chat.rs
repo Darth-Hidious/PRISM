@@ -218,6 +218,37 @@ pub async fn run(
         _ => None,
     };
 
+    // Phase 1(d) auth-fix: spawn the creds watcher.
+    //
+    // When `prism login` completes in ANOTHER shell, OR when the inline
+    // re-auth path (Commands::Tui arm with the bounded retry from
+    // PR #125) refreshes the on-disk credentials, the running TUI's
+    // bridge holds the OLD access_token frozen in memory. Without this
+    // watcher the user would need to quit + restart the TUI to pick up
+    // new creds. The task polls ~/.prism/cli_state.json mtime every 5s
+    // and on change pushes the fresh access_token into the bridge's
+    // hot-swap slot via ProxyHandle::update_access_token.
+    //
+    // Polling (vs `notify` fsevents/inotify) is deliberate: state.json
+    // changes are user-driven and rare, so polling at 5s is cheap and
+    // dodges the cross-platform fsevents/inotify quirk surface entirely.
+    // The task leaks when forge_chat::run returns — fine, the process
+    // exits shortly after and tokio cleans the runtime.
+    if let Some(ref handle) = _proxy {
+        let access_lock = handle.access_token_lock();
+        // Re-discover paths inside the watcher — forge_chat::run doesn't
+        // currently take a PrismPaths param. discover() is idempotent
+        // (just reads HOME + .config) so re-running it is fine. If it
+        // fails (no HOME?), we silently skip the watcher — the chat
+        // session still works, the user just needs to restart on a
+        // creds refresh, same as before this fix existed.
+        if let Ok(paths_for_watcher) = prism_runtime::PrismPaths::discover() {
+            tokio::spawn(async move {
+                watch_creds_for_updates(paths_for_watcher, access_lock).await;
+            });
+        }
+    }
+
     let mut cli = ForgeCli::parse_from(["prism-chat"]);
 
     // `prism resume <id>` integration: prism CLI sets PRISM_RESUME_ID
@@ -576,4 +607,52 @@ fn register_prism_mcp_servers(project_root: &Path, python_path: &Path) -> Result
             .with_context(|| format!("writing {}", mcp_path.display()))?;
     }
     Ok(())
+}
+
+/// Watch the on-disk credentials file and propagate token refreshes
+/// to the bridge without restarting it.
+///
+/// Phase 1(d) auth-fix: closes the OAuth-tango loop the user originally
+/// named. Polls cli_state.json mtime every 5 s; on change, reloads
+/// the state, extracts the current access_token, and writes it into
+/// the bridge's hot-swap slot if it actually changed. Token comparison
+/// before writing avoids a no-op spin if mtime changed for an unrelated
+/// reason (preferred_python update, org/project switch, etc.).
+async fn watch_creds_for_updates(
+    paths: prism_runtime::PrismPaths,
+    access_token: std::sync::Arc<tokio::sync::RwLock<String>>,
+) {
+    let state_path = paths.cli_state_path();
+    let mut last_mtime: Option<std::time::SystemTime> = std::fs::metadata(&state_path)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let now_mtime: Option<std::time::SystemTime> = std::fs::metadata(&state_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        if now_mtime == last_mtime {
+            continue;
+        }
+        last_mtime = now_mtime;
+        // mtime changed. Re-read state, propagate token if different.
+        let Ok(state) = paths.load_cli_state() else {
+            tracing::warn!(
+                target: "platform_bridge::creds_watcher",
+                "cli_state.json mtime changed but reload failed — skipping this tick"
+            );
+            continue;
+        };
+        let Some(new_token) = state.credentials.as_ref().map(|c| c.access_token.clone()) else {
+            continue;
+        };
+        let mut guard = access_token.write().await;
+        if *guard != new_token {
+            *guard = new_token;
+            tracing::info!(
+                target: "platform_bridge::creds_watcher",
+                "credentials refreshed via fs watcher — propagated to bridge"
+            );
+        }
+    }
 }

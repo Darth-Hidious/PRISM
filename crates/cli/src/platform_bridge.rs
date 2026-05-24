@@ -51,7 +51,15 @@ use crate::chat_config::ChatTarget;
 #[derive(Clone)]
 struct ProxyState {
     upstream_base: String, // e.g. "https://api.marc27.com/api/v1/projects/<pid>/llm"
-    access_token: String,
+    /// Bearer credential, wrapped for hot-swap. Phase 1(d) of the
+    /// auth-fix arc: when an outside actor (`prism login` in another
+    /// shell, the inline re-auth path in main.rs::Commands::Tui)
+    /// refreshes the on-disk credentials, the fsevents-watcher task
+    /// in forge_chat.rs updates this slot — the bridge picks up the
+    /// new token on the next request without tearing down. Each
+    /// handler reads at the top of the request via `.read().await`
+    /// so an in-flight refresh doesn't tear an in-flight request.
+    access_token: Arc<RwLock<String>>,
     http: reqwest::Client,
     /// Optional semantic tool router. When present, requests with a tools[]
     /// array are filtered to top-K=8 most relevant before forwarding to
@@ -88,10 +96,45 @@ pub struct ProxyHandle {
     /// `/use` handler can populate it without a struct reshape.
     #[allow(dead_code)]
     chat_target: Arc<RwLock<ChatTarget>>,
+    /// Hot-swappable Bearer credential. Shares the same RwLock the
+    /// bridge ProxyState reads from per-request — external callers
+    /// (the fsevents creds-watcher in forge_chat.rs) can update via
+    /// `update_access_token` and the bridge picks it up on the next
+    /// turn without restart. Phase 1(d) auth-fix.
+    access_token: Arc<RwLock<String>>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl ProxyHandle {
+    /// Explicit shutdown — alternative to letting the handle Drop. Both
+    /// paths fire the oneshot. Public API kept for callers that want to
+    /// shut the proxy down without dropping the handle.
+    #[allow(dead_code)]
+    pub fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// Replace the Bearer credential the bridge uses for upstream calls.
+    /// Used by the fsevents creds-watcher in forge_chat.rs when an
+    /// outside actor (`prism login` in another shell, or the inline
+    /// reauth path in Commands::Tui) refreshes the on-disk creds. The
+    /// bridge picks up the new token on the next request — no
+    /// listener teardown, no chat-session restart.
+    #[allow(dead_code)]
+    pub async fn update_access_token(&self, new_token: &str) {
+        let mut guard = self.access_token.write().await;
+        *guard = new_token.to_string();
+    }
+
+    /// Hand out the live access-token lock. The fsevents creds-watcher
+    /// task in forge_chat.rs holds a clone for the lifetime of the
+    /// TUI session and writes through it on state.json changes.
+    pub fn access_token_lock(&self) -> Arc<RwLock<String>> {
+        self.access_token.clone()
+    }
+
     /// Hand out the live `ChatTarget` lock so callers (the `/use` slash
     /// command, in particular) can hot-swap the chat upstream without
     /// restarting the proxy. The lock is the single source of truth
@@ -131,10 +174,15 @@ pub async fn start(
     );
 
     let chat_target = Arc::new(RwLock::new(initial_chat_target));
+    // Hot-swap slot for the Bearer credential — shared by reference
+    // between ProxyState (axum-side read at request time) and
+    // ProxyHandle (external write via update_access_token, used by
+    // the fsevents creds-watcher in forge_chat.rs).
+    let access_token = Arc::new(RwLock::new(access_token.to_string()));
 
     let state = ProxyState {
         upstream_base,
-        access_token: access_token.to_string(),
+        access_token: access_token.clone(),
         http: reqwest::Client::builder()
             // SSE streams can run for minutes — let the upstream control timing.
             .timeout(std::time::Duration::from_secs(600))
@@ -172,6 +220,7 @@ pub async fn start(
     Ok(ProxyHandle {
         url,
         chat_target,
+        access_token,
         shutdown: Some(tx),
     })
 }
@@ -182,12 +231,11 @@ pub async fn start(
 /// `{ "object": "list", "data": [{ id, object, created, owned_by }, …] }`.
 async fn list_models(State(state): State<Arc<ProxyState>>) -> Response {
     let upstream = format!("{}/models", state.upstream_base);
-    let res = state
-        .http
-        .get(&upstream)
-        .bearer_auth(&state.access_token)
-        .send()
-        .await;
+    // Read the hot-swappable token at request time. If the
+    // fsevents creds-watcher in forge_chat.rs just wrote a fresh
+    // token, this request uses it — no listener teardown needed.
+    let token = state.access_token.read().await.clone();
+    let res = state.http.get(&upstream).bearer_auth(&token).send().await;
 
     let resp = match res {
         Ok(r) => r,
@@ -646,7 +694,8 @@ async fn chat_completions(State(state): State<Arc<ProxyState>>, body: Bytes) -> 
         match target {
             ChatTarget::Marc27 { .. } => (
                 format!("{}/stream", state.upstream_base),
-                Some(state.access_token.clone()),
+                // Hot-swappable Bearer (Phase 1d): read fresh per request.
+                Some(state.access_token.read().await.clone()),
                 UpstreamShape::Marc27Sse,
             ),
             ChatTarget::Local { url, api_key, .. } => (
