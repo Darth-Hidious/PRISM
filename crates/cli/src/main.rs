@@ -3000,24 +3000,92 @@ async fn main() -> Result<()> {
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
             {
-                eprintln!();
-                eprintln!("\x1b[33mYour MARC27 session has expired — re-authenticating…\x1b[0m");
-                eprintln!();
-                if let Err(e) = perform_full_login(
-                    &paths,
-                    &endpoints,
-                    &python,
-                    LoginMode::Device { no_browser: false },
-                )
-                .await
-                {
-                    eprintln!("\x1b[31mInline re-login failed:\x1b[0m {e}");
+                // Bounded in-process retry instead of bouncing the user
+                // out to `prism login` + restart. The original "Run prism
+                // login manually, then start prism tui again" exit was
+                // Phase 1's biggest UX wart — users hit it when the
+                // device-flow inline-login failed for ANY reason (network
+                // blip, timeout, refresh-token revoked) and lost their
+                // whole TUI session. Now: up to MAX_ATTEMPTS tries with
+                // an explicit `[Enter] retry / [q] quit` prompt between
+                // attempts, plus a TTY guard so piped/CI invocations
+                // don't infinite-loop on prompts. PR #125 fixed the
+                // device-flow UI itself (URL+code always visible); this
+                // closes the loop on the *fallback* when device-flow
+                // itself errors.
+                use std::io::{IsTerminal, Write};
+                const MAX_ATTEMPTS: usize = 3;
+                let mut attempt = 0_usize;
+                loop {
+                    attempt += 1;
                     eprintln!();
-                    eprintln!(
-                        "  Run \x1b[1mprism login\x1b[0m manually, then start \x1b[1mprism tui\x1b[0m again."
-                    );
+                    if attempt == 1 {
+                        eprintln!(
+                            "\x1b[33mYour MARC27 session has expired — re-authenticating…\x1b[0m"
+                        );
+                    } else {
+                        eprintln!(
+                            "\x1b[33mRe-authenticating… (attempt {attempt}/{MAX_ATTEMPTS})\x1b[0m"
+                        );
+                    }
                     eprintln!();
-                    return Ok(());
+
+                    match perform_full_login(
+                        &paths,
+                        &endpoints,
+                        &python,
+                        LoginMode::Device { no_browser: false },
+                    )
+                    .await
+                    {
+                        Ok(()) => break,
+                        Err(e) => {
+                            eprintln!();
+                            eprintln!("\x1b[31mInline re-login failed:\x1b[0m {e}");
+                            eprintln!();
+                            if attempt >= MAX_ATTEMPTS {
+                                eprintln!(
+                                    "  Tried {MAX_ATTEMPTS} times — likely a server-side issue."
+                                );
+                                eprintln!(
+                                    "  Check \x1b[1mcurl https://api.marc27.com/health\x1b[0m, then"
+                                );
+                                eprintln!(
+                                    "  run \x1b[1mprism login\x1b[0m from a fresh shell."
+                                );
+                                eprintln!();
+                                return Ok(());
+                            }
+                            if !std::io::stdin().is_terminal() {
+                                // Non-interactive (piped input, CI, etc.)
+                                // — can't prompt. Exit cleanly with the
+                                // same guidance as exhaustion.
+                                eprintln!(
+                                    "  (Non-interactive stdin — can't prompt for retry. Run \x1b[1mprism login\x1b[0m and try again.)"
+                                );
+                                eprintln!();
+                                return Ok(());
+                            }
+                            eprintln!(
+                                "  Press \x1b[1mEnter\x1b[0m to retry, or type \x1b[1mq\x1b[0m + Enter to quit."
+                            );
+                            eprint!("  > ");
+                            std::io::stderr().flush().ok();
+                            let mut buf = String::new();
+                            if std::io::stdin().read_line(&mut buf).is_err() {
+                                // stdin closed mid-prompt — treat as quit
+                                eprintln!();
+                                return Ok(());
+                            }
+                            let trimmed = buf.trim();
+                            if trimmed.eq_ignore_ascii_case("q")
+                                || trimmed.eq_ignore_ascii_case("quit")
+                            {
+                                return Ok(());
+                            }
+                            // Empty / 'r' / 'retry' / anything else → loop
+                        }
+                    }
                 }
                 state = paths.load_cli_state().ok().unwrap_or_default();
                 boot_checks =
