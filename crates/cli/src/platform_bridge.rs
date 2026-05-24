@@ -106,6 +106,35 @@ impl ProxyHandle {
     pub fn chat_target(&self) -> Arc<RwLock<ChatTarget>> {
         self.chat_target.clone()
     }
+
+    /// Quick TCP-connect probe to the bound port — returns true if the
+    /// bridge is actually listening. Defensive accessor against the
+    /// silent-death-mid-session class of bug: axum::serve can return
+    /// (listener dies) without this handle's Drop firing, leaving the
+    /// shutdown sender alive and `url` pointing at a dead port. Callers
+    /// (forge_chat boot status, periodic health check, `/use` slash
+    /// command) should use this instead of trusting that the handle's
+    /// existence means the bridge is up. See spawn loop in `start()`
+    /// for the tracing::error! that names this exact failure mode.
+    #[allow(dead_code)]
+    pub async fn is_alive(&self) -> bool {
+        // url is "http://127.0.0.1:<port>/v1" — extract host:port for a
+        // raw TCP probe (skip HTTP overhead; we only care that the
+        // socket accepts a connection, not that any route responds).
+        let Some(addr) = self
+            .url
+            .strip_prefix("http://")
+            .and_then(|s| s.split('/').next())
+        else {
+            return false;
+        };
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok())
+    }
 }
 
 impl Drop for ProxyHandle {
@@ -167,12 +196,39 @@ pub async fn start(
     let url = format!("http://{}/v1", local);
 
     let (tx, rx) = oneshot::channel::<()>();
+    let bound_url_for_log = url.clone();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
+        // axum::serve returns when EITHER the graceful shutdown fires
+        // OR the listener errors (fd revoked, accept() failure, etc).
+        // The previous code swallowed both with `let _ =`, which hid
+        // the silent-death-mid-session class of bugs: spawned task
+        // ends, listener drops, but ProxyHandle in forge_chat still
+        // holds the shutdown sender and reports the bridge as alive —
+        // every subsequent chat request hits Connection refused and
+        // forge infinite-retries. Log both outcomes explicitly so the
+        // next diagnosis pass has real data to design the self-heal.
+        match axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 let _ = rx.await;
             })
-            .await;
+            .await
+        {
+            Ok(()) => tracing::info!(
+                target: "platform_bridge",
+                url = %bound_url_for_log,
+                "bridge serve loop exited cleanly (graceful shutdown)"
+            ),
+            Err(e) => tracing::error!(
+                target: "platform_bridge",
+                url = %bound_url_for_log,
+                error = %e,
+                error_debug = ?e,
+                "bridge serve loop ERRORED — listener is gone, subsequent \
+                 chat requests will hit Connection refused. ProxyHandle is \
+                 now stale; callers should use ProxyHandle::is_alive() to \
+                 detect this and trigger reauth/restart."
+            ),
+        }
     });
 
     Ok(ProxyHandle {
