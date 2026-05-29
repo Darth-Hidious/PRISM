@@ -6056,7 +6056,7 @@ where
         .ok_or_else(|| anyhow!("selection out of range"))
 }
 
-async fn refresh_access_token(
+pub(crate) async fn refresh_access_token(
     endpoints: &PlatformEndpoints,
     creds: &StoredCredentials,
 ) -> Result<StoredCredentials> {

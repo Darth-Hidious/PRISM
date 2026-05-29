@@ -129,10 +129,44 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
     boot::section("Platform Connectivity");
 
     let paths = PrismPaths::discover()?;
-    let state = paths.load_cli_state().unwrap_or_default();
+    let mut state = paths.load_cli_state().unwrap_or_default();
     let endpoints = PlatformEndpoints::from_env();
-    let platform_checks =
+    let mut platform_checks =
         boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+
+    // Match the boot-flow contract (main.rs ~line 991): if Auth shows
+    // "token rejected" and we have a refresh_token, the access token
+    // was likely server-side rotated. Silently refresh once and redo
+    // the checks. Only if the refresh ALSO fails do we surface
+    // "run prism login" — the user shouldn't have to log in just
+    // because the diagnostic command was used instead of the boot
+    // command. We own the platform; the doctor's job is to recover
+    // what's recoverable, not relay stale state.
+    let auth_rejected = platform_checks
+        .iter()
+        .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
+    if auth_rejected
+        && let Some(creds) = state.credentials.as_ref()
+        && !creds.refresh_token.is_empty()
+    {
+        match crate::refresh_access_token(&endpoints, creds).await {
+            Ok(new_creds) => {
+                tracing::info!("doctor: access token refreshed after server-side rejection");
+                state.credentials = Some(new_creds);
+                paths.save_cli_state(&state)?;
+                // Redo the checks with the fresh token so the rest of
+                // the platform-connectivity lines (KG / Models /
+                // Compute / Marketplace / Policy) reflect post-refresh
+                // state too — they all use the same Bearer.
+                platform_checks =
+                    boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "doctor: refresh failed, keeping rejected state");
+            }
+        }
+    }
+
     print_check_lines(&platform_checks);
 
     println!();
