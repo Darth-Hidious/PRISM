@@ -2260,13 +2260,22 @@ async fn main() -> Result<()> {
         }
         Commands::Research { query, depth, json } => {
             let (api_base, auth) = resolve_agent_auth()?;
+            // Target /research — the synchronous verb-shim that goes through
+            // marc27_core::research::engine::run, including the pre-FINAL
+            // gate and the claim-detection output gate (Task #40). The old
+            // /knowledge/research/query path proxied to a separate service
+            // that NEVER reached the engine — meaning every safety surface
+            // we built (no fabrication, signed bundles, discourse review)
+            // was silently bypassed. See marc27-core PR #50 for the shim.
+            //
+            // Handler timeout (server-side): 10 min default, overridable
+            // via RESEARCH_HANDLER_TIMEOUT_SECS. Client timeout below
+            // gives us 30 s of margin over that ceiling.
             let client = reqwest::Client::builder()
-                // Research can take longer than a plain graph query because it may
-                // run an iterative loop before producing the final answer.
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(630))
                 .build()?;
             let resp = auth
-                .apply(client.post(format!("{api_base}/knowledge/research/query")))
+                .apply(client.post(format!("{api_base}/research")))
                 // Keep smoke tests cheap by always making depth explicit.
                 .json(&serde_json::json!({ "query": query, "depth": depth, "stream": false }))
                 .send()
