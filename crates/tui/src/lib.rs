@@ -38,11 +38,12 @@ pub mod app;
 pub mod backend;
 pub mod msg;
 mod render;
+pub mod sanitize;
 
 use anyhow::Result;
 use crossterm::{
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::Terminal;
 use std::io;
@@ -107,9 +108,9 @@ pub async fn run(prism_binary: &str, project_root: &str, python_bin: &str) -> Re
 
     // Main event loop — tokio::select! between crossterm events,
     // agent messages, and a periodic render tick (100ms) for animations.
-    use crossterm::event::{EventStream, Event};
+    use crossterm::event::{Event, EventStream};
     use futures::StreamExt;
-    use tokio::time::{interval, Duration};
+    use tokio::time::{Duration, interval};
     let mut events = EventStream::new();
     let mut tick = interval(Duration::from_millis(100));
 

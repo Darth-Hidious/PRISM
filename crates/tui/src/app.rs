@@ -2,6 +2,7 @@
 
 use crate::backend::BackendHandle;
 use crate::msg::{AgentMsg, parse_notification};
+use crate::sanitize::sanitize_for_render;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_textarea::TextArea;
 use serde_json::Value;
@@ -445,11 +446,16 @@ impl App {
             } => {
                 // `..` ignores call_id, preview, approval_required —
                 // current behavior only pushes a tool-start line.
+                // Sanitize tool_name and verb before formatting —
+                // both come from the backend and could contain
+                // control sequences.
+                let clean_verb = sanitize_for_render(&verb);
+                let clean_name = sanitize_for_render(&tool_name);
                 self.push_message(ChatLine {
                     role: Role::Tool,
-                    text: format!("{} {}", verb, tool_name),
+                    text: format!("{} {}", clean_verb, clean_name),
                     kind: LineKind::ToolStart {
-                        tool_name,
+                        tool_name: clean_name,
                         elapsed_ms: None,
                     },
                 });
@@ -464,21 +470,24 @@ impl App {
             } => {
                 // `..` ignores call_id, provenance_id, data —
                 // current behavior only pushes a result/error line.
+                // Sanitize tool_name and content before storing.
+                let clean_name = sanitize_for_render(&tool_name);
+                let clean_content = sanitize_for_render(&content);
                 let success = card_type != "error";
                 let elapsed = elapsed_ms.unwrap_or(0);
                 if !success {
                     self.push_message(ChatLine {
                         role: Role::Tool,
-                        text: format!("{}: {}", tool_name, content),
-                        kind: LineKind::Error(format!("{}: {}", tool_name, content)),
+                        text: format!("{}: {}", clean_name, clean_content),
+                        kind: LineKind::Error(format!("{}: {}", clean_name, clean_content)),
                     });
                 } else {
                     self.push_message(ChatLine {
                         role: Role::Tool,
-                        text: format!("{}: {}", tool_name, content),
+                        text: format!("{}: {}", clean_name, clean_content),
                         kind: LineKind::ToolResult {
-                            tool_name,
-                            content,
+                            tool_name: clean_name,
+                            content: clean_content,
                             elapsed_ms: elapsed,
                             success,
                         },
@@ -491,12 +500,19 @@ impl App {
                 // `..` ignores call_id, tool_args, tool_description,
                 // requires_approval, permission_mode, choices, prompt_type —
                 // current behavior uses only tool_name + message.
-                self.approval_pending = Some((tool_name.clone(), message.clone()));
+                // Sanitize both before storing in approval_pending and
+                // the ChatLine.
+                let clean_name = sanitize_for_render(&tool_name);
+                let clean_msg = sanitize_for_render(&message);
+                self.approval_pending = Some((clean_name.clone(), clean_msg.clone()));
                 self.focus = Focus::Approval;
                 self.push_message(ChatLine {
                     role: Role::System,
-                    text: format!("{}: {}", tool_name, message),
-                    kind: LineKind::Approval { tool_name, message },
+                    text: format!("{}: {}", clean_name, clean_msg),
+                    kind: LineKind::Approval {
+                        tool_name: clean_name,
+                        message: clean_msg,
+                    },
                 });
             }
             AgentMsg::Cost {
@@ -514,13 +530,17 @@ impl App {
                 self.status_text = "Ready".to_string();
             }
             AgentMsg::View { title, tabs } => {
+                // Sanitize each visible field from the backend.
+                let clean_title = sanitize_for_render(&title);
                 for (tab_title, body) in tabs {
+                    let clean_tab = sanitize_for_render(&tab_title);
+                    let clean_body = sanitize_for_render(&body);
                     self.push_message(ChatLine {
                         role: Role::System,
-                        text: format!("[{} > {}]\n{}", title, tab_title, body),
+                        text: format!("[{} > {}]\n{}", clean_title, clean_tab, clean_body),
                         kind: LineKind::View {
-                            title: title.clone(),
-                            body,
+                            title: clean_title.clone(),
+                            body: clean_body,
                         },
                     });
                 }
@@ -550,6 +570,12 @@ impl App {
     }
 
     // ── Message helpers ───────────────────────────────────────────
+    //
+    // Sanitize at TUI state ingress so render remains pure and never
+    // receives raw terminal control sequences.  Every visible string
+    // that enters a `ChatLine` passes through `sanitize_for_render`
+    // here, at the lowest level — callers don't need to sanitize
+    // again.
 
     /// Append a message and trim if over the max.
     fn push_message(&mut self, line: ChatLine) {
@@ -567,40 +593,44 @@ impl App {
     }
 
     pub fn push_user(&mut self, text: &str) {
+        let clean = sanitize_for_render(text);
         self.push_message(ChatLine {
             role: Role::User,
-            text: text.to_string(),
+            text: clean.clone(),
             kind: LineKind::Text,
         });
     }
 
     pub fn push_system(&mut self, text: &str) {
+        let clean = sanitize_for_render(text);
         self.push_message(ChatLine {
             role: Role::System,
-            text: text.to_string(),
-            kind: LineKind::Status(text.to_string()),
+            text: clean.clone(),
+            kind: LineKind::Status(clean),
         });
     }
 
     pub fn push_error(&mut self, text: &str) {
+        let clean = sanitize_for_render(text);
         self.push_message(ChatLine {
             role: Role::System,
-            text: text.to_string(),
-            kind: LineKind::Error(text.to_string()),
+            text: clean.clone(),
+            kind: LineKind::Error(clean),
         });
     }
 
     pub fn append_assistant_text(&mut self, delta: &str) {
+        let clean = sanitize_for_render(delta);
         if let Some(last) = self.messages.last_mut()
             && matches!(last.role, Role::Assistant)
             && matches!(last.kind, LineKind::Text)
         {
-            last.text.push_str(delta);
+            last.text.push_str(&clean);
             return;
         }
         self.messages.push(ChatLine {
             role: Role::Assistant,
-            text: delta.to_string(),
+            text: clean,
             kind: LineKind::Text,
         });
     }
@@ -608,16 +638,17 @@ impl App {
     /// Append thinking/reasoning tokens to a separate thinking buffer.
     /// Rendered dimmed and collapsible.
     pub fn append_thinking_text(&mut self, delta: &str) {
+        let clean = sanitize_for_render(delta);
         if let Some(last) = self.messages.last_mut()
             && matches!(last.role, Role::Assistant)
             && matches!(last.kind, LineKind::Thinking)
         {
-            last.text.push_str(delta);
+            last.text.push_str(&clean);
             return;
         }
         self.messages.push(ChatLine {
             role: Role::Assistant,
-            text: delta.to_string(),
+            text: clean,
             kind: LineKind::Thinking,
         });
     }

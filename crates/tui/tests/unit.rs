@@ -1390,3 +1390,307 @@ fn cost_still_updates_existing_fields() {
     assert!((app.turn_cost - 0.02).abs() < 1e-9);
     assert!((app.session_cost - 0.99).abs() < 1e-9);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Patch 2 tests: ANSI/control sanitizer ingress
+// ═══════════════════════════════════════════════════════════════════════
+
+use prism_tui::sanitize::sanitize_for_render;
+
+/// Assert that stored visible text does not contain terminal control
+/// sequences.  Used for every ingress test.
+fn assert_no_terminal_controls(text: &str) {
+    assert!(!text.contains('\x1b'), "ESC (\\x1b) found in: {text:?}");
+    assert!(!text.contains('\x07'), "BEL (\\x07) found in: {text:?}");
+    assert!(!text.contains('\x08'), "BS (\\x08) found in: {text:?}");
+    assert!(!text.contains('\x0d'), "CR (\\x0d) found in: {text:?}");
+    assert!(!text.contains('\x7f'), "DEL (\\x7f) found in: {text:?}");
+}
+
+// ── Sanitizer function tests ─────────────────────────────────────────
+
+#[test]
+fn sanitize_csi_color_escape() {
+    assert_eq!(sanitize_for_render("\x1b[31mred\x1b[0m"), "red");
+}
+
+#[test]
+fn sanitize_cursor_movement_escape() {
+    let input = "\x1b[2J\x1b[Hhello\x1b[1;1H";
+    assert_eq!(sanitize_for_render(input), "hello");
+}
+
+#[test]
+fn sanitize_osc_terminal_title() {
+    let input = "\x1b]0;owned\x07hello";
+    assert_eq!(sanitize_for_render(input), "hello");
+}
+
+#[test]
+fn sanitize_osc_with_st_terminator() {
+    let input = "\x1b]0;title\x1b\\hello";
+    assert_eq!(sanitize_for_render(input), "hello");
+}
+
+#[test]
+fn sanitize_dcs_payload() {
+    let input = "\x1bPqhello\x1b\\world";
+    assert_eq!(sanitize_for_render(input), "world");
+}
+
+#[test]
+fn sanitize_removes_bel() {
+    assert_eq!(sanitize_for_render("beep\x07!"), "beep!");
+}
+
+#[test]
+fn sanitize_removes_backspace() {
+    assert_eq!(sanitize_for_render("abc\x08def"), "abcdef");
+}
+
+#[test]
+fn sanitize_removes_carriage_return() {
+    assert_eq!(sanitize_for_render("line1\r\nline2"), "line1\nline2");
+}
+
+#[test]
+fn sanitize_removes_del() {
+    assert_eq!(sanitize_for_render("text\x7fend"), "textend");
+}
+
+#[test]
+fn sanitize_removes_c1_controls() {
+    let input = "a\u{0085}b\u{0099}c";
+    assert_eq!(sanitize_for_render(input), "abc");
+}
+
+#[test]
+fn sanitize_preserves_normal_unicode() {
+    let input = "Ti₆Al₄V ΔH_mix 你好 café 🚀";
+    assert_eq!(sanitize_for_render(input), input);
+}
+
+#[test]
+fn sanitize_preserves_newlines() {
+    let input = "line1\nline2\nline3";
+    assert_eq!(sanitize_for_render(input), input);
+}
+
+#[test]
+fn sanitize_converts_tabs_to_four_spaces() {
+    assert_eq!(sanitize_for_render("a\tb"), "a    b");
+}
+
+#[test]
+fn sanitize_safe_text_unchanged() {
+    let input = "PRISM v2.7.1 — 42 tools available";
+    assert_eq!(sanitize_for_render(input), input);
+}
+
+#[test]
+fn sanitize_empty_string_returns_empty() {
+    assert_eq!(sanitize_for_render(""), "");
+}
+
+#[test]
+fn sanitize_long_safe_text_unchanged() {
+    let input = "x".repeat(10_000);
+    let result = sanitize_for_render(&input);
+    assert_eq!(result.len(), 10_000);
+    assert_eq!(result, input);
+}
+
+#[test]
+fn sanitize_mixed_ansi_and_unicode() {
+    let input = "\x1b[32mTi₆Al₄V\x1b[0m 你好 \x1b[1m🚀\x1b[0m";
+    assert_eq!(sanitize_for_render(input), "Ti₆Al₄V 你好 🚀");
+}
+
+#[test]
+fn sanitize_no_escape_left_after_any_input() {
+    let inputs = [
+        "\x1b[31mred\x1b[0m",
+        "\x1b]0;title\x07text",
+        "\x1b[2J\x1b[Hclear",
+        "beep\x07back\x08del\x7f",
+        "cr\r\nline",
+        "\u{0085}\u{0099}c1",
+        "\x1bPq\x1b\\dcs",
+    ];
+    for input in inputs {
+        let result = sanitize_for_render(input);
+        assert_no_terminal_controls(&result);
+    }
+}
+
+// ── App ingress tests: text is sanitized before storing ─────────────
+
+#[test]
+fn text_delta_with_ansi_stores_sanitized_text() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::TextDelta("\x1b[31mred text\x1b[0m".into()));
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.text, "red text");
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn thinking_delta_with_ansi_stores_sanitized_text() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ThinkingDelta(
+        "\x1b[33mthinking\x1b[0m about \x1b[2Jstuff".into(),
+    ));
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.text, "thinking about stuff");
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn tool_card_content_with_ansi_stores_sanitized_text() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "gfn_evaluate".into(),
+        content: "\x1b[32mdensity=7.8\x1b[0m".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(150),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.text, "gfn_evaluate: density=7.8");
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn tool_card_error_with_ansi_stores_sanitized_text() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "\x1b[31mbash\x1b[0m".into(),
+        content: "exit \x1b[1m1\x1b[0m".into(),
+        card_type: "error".into(),
+        elapsed_ms: Some(50),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.text, "bash: exit 1");
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn tool_start_with_ansi_stores_sanitized_text() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolStart {
+        tool_name: "\x1b[36malloy_sample\x1b[0m".into(),
+        verb: "\x1b[1mRunning\x1b[0m".into(),
+        call_id: None,
+        preview: None,
+        approval_required: None,
+    });
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.text, "Running alloy_sample");
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn backend_error_with_ansi_stores_sanitized_text() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::BackendError {
+        code: Some(500),
+        message: "\x1b[31mInternal\x1b[0m error\x07".into(),
+        recoverable: Some(true),
+    });
+    let last = app.messages.last().unwrap();
+    assert!(last.text.contains("Internal error"));
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn approval_prompt_with_ansi_stores_sanitized_text() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+        tool_name: "\x1b[33mcompute_submit\x1b[0m".into(),
+        message: "Allow \x1b[1mcompute_submit\x1b[0m?\x07".into(),
+        call_id: None,
+        tool_args: None,
+        tool_description: None,
+        requires_approval: None,
+        permission_mode: None,
+        choices: vec![],
+        prompt_type: None,
+    });
+    // Check approval_pending is sanitized
+    let (tool, msg) = app.approval_pending.as_ref().unwrap();
+    assert_eq!(tool, "compute_submit");
+    assert_eq!(msg, "Allow compute_submit?");
+    assert_no_terminal_controls(tool);
+    assert_no_terminal_controls(msg);
+    // Check the ChatLine is also sanitized
+    let last = app.messages.last().unwrap();
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn view_body_with_ansi_stores_sanitized_text() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::View {
+        title: "\x1b[1mResults\x1b[0m".into(),
+        tabs: vec![("MP".into(), "\x1b[32m5 hits\x1b[0m".into())],
+    });
+    let last = app.messages.last().unwrap();
+    assert!(last.text.contains("Results"));
+    assert!(last.text.contains("5 hits"));
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn backend_warning_with_ansi_stores_sanitized_text() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::BackendWarning {
+        code: Some("\x1b[31mrate_limit\x1b[0m".into()),
+        message: "Slow\x07 down\x1b[2J".into(),
+    });
+    let last = app.messages.last().unwrap();
+    assert!(last.text.contains("rate_limit"));
+    assert!(last.text.contains("Slow down"));
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn user_input_with_control_chars_is_sanitized() {
+    let mut app = test_app();
+    app.push_user("hello\x1b[31m world\x1b[0m\x07");
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.text, "hello world");
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn push_system_with_control_chars_is_sanitized() {
+    let mut app = test_app();
+    app.push_system("status\x1b[2J\x1b[H update\x07");
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.text, "status update");
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn push_error_with_control_chars_is_sanitized() {
+    let mut app = test_app();
+    app.push_error("\x1b[31mfatal\x1b[0m error\x08\x7f");
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.text, "fatal error");
+    assert_no_terminal_controls(&last.text);
+}
+
+#[test]
+fn append_assistant_text_preserves_unicode_through_sanitizer() {
+    let mut app = test_app();
+    app.append_assistant_text("Ti₆Al₄V ");
+    app.append_assistant_text("ΔH_mix 你好 🚀");
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.text, "Ti₆Al₄V ΔH_mix 你好 🚀");
+    assert_no_terminal_controls(&last.text);
+}
