@@ -26,7 +26,12 @@ impl BackendHandle {
         rx: mpsc::UnboundedReceiver<Value>,
         next_id: u64,
     ) -> Self {
-        Self { child, stdin, rx, next_id }
+        Self {
+            child,
+            stdin,
+            rx,
+            next_id,
+        }
     }
 
     pub fn spawn(prism_binary: &str, project_root: &str, python_bin: &str) -> Result<Self> {
@@ -51,10 +56,10 @@ impl BackendHandle {
             for line in reader.lines() {
                 match line {
                     Ok(l) if !l.trim().is_empty() => {
-                        if let Ok(v) = serde_json::from_str::<Value>(&l) {
-                            if tx.send(v).is_err() {
-                                break;
-                            }
+                        if let Ok(v) = serde_json::from_str::<Value>(&l)
+                            && tx.send(v).is_err()
+                        {
+                            break;
                         }
                     }
                     Err(_) => break,
@@ -94,20 +99,23 @@ impl BackendHandle {
     }
 
     pub async fn init(&mut self) -> Result<()> {
-        self.send_request("init", serde_json::json!({"auto_approve": false, "resume": ""}))?;
+        self.send_request(
+            "init",
+            serde_json::json!({"auto_approve": false, "resume": ""}),
+        )?;
         // Wait for the init response (first message with a "result" field)
-        if let Some(resp) = self.rx.recv().await {
-            if resp.get("result").is_some() || resp.get("method").is_some() {
-                // Could be the response or a welcome notification — both are fine
-                // If it's a notification, process it as a welcome
-                if resp.get("method").and_then(|m| m.as_str()) == Some("ui.welcome") {
-                    // Re-send to the channel for the app to process
-                    // Actually we should just let the app handle it — but since we
-                    // consumed it, we need to handle it. Let's just return Ok.
-                    return Ok(());
-                }
+        if let Some(resp) = self.rx.recv().await
+            && (resp.get("result").is_some() || resp.get("method").is_some())
+        {
+            // Could be the response or a welcome notification — both are fine
+            // If it's a notification, process it as a welcome
+            if resp.get("method").and_then(|m| m.as_str()) == Some("ui.welcome") {
+                // Re-send to the channel for the app to process
+                // Actually we should just let the app handle it — but since we
+                // consumed it, we need to handle it. Let's just return Ok.
                 return Ok(());
             }
+            return Ok(());
         }
         anyhow::bail!("init failed — no response from backend")
     }
@@ -117,11 +125,17 @@ impl BackendHandle {
     }
 
     pub fn send_command(&mut self, command: &str) -> Result<u64> {
-        self.send_request("input.command", serde_json::json!({"command": command, "silent": false}))
+        self.send_request(
+            "input.command",
+            serde_json::json!({"command": command, "silent": false}),
+        )
     }
 
     pub fn send_approval(&mut self, response: &str) -> Result<()> {
-        self.send_request("approval.respond", serde_json::json!({"response": response}))?;
+        self.send_request(
+            "approval.respond",
+            serde_json::json!({"response": response}),
+        )?;
         Ok(())
     }
 
