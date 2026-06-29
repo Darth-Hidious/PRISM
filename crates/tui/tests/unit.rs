@@ -1965,3 +1965,424 @@ async fn fake_backend_send_command_emits_response() {
     }
     assert!(methods.iter().any(|m| m == "ui.turn.complete"));
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Patch 3B tests: scenario library
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Helper: drain startup events (welcome + status) from a fake backend.
+async fn drain_startup(backend: &mut FakeBackend) {
+    backend.recv().await.unwrap(); // welcome
+    backend.recv().await.unwrap(); // status
+}
+
+/// Helper: collect all events until ui.turn.complete, returning the
+/// list of method names.
+async fn collect_until_turn_complete(backend: &mut FakeBackend) -> Vec<String> {
+    let mut methods = Vec::new();
+    while let Some(msg) = backend.recv().await {
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        methods.push(method.to_string());
+        if method == "ui.turn.complete" {
+            break;
+        }
+    }
+    methods
+}
+
+// ── Scenario name parsing ────────────────────────────────────────────
+
+#[test]
+fn all_scenario_names_parse() {
+    for &name in FakeScenario::all_names() {
+        assert!(
+            FakeScenario::from_name(name).is_ok(),
+            "failed to parse: {name}"
+        );
+    }
+}
+
+#[test]
+fn unknown_scenario_error_lists_all() {
+    let err = FakeScenario::from_name("nonexistent").unwrap_err();
+    let msg = err.to_string();
+    for &name in FakeScenario::all_names() {
+        assert!(msg.contains(name), "error missing '{name}': {msg}");
+    }
+}
+
+// ── Every scenario emits startup welcome/status ─────────────────────
+
+#[tokio::test]
+async fn all_scenarios_emit_welcome() {
+    for &scenario in FakeScenario::all_names() {
+        let s = FakeScenario::from_name(scenario).unwrap();
+        let mut backend = FakeBackend::new(s);
+        let msg = backend.recv().await.unwrap();
+        assert_eq!(
+            msg.get("method").and_then(|m| m.as_str()),
+            Some("ui.welcome"),
+            "scenario {scenario} did not emit welcome"
+        );
+    }
+}
+
+#[tokio::test]
+async fn all_scenarios_emit_status() {
+    for &scenario in FakeScenario::all_names() {
+        let s = FakeScenario::from_name(scenario).unwrap();
+        let mut backend = FakeBackend::new(s);
+        backend.recv().await.unwrap(); // welcome
+        let msg = backend.recv().await.unwrap();
+        assert_eq!(
+            msg.get("method").and_then(|m| m.as_str()),
+            Some("ui.status"),
+            "scenario {scenario} did not emit status"
+        );
+    }
+}
+
+// ── streaming_answer ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn streaming_answer_emits_multiple_text_deltas() {
+    let mut backend = FakeBackend::new(FakeScenario::StreamingAnswer);
+    drain_startup(&mut backend).await;
+    backend.send_message("test").unwrap();
+    let methods = collect_until_turn_complete(&mut backend).await;
+    let delta_count = methods.iter().filter(|m| *m == "ui.text.delta").count();
+    assert!(
+        delta_count > 5,
+        "expected >5 text deltas, got {delta_count}"
+    );
+}
+
+// ── thinking_stream ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn thinking_stream_emits_thinking_and_text_deltas() {
+    let mut backend = FakeBackend::new(FakeScenario::ThinkingStream);
+    drain_startup(&mut backend).await;
+    backend.send_message("test").unwrap();
+    let methods = collect_until_turn_complete(&mut backend).await;
+    assert!(
+        methods.iter().any(|m| m == "ui.thinking.delta"),
+        "no thinking delta"
+    );
+    assert!(
+        methods.iter().any(|m| m == "ui.text.delta"),
+        "no text delta"
+    );
+}
+
+// ── tool_success ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tool_success_emits_tool_start_and_card() {
+    let mut backend = FakeBackend::new(FakeScenario::ToolSuccess);
+    drain_startup(&mut backend).await;
+    backend.send_message("sample alloy").unwrap();
+    let methods = collect_until_turn_complete(&mut backend).await;
+    assert!(
+        methods.iter().any(|m| m == "ui.tool.start"),
+        "no tool.start"
+    );
+    assert!(methods.iter().any(|m| m == "ui.card"), "no card");
+    // Verify the card has results (success)
+}
+
+#[tokio::test]
+async fn tool_success_card_parses_as_result() {
+    let mut backend = FakeBackend::new(FakeScenario::ToolSuccess);
+    drain_startup(&mut backend).await;
+    backend.send_message("test").unwrap();
+    // Find the card event
+    while let Some(msg) = backend.recv().await {
+        if msg.get("method").and_then(|m| m.as_str()) == Some("ui.card") {
+            let parsed = parse_notification(&msg);
+            match parsed {
+                AgentMsg::ToolCard { card_type, .. } => {
+                    assert_eq!(card_type, "results");
+                }
+                other => panic!("expected ToolCard, got {other:?}"),
+            }
+            break;
+        }
+    }
+}
+
+// ── tool_error ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tool_error_emits_tool_start_and_error_card() {
+    let mut backend = FakeBackend::new(FakeScenario::ToolError);
+    drain_startup(&mut backend).await;
+    backend.send_message("submit job").unwrap();
+    let methods = collect_until_turn_complete(&mut backend).await;
+    assert!(
+        methods.iter().any(|m| m == "ui.tool.start"),
+        "no tool.start"
+    );
+    assert!(methods.iter().any(|m| m == "ui.card"), "no card");
+}
+
+#[tokio::test]
+async fn tool_error_card_parses_as_error() {
+    let mut backend = FakeBackend::new(FakeScenario::ToolError);
+    drain_startup(&mut backend).await;
+    backend.send_message("test").unwrap();
+    while let Some(msg) = backend.recv().await {
+        if msg.get("method").and_then(|m| m.as_str()) == Some("ui.card") {
+            let parsed = parse_notification(&msg);
+            match parsed {
+                AgentMsg::ToolCard { card_type, .. } => {
+                    assert_eq!(card_type, "error");
+                }
+                other => panic!("expected ToolCard, got {other:?}"),
+            }
+            break;
+        }
+    }
+}
+
+// ── approval_required ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn approval_required_emits_prompt_with_rich_fields() {
+    let mut backend = FakeBackend::new(FakeScenario::ApprovalRequired);
+    drain_startup(&mut backend).await;
+    backend.send_message("run compute").unwrap();
+
+    // The first event should be ui.prompt
+    let msg = backend.recv().await.unwrap();
+    assert_eq!(
+        msg.get("method").and_then(|m| m.as_str()),
+        Some("ui.prompt")
+    );
+    let parsed = parse_notification(&msg);
+    match parsed {
+        AgentMsg::ApprovalPrompt {
+            tool_name,
+            call_id,
+            tool_args,
+            requires_approval,
+            choices,
+            prompt_type,
+            ..
+        } => {
+            assert_eq!(tool_name, "compute_submit");
+            assert!(call_id.is_some());
+            assert!(tool_args.is_some());
+            assert_eq!(requires_approval, Some(true));
+            assert!(choices.contains(&"y".to_string()));
+            assert!(choices.contains(&"n".to_string()));
+            assert!(choices.contains(&"a".to_string()));
+            assert_eq!(prompt_type.as_deref(), Some("approval"));
+        }
+        other => panic!("expected ApprovalPrompt, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn approval_required_send_y_emits_tool_success() {
+    let mut backend = FakeBackend::new(FakeScenario::ApprovalRequired);
+    drain_startup(&mut backend).await;
+    backend.send_message("run").unwrap();
+    backend.recv().await.unwrap(); // prompt
+
+    backend.send_approval("y").unwrap();
+    let methods = collect_until_turn_complete(&mut backend).await;
+    assert!(methods.iter().any(|m| m == "ui.card"), "no card after y");
+    assert!(
+        methods.iter().any(|m| m == "ui.turn.complete"),
+        "no turn complete after y"
+    );
+}
+
+#[tokio::test]
+async fn approval_required_send_n_emits_status() {
+    let mut backend = FakeBackend::new(FakeScenario::ApprovalRequired);
+    drain_startup(&mut backend).await;
+    backend.send_message("run").unwrap();
+    backend.recv().await.unwrap(); // prompt
+
+    backend.send_approval("n").unwrap();
+    let methods = collect_until_turn_complete(&mut backend).await;
+    assert!(
+        methods.iter().any(|m| m == "ui.turn.complete"),
+        "no turn complete after n"
+    );
+}
+
+#[tokio::test]
+async fn approval_required_send_a_emits_permissions_and_card() {
+    let mut backend = FakeBackend::new(FakeScenario::ApprovalRequired);
+    drain_startup(&mut backend).await;
+    backend.send_message("run").unwrap();
+    backend.recv().await.unwrap(); // prompt
+
+    backend.send_approval("a").unwrap();
+    let methods = collect_until_turn_complete(&mut backend).await;
+    assert!(
+        methods.iter().any(|m| m == "ui.permissions"),
+        "no permissions after a"
+    );
+    assert!(methods.iter().any(|m| m == "ui.card"), "no card after a");
+}
+
+// ── cost_metrics ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cost_metrics_emits_cost_with_token_counts() {
+    let mut backend = FakeBackend::new(FakeScenario::CostMetrics);
+    drain_startup(&mut backend).await;
+    backend.send_message("show cost").unwrap();
+
+    let msg = backend.recv().await.unwrap();
+    assert_eq!(msg.get("method").and_then(|m| m.as_str()), Some("ui.cost"));
+    let parsed = parse_notification(&msg);
+    match parsed {
+        AgentMsg::Cost {
+            input_tokens,
+            output_tokens,
+            cache_tokens,
+            ..
+        } => {
+            assert_eq!(input_tokens, Some(1200));
+            assert_eq!(output_tokens, Some(800));
+            assert_eq!(cache_tokens, Some(400));
+        }
+        other => panic!("expected Cost, got {other:?}"),
+    }
+}
+
+// ── backend_warning_error ──────────────────────────────────────────
+
+#[tokio::test]
+async fn backend_warning_error_emits_warning_and_error() {
+    let mut backend = FakeBackend::new(FakeScenario::BackendWarningError);
+    drain_startup(&mut backend).await;
+    backend.send_message("trigger error").unwrap();
+
+    let msg1 = backend.recv().await.unwrap();
+    assert_eq!(
+        msg1.get("method").and_then(|m| m.as_str()),
+        Some("ui.backend.warning")
+    );
+    let parsed1 = parse_notification(&msg1);
+    assert!(matches!(parsed1, AgentMsg::BackendWarning { .. }));
+
+    let msg2 = backend.recv().await.unwrap();
+    assert_eq!(
+        msg2.get("method").and_then(|m| m.as_str()),
+        Some("ui.backend.error")
+    );
+    let parsed2 = parse_notification(&msg2);
+    match parsed2 {
+        AgentMsg::BackendError {
+            code, recoverable, ..
+        } => {
+            assert_eq!(code, Some(429));
+            assert_eq!(recoverable, Some(true));
+        }
+        other => panic!("expected BackendError, got {other:?}"),
+    }
+}
+
+// ── ansi_injection ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn ansi_injection_events_contain_ansi() {
+    let mut backend = FakeBackend::new(FakeScenario::AnsiInjection);
+    drain_startup(&mut backend).await;
+    backend.send_message("inject").unwrap();
+
+    // First event: text delta with ANSI
+    let msg = backend.recv().await.unwrap();
+    let text = msg
+        .get("params")
+        .and_then(|p| p.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    assert!(text.contains("\x1b["), "text delta should contain ANSI");
+}
+
+#[tokio::test]
+async fn ansi_injection_app_state_is_sanitized() {
+    // Verify the sanitizer strips ANSI from visible App state.
+    let handle = BackendHandle::fake(FakeScenario::AnsiInjection);
+    let mut app = prism_tui::app::App::new(handle);
+
+    // Drain startup
+    if let Some(msg) = app.backend.recv().await {
+        app.handle_backend_message(&msg);
+    }
+    if let Some(msg) = app.backend.recv().await {
+        app.handle_backend_message(&msg);
+    }
+
+    // Send a message to trigger the ansi_injection response
+    app.push_user("inject");
+    let _ = app.backend.send_message("inject");
+
+    // Apply all response events (with timeout for scenarios that
+    // don't emit ui.turn.complete).
+    let timeout = tokio::time::Duration::from_millis(500);
+    loop {
+        match tokio::time::timeout(timeout, app.backend.recv()).await {
+            Ok(Some(msg)) => {
+                app.handle_backend_message(&msg);
+                let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                if method == "ui.turn.complete" {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break, // timeout
+        }
+    }
+
+    // Assert no terminal controls in any visible text
+    for line in &app.messages {
+        assert_no_terminal_controls(&line.text);
+    }
+}
+
+// ── All scenarios pass through parse_notification ──────────────────
+
+#[tokio::test]
+async fn all_scenarios_events_parse_without_unknown() {
+    for &scenario_name in FakeScenario::all_names() {
+        let scenario = FakeScenario::from_name(scenario_name).unwrap();
+        let mut backend = FakeBackend::new(scenario);
+        drain_startup(&mut backend).await;
+        backend.send_message("test").unwrap();
+
+        // Collect events with a timeout — some scenarios (e.g.
+        // approval_required) don't emit ui.turn.complete after
+        // send_message; they wait for send_approval instead.
+        let mut found_unknown = false;
+        let timeout = tokio::time::Duration::from_millis(500);
+        loop {
+            match tokio::time::timeout(timeout, backend.recv()).await {
+                Ok(Some(msg)) => {
+                    let parsed = parse_notification(&msg);
+                    if matches!(parsed, AgentMsg::Unknown(_)) {
+                        found_unknown = true;
+                        break;
+                    }
+                    let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    if method == "ui.turn.complete" {
+                        break;
+                    }
+                }
+                Ok(None) => break, // channel closed
+                Err(_) => break,   // timeout — no more events
+            }
+        }
+        assert!(
+            !found_unknown,
+            "scenario {scenario_name} produced Unknown events"
+        );
+    }
+}

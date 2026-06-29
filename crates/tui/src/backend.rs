@@ -24,14 +24,26 @@ use tokio::sync::mpsc;
 /// Deterministic fake-backend scenario.  Each variant corresponds to a
 /// fixed sequence of JSON-RPC notifications that the fake backend
 /// replays when the user interacts with the TUI.
-///
-/// Only `BasicChat` is implemented in Patch 3A.  More scenarios
-/// (approval, tool_error, streaming, stress) will be added in later
-/// patches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FakeScenario {
     /// Minimal chat: welcome → status → user message → fake response.
     BasicChat,
+    /// Streaming: many small text deltas to exercise streaming path.
+    StreamingAnswer,
+    /// Thinking + answer: thinking deltas then text deltas.
+    ThinkingStream,
+    /// Tool call success: tool start → tool card result.
+    ToolSuccess,
+    /// Tool call error: tool start → tool card error.
+    ToolError,
+    /// Approval required: prompt with rich fields, y/n/a responses.
+    ApprovalRequired,
+    /// Cost + metrics: token counts and zero cost.
+    CostMetrics,
+    /// Backend warning + structured error.
+    BackendWarningError,
+    /// ANSI injection: payloads with unsafe control sequences.
+    AnsiInjection,
 }
 
 impl FakeScenario {
@@ -39,9 +51,18 @@ impl FakeScenario {
     pub fn from_name(name: &str) -> Result<Self> {
         match name {
             "basic_chat" => Ok(Self::BasicChat),
+            "streaming_answer" => Ok(Self::StreamingAnswer),
+            "thinking_stream" => Ok(Self::ThinkingStream),
+            "tool_success" => Ok(Self::ToolSuccess),
+            "tool_error" => Ok(Self::ToolError),
+            "approval_required" => Ok(Self::ApprovalRequired),
+            "cost_metrics" => Ok(Self::CostMetrics),
+            "backend_warning_error" => Ok(Self::BackendWarningError),
+            "ansi_injection" => Ok(Self::AnsiInjection),
             other => bail!(
                 "unknown fake backend scenario: '{other}'. \
-                 Available scenarios: basic_chat"
+                 Available scenarios: {}",
+                Self::all_names().join(", ")
             ),
         }
     }
@@ -50,7 +71,30 @@ impl FakeScenario {
     pub fn as_name(&self) -> &'static str {
         match self {
             Self::BasicChat => "basic_chat",
+            Self::StreamingAnswer => "streaming_answer",
+            Self::ThinkingStream => "thinking_stream",
+            Self::ToolSuccess => "tool_success",
+            Self::ToolError => "tool_error",
+            Self::ApprovalRequired => "approval_required",
+            Self::CostMetrics => "cost_metrics",
+            Self::BackendWarningError => "backend_warning_error",
+            Self::AnsiInjection => "ansi_injection",
         }
+    }
+
+    /// All scenario names, for error messages and CLI help.
+    pub fn all_names() -> &'static [&'static str] {
+        &[
+            "basic_chat",
+            "streaming_answer",
+            "thinking_stream",
+            "tool_success",
+            "tool_error",
+            "approval_required",
+            "cost_metrics",
+            "backend_warning_error",
+            "ansi_injection",
+        ]
     }
 }
 
@@ -250,37 +294,32 @@ impl FakeBackend {
     }
 
     /// Enqueue the startup sequence: welcome + status.
+    /// All scenarios emit the same startup — the difference is in the
+    /// response to user messages and approvals.
     fn enqueue_startup(&self) {
-        match self.scenario {
-            FakeScenario::BasicChat => {
-                self.notify(
-                    "ui.welcome",
-                    serde_json::json!({
-                        "version": "2.7.1-fake",
-                        "tool_count": 99,
-                    }),
-                );
-                self.notify(
-                    "ui.status",
-                    serde_json::json!({
-                        "model": "fake-backend",
-                        "session_mode": "chat",
-                        "message_count": 0,
-                    }),
-                );
-            }
-        }
+        self.notify(
+            "ui.welcome",
+            serde_json::json!({
+                "version": "2.7.1-fake",
+                "tool_count": 99,
+            }),
+        );
+        self.notify(
+            "ui.status",
+            serde_json::json!({
+                "model": "fake-backend",
+                "session_mode": "chat",
+                "message_count": 0,
+            }),
+        );
     }
 
     /// Enqueue the response sequence for a user message.
     fn enqueue_response(&self, _user_text: &str) {
         match self.scenario {
             FakeScenario::BasicChat => {
-                // Send a deterministic fake response in a few deltas
-                // so the TUI's streaming path is exercised.
                 let response = "Fake backend response: PRISM TUI is running \
                     in deterministic test mode.";
-                // Split into a few chunks to simulate streaming.
                 let words: Vec<&str> = response.split_whitespace().collect();
                 for chunk in words.chunks(3) {
                     let text = chunk.join(" ") + " ";
@@ -298,6 +337,166 @@ impl FakeBackend {
                 );
                 self.notify("ui.turn.complete", serde_json::json!({}));
             }
+            FakeScenario::StreamingAnswer => {
+                // Many small deltas to exercise streaming.
+                let words: Vec<&str> = "Streaming answer: each word is a \
+                    separate delta to test the TUI streaming pipeline \
+                    handles token-by-token rendering correctly without \
+                    dropping or duplicating text."
+                    .split_whitespace()
+                    .collect();
+                for word in &words {
+                    self.notify(
+                        "ui.text.delta",
+                        serde_json::json!({"text": format!("{word} ")}),
+                    );
+                }
+                self.notify("ui.text.flush", serde_json::json!({}));
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
+            FakeScenario::ThinkingStream => {
+                // Thinking tokens first, then answer.
+                let thinking = "Let me reason about this. The user is \
+                    asking a question. I should respond with a clear answer.";
+                for word in thinking.split_whitespace() {
+                    self.notify(
+                        "ui.thinking.delta",
+                        serde_json::json!({"text": format!("{word} ")}),
+                    );
+                }
+                let answer = "Based on my reasoning, here is the answer: \
+                    the fake backend is working correctly.";
+                for word in answer.split_whitespace() {
+                    self.notify(
+                        "ui.text.delta",
+                        serde_json::json!({"text": format!("{word} ")}),
+                    );
+                }
+                self.notify("ui.text.flush", serde_json::json!({}));
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
+            FakeScenario::ToolSuccess => {
+                self.notify(
+                    "ui.tool.start",
+                    serde_json::json!({
+                        "tool_name": "alloy_sample",
+                        "verb": "Running",
+                        "call_id": "call-1",
+                        "preview": "{\"n\": 10}",
+                        "approval_required": false,
+                    }),
+                );
+                self.notify(
+                    "ui.card",
+                    serde_json::json!({
+                        "tool_name": "alloy_sample",
+                        "call_id": "call-1",
+                        "content": "W0.3 Mo0.2 Ta0.3 Nb0.2",
+                        "card_type": "results",
+                        "elapsed_ms": 292,
+                        "provenance_id": "prov_001",
+                    }),
+                );
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
+            FakeScenario::ToolError => {
+                self.notify(
+                    "ui.tool.start",
+                    serde_json::json!({
+                        "tool_name": "compute_submit",
+                        "verb": "Running",
+                        "call_id": "call-2",
+                        "approval_required": true,
+                    }),
+                );
+                self.notify(
+                    "ui.card",
+                    serde_json::json!({
+                        "tool_name": "compute_submit",
+                        "call_id": "call-2",
+                        "content": "Error: budget exceeded ($50.00 limit)",
+                        "card_type": "error",
+                        "elapsed_ms": 1200,
+                    }),
+                );
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
+            FakeScenario::ApprovalRequired => {
+                self.notify(
+                    "ui.prompt",
+                    serde_json::json!({
+                        "tool_name": "compute_submit",
+                        "call_id": "call-3",
+                        "message": "Allow compute_submit?",
+                        "tool_args": {"image": "vasp:6.5", "budget_max_usd": 10.0},
+                        "tool_description": "Dispatch a GPU compute job",
+                        "requires_approval": true,
+                        "permission_mode": "full_access",
+                        "choices": ["y", "n", "a"],
+                        "prompt_type": "approval",
+                    }),
+                );
+            }
+            FakeScenario::CostMetrics => {
+                self.notify(
+                    "ui.cost",
+                    serde_json::json!({
+                        "turn_cost": 0.001,
+                        "session_cost": 0.05,
+                        "input_tokens": 1200,
+                        "output_tokens": 800,
+                        "cache_tokens": 400,
+                    }),
+                );
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
+            FakeScenario::BackendWarningError => {
+                self.notify(
+                    "ui.backend.warning",
+                    serde_json::json!({
+                        "code": "rate_limit",
+                        "message": "Approaching API rate limit (80% of quota)",
+                    }),
+                );
+                self.notify(
+                    "ui.backend.error",
+                    serde_json::json!({
+                        "code": 429,
+                        "message": "Rate limit exceeded, please retry in 60s",
+                        "recoverable": true,
+                    }),
+                );
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
+            FakeScenario::AnsiInjection => {
+                // Inject ANSI/control sequences into text to verify the
+                // sanitizer strips them before they reach the render path.
+                self.notify(
+                    "ui.text.delta",
+                    serde_json::json!({
+                        "text": "\x1b[31mred text\x1b[0m \x1b]0;owned\x07safe \x07BEL\x08BS\x0dCR\x7fDEL",
+                    }),
+                );
+                self.notify(
+                    "ui.tool.start",
+                    serde_json::json!({
+                        "tool_name": "\x1b[36mtainted_tool\x1b[0m",
+                        "verb": "Running",
+                        "call_id": "call-ansi",
+                    }),
+                );
+                self.notify(
+                    "ui.card",
+                    serde_json::json!({
+                        "tool_name": "tainted_tool",
+                        "content": "\x1b[32mresult\x1b[0m with \x1b[2Jclear",
+                        "card_type": "results",
+                        "elapsed_ms": 50,
+                    }),
+                );
+                self.notify("ui.text.flush", serde_json::json!({}));
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
         }
     }
 
@@ -311,7 +510,6 @@ impl FakeBackend {
                 "message_count": 1,
             }),
         );
-        // For /tools, emit a minimal tool list.
         if command.starts_with("/tools") {
             self.notify(
                 "ui.view",
@@ -325,6 +523,57 @@ impl FakeBackend {
             );
         }
         self.notify("ui.turn.complete", serde_json::json!({}));
+    }
+
+    /// Enqueue the approval response based on the user's decision.
+    fn enqueue_approval_response(&self, response: &str) {
+        match response {
+            "y" => {
+                self.notify(
+                    "ui.card",
+                    serde_json::json!({
+                        "tool_name": "compute_submit",
+                        "call_id": "call-3",
+                        "content": "Job submitted successfully (job_id: fake-123)",
+                        "card_type": "results",
+                        "elapsed_ms": 500,
+                    }),
+                );
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
+            "n" => {
+                self.notify(
+                    "ui.status",
+                    serde_json::json!({
+                        "model": "fake-backend",
+                        "session_mode": "chat",
+                        "message_count": 1,
+                    }),
+                );
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
+            "a" => {
+                self.notify(
+                    "ui.permissions",
+                    serde_json::json!({
+                        "mode": "agent",
+                        "auto_approved": true,
+                    }),
+                );
+                self.notify(
+                    "ui.card",
+                    serde_json::json!({
+                        "tool_name": "compute_submit",
+                        "call_id": "call-3",
+                        "content": "Job submitted (auto-approved for session)",
+                        "card_type": "results",
+                        "elapsed_ms": 500,
+                    }),
+                );
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
+            _ => {}
+        }
     }
 
     pub async fn init(&mut self) -> Result<()> {
@@ -345,10 +594,11 @@ impl FakeBackend {
         Ok(id)
     }
 
-    pub fn send_approval(&mut self, _response: &str) -> Result<()> {
-        // No-op for fake backend — the approval state is handled by
-        // the TUI locally.  A future approval scenario can enqueue
-        // a tool result here.
+    pub fn send_approval(&mut self, response: &str) -> Result<()> {
+        // Enqueue the deterministic approval response based on the
+        // user's decision (y/n/a).  This lets the TUI test the full
+        // approval lifecycle: prompt → user key → backend response.
+        self.enqueue_approval_response(response);
         Ok(())
     }
 

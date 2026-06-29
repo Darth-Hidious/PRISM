@@ -74,7 +74,9 @@ enum Commands {
         fake_backend: bool,
 
         /// Fake backend scenario name (only used with --fake-backend).
-        /// Available: basic_chat
+        /// Available: basic_chat, streaming_answer, thinking_stream,
+        /// tool_success, tool_error, approval_required, cost_metrics,
+        /// backend_warning_error, ansi_injection
         #[arg(long, default_value = "basic_chat")]
         scenario: String,
     },
