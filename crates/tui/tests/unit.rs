@@ -1694,3 +1694,274 @@ fn append_assistant_text_preserves_unicode_through_sanitizer() {
     assert_eq!(last.text, "Ti₆Al₄V ΔH_mix 你好 🚀");
     assert_no_terminal_controls(&last.text);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Patch 3A tests: fake backend seam
+// ═══════════════════════════════════════════════════════════════════════
+
+use prism_tui::backend::{FakeBackend, FakeScenario};
+
+// ── FakeScenario parsing ─────────────────────────────────────────────
+
+#[test]
+fn fake_scenario_parses_basic_chat() {
+    let scenario = FakeScenario::from_name("basic_chat").unwrap();
+    assert_eq!(scenario, FakeScenario::BasicChat);
+}
+
+#[test]
+fn fake_scenario_rejects_unknown_name() {
+    let err = FakeScenario::from_name("nonexistent").unwrap_err();
+    assert!(err.to_string().contains("unknown fake backend scenario"));
+    assert!(err.to_string().contains("basic_chat"));
+}
+
+#[test]
+fn fake_scenario_as_name_roundtrips() {
+    assert_eq!(FakeScenario::BasicChat.as_name(), "basic_chat");
+    let s = FakeScenario::from_name(FakeScenario::BasicChat.as_name()).unwrap();
+    assert_eq!(s, FakeScenario::BasicChat);
+}
+
+// ── Fake backend construction ───────────────────────────────────────
+
+#[test]
+fn fake_backend_does_not_spawn_subprocess() {
+    // Construct a fake backend — this should not spawn any process.
+    let backend = BackendHandle::fake(FakeScenario::BasicChat);
+    // It should be the Fake variant.
+    assert!(matches!(backend, BackendHandle::Fake(_)));
+}
+
+#[test]
+fn real_backend_from_parts_still_compiles() {
+    // The test_app() helper already uses from_parts — verify it still
+    // works by constructing a test app (which uses from_parts internally).
+    let _app = test_app();
+}
+
+// ── Fake backend startup events ─────────────────────────────────────
+
+#[tokio::test]
+async fn fake_backend_emits_welcome_on_startup() {
+    let mut backend = FakeBackend::new(FakeScenario::BasicChat);
+    let msg = backend.recv().await.expect("no message");
+    assert_eq!(
+        msg.get("method").and_then(|m| m.as_str()),
+        Some("ui.welcome")
+    );
+    let params = msg.get("params").unwrap();
+    assert_eq!(
+        params.get("version").and_then(|v| v.as_str()),
+        Some("2.7.1-fake")
+    );
+    assert_eq!(params.get("tool_count").and_then(|v| v.as_u64()), Some(99));
+}
+
+#[tokio::test]
+async fn fake_backend_emits_status_after_welcome() {
+    let mut backend = FakeBackend::new(FakeScenario::BasicChat);
+    // First message is welcome
+    let _welcome = backend.recv().await.unwrap();
+    // Second message is status
+    let msg = backend.recv().await.expect("no status message");
+    assert_eq!(
+        msg.get("method").and_then(|m| m.as_str()),
+        Some("ui.status")
+    );
+    let params = msg.get("params").unwrap();
+    assert_eq!(
+        params.get("model").and_then(|m| m.as_str()),
+        Some("fake-backend")
+    );
+}
+
+// ── Fake backend send_message response ──────────────────────────────
+
+#[tokio::test]
+async fn fake_backend_send_message_emits_text_deltas() {
+    let mut backend = FakeBackend::new(FakeScenario::BasicChat);
+    // Drain startup events
+    backend.recv().await.unwrap(); // welcome
+    backend.recv().await.unwrap(); // status
+
+    // Send a message — should enqueue response events
+    backend.send_message("hello").unwrap();
+
+    // Collect all response events
+    let mut methods = Vec::new();
+    while let Some(msg) = backend.recv().await {
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        methods.push(method.to_string());
+        if method == "ui.turn.complete" {
+            break;
+        }
+    }
+
+    // Should have at least one text delta, a flush, cost, and turn complete
+    assert!(
+        methods.iter().any(|m| m == "ui.text.delta"),
+        "no text delta in: {methods:?}"
+    );
+    assert!(
+        methods.iter().any(|m| m == "ui.text.flush"),
+        "no text flush in: {methods:?}"
+    );
+    assert!(
+        methods.iter().any(|m| m == "ui.cost"),
+        "no cost in: {methods:?}"
+    );
+    assert!(
+        methods.iter().any(|m| m == "ui.turn.complete"),
+        "no turn complete in: {methods:?}"
+    );
+}
+
+#[tokio::test]
+async fn fake_backend_response_text_contains_fake_message() {
+    let mut backend = FakeBackend::new(FakeScenario::BasicChat);
+    backend.recv().await.unwrap(); // welcome
+    backend.recv().await.unwrap(); // status
+    backend.send_message("test").unwrap();
+
+    // Collect all text deltas and concatenate
+    let mut full_text = String::new();
+    while let Some(msg) = backend.recv().await {
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        if method == "ui.text.delta" {
+            if let Some(text) = msg
+                .get("params")
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())
+            {
+                full_text.push_str(text);
+            }
+        }
+        if method == "ui.turn.complete" {
+            break;
+        }
+    }
+    assert!(
+        full_text.contains("Fake backend response"),
+        "text was: {full_text}"
+    );
+    assert!(
+        full_text.contains("deterministic test mode"),
+        "text was: {full_text}"
+    );
+}
+
+// ── Fake backend events pass through parse_notification ─────────────
+
+#[tokio::test]
+async fn fake_backend_events_parse_correctly() {
+    use prism_tui::msg::{AgentMsg, parse_notification};
+
+    let mut backend = FakeBackend::new(FakeScenario::BasicChat);
+
+    // Welcome
+    let welcome = backend.recv().await.unwrap();
+    let parsed = parse_notification(&welcome);
+    match parsed {
+        AgentMsg::Welcome {
+            version,
+            tool_count,
+        } => {
+            assert_eq!(version, "2.7.1-fake");
+            assert_eq!(tool_count, 99);
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+
+    // Status
+    let status = backend.recv().await.unwrap();
+    let parsed = parse_notification(&status);
+    match parsed {
+        AgentMsg::Status { model, mode, .. } => {
+            assert_eq!(model, "fake-backend");
+            assert_eq!(mode, "chat");
+        }
+        other => panic!("expected Status, got {other:?}"),
+    }
+
+    // Send message and check response events parse
+    backend.send_message("hello").unwrap();
+    let delta = backend.recv().await.unwrap();
+    let parsed = parse_notification(&delta);
+    assert!(
+        matches!(parsed, AgentMsg::TextDelta(_)),
+        "expected TextDelta, got {parsed:?}"
+    );
+}
+
+// ── App receives fake backend events ─────────────────────────────────
+
+#[tokio::test]
+async fn app_with_fake_backend_produces_assistant_text() {
+    // Build an App with a fake backend, apply startup events, send a
+    // message, apply response events, and verify assistant text appears.
+    let handle = BackendHandle::fake(FakeScenario::BasicChat);
+    let mut app = prism_tui::app::App::new(handle);
+
+    // Apply startup events (welcome + status)
+    if let Some(msg) = app.backend.recv().await {
+        app.handle_backend_message(&msg);
+    }
+    if let Some(msg) = app.backend.recv().await {
+        app.handle_backend_message(&msg);
+    }
+
+    // Verify welcome was applied
+    assert_eq!(app.prism_version, "2.7.1-fake");
+    assert_eq!(app.tool_count, 99);
+    assert_eq!(app.model, "fake-backend");
+
+    // Simulate user sending a message
+    app.push_user("hello");
+    let _ = app.backend.send_message("hello");
+
+    // Apply response events
+    let mut received_text = String::new();
+    while let Some(msg) = app.backend.recv().await {
+        app.handle_backend_message(&msg);
+        // Check if we got assistant text
+        if let Some(last) = app.messages.last() {
+            if matches!(last.role, prism_tui::app::Role::Assistant) {
+                received_text = last.text.clone();
+            }
+        }
+        // Stop after turn complete
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        if method == "ui.turn.complete" {
+            break;
+        }
+    }
+
+    // The assistant should have produced text containing the fake response
+    assert!(
+        received_text.contains("Fake backend response"),
+        "assistant text was: {received_text}"
+    );
+}
+
+// ── Fake backend slash command ───────────────────────────────────────
+
+#[tokio::test]
+async fn fake_backend_send_command_emits_response() {
+    let mut backend = FakeBackend::new(FakeScenario::BasicChat);
+    backend.recv().await.unwrap(); // welcome
+    backend.recv().await.unwrap(); // status
+
+    backend.send_command("/tools").unwrap();
+
+    // Should get a status update and possibly a view, then turn complete
+    let mut methods = Vec::new();
+    while let Some(msg) = backend.recv().await {
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        methods.push(method.to_string());
+        if method == "ui.turn.complete" {
+            break;
+        }
+    }
+    assert!(methods.iter().any(|m| m == "ui.turn.complete"));
+}

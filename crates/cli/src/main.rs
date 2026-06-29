@@ -66,7 +66,18 @@ enum Commands {
     /// Run first-time native setup and platform login.
     Setup,
     /// Launch the interactive AI agent TUI.
-    Tui,
+    Tui {
+        /// Use a deterministic fake backend instead of spawning `prism
+        /// backend`.  No subprocess, no network, no LLM.  Used for
+        /// testing and PTY verification.
+        #[arg(long)]
+        fake_backend: bool,
+
+        /// Fake backend scenario name (only used with --fake-backend).
+        /// Available: basic_chat
+        #[arg(long, default_value = "basic_chat")]
+        scenario: String,
+    },
     /// Resume a previous conversation.
     ///
     /// With no argument, opens the conversation picker (last-N sessions
@@ -988,7 +999,7 @@ async fn main() -> Result<()> {
     // avoid a network call on every trivial invocation.
     if matches!(
         cli.command,
-        Some(Commands::Tui)
+        Some(Commands::Tui { .. })
             | Some(Commands::Backend { .. })
             | Some(Commands::Resume { .. })
             | Some(Commands::Campaign { .. })
@@ -1032,7 +1043,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    match cli.command.unwrap_or(Commands::Tui) {
+    match cli.command.unwrap_or(Commands::Tui {
+        fake_backend: false,
+        scenario: "basic_chat".to_string(),
+    }) {
         Commands::Setup => {
             let mut state = paths.load_cli_state()?;
             state.preferred_python = Some(python.display().to_string());
@@ -1257,10 +1271,8 @@ async fn main() -> Result<()> {
                         ..Default::default()
                     };
 
-                    let campaign_id = format!(
-                        "campaign-{}",
-                        chrono::Utc::now().format("%Y%m%d-%H%M%S")
-                    );
+                    let campaign_id =
+                        format!("campaign-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
 
                     println!("Starting campaign: {campaign_id}");
                     println!("Goal: {goal}");
@@ -1300,14 +1312,20 @@ async fn main() -> Result<()> {
                     let state = campaign.state();
                     println!("Campaign: {}", state.campaign_id);
                     println!("Goal: {}", state.goal.description);
-                    println!("Status: {}", if state.completed {
-                        &state.completion_reason
-                    } else if state.paused {
-                        "paused (approval gate)"
-                    } else {
-                        "incomplete"
-                    });
-                    println!("Iterations: {} / {}", state.current_iteration, state.config.max_iterations);
+                    println!(
+                        "Status: {}",
+                        if state.completed {
+                            &state.completion_reason
+                        } else if state.paused {
+                            "paused (approval gate)"
+                        } else {
+                            "incomplete"
+                        }
+                    );
+                    println!(
+                        "Iterations: {} / {}",
+                        state.current_iteration, state.config.max_iterations
+                    );
                     println!("Candidates evaluated: {}", state.total_evaluated());
                     println!("Avg reward: {:.4}", state.avg_reward());
                     if let Some(best) = state.best() {
@@ -1399,20 +1417,15 @@ async fn main() -> Result<()> {
                     url,
                     model,
                     api_key: local_key,
-                } => (
-                    url.clone(),
-                    model.clone(),
-                    local_key.clone().or(api_key),
-                ),
+                } => (url.clone(), model.clone(), local_key.clone().or(api_key)),
                 crate::chat_config::ChatTarget::Provider {
                     provider,
                     model,
                     api_key_env,
                 } => {
-                    let env_name =
-                        api_key_env.as_deref().unwrap_or_else(|| {
-                            crate::chat_config::ChatTarget::default_api_key_env(provider)
-                        });
+                    let env_name = api_key_env.as_deref().unwrap_or_else(|| {
+                        crate::chat_config::ChatTarget::default_api_key_env(provider)
+                    });
                     let provider_key = std::env::var(env_name).ok();
                     (
                         format!(
@@ -1425,8 +1438,7 @@ async fn main() -> Result<()> {
                 }
                 // Marc27 cloud: use prism.toml [llm] as before.
                 crate::chat_config::ChatTarget::Marc27 { .. } => (
-                    std::env::var("LLM_BASE_URL")
-                        .unwrap_or_else(|_| cfg_llm.url.clone()),
+                    std::env::var("LLM_BASE_URL").unwrap_or_else(|_| cfg_llm.url.clone()),
                     std::env::var("LLM_MODEL").unwrap_or_else(|_| {
                         cfg_llm
                             .model
@@ -1855,8 +1867,7 @@ async fn main() -> Result<()> {
                 // Wire LLM config from config.toml [chat] (prism use local)
                 // falling back to prism.toml [indexer], then defaults.
                 {
-                    let chat_target =
-                        crate::chat_config::load().unwrap_or_default().chat;
+                    let chat_target = crate::chat_config::load().unwrap_or_default().chat;
                     let (base_url, model, api_key) = match &chat_target {
                         crate::chat_config::ChatTarget::Local {
                             url,
@@ -1865,13 +1876,11 @@ async fn main() -> Result<()> {
                         } => (
                             url.clone(),
                             model.clone(),
-                            local_key
-                                .clone()
-                                .or_else(|| {
-                                    prism_core::config::NodeConfig::resolve_api_key(
-                                        &node_config.indexer,
-                                    )
-                                }),
+                            local_key.clone().or_else(|| {
+                                prism_core::config::NodeConfig::resolve_api_key(
+                                    &node_config.indexer,
+                                )
+                            }),
                         ),
                         crate::chat_config::ChatTarget::Provider {
                             provider,
@@ -1895,18 +1904,18 @@ async fn main() -> Result<()> {
                             )
                         }
                         crate::chat_config::ChatTarget::Marc27 { .. } => {
-                            let api_key =
-                                prism_core::config::NodeConfig::resolve_api_key(
-                                    &node_config.indexer,
+                            let api_key = prism_core::config::NodeConfig::resolve_api_key(
+                                &node_config.indexer,
+                            );
+                            let base_url =
+                                node_config.indexer.uri.clone().unwrap_or_else(
+                                    || match node_config.indexer.mode.as_str() {
+                                        "platform" | "marc27" | "external" => {
+                                            node_config.platform.url.clone() + "/llm"
+                                        }
+                                        _ => "http://localhost:8080".into(),
+                                    },
                                 );
-                            let base_url = node_config.indexer.uri.clone().unwrap_or_else(|| {
-                                match node_config.indexer.mode.as_str() {
-                                    "platform" | "marc27" | "external" => {
-                                        node_config.platform.url.clone() + "/llm"
-                                    }
-                                    _ => "http://localhost:8080".into(),
-                                }
-                            });
                             let model = node_config
                                 .indexer
                                 .model
@@ -1934,7 +1943,10 @@ async fn main() -> Result<()> {
                 // we need credentials to join the mesh. The mesh refuses
                 // to start without an auth token (RBAC gate).
                 let cli_state = paths.load_cli_state().ok().unwrap_or_default();
-                let mesh_auth_token = cli_state.credentials.as_ref().map(|c| c.access_token.clone());
+                let mesh_auth_token = cli_state
+                    .credentials
+                    .as_ref()
+                    .map(|c| c.access_token.clone());
                 let mesh_has_auth = mesh_auth_token.is_some();
 
                 if !offline {
@@ -2652,7 +2664,11 @@ async fn main() -> Result<()> {
                         } else {
                             println!("{} tool update(s) available:", pending.len());
                             for (slug, local, remote) in &pending {
-                                let from = if local.is_empty() { "(not installed)" } else { local };
+                                let from = if local.is_empty() {
+                                    "(not installed)"
+                                } else {
+                                    local
+                                };
                                 println!("  {slug}: {from} → {remote}");
                             }
                         }
@@ -2906,13 +2922,26 @@ async fn main() -> Result<()> {
         } => {
             handle_configure(llm_provider, url, model, embedding_model, show)?;
         }
-        Commands::Tui => {
+        Commands::Tui {
+            fake_backend,
+            scenario,
+        } => {
+            // --fake-backend: deterministic test mode, no real backend.
+            if fake_backend {
+                let scen = prism_tui::backend::FakeScenario::from_name(&scenario)?;
+                let config = prism_tui::RunConfig {
+                    backend_mode: prism_tui::BackendMode::Fake { scenario: scen },
+                };
+                prism_tui::run_with_config(config).await?;
+                return Ok(());
+            }
+
             // --offline: skip auth refresh + boot checks entirely.
             // The TUI launches directly with local tools only.
             if cli.offline {
                 let _ = &python;
-                let prism_bin = std::env::current_exe()
-                    .context("failed to locate current prism executable")?;
+                let prism_bin =
+                    std::env::current_exe().context("failed to locate current prism executable")?;
                 prism_tui::run(
                     prism_bin.to_str().unwrap(),
                     &project_root.to_string_lossy().to_string(),
@@ -2996,8 +3025,8 @@ async fn main() -> Result<()> {
             let _ = &python;
             // Launch the new Ratatui full-screen TUI. It spawns
             // `prism backend` as a subprocess and talks JSON-RPC.
-            let prism_bin = std::env::current_exe()
-                .context("failed to locate current prism executable")?;
+            let prism_bin =
+                std::env::current_exe().context("failed to locate current prism executable")?;
             prism_tui::run(
                 prism_bin.to_str().unwrap(),
                 &project_root.to_string_lossy().to_string(),
@@ -3807,7 +3836,9 @@ fn build_llm_config(
             model: local_model,
             api_key: local_key,
         } => (
-            url_override.map(str::to_string).unwrap_or_else(|| url.clone()),
+            url_override
+                .map(str::to_string)
+                .unwrap_or_else(|| url.clone()),
             model_override
                 .map(str::to_string)
                 .unwrap_or_else(|| local_model.clone()),
@@ -3821,9 +3852,9 @@ fn build_llm_config(
             model: prov_model,
             api_key_env,
         } => {
-            let env_name = api_key_env.as_deref().unwrap_or_else(|| {
-                crate::chat_config::ChatTarget::default_api_key_env(provider)
-            });
+            let env_name = api_key_env
+                .as_deref()
+                .unwrap_or_else(|| crate::chat_config::ChatTarget::default_api_key_env(provider));
             (
                 url_override.map(str::to_string).unwrap_or_else(|| {
                     format!(

@@ -48,8 +48,57 @@ use crossterm::{
 use ratatui::Terminal;
 use std::io;
 
+// ── Run configuration ───────────────────────────────────────────────
+
+/// Selects which backend the TUI should drive.
+#[derive(Debug, Clone)]
+pub enum BackendMode {
+    /// Spawn the real `prism backend` subprocess.
+    Real {
+        prism_binary: String,
+        project_root: String,
+        python_bin: String,
+    },
+    /// Use a deterministic fake backend (no subprocess, no network).
+    Fake { scenario: backend::FakeScenario },
+}
+
+/// Configuration for [`run_with_config`].
+#[derive(Debug, Clone)]
+pub struct RunConfig {
+    pub backend_mode: BackendMode,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            backend_mode: BackendMode::Real {
+                prism_binary: "prism".into(),
+                project_root: ".".into(),
+                python_bin: "python3".into(),
+            },
+        }
+    }
+}
+
 /// Entry point — called by `prism` CLI (bare `prism` or `prism tui`).
+///
+/// Preserved for backward compatibility.  Delegates to
+/// [`run_with_config`] with a real backend mode.
 pub async fn run(prism_binary: &str, project_root: &str, python_bin: &str) -> Result<()> {
+    let config = RunConfig {
+        backend_mode: BackendMode::Real {
+            prism_binary: prism_binary.to_string(),
+            project_root: project_root.to_string(),
+            python_bin: python_bin.to_string(),
+        },
+    };
+    run_with_config(config).await
+}
+
+/// Entry point with explicit backend mode.  Used by
+/// `prism tui --fake-backend --scenario <name>`.
+pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // Check that we're running in a real terminal — raw mode requires a TTY.
     if !std::io::IsTerminal::is_terminal(&io::stdin()) {
         anyhow::bail!(
@@ -99,8 +148,15 @@ pub async fn run(prism_binary: &str, project_root: &str, python_bin: &str) -> Re
     // The first `terminal.draw()` will render the full frame anyway,
     // so the explicit clear is unnecessary.
 
-    // Spawn backend subprocess
-    let mut backend_handle = backend::BackendHandle::spawn(prism_binary, project_root, python_bin)?;
+    // Spawn backend — real subprocess or fake deterministic player.
+    let mut backend_handle = match &config.backend_mode {
+        BackendMode::Real {
+            prism_binary,
+            project_root,
+            python_bin,
+        } => backend::BackendHandle::spawn(prism_binary, project_root, python_bin)?,
+        BackendMode::Fake { scenario } => backend::BackendHandle::fake(*scenario),
+    };
     backend_handle.init().await?;
 
     // Build app state
