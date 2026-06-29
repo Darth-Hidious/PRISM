@@ -20,6 +20,8 @@ strip-ansi-escapes = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 arboard = "3"
+
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]

@@ -178,16 +178,29 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     let mut tick = interval(Duration::from_millis(100));
 
     // Install SIGINT handler — sets a flag the loop checks each iteration.
+    // On Unix, we use a raw libc::sigaction handler for reliable signal
+    // delivery in raw terminal mode.  On non-Unix (Windows), we fall
+    // back to tokio::signal::ctrl_c() which is polled in the select!
+    // loop below.  The raw handler is preferred on Unix because it
+    // cannot be starved by the select! branch ordering.
     static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
-    extern "C" fn handle_sigint(_: i32) {
-        SIGINT_RECEIVED.store(true, Ordering::SeqCst);
+
+    #[cfg(unix)]
+    {
+        extern "C" fn handle_sigint(_: i32) {
+            SIGINT_RECEIVED.store(true, Ordering::SeqCst);
+        }
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handle_sigint as usize;
+            sa.sa_flags = 0;
+            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        }
     }
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handle_sigint as usize;
-        sa.sa_flags = 0;
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-    }
+
+    // On non-Unix, use tokio::signal::ctrl_c() polled in the select!.
+    #[cfg(not(unix))]
+    let mut sigint_future = tokio::signal::ctrl_c();
 
     loop {
         // Render every frame
@@ -202,22 +215,43 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         // Select between key events, agent messages, and render ticks.
         // A 200ms timeout ensures the loop checks SIGINT at least
         // 5 times per second even if all other branches are idle.
-        tokio::select! {
-            // Render tick — fires every 100ms for animations
-            _ = tick.tick() => {}
-            // Terminal events (keyboard, resize, etc.)
-            Some(Ok(ev)) = events.next() => {
-                if let Event::Key(key) = ev {
-                    app.handle_key(key);
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = tick.tick() => {}
+                Some(Ok(ev)) = events.next() => {
+                    if let Event::Key(key) = ev {
+                        app.handle_key(key);
+                    }
                 }
+                Some(msg) = app.backend.recv() => {
+                    app.handle_backend_message(&msg);
+                }
+                _ = &mut sigint_future => {
+                    SIGINT_RECEIVED.store(true, Ordering::SeqCst);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
-            // Agent backend messages
-            Some(msg) = app.backend.recv() => {
-                app.handle_backend_message(&msg);
+        }
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                // Render tick — fires every 100ms for animations
+                _ = tick.tick() => {}
+                // Terminal events (keyboard, resize, etc.)
+                Some(Ok(ev)) = events.next() => {
+                    if let Event::Key(key) = ev {
+                        app.handle_key(key);
+                    }
+                }
+                // Agent backend messages
+                Some(msg) = app.backend.recv() => {
+                    app.handle_backend_message(&msg);
+                }
+                // Fallback timeout — ensures SIGINT flag is checked
+                // even if tick and events are both stalled.
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
-            // Fallback timeout — ensures SIGINT flag is checked
-            // even if tick and events are both stalled.
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
     }
 

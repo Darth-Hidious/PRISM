@@ -54,8 +54,13 @@ coverage.xml
 *.pot
 # Sphinx documentation
 docs/_build/
-# Generated docs (plans, designs)
+# Generated docs (plans, designs) — but allow committed harness docs
 docs/
+!docs/tui-mcp-verification.md
+!docs/examples/
+!docs/examples/**
+!docs/templates/
+!docs/templates/**
 # PyBuilder
 target/
 # Jupyter Notebook
