@@ -37,6 +37,13 @@
 pub mod app;
 pub mod backend;
 pub mod msg;
+/// Render module — public for integration snapshot tests only.
+///
+/// This module is NOT stable API. It exists as `pub` so that the
+/// `tests/render_snapshots.rs` integration tests can call
+/// `render::draw` via `TestBackend`. Do not depend on it from
+/// external crates.
+#[doc(hidden)]
 pub mod render;
 pub mod sanitize;
 

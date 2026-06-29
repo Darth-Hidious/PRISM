@@ -91,3 +91,13 @@ All output must be English. If CJK characters appear in any agent artifact (docs
 python scripts/check_no_cjk_in_agent_artifacts.py
 ```
 Correct any findings and note "language drift corrected" in the report.
+
+## Snapshot Review Policy
+
+Snapshot tests are in `crates/tui/tests/render_snapshots.rs`. Snapshots are stored as `.snap` files under `crates/tui/tests/snapshots/`.
+
+- Snapshot failures must be inspected, not blindly accepted.
+- Use `cargo insta review` if available to inspect diffs interactively.
+- Use `INSTA_UPDATE=always cargo test -p prism-tui --test render_snapshots` only when intentionally generating or updating snapshots.
+- Never set `INSTA_UPDATE=always` in CI or in `scripts/verify-tui.sh`.
+- Snapshot diffs are visual contract changes — review them like code changes.
