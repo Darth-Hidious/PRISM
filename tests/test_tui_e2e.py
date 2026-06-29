@@ -418,3 +418,71 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ── Fake backend PTY smoke tests ────────────────────────────────────
+
+
+def test_fake_backend_shutdown():
+    """Verify that `prism tui --fake-backend --scenario basic_chat` exits
+    cleanly when sent SIGINT.
+
+    This is a regression test for Patch 3A.5: the fake backend has no
+    child subprocess, so the old Ctrl-C key path (which relied on the
+    child dying to cascade-shutdown the reader thread) didn't work.
+    The fix adds a raw SIGINT handler (via libc::sigaction) that sets
+    an atomic flag checked by the render loop.
+
+    PTY output must be drained continuously — the TUI writes to stdout
+    on every render frame (100ms).  If the PTY output buffer fills up,
+    the TUI's write() syscall blocks and the loop never reaches the
+    SIGINT check.  We drain by calling proc.expect() in a background
+    thread.
+    """
+    import os
+    import signal
+    import threading
+
+    proc = pexpect.spawn(
+        PRISM_BIN,
+        args=["tui", "--fake-backend", "--scenario", "basic_chat"],
+        encoding="utf-8",
+        timeout=10,
+        dimensions=(40, 120),
+    )
+
+    # Background thread to continuously drain PTY output so the TUI's
+    # write() syscall doesn't block on a full pipe buffer.
+    def drain():
+        try:
+            while True:
+                proc.expect(pexpect.TIMEOUT, timeout=0.1)
+        except Exception:
+            pass
+
+    drain_thread = threading.Thread(target=drain, daemon=True)
+    drain_thread.start()
+
+    time.sleep(2)
+
+    # Verify the TUI started.
+    started = proc.isalive()
+    assert started, "TUI process died during startup"
+
+    # Send SIGINT to the child process.
+    os.kill(proc.pid, signal.SIGINT)
+
+    # Wait up to 3 seconds for the process to exit.
+    exited = False
+    for _ in range(30):
+        time.sleep(0.1)
+        if not proc.isalive():
+            exited = True
+            break
+
+    try:
+        proc.close(force=True)
+    except Exception:
+        pass
+
+    assert exited, "TUI did not exit within 3s after SIGINT"

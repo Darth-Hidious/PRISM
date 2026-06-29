@@ -47,6 +47,7 @@ use crossterm::{
 };
 use ratatui::Terminal;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Run configuration ───────────────────────────────────────────────
 
@@ -164,30 +165,46 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
 
     // Main event loop — tokio::select! between crossterm events,
     // agent messages, and a periodic render tick (100ms) for animations.
+    //
+    // SIGINT handling: we install a raw SIGINT handler that sets an
+    // atomic flag.  The loop checks this flag on every iteration (at
+    // least every 100ms via the tick).  This is more reliable than
+    // tokio::signal::ctrl_c() which can be starved by the select!
+    // in release mode.
     use crossterm::event::{Event, EventStream};
     use futures::StreamExt;
     use tokio::time::{Duration, interval};
     let mut events = EventStream::new();
     let mut tick = interval(Duration::from_millis(100));
 
+    // Install SIGINT handler — sets a flag the loop checks each iteration.
+    static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+    extern "C" fn handle_sigint(_: i32) {
+        SIGINT_RECEIVED.store(true, Ordering::SeqCst);
+    }
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handle_sigint as usize;
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+
     loop {
         // Render every frame
         terminal.draw(|f| render::draw(f, &app))?;
 
-        if app.should_quit {
+        // Check quit conditions: should_quit (from key handler) or
+        // SIGINT received (from the signal handler).
+        if app.should_quit || SIGINT_RECEIVED.load(Ordering::SeqCst) {
             break;
         }
 
         // Select between key events, agent messages, and render ticks.
-        // The tick ensures the spinner animates and metrics update even
-        // when no events are arriving (e.g. waiting for LLM response).
+        // A 200ms timeout ensures the loop checks SIGINT at least
+        // 5 times per second even if all other branches are idle.
         tokio::select! {
             // Render tick — fires every 100ms for animations
-            _ = tick.tick() => {
-                // Just causes a redraw — no state change needed.
-                // The spinner animation uses system time, so it
-                // updates on each render.
-            }
+            _ = tick.tick() => {}
             // Terminal events (keyboard, resize, etc.)
             Some(Ok(ev)) = events.next() => {
                 if let Event::Key(key) = ev {
@@ -198,6 +215,9 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
             Some(msg) = app.backend.recv() => {
                 app.handle_backend_message(&msg);
             }
+            // Fallback timeout — ensures SIGINT flag is checked
+            // even if tick and events are both stalled.
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
     }
 
