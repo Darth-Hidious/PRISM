@@ -1,0 +1,28 @@
+FROM rust:1.86-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    cmake libcurl4-openssl-dev pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY app/ app/
+RUN mkdir -p dashboard/dist && echo '<html></html>' > dashboard/dist/index.html
+RUN cargo build --release --bin prism
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates curl python3 python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/prism /usr/local/bin/prism
+COPY app/ /opt/prism/app/
+COPY pyproject.toml /opt/prism/
+
+WORKDIR /opt/prism
+ENV PRISM_PROJECT_ROOT=/opt/prism
+
+EXPOSE 7327
+CMD ["prism", "node", "up", "--no-services", "--broadcast", "--dashboard-port", "7327"]

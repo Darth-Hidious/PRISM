@@ -1,0 +1,22 @@
+[package]
+name = "prism-campaign"
+description = "Long-running autonomous materials discovery campaigns — budget-limited, checkpointable, human-in-the-loop."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid = { workspace = true }
+
+prism-workflows = { path = "../workflows" }
+prism-provenance = { path = "../provenance" }
+prism-llm = { path = "../llm" }
+reqwest.workspace = true
