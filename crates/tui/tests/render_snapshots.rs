@@ -434,3 +434,274 @@ fn snapshot_wide_terminal_basic_chat_200x60() {
     let rendered = render_app_to_string(&app, 200, 60);
     insta::assert_snapshot!("wide_terminal_basic_chat_200x60", rendered);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Patch 4B: expanded render snapshot coverage
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Helper: create a baseline app with welcome + status already applied.
+fn app_with_welcome() -> App {
+    let mut app = fake_app();
+    app.apply_agent_msg(AgentMsg::Welcome {
+        version: "2.7.1-fake".into(),
+        tool_count: 99,
+    });
+    app.apply_agent_msg(AgentMsg::Status {
+        model: "fake-backend".into(),
+        mode: "chat".into(),
+        message_count: 1,
+    });
+    app.tokens_per_sec = 0.0;
+    app.first_token_time = None;
+    app.last_token_time = None;
+    app.tokens_received = 0;
+    app
+}
+
+/// Helper: set volatile metrics to deterministic values.
+fn freeze_metrics(app: &mut App) {
+    app.tokens_per_sec = 0.0;
+    app.first_token_time = None;
+    app.last_token_time = None;
+    app.tokens_received = 0;
+}
+
+// ── Backend warning + error ─────────────────────────────────────────
+
+#[test]
+fn snapshot_backend_warning_error_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("trigger error");
+    app.apply_agent_msg(AgentMsg::BackendWarning {
+        code: Some("rate_limit".into()),
+        message: "Approaching API rate limit (80% of quota)".into(),
+    });
+    app.apply_agent_msg(AgentMsg::BackendError {
+        code: Some(429),
+        message: "Rate limit exceeded, please retry in 60s".into(),
+        recoverable: Some(true),
+    });
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("backend_warning_error_100x30", rendered);
+}
+
+// ── Approval after y (approved) ──────────────────────────────────────
+
+#[test]
+fn snapshot_approval_after_y_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("run compute");
+    // Show the approval prompt
+    app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+        tool_name: "compute_submit".into(),
+        call_id: Some("call-3".into()),
+        message: "Allow compute_submit?".into(),
+        tool_args: None,
+        tool_description: None,
+        requires_approval: Some(true),
+        permission_mode: None,
+        choices: vec!["y".into(), "n".into(), "a".into()],
+        prompt_type: None,
+    });
+    // Simulate pressing 'y' — the key handler approves and clears
+    // the pending state.  We replicate the visible behavior directly.
+    if let Some((tool, _)) = app.approval_pending.take() {
+        app.push_system(&format!("[approved {tool}]"));
+    }
+    app.focus = prism_tui::app::Focus::Input;
+    // Apply a tool success card as the backend response
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "compute_submit".into(),
+        call_id: Some("call-3".into()),
+        content: "Job submitted successfully (job_id: fake-123)".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(500),
+        provenance_id: None,
+        data: None,
+    });
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("approval_after_y_100x30", rendered);
+}
+
+// ── Approval after n (denied) ────────────────────────────────────────
+
+#[test]
+fn snapshot_approval_after_n_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("run compute");
+    app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+        tool_name: "compute_submit".into(),
+        call_id: Some("call-3".into()),
+        message: "Allow compute_submit?".into(),
+        tool_args: None,
+        tool_description: None,
+        requires_approval: Some(true),
+        permission_mode: None,
+        choices: vec!["y".into(), "n".into(), "a".into()],
+        prompt_type: None,
+    });
+    // Simulate pressing 'n' — deny
+    if let Some((tool, _)) = app.approval_pending.take() {
+        app.push_system(&format!("[denied {tool}]"));
+    }
+    app.focus = prism_tui::app::Focus::Input;
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("approval_after_n_100x30", rendered);
+}
+
+// ── Approval after a (allow-all) ──────────────────────────────────────
+
+#[test]
+fn snapshot_approval_after_a_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("run compute");
+    app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+        tool_name: "compute_submit".into(),
+        call_id: Some("call-3".into()),
+        message: "Allow compute_submit?".into(),
+        tool_args: None,
+        tool_description: None,
+        requires_approval: Some(true),
+        permission_mode: None,
+        choices: vec!["y".into(), "n".into(), "a".into()],
+        prompt_type: None,
+    });
+    // Simulate pressing 'a' — allow all
+    if let Some((tool, _)) = app.approval_pending.take() {
+        app.push_system(&format!("[allow-all {tool}]"));
+    }
+    app.focus = prism_tui::app::Focus::Input;
+    // Backend response: permissions auto-approved + card
+    app.apply_agent_msg(AgentMsg::Permissions {
+        mode: Some("agent".into()),
+        auto_approved: Some(true),
+        raw: serde_json::json!({}),
+    });
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "compute_submit".into(),
+        call_id: Some("call-3".into()),
+        content: "Job submitted (auto-approved for session)".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(500),
+        provenance_id: None,
+        data: None,
+    });
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("approval_after_a_100x30", rendered);
+}
+
+// ── Unicode-heavy message ────────────────────────────────────────────
+
+#[test]
+fn snapshot_unicode_heavy_message_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("show unicode");
+    // Intentional Unicode preservation test — contains CJK, emoji,
+    // math symbols, combining marks.  The sanitizer must preserve
+    // all of these.
+    app.apply_agent_msg(AgentMsg::TextDelta(
+        "Ti₆Al₄V ΔH_mix 你好 café 🚀 entropy μ".into(),
+    ));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("unicode_heavy_message_100x30", rendered);
+}
+
+// ── Long unbroken line ────────────────────────────────────────────────
+
+#[test]
+fn snapshot_long_unbroken_line_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("show long line");
+    // A long JSON-like string with no spaces — tests word wrapping.
+    let long = "key_".to_string() + &"value_".repeat(80) + &"end_of_long_unbroken_token";
+    app.apply_agent_msg(AgentMsg::TextDelta(long));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("long_unbroken_line_100x30", rendered);
+}
+
+// ── Multiline message ─────────────────────────────────────────────────
+
+#[test]
+fn snapshot_multiline_message_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("show multiline");
+    app.apply_agent_msg(AgentMsg::TextDelta("Line 1: hello\n".into()));
+    app.apply_agent_msg(AgentMsg::TextDelta("Line 2: world\n".into()));
+    app.apply_agent_msg(AgentMsg::TextDelta("Line 3: deterministic".into()));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("multiline_message_100x30", rendered);
+}
+
+// ── Metrics panel toggled ─────────────────────────────────────────────
+
+#[test]
+fn snapshot_metrics_panel_toggled_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("show metrics");
+    app.apply_agent_msg(AgentMsg::TextDelta("Metrics display is toggled.".into()));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    // Toggle metrics off — status bar should not show tok/s
+    app.show_metrics = false;
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("metrics_panel_toggled_100x30", rendered);
+}
+
+// ── Cost panel toggled off ────────────────────────────────────────────
+
+#[test]
+fn snapshot_cost_panel_toggled_100x30() {
+    let mut app = app_with_welcome();
+    app.push_user("show cost");
+    app.apply_agent_msg(AgentMsg::TextDelta("Cost display is hidden.".into()));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    app.apply_agent_msg(AgentMsg::Cost {
+        turn_cost: 0.01,
+        session_cost: 0.99,
+        input_tokens: Some(500),
+        output_tokens: Some(300),
+        cache_tokens: Some(100),
+    });
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    // Toggle cost OFF — status bar should not show cost
+    app.show_cost = false;
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("cost_panel_toggled_100x30", rendered);
+}

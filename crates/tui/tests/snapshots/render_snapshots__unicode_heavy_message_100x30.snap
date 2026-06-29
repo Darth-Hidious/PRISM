@@ -1,0 +1,32 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v2.7.1-fake · 99 tools ──────────────────────────────────────────────────────────────────────
+· PRISM v2.7.1-fake — 99 tools available
+
+> show unicode
+
+◆ Ti₆Al₄V ΔH_mix 你 好  café 🚀  entropy μ
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Ready  model: fake-backend   [INPUT]
+ Type a message... (Enter=send, Ctrl-C=quit)

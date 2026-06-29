@@ -1,0 +1,32 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v2.7.1-fake · 99 tools ──────────────────────────────────────────────────────────────────────
+· PRISM v2.7.1-fake — 99 tools available
+
+> show long line
+
+◆
+key_value_value_value_value_value_value_value_value_value_value_value_value_value_value_value_value_
+value_value_value_value_value_value_value_value_value_value_value_value_value_value_value_value_valu
+e_value_value_value_value_value_value_value_value_value_value_value_value_value_value_value_value_va
+lue_value_value_value_value_value_value_value_value_value_value_value_value_value_value_value_value_
+value_value_value_value_value_value_value_value_value_value_value_value_value_value_end_of_long_unbr
+oken_token
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Ready  model: fake-backend   [INPUT]
+ Type a message... (Enter=send, Ctrl-C=quit)

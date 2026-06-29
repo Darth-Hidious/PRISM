@@ -1,0 +1,32 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v2.7.1-fake · 99 tools ──────────────────────────────────────────────────────────────────────
+· PRISM v2.7.1-fake — 99 tools available
+
+> run compute
+
+· compute_submit: Allow compute_submit?
+
+· [approved compute_submit]
+
+⚙ compute_submit: Job submitted successfully (job_id: fake-123)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Ready  model: fake-backend   [INPUT]
+ Type a message... (Enter=send, Ctrl-C=quit)

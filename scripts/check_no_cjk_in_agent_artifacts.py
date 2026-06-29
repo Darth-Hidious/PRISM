@@ -64,10 +64,32 @@ CJK_RANGES = [
     (0x2CEB0, 0x2EBEF),  # CJK Unified Ideographs Extension F
 ]
 
-# Allowlist: files that intentionally contain CJK
-# These test that the sanitizer PRESERVES CJK/Unicode text.
-ALLOWLIST: set[str] = {
-    "crates/tui/tests/unit.rs",  # sanitizer tests use CJK/emoji to verify preservation
+# Allowlist: files that intentionally contain CJK.
+# Instead of allowlisting whole files (which hides accidental drift),
+# we allowlist specific (file, line_content_substring) pairs.
+# A CJK finding is suppressed only if the offending line contains
+# the allowlisted substring — so a new Chinese comment in the same
+# file is still caught.
+#
+# Format: { "relative/path": ["substring_on_line_1", "substring_on_line_2"] }
+# The substring must be a safe ASCII fragment of the line that
+# uniquely identifies the intentional CJK test line.
+ALLOWLIST_LINES: dict[str, list[str]] = {
+    "crates/tui/tests/unit.rs": [
+        # Sanitizer/Unicode tests that verify CJK text is preserved.
+        # These substrings uniquely identify the intentional test
+        # lines. Accidental Chinese in comments or prose on other
+        # lines is still caught.
+        "café",     # line with "café" + CJK + emoji
+        "x1b[32m",  # ANSI escape + CJK mixed test line
+        "append_assistant_text",  # streaming Unicode preservation test
+        "sanitize_for_render(input), \"Ti",  # sanitizer assertion
+        "last.text, \"Ti",       # App text assertion with CJK
+    ],
+    "crates/tui/tests/render_snapshots.rs": [
+        # Unicode preservation snapshot test:
+        "café",
+    ],
 }
 
 # ── Implementation ──────────────────────────────────────────────────
@@ -106,29 +128,48 @@ def should_skip_dir(d: Path) -> bool:
 
 
 def should_scan_file(path: Path) -> bool:
-    """Check if a file should be scanned."""
-    # Check allowlist using relative path
-    try:
-        rel = str(path.relative_to(PROJECT_ROOT))
-    except ValueError:
-        rel = str(path)
-    if rel in ALLOWLIST:
-        return False
+    """Check if a file should be scanned (by extension)."""
     ext = path.suffix.lower()
     return ext in SCAN_EXTENSIONS
+
+
+def is_allowlisted_line(rel_path: str, line: str) -> bool:
+    """Check if a specific line in a file is allowlisted for CJK.
+
+    Uses ALLOWLIST_LINES: { "relative/path": ["substring1", "substring2"] }.
+    A line is allowlisted if it contains any of the allowlisted substrings
+    for that file.  This narrows the exception to specific test lines
+    instead of entire files.
+    """
+    substrings = ALLOWLIST_LINES.get(rel_path)
+    if not substrings:
+        return False
+    return any(sub in line for sub in substrings)
 
 
 def main() -> int:
     """Scan all target files for CJK characters. Exit 1 if found."""
     violations: list[tuple[str, int, str, str]] = []
 
+    def check_file(path: Path) -> None:
+        """Scan a single file and append violations."""
+        if not should_scan_file(path):
+            return
+        try:
+            rel = str(path.relative_to(PROJECT_ROOT))
+        except ValueError:
+            rel = str(path)
+        findings = find_cjk_in_file(path)
+        for line_num, line, cjk in findings:
+            if is_allowlisted_line(rel, line):
+                continue
+            violations.append((str(path), line_num, line, cjk))
+
     # Scan individual files
     for name in SCAN_FILES:
         path = PROJECT_ROOT / name
-        if path.is_file() and should_scan_file(path):
-            findings = find_cjk_in_file(path)
-            for line_num, line, cjk in findings:
-                violations.append((str(path), line_num, line, cjk))
+        if path.is_file():
+            check_file(path)
 
     # Scan directories
     for dir_name in SCAN_DIRS:
@@ -137,16 +178,11 @@ def main() -> int:
             continue
         for file_path in dir_path.rglob("*"):
             if file_path.is_dir():
-                if should_skip_dir(file_path):
-                    continue
                 continue
             # Skip files in skipped directories
             if any(part in SKIP_DIRS for part in file_path.parts):
                 continue
-            if should_scan_file(file_path):
-                findings = find_cjk_in_file(file_path)
-                for line_num, line, cjk in findings:
-                    violations.append((str(file_path), line_num, line, cjk))
+            check_file(file_path)
 
     # Report
     if violations:
@@ -156,7 +192,7 @@ def main() -> int:
             print(f"  {rel}:{line_num}: CJK chars: {cjk!r}")
             print(f"    line: {line}")
             print()
-        print("If CJK is intentional, add the file to ALLOWLIST in this script.")
+        print("If CJK is intentional, add the line substring to ALLOWLIST_LINES.")
         return 1
 
     print("OK: no CJK language drift detected in agent artifacts")
