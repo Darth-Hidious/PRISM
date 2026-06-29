@@ -1,0 +1,32 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM ─────────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Ready  model: —   [INPUT]
+ Type a message... (Enter=send, Ctrl-C=quit)

@@ -37,7 +37,7 @@
 pub mod app;
 pub mod backend;
 pub mod msg;
-mod render;
+pub mod render;
 pub mod sanitize;
 
 use anyhow::Result;

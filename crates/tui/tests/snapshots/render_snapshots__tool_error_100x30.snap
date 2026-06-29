@@ -1,0 +1,32 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v2.7.1-fake · 99 tools ──────────────────────────────────────────────────────────────────────
+· PRISM v2.7.1-fake — 99 tools available
+
+> submit job
+
+⚙ Running compute_submit
+
+⚙ compute_submit: Error: budget exceeded ($50.00 limit)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Ready  model: fake-backend   [INPUT]
+ Type a message... (Enter=send, Ctrl-C=quit)

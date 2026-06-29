@@ -1,0 +1,32 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v2.7.1-fake · 99 tools ──────────────────────────────────────────────────────────────────────
+· PRISM v2.7.1-fake — 99 tools available
+
+> sample alloy
+
+⚙ Running alloy_sample
+
+⚙ alloy_sample: W0.3 Mo0.2 Ta0.3 Nb0.2
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Ready  model: fake-backend   [INPUT]
+ Type a message... (Enter=send, Ctrl-C=quit)

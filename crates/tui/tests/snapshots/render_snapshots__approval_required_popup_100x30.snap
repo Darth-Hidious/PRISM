@@ -1,0 +1,33 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v2.7.1-fake · 99 tools ──────────────────────────────────────────────────────────────────────
+· PRISM v2.7.1-fake — 99 tools available
+
+> run compute
+
+· compute_submit: Allow compute_submit?
+
+
+
+
+
+
+                    ┌──────────────────────────────────────────────────────────┐
+                    │                                                          │
+                    │  ⚠ APPROVAL REQUIRED                                     │
+                    │                                                          │
+                    │  Tool: compute_submit                                    │
+                    └──────────────────────────────────────────────────────────┘
+
+
+
+
+
+
+
+
+  Ready  model: fake-backend   [APPROVAL]
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Type a message... (press 'i' to focus input)
