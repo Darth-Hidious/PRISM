@@ -11,6 +11,7 @@ mod doctor;
 mod forge_chat;
 mod mcp_server_native;
 mod platform_bridge;
+mod tool_sync;
 mod use_command;
 
 use std::collections::BTreeMap;
@@ -43,6 +44,19 @@ struct Cli {
     python: PathBuf,
     #[arg(long, global = true, default_value = ".")]
     project_root: PathBuf,
+    /// Resume a previous conversation by ID. With no value, shows the
+    /// session picker. Shortcut for `prism resume [id]`.
+    #[arg(long, global = false)]
+    resume: Option<Option<String>>,
+    /// Override the LLM model for this session (e.g. --model gemma-4-12b).
+    #[arg(long, global = false)]
+    model: Option<String>,
+    /// Auto-approve all tool calls without prompting.
+    #[arg(long, global = false)]
+    auto_approve: bool,
+    /// Run in offline mode (no MARC27 platform connection).
+    #[arg(long, global = false)]
+    offline: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -103,6 +117,13 @@ enum Commands {
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommands,
+    },
+    /// Run an autonomous materials discovery campaign. The campaign agent
+    /// loops: propose → evaluate → rank → narrow, with budget limits,
+    /// checkpointing, and human approval gates.
+    Campaign {
+        #[command(subcommand)]
+        command: CampaignCommands,
     },
     /// Start the agent backend (JSON-RPC server for TUI frontend).
     Backend {
@@ -410,6 +431,49 @@ enum WorkflowCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum CampaignCommands {
+    /// Start a new discovery campaign from a goal description.
+    Start {
+        /// Natural-language description of what to discover.
+        #[arg(long)]
+        goal: String,
+        /// Comma-separated allowed elements (e.g. "W,Mo,Ta,Nb").
+        #[arg(long)]
+        elements: Option<String>,
+        /// What to optimize (e.g. "maximize creep resistance").
+        #[arg(long)]
+        objective: Option<String>,
+        /// Maximum number of discovery iterations.
+        #[arg(long, default_value_t = 50)]
+        max_iterations: usize,
+        /// Candidates per iteration.
+        #[arg(long, default_value_t = 10)]
+        batch_size: usize,
+        /// Optional USD budget cap.
+        #[arg(long)]
+        budget: Option<f64>,
+        /// Checkpoint every N iterations.
+        #[arg(long, default_value_t = 10)]
+        checkpoint_every: usize,
+        /// Pause for human approval at these iterations (comma-separated).
+        #[arg(long)]
+        approval_gates: Option<String>,
+    },
+    /// Resume a paused campaign from its checkpoint.
+    Resume {
+        /// Campaign ID to resume.
+        id: String,
+    },
+    /// Show the status of a campaign (from its checkpoint).
+    Status {
+        /// Campaign ID.
+        id: String,
+    },
+    /// List all campaign checkpoints on this machine.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum NodeCommands {
     /// Start the node daemon — register with the platform and wait for jobs.
@@ -655,6 +719,16 @@ enum MarketplaceCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Pull tool updates from the MARC27 marketplace. Re-downloads any
+    /// tool whose marketplace version differs from the locally-installed
+    /// one. Remote wins: locally-edited files are overwritten. Use
+    /// `--dry-run` to see what would change without modifying anything.
+    #[command(alias = "pull")]
+    Update {
+        /// Show what would be updated without downloading anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -886,7 +960,7 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let project_root = cli.project_root.clone();
     let endpoints = PlatformEndpoints::from_env();
     let paths = PrismPaths::discover()?;
@@ -900,6 +974,63 @@ async fn main() -> Result<()> {
         let prism_dir = PathBuf::from(&home).join(".prism");
         ensure_venv(&prism_dir, &project_root).await?
     };
+
+    // Tool auto-sync: on every prism invocation, kick off a background
+    // task that pulls tool updates from the MARC27 marketplace. This is
+    // non-blocking — the actual sync happens in a detached tokio task
+    // so startup (TUI/backend/CLI) isn't delayed by network I/O. If the
+    // marketplace is unreachable, the task fails silently. The full
+    // sync logic lives in `tool_sync::sync_tools`.
+    //
+    // Only fire for interactive commands (tui, backend, resume, chat)
+    // where long-running sessions benefit from fresh tools. Skip for
+    // one-shot commands like `marketplace`, `billing`, `doctor` to
+    // avoid a network call on every trivial invocation.
+    if matches!(
+        cli.command,
+        Some(Commands::Tui)
+            | Some(Commands::Backend { .. })
+            | Some(Commands::Resume { .. })
+            | Some(Commands::Campaign { .. })
+            | None
+    ) {
+        if let Ok(state) = paths.load_cli_state() {
+            let token = state.credentials.as_ref().map(|c| c.access_token.clone());
+            let platform = if let Some(t) = &token {
+                prism_client::api::PlatformClient::new(&endpoints.api_base).with_token(t)
+            } else {
+                prism_client::api::PlatformClient::new(&endpoints.api_base)
+            };
+            crate::tool_sync::spawn_background_sync_owned(platform);
+        }
+    }
+
+    // Handle top-level flags (--resume, --model, --auto-approve, --offline)
+    // when no subcommand is given. These are shortcuts that launch the
+    // TUI with the specified options, avoiding the need for a subcommand.
+    if cli.command.is_none() {
+        if let Some(resume_id) = cli.resume.take() {
+            // `prism --resume` or `prism --resume <id>` → acts like `prism resume`
+            unsafe {
+                match resume_id.as_deref() {
+                    Some(raw_id) => std::env::set_var("PRISM_RESUME_ID", raw_id),
+                    None => std::env::set_var("PRISM_RESUME_PICKER", "1"),
+                }
+            }
+        }
+        // --model override: set env var that build_llm_config reads
+        if let Some(ref model) = cli.model {
+            unsafe {
+                std::env::set_var("LLM_MODEL", model);
+            }
+        }
+        // --auto-approve: set env var that the backend reads
+        if cli.auto_approve {
+            unsafe {
+                std::env::set_var("PRISM_AUTO_APPROVE", "1");
+            }
+        }
+    }
 
     match cli.command.unwrap_or(Commands::Tui) {
         Commands::Setup => {
@@ -1076,6 +1207,159 @@ async fn main() -> Result<()> {
         Commands::Workflow { command } => {
             handle_workflow_command(command, &project_root).await?;
         }
+        Commands::Campaign { command } => {
+            use prism_campaign::{Campaign, CampaignConfig, CampaignGoal};
+
+            match command {
+                CampaignCommands::Start {
+                    goal,
+                    elements,
+                    objective,
+                    max_iterations,
+                    batch_size,
+                    budget,
+                    checkpoint_every,
+                    approval_gates,
+                } => {
+                    let elements_vec = elements
+                        .as_ref()
+                        .map(|s| {
+                            s.split(',')
+                                .map(|e| e.trim().to_string())
+                                .filter(|e| !e.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    let gates_vec = approval_gates
+                        .as_ref()
+                        .map(|s| {
+                            s.split(',')
+                                .filter_map(|g| g.trim().parse::<usize>().ok())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    let campaign_goal = CampaignGoal {
+                        description: goal.clone(),
+                        elements: elements_vec,
+                        objective: objective.clone().unwrap_or_default(),
+                        constraints: Vec::new(),
+                        seeds: Vec::new(),
+                    };
+
+                    let config = CampaignConfig {
+                        max_iterations,
+                        batch_size,
+                        budget_usd: budget,
+                        checkpoint_every,
+                        approval_gate_at: gates_vec,
+                        ..Default::default()
+                    };
+
+                    let campaign_id = format!(
+                        "campaign-{}",
+                        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+                    );
+
+                    println!("Starting campaign: {campaign_id}");
+                    println!("Goal: {goal}");
+                    if let Some(obj) = objective {
+                        println!("Objective: {obj}");
+                    }
+                    println!("Max iterations: {max_iterations}, batch size: {batch_size}");
+                    if let Some(b) = budget {
+                        println!("Budget cap: ${b:.2}");
+                    }
+                    println!();
+
+                    let mut campaign = Campaign::new(campaign_goal, config, campaign_id.clone());
+                    let result = campaign.run().await?;
+
+                    println!("\n{}", result.summary);
+                    println!("\nCheckpoint: ~/.prism/campaigns/{campaign_id}.json");
+                }
+                CampaignCommands::Resume { id } => {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let path = PathBuf::from(&home)
+                        .join(".prism")
+                        .join("campaigns")
+                        .join(format!("{id}.json"));
+                    let mut campaign = Campaign::from_checkpoint(&path)?;
+                    println!("Resuming campaign: {id}");
+                    let result = campaign.resume().await?;
+                    println!("\n{}", result.summary);
+                }
+                CampaignCommands::Status { id } => {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let path = PathBuf::from(&home)
+                        .join(".prism")
+                        .join("campaigns")
+                        .join(format!("{id}.json"));
+                    let campaign = Campaign::from_checkpoint(&path)?;
+                    let state = campaign.state();
+                    println!("Campaign: {}", state.campaign_id);
+                    println!("Goal: {}", state.goal.description);
+                    println!("Status: {}", if state.completed {
+                        &state.completion_reason
+                    } else if state.paused {
+                        "paused (approval gate)"
+                    } else {
+                        "incomplete"
+                    });
+                    println!("Iterations: {} / {}", state.current_iteration, state.config.max_iterations);
+                    println!("Candidates evaluated: {}", state.total_evaluated());
+                    println!("Avg reward: {:.4}", state.avg_reward());
+                    if let Some(best) = state.best() {
+                        println!("Best: {} (reward={:.4})", best.composition, best.reward);
+                    }
+                }
+                CampaignCommands::List => {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let dir = PathBuf::from(&home).join(".prism").join("campaigns");
+                    if !dir.is_dir() {
+                        println!("No campaigns found ({} doesn't exist)", dir.display());
+                        return Ok(());
+                    }
+                    let mut found = false;
+                    for entry in std::fs::read_dir(&dir)? {
+                        let entry = entry?;
+                        let path = entry.path();
+                        if path.extension().is_none_or(|e| e != "json") {
+                            continue;
+                        }
+                        match Campaign::from_checkpoint(&path) {
+                            Ok(c) => {
+                                let s = c.state();
+                                let status = if s.completed {
+                                    &s.completion_reason
+                                } else if s.paused {
+                                    "paused"
+                                } else {
+                                    "incomplete"
+                                };
+                                println!(
+                                    "  {} — {} — iter {}/{} — {} candidates — {}",
+                                    s.campaign_id,
+                                    status,
+                                    s.current_iteration,
+                                    s.config.max_iterations,
+                                    s.total_evaluated(),
+                                    s.goal.description
+                                );
+                                found = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!(path = %path.display(), error = %e, "skipping unreadable campaign file");
+                            }
+                        }
+                    }
+                    if !found {
+                        println!("No campaigns found in {}", dir.display());
+                    }
+                }
+            }
+        }
         Commands::Backend {
             project_root: backend_pr,
             python: backend_py,
@@ -1085,6 +1369,14 @@ async fn main() -> Result<()> {
             // Load from prism.toml [llm] section, env vars as overrides
             let node_config = prism_core::config::NodeConfig::load(Some(&backend_pr));
             let cfg_llm = &node_config.llm;
+
+            // Also load ~/.prism/config.toml [chat] — the user-visible
+            // chat target set by `prism use local/provider/marc27`.
+            // If the user configured a local or direct-provider target,
+            // that takes precedence over prism.toml [llm] for the agent
+            // backend's LLM endpoint. This unifies the two config worlds
+            // so `prism use local` actually affects `prism backend`.
+            let chat_target = crate::chat_config::load().unwrap_or_default().chat;
 
             let api_key = std::env::var("LLM_API_KEY")
                 .or_else(|_| std::env::var("MARC27_TOKEN"))
@@ -1100,14 +1392,54 @@ async fn main() -> Result<()> {
                         .map(|c| c.access_token)
                 });
 
+            // Resolve base_url, model, and api_key from the chat target
+            // when it overrides the prism.toml [llm] defaults.
+            let (base_url, model, api_key) = match &chat_target {
+                crate::chat_config::ChatTarget::Local {
+                    url,
+                    model,
+                    api_key: local_key,
+                } => (
+                    url.clone(),
+                    model.clone(),
+                    local_key.clone().or(api_key),
+                ),
+                crate::chat_config::ChatTarget::Provider {
+                    provider,
+                    model,
+                    api_key_env,
+                } => {
+                    let env_name =
+                        api_key_env.as_deref().unwrap_or_else(|| {
+                            crate::chat_config::ChatTarget::default_api_key_env(provider)
+                        });
+                    let provider_key = std::env::var(env_name).ok();
+                    (
+                        format!(
+                            "https://api.{provider}.com/v1",
+                            provider = provider.to_ascii_lowercase()
+                        ),
+                        model.clone(),
+                        provider_key.or(api_key),
+                    )
+                }
+                // Marc27 cloud: use prism.toml [llm] as before.
+                crate::chat_config::ChatTarget::Marc27 { .. } => (
+                    std::env::var("LLM_BASE_URL")
+                        .unwrap_or_else(|_| cfg_llm.url.clone()),
+                    std::env::var("LLM_MODEL").unwrap_or_else(|_| {
+                        cfg_llm
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| "gpt-5.5".to_string())
+                    }),
+                    api_key,
+                ),
+            };
+
             let llm_config = LlmConfig {
-                base_url: std::env::var("LLM_BASE_URL").unwrap_or_else(|_| cfg_llm.url.clone()),
-                model: std::env::var("LLM_MODEL").unwrap_or_else(|_| {
-                    cfg_llm
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| "gpt-5.5".to_string())
-                }),
+                base_url,
+                model,
                 api_key,
                 embedding_model: cfg_llm.embedding_model.clone(),
                 ..Default::default()
@@ -1520,29 +1852,76 @@ async fn main() -> Result<()> {
                     });
                 }
 
-                // Wire LLM config from prism.toml [indexer] section or defaults
+                // Wire LLM config from config.toml [chat] (prism use local)
+                // falling back to prism.toml [indexer], then defaults.
                 {
-                    let api_key =
-                        prism_core::config::NodeConfig::resolve_api_key(&node_config.indexer);
-                    let base_url = node_config.indexer.uri.clone().unwrap_or_else(|| {
-                        match node_config.indexer.mode.as_str() {
-                            "platform" | "marc27" | "external" => {
-                                node_config.platform.url.clone() + "/llm"
-                            }
-                            _ => "http://localhost:8080".into(), // llama.cpp default
+                    let chat_target =
+                        crate::chat_config::load().unwrap_or_default().chat;
+                    let (base_url, model, api_key) = match &chat_target {
+                        crate::chat_config::ChatTarget::Local {
+                            url,
+                            model,
+                            api_key: local_key,
+                        } => (
+                            url.clone(),
+                            model.clone(),
+                            local_key
+                                .clone()
+                                .or_else(|| {
+                                    prism_core::config::NodeConfig::resolve_api_key(
+                                        &node_config.indexer,
+                                    )
+                                }),
+                        ),
+                        crate::chat_config::ChatTarget::Provider {
+                            provider,
+                            model,
+                            api_key_env,
+                        } => {
+                            let env_name = api_key_env.as_deref().unwrap_or_else(|| {
+                                crate::chat_config::ChatTarget::default_api_key_env(provider)
+                            });
+                            (
+                                format!(
+                                    "https://api.{provider}.com/v1",
+                                    provider = provider.to_ascii_lowercase()
+                                ),
+                                model.clone(),
+                                std::env::var(env_name).ok().or_else(|| {
+                                    prism_core::config::NodeConfig::resolve_api_key(
+                                        &node_config.indexer,
+                                    )
+                                }),
+                            )
                         }
-                    });
+                        crate::chat_config::ChatTarget::Marc27 { .. } => {
+                            let api_key =
+                                prism_core::config::NodeConfig::resolve_api_key(
+                                    &node_config.indexer,
+                                );
+                            let base_url = node_config.indexer.uri.clone().unwrap_or_else(|| {
+                                match node_config.indexer.mode.as_str() {
+                                    "platform" | "marc27" | "external" => {
+                                        node_config.platform.url.clone() + "/llm"
+                                    }
+                                    _ => "http://localhost:8080".into(),
+                                }
+                            });
+                            let model = node_config
+                                .indexer
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| "gemma-3-27b".into());
+                            (base_url, model, api_key)
+                        }
+                    };
                     server_node_state.llm = Some(prism_ingest::LlmConfig {
                         base_url,
-                        model: node_config
-                            .indexer
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| "gemma-3-27b".into()),
+                        model,
                         api_key,
                         embedding_model: node_config.indexer.embedding_model.clone(),
                         max_sample_rows: 10,
-                        timeout_secs: 120,
+                        timeout_secs: 300,
                     });
                 }
 
@@ -1551,8 +1930,14 @@ async fn main() -> Result<()> {
                 let mut daemon_platform_node_id: Option<String> = None;
                 let mut daemon_org_id: Option<String> = None;
 
+                // Load CLI state for mesh auth — even in offline mode,
+                // we need credentials to join the mesh. The mesh refuses
+                // to start without an auth token (RBAC gate).
+                let cli_state = paths.load_cli_state().ok().unwrap_or_default();
+                let mesh_auth_token = cli_state.credentials.as_ref().map(|c| c.access_token.clone());
+                let mesh_has_auth = mesh_auth_token.is_some();
+
                 if !offline {
-                    let cli_state = paths.load_cli_state()?;
                     if let Some(ref creds) = cli_state.credentials {
                         daemon_org_id = creds.org_id.clone();
                         let platform = PlatformClient::new(&endpoints.api_base)
@@ -1662,6 +2047,7 @@ async fn main() -> Result<()> {
                         capabilities: Vec::new(),
                         discovery_interval_secs: 30,
                         event_tx: Some(server_state.ws_broadcast.clone()),
+                        auth_token: mesh_auth_token,
                     },
                     mesh_cancel.clone(),
                 );
@@ -1670,7 +2056,9 @@ async fn main() -> Result<()> {
                     .federation
                     .set(prism_mesh::federated_query::FederatedQuery::default());
 
-                if broadcast {
+                if !mesh_has_auth {
+                    println!("  \u{26A0} Mesh: disabled (no auth — run `prism login` to enable)");
+                } else if broadcast {
                     println!("  \u{2713} Mesh: broadcasting (mDNS + platform discovery)");
                 } else {
                     println!("  \u{2713} Mesh: passive discovery (use --broadcast to advertise)");
@@ -2256,6 +2644,27 @@ async fn main() -> Result<()> {
                         println!("Tags:        {}", tool.tags.join(", "));
                     }
                 }
+                MarketplaceCommands::Update { dry_run } => {
+                    if dry_run {
+                        let pending = crate::tool_sync::check_for_updates(&marketplace).await?;
+                        if pending.is_empty() {
+                            println!("All installed tools are up to date.");
+                        } else {
+                            println!("{} tool update(s) available:", pending.len());
+                            for (slug, local, remote) in &pending {
+                                let from = if local.is_empty() { "(not installed)" } else { local };
+                                println!("  {slug}: {from} → {remote}");
+                            }
+                        }
+                    } else {
+                        // Also prune stale manifest entries before syncing.
+                        if let Err(e) = crate::tool_sync::prune_manifest() {
+                            tracing::warn!(error = %e, "manifest prune failed (non-fatal)");
+                        }
+                        let report = crate::tool_sync::sync_tools(&marketplace).await?;
+                        crate::tool_sync::print_report(&report);
+                    }
+                }
             }
         }
         Commands::Research { query, depth, json } => {
@@ -2498,6 +2907,21 @@ async fn main() -> Result<()> {
             handle_configure(llm_provider, url, model, embedding_model, show)?;
         }
         Commands::Tui => {
+            // --offline: skip auth refresh + boot checks entirely.
+            // The TUI launches directly with local tools only.
+            if cli.offline {
+                let _ = &python;
+                let prism_bin = std::env::current_exe()
+                    .context("failed to locate current prism executable")?;
+                prism_tui::run(
+                    prism_bin.to_str().unwrap(),
+                    &project_root.to_string_lossy().to_string(),
+                    &python.to_string_lossy().to_string(),
+                )
+                .await?;
+                return Ok(());
+            }
+
             // Auto-refresh + refresh-on-rejection. Mirrors the `prism
             // setup` path — see comments there for design notes.
             // The two triggers (proactive expiry + reactive 401) keep
@@ -2569,9 +2993,17 @@ async fn main() -> Result<()> {
                     boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
             boot::boot_sequence(&boot_checks);
-            // Splash skipped — see note in default chat path.
             let _ = &python;
-            forge_chat::run(&project_root, state.credentials.as_ref(), &python).await?;
+            // Launch the new Ratatui full-screen TUI. It spawns
+            // `prism backend` as a subprocess and talks JSON-RPC.
+            let prism_bin = std::env::current_exe()
+                .context("failed to locate current prism executable")?;
+            prism_tui::run(
+                prism_bin.to_str().unwrap(),
+                &project_root.to_string_lossy().to_string(),
+                &python.to_string_lossy().to_string(),
+            )
+            .await?;
         }
         Commands::Resume { id } => {
             // Reuses the same Tui setup path: same auth refresh, same
@@ -3351,7 +3783,7 @@ fn handle_configure(
 
 /// Build LlmConfig from prism.toml with optional CLI overrides.
 ///
-/// Precedence: CLI flags > prism.toml ([llm] section) > built-in defaults.
+/// Precedence: CLI flags > config.toml [chat] > prism.toml [llm] > built-in defaults.
 /// Returns a helpful error if no model is configured anywhere.
 fn build_llm_config(
     project_root: &Path,
@@ -3362,18 +3794,67 @@ fn build_llm_config(
     let node_config = prism_core::config::NodeConfig::load(Some(project_root));
     let llm = &node_config.llm;
 
-    let base_url = url_override
-        .map(str::to_string)
-        .unwrap_or_else(|| llm.url.clone());
+    // Also load ~/.prism/config.toml [chat] — the user-visible chat target
+    // set by `prism use local/provider/marc27`. When set to Local or Provider,
+    // it takes precedence over prism.toml [llm] for the LLM endpoint.
+    let chat_target = crate::chat_config::load().unwrap_or_default().chat;
 
-    let model = match model_override {
-        Some(m) => m.to_string(),
-        None => llm.resolve_model()?,
+    // Resolve base_url, model, and api_key with the same precedence as
+    // Commands::Backend: CLI flags > chat target > prism.toml [llm].
+    let (base_url, model, api_key) = match &chat_target {
+        crate::chat_config::ChatTarget::Local {
+            url,
+            model: local_model,
+            api_key: local_key,
+        } => (
+            url_override.map(str::to_string).unwrap_or_else(|| url.clone()),
+            model_override
+                .map(str::to_string)
+                .unwrap_or_else(|| local_model.clone()),
+            api_key_override
+                .map(str::to_string)
+                .or_else(|| local_key.clone())
+                .or_else(|| llm.resolve_api_key()),
+        ),
+        crate::chat_config::ChatTarget::Provider {
+            provider,
+            model: prov_model,
+            api_key_env,
+        } => {
+            let env_name = api_key_env.as_deref().unwrap_or_else(|| {
+                crate::chat_config::ChatTarget::default_api_key_env(provider)
+            });
+            (
+                url_override.map(str::to_string).unwrap_or_else(|| {
+                    format!(
+                        "https://api.{provider}.com/v1",
+                        provider = provider.to_ascii_lowercase()
+                    )
+                }),
+                model_override
+                    .map(str::to_string)
+                    .unwrap_or_else(|| prov_model.clone()),
+                api_key_override
+                    .map(str::to_string)
+                    .or_else(|| std::env::var(env_name).ok())
+                    .or_else(|| llm.resolve_api_key()),
+            )
+        }
+        // Marc27 cloud: use prism.toml [llm] as before.
+        crate::chat_config::ChatTarget::Marc27 { .. } => {
+            let base_url = url_override
+                .map(str::to_string)
+                .unwrap_or_else(|| llm.url.clone());
+            let model = match model_override {
+                Some(m) => m.to_string(),
+                None => llm.resolve_model()?,
+            };
+            let api_key = api_key_override
+                .map(str::to_string)
+                .or_else(|| llm.resolve_api_key());
+            (base_url, model, api_key)
+        }
     };
-
-    let api_key = api_key_override
-        .map(str::to_string)
-        .or_else(|| llm.resolve_api_key());
 
     Ok(prism_ingest::LlmConfig {
         base_url,
@@ -5605,7 +6086,6 @@ async fn handle_query(
 /// Mode flag for [`perform_full_login`] — picks the credential source
 /// (PAT vs interactive device flow) without committing the caller to
 /// the structure of [`Commands::Login`]'s arguments.
-#[allow(dead_code)]
 enum LoginMode {
     /// Personal Access Token — non-interactive, suitable for headless
     /// scripts and CI. Skips the device-flow polling step.

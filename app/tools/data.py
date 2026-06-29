@@ -1,4 +1,5 @@
 """Data tools: OPTIMADE search and Materials Project queries."""
+
 import csv
 import json
 import os
@@ -15,18 +16,29 @@ def _search_materials(**kwargs) -> dict:
 
     try:
         elements = kwargs.get("elements")
+        # Normalize elements to a list — accept comma-separated string
+        # or list. The LLM often passes "Ti,Al,V" as a string.
+        if isinstance(elements, str):
+            elements = [e.strip() for e in elements.split(",") if e.strip()]
         # Only constrain n_elements when explicitly requested by the LLM.
         # elements HAS ALL already ensures the listed elements are present;
         # auto-adding nelements<=N would exclude valid ternary+ compounds.
         n_elements = None
         if kwargs.get("n_elements_min") or kwargs.get("n_elements_max"):
-            n_elements = PropertyRange(min=kwargs.get("n_elements_min"), max=kwargs.get("n_elements_max"))
+            n_elements = PropertyRange(
+                min=kwargs.get("n_elements_min"), max=kwargs.get("n_elements_max")
+            )
 
         query = MaterialSearchQuery(
             elements=elements,
             formula=kwargs.get("formula"),
             n_elements=n_elements,
-            band_gap=PropertyRange(min=kwargs.get("band_gap_min"), max=kwargs.get("band_gap_max")) if kwargs.get("band_gap_min") is not None or kwargs.get("band_gap_max") is not None else None,
+            band_gap=PropertyRange(
+                min=kwargs.get("band_gap_min"), max=kwargs.get("band_gap_max")
+            )
+            if kwargs.get("band_gap_min") is not None
+            or kwargs.get("band_gap_max") is not None
+            else None,
             space_group=kwargs.get("space_group"),
             crystal_system=kwargs.get("crystal_system"),
             providers=kwargs.get("providers"),
@@ -39,15 +51,24 @@ def _search_materials(**kwargs) -> dict:
         materials = []
         for m in result.materials:
             entry = {
-                "id": m.id, "formula": m.formula, "elements": m.elements,
+                "id": m.id,
+                "formula": m.formula,
+                "elements": m.elements,
                 "sources": m.sources,
             }
             if m.band_gap:
-                entry["band_gap"] = {"value": m.band_gap.value, "unit": m.band_gap.unit, "source": m.band_gap.source}
+                entry["band_gap"] = {
+                    "value": m.band_gap.value,
+                    "unit": m.band_gap.unit,
+                    "source": m.band_gap.source,
+                }
             if m.space_group:
                 entry["space_group"] = m.space_group.value
             if m.formation_energy:
-                entry["formation_energy"] = {"value": m.formation_energy.value, "unit": m.formation_energy.unit}
+                entry["formation_energy"] = {
+                    "value": m.formation_energy.value,
+                    "unit": m.formation_energy.unit,
+                }
             materials.append(entry)
 
         return {
@@ -56,7 +77,14 @@ def _search_materials(**kwargs) -> dict:
             "search_time_ms": result.search_time_ms,
             "cached": result.cached,
             "warnings": result.warnings,
-            "providers_queried": [{"id": log.provider_id, "status": log.status, "results": log.result_count} for log in result.query_log],
+            "providers_queried": [
+                {
+                    "id": log.provider_id,
+                    "status": log.status,
+                    "results": log.result_count,
+                }
+                for log in result.query_log
+            ],
         }
     except Exception as e:
         return {"error": str(e)}
@@ -105,7 +133,9 @@ def _query_materials_project(**kwargs) -> dict:
                         material_ids=[material_id], fields=properties
                     )
                 else:
-                    docs = mpr.materials.summary.search(formula=formula, fields=properties)
+                    docs = mpr.materials.summary.search(
+                        formula=formula, fields=properties
+                    )
                 results = []
                 for doc in docs[:20]:
                     entry = {}
@@ -298,23 +328,35 @@ def create_data_tools(registry: ToolRegistry) -> None:
         with explicit field selection); materials_search is the
         federated catalog-shaped query. Both are useful.
     """
-    registry.register(Tool(
-        name="query_materials_project",
-        description=(
-            "Query Materials Project for detailed material properties — "
-            "band gap, formation energy, bulk modulus, etc. Use this "
-            "when you have a specific material (formula or mp-ID) and "
-            "need rich property data. NOT a substitute for "
-            "materials_search (use that for federated catalog queries "
-            "across 20+ databases). Requires MP_API_KEY."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "formula": {"type": "string", "description": "Chemical formula, e.g. 'LiCoO2'"},
-                "material_id": {"type": "string", "description": "Materials Project ID, e.g. 'mp-1234'"},
-                "properties": {"type": "array", "items": {"type": "string"}, "description": "Properties to retrieve."},
+    registry.register(
+        Tool(
+            name="query_materials_project",
+            description=(
+                "Query Materials Project for detailed material properties — "
+                "band gap, formation energy, bulk modulus, etc. Use this "
+                "when you have a specific material (formula or mp-ID) and "
+                "need rich property data. NOT a substitute for "
+                "materials_search (use that for federated catalog queries "
+                "across 20+ databases). Requires MP_API_KEY."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "formula": {
+                        "type": "string",
+                        "description": "Chemical formula, e.g. 'LiCoO2'",
+                    },
+                    "material_id": {
+                        "type": "string",
+                        "description": "Materials Project ID, e.g. 'mp-1234'",
+                    },
+                    "properties": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Properties to retrieve.",
+                    },
+                },
             },
-        },
-        func=_query_materials_project,
-    ))
+            func=_query_materials_project,
+        )
+    )

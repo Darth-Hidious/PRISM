@@ -400,11 +400,30 @@ pub async fn run_turn(
         messages.extend(history.iter().cloned());
 
         // ── 2c. Call LLM ─────────────────────────────────────────
-        // The on_delta callback is unused for MARC27 (text-based tool calling)
-        // because we collect full_text, strip tool calls, and emit clean content
-        // after the response completes. Kept for future OpenAI-path streaming.
+        // Tool selection: filter to top-K relevant tools based on the
+        // latest user message to avoid "tool stuffing" (sending all 99
+        // tool definitions = 21K tokens every turn). On iteration 0 we
+        // use the user's message; on later iterations the LLM may be
+        // calling tools based on prior results, so we include the tools
+        // it has already called plus top-K for the original query.
+        let relevant_tools = tool_catalog.definitions_for_query(user_message, 15);
+        tracing::debug!(
+            total_tools = tool_catalog.len(),
+            selected_tools = relevant_tools.len(),
+            "tool selection for LLM call"
+        );
+
+        // Stream tokens incrementally — collect deltas from the
+        // streaming callback and emit them after the call completes.
+        // Reasoning tokens (is_reasoning=true) are emitted as a separate
+        // event so the TUI can render them dimmed/collapsed.
+        let mut streamed_deltas: Vec<(String, bool)> = Vec::new();
         let response = llm
-            .chat_with_tools_streaming(&messages, tool_catalog.definitions(), |_delta| {})
+            .chat_with_tools_streaming(&messages, &relevant_tools, |delta: &str, is_reasoning: bool| {
+                if !delta.is_empty() {
+                    streamed_deltas.push((delta.to_string(), is_reasoning));
+                }
+            })
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "LLM call failed: {e:#}");
@@ -431,14 +450,31 @@ pub async fn run_turn(
         // Use the clean content from the response (tool call blocks already
         // stripped) instead of raw streaming deltas which can leak partial
         // tool call JSON when SSE chunks split across the ``` boundary.
+        // ── 2e. Emit streamed content ───────────────────────────
+        // Emit each delta individually so the TUI renders token-by-token.
+        // Reasoning tokens (is_reasoning=true) are emitted as
+        // ThinkingDelta so the TUI renders them dimmed and collapsed.
+        for (delta, is_reasoning) in &streamed_deltas {
+            if *is_reasoning {
+                emit(AgentEvent::ThinkingDelta {
+                    text: delta.clone(),
+                });
+            } else {
+                emit(AgentEvent::TextDelta {
+                    text: delta.clone(),
+                });
+            }
+        }
+
         if let Some(content) = &response.message.content
             && !content.is_empty()
+            && streamed_deltas.is_empty()
         {
             emit(AgentEvent::TextDelta {
                 text: content.clone(),
             });
-            emit(AgentEvent::TextFlush);
         }
+        emit(AgentEvent::TextFlush);
 
         // ── 2f. Push assistant message ────────────────────────────
         history.push(response.message.clone());

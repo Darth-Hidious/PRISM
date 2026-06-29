@@ -1,5 +1,6 @@
 # Claude Code session-local state — not for the repo
 .claude/
+.codex/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -13,6 +14,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+.build/
 downloads/
 eggs/
 .eggs/
@@ -135,6 +137,11 @@ optimade-python-tools/
 # Output artifacts
 output/
 node_modules/
+extensions/*/out/
+extensions/*/.vscode-test/
+extensions/**/*.vsix
+!extensions/*/docs/
+!extensions/*/docs/**
 .codebase-memory/
 .superpowers/
 .venv-mlx-gemma4/

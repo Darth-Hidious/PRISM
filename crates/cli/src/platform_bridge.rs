@@ -83,21 +83,15 @@ struct ProxyState {
 /// writes the new value, and the bridge picks it up on the next turn.
 pub struct ProxyHandle {
     pub url: String, // base URL forge should hit (proxy_url + "/v1")
+    /// Hot-swap target for the in-chat `/use` slash command. Not yet
+    /// wired into the bridge's per-turn read path; retained so the
+    /// `/use` handler can populate it without a struct reshape.
+    #[allow(dead_code)]
     chat_target: Arc<RwLock<ChatTarget>>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl ProxyHandle {
-    /// Explicit shutdown — alternative to letting the handle Drop. Both
-    /// paths fire the oneshot. Public API kept for callers that want to
-    /// shut the proxy down without dropping the handle.
-    #[allow(dead_code)]
-    pub fn shutdown(mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
-    }
-
     /// Hand out the live `ChatTarget` lock so callers (the `/use` slash
     /// command, in particular) can hot-swap the chat upstream without
     /// restarting the proxy. The lock is the single source of truth

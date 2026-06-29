@@ -66,6 +66,14 @@ pub struct PeerNode {
     pub port: u16,
     pub last_seen: DateTime<Utc>,
     pub capabilities: Vec<String>,
+    /// Whether this peer presented an auth token in mDNS TXT records.
+    /// Unauthenticated peers are discovered but NOT trusted — their
+    /// requests are rejected at the federation layer.
+    #[serde(default)]
+    pub authenticated: bool,
+    /// Short hash of the peer's auth token (for logging/debugging).
+    #[serde(default, skip_serializing)]
+    pub auth_hash: Option<String>,
 }
 
 // ── Mesh handle ────────────────────────────────────────────────────
@@ -165,6 +173,12 @@ pub struct MeshStartOptions {
     pub discovery_interval_secs: u64,
     /// Optional channel to emit peer-change events (for live dashboard updates).
     pub event_tx: Option<tokio::sync::broadcast::Sender<String>>,
+    /// Auth token from `prism login`. If `None`, the mesh refuses to
+    /// start — you cannot join the mesh without authenticating to
+    /// MARC27 first. This is the RBAC gate: the token proves the
+    /// user's org/project/roles, which are checked before any peer
+    /// interaction is allowed.
+    pub auth_token: Option<String>,
 }
 
 /// Start mesh networking as a background task.
@@ -180,6 +194,17 @@ pub fn start_mesh(
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // ── RBAC gate: refuse to start mesh without auth ──────────
+        // The mesh is a trusted network. You cannot join without
+        // proving your identity via `prism login`. The auth_token
+        // carries org_id, project_id, and roles — checked by every
+        // peer before accepting requests from this node.
+        if opts.auth_token.is_none() {
+            eprintln!("\x1b[33m  ⚠ Mesh disabled: no auth token — run `prism login` first.\x1b[0m");
+            eprintln!("\x1b[33m    The mesh requires MARC27 authentication for RBAC enforcement.\x1b[0m");
+            return;
+        }
+
         let node_id = match handle.node_id() {
             Some(id) => id,
             None => {
@@ -199,7 +224,7 @@ pub fn start_mesh(
 
         // Announce only if broadcast is enabled
         if opts.broadcast
-            && let Err(e) = mdns.announce(node_id, &opts.node_name, &opts.capabilities)
+            && let Err(e) = mdns.announce(node_id, &opts.node_name, &opts.capabilities, opts.auth_token.as_deref())
         {
             tracing::warn!(error = %e, "mDNS announce failed (continuing without broadcast)");
         }
@@ -218,6 +243,21 @@ pub fn start_mesh(
                     match mdns.discover(std::time::Duration::from_secs(3)) {
                         Ok(discovered) => {
                             for peer in discovered {
+                                // ── RBAC gate: reject unauthenticated peers ──
+                                // Only authenticated peers (those with an
+                                // auth hash in their mDNS TXT records) are
+                                // added to the peer list. Unauthenticated
+                                // peers are logged but not trusted.
+                                if !peer.authenticated {
+                                    tracing::warn!(
+                                        peer_name = %peer.name,
+                                        peer_id = %peer.node_id,
+                                        "discovered peer is NOT authenticated — refusing to add to mesh. \
+                                         Peer must run `prism login` before joining."
+                                    );
+                                    continue;
+                                }
+
                                 // Only add if not already known
                                 let known = handle.peers();
                                 if !known.iter().any(|p| p.node_id == peer.node_id) {
@@ -281,6 +321,8 @@ mod tests {
             port: 9100,
             last_seen: Utc::now(),
             capabilities: vec!["compute".into()],
+            authenticated: true,
+            auth_hash: None,
         }
     }
 

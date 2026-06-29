@@ -137,6 +137,25 @@ impl<'a> MarketplaceClient<'a> {
             .context("failed to fetch install URL")?;
         Ok(info.url)
     }
+
+    /// Pull the full marketplace tool catalog and return every published
+    /// tool (resource_type = "cli_tool" or empty, i.e. a Python tool PRISM
+    /// can install).  Used by the auto-update sync to diff against the
+    /// local `~/.prism/tools/` directory.
+    ///
+    /// This is a thin wrapper over `list_tools(None)` that filters to
+    /// installable Python tools (excludes models, datasets, workflows,
+    /// which live under different install paths).
+    pub async fn list_installable_tools(&self) -> Result<Vec<MarketplaceTool>> {
+        let all = self.list_tools(None).await?;
+        Ok(all
+            .into_iter()
+            .filter(|t| {
+                let rt = t.resource_type.as_str();
+                rt == "cli_tool" || rt == "tool" || rt.is_empty()
+            })
+            .collect())
+    }
 }
 
 /// Minimal percent-encoding for query parameter values.

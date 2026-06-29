@@ -3829,6 +3829,9 @@ fn emit_agent_event(event: AgentEvent) {
         AgentEvent::TextDelta { text } => {
             emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
         }
+        AgentEvent::ThinkingDelta { text } => {
+            emit_notification("ui.thinking.delta", serde_json::json!({ "text": text }));
+        }
         AgentEvent::TextFlush => {
             emit_notification("ui.text.flush", serde_json::json!({ "text": "" }));
         }
@@ -4562,6 +4565,7 @@ fn spawn_agent_turn(
     user_text: String,
     tools: Arc<ToolCatalog>,
     config: Arc<AgentConfig>,
+    auto_approve: bool,
     hooks: Arc<HookRegistry>,
     slash_ctx: SlashCommandContext,
     approval_rx: agent_loop::SharedApprovalReceiver,
@@ -4572,6 +4576,7 @@ fn spawn_agent_turn(
     tokio::spawn(async move {
         let llm = LlmClient::new(runtime.llm_config.clone());
         let mut turn_config = config.as_ref().clone();
+        turn_config.auto_approve = auto_approve;
         turn_config.system_prompt = system_prompt_for_mode(
             runtime.session_mode,
             &config.system_prompt,
@@ -6053,6 +6058,9 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
         system_prompt: build_system_prompt(true),
         ..Default::default()
     });
+    // Auto-approve flag — set from init params, read by the approval gate.
+    // Stored separately so we don't need to rebuild the Arc<AgentConfig>.
+    let auto_approve_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let slash_ctx = SlashCommandContext {
         current_exe: std::env::current_exe()
             .context("failed to locate current prism executable")?,
@@ -6123,6 +6131,9 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
     });
     let mut pending_turn: Option<oneshot::Receiver<ServerRuntime>> = None;
     let mut deferred_updates: Vec<DeferredRuntimeUpdate> = Vec::new();
+    // Queue of messages that arrived while a turn was in progress.
+    // These are processed when the current turn completes.
+    let mut message_queue: Vec<String> = Vec::new();
 
     // Read JSON-RPC lines from stdin
     let stdin = io::stdin();
@@ -6166,6 +6177,32 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                         &slash_ctx,
                     );
                     runtime = Some(restored_runtime);
+
+                    // Process queued messages — if a message arrived
+                    // while the previous turn was running, start it now.
+                    if let Some(queued_text) = message_queue.first().cloned() {
+                        message_queue.remove(0);
+                        if let Some(mut rt) = runtime.take() {
+                            rt.session_store
+                                .append_message("user", &queued_text, "", "", None);
+                            sync_live_permission_overrides(
+                                &live_permission_overrides,
+                                &rt.permission_overrides,
+                            )
+                            .await;
+                            pending_turn = Some(spawn_agent_turn(
+                                rt,
+                                queued_text,
+                                Arc::clone(&tools),
+                                Arc::clone(&config),
+                                auto_approve_flag.load(std::sync::atomic::Ordering::Relaxed),
+                                Arc::clone(&hooks),
+                                slash_ctx.clone(),
+                                Arc::clone(&approval_rx),
+                                Arc::clone(&live_permission_overrides),
+                            ));
+                        }
+                    }
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     pending_turn = Some(receiver);
@@ -6208,6 +6245,12 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                 } else {
                     resume_ref
                 };
+
+                // Read auto_approve from init params — controls whether
+                // tool calls skip the approval prompt.
+                if let Some(auto) = params.get("auto_approve").and_then(|v| v.as_bool()) {
+                    auto_approve_flag.store(auto, std::sync::atomic::Ordering::Relaxed);
+                }
 
                 let mut welcome = serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
@@ -6273,13 +6316,11 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                 emit_response(id, serde_json::json!({ "status": "ok" }));
 
                 if turn_active {
-                    emit_notification(
-                        "ui.text.delta",
-                        serde_json::json!({
-                            "text": "A turn is already in progress. Respond to the approval prompt or wait for the current turn to finish."
-                        }),
+                    message_queue.push(text.to_string());
+                    tracing::info!(
+                        queue_len = message_queue.len(),
+                        "queued message while turn in progress"
                     );
-                    emit_notification("ui.turn.complete", serde_json::json!({}));
                     continue;
                 }
 
@@ -6297,6 +6338,7 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                     text.to_string(),
                     Arc::clone(&tools),
                     Arc::clone(&config),
+                    auto_approve_flag.load(std::sync::atomic::Ordering::Relaxed),
                     Arc::clone(&hooks),
                     slash_ctx.clone(),
                     Arc::clone(&approval_rx),
@@ -6313,13 +6355,11 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                 emit_response(id.clone(), serde_json::json!({ "status": "ok" }));
 
                 if turn_active {
-                    emit_notification(
-                        "ui.text.delta",
-                        serde_json::json!({
-                            "text": "A turn is already in progress. Respond to the approval prompt or wait for the current turn to finish."
-                        }),
+                    message_queue.push(format!("/{}", command));
+                    tracing::info!(
+                        queue_len = message_queue.len(),
+                        "queued command while turn in progress"
                     );
-                    emit_notification("ui.turn.complete", serde_json::json!({}));
                     continue;
                 }
 
@@ -6395,6 +6435,7 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                     text,
                     Arc::clone(&tools),
                     Arc::clone(&config),
+                    auto_approve_flag.load(std::sync::atomic::Ordering::Relaxed),
                     Arc::clone(&hooks),
                     slash_ctx.clone(),
                     Arc::clone(&approval_rx),
@@ -6496,21 +6537,45 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
         }
     }
 
-    tracing::info!("stdin closed, shutting down");
-    if let Some(mut receiver) = pending_turn.take()
-        && let Ok(mut restored_runtime) = receiver.try_recv()
-    {
-        apply_deferred_runtime_updates(
-            &mut restored_runtime,
-            tools.as_ref(),
-            &mut deferred_updates,
-        );
-        sync_live_permission_overrides(
-            &live_permission_overrides,
-            &restored_runtime.permission_overrides,
-        )
-        .await;
-        runtime = Some(restored_runtime);
+    tracing::info!("stdin closed, waiting for pending turn before shutdown");
+
+    // If a turn is in-flight, wait for it to complete (with a timeout)
+    // so the user sees the response instead of a silent kill.
+    if let Some(mut receiver) = pending_turn.take() {
+        let timeout = tokio::time::Duration::from_secs(300);
+        match tokio::time::timeout(timeout, &mut receiver).await {
+            Ok(Ok(mut restored_runtime)) => {
+                apply_deferred_runtime_updates(
+                    &mut restored_runtime,
+                    tools.as_ref(),
+                    &mut deferred_updates,
+                );
+                sync_live_permission_overrides(
+                    &live_permission_overrides,
+                    &restored_runtime.permission_overrides,
+                )
+                .await;
+                runtime = Some(restored_runtime);
+            }
+            Ok(Err(_)) => {
+                emit_notification(
+                    "ui.text.delta",
+                    serde_json::json!({
+                        "text": "The active turn exited unexpectedly. You can continue with a new prompt."
+                    }),
+                );
+                emit_notification("ui.turn.complete", serde_json::json!({}));
+            }
+            Err(_) => {
+                emit_notification(
+                    "ui.text.delta",
+                    serde_json::json!({
+                        "text": "Turn timed out after 300s."
+                    }),
+                );
+                emit_notification("ui.turn.complete", serde_json::json!({}));
+            }
+        }
     }
     if let Some(mut runtime) = runtime {
         let _ = runtime.tool_server.shutdown().await;

@@ -24,10 +24,17 @@ def _get_platform_client():
 
 
 def _read_platform_json(client, path: str):
-    """Read a raw JSON payload from the public platform API."""
-    from marc27.api.base import BaseAPI
+    """Read a raw JSON payload from the public platform API.
 
-    base: BaseAPI = client._base
+    The import of ``marc27.api.base`` is deferred to call-time so this
+    helper also works against lightweight test doubles that expose a
+    ``_base.get(path)`` returning an object with ``.json()``. We only
+    need the ``BaseAPI`` annotation when the real SDK is present; the
+    duck-typed path works either way.
+    """
+    base = getattr(client, "_base", None)
+    if base is None:
+        raise RuntimeError("platform client has no _base attribute")
     resp = base.get(path)
     return resp.json()
 

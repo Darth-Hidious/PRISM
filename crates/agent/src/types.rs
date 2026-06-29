@@ -81,6 +81,11 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
+    /// Reasoning/thinking tokens — separate from the response text.
+    /// Rendered dimmed and collapsible by the TUI.
+    ThinkingDelta {
+        text: String,
+    },
     /// Signal the frontend to flush accumulated streaming text into chat history.
     TextFlush,
     ToolCallStart {

@@ -1,4 +1,5 @@
 """SearchEngine -- the federated search orchestrator."""
+
 from __future__ import annotations
 
 import asyncio
@@ -23,9 +24,11 @@ DEFAULT_CACHE_DIR = Path.home() / ".prism" / "cache"
 def _sanitize_error(msg: str) -> str:
     """Strip HTML tags and truncate to a single readable line."""
     import re
-    clean = re.sub(r"<[^>]+>", "", msg)          # strip HTML tags
-    clean = re.sub(r"\s+", " ", clean).strip()    # collapse whitespace
+
+    clean = re.sub(r"<[^>]+>", "", msg)  # strip HTML tags
+    clean = re.sub(r"\s+", " ", clean).strip()  # collapse whitespace
     return clean[:120] if clean else "unknown error"
+
 
 DEFAULT_HEALTH_PATH = Path.home() / ".prism" / "cache" / "provider_health.json"
 
@@ -42,7 +45,7 @@ class SearchEngine:
         registry: ProviderRegistry,
         cache: SearchCache | None = None,
         health_manager: HealthManager | None = None,
-        global_timeout: float = 15.0,
+        global_timeout: float = 5.0,
     ):
         self._registry = registry
         self._cache = cache or SearchCache(disk_dir=DEFAULT_CACHE_DIR)
@@ -65,10 +68,7 @@ class SearchEngine:
 
         # 2. Select capable providers with healthy circuits
         capable = self._registry.get_capable(query)
-        providers = [
-            p for p in capable
-            if self._health.get(p.id).should_query()
-        ]
+        providers = [p for p in capable if self._health.get(p.id).should_query()]
 
         if not providers:
             return SearchResult(
@@ -80,8 +80,39 @@ class SearchEngine:
                 search_time_ms=(time.time() - start) * 1000,
             )
 
-        # 3. Fan out async
-        tasks = {p.id: self._query_provider(p, query) for p in providers}
+        # 3. Fan out async with concurrency limit + early termination
+        # Use a semaphore to avoid hammering 20+ providers simultaneously.
+        # 8 concurrent connections is a good balance between speed and
+        # being a good citizen to the OPTIMADE federation.
+        semaphore = asyncio.Semaphore(8)
+        # Early-return: once we have 2x the requested limit from fast
+        # providers, cancel remaining slow ones. We over-fetch 2x so
+        # fusion (dedup across providers) still yields enough results.
+        early_target = query.limit * 2
+        early_event = asyncio.Event()
+        collected = {"count": 0}
+
+        async def _guarded_query(p):
+            if early_event.is_set():
+                return [], ProviderQueryLog(
+                    provider_id=p.id,
+                    provider_name=p.name,
+                    endpoint_url=self._get_endpoint_url(p),
+                    query_sent="",
+                    started_at=time.time(),
+                    completed_at=time.time(),
+                    latency_ms=0,
+                    status="skipped",
+                    error_message="Early termination — enough results from fast providers",
+                )
+            async with semaphore:
+                materials, log = await self._query_provider(p, query)
+                collected["count"] += len(materials)
+                if collected["count"] >= early_target and not early_event.is_set():
+                    early_event.set()
+                return materials, log
+
+        tasks = {p.id: asyncio.create_task(_guarded_query(p)) for p in providers}
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
         provider_results = dict(zip(tasks.keys(), results))
 
@@ -137,10 +168,7 @@ class SearchEngine:
 
     def get_provider_status(self) -> dict[str, dict]:
         """Health dashboard for all known providers."""
-        return {
-            pid: h.to_dict()
-            for pid, h in self._health._health.items()
-        }
+        return {pid: h.to_dict() for pid, h in self._health._health.items()}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -156,12 +184,15 @@ class SearchEngine:
         endpoint_url = self._get_endpoint_url(provider)
         query_sent = QueryTranslator.to_optimade(query)
 
-        # Determine per-provider timeout
+        # Determine per-provider timeout — use the minimum of the
+        # global timeout and the per-provider configured timeout.
+        # This ensures the global timeout always caps slow providers.
         timeout = self._global_timeout
         if hasattr(provider, "_endpoint") and provider._endpoint:
             ep = provider._endpoint
             if hasattr(ep, "behavior") and ep.behavior:
-                timeout = ep.behavior.timeout_ms / 1000
+                per_provider = ep.behavior.timeout_ms / 1000
+                timeout = min(timeout, per_provider)
 
         try:
             materials = await asyncio.wait_for(

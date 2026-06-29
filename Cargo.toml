@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "crates/tui", "crates/provenance"]
 resolver = "2"
 
 [workspace.package]
@@ -67,9 +67,11 @@ clap = { version = "4.6.0", features = ["derive", "env"] }
 clap_complete = "4.6.0"
 colored = "3.1.1"
 console = "0.16.3"
+crossterm = "0.28.1"
 enable-ansi-support = "0.3.1"
 nu-ansi-term = "0.50.1"
 nucleo = "0.5.0"
+ratatui = "0.30"
 reedline = "0.47.0"
 rustyline = "18.0.0"
 strip-ansi-escapes = "0.2.1"
@@ -182,6 +184,8 @@ rdkafka = { version = "0.36", features = ["cmake-build"] }
 tower = { version = "0.5", features = ["limit", "buffer"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rust-embed = "8"
+falkordb = "0.10"
+turso = "0.7.0-pre.10"
 
 # ─────────────────────────────────────────────────────────────────────
 # Internal crates — forge_* are Apache-2.0 (vendored from tailcallhq/forgecode)

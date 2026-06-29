@@ -810,7 +810,7 @@ impl From<DataCommandGroup> for forge_domain::DataGenerationParameters {
 /// VS Code integration commands.
 #[derive(Subcommand, Debug, Clone)]
 pub enum VscodeCommand {
-    /// Install the Forge VS Code extension.
+    /// Install the PRISM VS Code extension.
     InstallExtension,
 }
 

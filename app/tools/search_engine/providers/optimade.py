@@ -1,4 +1,5 @@
 """OPTIMADE federation provider -- wraps OptimadeClient for a single endpoint."""
+
 from __future__ import annotations
 
 import logging
@@ -29,35 +30,80 @@ class OptimadeProvider(Provider):
         )
 
     async def search(self, query: MaterialSearchQuery) -> list[Material]:
-        """Query this OPTIMADE endpoint and return normalized materials."""
-        import contextlib
-        import io
-        from optimade.client import OptimadeClient
+        """Query this OPTIMADE endpoint via async httpx (not OptimadeClient).
+
+        The OptimadeClient library uses synchronous HTTP which blocks the
+        event loop. We use httpx directly for a clean async path with
+        proper timeouts.
+        """
+        import httpx
 
         filter_string = QueryTranslator.to_optimade(query)
         base_url = self._endpoint.base_url
         if not base_url:
             return []
 
+        # Build the structures URL. OPTIMADE spec requires /v1/structures.
+        # Some base_urls already include /v1 (e.g. from discovery), others
+        # don't (e.g. "https://optimade.materialsproject.org"). Handle both.
+        base = base_url.rstrip("/")
+        if base.endswith("/v1"):
+            url = f"{base}/structures"
+        else:
+            url = f"{base}/v1/structures"
+        params = {}
+        if filter_string:
+            params["filter"] = filter_string
+        params["page_limit"] = str(
+            min(query.limit, self._endpoint.behavior.max_results)
+        )
+
+        timeout = self._endpoint.behavior.timeout_ms / 1000
+        headers = {"Accept": "application/json"}
+
         try:
-            client = OptimadeClient(
-                base_urls=[base_url],
-                max_results_per_provider=min(query.limit, self._endpoint.behavior.max_results),
-                use_async=False,
-                silent=True,
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                headers=headers,
+                follow_redirects=True,
+            ) as client:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.TimeoutException:
+            logger.warning("OPTIMADE timeout for %s (%.1fs)", self.id, timeout)
+            raise
+        except httpx.HTTPStatusError as e:
+            logger.warning(
+                "OPTIMADE HTTP %d for %s: %s",
+                e.response.status_code,
+                self.id,
+                str(e)[:200],
             )
-            # Suppress optimade-python's own console output (error messages,
-            # progress boxes) so it doesn't leak into the Ink TUI or corrupt
-            # the JSON-RPC stdio stream.
-            with contextlib.redirect_stdout(io.StringIO()), \
-                 contextlib.redirect_stderr(io.StringIO()):
-                results = client.structures.get(filter=filter_string) if filter_string else client.structures.get()
+            raise
         except Exception as e:
             logger.warning("OPTIMADE query failed for %s: %s", self.id, e)
             raise
 
-        materials = self._parse_response(results, filter_string)
-        # Hard cap to requested limit (OptimadeClient may over-fetch)
+        # Check for OPTIMADE error responses
+        errors = data.get("errors", [])
+        entries = data.get("data", [])
+        if errors and not entries:
+            err = errors[0]
+            if isinstance(err, dict):
+                err = err.get("detail", err.get("title", str(err)))
+            raise RuntimeError(f"Provider '{self.id}' returned error: {str(err)[:200]}")
+
+        materials = []
+        if isinstance(entries, list):
+            for entry in entries:
+                try:
+                    m = self._parse_entry(entry)
+                    if m:
+                        materials.append(m)
+                except Exception as e:
+                    logger.debug("Failed to parse entry: %s", e)
+
         limit = min(query.limit, self._endpoint.behavior.max_results)
         return materials[:limit]
 
@@ -148,6 +194,7 @@ class OptimadeProvider(Provider):
     async def health_check(self) -> bool:
         """Check if this endpoint is responding."""
         import httpx
+
         try:
             url = f"{self._endpoint.base_url}/{self._endpoint.api_version}/info"
             async with httpx.AsyncClient(timeout=5.0) as client:

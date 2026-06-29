@@ -16,3 +16,4 @@ serde_yaml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 prism-policy = { path = "../policy" }
+prism-llm = { path = "../llm" }

@@ -213,7 +213,7 @@ mod tests {
         let json = r#"{"base_url":"http://localhost:11434","model":"qwen2.5:7b"}"#;
         let cfg: LlmConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.max_sample_rows, 10);
-        assert_eq!(cfg.timeout_secs, 120);
+        assert_eq!(cfg.timeout_secs, 300);
     }
 
     // --- Neo4jConfig serde ---

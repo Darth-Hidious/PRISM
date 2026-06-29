@@ -118,6 +118,90 @@ impl ToolCatalog {
         }
         self.definitions = self.tools.iter().map(LoadedTool::to_definition).collect();
     }
+
+    /// Return tool definitions filtered to the top-K most relevant for
+    /// the user's query. Uses lightweight keyword matching on tool name
+    /// and description — no embedding server required.
+    ///
+    /// This prevents "tool stuffing" (sending all 99 tools = 21K tokens
+    /// to the LLM every turn). Falls back to all definitions if the
+    /// query is empty or matches nothing.
+    #[must_use]
+    pub fn definitions_for_query(&self, query: &str, top_k: usize) -> Vec<ToolDefinition> {
+        if query.trim().is_empty() || self.tools.len() <= top_k {
+            return self.definitions.clone();
+        }
+
+        let query_lower = query.to_lowercase();
+        let query_words: Vec<&str> = query_lower
+            .split_whitespace()
+            .filter(|w| w.len() > 2)
+            .collect();
+
+        // Always-include tools that are core to every session
+        const ALWAYS_INCLUDE: &[&str] = &["query", "search_materials", "knowledge"];
+
+        let mut scored: Vec<(usize, &LoadedTool)> = self
+            .tools
+            .iter()
+            .map(|tool| {
+                let name_lower = tool.name.to_lowercase();
+                let desc_lower = tool.description.to_lowercase();
+
+                let mut score = 0usize;
+
+                // Exact name match — highest signal
+                if query_lower.contains(&name_lower) {
+                    score += 10;
+                }
+
+                // Query words appearing in tool name
+                for word in &query_words {
+                    if name_lower.contains(word) {
+                        score += 5;
+                    }
+                }
+
+                // Query words appearing in description
+                for word in &query_words {
+                    if desc_lower.contains(word) {
+                        score += 2;
+                    }
+                }
+
+                // Always-include tools get a floor score
+                if ALWAYS_INCLUDE.contains(&tool.name.as_str()) {
+                    score += 1;
+                }
+
+                (score, tool)
+            })
+            .collect();
+
+        // Sort by score descending, take top_k
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let selected: Vec<&LoadedTool> = scored
+            .into_iter()
+            .filter(|(score, tool)| {
+                *score > 0 || ALWAYS_INCLUDE.contains(&tool.name.as_str())
+            })
+            .take(top_k)
+            .map(|(_, tool)| tool)
+            .collect();
+
+        if selected.is_empty() {
+            // No keyword matches — fall back to a sensible default set
+            self.tools
+                .iter()
+                .filter(|t| ALWAYS_INCLUDE.contains(&t.name.as_str()))
+                .take(top_k)
+                .map(|t| t.to_definition())
+                .collect()
+        } else {
+            selected.iter().map(|t| t.to_definition()).collect()
+        }
+    }
 }
 
 #[cfg(test)]

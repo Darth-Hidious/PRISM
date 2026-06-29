@@ -32,12 +32,27 @@ impl MdnsDiscovery {
     }
 
     /// Announce this node on the local network via mDNS.
-    pub fn announce(&mut self, node_id: Uuid, name: &str, capabilities: &[String]) -> Result<()> {
+    /// The auth token is included in TXT records so peers can verify
+    /// this node is authenticated via MARC27.
+    pub fn announce(
+        &mut self,
+        node_id: Uuid,
+        name: &str,
+        capabilities: &[String],
+        auth_token: Option<&str>,
+    ) -> Result<()> {
         let instance_name = format!("prism-{}", &node_id.to_string()[..8]);
         let mut properties = HashMap::new();
         properties.insert("node_id".to_string(), node_id.to_string());
         properties.insert("name".to_string(), name.to_string());
         properties.insert("caps".to_string(), capabilities.join(","));
+        // Include a short hash of the auth token so peers can verify
+        // this node is authenticated. Full token exchange happens over
+        // the encrypted mesh channel, not in mDNS plaintext.
+        if let Some(token) = auth_token {
+            let hash = simple_token_hash(token);
+            properties.insert("auth".to_string(), hash);
+        }
 
         // Pass an explicit address list so mdns-sd advertises on BOTH
         // loopback (so two prism processes on the same machine see
@@ -137,6 +152,10 @@ fn service_info_to_peer(info: &ResolvedService) -> Option<PeerNode> {
         .map(String::from)
         .collect();
 
+    // Check if the peer is authenticated (has auth hash in TXT records)
+    let auth_hash = info.get_property_val_str("auth").map(String::from);
+    let authenticated = auth_hash.is_some();
+
     // `addresses` is `HashSet<ScopedIp>` in 0.18; extract any IP.
     let address = info
         .get_addresses()
@@ -152,5 +171,19 @@ fn service_info_to_peer(info: &ResolvedService) -> Option<PeerNode> {
         port: info.get_port(),
         last_seen: Utc::now(),
         capabilities,
+        authenticated,
+        auth_hash,
     })
+}
+
+/// Simple non-cryptographic hash of the auth token for mDNS TXT records.
+/// This is NOT a security mechanism — it's a quick "is this peer
+/// authenticated at all?" check. Full verification happens over the
+/// encrypted mesh channel via `federation::verify_peer`.
+fn simple_token_hash(token: &str) -> String {
+    let mut hash: u64 = 5381;
+    for byte in token.bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
+    }
+    format!("{hash:016x}")
 }

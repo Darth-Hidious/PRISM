@@ -1,4 +1,5 @@
 """Central bootstrap: build a fully loaded ToolRegistry in one call."""
+
 import logging
 
 from app.tools.base import ToolRegistry
@@ -71,7 +72,13 @@ def build_full_registry(
     # original tool result passes through unchanged. See
     # docs/stateful_tools_2026.md for the architecture.
     import os as _os
-    if _os.environ.get("PRISM_DISABLE_MEMORY", "").strip().lower() not in {"1", "true", "yes", "on"}:
+
+    if _os.environ.get("PRISM_DISABLE_MEMORY", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
         try:
             from app.tools.memory import (
                 ArtifactStore,
@@ -79,6 +86,7 @@ def build_full_registry(
                 create_memory_tools,
                 default_db_path,
             )
+
             _store = ArtifactStore(default_db_path())
             _configure_memory(store=_store)
             create_memory_tools(registry)
@@ -88,6 +96,7 @@ def build_full_registry(
     # Web browsing tools (Firecrawl + DuckDuckGo fallback)
     try:
         from app.tools.web import create_web_tools
+
         create_web_tools(registry)
     except Exception:
         pass
@@ -95,6 +104,7 @@ def build_full_registry(
     # MARC27 Knowledge Plane tools (graph search, semantic search, ingest)
     try:
         from app.tools.knowledge import create_knowledge_tools
+
         create_knowledge_tools(registry)
     except Exception:
         pass
@@ -104,6 +114,7 @@ def build_full_registry(
     # See app/tools/research.py for the SSE protocol + cost notes.
     try:
         from app.tools.research import create_research_tools
+
         create_research_tools(registry)
     except Exception:
         pass
@@ -111,12 +122,14 @@ def build_full_registry(
     # MARC27 Compute Broker tools (GPU dispatch, job management)
     try:
         from app.tools.compute import create_compute_tools
+
         create_compute_tools(registry)
     except Exception:
         pass
 
     # Premium labs tools (marketplace services)
     from app.tools.labs import create_labs_tools
+
     create_labs_tools(registry)
 
     # Simulation tools (optional — pyiron may not be installed)
@@ -169,7 +182,11 @@ def build_full_registry(
         pass
 
     # Search provider registry (3-layer: discovery + overrides + catalog)
-    from app.tools.search_engine.providers.registry import ProviderRegistry, build_registry
+    from app.tools.search_engine.providers.registry import (
+        ProviderRegistry,
+        build_registry,
+    )
+
     try:
         provider_reg = build_registry()
     except Exception:
@@ -219,13 +236,29 @@ def build_full_registry(
     except Exception:
         pass
 
+    # MCMC alloy discovery tools — lightweight, torch-free, local default.
+    # GFlowNet (gfn_sample, gfn_discover) is a premium marketplace tool
+    # for users who want learned, diversity-optimized sampling.
+    # Local PRISM gets MCMC (alloy_sample, alloy_discover) + the physics
+    # evaluation tools (gfn_evaluate, gfn_elements) which are torch-free.
+    try:
+        from app.tools.mcmc_tools import create_mcmc_tools
+        from app.tools.gflownet_tools import create_gflownet_eval_tools
+
+        create_mcmc_tools(registry)
+        create_gflownet_eval_tools(registry)
+    except Exception:
+        logger.debug("mcmc/eval tools not registered", exc_info=True)
+
     # Custom tools from ~/.prism/tools/*.py
     try:
         from app.tools.custom_loader import discover_custom_tools
 
         custom_names = discover_custom_tools(registry)
         if custom_names:
-            logger.info("Loaded %d custom tools: %s", len(custom_names), ", ".join(custom_names))
+            logger.info(
+                "Loaded %d custom tools: %s", len(custom_names), ", ".join(custom_names)
+            )
     except Exception:
         pass
 

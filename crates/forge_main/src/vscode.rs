@@ -1,6 +1,20 @@
-//! VS Code terminal detection and automatic extension installation
+//! VS Code terminal detection and automatic PRISM extension installation
 
 use std::process::Command;
+
+const DEFAULT_EXTENSION_ID: &str = "marc27.prism-vscode";
+
+/// Returns the VS Code extension id to detect/install.
+///
+/// `PRISM_VSCODE_EXTENSION_ID` keeps local/dev builds flexible while the
+/// marketplace identity is being finalized.
+pub fn extension_id() -> String {
+    std::env::var("PRISM_VSCODE_EXTENSION_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_EXTENSION_ID.to_string())
+}
 
 /// Checks if running in VS Code terminal
 ///
@@ -15,11 +29,12 @@ pub fn is_vscode_terminal() -> bool {
         || std::env::var("VSCODE_GIT_IPC_HANDLE").is_ok()
 }
 
-/// Checks if the Forge VS Code extension is installed
+/// Checks if the PRISM VS Code extension is installed
 ///
-/// Checks VS Code's extension list to see if ForgeCode.forge-vscode is
+/// Checks VS Code's extension list to see if the configured extension id is
 /// installed.
 pub fn is_extension_installed() -> bool {
+    let extension_id = extension_id();
     // Try to list installed extensions
     if let Ok(output) = Command::new("code").arg("--list-extensions").output()
         && output.status.success()
@@ -27,19 +42,19 @@ pub fn is_extension_installed() -> bool {
     {
         return extensions
             .lines()
-            .any(|line| line.trim() == "ForgeCode.forge-vscode");
+            .any(|line| line.trim() == extension_id);
     }
     false
 }
 
-/// Attempts to install the Forge VS Code extension silently
+/// Attempts to install the PRISM VS Code extension silently
 ///
 /// Returns Ok(true) if installation was successful, Ok(false) if it failed,
 /// or Err if the command couldn't be executed.
 pub fn install_extension() -> Result<bool, std::io::Error> {
     let output = Command::new("code")
         .arg("--install-extension")
-        .arg("ForgeCode.forge-vscode")
+        .arg(extension_id())
         .arg("--force")
         .output()?;
 
@@ -142,6 +157,20 @@ mod tests {
             // on the actual VS Code installation, but we can verify the logic
             // when in VS Code terminal
             assert!(is_vscode_terminal());
+        });
+    }
+
+    #[test]
+    fn test_extension_id_env_override() {
+        with_env_var("PRISM_VSCODE_EXTENSION_ID", "local.prism-vscode", || {
+            assert_eq!(extension_id(), "local.prism-vscode");
+        });
+    }
+
+    #[test]
+    fn test_extension_id_blank_uses_default() {
+        with_env_var("PRISM_VSCODE_EXTENSION_ID", "  ", || {
+            assert_eq!(extension_id(), DEFAULT_EXTENSION_ID);
         });
     }
 }
