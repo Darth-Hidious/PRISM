@@ -16,7 +16,7 @@ use serde_json::json;
 
 use prism_tui::app::{App, Focus, LineKind, Role};
 use prism_tui::backend::BackendHandle;
-use prism_tui::msg::{parse_notification, AgentMsg};
+use prism_tui::msg::{AgentMsg, parse_notification};
 
 /// Build an `App` backed by a `cat` subprocess so the stdin writes in
 /// `send_message`/`send_approval` don't crash.  The `cat` process is
@@ -59,7 +59,10 @@ fn parse_welcome() {
     });
     let parsed = parse_notification(&msg);
     match parsed {
-        AgentMsg::Welcome { version, tool_count } => {
+        AgentMsg::Welcome {
+            version,
+            tool_count,
+        } => {
             assert_eq!(version, "2.7.1");
             assert_eq!(tool_count, 42);
         }
@@ -75,7 +78,11 @@ fn parse_status() {
     });
     let parsed = parse_notification(&msg);
     match parsed {
-        AgentMsg::Status { model, mode, message_count } => {
+        AgentMsg::Status {
+            model,
+            mode,
+            message_count,
+        } => {
             assert_eq!(model, "gemma-4-12b");
             assert_eq!(mode, "agent");
             assert_eq!(message_count, 5);
@@ -109,10 +116,19 @@ fn parse_tool_start() {
         "params": {"tool_name": "alloy_sample", "verb": "Running", "call_id": "c1"}
     });
     match parse_notification(&msg) {
-        AgentMsg::ToolStart { tool_name, verb, call_id } => {
+        AgentMsg::ToolStart {
+            tool_name,
+            verb,
+            call_id,
+            preview,
+            approval_required,
+            ..
+        } => {
             assert_eq!(tool_name, "alloy_sample");
             assert_eq!(verb, "Running");
-            assert_eq!(call_id, "c1");
+            assert_eq!(call_id.as_deref(), Some("c1"));
+            assert!(preview.is_none());
+            assert!(approval_required.is_none());
         }
         other => panic!("expected ToolStart, got {other:?}"),
     }
@@ -130,11 +146,23 @@ fn parse_tool_card() {
         }
     });
     match parse_notification(&msg) {
-        AgentMsg::ToolCard { tool_name, content, card_type, elapsed_ms } => {
+        AgentMsg::ToolCard {
+            tool_name,
+            content,
+            card_type,
+            elapsed_ms,
+            call_id,
+            provenance_id,
+            data,
+            ..
+        } => {
             assert_eq!(tool_name, "gfn_evaluate");
             assert_eq!(content, "Fe: 0.3, Ni: 0.3");
             assert_eq!(card_type, "results");
-            assert_eq!(elapsed_ms, 292);
+            assert_eq!(elapsed_ms, Some(292));
+            assert!(call_id.is_none());
+            assert!(provenance_id.is_none());
+            assert!(data.is_none());
         }
         other => panic!("expected ToolCard, got {other:?}"),
     }
@@ -147,9 +175,17 @@ fn parse_approval_prompt() {
         "params": {"tool_name": "bash", "message": "Run `ls`?"}
     });
     match parse_notification(&msg) {
-        AgentMsg::ApprovalPrompt { tool_name, message } => {
+        AgentMsg::ApprovalPrompt {
+            tool_name,
+            message,
+            call_id,
+            choices,
+            ..
+        } => {
             assert_eq!(tool_name, "bash");
             assert_eq!(message, "Run `ls`?");
+            assert!(call_id.is_none());
+            assert!(choices.is_empty());
         }
         other => panic!("expected ApprovalPrompt, got {other:?}"),
     }
@@ -162,9 +198,18 @@ fn parse_cost() {
         "params": {"turn_cost": 0.002, "session_cost": 0.05}
     });
     match parse_notification(&msg) {
-        AgentMsg::Cost { turn_cost, session_cost } => {
+        AgentMsg::Cost {
+            turn_cost,
+            session_cost,
+            input_tokens,
+            output_tokens,
+            cache_tokens,
+        } => {
             assert!((turn_cost - 0.002).abs() < 1e-9);
             assert!((session_cost - 0.05).abs() < 1e-9);
+            assert!(input_tokens.is_none());
+            assert!(output_tokens.is_none());
+            assert!(cache_tokens.is_none());
         }
         other => panic!("expected Cost, got {other:?}"),
     }
@@ -219,7 +264,10 @@ fn parse_unknown_method() {
 fn parse_missing_fields_default_gracefully() {
     let msg = json!({"method": "ui.welcome", "params": {}});
     match parse_notification(&msg) {
-        AgentMsg::Welcome { version, tool_count } => {
+        AgentMsg::Welcome {
+            version,
+            tool_count,
+        } => {
             assert_eq!(version, "?");
             assert_eq!(tool_count, 0);
         }
@@ -275,7 +323,9 @@ fn text_delta_starts_new_message_after_non_text() {
     app.apply_agent_msg(AgentMsg::ToolStart {
         tool_name: "t".into(),
         verb: "Running".into(),
-        call_id: "c".into(),
+        call_id: Some("c".into()),
+        preview: None,
+        approval_required: None,
     });
     app.apply_agent_msg(AgentMsg::TextDelta("second".into()));
     // Should have 3 messages: text, tool-start, text
@@ -320,7 +370,9 @@ fn tool_start_pushes_tool_message() {
     app.apply_agent_msg(AgentMsg::ToolStart {
         tool_name: "alloy_sample".into(),
         verb: "Running".into(),
-        call_id: "c1".into(),
+        call_id: Some("c1".into()),
+        preview: None,
+        approval_required: None,
     });
     let last = app.messages.last().unwrap();
     assert!(matches!(last.role, Role::Tool));
@@ -335,10 +387,16 @@ fn tool_card_success_pushes_result() {
         tool_name: "gfn_evaluate".into(),
         content: "density=7.8".into(),
         card_type: "results".into(),
-        elapsed_ms: 150,
+        elapsed_ms: Some(150),
+        call_id: None,
+        provenance_id: None,
+        data: None,
     });
     let last = app.messages.last().unwrap();
-    assert!(matches!(last.kind, LineKind::ToolResult { success: true, .. }));
+    assert!(matches!(
+        last.kind,
+        LineKind::ToolResult { success: true, .. }
+    ));
 }
 
 #[test]
@@ -348,7 +406,10 @@ fn tool_card_error_pushes_error_line() {
         tool_name: "bash".into(),
         content: "exit 1".into(),
         card_type: "error".into(),
-        elapsed_ms: 50,
+        elapsed_ms: Some(50),
+        call_id: None,
+        provenance_id: None,
+        data: None,
     });
     let last = app.messages.last().unwrap();
     assert!(matches!(last.kind, LineKind::Error(_)));
@@ -360,6 +421,13 @@ fn approval_prompt_sets_pending_and_focus() {
     app.apply_agent_msg(AgentMsg::ApprovalPrompt {
         tool_name: "bash".into(),
         message: "rm -rf?".into(),
+        call_id: None,
+        tool_args: None,
+        tool_description: None,
+        requires_approval: None,
+        permission_mode: None,
+        choices: vec![],
+        prompt_type: None,
     });
     assert!(app.approval_pending.is_some());
     assert_eq!(app.approval_pending.as_ref().unwrap().0, "bash");
@@ -372,6 +440,9 @@ fn cost_updates_totals() {
     app.apply_agent_msg(AgentMsg::Cost {
         turn_cost: 0.01,
         session_cost: 0.50,
+        input_tokens: None,
+        output_tokens: None,
+        cache_tokens: None,
     });
     assert!((app.turn_cost - 0.01).abs() < 1e-9);
     assert!((app.session_cost - 0.50).abs() < 1e-9);
@@ -391,7 +462,10 @@ fn view_pushes_tab_messages() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::View {
         title: "Results".into(),
-        tabs: vec![("MP".into(), "5 hits".into()), ("OQMD".into(), "3 hits".into())],
+        tabs: vec![
+            ("MP".into(), "5 hits".into()),
+            ("OQMD".into(), "3 hits".into()),
+        ],
     });
     assert_eq!(app.messages.len(), 2);
     assert!(app.messages[0].text.contains("MP"));
@@ -486,7 +560,11 @@ fn enter_submits_message_when_in_input_focus() {
     assert!(app.is_thinking);
     assert_eq!(app.status_text, "Thinking…");
     // User message should be pushed
-    assert!(app.messages.iter().any(|m| m.text == "hello world" && matches!(m.role, Role::User)));
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.text == "hello world" && matches!(m.role, Role::User))
+    );
     // Input should be cleared
     assert!(app.input.lines().is_empty() || app.input.lines().join("").is_empty());
 }
@@ -533,7 +611,11 @@ fn approval_y_approves() {
     app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
     assert!(app.approval_pending.is_none());
     assert!(matches!(app.focus, Focus::Input));
-    assert!(app.messages.iter().any(|m| m.text.contains("approved bash")));
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.text.contains("approved bash"))
+    );
 }
 
 #[test]
@@ -553,7 +635,11 @@ fn approval_a_allows_all() {
     app.focus = Focus::Approval;
     app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE));
     assert!(app.approval_pending.is_none());
-    assert!(app.messages.iter().any(|m| m.text.contains("allow-all bash")));
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.text.contains("allow-all bash"))
+    );
 }
 
 // ── message helpers ────────────────────────────────────────────────
@@ -647,7 +733,660 @@ fn tool_card_empty_card_type_is_success() {
         tool_name: "t".into(),
         content: "ok".into(),
         card_type: "".into(), // empty != "error" → success
-        elapsed_ms: 10,
+        elapsed_ms: Some(10),
+        call_id: None,
+        provenance_id: None,
+        data: None,
     });
-    assert!(matches!(app.messages.last().unwrap().kind, LineKind::ToolResult { .. }));
+    assert!(matches!(
+        app.messages.last().unwrap().kind,
+        LineKind::ToolResult { .. }
+    ));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Patch 1 tests: enriched event protocol normalization
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── Enriched parser tests (wire fields the backend already sends) ────
+
+#[test]
+fn parse_tool_start_captures_preview_and_approval() {
+    let msg = json!({
+        "method": "ui.tool.start",
+        "params": {
+            "tool_name": "compute_submit",
+            "verb": "Running",
+            "call_id": "call-42",
+            "preview": "{\"image\":\"vasp:6.5\"}",
+            "approval_required": true,
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ToolStart {
+            tool_name,
+            verb,
+            call_id,
+            preview,
+            approval_required,
+        } => {
+            assert_eq!(tool_name, "compute_submit");
+            assert_eq!(verb, "Running");
+            assert_eq!(call_id.as_deref(), Some("call-42"));
+            assert_eq!(preview.as_deref(), Some("{\"image\":\"vasp:6.5\"}"));
+            assert_eq!(approval_required, Some(true));
+        }
+        other => panic!("expected ToolStart, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_tool_start_missing_optional_fields_are_none() {
+    let msg = json!({
+        "method": "ui.tool.start",
+        "params": {"tool_name": "gfn_evaluate"}
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ToolStart {
+            call_id,
+            preview,
+            approval_required,
+            ..
+        } => {
+            assert!(call_id.is_none());
+            assert!(preview.is_none());
+            assert!(approval_required.is_none());
+        }
+        other => panic!("expected ToolStart, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_tool_card_captures_call_id_provenance_data() {
+    let msg = json!({
+        "method": "ui.card",
+        "params": {
+            "tool_name": "gfn_evaluate",
+            "content": "density=7.8",
+            "card_type": "results",
+            "elapsed_ms": 292,
+            "call_id": "call-7",
+            "provenance_id": "prov_abc123",
+            "data": {"density": 7.8, "vec": 6.5},
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ToolCard {
+            tool_name,
+            elapsed_ms,
+            call_id,
+            provenance_id,
+            data,
+            ..
+        } => {
+            assert_eq!(tool_name, "gfn_evaluate");
+            assert_eq!(elapsed_ms, Some(292));
+            assert_eq!(call_id.as_deref(), Some("call-7"));
+            assert_eq!(provenance_id.as_deref(), Some("prov_abc123"));
+            assert!(data.is_some());
+            assert_eq!(data.unwrap()["density"], 7.8);
+        }
+        other => panic!("expected ToolCard, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_tool_card_missing_optional_fields_are_none() {
+    let msg = json!({
+        "method": "ui.card",
+        "params": {"tool_name": "t", "content": "ok"}
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ToolCard {
+            elapsed_ms,
+            call_id,
+            provenance_id,
+            data,
+            ..
+        } => {
+            assert!(elapsed_ms.is_none());
+            assert!(call_id.is_none());
+            assert!(provenance_id.is_none());
+            assert!(data.is_none());
+        }
+        other => panic!("expected ToolCard, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_approval_prompt_captures_rich_fields() {
+    let msg = json!({
+        "method": "ui.prompt",
+        "params": {
+            "tool_name": "compute_submit",
+            "message": "Allow compute_submit?",
+            "call_id": "call-99",
+            "tool_args": {"image": "vasp:6.5", "gpu_type": "A100-80GB"},
+            "tool_description": "Dispatch a GPU compute job",
+            "requires_approval": true,
+            "permission_mode": "full_access",
+            "choices": ["y", "n", "a", "b"],
+            "prompt_type": "approval",
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ApprovalPrompt {
+            tool_name,
+            message,
+            call_id,
+            tool_args,
+            tool_description,
+            requires_approval,
+            permission_mode,
+            choices,
+            prompt_type,
+        } => {
+            assert_eq!(tool_name, "compute_submit");
+            assert_eq!(message, "Allow compute_submit?");
+            assert_eq!(call_id.as_deref(), Some("call-99"));
+            assert!(tool_args.is_some());
+            assert_eq!(tool_args.unwrap()["gpu_type"], "A100-80GB");
+            assert_eq!(
+                tool_description.as_deref(),
+                Some("Dispatch a GPU compute job")
+            );
+            assert_eq!(requires_approval, Some(true));
+            assert_eq!(permission_mode.as_deref(), Some("full_access"));
+            assert_eq!(choices, vec!["y", "n", "a", "b"]);
+            assert_eq!(prompt_type.as_deref(), Some("approval"));
+        }
+        other => panic!("expected ApprovalPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_approval_prompt_missing_optional_fields_are_none() {
+    let msg = json!({
+        "method": "ui.prompt",
+        "params": {"tool_name": "bash", "message": "ok?"}
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ApprovalPrompt {
+            call_id,
+            tool_args,
+            tool_description,
+            requires_approval,
+            permission_mode,
+            choices,
+            prompt_type,
+            ..
+        } => {
+            assert!(call_id.is_none());
+            assert!(tool_args.is_none());
+            assert!(tool_description.is_none());
+            assert!(requires_approval.is_none());
+            assert!(permission_mode.is_none());
+            assert!(choices.is_empty());
+            assert!(prompt_type.is_none());
+        }
+        other => panic!("expected ApprovalPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_cost_captures_token_counts() {
+    let msg = json!({
+        "method": "ui.cost",
+        "params": {
+            "turn_cost": 0.01,
+            "session_cost": 0.50,
+            "input_tokens": 1200,
+            "output_tokens": 800,
+            "cache_tokens": 400,
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::Cost {
+            turn_cost,
+            session_cost,
+            input_tokens,
+            output_tokens,
+            cache_tokens,
+        } => {
+            assert!((turn_cost - 0.01).abs() < 1e-9);
+            assert!((session_cost - 0.50).abs() < 1e-9);
+            assert_eq!(input_tokens, Some(1200));
+            assert_eq!(output_tokens, Some(800));
+            assert_eq!(cache_tokens, Some(400));
+        }
+        other => panic!("expected Cost, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_cost_missing_tokens_are_none() {
+    let msg = json!({
+        "method": "ui.cost",
+        "params": {"turn_cost": 0.0, "session_cost": 0.0}
+    });
+    match parse_notification(&msg) {
+        AgentMsg::Cost {
+            input_tokens,
+            output_tokens,
+            cache_tokens,
+            ..
+        } => {
+            assert!(input_tokens.is_none());
+            assert!(output_tokens.is_none());
+            assert!(cache_tokens.is_none());
+        }
+        other => panic!("expected Cost, got {other:?}"),
+    }
+}
+
+// ── New variant parser tests ─────────────────────────────────────────
+
+#[test]
+fn parse_permissions() {
+    let msg = json!({
+        "method": "ui.permissions",
+        "params": {
+            "mode": "agent",
+            "auto_approved": false,
+            "blocked": [],
+            "approval_required": true,
+            "read_only": false,
+            "workspace_write": true,
+            "full_access": false,
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::Permissions {
+            mode,
+            auto_approved,
+            raw,
+        } => {
+            assert_eq!(mode.as_deref(), Some("agent"));
+            assert_eq!(auto_approved, Some(false));
+            // raw retains the full params object
+            assert!(raw.get("workspace_write").is_some());
+        }
+        other => panic!("expected Permissions, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_permissions_missing_fields_no_panic() {
+    let msg = json!({"method": "ui.permissions", "params": {}});
+    match parse_notification(&msg) {
+        AgentMsg::Permissions {
+            mode,
+            auto_approved,
+            raw,
+        } => {
+            assert!(mode.is_none());
+            assert!(auto_approved.is_none());
+            assert!(raw.is_object());
+        }
+        other => panic!("expected Permissions, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_session_list() {
+    let msg = json!({
+        "method": "ui.session.list",
+        "params": {
+            "sessions": [
+                {"id": "s1", "title": "Ti alloy search"},
+                {"id": "s2", "title": "HEA discovery"}
+            ]
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::SessionList { sessions, raw } => {
+            assert_eq!(sessions.len(), 2);
+            assert_eq!(sessions[0]["id"], "s1");
+            assert!(raw.get("sessions").is_some());
+        }
+        other => panic!("expected SessionList, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_session_list_empty_no_panic() {
+    let msg = json!({"method": "ui.session.list", "params": {}});
+    match parse_notification(&msg) {
+        AgentMsg::SessionList { sessions, .. } => {
+            assert!(sessions.is_empty());
+        }
+        other => panic!("expected SessionList, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_backend_warning() {
+    let msg = json!({
+        "method": "ui.backend.warning",
+        "params": {
+            "code": "rate_limit",
+            "message": "Approaching API rate limit",
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::BackendWarning { code, message } => {
+            assert_eq!(code.as_deref(), Some("rate_limit"));
+            assert_eq!(message, "Approaching API rate limit");
+        }
+        other => panic!("expected BackendWarning, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_backend_error_notification() {
+    let msg = json!({
+        "method": "ui.backend.error",
+        "params": {
+            "code": 500,
+            "message": "Internal backend error",
+            "recoverable": true,
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::BackendError {
+            code,
+            message,
+            recoverable,
+        } => {
+            assert_eq!(code, Some(500));
+            assert_eq!(message, "Internal backend error");
+            assert_eq!(recoverable, Some(true));
+        }
+        other => panic!("expected BackendError, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_jsonrpc_error_response_structured() {
+    // A JSON-RPC error response (no method, has error object with code+message)
+    let msg = json!({
+        "error": {
+            "code": -32600,
+            "message": "Invalid Request",
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::BackendError {
+            code,
+            message,
+            recoverable,
+        } => {
+            assert_eq!(code, Some(-32600));
+            assert_eq!(message, "Invalid Request");
+            assert!(recoverable.is_none());
+        }
+        other => panic!("expected BackendError, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_jsonrpc_error_response_bare_string_falls_back() {
+    // A JSON-RPC error where error is a bare string (not an object)
+    let msg = json!({"error": "something broke"});
+    match parse_notification(&msg) {
+        AgentMsg::Error(s) => {
+            assert!(s.contains("something broke"));
+        }
+        other => panic!("expected Error fallback, got {other:?}"),
+    }
+}
+
+// ── Tolerance tests ──────────────────────────────────────────────────
+
+#[test]
+fn parse_extra_unknown_fields_ignored_safely() {
+    // The parser must not crash or reject payloads with extra fields
+    // it doesn't know about — forward compatibility.
+    let msg = json!({
+        "method": "ui.welcome",
+        "params": {
+            "version": "2.0.0",
+            "tool_count": 42,
+            "future_field": "hello",
+            "another_unknown": 123,
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::Welcome {
+            version,
+            tool_count,
+        } => {
+            assert_eq!(version, "2.0.0");
+            assert_eq!(tool_count, 42);
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_missing_method_field_returns_unknown() {
+    let msg = json!({"params": {"foo": "bar"}});
+    assert!(matches!(parse_notification(&msg), AgentMsg::Unknown(_)));
+}
+
+#[test]
+fn parse_null_params_no_panic() {
+    let msg = json!({"method": "ui.welcome", "params": null});
+    match parse_notification(&msg) {
+        AgentMsg::Welcome {
+            version,
+            tool_count,
+        } => {
+            assert_eq!(version, "?");
+            assert_eq!(tool_count, 0);
+        }
+        other => panic!("expected Welcome with defaults, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_garbage_method_returns_unknown() {
+    let msg = json!({"method": "ui.this.does.not.exist", "params": {}});
+    assert!(matches!(parse_notification(&msg), AgentMsg::Unknown(_)));
+}
+
+// ── App behavior regression tests for new variants ───────────────────
+
+#[test]
+fn permissions_updates_mode_when_present() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::Permissions {
+        mode: Some("agent".into()),
+        auto_approved: Some(false),
+        raw: json!({}),
+    });
+    assert_eq!(app.session_mode, "agent");
+}
+
+#[test]
+fn permissions_auto_approved_pushes_system_line() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::Permissions {
+        mode: None,
+        auto_approved: Some(true),
+        raw: json!({}),
+    });
+    assert!(app.messages.iter().any(|m| m.text.contains("auto-approve")));
+}
+
+#[test]
+fn permissions_not_auto_approved_no_system_line() {
+    let mut app = test_app();
+    let before = app.messages.len();
+    app.apply_agent_msg(AgentMsg::Permissions {
+        mode: None,
+        auto_approved: Some(false),
+        raw: json!({}),
+    });
+    assert_eq!(app.messages.len(), before);
+}
+
+#[test]
+fn session_list_empty_pushes_no_sessions_line() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::SessionList {
+        sessions: vec![],
+        raw: json!({}),
+    });
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.text.contains("no previous sessions"))
+    );
+}
+
+#[test]
+fn session_list_non_empty_pushes_count_line() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::SessionList {
+        sessions: vec![
+            json!({"id": "s1"}),
+            json!({"id": "s2"}),
+            json!({"id": "s3"}),
+        ],
+        raw: json!({}),
+    });
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.text.contains("3 previous session"))
+    );
+}
+
+#[test]
+fn backend_warning_pushes_system_line() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::BackendWarning {
+        code: Some("rate_limit".into()),
+        message: "Slow down".into(),
+    });
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.text.contains("rate_limit") && m.text.contains("Slow down"))
+    );
+}
+
+#[test]
+fn backend_error_pushes_error_line() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::BackendError {
+        code: Some(500),
+        message: "Internal error".into(),
+        recoverable: Some(true),
+    });
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.text.contains("error") && m.text.contains("Internal error"))
+    );
+}
+
+#[test]
+fn backend_error_fatal_pushes_error_line() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::BackendError {
+        code: Some(-1),
+        message: "Backend crashed".into(),
+        recoverable: Some(false),
+    });
+    assert!(app.messages.iter().any(|m| m.text.contains("fatal")));
+}
+
+#[test]
+fn backend_error_no_code_still_pushes() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::BackendError {
+        code: None,
+        message: "Unknown failure".into(),
+        recoverable: None,
+    });
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.text.contains("Unknown failure"))
+    );
+}
+
+// ── App behavior regression: existing variants still work ────────────
+
+#[test]
+fn tool_start_still_pushes_same_visible_behavior() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolStart {
+        tool_name: "alloy_sample".into(),
+        verb: "Running".into(),
+        call_id: Some("c1".into()),
+        preview: Some("{...}".into()),
+        approval_required: Some(true),
+    });
+    let last = app.messages.last().unwrap();
+    assert!(matches!(last.role, Role::Tool));
+    // The visible text is still "Running alloy_sample" — preview is NOT
+    // shown in the current behavior (that's for the tool-card patch).
+    assert_eq!(last.text, "Running alloy_sample");
+}
+
+#[test]
+fn tool_card_result_still_pushes_same_visible_behavior() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "gfn_evaluate".into(),
+        content: "density=7.8".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(150),
+        call_id: Some("c7".into()),
+        provenance_id: Some("prov_abc".into()),
+        data: Some(json!({"density": 7.8})),
+    });
+    let last = app.messages.last().unwrap();
+    assert!(matches!(
+        last.kind,
+        LineKind::ToolResult { success: true, .. }
+    ));
+    // Visible text is still "gfn_evaluate: density=7.8"
+    assert_eq!(last.text, "gfn_evaluate: density=7.8");
+}
+
+#[test]
+fn approval_prompt_still_sets_pending_and_focus() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+        tool_name: "bash".into(),
+        message: "rm?".into(),
+        call_id: Some("c1".into()),
+        tool_args: Some(json!({"cmd": "rm"})),
+        tool_description: Some("Run shell".into()),
+        requires_approval: Some(true),
+        permission_mode: Some("full_access".into()),
+        choices: vec!["y".into(), "n".into(), "a".into()],
+        prompt_type: Some("approval".into()),
+    });
+    assert!(app.approval_pending.is_some());
+    assert_eq!(app.approval_pending.as_ref().unwrap().0, "bash");
+    assert!(matches!(app.focus, Focus::Approval));
+}
+
+#[test]
+fn cost_still_updates_existing_fields() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::Cost {
+        turn_cost: 0.02,
+        session_cost: 0.99,
+        input_tokens: Some(500),
+        output_tokens: Some(300),
+        cache_tokens: Some(100),
+    });
+    assert!((app.turn_cost - 0.02).abs() < 1e-9);
+    assert!((app.session_cost - 0.99).abs() < 1e-9);
 }

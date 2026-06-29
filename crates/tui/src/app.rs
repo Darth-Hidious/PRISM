@@ -27,12 +27,26 @@ pub enum LineKind {
     Text,
     /// Reasoning/thinking tokens (from reasoning_content) — dimmed, collapsible
     Thinking,
-    ToolStart { tool_name: String, elapsed_ms: Option<u64> },
-    ToolResult { tool_name: String, content: String, elapsed_ms: u64, success: bool },
-    Approval { tool_name: String, message: String },
+    ToolStart {
+        tool_name: String,
+        elapsed_ms: Option<u64>,
+    },
+    ToolResult {
+        tool_name: String,
+        content: String,
+        elapsed_ms: u64,
+        success: bool,
+    },
+    Approval {
+        tool_name: String,
+        message: String,
+    },
     Status(String),
     Error(String),
-    View { title: String, body: String },
+    View {
+        title: String,
+        body: String,
+    },
 }
 
 /// The focus state — which panel has keyboard focus.
@@ -175,7 +189,8 @@ impl App {
                 if !text.trim().is_empty() {
                     self.send_message(&text);
                     self.input = TextArea::default();
-                    self.input.set_placeholder_text("Type a message... (Enter=send, Ctrl-C=quit)");
+                    self.input
+                        .set_placeholder_text("Type a message... (Enter=send, Ctrl-C=quit)");
                 }
             }
             _ => {
@@ -188,35 +203,71 @@ impl App {
     /// Convert crossterm key events to textarea operations manually.
     /// This avoids the ratatui-crossterm dependency mismatch.
     fn handle_textarea_key(&mut self, key: KeyEvent) {
-        use ratatui_textarea::{CursorMove};
+        use ratatui_textarea::CursorMove;
 
         // Handle modifiers first
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('a') => { self.input.move_cursor(CursorMove::Head); }
-                KeyCode::Char('e') => { self.input.move_cursor(CursorMove::End); }
-                KeyCode::Char('u') => { self.input.delete_line_by_head(); }
-                KeyCode::Char('k') => { self.input.delete_line_by_end(); }
-                KeyCode::Char('w') => { self.input.delete_word(); }
-                KeyCode::Char('d') => { self.input.delete_char(); }
-                KeyCode::Left => { self.input.move_cursor(CursorMove::Head); }
-                KeyCode::Right => { self.input.move_cursor(CursorMove::End); }
+                KeyCode::Char('a') => {
+                    self.input.move_cursor(CursorMove::Head);
+                }
+                KeyCode::Char('e') => {
+                    self.input.move_cursor(CursorMove::End);
+                }
+                KeyCode::Char('u') => {
+                    self.input.delete_line_by_head();
+                }
+                KeyCode::Char('k') => {
+                    self.input.delete_line_by_end();
+                }
+                KeyCode::Char('w') => {
+                    self.input.delete_word();
+                }
+                KeyCode::Char('d') => {
+                    self.input.delete_char();
+                }
+                KeyCode::Left => {
+                    self.input.move_cursor(CursorMove::Head);
+                }
+                KeyCode::Right => {
+                    self.input.move_cursor(CursorMove::End);
+                }
                 _ => {}
             }
             return;
         }
 
         match key.code {
-            KeyCode::Char(c) => { self.input.insert_char(c); }
-            KeyCode::Backspace => { self.input.delete_char(); }
-            KeyCode::Delete => { self.input.delete_next_char(); }
-            KeyCode::Left => { self.input.move_cursor(CursorMove::Back); }
-            KeyCode::Right => { self.input.move_cursor(CursorMove::Forward); }
-            KeyCode::Up => { self.input.move_cursor(CursorMove::Up); }
-            KeyCode::Down => { self.input.move_cursor(CursorMove::Down); }
-            KeyCode::Home => { self.input.move_cursor(CursorMove::Head); }
-            KeyCode::End => { self.input.move_cursor(CursorMove::End); }
-            KeyCode::Esc => { self.focus = Focus::Chat; }
+            KeyCode::Char(c) => {
+                self.input.insert_char(c);
+            }
+            KeyCode::Backspace => {
+                self.input.delete_char();
+            }
+            KeyCode::Delete => {
+                self.input.delete_next_char();
+            }
+            KeyCode::Left => {
+                self.input.move_cursor(CursorMove::Back);
+            }
+            KeyCode::Right => {
+                self.input.move_cursor(CursorMove::Forward);
+            }
+            KeyCode::Up => {
+                self.input.move_cursor(CursorMove::Up);
+            }
+            KeyCode::Down => {
+                self.input.move_cursor(CursorMove::Down);
+            }
+            KeyCode::Home => {
+                self.input.move_cursor(CursorMove::Head);
+            }
+            KeyCode::End => {
+                self.input.move_cursor(CursorMove::End);
+            }
+            KeyCode::Esc => {
+                self.focus = Focus::Chat;
+            }
             _ => {}
         }
     }
@@ -298,12 +349,49 @@ impl App {
 
     pub fn apply_agent_msg(&mut self, msg: AgentMsg) {
         match msg {
-            AgentMsg::Welcome { version, tool_count } => {
+            AgentMsg::Welcome {
+                version,
+                tool_count,
+            } => {
                 self.prism_version = version;
                 self.tool_count = tool_count;
-                self.push_system(&format!("PRISM v{} — {} tools available", self.prism_version, self.tool_count));
+                self.push_system(&format!(
+                    "PRISM v{} — {} tools available",
+                    self.prism_version, self.tool_count
+                ));
             }
-            AgentMsg::Status { model, mode, message_count } => {
+            AgentMsg::Permissions {
+                mode,
+                auto_approved,
+                ..
+            } => {
+                // Preserve current behavior: update mode if present.
+                // The existing TUI doesn't display a permissions panel,
+                // so we only surface auto-approve as a system line (if
+                // the backend says it's on).  The full `raw` payload is
+                // retained in the variant for the approval-state patch.
+                if let Some(m) = mode {
+                    self.session_mode = m;
+                }
+                if auto_approved.unwrap_or(false) {
+                    self.push_system("[auto-approve enabled for this session]");
+                }
+            }
+            AgentMsg::SessionList { sessions, .. } => {
+                // Current behavior: display as a system line listing
+                // the session count.  The full JSON objects are retained
+                // in the variant for future rendering.
+                if sessions.is_empty() {
+                    self.push_system("[no previous sessions]");
+                } else {
+                    self.push_system(&format!("[{} previous session(s)]", sessions.len()));
+                }
+            }
+            AgentMsg::Status {
+                model,
+                mode,
+                message_count,
+            } => {
                 self.model = model;
                 self.session_mode = mode;
                 self.message_count = message_count;
@@ -352,16 +440,32 @@ impl App {
                 self.is_waiting = false;
                 self.status_text = "Ready".to_string();
             }
-            AgentMsg::ToolStart { tool_name, verb, call_id } => {
+            AgentMsg::ToolStart {
+                tool_name, verb, ..
+            } => {
+                // `..` ignores call_id, preview, approval_required —
+                // current behavior only pushes a tool-start line.
                 self.push_message(ChatLine {
                     role: Role::Tool,
                     text: format!("{} {}", verb, tool_name),
-                    kind: LineKind::ToolStart { tool_name, elapsed_ms: None },
+                    kind: LineKind::ToolStart {
+                        tool_name,
+                        elapsed_ms: None,
+                    },
                 });
                 self.is_waiting = false;
             }
-            AgentMsg::ToolCard { tool_name, content, card_type, elapsed_ms } => {
+            AgentMsg::ToolCard {
+                tool_name,
+                content,
+                card_type,
+                elapsed_ms,
+                ..
+            } => {
+                // `..` ignores call_id, provenance_id, data —
+                // current behavior only pushes a result/error line.
                 let success = card_type != "error";
+                let elapsed = elapsed_ms.unwrap_or(0);
                 if !success {
                     self.push_message(ChatLine {
                         role: Role::Tool,
@@ -372,11 +476,21 @@ impl App {
                     self.push_message(ChatLine {
                         role: Role::Tool,
                         text: format!("{}: {}", tool_name, content),
-                        kind: LineKind::ToolResult { tool_name, content, elapsed_ms, success },
+                        kind: LineKind::ToolResult {
+                            tool_name,
+                            content,
+                            elapsed_ms: elapsed,
+                            success,
+                        },
                     });
                 }
             }
-            AgentMsg::ApprovalPrompt { tool_name, message } => {
+            AgentMsg::ApprovalPrompt {
+                tool_name, message, ..
+            } => {
+                // `..` ignores call_id, tool_args, tool_description,
+                // requires_approval, permission_mode, choices, prompt_type —
+                // current behavior uses only tool_name + message.
                 self.approval_pending = Some((tool_name.clone(), message.clone()));
                 self.focus = Focus::Approval;
                 self.push_message(ChatLine {
@@ -385,7 +499,13 @@ impl App {
                     kind: LineKind::Approval { tool_name, message },
                 });
             }
-            AgentMsg::Cost { turn_cost, session_cost } => {
+            AgentMsg::Cost {
+                turn_cost,
+                session_cost,
+                ..
+            } => {
+                // `..` ignores input_tokens, output_tokens, cache_tokens —
+                // current behavior only updates cost figures.
                 self.turn_cost = turn_cost;
                 self.session_cost = session_cost;
             }
@@ -398,9 +518,29 @@ impl App {
                     self.push_message(ChatLine {
                         role: Role::System,
                         text: format!("[{} > {}]\n{}", title, tab_title, body),
-                        kind: LineKind::View { title: title.clone(), body },
+                        kind: LineKind::View {
+                            title: title.clone(),
+                            body,
+                        },
                     });
                 }
+            }
+            AgentMsg::BackendWarning { code, message } => {
+                let label = code.unwrap_or_else(|| "warning".to_string());
+                self.push_system(&format!("[{label}] {message}"));
+            }
+            AgentMsg::BackendError {
+                code,
+                message,
+                recoverable,
+            } => {
+                let prefix = match (code, recoverable) {
+                    (Some(c), Some(false)) => format!("[fatal error {c}]"),
+                    (Some(c), _) => format!("[error {c}]"),
+                    (None, Some(false)) => "[fatal error]".to_string(),
+                    (None, _) => "[error]".to_string(),
+                };
+                self.push_error(&format!("{prefix} {message}"));
             }
             AgentMsg::Error(e) => {
                 self.push_error(&e);
@@ -451,11 +591,12 @@ impl App {
     }
 
     pub fn append_assistant_text(&mut self, delta: &str) {
-        if let Some(last) = self.messages.last_mut() {
-            if matches!(last.role, Role::Assistant) && matches!(last.kind, LineKind::Text) {
-                last.text.push_str(delta);
-                return;
-            }
+        if let Some(last) = self.messages.last_mut()
+            && matches!(last.role, Role::Assistant)
+            && matches!(last.kind, LineKind::Text)
+        {
+            last.text.push_str(delta);
+            return;
         }
         self.messages.push(ChatLine {
             role: Role::Assistant,
@@ -467,11 +608,12 @@ impl App {
     /// Append thinking/reasoning tokens to a separate thinking buffer.
     /// Rendered dimmed and collapsible.
     pub fn append_thinking_text(&mut self, delta: &str) {
-        if let Some(last) = self.messages.last_mut() {
-            if matches!(last.role, Role::Assistant) && matches!(last.kind, LineKind::Thinking) {
-                last.text.push_str(delta);
-                return;
-            }
+        if let Some(last) = self.messages.last_mut()
+            && matches!(last.role, Role::Assistant)
+            && matches!(last.kind, LineKind::Thinking)
+        {
+            last.text.push_str(delta);
+            return;
         }
         self.messages.push(ChatLine {
             role: Role::Assistant,
