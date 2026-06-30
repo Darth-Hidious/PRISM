@@ -33,7 +33,6 @@ def build_full_registry(
     from app.tools.platform_workflows import create_platform_workflows_tools
     from app.tools.mcp_services import create_mcp_services_tools
     from app.tools.mesh import create_mesh_tools
-    from app.tools.alpha import create_alpha_tools
 
     registry = ToolRegistry()
     create_system_tools(registry)
@@ -66,12 +65,10 @@ def build_full_registry(
     # Mesh networking — peers, health, subscriptions (read) + publish,
     # subscribe, unsubscribe (approval-gated cross-node operations).
     create_mesh_tools(registry)
-    # PRISM Alpha — multi-fidelity deterministic evaluator. Computes
-    # formation energy, elastic moduli, and stability descriptors across
-    # physics + M3GNet + MACE-MH-1 verifiers. This is the grounding layer
-    # for SUN (Stable, Unique, Novel) materials discovery — the LLM agent
-    # designs search spaces, Alpha evaluates candidates deterministically.
-    create_alpha_tools(registry)
+    # NOTE: PRISM Alpha (multi-fidelity property oracle) and MoGFN-AL
+    # (active learning discovery loop) are marketplace tools, NOT part of
+    # core PRISM. Install via: prism marketplace install alpha
+    # They register themselves via custom_loader (~/.prism/tools/).
     # Unified dataset tool — replaces VALIDATE_SKILL / REVIEW_SKILL /
     # VISUALIZE_SKILL Tool registrations. See app/tools/dataset.py.
     create_dataset_tool(registry)
