@@ -77,6 +77,21 @@ def discover_custom_tools(
             schema = getattr(module, "TOOL_SCHEMA", None)
             run_fn = getattr(module, "run", None)
 
+            # Check for multi-tool registration hook first.
+            # A file with __prism_tools__(registry) can register multiple
+            # tools at once — used by marketplace packages like PRISM Alpha.
+            prism_tools_hook = getattr(module, "__prism_tools__", None)
+            if callable(prism_tools_hook):
+                try:
+                    prism_tools_hook(registry)
+                    loaded.append(py_file.stem)
+                    logger.info("Loaded multi-tool package: %s", py_file.name)
+                except Exception as e:
+                    logger.warning(
+                        "Multi-tool package %s failed: %s", py_file.name, e
+                    )
+                continue
+
             if not all([name, description, schema, run_fn]):
                 logger.warning(
                     "Skipping %s: missing TOOL_NAME, TOOL_DESCRIPTION, TOOL_SCHEMA, or run()",
