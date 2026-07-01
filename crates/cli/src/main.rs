@@ -1006,16 +1006,15 @@ async fn main() -> Result<()> {
             | Some(Commands::Resume { .. })
             | Some(Commands::Campaign { .. })
             | None
-    ) {
-        if let Ok(state) = paths.load_cli_state() {
-            let token = state.credentials.as_ref().map(|c| c.access_token.clone());
-            let platform = if let Some(t) = &token {
-                prism_client::api::PlatformClient::new(&endpoints.api_base).with_token(t)
-            } else {
-                prism_client::api::PlatformClient::new(&endpoints.api_base)
-            };
-            crate::tool_sync::spawn_background_sync_owned(platform);
-        }
+    ) && let Ok(state) = paths.load_cli_state()
+    {
+        let token = state.credentials.as_ref().map(|c| c.access_token.clone());
+        let platform = if let Some(t) = &token {
+            prism_client::api::PlatformClient::new(&endpoints.api_base).with_token(t)
+        } else {
+            prism_client::api::PlatformClient::new(&endpoints.api_base)
+        };
+        crate::tool_sync::spawn_background_sync_owned(platform);
     }
 
     // Handle top-level flags (--resume, --model, --auto-approve, --offline)
@@ -2946,8 +2945,8 @@ async fn main() -> Result<()> {
                     std::env::current_exe().context("failed to locate current prism executable")?;
                 prism_tui::run(
                     prism_bin.to_str().unwrap(),
-                    &project_root.to_string_lossy().to_string(),
-                    &python.to_string_lossy().to_string(),
+                    project_root.to_string_lossy().as_ref(),
+                    python.to_string_lossy().as_ref(),
                 )
                 .await?;
                 return Ok(());
@@ -3097,8 +3096,8 @@ async fn main() -> Result<()> {
                 std::env::current_exe().context("failed to locate current prism executable")?;
             prism_tui::run(
                 prism_bin.to_str().unwrap(),
-                &project_root.to_string_lossy().to_string(),
-                &python.to_string_lossy().to_string(),
+                project_root.to_string_lossy().as_ref(),
+                python.to_string_lossy().as_ref(),
             )
             .await?;
         }

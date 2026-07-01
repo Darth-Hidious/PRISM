@@ -25,7 +25,7 @@
 
 #![cfg(test)]
 
-use prism_tui::app::{App, Focus};
+use prism_tui::app::App;
 use prism_tui::backend::{BackendHandle, FakeScenario};
 use prism_tui::msg::AgentMsg;
 use prism_tui::render::draw;
@@ -634,7 +634,7 @@ fn snapshot_long_unbroken_line_100x30() {
     let mut app = app_with_welcome();
     app.push_user("show long line");
     // A long JSON-like string with no spaces — tests word wrapping.
-    let long = "key_".to_string() + &"value_".repeat(80) + &"end_of_long_unbroken_token";
+    let long = "key_".to_string() + &"value_".repeat(80) + "end_of_long_unbroken_token";
     app.apply_agent_msg(AgentMsg::TextDelta(long));
     app.apply_agent_msg(AgentMsg::TextFlush);
     app.apply_agent_msg(AgentMsg::TurnComplete);

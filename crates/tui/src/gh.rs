@@ -208,12 +208,14 @@ mod tests {
 
     #[test]
     fn filtered_rows_respect_query() {
-        let mut p = GhPanel::default();
-        p.tab = GhTab::Issues;
-        p.items = vec![
-            json!({"number": 1, "title": "fix login", "state": "open", "url": "u1"}),
-            json!({"number": 2, "title": "dark mode", "state": "open", "url": "u2"}),
-        ];
+        let mut p = GhPanel {
+            tab: GhTab::Issues,
+            items: vec![
+                json!({"number": 1, "title": "fix login", "state": "open", "url": "u1"}),
+                json!({"number": 2, "title": "dark mode", "state": "open", "url": "u2"}),
+            ],
+            ..Default::default()
+        };
         assert_eq!(filtered_rows(&p).len(), 2);
         p.query = "dark".into();
         let rows = filtered_rows(&p);
