@@ -24,6 +24,8 @@ fn make_peer(id: Uuid, name: &str, port: u16) -> PeerNode {
         port,
         last_seen: Utc::now(),
         capabilities: vec!["compute".into()],
+        authenticated: true,
+        auth_hash: None,
     }
 }
 

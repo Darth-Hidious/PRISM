@@ -105,9 +105,13 @@ reports = [
     "markdown>=3.5",
     "weasyprint>=60.0",
 ]
-all = [
-    "prism-platform[ml,calphad,mace,data,reports]",
+ gflownet = [
+    "torch>=2.0.0",
+    "pyyaml>=6.0.0",
 ]
+ all = [
+    "prism-platform[ml,calphad,mace,data,reports,gflownet]",
+ ]
 full = [
     "prism-platform[all,simulation]",
 ]
@@ -145,6 +149,11 @@ packages = [
     "app.tools.simulation.mace.cache",
     "app.tools.simulation.mace.jobs",
     "app.tools.simulation.mace.payloads",
+    "app.tools.gflownet",
+    "app.tools.gflownet.al",
+    "app.tools.gflownet.gfn",
+    "app.tools.gflownet.oracles",
+    "app.tools.gflownet.surrogates",
     "app.tools.skills", "app.plugins", "app.tools.validation",
     "app.tools.search_engine", "app.tools.search_engine.cache",
     "app.tools.search_engine.providers", "app.tools.search_engine.resilience",

@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use forge_api::{AgentInfo, Model, Template};
 use forge_domain::UserCommand;
 use strum::{EnumProperty, IntoEnumIterator};
-use strum_macros::{EnumIter, EnumProperty};
+use strum_macros::EnumIter;
 
 use crate::info::Info;
 

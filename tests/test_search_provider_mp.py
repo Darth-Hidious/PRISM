@@ -2,14 +2,22 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from app.tools.search_engine.query import MaterialSearchQuery, PropertyRange
-from app.tools.search_engine.providers.endpoint import ProviderEndpoint, AuthConfig, BehaviorConfig, CapabilitiesConfig
+from app.tools.search_engine.providers.endpoint import (
+    ProviderEndpoint,
+    AuthConfig,
+    BehaviorConfig,
+    CapabilitiesConfig,
+)
 
 
 def _make_mp_endpoint():
     return ProviderEndpoint(
-        id="mp_native", name="Materials Project (Native)",
+        id="mp_native",
+        name="Materials Project (Native)",
         base_url="https://api.materialsproject.org",
-        api_type="mp_native", tier=1, enabled=True,
+        api_type="mp_native",
+        tier=1,
+        enabled=True,
         auth=AuthConfig(required=True, auth_type="api_key", auth_env_var="MP_API_KEY"),
         behavior=BehaviorConfig(timeout_ms=10000),
         capabilities=CapabilitiesConfig(
@@ -20,14 +28,20 @@ def _make_mp_endpoint():
 
 
 def test_mp_provider_creates():
-    from app.tools.search_engine.providers.materials_project import MaterialsProjectProvider
+    from app.tools.search_engine.providers.materials_project import (
+        MaterialsProjectProvider,
+    )
+
     ep = _make_mp_endpoint()
     p = MaterialsProjectProvider(endpoint=ep)
     assert p.id == "mp_native"
 
 
 def test_mp_provider_parse_doc():
-    from app.tools.search_engine.providers.materials_project import MaterialsProjectProvider
+    from app.tools.search_engine.providers.materials_project import (
+        MaterialsProjectProvider,
+    )
+
     ep = _make_mp_endpoint()
     p = MaterialsProjectProvider(endpoint=ep)
     doc = {
@@ -48,10 +62,17 @@ def test_mp_provider_parse_doc():
 
 
 def test_mp_provider_skips_without_api_key():
-    from app.tools.search_engine.providers.materials_project import MaterialsProjectProvider
+    from app.tools.search_engine.providers.materials_project import (
+        MaterialsProjectProvider,
+    )
+
     ep = _make_mp_endpoint()
     p = MaterialsProjectProvider(endpoint=ep)
-    with patch.dict("os.environ", {}, clear=True):
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch("pathlib.Path.exists", return_value=False),
+    ):
         import asyncio
+
         results = asyncio.run(p.search(MaterialSearchQuery(elements=["Fe"])))
         assert results == []

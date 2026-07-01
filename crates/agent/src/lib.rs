@@ -3,6 +3,7 @@ pub mod agent_loop;
 pub mod command_tools;
 pub mod commands;
 pub mod hooks;
+pub mod meta_tools;
 pub mod models;
 pub mod permissions;
 pub mod prompts;

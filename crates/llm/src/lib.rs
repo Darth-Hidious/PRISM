@@ -39,7 +39,7 @@ fn default_max_sample_rows() -> usize {
     10
 }
 fn default_timeout_secs() -> u64 {
-    120
+    300
 }
 
 impl Default for LlmConfig {
@@ -52,7 +52,7 @@ impl Default for LlmConfig {
             api_key: None,
             embedding_model: None,
             max_sample_rows: 10,
-            timeout_secs: 120,
+            timeout_secs: 300,
         }
     }
 }
@@ -131,6 +131,7 @@ impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
+            .connect_timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
         Self { client, config }
@@ -147,6 +148,34 @@ impl LlmClient {
         self.config.base_url.contains("marc27.com") || self.config.base_url.contains("/llm")
     }
 
+    /// Build the OpenAI chat-completions URL. Handles base URLs that
+    /// already include `/v1` (e.g. `http://localhost:8081/v1`) by not
+    /// double-appending, and base URLs that don't (e.g.
+    /// `http://localhost:8081`) by appending `/v1`.
+    fn chat_completions_url(&self) -> String {
+        let base = self.config.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{base}/chat/completions")
+        } else {
+            format!("{base}/v1/chat/completions")
+        }
+    }
+
+    /// Extract the assistant's text from an OpenAI-compatible response.
+    /// Falls back to `reasoning_content` when `content` is empty (e.g.
+    /// Gemma 4 thinking mode puts all text in `reasoning_content`).
+    fn extract_content(data: &serde_json::Value) -> String {
+        let msg = &data["choices"][0]["message"];
+        let content = msg["content"].as_str().unwrap_or_default();
+        if !content.is_empty() {
+            return content.to_string();
+        }
+        msg["reasoning_content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
     /// Generate text with a system + user message.
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
         let messages = serde_json::json!([
@@ -156,7 +185,7 @@ impl LlmClient {
         if self.is_marc27() {
             return self.chat_marc27_simple(&messages).await;
         }
-        let url = format!("{}/v1/chat/completions", self.config.base_url);
+        let url = self.chat_completions_url();
         let body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
@@ -165,10 +194,7 @@ impl LlmClient {
         });
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
-        Ok(data["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string())
+        Ok(Self::extract_content(&data))
     }
 
     /// MARC27 platform LLM: POST /stream with SSE response.
@@ -223,7 +249,7 @@ impl LlmClient {
                 usage: None,
             });
         }
-        let url = format!("{}/v1/chat/completions", self.config.base_url);
+        let url = self.chat_completions_url();
 
         let mut body = serde_json::json!({
             "model": self.config.model,
@@ -246,7 +272,12 @@ impl LlmClient {
             .get("tool_calls")
             .and_then(|tc| serde_json::from_value(tc.clone()).ok());
 
-        let content = msg_val["content"].as_str().map(|s| s.to_string());
+        let content_str = Self::extract_content(&data);
+        let content = if content_str.is_empty() {
+            None
+        } else {
+            Some(content_str)
+        };
 
         let usage = data
             .get("usage")
@@ -265,7 +296,7 @@ impl LlmClient {
 
     /// Generate text and parse as JSON (uses response_format).
     pub async fn generate_json(&self, prompt: &str) -> Result<String> {
-        let url = format!("{}/v1/chat/completions", self.config.base_url);
+        let url = self.chat_completions_url();
         let body = serde_json::json!({
             "model": self.config.model,
             "messages": [
@@ -277,10 +308,7 @@ impl LlmClient {
         });
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
-        Ok(data["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string())
+        Ok(Self::extract_content(&data))
     }
 
     /// Embed a single text string. Returns the embedding vector.
@@ -293,7 +321,12 @@ impl LlmClient {
 
     /// Batch embedding. Returns one vector per input text.
     pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        let url = format!("{}/v1/embeddings", self.config.base_url);
+        let base = self.config.base_url.trim_end_matches('/');
+        let url = if base.ends_with("/v1") {
+            format!("{base}/embeddings")
+        } else {
+            format!("{base}/v1/embeddings")
+        };
         let body = serde_json::json!({
             "model": self.embed_model(),
             "input": texts,
@@ -319,7 +352,7 @@ impl LlmClient {
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
-        mut on_delta: impl FnMut(&str),
+        mut on_delta: impl FnMut(&str, bool),
     ) -> Result<ChatResponse> {
         // MARC27 platform: use /stream with SSE.
         // The platform proxy doesn't support OpenAI-style tool_calls in the response,
@@ -518,7 +551,7 @@ impl LlmClient {
                 usage: usage_info,
             });
         }
-        let url = format!("{}/v1/chat/completions", self.config.base_url);
+        let url = self.chat_completions_url();
 
         let mut body = serde_json::json!({
             "model": self.config.model,
@@ -573,13 +606,27 @@ impl LlmClient {
                 if let Some(data) = line.strip_prefix("data: ")
                     && let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data)
                 {
-                    // Extract text delta
-                    if let Some(delta) = chunk
+                    // Extract text delta — separate content from
+                    // reasoning_content. Content is the actual response;
+                    // reasoning_content is thinking/reasoning tokens that
+                    // should be rendered dimmed/collapsed in the TUI.
+                    let content_delta = chunk
                         .pointer("/choices/0/delta/content")
                         .and_then(|c| c.as_str())
-                        && !delta.is_empty()
-                    {
-                        on_delta(delta);
+                        .filter(|s| !s.is_empty());
+
+                    let reasoning_delta = chunk
+                        .pointer("/choices/0/delta/reasoning_content")
+                        .and_then(|c| c.as_str())
+                        .filter(|s| !s.is_empty());
+
+                    if let Some(delta) = content_delta {
+                        on_delta(delta, false);
+                        full_content.push_str(delta);
+                    } else if let Some(delta) = reasoning_delta {
+                        // Reasoning tokens — is_reasoning=true so the
+                        // agent loop can emit them as ui.thinking.delta
+                        on_delta(delta, true);
                         full_content.push_str(delta);
                     }
 
@@ -722,29 +769,6 @@ impl LlmClient {
         bail!("LLM request to {url} failed after 3 retries (429 rate limit)");
     }
 
-    // Keep old signature for callers that held the single-attempt path
-    #[allow(dead_code)]
-    async fn post_no_retry(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-    ) -> Result<reqwest::Response> {
-        debug!(%url, "LLM request (no retry)");
-        let mut req = self.client.post(url).json(body);
-        if let Some(auth) = self.auth_header() {
-            req = req.header("Authorization", auth);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("LLM request to {url} failed"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("LLM returned HTTP {status}: {text}");
-        }
-        Ok(resp)
-    }
 }
 
 // ── MARC27 text-based tool calling helpers ──────────────────────────

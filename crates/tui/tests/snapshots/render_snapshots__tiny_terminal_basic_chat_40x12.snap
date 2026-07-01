@@ -1,0 +1,16 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New ses│ Workspace
+99 tools       ▲│ [Activity] Tools Files
+available      █│
+               █│  1. prompt "Hello" •
+> Hello        ║│
+               ▼│
+┌ Prompt ──────┐│
+│ Type a messag││
+│              ││
+│              ││
+└──────────────┘│
+  Ready  model: │

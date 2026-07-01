@@ -87,6 +87,8 @@ pub async fn run_sync_handler(
                     port,
                     last_seen: chrono::Utc::now(),
                     capabilities,
+                    authenticated: true,
+                    auth_hash: None,
                 };
                 let mut list = peers.write().unwrap_or_else(|e| e.into_inner());
                 if list.iter().any(|p| p.node_id == node_id) {

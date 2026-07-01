@@ -41,6 +41,8 @@ prism-python-bridge = { path = "../python-bridge" }
 prism-runtime = { path = "../runtime" }
 prism-server = { path = "../server" }
 prism-workflows = { path = "../workflows" }
+prism-campaign = { path = "../campaign" }
+prism-tui = { path = "../tui" }
 
 # Forge harness — chat UI + agent loop. Apache-2.0, vendored from tailcallhq/forgecode.
 forge_main.workspace = true

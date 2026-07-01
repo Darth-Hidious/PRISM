@@ -1,5 +1,6 @@
 # Claude Code session-local state — not for the repo
 .claude/
+.codex/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -13,6 +14,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+.build/
 downloads/
 eggs/
 .eggs/
@@ -52,8 +54,13 @@ coverage.xml
 *.pot
 # Sphinx documentation
 docs/_build/
-# Generated docs (plans, designs)
+# Generated docs (plans, designs) — but allow committed harness docs
 docs/
+!docs/tui-mcp-verification.md
+!docs/examples/
+!docs/examples/**
+!docs/templates/
+!docs/templates/**
 # PyBuilder
 target/
 # Jupyter Notebook
@@ -135,6 +142,11 @@ optimade-python-tools/
 # Output artifacts
 output/
 node_modules/
+extensions/*/out/
+extensions/*/.vscode-test/
+extensions/**/*.vsix
+!extensions/*/docs/
+!extensions/*/docs/**
 .codebase-memory/
 .superpowers/
 .venv-mlx-gemma4/

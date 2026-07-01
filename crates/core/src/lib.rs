@@ -8,9 +8,12 @@
 //! - [`rbac`]: Role-based access control (platform + local roles, permission checks).
 //! - [`audit`]: Append-only audit log (SQLite-backed, required for ESA/defense compliance).
 //! - [`registry`]: Tool manifest discovery and in-memory tool registry.
+//! - [`execution`]: Harness execution envelope + trace events (who is
+//!   executing, under which policy mode, reconstructable from trace events).
 
 pub mod audit;
 pub mod config;
+pub mod execution;
 pub mod rbac;
 pub mod registry;
 pub mod session;

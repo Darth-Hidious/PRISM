@@ -37,6 +37,18 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
         ],
     ));
 
+    // 1b. Check if llama-server is running (async check)
+    // We use a simple TCP connect instead of reqwest to avoid async/blocking mismatch.
+    if std::net::TcpStream::connect("127.0.0.1:8081").is_ok() {
+        checks.push(BootCheck {
+            name: "llama-server running".into(),
+            result: "OK".into(),
+            ok: true,
+            dots: 0,
+            delay_ms: 0,
+        });
+    }
+
     // 2. Embedder GGUF
     let embed_gguf = prism_dir.join("models/embeddinggemma-300m.gguf");
     checks.push(check_file(

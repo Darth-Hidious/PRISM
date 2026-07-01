@@ -9,8 +9,12 @@ the MCP path because mcp_server captures `tool.execute` as a bound method
 at registration time; bound methods cache `(func, instance)` and don't
 see later class-level patches.
 """
+
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -58,7 +62,14 @@ class ToolRegistry:
         self._tools: Dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
-        """Register a tool."""
+        """Register a tool. Logs a warning if the name is already taken."""
+        if tool.name in self._tools:
+            logger.warning(
+                "tool '%s' re-registered (overwrites %s from %s)",
+                tool.name,
+                self._tools[tool.name].source,
+                self._tools[tool.name].source_detail or "unknown",
+            )
         self._tools[tool.name] = tool
 
     def get(self, name: str) -> Tool:

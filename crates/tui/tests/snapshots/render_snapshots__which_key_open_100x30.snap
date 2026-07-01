@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+          ┌ Keybindings — j/k scroll · ? or Esc close ───────────────────────────────────┐
+          │ Commands & palette                                                           │
+          │   Ctrl-P                Command palette — run any command                    │
+          │   ?                     This keybindings panel                               │
+          │   Ctrl-L                Clear the chat transcript                            │
+          │   Ctrl-C                Quit PRISM                                           │
+          │   /<command>            Slash commands: /help /cost /model /mcp /goal        │
+          │                                                                              │
+          │ Navigation                                                                   │
+          │   Tab                   Cycle focus: input → workspace → chat                │
+          │   i                     Focus the message input                              │
+          │   Esc                   Leave a panel / cancel                               │
+          │   PgUp / PgDn           Scroll transcript by a page                          │
+          │   ↑↓ / k j              Scroll transcript one line                           │
+          │   g / G                 Jump to top / bottom                                 │
+          │   mouse wheel           Scroll transcript                                    │
+          │                                                                              │
+          │ Display                                                                      │
+          │   Ctrl-T                Toggle thinking tokens                               │
+          │   Ctrl-M                Toggle tok/s metrics                                 │
+          │   Ctrl-$                Toggle cost in the status bar                        │
+┌ Prompt ─│   Ctrl-P → theme        Switch color theme (via the command palette)         │
+│ Type a m│                                                                              │
+│         └──────────────────────────────────────────────────────────────────────────────┘
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

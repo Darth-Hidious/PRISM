@@ -11,6 +11,7 @@ prism-python-bridge = { path = "../python-bridge" }
 prism-client = { path = "../client" }
 prism-runtime = { path = "../runtime" }
 prism-workflows = { path = "../workflows" }
+prism-provenance = { path = "../provenance" }
 
 regex = "1"
 anyhow.workspace = true
@@ -18,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "io-std", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
+dirs = "6"
 chrono.workspace = true
 directories.workspace = true
 shlex = "1"

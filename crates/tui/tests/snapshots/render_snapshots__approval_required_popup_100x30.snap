@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+> run compute                                                      │  1. prompt "run compute" •
+                                                                   │
+· compute_submit: Allow compute_submit?                            │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                    ┌──────────────────────────────────────────────────────────┐
+                    │                                                          │
+                    │  ⚠ APPROVAL REQUIRED                                     │
+                    │                                                          │
+                    │  Tool: compute_submit                                    │
+                    └──────────────────────────────────────────────────────────┘
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+┌ Prompt ─────────────────────────────────────────────────────────┐│
+│type a message…  (press i to focus · ↵ send)                     ││
+│                                                                 ││
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [APPROVAL]    Ctrl-C quit           │

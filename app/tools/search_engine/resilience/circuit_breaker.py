@@ -1,4 +1,5 @@
 """Per-provider circuit breaker with persistent health tracking."""
+
 from __future__ import annotations
 
 import json
@@ -18,11 +19,18 @@ class ProviderHealth:
     success_count: int = 0
     failure_count: int = 0
 
-    def should_query(self, cooldown_seconds: float = 60.0) -> bool:
+    def should_query(self, cooldown_seconds: float = 300.0) -> bool:
+        """Check if this provider should be queried.
+
+        Cooldown is 5 minutes (300s) — dead OPTIMADE endpoints don't
+        come back quickly, so re-probing every 60s just wastes time.
+        """
         if self.circuit_state == "closed":
             return True
         if self.circuit_state == "open":
-            if self.last_failure and (time.time() - self.last_failure > cooldown_seconds):
+            if self.last_failure and (
+                time.time() - self.last_failure > cooldown_seconds
+            ):
                 self.circuit_state = "half_open"
                 return True
             return False
@@ -41,7 +49,7 @@ class ProviderHealth:
         self.consecutive_failures += 1
         self.failure_count += 1
         self.last_failure = time.time()
-        if self.consecutive_failures >= 3:
+        if self.consecutive_failures >= 2:
             self.circuit_state = "open"
 
     def to_dict(self) -> dict:

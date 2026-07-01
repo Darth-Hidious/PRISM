@@ -26,6 +26,7 @@ This commit only *exposes* the federation — no new providers wired
 yet. The existing `materials_project.py` and `optimade.py` providers
 fan out automatically.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -143,8 +144,13 @@ _MATERIALS_SEARCH_SCHEMA: dict = {
         "crystal_system": {
             "type": "string",
             "enum": [
-                "cubic", "hexagonal", "tetragonal",
-                "orthorhombic", "monoclinic", "triclinic", "trigonal",
+                "cubic",
+                "hexagonal",
+                "tetragonal",
+                "orthorhombic",
+                "monoclinic",
+                "triclinic",
+                "trigonal",
             ],
             "description": "Crystal system constraint.",
         },
@@ -216,7 +222,7 @@ def _materials_search_factory(provider_registry: ProviderRegistry):
                     "latency_ms": log.latency_ms,
                     "ok": getattr(log, "ok", True),
                 }
-                for log in result.provider_logs
+                for log in result.query_log
             ],
             "query_hash": query.query_hash(),
         }
@@ -233,10 +239,17 @@ def _normalize_property_ranges(kwargs: dict) -> dict:
     that prevents one class of "I tried calling but it 422'd" loops.
     """
     range_fields = {
-        "n_elements", "band_gap", "formation_energy", "energy_above_hull",
-        "bulk_modulus", "debye_temperature",
+        "n_elements",
+        "band_gap",
+        "formation_energy",
+        "energy_above_hull",
+        "bulk_modulus",
+        "debye_temperature",
     }
     out = dict(kwargs)
+    # Normalize elements: accept comma-separated string or list
+    if isinstance(out.get("elements"), str):
+        out["elements"] = [e.strip() for e in out["elements"].split(",") if e.strip()]
     for field in range_fields:
         v = out.get(field)
         if isinstance(v, list) and len(v) == 2:

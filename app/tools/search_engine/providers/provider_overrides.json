@@ -10,7 +10,13 @@
   },
 
   "url_corrections": {
-    "mpdd": "http://mpddoptimade.phaseslab.com"
+    "mpdd": "http://mpddoptimade.phaseslab.com",
+    "mp": "https://optimade.materialsproject.org/v1",
+    "nmd": "https://nomad-lab.eu/prod/v1/optimade/v1",
+    "matcloud": "",
+    "mcloud": "",
+    "jarvis": "https://jarvis.nist.gov/optimade/jarvisdft/v1",
+    "oqmd": ""
   },
 
   "defaults": {
@@ -19,7 +25,7 @@
     "tier": 3,
     "enabled": true,
     "behavior": {
-      "timeout_ms": 10000,
+      "timeout_ms": 5000,
       "max_results": 1000,
       "use_https": true
     },

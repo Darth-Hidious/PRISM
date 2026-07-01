@@ -217,13 +217,67 @@ pub fn audit_hook() -> Hook {
     }
 }
 
-/// Build the default hook registry with safety + cost + audit hooks.
+/// Build the default hook registry with safety + cost + audit + provenance hooks.
 pub fn build_default_hooks() -> HookRegistry {
     let mut registry = HookRegistry::new();
     registry.register(safety_hook());
     registry.register(cost_hook());
     registry.register(audit_hook());
+    registry.register(provenance_hook());
     registry
+}
+
+/// Provenance hook — records every tool call to Turso via a spawned
+/// async task. Non-blocking: the hook returns immediately, the write
+/// happens in the background.
+fn provenance_hook() -> Hook {
+    use prism_provenance::{ActionType, Actor, new_record};
+
+    Hook {
+        name: "provenance".to_string(),
+        before: None,
+        after: Some(Box::new(move |tool_name, inputs, result, _elapsed_ms| {
+            // Spawn an async task to write the provenance record.
+            // This requires being inside a tokio runtime — the agent
+            // loop runs inside one, so this works.
+            let mut record = new_record(
+                "session",
+                ActionType::ToolCall,
+                Actor::Agent,
+                Some(tool_name),
+                None,
+                inputs.clone(),
+            );
+            // Record the output too so `recall` can pull the full result
+            // back later (by id or keyword), not just the tool's inputs.
+            record.output_json = Some(result.clone());
+
+            // Try to spawn a background write task
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let db_path = dirs::home_dir()
+                        .map(|h| h.join(".prism/provenance.db"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+                    match prism_provenance::ProvenanceStore::open(&db_path).await {
+                        Ok(store) => {
+                            if let Err(e) = store.record(&record).await {
+                                warn!("provenance write failed: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            warn!("provenance store open failed: {e}");
+                        }
+                    }
+                });
+            }
+
+            PostHookResult {
+                log_message: String::new(),
+                modified_result: None,
+            }
+        })),
+        tool_filter: None, // matches all tools
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

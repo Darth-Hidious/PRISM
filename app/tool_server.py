@@ -10,6 +10,15 @@ import json
 import os
 import sys
 
+# CRITICAL: this worker writes line-delimited JSON-RPC to stdout. Some tools
+# import heavy ML libraries (e.g. MACE → mace/tools/cg.py) that print() a
+# banner to stdout at import time, which corrupts the protocol's first line
+# and makes the Rust side fail with "expected value at line 1 column 1".
+# Save the real stdout for the protocol, then point sys.stdout at stderr so any
+# library banner lands on stderr instead of the JSON channel.
+_PROTOCOL_OUT = sys.stdout
+sys.stdout = sys.stderr
+
 from app.plugins.bootstrap import build_full_registry
 
 
@@ -77,8 +86,8 @@ def main():
         else:
             response = _handle(tool_reg, request)
 
-        sys.stdout.write(json.dumps(response) + "\n")
-        sys.stdout.flush()
+        _PROTOCOL_OUT.write(json.dumps(response) + "\n")
+        _PROTOCOL_OUT.flush()
 
 
 if __name__ == "__main__":

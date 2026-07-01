@@ -82,6 +82,8 @@ impl<'a> PlatformDiscovery<'a> {
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(Utc::now),
                 capabilities,
+                authenticated: true,
+                auth_hash: None,
             });
         }
 

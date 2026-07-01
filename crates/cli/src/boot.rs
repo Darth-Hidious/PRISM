@@ -102,7 +102,7 @@ pub fn section(title: &str) {
 }
 
 /// Print a single bullet without a status marker — for plain progress text.
-#[allow(dead_code)] // public API surface, used by external boot-step modules
+#[allow(dead_code)]
 pub fn bullet(text: &str) {
     println!("\x1b[38;2;100;100;255m \u{251c}\u{2500}\u{2500} \x1b[38;2;200;200;200m{text}\x1b[0m");
 }
@@ -110,43 +110,4 @@ pub fn bullet(text: &str) {
 /// A nicely-coloured warning the user should notice but isn't fatal.
 pub fn warn(text: &str) {
     println!("\x1b[38;2;100;100;255m \u{2502}   \x1b[38;2;255;200;100m\u{26A0}  {text}\x1b[0m");
-}
-
-/// A simple inline progress bar that overwrites itself while in a tty.
-/// `done` and `total` are bytes; we render in MB.
-#[allow(dead_code)] // public API surface, used by long-running download flows
-pub fn progress(prefix: &str, done: u64, total: Option<u64>) {
-    use std::io::IsTerminal;
-    let cr = if io::stderr().is_terminal() {
-        "\r"
-    } else {
-        "\n"
-    };
-    match total {
-        Some(t) if t > 0 => {
-            let pct = (done as f64 / t as f64).min(1.0);
-            let bar_w = 24usize;
-            let filled = (pct * bar_w as f64) as usize;
-            let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
-            eprint!(
-                "{cr}\x1b[38;2;100;100;255m \u{2502}   \x1b[38;2;200;200;200m{prefix} \x1b[38;2;0;255;255m{bar} \x1b[38;2;255;255;255m{:>5.1}% \x1b[38;2;100;100;100m{}/{} MB\x1b[0m",
-                pct * 100.0,
-                done / 1_048_576,
-                t / 1_048_576
-            );
-        }
-        _ => {
-            eprint!(
-                "{cr}\x1b[38;2;100;100;255m \u{2502}   \x1b[38;2;200;200;200m{prefix} \x1b[38;2;100;100;100m{} MB\x1b[0m",
-                done / 1_048_576
-            );
-        }
-    }
-    let _ = std::io::stderr().flush();
-}
-
-/// Finish a progress line with a newline so subsequent output starts fresh.
-#[allow(dead_code)] // pairs with `progress()`
-pub fn progress_done() {
-    eprintln!();
 }

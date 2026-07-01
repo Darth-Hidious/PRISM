@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v1 · 99 tools ─────────────────────────────────────────────────│ Workspace
+· PRISM v1                                                            │  Activity [Tools] Files
+                                                                      │
+⚙ Running alloy_sample                                                │▸ ✓ alloy_sample  292ms §
+                                                                      │  W0.3 Mo0.2 Ta0.3 Nb0.2
+⚙ alloy_sample: W0.3 Mo0.2 Ta0.3 Nb0.2                                │
+                                                                      │  ✓ write_file  84ms
+⚙ write_file: Updated crates/tui/src/app.rs                           │  Updated crates/tui/src/ap…
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+  Ready  model: fake-backend   [WORKSPACE]                            │
+──────────────────────────────────────────────────────────────────────│
+Type a message... (press 'i' to focus input)                          │
+                                                                      │

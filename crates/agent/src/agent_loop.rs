@@ -63,7 +63,10 @@ fn process_large_result(content: &str, result_store: &mut HashMap<String, String
     result_store.insert(result_id.clone(), content.to_string());
     let end = content.len().min(2000);
     let truncated = &content[..end];
-    format!("{truncated}\n\n[Result truncated. Use peek_result('{result_id}') to see more]")
+    format!(
+        "{truncated}\n\n[Result truncated to {end} chars — earlier tool outputs are in \
+         durable memory; call recall(query=\"<keywords>\") to pull the full result back.]"
+    )
 }
 
 // ── Doom-loop detection ───────────────────────────────────────────
@@ -400,11 +403,34 @@ pub async fn run_turn(
         messages.extend(history.iter().cloned());
 
         // ── 2c. Call LLM ─────────────────────────────────────────
-        // The on_delta callback is unused for MARC27 (text-based tool calling)
-        // because we collect full_text, strip tool calls, and emit clean content
-        // after the response completes. Kept for future OpenAI-path streaming.
+        // Tool selection: filter to top-K relevant tools based on the
+        // latest user message to avoid "tool stuffing" (sending all 99
+        // tool definitions = 21K tokens every turn). On iteration 0 we
+        // use the user's message; on later iterations the LLM may be
+        // calling tools based on prior results, so we include the tools
+        // it has already called plus top-K for the original query.
+        let mut relevant_tools = tool_catalog.definitions_for_query(user_message, 15);
+        // Always offer the native meta-tools (recall + find_tools) so the model
+        // can pull earlier results back from durable memory and discover tools
+        // beyond the top-K selection.
+        relevant_tools.extend(crate::meta_tools::definitions().iter().map(|t| t.to_definition()));
+        tracing::debug!(
+            total_tools = tool_catalog.len(),
+            selected_tools = relevant_tools.len(),
+            "tool selection for LLM call"
+        );
+
+        // Stream tokens incrementally — collect deltas from the
+        // streaming callback and emit them after the call completes.
+        // Reasoning tokens (is_reasoning=true) are emitted as a separate
+        // event so the TUI can render them dimmed/collapsed.
+        let mut streamed_deltas: Vec<(String, bool)> = Vec::new();
         let response = llm
-            .chat_with_tools_streaming(&messages, tool_catalog.definitions(), |_delta| {})
+            .chat_with_tools_streaming(&messages, &relevant_tools, |delta: &str, is_reasoning: bool| {
+                if !delta.is_empty() {
+                    streamed_deltas.push((delta.to_string(), is_reasoning));
+                }
+            })
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "LLM call failed: {e:#}");
@@ -431,14 +457,31 @@ pub async fn run_turn(
         // Use the clean content from the response (tool call blocks already
         // stripped) instead of raw streaming deltas which can leak partial
         // tool call JSON when SSE chunks split across the ``` boundary.
+        // ── 2e. Emit streamed content ───────────────────────────
+        // Emit each delta individually so the TUI renders token-by-token.
+        // Reasoning tokens (is_reasoning=true) are emitted as
+        // ThinkingDelta so the TUI renders them dimmed and collapsed.
+        for (delta, is_reasoning) in &streamed_deltas {
+            if *is_reasoning {
+                emit(AgentEvent::ThinkingDelta {
+                    text: delta.clone(),
+                });
+            } else {
+                emit(AgentEvent::TextDelta {
+                    text: delta.clone(),
+                });
+            }
+        }
+
         if let Some(content) = &response.message.content
             && !content.is_empty()
+            && streamed_deltas.is_empty()
         {
             emit(AgentEvent::TextDelta {
                 text: content.clone(),
             });
-            emit(AgentEvent::TextFlush);
         }
+        emit(AgentEvent::TextFlush);
 
         // ── 2f. Push assistant message ────────────────────────────
         history.push(response.message.clone());
@@ -660,7 +703,25 @@ pub async fn run_turn(
 
             // ── h5. Execute tool ──────────────────────────────────
             let start = Instant::now();
-            let result: Result<Value> = if command_tools::is_command_tool(tool_name) {
+            let result: Result<Value> = if crate::meta_tools::is_meta_tool(tool_name) {
+                // Native meta-tools (recall / find_tools) operate on the agent's
+                // own state — durable memory + the tool catalog — so intercept
+                // them before command-tool / Python dispatch. Open the same
+                // Turso store the provenance hook writes to.
+                let db_path = dirs::home_dir()
+                    .map(|h| h.join(".prism/provenance.db"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+                let store = prism_provenance::ProvenanceStore::open(&db_path).await.ok();
+                crate::meta_tools::execute_meta_tool(
+                    tool_name,
+                    &args,
+                    store.as_ref(),
+                    "session",
+                    tool_catalog,
+                )
+                .await
+                .map(|value| serde_json::json!({ "result": value }))
+            } else if command_tools::is_command_tool(tool_name) {
                 command_tools::execute_command_tool(
                     command_tool_runtime,
                     tool_name,
@@ -859,7 +920,7 @@ mod tests {
         let content = "x".repeat(40_000);
         let result = process_large_result(&content, &mut store);
         assert!(result.contains("[Result truncated"));
-        assert!(result.contains("peek_result"));
+        assert!(result.contains("recall"));
         assert_eq!(store.len(), 1);
         // Stored value is the full content
         let stored = store.values().next().unwrap();

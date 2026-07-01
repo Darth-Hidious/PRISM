@@ -1807,25 +1807,25 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(ForgeConfig) -> A + Send + Sync> UI
     /// Install the Forge VS Code extension
     async fn on_vscode_extension_install(&mut self) -> anyhow::Result<()> {
         self.spinner
-            .start(Some("Installing Forge VS Code extension"))?;
+            .start(Some("Installing PRISM VS Code extension"))?;
 
         match crate::vscode::install_extension() {
             Ok(true) => {
                 self.spinner.stop(None)?;
                 self.writeln_title(TitleFormat::info(
-                    "Forge VS Code extension installed successfully",
+                    "PRISM VS Code extension installed successfully",
                 ))?;
             }
             Ok(false) => {
                 self.spinner.stop(None)?;
                 self.writeln_title(TitleFormat::error(
-                    "Failed to install Forge VS Code extension.",
+                    "Failed to install PRISM VS Code extension.",
                 ))?;
             }
             Err(e) => {
                 self.spinner.stop(None)?;
                 self.writeln_title(TitleFormat::error(format!(
-                    "Failed to install Forge VS Code extension: {e}"
+                    "Failed to install PRISM VS Code extension: {e}"
                 )))?;
             }
         }

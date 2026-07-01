@@ -1,4 +1,5 @@
 """Central bootstrap: build a fully loaded ToolRegistry in one call."""
+
 import logging
 
 from app.tools.base import ToolRegistry
@@ -31,6 +32,7 @@ def build_full_registry(
     from app.tools.platform_jobs import create_platform_jobs_tools
     from app.tools.platform_workflows import create_platform_workflows_tools
     from app.tools.mcp_services import create_mcp_services_tools
+    from app.tools.mesh import create_mesh_tools
 
     registry = ToolRegistry()
     create_system_tools(registry)
@@ -60,6 +62,24 @@ def build_full_registry(
     # Platform-hosted MCP service discovery + invocation. Read in
     # `mcp_services`, proxy/scale state-changes in `mcp_services_invoke`.
     create_mcp_services_tools(registry)
+    # Mesh networking — peers, health, subscriptions (read) + publish,
+    # subscribe, unsubscribe (approval-gated cross-node operations).
+    create_mesh_tools(registry)
+    # KAG-style tool reasoning — helps the agent plan tool sequences
+    # before executing. Classifies intent, recommends tools, shows data flow.
+    # Session context builder — running knowledge base that survives
+    # compaction. Records evaluations, builds summaries, queries history.
+    try:
+        from app.tools.tool_reasoning import create_tool_reasoning_tool
+        from app.tools.session_context import create_session_context_tool
+        create_tool_reasoning_tool(registry)
+        create_session_context_tool(registry)
+    except Exception:
+        logger.debug("KAG tools not registered", exc_info=True)
+    # NOTE: PRISM Alpha (multi-fidelity property oracle) and MoGFN-AL
+    # (active learning discovery loop) are marketplace tools, NOT part of
+    # core PRISM. Install via: prism marketplace install alpha
+    # They register themselves via custom_loader (~/.prism/tools/).
     # Unified dataset tool — replaces VALIDATE_SKILL / REVIEW_SKILL /
     # VISUALIZE_SKILL Tool registrations. See app/tools/dataset.py.
     create_dataset_tool(registry)
@@ -71,7 +91,13 @@ def build_full_registry(
     # original tool result passes through unchanged. See
     # docs/stateful_tools_2026.md for the architecture.
     import os as _os
-    if _os.environ.get("PRISM_DISABLE_MEMORY", "").strip().lower() not in {"1", "true", "yes", "on"}:
+
+    if _os.environ.get("PRISM_DISABLE_MEMORY", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
         try:
             from app.tools.memory import (
                 ArtifactStore,
@@ -79,6 +105,7 @@ def build_full_registry(
                 create_memory_tools,
                 default_db_path,
             )
+
             _store = ArtifactStore(default_db_path())
             _configure_memory(store=_store)
             create_memory_tools(registry)
@@ -88,6 +115,7 @@ def build_full_registry(
     # Web browsing tools (Firecrawl + DuckDuckGo fallback)
     try:
         from app.tools.web import create_web_tools
+
         create_web_tools(registry)
     except Exception:
         pass
@@ -95,6 +123,7 @@ def build_full_registry(
     # MARC27 Knowledge Plane tools (graph search, semantic search, ingest)
     try:
         from app.tools.knowledge import create_knowledge_tools
+
         create_knowledge_tools(registry)
     except Exception:
         pass
@@ -104,6 +133,7 @@ def build_full_registry(
     # See app/tools/research.py for the SSE protocol + cost notes.
     try:
         from app.tools.research import create_research_tools
+
         create_research_tools(registry)
     except Exception:
         pass
@@ -111,12 +141,14 @@ def build_full_registry(
     # MARC27 Compute Broker tools (GPU dispatch, job management)
     try:
         from app.tools.compute import create_compute_tools
+
         create_compute_tools(registry)
     except Exception:
         pass
 
     # Premium labs tools (marketplace services)
     from app.tools.labs import create_labs_tools
+
     create_labs_tools(registry)
 
     # Simulation tools (optional — pyiron may not be installed)
@@ -169,7 +201,11 @@ def build_full_registry(
         pass
 
     # Search provider registry (3-layer: discovery + overrides + catalog)
-    from app.tools.search_engine.providers.registry import ProviderRegistry, build_registry
+    from app.tools.search_engine.providers.registry import (
+        ProviderRegistry,
+        build_registry,
+    )
+
     try:
         provider_reg = build_registry()
     except Exception:
@@ -216,16 +252,6 @@ def build_full_registry(
             from app.tools.spark import create_spark_tools
 
             create_spark_tools(registry)
-    except Exception:
-        pass
-
-    # Custom tools from ~/.prism/tools/*.py
-    try:
-        from app.tools.custom_loader import discover_custom_tools
-
-        custom_names = discover_custom_tools(registry)
-        if custom_names:
-            logger.info("Loaded %d custom tools: %s", len(custom_names), ", ".join(custom_names))
     except Exception:
         pass
 

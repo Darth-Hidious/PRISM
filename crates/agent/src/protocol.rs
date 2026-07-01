@@ -3580,6 +3580,143 @@ async fn handle_models_slash_command(
     }
 }
 
+/// `/gh` — GitHub inside the TUI. Backs the Issues / PRs / Status / Bug panel.
+/// Shells to the authenticated `gh` CLI and emits a single structured
+/// `ui.gh.data` notification the TUI renders. The repo is auto-detected from
+/// `git remote origin` (falling back to the hardcoded default).
+async fn handle_gh_slash_command(args: &[String], slash_ctx: &SlashCommandContext) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("gh") {
+        return Ok(false);
+    }
+    let tab = args.get(1).map(String::as_str).unwrap_or("issues");
+    let repo = detect_github_repo(&slash_ctx.project_root).await;
+
+    let emit = |items: Vec<Value>, error: Option<String>| {
+        emit_notification(
+            "ui.gh.data",
+            serde_json::json!({ "tab": tab, "repo": repo, "items": items, "error": error }),
+        );
+        emit_notification("ui.turn.complete", serde_json::json!({}));
+    };
+
+    match tab {
+        "issues" => match gh_json(&repo, &["issue", "list", "--json", "number,title,state,labels,author,url", "--limit", "50"]).await {
+            Ok(items) => emit(items, None),
+            Err(e) => emit(vec![], Some(format!("{e}"))),
+        },
+        "prs" => match gh_json(&repo, &["pr", "list", "--json", "number,title,state,author,headRefName,url", "--limit", "50"]).await {
+            Ok(items) => emit(items, None),
+            Err(e) => emit(vec![], Some(format!("{e}"))),
+        },
+        "status" => match gh_json(&repo, &["run", "list", "--json", "name,status,conclusion,headBranch,url", "--limit", "20"]).await {
+            Ok(items) => emit(items, None),
+            Err(e) => emit(vec![], Some(format!("{e}"))),
+        },
+        "bug" => {
+            // `/gh bug <description>` → file a GitHub issue via `gh issue create`.
+            let desc = args.get(2..).map(|d| d.join(" ").trim().to_string()).unwrap_or_default();
+            if desc.is_empty() {
+                emit(vec![], Some("usage: /gh bug <description>".into()));
+            } else {
+                let title = char_safe_truncate(&format!("bug: {desc}"), 70);
+                let body = format!("## Bug\n\n{desc}\n\n(filed from the PRISM TUI)");
+                match gh_create_issue(&repo, &title, &body).await {
+                    Ok(url) => emit(vec![serde_json::json!({ "url": url, "title": title })], None),
+                    Err(e) => emit(vec![], Some(format!("{e}"))),
+                }
+            }
+        }
+        _ => emit(vec![], Some(format!("unknown /gh subcommand: {tab} (try issues, prs, status, bug)"))),
+    }
+    Ok(true)
+}
+
+/// Run `gh … --repo <repo> --json …` and return the parsed JSON array.
+async fn gh_json(repo: &str, sub: &[&str]) -> Result<Vec<Value>> {
+    let mut cmd = TokioCommand::new("gh");
+    cmd.args(sub).args(["--repo", repo]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let out = cmd
+        .output()
+        .await
+        .context("failed to run `gh` — is the GitHub CLI installed and authenticated?")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        bail!(if err.is_empty() { "gh command failed".to_string() } else { err });
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(s.trim()).context("gh did not return JSON")?;
+    Ok(match v {
+        Value::Array(a) => a,
+        other => vec![other],
+    })
+}
+
+/// `gh issue create` — returns the new issue URL from stdout.
+async fn gh_create_issue(repo: &str, title: &str, body: &str) -> Result<String> {
+    let out = TokioCommand::new("gh")
+        .args([
+            "issue",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            title,
+            "--body",
+            body,
+            "--label",
+            "bug",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .context("failed to run `gh issue create`")?;
+    if !out.status.success() {
+        bail!(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Detect the `owner/repo` from `git remote get-url origin` in `root`.
+async fn detect_github_repo(root: &std::path::Path) -> String {
+    let out = TokioCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["remote", "get-url", "origin"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    let url = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return "Darth-Hidious/PRISM".to_string(),
+    };
+    parse_github_repo(&url).unwrap_or_else(|| "Darth-Hidious/PRISM".to_string())
+}
+
+fn parse_github_repo(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches(".git");
+    if let Some(rest) = url.strip_prefix("https://github.com/") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        return Some(rest.to_string());
+    }
+    url.split("github.com/").nth(1).map(|s| s.to_string())
+}
+
+/// Truncate at a character boundary (avoid panicking on multi-byte UTF-8).
+fn char_safe_truncate(s: &str, max_chars: usize) -> String {
+    let chars: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        format!("{chars}…")
+    } else {
+        chars
+    }
+}
+
 async fn handle_deploy_slash_command(
     args: &[String],
     slash_ctx: &SlashCommandContext,
@@ -3828,6 +3965,9 @@ fn emit_agent_event(event: AgentEvent) {
     match event {
         AgentEvent::TextDelta { text } => {
             emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
+        }
+        AgentEvent::ThinkingDelta { text } => {
+            emit_notification("ui.thinking.delta", serde_json::json!({ "text": text }));
         }
         AgentEvent::TextFlush => {
             emit_notification("ui.text.flush", serde_json::json!({ "text": "" }));
@@ -4562,6 +4702,7 @@ fn spawn_agent_turn(
     user_text: String,
     tools: Arc<ToolCatalog>,
     config: Arc<AgentConfig>,
+    auto_approve: bool,
     hooks: Arc<HookRegistry>,
     slash_ctx: SlashCommandContext,
     approval_rx: agent_loop::SharedApprovalReceiver,
@@ -4572,6 +4713,7 @@ fn spawn_agent_turn(
     tokio::spawn(async move {
         let llm = LlmClient::new(runtime.llm_config.clone());
         let mut turn_config = config.as_ref().clone();
+        turn_config.auto_approve = auto_approve;
         turn_config.system_prompt = system_prompt_for_mode(
             runtime.session_mode,
             &config.system_prompt,
@@ -5995,6 +6137,9 @@ async fn handle_command(
             if handle_models_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
+            if handle_gh_slash_command(&args, slash_ctx).await? {
+                return Ok(true);
+            }
             if handle_deploy_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
@@ -6053,6 +6198,9 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
         system_prompt: build_system_prompt(true),
         ..Default::default()
     });
+    // Auto-approve flag — set from init params, read by the approval gate.
+    // Stored separately so we don't need to rebuild the Arc<AgentConfig>.
+    let auto_approve_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let slash_ctx = SlashCommandContext {
         current_exe: std::env::current_exe()
             .context("failed to locate current prism executable")?,
@@ -6123,6 +6271,9 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
     });
     let mut pending_turn: Option<oneshot::Receiver<ServerRuntime>> = None;
     let mut deferred_updates: Vec<DeferredRuntimeUpdate> = Vec::new();
+    // Queue of messages that arrived while a turn was in progress.
+    // These are processed when the current turn completes.
+    let mut message_queue: Vec<String> = Vec::new();
 
     // Read JSON-RPC lines from stdin
     let stdin = io::stdin();
@@ -6166,6 +6317,32 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                         &slash_ctx,
                     );
                     runtime = Some(restored_runtime);
+
+                    // Process queued messages — if a message arrived
+                    // while the previous turn was running, start it now.
+                    if let Some(queued_text) = message_queue.first().cloned() {
+                        message_queue.remove(0);
+                        if let Some(mut rt) = runtime.take() {
+                            rt.session_store
+                                .append_message("user", &queued_text, "", "", None);
+                            sync_live_permission_overrides(
+                                &live_permission_overrides,
+                                &rt.permission_overrides,
+                            )
+                            .await;
+                            pending_turn = Some(spawn_agent_turn(
+                                rt,
+                                queued_text,
+                                Arc::clone(&tools),
+                                Arc::clone(&config),
+                                auto_approve_flag.load(std::sync::atomic::Ordering::Relaxed),
+                                Arc::clone(&hooks),
+                                slash_ctx.clone(),
+                                Arc::clone(&approval_rx),
+                                Arc::clone(&live_permission_overrides),
+                            ));
+                        }
+                    }
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     pending_turn = Some(receiver);
@@ -6208,6 +6385,12 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                 } else {
                     resume_ref
                 };
+
+                // Read auto_approve from init params — controls whether
+                // tool calls skip the approval prompt.
+                if let Some(auto) = params.get("auto_approve").and_then(|v| v.as_bool()) {
+                    auto_approve_flag.store(auto, std::sync::atomic::Ordering::Relaxed);
+                }
 
                 let mut welcome = serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
@@ -6273,13 +6456,11 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                 emit_response(id, serde_json::json!({ "status": "ok" }));
 
                 if turn_active {
-                    emit_notification(
-                        "ui.text.delta",
-                        serde_json::json!({
-                            "text": "A turn is already in progress. Respond to the approval prompt or wait for the current turn to finish."
-                        }),
+                    message_queue.push(text.to_string());
+                    tracing::info!(
+                        queue_len = message_queue.len(),
+                        "queued message while turn in progress"
                     );
-                    emit_notification("ui.turn.complete", serde_json::json!({}));
                     continue;
                 }
 
@@ -6297,6 +6478,7 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                     text.to_string(),
                     Arc::clone(&tools),
                     Arc::clone(&config),
+                    auto_approve_flag.load(std::sync::atomic::Ordering::Relaxed),
                     Arc::clone(&hooks),
                     slash_ctx.clone(),
                     Arc::clone(&approval_rx),
@@ -6313,13 +6495,11 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                 emit_response(id.clone(), serde_json::json!({ "status": "ok" }));
 
                 if turn_active {
-                    emit_notification(
-                        "ui.text.delta",
-                        serde_json::json!({
-                            "text": "A turn is already in progress. Respond to the approval prompt or wait for the current turn to finish."
-                        }),
+                    message_queue.push(format!("/{}", command));
+                    tracing::info!(
+                        queue_len = message_queue.len(),
+                        "queued command while turn in progress"
                     );
-                    emit_notification("ui.turn.complete", serde_json::json!({}));
                     continue;
                 }
 
@@ -6395,6 +6575,7 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                     text,
                     Arc::clone(&tools),
                     Arc::clone(&config),
+                    auto_approve_flag.load(std::sync::atomic::Ordering::Relaxed),
                     Arc::clone(&hooks),
                     slash_ctx.clone(),
                     Arc::clone(&approval_rx),
@@ -6496,21 +6677,45 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
         }
     }
 
-    tracing::info!("stdin closed, shutting down");
-    if let Some(mut receiver) = pending_turn.take()
-        && let Ok(mut restored_runtime) = receiver.try_recv()
-    {
-        apply_deferred_runtime_updates(
-            &mut restored_runtime,
-            tools.as_ref(),
-            &mut deferred_updates,
-        );
-        sync_live_permission_overrides(
-            &live_permission_overrides,
-            &restored_runtime.permission_overrides,
-        )
-        .await;
-        runtime = Some(restored_runtime);
+    tracing::info!("stdin closed, waiting for pending turn before shutdown");
+
+    // If a turn is in-flight, wait for it to complete (with a timeout)
+    // so the user sees the response instead of a silent kill.
+    if let Some(mut receiver) = pending_turn.take() {
+        let timeout = tokio::time::Duration::from_secs(300);
+        match tokio::time::timeout(timeout, &mut receiver).await {
+            Ok(Ok(mut restored_runtime)) => {
+                apply_deferred_runtime_updates(
+                    &mut restored_runtime,
+                    tools.as_ref(),
+                    &mut deferred_updates,
+                );
+                sync_live_permission_overrides(
+                    &live_permission_overrides,
+                    &restored_runtime.permission_overrides,
+                )
+                .await;
+                runtime = Some(restored_runtime);
+            }
+            Ok(Err(_)) => {
+                emit_notification(
+                    "ui.text.delta",
+                    serde_json::json!({
+                        "text": "The active turn exited unexpectedly. You can continue with a new prompt."
+                    }),
+                );
+                emit_notification("ui.turn.complete", serde_json::json!({}));
+            }
+            Err(_) => {
+                emit_notification(
+                    "ui.text.delta",
+                    serde_json::json!({
+                        "text": "Turn timed out after 300s."
+                    }),
+                );
+                emit_notification("ui.turn.complete", serde_json::json!({}));
+            }
+        }
     }
     if let Some(mut runtime) = runtime {
         let _ = runtime.tool_server.shutdown().await;

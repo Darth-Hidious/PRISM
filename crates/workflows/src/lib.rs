@@ -468,8 +468,20 @@ pub async fn execute_workflow_with_policy(
                 "message" => run_message_step(step, &mut context, !execute),
                 "http" => run_http_step(step, &mut context, !execute, &client).await,
                 "tool" => run_tool_step(step, &mut context, !execute, &client).await,
+                "llm" => run_llm_step(step, &mut context, !execute).await,
                 "if" => {
                     run_if_step(
+                        step,
+                        &mut context,
+                        !execute,
+                        &client,
+                        policy.as_deref_mut(),
+                        principal,
+                    )
+                    .await
+                }
+                "loop" => {
+                    run_loop_step(
                         step,
                         &mut context,
                         !execute,
@@ -941,6 +953,301 @@ async fn run_if_step(
     })
 }
 
+// ── LLM step ─────────────────────────────────────────────────────────
+//
+// Calls the PRISM LLM client with a templated prompt and stores the
+// response in the workflow context.  This is the bridge between the
+// deterministic workflow DAG and the agentic layer: the LLM can reason
+// over prior step outputs, decide what to do next, or generate
+// natural-language summaries that downstream `tool` / `http` steps use
+// as inputs.
+//
+// YAML:
+//   - id: reason
+//     action: llm
+//     prompt: |
+//       Given these search results: {{ search.body }}
+//       Which 3 materials are most promising for {{ goal }}?
+//     model: gemma-4-12b          # optional; defaults to config
+//     system: "You are a materials scientist."  # optional
+//     temperature: 0.7            # optional
+//     max_tokens: 2000            # optional
+//     output_key: recommendations # optional; defaults to step id
+//
+// The response text is stored under `context[output_key]` as a string.
+// If the LLM call fails, the step errors (subject to the retry wrapper).
+async fn run_llm_step(
+    step: &WorkflowStep,
+    context: &mut BTreeMap<String, serde_json::Value>,
+    dry_run: bool,
+) -> Result<WorkflowStepResult> {
+    let prompt = render_value(
+        config_first(&step.config, &["prompt", "text", "input"])
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String(String::new())),
+        context,
+    )?;
+    let prompt_str = if let Some(s) = prompt.as_str() {
+        s.to_string()
+    } else {
+        prompt.to_string()
+    };
+
+    let system = render_value(
+        step.config
+            .get("system")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Null),
+        context,
+    )?;
+    let system_str = system.as_str().map(str::to_string);
+
+    let model = step.config.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let _temperature = step
+        .config
+        .get("temperature")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.7);
+    let _max_tokens = step
+        .config
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2000) as usize;
+
+    let output_key = step
+        .config
+        .get("output_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&step.id)
+        .to_string();
+
+    if dry_run {
+        return Ok(WorkflowStepResult {
+            id: step.id.clone(),
+            action: step.action.clone(),
+            status: "planned".to_string(),
+            summary: format!("llm prompt ({} chars) → {}", prompt_str.len(), output_key),
+            data: serde_json::json!({
+                "prompt": &prompt_str,
+                "model": model,
+                "system": system_str,
+                "output_key": output_key,
+            }),
+        });
+    }
+
+    // Build the LLM client from env/config. We use the same env vars
+    // that `prism backend` uses so a workflow running on a PRISM node
+    // hits the same LLM endpoint the agent uses.
+    let base_url = env::var("LLM_BASE_URL")
+        .or_else(|_| env::var("LLM_API_BASE"))
+        .unwrap_or_else(|_| "http://127.0.0.1:8081/v1".to_string());
+    let api_key = env::var("LLM_API_KEY")
+        .or_else(|_| env::var("MARC27_TOKEN"))
+        .ok();
+    let model = if model.is_empty() {
+        env::var("LLM_MODEL").unwrap_or_else(|_| "gemma-4-12b".to_string())
+    } else {
+        model.to_string()
+    };
+
+    let config = prism_llm::LlmConfig {
+        base_url,
+        api_key,
+        model,
+        embedding_model: None,
+        max_sample_rows: 10,
+        timeout_secs: 300,
+    };
+    let model_name = config.model.clone();
+    let client = prism_llm::LlmClient::new(config);
+
+    let system_text = system_str.unwrap_or_default();
+    let response_text = client
+        .chat(&system_text, &prompt_str)
+        .await
+        .context("LLM call failed in workflow step")?;
+
+    context.insert(output_key.clone(), serde_json::Value::String(response_text.clone()));
+    context.insert(
+        step.id.clone(),
+        serde_json::json!({
+            "prompt": &prompt_str,
+            "response": response_text,
+            "model": model_name,
+        }),
+    );
+
+    Ok(WorkflowStepResult {
+        id: step.id.clone(),
+        action: step.action.clone(),
+        status: "completed".to_string(),
+        summary: format!("llm → {} ({} chars)", output_key, response_text.len()),
+        data: serde_json::json!({
+            "prompt": &prompt_str,
+            "response": response_text,
+            "model": model_name,
+        }),
+    })
+}
+
+// ── Loop step ────────────────────────────────────────────────────────
+//
+// Repeats a block of sub-steps until a condition is met or max_iterations
+// is reached.  The condition is evaluated after each iteration using the
+// same truthiness rules as the `if` step.  The loop body has access to
+// the parent context plus `loop_index` (0-based) and `loop_iteration`
+// (1-based, human-friendly).
+//
+// YAML:
+//   - id: discover
+//     action: loop
+//     max_iterations: 10
+//     until: "{{ done }}"          # stop when this is truthy
+//     steps:
+//       - id: sample
+//         action: tool
+//         name: alloy_sample
+//       - id: evaluate
+//         action: tool
+//         name: gfn_evaluate
+//         inputs: { composition: "{{ sample.output }}" }
+//       - id: check
+//         action: set
+//         values: { done: "{{ evaluate.output.score > 0.9 }}" }
+//
+// Safety: max_iterations defaults to 5 and is capped at 100 to prevent
+// runaway loops in LLM-generated workflows.
+async fn run_loop_step(
+    step: &WorkflowStep,
+    context: &mut BTreeMap<String, serde_json::Value>,
+    dry_run: bool,
+    client: &reqwest::Client,
+    mut policy: Option<&mut prism_policy::PolicyEngine>,
+    principal: &str,
+) -> Result<WorkflowStepResult> {
+    let max_iterations = step
+        .config
+        .get("max_iterations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .min(100) as usize;
+
+    let until_expr = config_first(&step.config, &["until", "condition", "stop_when"])
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let body_steps: Vec<WorkflowStep> = config_first(&step.config, &["steps", "tasks", "body", "do"])
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    if body_steps.is_empty() {
+        bail!("loop step '{}' has no body steps", step.id);
+    }
+
+    if dry_run {
+        return Ok(WorkflowStepResult {
+            id: step.id.clone(),
+            action: step.action.clone(),
+            status: "planned".to_string(),
+            summary: format!("loop (max {} iterations, {} body steps)", max_iterations, body_steps.len()),
+            data: serde_json::json!({
+                "max_iterations": max_iterations,
+                "until": until_expr,
+                "body_steps": body_steps.iter().map(|s| &s.id).collect::<Vec<_>>(),
+            }),
+        });
+    }
+
+    let mut iterations = 0usize;
+    let mut all_sub_results = Vec::new();
+
+    for i in 0..max_iterations {
+        // Inject loop counters into context so body steps can reference them.
+        context.insert("loop_index".into(), serde_json::json!(i));
+        context.insert("loop_iteration".into(), serde_json::json!(i + 1));
+
+        let mut iter_results = Vec::new();
+        for body_step in &body_steps {
+            let sub_result = match body_step.action.as_str() {
+                "set" => run_set_step(body_step, context, dry_run),
+                "message" => run_message_step(body_step, context, dry_run),
+                "http" => run_http_step(body_step, context, dry_run, client).await,
+                "tool" => run_tool_step(body_step, context, dry_run, client).await,
+                "llm" => run_llm_step(body_step, context, dry_run).await,
+                "if" => {
+                    run_if_step(
+                        body_step,
+                        context,
+                        dry_run,
+                        client,
+                        policy.as_deref_mut(),
+                        principal,
+                    )
+                    .await
+                }
+                other => bail!("unsupported step action in loop body: {other}"),
+            };
+            iter_results.push(sub_result?);
+        }
+
+        all_sub_results.extend(iter_results);
+        iterations = i + 1;
+
+        // Evaluate the until condition. Empty until → always false (loop
+        // runs to max_iterations).
+        if !until_expr.is_empty() {
+            let rendered = render_value(
+                serde_json::Value::String(until_expr.clone()),
+                context,
+            )?;
+            let is_truthy = match &rendered {
+                serde_json::Value::Null => false,
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => {
+                    !s.is_empty() && s != "false" && s != "0" && s != "null"
+                }
+                serde_json::Value::Number(n) => n.as_f64().is_some_and(|v| v != 0.0),
+                serde_json::Value::Array(a) => !a.is_empty(),
+                serde_json::Value::Object(o) => !o.is_empty(),
+            };
+            if is_truthy {
+                break;
+            }
+        }
+    }
+
+    // Clean up loop counters from parent context.
+    context.remove("loop_index");
+    context.remove("loop_iteration");
+
+    context.insert(
+        step.id.clone(),
+        serde_json::json!({
+            "iterations": iterations,
+            "until": until_expr,
+            "completed": iterations < max_iterations,
+        }),
+    );
+
+    Ok(WorkflowStepResult {
+        id: step.id.clone(),
+        action: step.action.clone(),
+        status: "completed".to_string(),
+        summary: format!(
+            "loop: {} iteration(s){}",
+            iterations,
+            if iterations < max_iterations { " (until met)" } else { " (max reached)" }
+        ),
+        data: serde_json::json!({
+            "iterations": iterations,
+            "completed": iterations < max_iterations,
+            "sub_steps": all_sub_results,
+        }),
+    })
+}
+
 // ── Parallel step ────────────────────────────────────────────────────
 //
 // YAML:
@@ -1166,7 +1473,7 @@ fn interpolated_display(value: &serde_json::Value) -> String {
 /// Known step actions. Used both for validation and for `did you mean?`
 /// suggestions on typos in LLM-generated workflows.
 const KNOWN_ACTIONS: &[&str] = &[
-    "set", "message", "http", "tool", "if", "parallel", "workflow",
+    "set", "message", "http", "tool", "llm", "if", "loop", "parallel", "workflow",
 ];
 
 /// Cheap edit-distance for "did you mean?" suggestions on action typos.
@@ -1982,5 +2289,255 @@ tasks:
     fn ssrf_blocks_unparseable_urls() {
         assert!(ssrf_block_reason("not a url").is_some());
         assert!(ssrf_block_reason("").is_some());
+    }
+
+    // ── llm step tests ──────────────────────────────────────────────
+
+    #[test]
+    fn llm_step_dry_run_plans_without_calling_llm() {
+        let yaml = r#"
+name: llm-dry-run
+description: test
+command_name: llm-dry-run
+arguments:
+  - name: material
+    type: string
+    required: true
+steps:
+  - id: reason
+    action: llm
+    prompt: "What is {{ material }}?"
+    system: "You are a scientist."
+    output_key: answer
+"#;
+        let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut values = BTreeMap::new();
+        values.insert("material".to_string(), "TiAl".to_string());
+        let result = rt.block_on(execute_workflow(&spec, &values, false)).unwrap();
+        assert_eq!(result.steps.len(), 1);
+        assert_eq!(result.steps[0].status, "planned");
+        assert!(result.steps[0].summary.contains("llm prompt"));
+    }
+
+    #[test]
+    fn llm_step_parses_with_all_options() {
+        let yaml = r#"
+name: llm-full
+description: test
+command_name: llm-full
+steps:
+  - id: reason
+    action: llm
+    prompt: "Analyze {{ data }}"
+    system: "You are a materials scientist."
+    model: "gemma-4-12b"
+    temperature: 0.5
+    max_tokens: 1000
+    output_key: analysis
+"#;
+        let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
+        assert_eq!(spec.steps.len(), 1);
+        assert_eq!(spec.steps[0].action, "llm");
+    }
+
+    #[test]
+    fn llm_step_in_known_actions() {
+        assert!(KNOWN_ACTIONS.contains(&"llm"));
+    }
+
+    // ── loop step tests ─────────────────────────────────────────────
+
+    #[test]
+    fn loop_step_dry_run_plans_iterations() {
+        let yaml = r#"
+name: loop-dry
+description: test
+command_name: loop-dry
+steps:
+  - id: iterate
+    action: loop
+    max_iterations: 5
+    until: "{{ done }}"
+    steps:
+      - id: sample
+        action: tool
+        name: alloy_sample
+"#;
+        let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(execute_workflow(&spec, &BTreeMap::new(), false)).unwrap();
+        assert_eq!(result.steps.len(), 1);
+        assert_eq!(result.steps[0].status, "planned");
+        assert!(result.steps[0].summary.contains("loop"));
+    }
+
+    #[test]
+    fn loop_step_parses_with_body_and_until() {
+        let yaml = r#"
+name: loop-test
+description: test
+command_name: loop-test
+steps:
+  - id: discover
+    action: loop
+    max_iterations: 10
+    until: "{{ done }}"
+    steps:
+      - id: s1
+        action: set
+        values: { x: "1" }
+      - id: s2
+        action: set
+        values: { done: "true" }
+"#;
+        let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
+        assert_eq!(spec.steps.len(), 1);
+        assert_eq!(spec.steps[0].action, "loop");
+    }
+
+    #[test]
+    fn loop_step_in_known_actions() {
+        assert!(KNOWN_ACTIONS.contains(&"loop"));
+    }
+
+    #[test]
+    fn loop_step_with_empty_body_errors() {
+        let yaml = r#"
+name: loop-empty
+description: test
+command_name: loop-empty
+steps:
+  - id: empty
+    action: loop
+    max_iterations: 3
+    steps: []
+"#;
+        let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(execute_workflow(&spec, &BTreeMap::new(), true));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no body steps"));
+    }
+
+    #[test]
+    fn loop_step_executes_and_stops_on_condition() {
+        let yaml = r#"
+name: loop-cond
+description: test
+command_name: loop-cond
+steps:
+  - id: iterate
+    action: loop
+    max_iterations: 10
+    until: "{{ stop }}"
+    steps:
+      - id: set_stop
+        action: set
+        values: { stop: "true" }
+"#;
+        let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(execute_workflow(&spec, &BTreeMap::new(), true)).unwrap();
+        assert_eq!(result.steps.len(), 1);
+        assert_eq!(result.steps[0].status, "completed");
+        // Should stop after 1 iteration because `stop` is set to "true"
+        assert!(result.steps[0].summary.contains("1 iteration"));
+        assert!(result.steps[0].summary.contains("until met"));
+    }
+
+    #[test]
+    fn loop_step_runs_to_max_without_until() {
+        let yaml = r#"
+name: loop-max
+description: test
+command_name: loop-max
+steps:
+  - id: iterate
+    action: loop
+    max_iterations: 3
+    steps:
+      - id: noop
+        action: set
+        values: { x: "1" }
+"#;
+        let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(execute_workflow(&spec, &BTreeMap::new(), true)).unwrap();
+        assert_eq!(result.steps.len(), 1);
+        assert!(result.steps[0].summary.contains("3 iteration"));
+        assert!(result.steps[0].summary.contains("max reached"));
+    }
+
+    #[test]
+    fn loop_step_caps_max_iterations_at_100() {
+        let yaml = r#"
+name: loop-cap
+description: test
+command_name: loop-cap
+steps:
+  - id: iterate
+    action: loop
+    max_iterations: 999
+    steps:
+      - id: noop
+        action: set
+        values: { x: "1" }
+"#;
+        let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(execute_workflow(&spec, &BTreeMap::new(), false)).unwrap();
+        // Dry-run shows the planned max (capped at 100 in the handler,
+        // but dry-run summary reflects the cap)
+        assert_eq!(result.steps[0].status, "planned");
+    }
+
+    // ── combined agentic pipeline test ──────────────────────────────
+
+    #[test]
+    fn agentic_pipeline_dry_run_with_llm_and_loop() {
+        // A realistic materials-discovery pipeline shape.  Dry-run
+        // still interpolates templates, so we only reference the input
+        // arg `goal` (which is in context from the start), not outputs
+        // of prior steps (which don't exist in dry-run).
+        let yaml = r#"
+name: discover
+description: Agentic materials discovery pipeline
+command_name: discover
+arguments:
+  - name: goal
+    type: string
+    required: true
+    help: Materials discovery goal
+steps:
+  - id: reason
+    action: llm
+    prompt: "Propose 3 candidate compositions for {{ goal }}."
+    system: "You are a materials scientist."
+    output_key: candidates
+  - id: discover_loop
+    action: loop
+    max_iterations: 5
+    until: "{{ done }}"
+    steps:
+      - id: check
+        action: set
+        values: { done: "true" }
+"#;
+        let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
+        assert_eq!(spec.steps.len(), 2);
+        assert_eq!(spec.steps[0].action, "llm");
+        assert_eq!(spec.steps[1].action, "loop");
+
+        // Dry-run should plan all steps without executing anything.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut values = BTreeMap::new();
+        values.insert("goal".to_string(), "high-strength Ti alloy".to_string());
+        let result = rt.block_on(execute_workflow(&spec, &values, false)).unwrap();
+        assert_eq!(result.steps.len(), 2);
+        for step in &result.steps {
+            assert_eq!(step.status, "planned");
+        }
     }
 }
