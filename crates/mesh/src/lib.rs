@@ -201,7 +201,9 @@ pub fn start_mesh(
         // peer before accepting requests from this node.
         if opts.auth_token.is_none() {
             eprintln!("\x1b[33m  ⚠ Mesh disabled: no auth token — run `prism login` first.\x1b[0m");
-            eprintln!("\x1b[33m    The mesh requires MARC27 authentication for RBAC enforcement.\x1b[0m");
+            eprintln!(
+                "\x1b[33m    The mesh requires MARC27 authentication for RBAC enforcement.\x1b[0m"
+            );
             return;
         }
 
@@ -224,7 +226,12 @@ pub fn start_mesh(
 
         // Announce only if broadcast is enabled
         if opts.broadcast
-            && let Err(e) = mdns.announce(node_id, &opts.node_name, &opts.capabilities, opts.auth_token.as_deref())
+            && let Err(e) = mdns.announce(
+                node_id,
+                &opts.node_name,
+                &opts.capabilities,
+                opts.auth_token.as_deref(),
+            )
         {
             tracing::warn!(error = %e, "mDNS announce failed (continuing without broadcast)");
         }

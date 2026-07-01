@@ -40,9 +40,7 @@ pub fn is_extension_installed() -> bool {
         && output.status.success()
         && let Ok(extensions) = String::from_utf8(output.stdout)
     {
-        return extensions
-            .lines()
-            .any(|line| line.trim() == extension_id);
+        return extensions.lines().any(|line| line.trim() == extension_id);
     }
     false
 }

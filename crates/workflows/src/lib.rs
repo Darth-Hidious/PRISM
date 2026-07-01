@@ -1002,7 +1002,11 @@ async fn run_llm_step(
     )?;
     let system_str = system.as_str().map(str::to_string);
 
-    let model = step.config.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let model = step
+        .config
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let _temperature = step
         .config
         .get("temperature")
@@ -1068,7 +1072,10 @@ async fn run_llm_step(
         .await
         .context("LLM call failed in workflow step")?;
 
-    context.insert(output_key.clone(), serde_json::Value::String(response_text.clone()));
+    context.insert(
+        output_key.clone(),
+        serde_json::Value::String(response_text.clone()),
+    );
     context.insert(
         step.id.clone(),
         serde_json::json!({
@@ -1138,9 +1145,10 @@ async fn run_loop_step(
         .unwrap_or("")
         .to_string();
 
-    let body_steps: Vec<WorkflowStep> = config_first(&step.config, &["steps", "tasks", "body", "do"])
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let body_steps: Vec<WorkflowStep> =
+        config_first(&step.config, &["steps", "tasks", "body", "do"])
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
     if body_steps.is_empty() {
         bail!("loop step '{}' has no body steps", step.id);
@@ -1151,7 +1159,11 @@ async fn run_loop_step(
             id: step.id.clone(),
             action: step.action.clone(),
             status: "planned".to_string(),
-            summary: format!("loop (max {} iterations, {} body steps)", max_iterations, body_steps.len()),
+            summary: format!(
+                "loop (max {} iterations, {} body steps)",
+                max_iterations,
+                body_steps.len()
+            ),
             data: serde_json::json!({
                 "max_iterations": max_iterations,
                 "until": until_expr,
@@ -1198,10 +1210,7 @@ async fn run_loop_step(
         // Evaluate the until condition. Empty until → always false (loop
         // runs to max_iterations).
         if !until_expr.is_empty() {
-            let rendered = render_value(
-                serde_json::Value::String(until_expr.clone()),
-                context,
-            )?;
+            let rendered = render_value(serde_json::Value::String(until_expr.clone()), context)?;
             let is_truthy = match &rendered {
                 serde_json::Value::Null => false,
                 serde_json::Value::Bool(b) => *b,
@@ -1238,7 +1247,11 @@ async fn run_loop_step(
         summary: format!(
             "loop: {} iteration(s){}",
             iterations,
-            if iterations < max_iterations { " (until met)" } else { " (max reached)" }
+            if iterations < max_iterations {
+                " (until met)"
+            } else {
+                " (max reached)"
+            }
         ),
         data: serde_json::json!({
             "iterations": iterations,
@@ -2314,7 +2327,9 @@ steps:
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut values = BTreeMap::new();
         values.insert("material".to_string(), "TiAl".to_string());
-        let result = rt.block_on(execute_workflow(&spec, &values, false)).unwrap();
+        let result = rt
+            .block_on(execute_workflow(&spec, &values, false))
+            .unwrap();
         assert_eq!(result.steps.len(), 1);
         assert_eq!(result.steps[0].status, "planned");
         assert!(result.steps[0].summary.contains("llm prompt"));
@@ -2366,7 +2381,9 @@ steps:
 "#;
         let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(execute_workflow(&spec, &BTreeMap::new(), false)).unwrap();
+        let result = rt
+            .block_on(execute_workflow(&spec, &BTreeMap::new(), false))
+            .unwrap();
         assert_eq!(result.steps.len(), 1);
         assert_eq!(result.steps[0].status, "planned");
         assert!(result.steps[0].summary.contains("loop"));
@@ -2439,7 +2456,9 @@ steps:
 "#;
         let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(execute_workflow(&spec, &BTreeMap::new(), true)).unwrap();
+        let result = rt
+            .block_on(execute_workflow(&spec, &BTreeMap::new(), true))
+            .unwrap();
         assert_eq!(result.steps.len(), 1);
         assert_eq!(result.steps[0].status, "completed");
         // Should stop after 1 iteration because `stop` is set to "true"
@@ -2464,7 +2483,9 @@ steps:
 "#;
         let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(execute_workflow(&spec, &BTreeMap::new(), true)).unwrap();
+        let result = rt
+            .block_on(execute_workflow(&spec, &BTreeMap::new(), true))
+            .unwrap();
         assert_eq!(result.steps.len(), 1);
         assert!(result.steps[0].summary.contains("3 iteration"));
         assert!(result.steps[0].summary.contains("max reached"));
@@ -2487,7 +2508,9 @@ steps:
 "#;
         let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(execute_workflow(&spec, &BTreeMap::new(), false)).unwrap();
+        let result = rt
+            .block_on(execute_workflow(&spec, &BTreeMap::new(), false))
+            .unwrap();
         // Dry-run shows the planned max (capped at 100 in the handler,
         // but dry-run summary reflects the cap)
         assert_eq!(result.steps[0].status, "planned");
@@ -2534,7 +2557,9 @@ steps:
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut values = BTreeMap::new();
         values.insert("goal".to_string(), "high-strength Ti alloy".to_string());
-        let result = rt.block_on(execute_workflow(&spec, &values, false)).unwrap();
+        let result = rt
+            .block_on(execute_workflow(&spec, &values, false))
+            .unwrap();
         assert_eq!(result.steps.len(), 2);
         for step in &result.steps {
             assert_eq!(step.status, "planned");

@@ -330,7 +330,10 @@ mod tests {
     #[test]
     fn find_tools_returns_relevant_matches() {
         let catalog = catalog_with(&[
-            ("deploy_model", "Deploy a trained model to a serving endpoint"),
+            (
+                "deploy_model",
+                "Deploy a trained model to a serving endpoint",
+            ),
             ("query_graph", "Query the materials knowledge graph"),
             ("send_email", "Send an email to a recipient"),
         ]);

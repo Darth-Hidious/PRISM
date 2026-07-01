@@ -216,9 +216,7 @@ impl ToolCatalog {
 
         let selected: Vec<&LoadedTool> = scored
             .into_iter()
-            .filter(|(score, tool)| {
-                *score > 0 || ALWAYS_INCLUDE.contains(&tool.name.as_str())
-            })
+            .filter(|(score, tool)| *score > 0 || ALWAYS_INCLUDE.contains(&tool.name.as_str()))
             .take(top_k)
             .map(|(_, tool)| tool)
             .collect();

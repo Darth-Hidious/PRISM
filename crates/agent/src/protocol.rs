@@ -3600,33 +3600,80 @@ async fn handle_gh_slash_command(args: &[String], slash_ctx: &SlashCommandContex
     };
 
     match tab {
-        "issues" => match gh_json(&repo, &["issue", "list", "--json", "number,title,state,labels,author,url", "--limit", "50"]).await {
+        "issues" => match gh_json(
+            &repo,
+            &[
+                "issue",
+                "list",
+                "--json",
+                "number,title,state,labels,author,url",
+                "--limit",
+                "50",
+            ],
+        )
+        .await
+        {
             Ok(items) => emit(items, None),
             Err(e) => emit(vec![], Some(format!("{e}"))),
         },
-        "prs" => match gh_json(&repo, &["pr", "list", "--json", "number,title,state,author,headRefName,url", "--limit", "50"]).await {
+        "prs" => match gh_json(
+            &repo,
+            &[
+                "pr",
+                "list",
+                "--json",
+                "number,title,state,author,headRefName,url",
+                "--limit",
+                "50",
+            ],
+        )
+        .await
+        {
             Ok(items) => emit(items, None),
             Err(e) => emit(vec![], Some(format!("{e}"))),
         },
-        "status" => match gh_json(&repo, &["run", "list", "--json", "name,status,conclusion,headBranch,url", "--limit", "20"]).await {
+        "status" => match gh_json(
+            &repo,
+            &[
+                "run",
+                "list",
+                "--json",
+                "name,status,conclusion,headBranch,url",
+                "--limit",
+                "20",
+            ],
+        )
+        .await
+        {
             Ok(items) => emit(items, None),
             Err(e) => emit(vec![], Some(format!("{e}"))),
         },
         "bug" => {
             // `/gh bug <description>` → file a GitHub issue via `gh issue create`.
-            let desc = args.get(2..).map(|d| d.join(" ").trim().to_string()).unwrap_or_default();
+            let desc = args
+                .get(2..)
+                .map(|d| d.join(" ").trim().to_string())
+                .unwrap_or_default();
             if desc.is_empty() {
                 emit(vec![], Some("usage: /gh bug <description>".into()));
             } else {
                 let title = char_safe_truncate(&format!("bug: {desc}"), 70);
                 let body = format!("## Bug\n\n{desc}\n\n(filed from the PRISM TUI)");
                 match gh_create_issue(&repo, &title, &body).await {
-                    Ok(url) => emit(vec![serde_json::json!({ "url": url, "title": title })], None),
+                    Ok(url) => emit(
+                        vec![serde_json::json!({ "url": url, "title": title })],
+                        None,
+                    ),
                     Err(e) => emit(vec![], Some(format!("{e}"))),
                 }
             }
         }
-        _ => emit(vec![], Some(format!("unknown /gh subcommand: {tab} (try issues, prs, status, bug)"))),
+        _ => emit(
+            vec![],
+            Some(format!(
+                "unknown /gh subcommand: {tab} (try issues, prs, status, bug)"
+            )),
+        ),
     }
     Ok(true)
 }
@@ -3643,7 +3690,11 @@ async fn gh_json(repo: &str, sub: &[&str]) -> Result<Vec<Value>> {
         .context("failed to run `gh` — is the GitHub CLI installed and authenticated?")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        bail!(if err.is_empty() { "gh command failed".to_string() } else { err });
+        bail!(if err.is_empty() {
+            "gh command failed".to_string()
+        } else {
+            err
+        });
     }
     let s = String::from_utf8_lossy(&out.stdout);
     let v: Value = serde_json::from_str(s.trim()).context("gh did not return JSON")?;
@@ -3657,16 +3708,7 @@ async fn gh_json(repo: &str, sub: &[&str]) -> Result<Vec<Value>> {
 async fn gh_create_issue(repo: &str, title: &str, body: &str) -> Result<String> {
     let out = TokioCommand::new("gh")
         .args([
-            "issue",
-            "create",
-            "--repo",
-            repo,
-            "--title",
-            title,
-            "--body",
-            body,
-            "--label",
-            "bug",
+            "issue", "create", "--repo", repo, "--title", title, "--body", body, "--label", "bug",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

@@ -260,7 +260,9 @@ impl ProvenanceStore {
         } else {
             0
         };
-        Ok(ProvenanceStats { total_records: total })
+        Ok(ProvenanceStats {
+            total_records: total,
+        })
     }
 }
 
@@ -390,13 +392,13 @@ mod tests {
         let results = store.query_by_session("test-session").await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].tool_name.as_deref(), Some("gfn_sample"));
-        assert_eq!(results[0].material_ref.as_deref(), Some("Ni0.3 Cr0.4 Co0.3"));
+        assert_eq!(
+            results[0].material_ref.as_deref(),
+            Some("Ni0.3 Cr0.4 Co0.3")
+        );
         assert!((results[0].confidence - 0.85).abs() < 0.01);
 
-        let mat_results = store
-            .query_by_material("Ni0.3 Cr0.4 Co0.3")
-            .await
-            .unwrap();
+        let mat_results = store.query_by_material("Ni0.3 Cr0.4 Co0.3").await.unwrap();
         assert_eq!(mat_results.len(), 1);
     }
 

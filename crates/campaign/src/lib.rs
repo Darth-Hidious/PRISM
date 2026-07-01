@@ -256,13 +256,10 @@ pub struct Campaign {
 impl Campaign {
     /// Create a new campaign with the given goal and config.
     pub fn new(goal: CampaignGoal, config: CampaignConfig, campaign_id: String) -> Self {
-        let checkpoint_dir = config
-            .checkpoint_dir
-            .clone()
-            .unwrap_or_else(|| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                PathBuf::from(home).join(".prism").join("campaigns")
-            });
+        let checkpoint_dir = config.checkpoint_dir.clone().unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            PathBuf::from(home).join(".prism").join("campaigns")
+        });
         let checkpoint_path = checkpoint_dir.join(format!("{campaign_id}.json"));
 
         Self {
@@ -315,10 +312,13 @@ impl Campaign {
             "campaign started"
         );
 
-        self.record_event("campaign.start", serde_json::json!({
-            "goal": self.state.goal,
-            "config": self.state.config,
-        }))
+        self.record_event(
+            "campaign.start",
+            serde_json::json!({
+                "goal": self.state.goal,
+                "config": self.state.config,
+            }),
+        )
         .await;
 
         while !self.state.completed && !self.state.paused {
@@ -371,12 +371,15 @@ impl Campaign {
         }
 
         if self.state.completed {
-            self.record_event("campaign.complete", serde_json::json!({
-                "reason": self.state.completion_reason,
-                "iterations": self.state.current_iteration,
-                "candidates": self.state.total_evaluated(),
-                "best_reward": self.state.best().map(|c| c.reward).unwrap_or(0.0),
-            }))
+            self.record_event(
+                "campaign.complete",
+                serde_json::json!({
+                    "reason": self.state.completion_reason,
+                    "iterations": self.state.current_iteration,
+                    "candidates": self.state.total_evaluated(),
+                    "best_reward": self.state.best().map(|c| c.reward).unwrap_or(0.0),
+                }),
+            )
             .await;
         }
 
@@ -384,12 +387,7 @@ impl Campaign {
         self.checkpoint()?;
 
         // Build result
-        let winners: Vec<Candidate> = self
-            .state
-            .top_n(10)
-            .iter()
-            .cloned()
-            .collect();
+        let winners: Vec<Candidate> = self.state.top_n(10).iter().cloned().collect();
 
         let summary = self.build_summary(&winners);
 
@@ -498,14 +496,7 @@ impl Campaign {
 
         if iter == 0 && !self.state.goal.seeds.is_empty() {
             // Use provided seeds for the first iteration.
-            let seeds: Vec<String> = self
-                .state
-                .goal
-                .seeds
-                .iter()
-                .take(batch)
-                .cloned()
-                .collect();
+            let seeds: Vec<String> = self.state.goal.seeds.iter().take(batch).cloned().collect();
             return Ok(seeds);
         }
 
@@ -544,11 +535,14 @@ impl Campaign {
             .await
             .context("LLM proposal call failed")?;
 
-        self.record_event("campaign.propose", serde_json::json!({
-            "iteration": iter,
-            "prompt": prompt,
-            "response": &response,
-        }))
+        self.record_event(
+            "campaign.propose",
+            serde_json::json!({
+                "iteration": iter,
+                "prompt": prompt,
+                "response": &response,
+            }),
+        )
         .await;
 
         // Parse the response — expect a JSON array of composition strings.
@@ -652,7 +646,13 @@ impl Campaign {
     /// Fallback: generate simple placeholder compositions when the LLM fails.
     fn fallback_proposals(&self, batch: usize) -> Vec<String> {
         let elements: Vec<String> = if self.state.goal.elements.is_empty() {
-            vec!["Fe".into(), "Ni".into(), "Cr".into(), "Co".into(), "Ti".into()]
+            vec![
+                "Fe".into(),
+                "Ni".into(),
+                "Cr".into(),
+                "Co".into(),
+                "Ti".into(),
+            ]
         } else {
             self.state.goal.elements.clone()
         };
@@ -682,8 +682,7 @@ impl Campaign {
     /// the returned physics descriptors.
     async fn evaluate_candidate(&self, composition: &str, iteration: usize) -> Result<Candidate> {
         // Call the local PRISM node's gfn_evaluate tool.
-        let port = std::env::var("PRISM_NODE_PORT")
-            .unwrap_or_else(|_| "7327".to_string());
+        let port = std::env::var("PRISM_NODE_PORT").unwrap_or_else(|_| "7327".to_string());
         let url = format!("http://127.0.0.1:{port}/api/tools/gfn_evaluate/run");
         let body = serde_json::json!({
             "inputs": { "composition": composition },
@@ -704,22 +703,21 @@ impl Campaign {
             .unwrap_or_else(|_| serde_json::json!({"error": "failed to parse response"}));
 
         if !status.is_success() {
-            bail!(
-                "gfn_evaluate returned {}: {}",
-                status,
-                resp_body
-            );
+            bail!("gfn_evaluate returned {}: {}", status, resp_body);
         }
 
         // Compute scalarized reward from the properties.
         let reward = self.compute_reward(&resp_body);
 
-        self.record_event("campaign.evaluate", serde_json::json!({
-            "iteration": iteration,
-            "composition": composition,
-            "properties": &resp_body,
-            "reward": reward,
-        }))
+        self.record_event(
+            "campaign.evaluate",
+            serde_json::json!({
+                "iteration": iteration,
+                "composition": composition,
+                "properties": &resp_body,
+                "reward": reward,
+            }),
+        )
         .await;
 
         Ok(Candidate {
@@ -727,7 +725,11 @@ impl Campaign {
             properties: resp_body,
             reward,
             iteration,
-            source: if iteration == 0 { "seed".into() } else { "llm".into() },
+            source: if iteration == 0 {
+                "seed".into()
+            } else {
+                "llm".into()
+            },
         })
     }
 
@@ -744,10 +746,7 @@ impl Campaign {
                 .or_else(|| props.get("entropy"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-            let density = props
-                .get("density")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(8.0);
+            let density = props.get("density").and_then(|v| v.as_f64()).unwrap_or(8.0);
             // Normalize: entropy typically 0-2 R, density 2-20 g/cm³.
             let entropy_score = entropy / 2.0;
             let density_score = 1.0 - (density / 20.0).clamp(0.0, 1.0);
@@ -757,10 +756,7 @@ impl Campaign {
         // Weighted sum of named properties.
         let mut reward = 0.0;
         for (prop, weight) in &self.state.config.reward_weights {
-            let value = props
-                .get(prop)
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+            let value = props.get(prop).and_then(|v| v.as_f64()).unwrap_or(0.0);
             reward += value * weight;
         }
         reward
@@ -805,13 +801,16 @@ impl Campaign {
         let mut s = String::new();
         s.push_str(&format!("Campaign: {}\n", self.state.campaign_id));
         s.push_str(&format!("Goal: {}\n", self.state.goal.description));
-        s.push_str(&format!("Status: {}", if self.state.completed {
-            &self.state.completion_reason
-        } else if self.state.paused {
-            "paused (approval gate)"
-        } else {
-            "running"
-        }));
+        s.push_str(&format!(
+            "Status: {}",
+            if self.state.completed {
+                &self.state.completion_reason
+            } else if self.state.paused {
+                "paused (approval gate)"
+            } else {
+                "running"
+            }
+        ));
         s.push('\n');
         s.push_str(&format!(
             "Iterations: {} / {}\n",
@@ -821,10 +820,7 @@ impl Campaign {
             "Candidates evaluated: {}\n",
             self.state.total_evaluated()
         ));
-        s.push_str(&format!(
-            "Avg reward: {:.4}\n",
-            self.state.avg_reward()
-        ));
+        s.push_str(&format!("Avg reward: {:.4}\n", self.state.avg_reward()));
         if let Some(best) = self.state.best() {
             s.push_str(&format!(
                 "Best: {} (reward={:.4})\n",
@@ -858,7 +854,13 @@ mod tests {
     fn test_goal() -> CampaignGoal {
         CampaignGoal {
             description: "High-strength Ti alloy".into(),
-            elements: vec!["Ti".into(), "Al".into(), "V".into(), "Cr".into(), "Mo".into()],
+            elements: vec![
+                "Ti".into(),
+                "Al".into(),
+                "V".into(),
+                "Cr".into(),
+                "Mo".into(),
+            ],
             objective: "maximize strength-to-weight ratio".into(),
             constraints: vec!["density < 5 g/cm³".into()],
             seeds: vec!["Ti0.9 Al0.06 V0.04".into()],
@@ -867,11 +869,7 @@ mod tests {
 
     #[test]
     fn campaign_state_new_initializes_correctly() {
-        let state = CampaignState::new(
-            "c1".into(),
-            test_goal(),
-            CampaignConfig::default(),
-        );
+        let state = CampaignState::new("c1".into(), test_goal(), CampaignConfig::default());
         assert_eq!(state.current_iteration, 0);
         assert!(!state.completed);
         assert!(!state.paused);
@@ -903,7 +901,9 @@ mod tests {
             source: "llm".into(),
         });
         // Sort by reward descending
-        state.candidates.sort_by(|a, b| b.reward.partial_cmp(&a.reward).unwrap());
+        state
+            .candidates
+            .sort_by(|a, b| b.reward.partial_cmp(&a.reward).unwrap());
         let top = state.top_n(2);
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].composition, "B");

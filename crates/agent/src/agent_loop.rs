@@ -413,7 +413,11 @@ pub async fn run_turn(
         // Always offer the native meta-tools (recall + find_tools) so the model
         // can pull earlier results back from durable memory and discover tools
         // beyond the top-K selection.
-        relevant_tools.extend(crate::meta_tools::definitions().iter().map(|t| t.to_definition()));
+        relevant_tools.extend(
+            crate::meta_tools::definitions()
+                .iter()
+                .map(|t| t.to_definition()),
+        );
         tracing::debug!(
             total_tools = tool_catalog.len(),
             selected_tools = relevant_tools.len(),
@@ -426,11 +430,15 @@ pub async fn run_turn(
         // event so the TUI can render them dimmed/collapsed.
         let mut streamed_deltas: Vec<(String, bool)> = Vec::new();
         let response = llm
-            .chat_with_tools_streaming(&messages, &relevant_tools, |delta: &str, is_reasoning: bool| {
-                if !delta.is_empty() {
-                    streamed_deltas.push((delta.to_string(), is_reasoning));
-                }
-            })
+            .chat_with_tools_streaming(
+                &messages,
+                &relevant_tools,
+                |delta: &str, is_reasoning: bool| {
+                    if !delta.is_empty() {
+                        streamed_deltas.push((delta.to_string(), is_reasoning));
+                    }
+                },
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "LLM call failed: {e:#}");

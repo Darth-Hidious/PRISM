@@ -768,7 +768,6 @@ impl LlmClient {
         }
         bail!("LLM request to {url} failed after 3 retries (429 rate limit)");
     }
-
 }
 
 // ── MARC27 text-based tool calling helpers ──────────────────────────
