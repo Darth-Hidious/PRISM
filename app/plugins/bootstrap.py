@@ -190,7 +190,7 @@ def build_full_registry(
 
             create_mace_tools(registry)
     except Exception:
-        logger.debug("mace tools not registered", exc_info=True)
+        logger.exception("mace tools not registered")
 
     # Built-in skills → tools
     try:

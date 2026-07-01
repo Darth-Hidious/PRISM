@@ -106,8 +106,8 @@ class MaceBridge:
         resolved_cache_dir = cache_dir or _default_cache_dir()
         sqlite_path = sqlite_path or os.path.join(resolved_cache_dir, "mace_jobs.db")
 
-        self.cache: "CacheStore" = CacheStore(cache_dir=resolved_cache_dir)
-        self.job_store = JobStore(db_path=sqlite_path)
+        self.cache: "CacheStore" = CacheStore(root=resolved_cache_dir)
+        self.job_store = JobStore(sqlite_path)
 
         # Build the default backend set.
         #
@@ -137,11 +137,15 @@ class MaceBridge:
 
         self.backends: dict[str, "Backend"] = backends
 
+        # JobRunner owns its own CacheStore via cache_root. Use the same
+        # directory the bridge resolved so both ends share one cache.
+        # `results_repo` is a planned remote-mirror knob and is not
+        # implemented by JobRunner yet.
+        _ = results_repo
         self.runner: "JobRunner" = JobRunner(
-            cache=self.cache,
-            job_store=self.job_store,
+            store=self.job_store,
             backends=self.backends,
-            results_repo=results_repo,
+            cache_root=resolved_cache_dir,
         )
 
         logger.info(
