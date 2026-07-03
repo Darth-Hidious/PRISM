@@ -1,0 +1,313 @@
+//! Mesh discovery and federation handlers.
+
+use axum::extract::State;
+use axum::response::Json;
+use serde::Serialize;
+use std::sync::Arc;
+
+use crate::NodeState;
+
+#[derive(Serialize)]
+pub struct MeshNode {
+    pub id: String,
+    pub name: String,
+    pub address: String,
+    pub port: u16,
+    pub last_seen: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct MeshStatus {
+    pub online: bool,
+    pub node_id: Option<String>,
+    pub peer_count: usize,
+    pub peers: Vec<MeshNode>,
+}
+
+#[derive(Serialize)]
+pub struct SubscriptionInfo {
+    pub dataset_name: String,
+    pub publisher_node: String,
+    pub subscribed_at: String,
+}
+
+#[derive(Serialize)]
+pub struct PublishedInfo {
+    pub name: String,
+    pub schema_version: String,
+    pub subscriber_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct SubscriptionsResponse {
+    pub published: Vec<PublishedInfo>,
+    pub subscribed: Vec<SubscriptionInfo>,
+}
+
+/// GET /api/mesh/nodes — list known mesh peers and mesh status.
+pub async fn list_nodes(State(state): State<Arc<NodeState>>) -> Json<MeshStatus> {
+    let mesh = state.mesh.read().unwrap_or_else(|e| e.into_inner());
+    let online = mesh.node_id().is_some();
+    let node_id = mesh.node_id().map(|id| id.to_string());
+    let peers: Vec<MeshNode> = mesh
+        .peers()
+        .into_iter()
+        .map(|p| MeshNode {
+            id: p.node_id.to_string(),
+            name: p.name,
+            address: p.address,
+            port: p.port,
+            last_seen: p.last_seen.to_rfc3339(),
+            capabilities: p.capabilities,
+        })
+        .collect();
+    let peer_count = peers.len();
+
+    Json(MeshStatus {
+        online,
+        node_id,
+        peer_count,
+        peers,
+    })
+}
+
+/// POST /api/mesh/publish — publish a dataset for other nodes to subscribe to.
+pub async fn publish_dataset(
+    State(state): State<Arc<NodeState>>,
+    Json(body): Json<PublishRequest>,
+) -> Result<Json<PublishResponse>, (axum::http::StatusCode, String)> {
+    use prism_mesh::subscription::PublishedDataset;
+
+    // Refuse publish requests with malformed names — defence in depth
+    // against the Cypher-injection class fixed in PR #75. The remote
+    // sync path now validates names too, but unvalidated names from
+    // pre-#75 builds (or third-party PRISM-compatible nodes) would
+    // still execute injection. Stop them at the source. Same allowlist:
+    // ASCII alphanumeric + `_-.`, non-empty, ≤128 chars.
+    if !valid_dataset_name(&body.name) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "invalid dataset name {:?}: must be ASCII alphanumeric + _-., \
+                 non-empty, ≤128 chars",
+                body.name
+            ),
+        ));
+    }
+
+    {
+        let mut subs = state
+            .subscriptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        subs.publish(PublishedDataset {
+            name: body.name.clone(),
+            schema_version: body.schema_version.clone(),
+            subscribers: vec![],
+        });
+    }
+
+    // Broadcast via Kafka so other nodes discover this dataset
+    if let (Some(producer), Some(&node_id)) = (state.kafka_producer.get(), state.node_id.get()) {
+        let msg = prism_mesh::protocol::MeshMessage::DataPublish {
+            node_id,
+            dataset_name: body.name.clone(),
+            schema_version: body.schema_version.clone(),
+            update_frequency: "on-demand".to_string(),
+        };
+        if let Err(e) = producer.publish(&msg).await {
+            tracing::warn!(error = %e, "failed to announce dataset via Kafka");
+        }
+    }
+
+    Ok(Json(PublishResponse {
+        name: body.name,
+        status: "published".to_string(),
+    }))
+}
+
+/// POST /api/mesh/subscribe — subscribe to a dataset on a remote node.
+pub async fn subscribe_dataset(
+    State(state): State<Arc<NodeState>>,
+    Json(body): Json<SubscribeRequest>,
+) -> Result<Json<SubscribeResponse>, (axum::http::StatusCode, String)> {
+    use prism_mesh::subscription::Subscription;
+
+    if !valid_dataset_name(&body.dataset_name) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "invalid dataset name {:?}: must be ASCII alphanumeric + _-., \
+                 non-empty, ≤128 chars",
+                body.dataset_name
+            ),
+        ));
+    }
+    let publisher = uuid::Uuid::parse_str(&body.publisher_node).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("invalid publisher node ID: {e}"),
+        )
+    })?;
+
+    {
+        let mut subs = state
+            .subscriptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        subs.subscribe(Subscription {
+            dataset_name: body.dataset_name.clone(),
+            publisher_node: publisher,
+            subscribed_at: chrono::Utc::now(),
+        });
+    }
+
+    // Notify the publisher node via Kafka that we subscribed
+    if let (Some(producer), Some(&node_id)) = (state.kafka_producer.get(), state.node_id.get()) {
+        let msg = prism_mesh::protocol::MeshMessage::DataSubscribe {
+            subscriber_id: node_id,
+            dataset_name: body.dataset_name.clone(),
+        };
+        if let Err(e) = producer.publish(&msg).await {
+            tracing::warn!(error = %e, "failed to announce subscription via Kafka");
+        }
+    }
+
+    Ok(Json(SubscribeResponse {
+        dataset_name: body.dataset_name,
+        publisher_node: body.publisher_node,
+        status: "subscribed".to_string(),
+    }))
+}
+
+/// DELETE /api/mesh/subscribe — unsubscribe from a remote dataset.
+pub async fn unsubscribe_dataset(
+    State(state): State<Arc<NodeState>>,
+    Json(body): Json<UnsubscribeRequest>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    if !valid_dataset_name(&body.dataset_name) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "invalid dataset name {:?}: must be ASCII alphanumeric + _-., \
+                 non-empty, ≤128 chars",
+                body.dataset_name
+            ),
+        ));
+    }
+    let publisher = uuid::Uuid::parse_str(&body.publisher_node).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("invalid publisher node ID: {e}"),
+        )
+    })?;
+
+    {
+        let mut subs = state
+            .subscriptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        subs.unsubscribe(&body.dataset_name, publisher);
+    }
+
+    // Notify peers via Kafka that we unsubscribed
+    if let (Some(producer), Some(&node_id)) = (state.kafka_producer.get(), state.node_id.get()) {
+        let msg = prism_mesh::protocol::MeshMessage::DataUnsubscribe {
+            subscriber_id: node_id,
+            dataset_name: body.dataset_name.clone(),
+        };
+        if let Err(e) = producer.publish(&msg).await {
+            tracing::warn!(error = %e, "failed to announce unsubscription via Kafka");
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "dataset_name": body.dataset_name,
+        "status": "unsubscribed",
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct PublishRequest {
+    pub name: String,
+    #[serde(default = "default_schema_version")]
+    pub schema_version: String,
+}
+
+fn default_schema_version() -> String {
+    "1.0".to_string()
+}
+
+/// Allowlist for dataset names, matching the consumer-side check in
+/// `prism_mesh::sync::sync_dataset_from_peer` (Bug #45). Both sides
+/// validate so a name that gets through one is still rejected by the
+/// other; reject early at the publish/subscribe HTTP boundary so the
+/// bad value never makes it onto the Kafka mesh.
+fn valid_dataset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+#[derive(Serialize)]
+pub struct PublishResponse {
+    pub name: String,
+    pub status: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SubscribeRequest {
+    pub dataset_name: String,
+    pub publisher_node: String,
+}
+
+#[derive(Serialize)]
+pub struct SubscribeResponse {
+    pub dataset_name: String,
+    pub publisher_node: String,
+    pub status: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct UnsubscribeRequest {
+    pub dataset_name: String,
+    pub publisher_node: String,
+}
+
+/// GET /api/mesh/subscriptions — list published datasets and active subscriptions.
+pub async fn list_subscriptions(
+    State(state): State<Arc<NodeState>>,
+) -> Json<SubscriptionsResponse> {
+    let subs = state
+        .subscriptions
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let published = subs
+        .published()
+        .iter()
+        .map(|d| PublishedInfo {
+            name: d.name.clone(),
+            schema_version: d.schema_version.clone(),
+            subscriber_count: d.subscribers.len(),
+        })
+        .collect();
+
+    let subscribed = subs
+        .subscriptions()
+        .iter()
+        .map(|s| SubscriptionInfo {
+            dataset_name: s.dataset_name.clone(),
+            publisher_node: s.publisher_node.to_string(),
+            subscribed_at: s.subscribed_at.to_rfc3339(),
+        })
+        .collect();
+
+    Json(SubscriptionsResponse {
+        published,
+        subscribed,
+    })
+}

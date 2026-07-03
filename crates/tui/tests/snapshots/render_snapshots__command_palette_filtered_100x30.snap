@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+                                                                   │  (no activity yet)
+                                                                   │
+                                                                   │
+               ┌ Commands ──────────────────────────────────────────────────────────┐
+               │> tool                                                              │
+               │                                                                    │
+               │    reference ▸ Tool catalog            Browse the agent t… palette │
+               │  diagnostics ▸ Show tool permissions   Tool access &… /permissions │
+               │   navigation ▸ Workspace: Tools        Switch sidebar to Tools ←/→ │
+               │      session ▸ Set goal                Standing goal… /goal <text> │
+               │      display ▸ Switch theme            Pick a color theme  palette │
+               │      session ▸ Compact conversation    Compact older con… /compact │
+               │      science ▸ Knowledge               Search & ingest — … palette │
+               │  diagnostics ▸ Show diff               Git diff for the repo /diff │
+               │     settings ▸ Config                  View prism.toml / … palette │
+               │  diagnostics ▸ Run doctor checks       Runtime diagnostics /doctor │
+               │      display ▸ Toggle metrics          Show/hide tok/s met… Ctrl-M │
+               │      session ▸ Model                   Active model + how … /model │
+               │  … 9 more — ↓ to scroll or type to filter                          │
+               │                                                                    │
+               └────────────────────────────────────────────────────────────────────┘
+┌ Prompt ─────────────────────────────────────────────────────────┐│
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)              ││
+│                                                                 ││
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

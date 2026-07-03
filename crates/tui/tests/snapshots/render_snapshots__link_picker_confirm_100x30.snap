@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+◆ PRISM                                                            │  (no activity yet)
+  source: https://example.org/paper                                │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                  ┌ Open link ───────────────────────────────────────────────────┐
+                  │                                                              │
+                  │  Do you want to go to this website?                          │
+                  │                                                              │
+                  │  https://example.org/paper                                   │
+                  │                                                              │
+                  │  [y/↵] Open in browser   [n/Esc] Cancel                      │
+                  └──────────────────────────────────────────────────────────────┘
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+┌ Prompt ─────────────────────────────────────────────────────────┐│
+│type a message…  (press i to focus · ↵ send)                     ││
+│                                                                 ││
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [CHAT]    Ctrl-C quit               │

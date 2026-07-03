@@ -1,0 +1,49 @@
+api_version: prism/v1
+kind: workflow
+name: forge
+command_name: forge
+description: Research-to-model orchestration workflow.
+default_mode: dry_run
+arguments:
+  - name: paper
+    type: string
+    required: true
+    help: Paper identifier or URL, for example arxiv:2106.09685.
+  - name: dataset
+    type: string
+    required: true
+    help: Dataset or knowledge source to use for training data discovery.
+  - name: target
+    type: string
+    required: true
+    help: Compute target, for example runpod:A100 or prism-node:local.
+  - name: project_id
+    type: string
+    env: MARC27_PROJECT_ID
+    help: MARC27 project id.
+  - name: platform_api_base
+    type: string
+    default: https://api.marc27.com/api/v1
+    help: Base MARC27 API URL.
+steps:
+  - id: forge_request
+    action: set
+    values:
+      workflow: forge
+      paper: "{{paper}}"
+      dataset: "{{dataset}}"
+      target: "{{target}}"
+      project_id: "{{project_id}}"
+      submitted_at: "{{now_iso}}"
+  - id: workflow_summary
+    action: message
+    text: "Forge will plan training from {{paper}} using {{dataset}} on {{target}}."
+  - id: knowledge_lookup
+    action: http
+    method: GET
+    url: "{{platform_api_base}}/marketplace/search?q={{dataset}}"
+    expect_status: 200
+  - id: dispatch_preview
+    action: message
+    text: "Next execution step should dispatch a compute job for {{target}} under project {{project_id}}."
+

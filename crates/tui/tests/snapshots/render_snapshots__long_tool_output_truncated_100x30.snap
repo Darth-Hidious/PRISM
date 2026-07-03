@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v1 · 99 tools ─────────────────────────────────────────────────│ Workspace
+· PRISM v1                                                            │ [Activity] Tools  Files
+                                                                      │
+> run big tool                                                        │ 1. tool materials_sear… ✓
+                                                                      │
+⚙ Running materials_search                                            │
+                                                                      │
+⚙ materials_search: Found candidate alloy Found candidate alloy Found │
+candidate alloy Found candidate alloy Found candidate alloy Found     │
+candidate alloy Found candidate alloy Found candidate alloy Found     │
+candidate alloy Found candidate alloy Found candidate alloy Found     │
+candidate alloy Found candidate alloy Found candidate alloy Found     │
+candidate alloy Found candidate alloy Found candidate alloy Found     │
+candidate alloy Found candidate alloy Found candidate alloy Found     │
+candidate alloy Found candidate alloy Found candidate alloy Found     │
+candidate alloy Found candidate alloy Found candidate alloy Found     │
+candidate alloy Found candidate alloy Found candidate alloy Found     │
+candidate alloy                                                       │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+  Ready  model: fake-backend   [INPUT]                                │
+ Type a message... (Enter=send, Ctrl-C=quit)                          │
+                                                                      │
+                                                                      │

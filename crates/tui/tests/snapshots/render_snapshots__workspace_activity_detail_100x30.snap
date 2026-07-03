@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+       ┌────────────────────────────────────────────────────────────────────────────────────┐
+❯ You  │ Activity — 2. tool                                                                 │
+▌ sampl│                                                                                    │" •
+       │{                                                                                   │
+  ✓ all│  "content": "W0.3 Mo0.2 Ta0.3 Nb0.2",                                              │
+       │  "elapsed_ms": 292,                                                                │
+       │  "event": "tool_result",                                                           │
+       │  "role": "tool",                                                                   │
+       │  "success": true,                                                                  │
+       │  "text": "alloy_sample: W0.3 Mo0.2 Ta0.3 Nb0.2",                                   │
+       │  "tool_name": "alloy_sample"                                                       │
+       │}                                                                                   │
+       │                                                                                    │
+       │  j/k scroll · Esc close                                                            │
+       │                                                                                    │
+       │                                                                                    │
+       │                                                                                    │
+       │                                                                                    │
+       │                                                                                    │
+       │                                                                                    │
+       │                                                                                    │
+       │                                                                                    │
+┌ Promp│                                                                                    │
+│type a│                                                                                    │
+│      │                                                                                    │
+│      └────────────────────────────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [WORKSPACE]    Ctrl-C quit          │

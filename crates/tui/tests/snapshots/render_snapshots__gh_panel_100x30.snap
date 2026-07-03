@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+         ┌ GitHub — Issues ───────────────────────────────────────────────────────────────┐
+         │ [Issues]  PRs  Status    ◆ Darth-Hidious/PRISM                                 │
+         │> type to filter…    (2 shown)                                                  │
+         │                                                                                │
+         │  #42    TUI crashes on startup  OPEN · alice · bug  ◀                          │
+         │  #7     Add dark mode  CLOSED · bob                                            │
+         │                                                                                │
+         │  ←/→ tabs · filter · j/k move · ↵ post link · Esc close                        │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+┌ Prompt │                                                                                │
+│ Type a │                                                                                │
+│        └────────────────────────────────────────────────────────────────────────────────┘
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

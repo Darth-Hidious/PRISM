@@ -1,0 +1,38 @@
+{
+  "mcpServers": {
+    "pty-debug": {
+      "command": "pty-mcp-server",
+      "args": [],
+      "description": "PRIMARY TUI MCP \u2014 text snapshots. Drives interactive terminal programs (PRISM TUI, llama-server, REPLs). Local, fast, no network. NOTE: needs spawn-helper +x bit (chmod fix shipped). Capabilities: spawn_session, send_input, get_snapshot (text), list_sessions, close_session, resize_terminal."
+    },
+    "terminalcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@mariozechner/terminalcp",
+        "--mcp"
+      ],
+      "description": "FULL PTY emulation \u2014 preserves colors, cursor movement, special keys (better fidelity than pty-debug for visually-rich TUIs). Auto-installs on first use via npx. Use when pty-debug's text dump misses ANSI / color / cursor state. NOTE: requires `--mcp` arg \u2014 without it, terminalcp prints a usage banner to stdout and rmcp can't parse it as JSON."
+    },
+    "iterm-tmux": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcpretentious"
+      ],
+      "description": "iTerm2 (macOS native) + tmux session control via WebSocket API. Lets Claude drive a REAL terminal window the user can watch, instead of headless PTY. Use when you want the human to see the agent typing. Auto-installs via npx. See .mcp.json.notes.md for the manual-install MCPs (mcp-tui-driver, mcp-tui-test) that scripts/install-tui-mcps.sh handles."
+    },
+    "tui-driver": {
+      "command": "mcp-tui-driver",
+      "args": [],
+      "description": "VISUAL TUI MCP \u2014 adds tui_screenshot (PNG) for verifying color, alignment, kerning, banner geometry. Use when text-only snapshots can't tell you what the human will see."
+    },
+    "tui-test": {
+      "command": "/Users/siddharthakovid/.prism/mcps/mcp-tui-test/.venv/bin/python",
+      "args": [
+        "/Users/siddharthakovid/.prism/mcps/mcp-tui-test/server.py"
+      ],
+      "description": "PLAYWRIGHT-style TUI testing \u2014 buffer mode with position assertions, snapshot diffing, wait_for_text, cursor tracking. Use for writing reusable TUI regression tests."
+    }
+  }
+}

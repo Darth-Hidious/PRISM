@@ -1,0 +1,183 @@
+{
+  "name": "prism-vscode",
+  "displayName": "PRISM",
+  "description": "VS Code client for PRISM and MARC27 materials-science workflows.",
+  "version": "0.1.0",
+  "publisher": "marc27",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Data Science",
+    "Other"
+  ],
+  "keywords": [
+    "prism",
+    "marc27",
+    "materials-science",
+    "llm",
+    "workflow"
+  ],
+  "activationEvents": [
+    "onView:prism.agent",
+    "onView:prism.context",
+    "onCommand:prism.openAgent",
+    "onCommand:prism.startBackend",
+    "onCommand:prism.refreshMarc27"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "check": "tsc -p ./ --noEmit",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.8.3"
+  },
+  "contributes": {
+    "configuration": {
+      "title": "PRISM",
+      "properties": {
+        "prism.backendCommand": {
+          "type": "string",
+          "default": "prism",
+          "description": "Command used to launch the local PRISM backend."
+        },
+        "prism.backendArgs": {
+          "type": "array",
+          "default": [
+            "backend"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Arguments passed before --project-root and --python when launching the backend."
+        },
+        "prism.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python interpreter passed to prism backend."
+        },
+        "prism.autoStartBackend": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the local backend before sending agent messages."
+        },
+        "prism.marc27ApiBaseUrl": {
+          "type": "string",
+          "default": "https://api.marc27.com/api/v1",
+          "description": "Base URL for the MARC27 API."
+        },
+        "prism.maxStreamingBufferChars": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 20000,
+          "description": "Maximum text retained in the Agent view before older stream content is compacted."
+        },
+        "prism.experimentalMarc27ApiV2": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable opt-in calls to versioned MARC27 API revamp endpoints as they land."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "prism.openAgent",
+        "title": "PRISM: Open Agent"
+      },
+      {
+        "command": "prism.startBackend",
+        "title": "PRISM: Start Backend"
+      },
+      {
+        "command": "prism.stopBackend",
+        "title": "PRISM: Stop Backend"
+      },
+      {
+        "command": "prism.sendSelection",
+        "title": "PRISM: Send Selection to Agent"
+      },
+      {
+        "command": "prism.runResearch",
+        "title": "PRISM: Run Research Query"
+      },
+      {
+        "command": "prism.queryKnowledge",
+        "title": "PRISM: Query Knowledge"
+      },
+      {
+        "command": "prism.openModels",
+        "title": "PRISM: Show Models"
+      },
+      {
+        "command": "prism.openWorkflows",
+        "title": "PRISM: Show Workflows"
+      },
+      {
+        "command": "prism.refreshMarc27",
+        "title": "PRISM: Refresh MARC27 Capabilities"
+      },
+      {
+        "command": "prism.setMarc27ApiKey",
+        "title": "PRISM: Set MARC27 API Key"
+      },
+      {
+        "command": "prism.clearMarc27ApiKey",
+        "title": "PRISM: Clear MARC27 API Key"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "prism.sendSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@90"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "prism",
+          "title": "PRISM",
+          "icon": "resources/prism.svg"
+        }
+      ]
+    },
+    "views": {
+      "prism": [
+        {
+          "id": "prism.agent",
+          "name": "Agent",
+          "type": "webview"
+        },
+        {
+          "id": "prism.context",
+          "name": "Context"
+        },
+        {
+          "id": "prism.models",
+          "name": "Models"
+        },
+        {
+          "id": "prism.workflows",
+          "name": "Workflows"
+        },
+        {
+          "id": "prism.jobs",
+          "name": "Jobs"
+        },
+        {
+          "id": "prism.billing",
+          "name": "Billing"
+        }
+      ]
+    }
+  }
+}

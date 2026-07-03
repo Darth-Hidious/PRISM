@@ -1,0 +1,66 @@
+[package]
+name = "prism-cli"
+description = "CLI entry point for PRISM — command routing, auth bootstrap, and worker supervision."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "prism"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml.workspace = true
+base64.workspace = true
+
+sysinfo.workspace = true
+uuid.workspace = true
+
+prism-client = { path = "../client" }
+prism-compute = { path = "../compute" }
+prism-core = { path = "../core" }
+prism-ingest = { path = "../ingest" }
+prism-mesh = { path = "../mesh" }
+prism-node = { path = "../node" }
+prism-orch = { path = "../orch" }
+prism-ipc = { path = "../ipc" }
+prism-proto = { path = "../proto" }
+prism-agent = { path = "../agent" }
+prism-python-bridge = { path = "../python-bridge" }
+prism-runtime = { path = "../runtime" }
+prism-server = { path = "../server" }
+prism-workflows = { path = "../workflows" }
+prism-campaign = { path = "../campaign" }
+prism-tui = { path = "../tui" }
+
+# Forge harness — chat UI + agent loop. Apache-2.0, vendored from tailcallhq/forgecode.
+forge_main.workspace = true
+forge_api.workspace = true
+forge_config.workspace = true
+forge_domain.workspace = true
+rustls.workspace = true
+
+# MARC27 ↔ OpenAI proxy
+axum.workspace = true
+async-stream.workspace = true
+futures-util.workspace = true
+
+# Stage 2: semantic tool retrieval
+prism_tool_router = { path = "../prism_tool_router" }
+
+# URL parsing for `prism use local --url ...` validation
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

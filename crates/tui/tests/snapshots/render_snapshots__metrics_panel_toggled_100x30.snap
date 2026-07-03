@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+❯ You                                                              │  1. prompt "show metrics" •
+▌ show metrics                                                     │
+                                                                   │
+◆ PRISM                                                            │
+  Metrics display is toggled.                                      │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+┌ Prompt ─────────────────────────────────────────────────────────┐│
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)              ││
+│                                                                 ││
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

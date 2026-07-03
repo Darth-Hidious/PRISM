@@ -1,0 +1,29 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+//! Core domain logic for a PRISM node.
+//!
+//! This crate is the shared foundation that every other crate depends on:
+//!
+//! - [`config`]: Node configuration (`prism.toml` schema).
+//! - [`session`]: Multi-user session management (SQLite-backed).
+//! - [`rbac`]: Role-based access control (platform + local roles, permission checks).
+//! - [`audit`]: Append-only audit log (SQLite-backed, required for ESA/defense compliance).
+//! - [`registry`]: Tool manifest discovery and in-memory tool registry.
+//! - [`execution`]: Harness execution envelope + trace events (who is
+//!   executing, under which policy mode, reconstructable from trace events).
+
+pub mod audit;
+pub mod config;
+pub mod execution;
+pub mod rbac;
+pub mod registry;
+pub mod session;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_compiles() {
+        let _ = config::NodeConfig::default();
+    }
+}

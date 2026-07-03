@@ -1,0 +1,14 @@
+[package]
+name = "prism-ipc"
+description = "JSON-RPC 2.0 IPC layer between the Rust CLI and the Ink TUI frontend."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
