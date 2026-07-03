@@ -340,25 +340,26 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     };
     let _ = title; // title now lives in the header bar; kept for diffs only.
 
-    // Compute scroll bounds: auto-follow sticks to the bottom, manual scroll
-    // clamps to content. `view_max_scroll` is read back by the key handlers,
-    // which otherwise don't know the viewport height.
+    // Compute scroll bounds from the ACTUAL wrapped height, not the raw line
+    // count. The transcript wraps long lines, and `Paragraph::scroll` counts
+    // in wrapped rows — so measuring with ratatui's own `line_count(width)`
+    // is what makes the offset map 1:1 to what's on screen. Using the
+    // unwrapped `lines.len()` left the final wrapped rows unreachable and
+    // drifted the scrollbar off-axis.
     let viewport = area.height;
-    let content_lines = lines.len() as u16;
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().bg(t.overlay_bg))
+        .wrap(Wrap { trim: false });
+    let content_lines = paragraph.line_count(area.width) as u16;
     let max_scroll = content_lines.saturating_sub(viewport);
     app.view_max_scroll.set(max_scroll);
     let effective_scroll = if app.auto_scroll {
         max_scroll
     } else {
-        app.scroll_offset.min(max_scroll)
+        crate::app::clamp_scroll(app.scroll_offset, content_lines, viewport)
     };
 
-    let paragraph = Paragraph::new(lines)
-        .style(Style::default().bg(t.overlay_bg))
-        .wrap(Wrap { trim: false })
-        .scroll((effective_scroll, 0));
-
-    f.render_widget(paragraph, area);
+    f.render_widget(paragraph.scroll((effective_scroll, 0)), area);
 
     // Scrollbar whenever the transcript overflows, so scrolling is discoverable.
     if max_scroll > 0 {

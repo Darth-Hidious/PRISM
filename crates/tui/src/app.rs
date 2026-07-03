@@ -3079,10 +3079,34 @@ fn title_from_message(msg: &str) -> String {
     }
 }
 
+/// Clamp a transcript scroll offset to valid bounds: `[0, content_height −
+/// viewport]`, saturating so a viewport taller than the content pins the
+/// offset at 0. Shared with the renderer so page/line scroll and auto-follow
+/// all agree on the same top and bottom limits.
+pub fn clamp_scroll(offset: u16, content_height: u16, viewport: u16) -> u16 {
+    offset.min(content_height.saturating_sub(viewport))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::FakeScenario;
+
+    #[test]
+    fn clamp_scroll_bounds_are_saturating() {
+        // Content taller than the viewport: max offset = content − viewport.
+        assert_eq!(clamp_scroll(0, 100, 30), 0, "top is reachable");
+        assert_eq!(clamp_scroll(70, 100, 30), 70, "true bottom is reachable");
+        assert_eq!(
+            clamp_scroll(999, 100, 30),
+            70,
+            "over-scroll clamps to bottom"
+        );
+        // Content that fits (or is shorter than) the viewport: no scroll.
+        assert_eq!(clamp_scroll(0, 10, 30), 0);
+        assert_eq!(clamp_scroll(5, 10, 30), 0, "short content pins to 0");
+        assert_eq!(clamp_scroll(5, 30, 30), 0, "exactly-fits pins to 0");
+    }
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
