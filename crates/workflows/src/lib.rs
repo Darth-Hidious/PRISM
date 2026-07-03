@@ -997,7 +997,7 @@ async fn run_llm_step(
         step.config
             .get("system")
             .cloned()
-            .unwrap_or_else(|| serde_json::Value::Null),
+            .unwrap_or(serde_json::Value::Null),
         context,
     )?;
     let system_str = system.as_str().map(str::to_string);

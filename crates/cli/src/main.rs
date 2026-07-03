@@ -1067,16 +1067,15 @@ async fn main() -> Result<()> {
             | Some(Commands::Resume { .. })
             | Some(Commands::Campaign { .. })
             | None
-    ) {
-        if let Ok(state) = paths.load_cli_state() {
-            let token = state.credentials.as_ref().map(|c| c.access_token.clone());
-            let platform = if let Some(t) = &token {
-                prism_client::api::PlatformClient::new(&endpoints.api_base).with_token(t)
-            } else {
-                prism_client::api::PlatformClient::new(&endpoints.api_base)
-            };
-            crate::tool_sync::spawn_background_sync_owned(platform);
-        }
+    ) && let Ok(state) = paths.load_cli_state()
+    {
+        let token = state.credentials.as_ref().map(|c| c.access_token.clone());
+        let platform = if let Some(t) = &token {
+            prism_client::api::PlatformClient::new(&endpoints.api_base).with_token(t)
+        } else {
+            prism_client::api::PlatformClient::new(&endpoints.api_base)
+        };
+        crate::tool_sync::spawn_background_sync_owned(platform);
     }
 
     // --offline applies to EVERY command, not just the bare-TUI shortcut:
@@ -1472,7 +1471,7 @@ async fn main() -> Result<()> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs_f64();
-                    println!("{:<8} {:<8} {:<10} {}", "PID", "PORT", "UPTIME", "URL");
+                    println!("{:<8} {:<8} {:<10} URL", "PID", "PORT", "UPTIME");
                     for s in &sessions {
                         let up = now - s.started_at;
                         let h = (up as u64) / 3600;
@@ -3140,8 +3139,8 @@ async fn main() -> Result<()> {
                     std::env::current_exe().context("failed to locate current prism executable")?;
                 prism_tui::run(
                     prism_bin.to_str().unwrap(),
-                    &project_root.to_string_lossy().to_string(),
-                    &python.to_string_lossy().to_string(),
+                    project_root.to_string_lossy().as_ref(),
+                    python.to_string_lossy().as_ref(),
                 )
                 .await?;
                 return Ok(());
@@ -3225,8 +3224,8 @@ async fn main() -> Result<()> {
                 std::env::current_exe().context("failed to locate current prism executable")?;
             prism_tui::run(
                 prism_bin.to_str().unwrap(),
-                &project_root.to_string_lossy().to_string(),
-                &python.to_string_lossy().to_string(),
+                project_root.to_string_lossy().as_ref(),
+                python.to_string_lossy().as_ref(),
             )
             .await?;
         }
@@ -5927,6 +5926,9 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
     Ok(())
 }
 
+// No production caller since research moved to the prism-client API path;
+// kept because the unit tests below pin the raw research SSE/JSON body format.
+#[allow(dead_code)]
 fn parse_research_response_body(body: &str) -> Result<serde_json::Value> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -6068,6 +6070,8 @@ fn normalize_stream_events(events: Vec<serde_json::Value>) -> Vec<serde_json::Va
     normalized
 }
 
+// Only reachable from parse_research_response_body above; same test-pinned status.
+#[allow(dead_code)]
 fn extract_research_answer(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     for key in ["answer", "text", "content", "message"] {
         if let Some(value) = obj.get(key).and_then(|value| value.as_str()) {

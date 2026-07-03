@@ -86,13 +86,14 @@ pub fn hydrate_env_from_api_keys() {
         ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
         ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     ] {
-        if let Ok(v) = std::env::var(have) {
-            if !v.is_empty() && std::env::var_os(want).is_none() {
-                // SAFETY: called at process start / in the backend's
-                // single-threaded command loop, before any concurrent
-                // env reads for these provider vars.
-                unsafe { std::env::set_var(want, v) };
-            }
+        if let Ok(v) = std::env::var(have)
+            && !v.is_empty()
+            && std::env::var_os(want).is_none()
+        {
+            // SAFETY: called at process start / in the backend's
+            // single-threaded command loop, before any concurrent
+            // env reads for these provider vars.
+            unsafe { std::env::set_var(want, v) };
         }
     }
 }
