@@ -237,7 +237,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     "◆ PRISM",
                     Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                 )));
-                for md in markdown::markdown_lines(&msg.text, t) {
+                for md in markdown::markdown_lines(&msg.text, t, area.width.saturating_sub(2)) {
                     let mut spans = vec![Span::raw("  ")];
                     spans.extend(md.spans);
                     lines.push(Line::from(spans));
