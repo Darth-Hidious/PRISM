@@ -1026,7 +1026,7 @@ mod tests {
             source: "llm".into(),
         });
         // Need to construct a Campaign with this state — use checkpoint roundtrip
-        let config = CampaignConfig::default();
+        let _config = CampaignConfig::default();
         let _checkpoint_dir = std::env::temp_dir().join("prism_campaign_test");
         let campaign = Campaign {
             state,
