@@ -133,10 +133,14 @@ if [ "$PLATFORM" = "linux" ]; then
     chmod +x "${INSTALL_DIR}/prism" "${INSTALL_DIR}/prism-node" 2>/dev/null || true
 fi
 
-# --- Setup Python venv for tools ---
+# --- Setup Python venv + install the PRISM tool platform ---
+# The binary is self-sufficient for chat; the Python venv provides the
+# local tool server. A venv that exists but has no pip (Debian/Ubuntu
+# without python3-venv) or no `app` package is BROKEN, not "done" —
+# heal it or remove it so a re-run can start clean. Never fail the
+# binary install over Python; degrade with honest, actionable messages.
 VENV_DIR="$HOME/.prism/venv"
-if [ ! -d "$VENV_DIR" ]; then
-    echo "Setting up Python environment..."
+setup_python_tools() {
     PYTHON=""
     for py in python3.14 python3.13 python3.12 python3.11 python3; do
         if command -v "$py" >/dev/null 2>&1; then
@@ -144,16 +148,45 @@ if [ ! -d "$VENV_DIR" ]; then
             break
         fi
     done
-
-    if [ -n "$PYTHON" ]; then
-        "$PYTHON" -m venv "$VENV_DIR" 2>/dev/null || true
-        if [ -f "$VENV_DIR/bin/pip" ]; then
-            "$VENV_DIR/bin/pip" install -q --upgrade pip 2>/dev/null || true
-        fi
-    else
-        echo "  Warning: No Python 3 found. Some tools will be unavailable."
+    if [ -z "$PYTHON" ]; then
+        echo "  Warning: No Python 3 found — local tools disabled (chat still works)."
+        echo "  Install python3 + python3-venv, then re-run this installer."
+        return 0
     fi
-fi
+
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "Setting up Python environment..."
+        "$PYTHON" -m venv "$VENV_DIR" 2>/dev/null || true
+    fi
+    # Heal a pipless venv (missing ensurepip at creation time).
+    if [ ! -x "$VENV_DIR/bin/pip" ]; then
+        "$VENV_DIR/bin/python3" -m ensurepip --upgrade >/dev/null 2>&1 || true
+    fi
+    if [ ! -x "$VENV_DIR/bin/pip" ]; then
+        rm -rf "$VENV_DIR"
+        echo "  Warning: could not create a working Python venv (pip unavailable)."
+        echo "  On Debian/Ubuntu:  sudo apt-get install -y python3-venv"
+        echo "  then re-run:       curl -fsSL https://prism.marc27.com/install.sh | bash"
+        return 0
+    fi
+
+    # Install the tool platform, pinned to this release. Wheel asset first
+    # (no git required); tagged-tree sdist as fallback for older releases.
+    if ! "$VENV_DIR/bin/python3" -c "import app" >/dev/null 2>&1; then
+        echo "Installing PRISM tools (Python) — this can take a few minutes..."
+        "$VENV_DIR/bin/pip" install -q --upgrade pip 2>/dev/null || true
+        WHEEL_URL="https://github.com/${REPO}/releases/download/${VERSION}/prism_platform-${VERSION#v}-py3-none-any.whl"
+        if ! "$VENV_DIR/bin/pip" install -q "prism-platform @ ${WHEEL_URL}"; then
+            if ! "$VENV_DIR/bin/pip" install -q "prism-platform @ https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz"; then
+                echo "  Warning: Python tools install failed — chat works, local tools disabled."
+                echo "  Retry later:  $VENV_DIR/bin/pip install \"prism-platform @ ${WHEEL_URL}\""
+                return 0
+            fi
+        fi
+        echo "  PRISM tools installed."
+    fi
+}
+setup_python_tools
 
 # --- Add to PATH ---
 SHELL_NAME="$(basename "${SHELL:-bash}")"
