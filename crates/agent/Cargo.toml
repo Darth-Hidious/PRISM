@@ -28,3 +28,10 @@ shlex = "1"
 [dev-dependencies]
 tempfile = "3"
 async-trait = { workspace = true }
+# For the HTTP chat parity/approval integration tests (tests/http_chat_parity.rs):
+# stub OpenAI-compatible LLM server + direct use of the loop's own types.
+axum = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+prism-ingest = { path = "../ingest" }
+prism-python-bridge = { path = "../python-bridge" }

@@ -1621,7 +1621,7 @@ fn resolve_loaded_tool_name(tool_name: &str, tools: &ToolCatalog) -> Option<Stri
     tools.find(tool_name).map(|tool| tool.name.clone())
 }
 
-fn restore_history_and_transcript_from_messages(
+pub(crate) fn restore_history_and_transcript_from_messages(
     history: &mut Vec<ChatMessage>,
     transcript: &mut TranscriptStore,
     scratchpad: &mut Scratchpad,
@@ -6385,10 +6385,28 @@ async fn handle_command(
 // ── Main server loop ──────────────────────────────────────────────
 
 /// Run the JSON-RPC stdio server. Blocks until stdin is closed.
-pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -> Result<()> {
-    // LlmClient is rebuilt per-turn so /model switches take effect.
-    let _verify_config = LlmClient::new(llm_config.clone());
+/// The complete machinery needed to run agent turns — built once per process
+/// and shared by every transport front-end.
+///
+/// PARITY INVARIANT: `run_server` (the stdio JSON-RPC backend the TUI spawns)
+/// and [`crate::service::ChatService`] (the embedded HTTP chat service behind
+/// `POST /api/chat` on `prism node up`) both construct their runtime through
+/// [`build_agent_seed`] and both dispatch user turns through
+/// [`crate::agent_loop::run_turn`]. Anything the chat app can do therefore
+/// exists for API/MCP clients too — same tool catalog, same agent config,
+/// same hooks, same chat-mode permission baseline.
+pub struct AgentSeed {
+    pub tool_server: ToolServerHandle,
+    pub command_tool_runtime: CommandToolRuntime,
+    pub tools: Arc<ToolCatalog>,
+    pub config: Arc<AgentConfig>,
+    pub hooks: Arc<HookRegistry>,
+    pub permissions: ToolPermissionContext,
+}
 
+/// Spawn the Python tool server and assemble the shared agent machinery.
+/// Single construction path for all agent transports — see [`AgentSeed`].
+pub async fn build_agent_seed(tool_server_config: &ToolServer) -> Result<AgentSeed> {
     tracing::info!("spawning python tool server");
     let mut tool_server: ToolServerHandle = tool_server_config
         .spawn()
@@ -6409,27 +6427,54 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
         system_prompt: build_system_prompt(true),
         ..Default::default()
     });
-    // Auto-approve flag — set from init params, read by the approval gate.
-    // Stored separately so we don't need to rebuild the Arc<AgentConfig>.
-    let auto_approve_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let slash_ctx = SlashCommandContext {
+    let command_tool_runtime = CommandToolRuntime {
         current_exe: std::env::current_exe()
             .context("failed to locate current prism executable")?,
         project_root: tool_server_config.project_root.clone(),
         python_bin: tool_server_config.python_bin.clone(),
     };
-    let command_tool_runtime = CommandToolRuntime {
-        current_exe: slash_ctx.current_exe.clone(),
-        project_root: slash_ctx.project_root.clone(),
-        python_bin: slash_ctx.python_bin.clone(),
-    };
     let hooks = Arc::new(build_default_hooks());
+    let permissions = build_effective_permission_context(
+        SessionMode::Chat,
+        tools.as_ref(),
+        &PermissionOverrides::default(),
+    );
+
+    Ok(AgentSeed {
+        tool_server,
+        command_tool_runtime,
+        tools,
+        config,
+        hooks,
+        permissions,
+    })
+}
+
+pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -> Result<()> {
+    // LlmClient is rebuilt per-turn so /model switches take effect.
+    let _verify_config = LlmClient::new(llm_config.clone());
+
+    let AgentSeed {
+        tool_server,
+        command_tool_runtime,
+        tools,
+        config,
+        hooks,
+        permissions,
+    } = build_agent_seed(&tool_server_config).await?;
+
+    // Auto-approve flag — set from init params, read by the approval gate.
+    // Stored separately so we don't need to rebuild the Arc<AgentConfig>.
+    let auto_approve_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let slash_ctx = SlashCommandContext {
+        current_exe: command_tool_runtime.current_exe.clone(),
+        project_root: tool_server_config.project_root.clone(),
+        python_bin: tool_server_config.python_bin.clone(),
+    };
 
     let session_mode = SessionMode::Chat;
     let plan_state = PlanRuntimeState::default();
     let permission_overrides = PermissionOverrides::default();
-    let permissions =
-        build_effective_permission_context(session_mode, tools.as_ref(), &permission_overrides);
     let scratchpad = Scratchpad::new();
 
     // Session persistence

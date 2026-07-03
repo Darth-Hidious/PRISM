@@ -113,6 +113,16 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
             Permission::ExecuteTools,
         )));
 
+    // ── Conversational agent (auth required, ExecuteTools — chat turns
+    // execute tools) ─────────────────────────────────────────────────
+    let chat_routes = Router::new()
+        .route("/api/chat", post(handlers::chat::chat))
+        .route("/api/chat/sessions", get(handlers::chat::list_sessions))
+        .route("/api/chat/sessions/{id}", get(handlers::chat::get_session))
+        .layer(middleware::from_fn(require_permission(
+            Permission::ExecuteTools,
+        )));
+
     // ── User management (auth required, ManageUsers permission) ─────
     let user_routes = Router::new()
         .route("/api/users", get(handlers::users::list_users))
@@ -143,6 +153,7 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
         .merge(mesh_write_routes)
         .merge(ingest_routes)
         .merge(tool_exec_routes)
+        .merge(chat_routes)
         .merge(user_routes)
         .merge(audit_routes)
         .merge(session_routes)

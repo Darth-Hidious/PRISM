@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod chat;
 pub mod data;
 pub mod mesh;
 pub mod node;

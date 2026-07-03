@@ -2137,6 +2137,56 @@ async fn main() -> Result<()> {
                     "  \u{2713} {:<12} http://localhost:{}",
                     "Dashboard", dashboard_port
                 );
+
+                // ── Conversational agent service (POST /api/chat) ──
+                // Chat-app parity: the SAME agent loop the TUI backend runs
+                // (prism_agent::service::ChatService shares build_agent_seed
+                // + agent_loop::run_turn with `prism backend`), exposed as an
+                // HTTP service on this node. Spawned in the background AFTER
+                // the listener is up so the command-tool catalog's node probe
+                // sees the dashboard live and a slow Python spawn never
+                // delays node boot. On failure /api/chat answers 503.
+                if server_state.llm.is_some() {
+                    println!(
+                        "  ~ {:<12} http://localhost:{}/api/chat (starting)",
+                        "Chat", dashboard_port
+                    );
+                    let chat_state = server_state.clone();
+                    let chat_python = python.clone();
+                    let chat_project_root = project_root.clone();
+                    let chat_api_base = endpoints.api_base.clone();
+                    tokio::spawn(async move {
+                        let llm_config = chat_state
+                            .llm
+                            .clone()
+                            .expect("checked is_some before spawn");
+                        let tool_server = prism_python_bridge::ToolServer {
+                            python_bin: chat_python,
+                            project_root: chat_project_root,
+                            env: prism_agent::service::default_tool_server_env(&chat_api_base),
+                        };
+                        match prism_agent::service::ChatService::spawn(
+                            llm_config,
+                            tool_server,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(service) => {
+                                let _ = chat_state.chat.set(std::sync::Arc::new(service));
+                                tracing::info!("chat service ready — POST /api/chat");
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "chat service failed to start — /api/chat returns 503"
+                                );
+                            }
+                        }
+                    });
+                } else {
+                    tracing::warn!("no LLM configured — /api/chat disabled (503)");
+                }
                 println!();
 
                 // ── V1: Run the platform daemon (heartbeat, job dispatch) ──
