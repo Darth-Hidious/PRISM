@@ -1588,12 +1588,16 @@ async fn main() -> Result<()> {
             let mut tool_server_env = std::collections::BTreeMap::new();
             tool_server_env.insert("PRISM_ENABLE_MCP".to_string(), "1".to_string());
 
-            // Pass platform auth token to Python tool server so tools can call MARC27 API
-            if let Ok(state) = paths.load_cli_state()
-                && let Some(creds) = &state.credentials
-            {
-                tool_server_env.insert("MARC27_API_KEY".to_string(), creds.access_token.clone());
-            }
+            // Platform auth for the Python tool server: do NOT export the
+            // session JWT as MARC27_API_KEY. That env var is the X-API-Key
+            // channel (stable `m27_*` keys); the server rejects a JWT there
+            // with 401 "invalid API key", which broke every Python platform
+            // tool (knowledge semantic/graph, research) while Rust-side
+            // Bearer calls kept working. The Python side reads the rotating
+            // JWT itself from ~/.prism/credentials.json (kept in sync by
+            // login/refresh) and re-reads it on 401, which a frozen env
+            // snapshot can never do. A genuine user-set MARC27_API_KEY still
+            // reaches the tool server through normal env inheritance.
             tool_server_env.insert("MARC27_API_URL".to_string(), endpoints.api_base.clone());
 
             // Pass through any API keys the user has set
