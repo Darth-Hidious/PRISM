@@ -41,6 +41,7 @@ pub mod form;
 pub mod gh;
 pub mod keymap;
 pub mod knowledge;
+pub mod latex;
 pub mod markdown;
 pub mod msg;
 /// Render module — public for integration snapshot tests only.
@@ -81,10 +82,21 @@ pub enum BackendMode {
     Fake { scenario: backend::FakeScenario },
 }
 
+/// Platform base URL (`…/api/v1`) + bearer token for cheap billing/credits
+/// polling at turn boundaries. Absent for offline / fake backends, in which
+/// case no credits are shown.
+#[derive(Debug, Clone)]
+pub struct PlatformAuth {
+    pub base_url: String,
+    pub token: String,
+}
+
 /// Configuration for [`run_with_config`].
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub backend_mode: BackendMode,
+    /// When set, the status bar polls the org credit balance.
+    pub platform: Option<PlatformAuth>,
 }
 
 impl Default for RunConfig {
@@ -95,6 +107,7 @@ impl Default for RunConfig {
                 project_root: ".".into(),
                 python_bin: "python3".into(),
             },
+            platform: None,
         }
     }
 }
@@ -110,6 +123,7 @@ pub async fn run(prism_binary: &str, project_root: &str, python_bin: &str) -> Re
             project_root: project_root.to_string(),
             python_bin: python_bin.to_string(),
         },
+        platform: None,
     };
     run_with_config(config).await
 }
@@ -190,6 +204,12 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // Build app state
     let mut app = app::App::new(backend_handle);
 
+    // Credits polling: a spawned task fetches the org balance and publishes it
+    // via an atomic the loop reads (no extra select! branch needed). Fired at
+    // startup and after each completed turn. Stays None when unauthed.
+    let credits_cell = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
+    let platform_auth = config.platform.clone();
+
     // Main event loop — tokio::select! between crossterm events,
     // agent messages, and a periodic render tick (100ms) for animations.
     //
@@ -232,9 +252,37 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // bound (E0277) and breaks the Windows build. Calling it inline lets the
     // macro pin the temporary internally — the same pattern forge_main uses.
 
+    // Tracks the terminal's mouse-capture state so copy mode can toggle it.
+    let mut mouse_captured = true;
     loop {
         // Render every frame
         terminal.draw(|f| render::draw(f, &app))?;
+
+        // Credits: (re)fetch at startup and after each completed turn, then
+        // publish the latest known balance into the app for the status bar.
+        if app.needs_credits_refresh {
+            app.needs_credits_refresh = false;
+            if let Some(auth) = &platform_auth {
+                let (base, token, cell) = (
+                    auth.base_url.clone(),
+                    auth.token.clone(),
+                    credits_cell.clone(),
+                );
+                tokio::spawn(async move {
+                    let client = prism_client::PlatformClient::new(base).with_token(token);
+                    match prism_client::billing::get_balance(&client).await {
+                        Ok(b) => {
+                            cell.store(b.balance_millicredits, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Err(e) => tracing::debug!(error = %e, "credits fetch failed"),
+                    }
+                });
+            }
+        }
+        let fetched = credits_cell.load(std::sync::atomic::Ordering::SeqCst);
+        if fetched != i64::MIN {
+            app.credits = Some(fetched);
+        }
 
         // Check quit conditions: should_quit (from key handler) or
         // SIGINT received (from the signal handler).
@@ -286,6 +334,18 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
                 // even if tick and events are both stalled.
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
+        }
+
+        // Reconcile terminal mouse capture with copy mode: capture ON blocks
+        // the terminal's native drag-to-select, so copy mode turns it off and
+        // exiting restores it. Done here because the loop owns stdout.
+        if app.copy_mode == mouse_captured {
+            let _ = if app.copy_mode {
+                execute!(io::stdout(), DisableMouseCapture)
+            } else {
+                execute!(io::stdout(), EnableMouseCapture)
+            };
+            mouse_captured = !app.copy_mode;
         }
     }
 

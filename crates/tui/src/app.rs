@@ -347,6 +347,16 @@ pub struct App {
     // Thinking token state — separate from response text
     pub is_thinking: bool,
     pub thinking_expanded: bool,
+    /// Copy mode: while true the event loop disables terminal mouse capture
+    /// so the user can drag-select and copy transcript text. The loop
+    /// reconciles the crossterm capture state with this flag.
+    pub copy_mode: bool,
+    /// Latest known org credit balance in millicredits (platform billing), or
+    /// None when unauthed / not yet fetched. Rendered in the status bar.
+    pub credits: Option<i64>,
+    /// Set at startup and on each turn boundary to trigger a cheap balance
+    /// refresh in the event loop (never on every keystroke).
+    pub needs_credits_refresh: bool,
     // Workspace sidebar — the right-hand panel (Activity / Tools / Files)
     pub workspace_tab: WorkspaceTab,
     pub workspace_selected: usize,
@@ -434,6 +444,9 @@ impl App {
             show_metrics: true,
             is_thinking: false,
             thinking_expanded: false,
+            copy_mode: false,
+            credits: None,
+            needs_credits_refresh: true,
             workspace_tab: WorkspaceTab::Activity,
             workspace_selected: 0,
             workspace_expanded: false,
@@ -614,6 +627,13 @@ impl App {
         // Global: Ctrl-$ toggles cost display
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('4') {
             self.show_cost = !self.show_cost;
+            return;
+        }
+
+        // Global: Ctrl-Y toggles copy mode (disables terminal mouse capture
+        // so native drag-to-select / copy works).
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
+            self.toggle_copy_mode();
             return;
         }
 
@@ -1052,7 +1072,9 @@ impl App {
                     .map(|c| c.id)
                     .map(str::to_owned);
                 match id {
-                    Some(id) => self.dispatch_command(&id),
+                    Some(id) => {
+                        self.dispatch_command(&id);
+                    }
                     None => self.close_palette(),
                 }
             }
@@ -2272,7 +2294,26 @@ impl App {
 
     /// Execute a catalog command by id. Reuses existing action paths so
     /// the palette, slash-commands, and keybinds stay in sync.
-    fn dispatch_command(&mut self, id: &str) {
+    /// Toggle copy mode. While on, the event loop disables terminal mouse
+    /// capture so the user can drag-select and copy transcript text; a
+    /// persistent footer hint shows how to exit. Reachable via Ctrl-Y,
+    /// `/copy`, and the command palette (`copy.toggle`).
+    fn toggle_copy_mode(&mut self) {
+        self.copy_mode = !self.copy_mode;
+        if self.copy_mode {
+            self.toast(
+                "copy mode ON — drag to select, Ctrl-Y to exit",
+                ToastKind::Info,
+            );
+        } else {
+            self.toast("copy mode OFF — mouse capture restored", ToastKind::Info);
+        }
+    }
+
+    /// Dispatch a palette command by id. Returns `false` for an unrecognized
+    /// id — the completeness test relies on every [`command::CATALOG`] entry
+    /// dispatching, so a palette entry can never be a silent no-op.
+    fn dispatch_command(&mut self, id: &str) -> bool {
         self.close_palette();
         match id {
             // Science entries pre-fill the prompt with a scaffold that
@@ -2359,6 +2400,7 @@ impl App {
                     ToastKind::Info,
                 );
             }
+            "copy.toggle" => self.toggle_copy_mode(),
             "input.focus" => self.focus = Focus::Input,
             "workspace.activity" => {
                 self.workspace_tab = WorkspaceTab::Activity;
@@ -2385,8 +2427,9 @@ impl App {
                 let cmd = format!("/{root}");
                 let _ = self.backend.send_command(&cmd);
             }
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
     fn send_message(&mut self, text: &str) {
@@ -2408,6 +2451,10 @@ impl App {
             }
             "/mcp" | "/setup" => {
                 self.modal = Some(Modal::Tools);
+                return;
+            }
+            "/copy" => {
+                self.toggle_copy_mode();
                 return;
             }
             _ => {}
@@ -2713,6 +2760,8 @@ impl App {
             AgentMsg::TurnComplete => {
                 self.is_waiting = false;
                 self.status_text = "Ready".to_string();
+                // Turn boundary — cheap-poll the credit balance next frame.
+                self.needs_credits_refresh = true;
                 // A login/logout turn just finished — refresh account status.
                 if self.account.busy {
                     self.account.busy = false;
@@ -3079,10 +3128,34 @@ fn title_from_message(msg: &str) -> String {
     }
 }
 
+/// Clamp a transcript scroll offset to valid bounds: `[0, content_height −
+/// viewport]`, saturating so a viewport taller than the content pins the
+/// offset at 0. Shared with the renderer so page/line scroll and auto-follow
+/// all agree on the same top and bottom limits.
+pub fn clamp_scroll(offset: u16, content_height: u16, viewport: u16) -> u16 {
+    offset.min(content_height.saturating_sub(viewport))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::FakeScenario;
+
+    #[test]
+    fn clamp_scroll_bounds_are_saturating() {
+        // Content taller than the viewport: max offset = content − viewport.
+        assert_eq!(clamp_scroll(0, 100, 30), 0, "top is reachable");
+        assert_eq!(clamp_scroll(70, 100, 30), 70, "true bottom is reachable");
+        assert_eq!(
+            clamp_scroll(999, 100, 30),
+            70,
+            "over-scroll clamps to bottom"
+        );
+        // Content that fits (or is shorter than) the viewport: no scroll.
+        assert_eq!(clamp_scroll(0, 10, 30), 0);
+        assert_eq!(clamp_scroll(5, 10, 30), 0, "short content pins to 0");
+        assert_eq!(clamp_scroll(5, 30, 30), 0, "exactly-fits pins to 0");
+    }
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
@@ -3094,6 +3167,63 @@ mod tests {
 
     fn fresh() -> App {
         App::new(BackendHandle::fake(FakeScenario::BasicChat))
+    }
+
+    #[test]
+    fn ctrl_y_toggles_copy_mode() {
+        let mut app = fresh();
+        assert!(!app.copy_mode);
+        app.handle_key(ctrl('y'));
+        assert!(app.copy_mode, "Ctrl-Y enables copy mode");
+        app.handle_key(ctrl('y'));
+        assert!(!app.copy_mode, "Ctrl-Y again disables copy mode");
+    }
+
+    #[test]
+    fn copy_toggle_command_flips_copy_mode() {
+        let mut app = fresh();
+        app.dispatch_command("copy.toggle");
+        assert!(app.copy_mode, "palette copy.toggle enables copy mode");
+        app.dispatch_command("copy.toggle");
+        assert!(!app.copy_mode);
+    }
+
+    #[test]
+    fn every_palette_command_dispatches() {
+        // The palette registry (command::CATALOG) is the single source of
+        // truth for invocable commands: every entry must resolve to a real
+        // dispatch action. A command added to dispatch without a CATALOG entry
+        // won't appear here — and one added to CATALOG without a dispatch arm
+        // fails this test — so nothing can silently skip the palette.
+        for cmd in command::catalog() {
+            let mut app = fresh();
+            assert!(
+                app.dispatch_command(cmd.id),
+                "palette command {:?} has no dispatch action",
+                cmd.id
+            );
+        }
+    }
+
+    #[test]
+    fn client_slash_commands_are_in_the_palette() {
+        // Every in-TUI slash command must also be a palette entry, so it's
+        // discoverable and never reachable only by knowing the magic string.
+        let ids: std::collections::HashSet<&str> =
+            command::catalog().iter().map(|c| c.id).collect();
+        for (slash, id) in [
+            ("/help", "help.show"),
+            ("/cost", "cost.show"),
+            ("/model", "model.show"),
+            ("/mcp", "mcp.show"),
+            ("/goal", "goal.set"),
+            ("/copy", "copy.toggle"),
+        ] {
+            assert!(
+                ids.contains(id),
+                "slash {slash} -> {id} missing from palette"
+            );
+        }
     }
 
     #[test]

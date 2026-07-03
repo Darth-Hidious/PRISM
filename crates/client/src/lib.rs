@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod billing;
 pub mod knowledge;
 pub mod marketplace;
 pub mod node_registry;

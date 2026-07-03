@@ -1,5 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 721
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
@@ -23,7 +24,7 @@ expression: rendered
                │    Toggle thinking         Show/hide reasoning tokens       Ctrl-T │
                │  ── HELP ───────────────────────────────────────────────────────── │
                │    Help                    Show keys & commands              /help │
-               │  … 32 more — ↓ to scroll or type to filter                         │
+               │  … 33 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│

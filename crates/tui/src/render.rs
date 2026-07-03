@@ -237,7 +237,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     "◆ PRISM",
                     Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                 )));
-                for md in markdown::markdown_lines(&msg.text, t) {
+                for md in markdown::markdown_lines(&msg.text, t, area.width.saturating_sub(2)) {
                     let mut spans = vec![Span::raw("  ")];
                     spans.extend(md.spans);
                     lines.push(Line::from(spans));
@@ -340,25 +340,26 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     };
     let _ = title; // title now lives in the header bar; kept for diffs only.
 
-    // Compute scroll bounds: auto-follow sticks to the bottom, manual scroll
-    // clamps to content. `view_max_scroll` is read back by the key handlers,
-    // which otherwise don't know the viewport height.
+    // Compute scroll bounds from the ACTUAL wrapped height, not the raw line
+    // count. The transcript wraps long lines, and `Paragraph::scroll` counts
+    // in wrapped rows — so measuring with ratatui's own `line_count(width)`
+    // is what makes the offset map 1:1 to what's on screen. Using the
+    // unwrapped `lines.len()` left the final wrapped rows unreachable and
+    // drifted the scrollbar off-axis.
     let viewport = area.height;
-    let content_lines = lines.len() as u16;
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().bg(t.overlay_bg))
+        .wrap(Wrap { trim: false });
+    let content_lines = paragraph.line_count(area.width) as u16;
     let max_scroll = content_lines.saturating_sub(viewport);
     app.view_max_scroll.set(max_scroll);
     let effective_scroll = if app.auto_scroll {
         max_scroll
     } else {
-        app.scroll_offset.min(max_scroll)
+        crate::app::clamp_scroll(app.scroll_offset, content_lines, viewport)
     };
 
-    let paragraph = Paragraph::new(lines)
-        .style(Style::default().bg(t.overlay_bg))
-        .wrap(Wrap { trim: false })
-        .scroll((effective_scroll, 0));
-
-    f.render_widget(paragraph, area);
+    f.render_widget(paragraph.scroll((effective_scroll, 0)), area);
 
     // Scrollbar whenever the transcript overflows, so scrolling is discoverable.
     if max_scroll > 0 {
@@ -404,6 +405,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
     ];
 
+    // Org credit balance (platform billing). Only shown when known — a failed
+    // fetch leaves it absent rather than displaying a misleading zero.
+    if let Some(millicredits) = app.credits {
+        spans.push(Span::styled("credits:", Style::default().fg(t.system)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            prism_client::billing::format_credits(millicredits),
+            Style::default().fg(t.ok),
+        ));
+        spans.push(Span::raw("  "));
+    }
+
     // Show tokens/sec when streaming (if metrics enabled)
     if app.show_metrics && app.tokens_per_sec > 0.0 {
         spans.push(Span::styled("tok/s:", Style::default().fg(t.system)));
@@ -437,6 +450,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             "[thinking · Ctrl-T]",
             Style::default().fg(t.dim),
+        ));
+        spans.push(Span::raw("  "));
+    }
+
+    // Copy mode is a modal input state — surface it prominently so the user
+    // knows mouse selection is enabled and how to leave.
+    if app.copy_mode {
+        spans.push(Span::styled(
+            " COPY MODE — mouse selection enabled, Ctrl-Y to exit ",
+            Style::default()
+                .fg(t.status_fg)
+                .bg(t.accent)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw("  "));
     }
@@ -889,6 +915,11 @@ fn help_lines(t: Theme) -> Vec<Line<'static>> {
         kv_row(t, "y / a / n", "allow / allow-all / deny a tool"),
         kv_row(t, "Ctrl-T", "toggle thinking tokens"),
         kv_row(t, "Ctrl-M / Ctrl-$", "toggle metrics / cost"),
+        kv_row(
+            t,
+            "Ctrl-Y",
+            "copy mode — drag-select/copy (mouse capture off)",
+        ),
         Line::raw(""),
         section(t, "Commands"),
         kv_row(t, "Ctrl-P", "command palette — run any command"),

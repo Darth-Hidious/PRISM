@@ -8768,6 +8768,7 @@ dependencies = [
  "futures",
  "insta",
  "libc",
+ "prism-client",
  "ratatui",
  "ratatui-textarea",
  "serde",

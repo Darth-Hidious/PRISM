@@ -2025,14 +2025,13 @@ async fn fake_backend_response_text_contains_fake_message() {
     let mut full_text = String::new();
     while let Some(msg) = backend.recv().await {
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        if method == "ui.text.delta" {
-            if let Some(text) = msg
+        if method == "ui.text.delta"
+            && let Some(text) = msg
                 .get("params")
                 .and_then(|p| p.get("text"))
                 .and_then(|t| t.as_str())
-            {
-                full_text.push_str(text);
-            }
+        {
+            full_text.push_str(text);
         }
         if method == "ui.turn.complete" {
             break;
@@ -2129,10 +2128,10 @@ async fn app_with_fake_backend_produces_assistant_text() {
     while let Some(msg) = app.backend.recv().await {
         app.handle_backend_message(&msg);
         // Check if we got assistant text
-        if let Some(last) = app.messages.last() {
-            if matches!(last.role, prism_tui::app::Role::Assistant) {
-                received_text = last.text.clone();
-            }
+        if let Some(last) = app.messages.last()
+            && matches!(last.role, prism_tui::app::Role::Assistant)
+        {
+            received_text = last.text.clone();
         }
         // Stop after turn complete
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
