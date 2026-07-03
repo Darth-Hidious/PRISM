@@ -28,7 +28,9 @@ Or download from [GitHub Releases](../../releases):
 | Platform | Archive |
 |----------|---------|
 | Linux x86_64 | `prism-linux-x86_64.tar.gz` |
+| Linux ARM64 | `prism-linux-aarch64.tar.gz` |
 | macOS Apple Silicon | `prism-macos-aarch64.tar.gz` |
+| macOS Intel | `prism-macos-x86_64.tar.gz` |
 | Windows x86_64 | `prism-windows-x86_64.zip` |
 
 Or from source:
@@ -104,7 +106,6 @@ prism models search "claude"
 ```
 prism workflow list
 prism workflow run explore --space "Ni-Cr-Co" --target "yield_strength > 900"
-prism forge --paper arxiv:2106.09685 --dataset materials-project --target runpod:A100
 ```
 
 ### Billing
@@ -117,7 +118,7 @@ prism billing prices     # Pricing table
 
 ### Other
 ```
-prism tools              # List 108 available tools
+prism tools              # List 123 available tools
 prism marketplace search # Browse datasets, models, plugins
 prism discourse list     # Multi-agent debate workflows
 prism report "bug"       # File support ticket
@@ -138,7 +139,7 @@ prism (single Rust binary)
   prism-policy   OPA/Rego policy engine
   prism-workflows YAML workflow engine (8 step types)
 
-Python tools (108 tools via JSON stdio)
+Python tools (123 tools via JSON stdio)
   Search: OPTIMADE (20+ providers), arXiv, Semantic Scholar
   Predict: property prediction, structure prediction
   Simulate: CALPHAD, DFT planning
