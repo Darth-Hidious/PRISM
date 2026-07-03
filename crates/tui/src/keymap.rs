@@ -110,6 +110,11 @@ pub static KEYMAP: &[KeyBinding] = &[
         category: "Display",
     },
     KeyBinding {
+        keys: "Ctrl-Y",
+        description: "Copy mode — disable mouse capture to drag-select/copy",
+        category: "Display",
+    },
+    KeyBinding {
         keys: "Ctrl-P → theme",
         description: "Switch color theme (via the command palette)",
         category: "Display",

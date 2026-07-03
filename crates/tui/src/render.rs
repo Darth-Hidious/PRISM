@@ -442,6 +442,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw("  "));
     }
 
+    // Copy mode is a modal input state — surface it prominently so the user
+    // knows mouse selection is enabled and how to leave.
+    if app.copy_mode {
+        spans.push(Span::styled(
+            " COPY MODE — mouse selection enabled, Ctrl-Y to exit ",
+            Style::default()
+                .fg(t.status_fg)
+                .bg(t.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
+    }
+
     spans.push(Span::styled(focus_indicator, Style::default().fg(t.warn)));
     spans.push(Span::styled("   Ctrl-C quit", Style::default().fg(t.muted)));
 
@@ -890,6 +903,11 @@ fn help_lines(t: Theme) -> Vec<Line<'static>> {
         kv_row(t, "y / a / n", "allow / allow-all / deny a tool"),
         kv_row(t, "Ctrl-T", "toggle thinking tokens"),
         kv_row(t, "Ctrl-M / Ctrl-$", "toggle metrics / cost"),
+        kv_row(
+            t,
+            "Ctrl-Y",
+            "copy mode — drag-select/copy (mouse capture off)",
+        ),
         Line::raw(""),
         section(t, "Commands"),
         kv_row(t, "Ctrl-P", "command palette — run any command"),

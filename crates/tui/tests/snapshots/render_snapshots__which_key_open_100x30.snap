@@ -1,5 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 747
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
@@ -27,7 +28,7 @@ expression: rendered
           │   Ctrl-T                Toggle thinking tokens                               │
           │   Ctrl-M                Toggle tok/s metrics                                 │
 ┌ Prompt ─│   Ctrl-$                Toggle cost in the status bar                        │
-│ Type a m│   Ctrl-P → theme        Switch color theme (via the command palette)         │
+│ Type a m│   Ctrl-Y                Copy mode — disable mouse capture to drag-select/copy│
 │         └──────────────────────────────────────────────────────────────────────────────┘
 │                                                                 ││
 └─────────────────────────────────────────────────────────────────┘│

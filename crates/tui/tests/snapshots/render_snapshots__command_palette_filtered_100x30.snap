@@ -1,5 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 734
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
@@ -23,7 +24,7 @@ expression: rendered
                │  diagnostics ▸ Run doctor checks       Runtime diagnostics /doctor │
                │      display ▸ Toggle metrics          Show/hide tok/s met… Ctrl-M │
                │      session ▸ Model                   Active model + how … /model │
-               │  … 9 more — ↓ to scroll or type to filter                          │
+               │  … 10 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│

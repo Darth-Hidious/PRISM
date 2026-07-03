@@ -233,6 +233,8 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // bound (E0277) and breaks the Windows build. Calling it inline lets the
     // macro pin the temporary internally — the same pattern forge_main uses.
 
+    // Tracks the terminal's mouse-capture state so copy mode can toggle it.
+    let mut mouse_captured = true;
     loop {
         // Render every frame
         terminal.draw(|f| render::draw(f, &app))?;
@@ -287,6 +289,18 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
                 // even if tick and events are both stalled.
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
+        }
+
+        // Reconcile terminal mouse capture with copy mode: capture ON blocks
+        // the terminal's native drag-to-select, so copy mode turns it off and
+        // exiting restores it. Done here because the loop owns stdout.
+        if app.copy_mode == mouse_captured {
+            let _ = if app.copy_mode {
+                execute!(io::stdout(), DisableMouseCapture)
+            } else {
+                execute!(io::stdout(), EnableMouseCapture)
+            };
+            mouse_captured = !app.copy_mode;
         }
     }
 

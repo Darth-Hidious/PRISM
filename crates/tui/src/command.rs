@@ -355,6 +355,14 @@ pub static CATALOG: &[Command] = &[
         suggested: false,
     },
     Command {
+        id: "copy.toggle",
+        title: "Copy mode",
+        description: "Disable mouse capture for drag-to-select / copy",
+        category: "Display",
+        keybind: "Ctrl-Y",
+        suggested: false,
+    },
+    Command {
         id: "input.focus",
         title: "Focus input",
         description: "Jump to the message input",

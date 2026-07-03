@@ -347,6 +347,10 @@ pub struct App {
     // Thinking token state — separate from response text
     pub is_thinking: bool,
     pub thinking_expanded: bool,
+    /// Copy mode: while true the event loop disables terminal mouse capture
+    /// so the user can drag-select and copy transcript text. The loop
+    /// reconciles the crossterm capture state with this flag.
+    pub copy_mode: bool,
     // Workspace sidebar — the right-hand panel (Activity / Tools / Files)
     pub workspace_tab: WorkspaceTab,
     pub workspace_selected: usize,
@@ -434,6 +438,7 @@ impl App {
             show_metrics: true,
             is_thinking: false,
             thinking_expanded: false,
+            copy_mode: false,
             workspace_tab: WorkspaceTab::Activity,
             workspace_selected: 0,
             workspace_expanded: false,
@@ -614,6 +619,13 @@ impl App {
         // Global: Ctrl-$ toggles cost display
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('4') {
             self.show_cost = !self.show_cost;
+            return;
+        }
+
+        // Global: Ctrl-Y toggles copy mode (disables terminal mouse capture
+        // so native drag-to-select / copy works).
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
+            self.toggle_copy_mode();
             return;
         }
 
@@ -2272,6 +2284,22 @@ impl App {
 
     /// Execute a catalog command by id. Reuses existing action paths so
     /// the palette, slash-commands, and keybinds stay in sync.
+    /// Toggle copy mode. While on, the event loop disables terminal mouse
+    /// capture so the user can drag-select and copy transcript text; a
+    /// persistent footer hint shows how to exit. Reachable via Ctrl-Y,
+    /// `/copy`, and the command palette (`copy.toggle`).
+    fn toggle_copy_mode(&mut self) {
+        self.copy_mode = !self.copy_mode;
+        if self.copy_mode {
+            self.toast(
+                "copy mode ON — drag to select, Ctrl-Y to exit",
+                ToastKind::Info,
+            );
+        } else {
+            self.toast("copy mode OFF — mouse capture restored", ToastKind::Info);
+        }
+    }
+
     fn dispatch_command(&mut self, id: &str) {
         self.close_palette();
         match id {
@@ -2359,6 +2387,7 @@ impl App {
                     ToastKind::Info,
                 );
             }
+            "copy.toggle" => self.toggle_copy_mode(),
             "input.focus" => self.focus = Focus::Input,
             "workspace.activity" => {
                 self.workspace_tab = WorkspaceTab::Activity;
@@ -2408,6 +2437,10 @@ impl App {
             }
             "/mcp" | "/setup" => {
                 self.modal = Some(Modal::Tools);
+                return;
+            }
+            "/copy" => {
+                self.toggle_copy_mode();
                 return;
             }
             _ => {}
@@ -3118,6 +3151,25 @@ mod tests {
 
     fn fresh() -> App {
         App::new(BackendHandle::fake(FakeScenario::BasicChat))
+    }
+
+    #[test]
+    fn ctrl_y_toggles_copy_mode() {
+        let mut app = fresh();
+        assert!(!app.copy_mode);
+        app.handle_key(ctrl('y'));
+        assert!(app.copy_mode, "Ctrl-Y enables copy mode");
+        app.handle_key(ctrl('y'));
+        assert!(!app.copy_mode, "Ctrl-Y again disables copy mode");
+    }
+
+    #[test]
+    fn copy_toggle_command_flips_copy_mode() {
+        let mut app = fresh();
+        app.dispatch_command("copy.toggle");
+        assert!(app.copy_mode, "palette copy.toggle enables copy mode");
+        app.dispatch_command("copy.toggle");
+        assert!(!app.copy_mode);
     }
 
     #[test]
