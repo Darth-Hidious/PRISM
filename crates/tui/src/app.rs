@@ -1072,7 +1072,9 @@ impl App {
                     .map(|c| c.id)
                     .map(str::to_owned);
                 match id {
-                    Some(id) => self.dispatch_command(&id),
+                    Some(id) => {
+                        self.dispatch_command(&id);
+                    }
                     None => self.close_palette(),
                 }
             }
@@ -2308,7 +2310,10 @@ impl App {
         }
     }
 
-    fn dispatch_command(&mut self, id: &str) {
+    /// Dispatch a palette command by id. Returns `false` for an unrecognized
+    /// id — the completeness test relies on every [`command::CATALOG`] entry
+    /// dispatching, so a palette entry can never be a silent no-op.
+    fn dispatch_command(&mut self, id: &str) -> bool {
         self.close_palette();
         match id {
             // Science entries pre-fill the prompt with a scaffold that
@@ -2422,8 +2427,9 @@ impl App {
                 let cmd = format!("/{root}");
                 let _ = self.backend.send_command(&cmd);
             }
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
     fn send_message(&mut self, text: &str) {
@@ -3180,6 +3186,44 @@ mod tests {
         assert!(app.copy_mode, "palette copy.toggle enables copy mode");
         app.dispatch_command("copy.toggle");
         assert!(!app.copy_mode);
+    }
+
+    #[test]
+    fn every_palette_command_dispatches() {
+        // The palette registry (command::CATALOG) is the single source of
+        // truth for invocable commands: every entry must resolve to a real
+        // dispatch action. A command added to dispatch without a CATALOG entry
+        // won't appear here — and one added to CATALOG without a dispatch arm
+        // fails this test — so nothing can silently skip the palette.
+        for cmd in command::catalog() {
+            let mut app = fresh();
+            assert!(
+                app.dispatch_command(cmd.id),
+                "palette command {:?} has no dispatch action",
+                cmd.id
+            );
+        }
+    }
+
+    #[test]
+    fn client_slash_commands_are_in_the_palette() {
+        // Every in-TUI slash command must also be a palette entry, so it's
+        // discoverable and never reachable only by knowing the magic string.
+        let ids: std::collections::HashSet<&str> =
+            command::catalog().iter().map(|c| c.id).collect();
+        for (slash, id) in [
+            ("/help", "help.show"),
+            ("/cost", "cost.show"),
+            ("/model", "model.show"),
+            ("/mcp", "mcp.show"),
+            ("/goal", "goal.set"),
+            ("/copy", "copy.toggle"),
+        ] {
+            assert!(
+                ids.contains(id),
+                "slash {slash} -> {id} missing from palette"
+            );
+        }
     }
 
     #[test]
