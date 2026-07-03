@@ -182,7 +182,7 @@ setup_python_tools() {
 
     # Install the tool platform, pinned to this release. Wheel asset first
     # (no git required); tagged-tree sdist as fallback for older releases.
-    if ! "$VENV_DIR/bin/python3" -c "import app" >/dev/null 2>&1; then
+    if ! "$VENV_DIR/bin/python3" -I -c "import app" >/dev/null 2>&1; then
         echo "Installing PRISM tools (Python) — this can take a few minutes..."
         "$VENV_DIR/bin/pip" install -q --upgrade pip 2>/dev/null || true
         WHEEL_URL="https://github.com/${REPO}/releases/download/${VERSION}/prism_platform-${VERSION#v}-py3-none-any.whl"
