@@ -192,7 +192,7 @@ fn check_venv_tools(venv_python: &std::path::Path) -> BootCheck {
         };
     }
     let importable = std::process::Command::new(venv_python)
-        .args(["-c", "import app"])
+        .args(["-I", "-c", "import app"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

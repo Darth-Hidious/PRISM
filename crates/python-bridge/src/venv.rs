@@ -148,7 +148,7 @@ pub async fn ensure_venv(
 /// Does this interpreter have the PRISM tool platform importable?
 async fn python_has_app(python: &Path) -> bool {
     Command::new(python)
-        .args(["-c", "import app"])
+        .args(["-I", "-c", "import app"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
