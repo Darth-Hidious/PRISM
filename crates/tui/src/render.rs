@@ -405,6 +405,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
     ];
 
+    // Org credit balance (platform billing). Only shown when known — a failed
+    // fetch leaves it absent rather than displaying a misleading zero.
+    if let Some(millicredits) = app.credits {
+        spans.push(Span::styled("credits:", Style::default().fg(t.system)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            prism_client::billing::format_credits(millicredits),
+            Style::default().fg(t.ok),
+        ));
+        spans.push(Span::raw("  "));
+    }
+
     // Show tokens/sec when streaming (if metrics enabled)
     if app.show_metrics && app.tokens_per_sec > 0.0 {
         spans.push(Span::styled("tok/s:", Style::default().fg(t.system)));

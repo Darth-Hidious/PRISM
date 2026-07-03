@@ -3130,6 +3130,7 @@ async fn main() -> Result<()> {
                 let scen = prism_tui::backend::FakeScenario::from_name(&scenario)?;
                 let config = prism_tui::RunConfig {
                     backend_mode: prism_tui::BackendMode::Fake { scenario: scen },
+                    platform: None,
                 };
                 prism_tui::run_with_config(config).await?;
                 return Ok(());
@@ -3226,12 +3227,21 @@ async fn main() -> Result<()> {
             // `prism backend` as a subprocess and talks JSON-RPC.
             let prism_bin =
                 std::env::current_exe().context("failed to locate current prism executable")?;
-            prism_tui::run(
-                prism_bin.to_str().unwrap(),
-                &project_root.to_string_lossy().to_string(),
-                &python.to_string_lossy().to_string(),
-            )
-            .await?;
+            // Give the TUI the platform bearer so it can poll the org credit
+            // balance at turn boundaries (status bar). None → no credits shown.
+            let platform = state.credentials.as_ref().map(|c| prism_tui::PlatformAuth {
+                base_url: endpoints.api_base.clone(),
+                token: c.access_token.clone(),
+            });
+            let config = prism_tui::RunConfig {
+                backend_mode: prism_tui::BackendMode::Real {
+                    prism_binary: prism_bin.to_str().unwrap().to_string(),
+                    project_root: project_root.to_string_lossy().to_string(),
+                    python_bin: python.to_string_lossy().to_string(),
+                },
+                platform,
+            };
+            prism_tui::run_with_config(config).await?;
         }
         Commands::Resume { id } => {
             // Reuses the same Tui setup path: same auth refresh, same

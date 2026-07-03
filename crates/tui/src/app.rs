@@ -351,6 +351,12 @@ pub struct App {
     /// so the user can drag-select and copy transcript text. The loop
     /// reconciles the crossterm capture state with this flag.
     pub copy_mode: bool,
+    /// Latest known org credit balance in millicredits (platform billing), or
+    /// None when unauthed / not yet fetched. Rendered in the status bar.
+    pub credits: Option<i64>,
+    /// Set at startup and on each turn boundary to trigger a cheap balance
+    /// refresh in the event loop (never on every keystroke).
+    pub needs_credits_refresh: bool,
     // Workspace sidebar — the right-hand panel (Activity / Tools / Files)
     pub workspace_tab: WorkspaceTab,
     pub workspace_selected: usize,
@@ -439,6 +445,8 @@ impl App {
             is_thinking: false,
             thinking_expanded: false,
             copy_mode: false,
+            credits: None,
+            needs_credits_refresh: true,
             workspace_tab: WorkspaceTab::Activity,
             workspace_selected: 0,
             workspace_expanded: false,
@@ -2746,6 +2754,8 @@ impl App {
             AgentMsg::TurnComplete => {
                 self.is_waiting = false;
                 self.status_text = "Ready".to_string();
+                // Turn boundary — cheap-poll the credit balance next frame.
+                self.needs_credits_refresh = true;
                 // A login/logout turn just finished — refresh account status.
                 if self.account.busy {
                     self.account.busy = false;
