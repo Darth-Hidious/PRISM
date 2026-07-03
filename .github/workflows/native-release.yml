@@ -30,7 +30,7 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
             archive: prism-windows-x86_64.zip
           # Intel Macs — install.sh computes prism-macos-x86_64 for x86_64 Darwin.
-          - os: macos-13
+          - os: macos-15-intel
             label: macos-x86_64
             rust_target: x86_64-apple-darwin
             archive: prism-macos-x86_64.tar.gz
