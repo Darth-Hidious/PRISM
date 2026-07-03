@@ -158,9 +158,19 @@ setup_python_tools() {
         echo "Setting up Python environment..."
         "$PYTHON" -m venv "$VENV_DIR" 2>/dev/null || true
     fi
-    # Heal a pipless venv (missing ensurepip at creation time).
-    if [ ! -x "$VENV_DIR/bin/pip" ]; then
+    # Stock Debian/Ubuntu ships python3 without ensurepip (python3-venv
+    # package). `venv` then half-creates: interpreter present, no pip.
+    if [ ! -x "$VENV_DIR/bin/python3" ]; then
+        "$PYTHON" -m venv --without-pip "$VENV_DIR" 2>/dev/null || true
+    fi
+    # Heal a pipless venv: ensurepip first, then pypa's get-pip bootstrap
+    # (works without python3-venv and without sudo).
+    if [ ! -x "$VENV_DIR/bin/pip" ] && [ -x "$VENV_DIR/bin/python3" ]; then
         "$VENV_DIR/bin/python3" -m ensurepip --upgrade >/dev/null 2>&1 || true
+    fi
+    if [ ! -x "$VENV_DIR/bin/pip" ] && [ -x "$VENV_DIR/bin/python3" ]; then
+        curl -fsSL https://bootstrap.pypa.io/get-pip.py \
+            | "$VENV_DIR/bin/python3" - --quiet >/dev/null 2>&1 || true
     fi
     if [ ! -x "$VENV_DIR/bin/pip" ]; then
         rm -rf "$VENV_DIR"
