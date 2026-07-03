@@ -1,0 +1,38 @@
+PRISM — Dual License
+
+Copyright (c) 2025-2026 MARC27
+
+This project uses a dual-license model:
+
+1. Python tools (app/tools/, app/tool_server.py, app/config/,
+   app/plugins/, app/workflows/, app/mcp_*.py, app/update.py)
+   are licensed under the MIT License. See LICENSE-MIT.
+
+2. Everything else — all Rust crates (crates/), the Ink frontend
+   (frontend/), install scripts, CI/CD, and documentation — is
+   licensed under the MARC27 Source-Available License. See
+   LICENSE-MARC27.
+
+The license boundary:
+
+  MIT (open, community-contributed):
+    app/tools/**          — All Python tools (search, predict, simulate, etc.)
+    app/tool_server.py    — Tool execution server
+    app/config/**         — Configuration schema
+    app/plugins/**        — Plugin loading and registry
+    app/workflows/**      — Workflow engine
+    app/mcp_*.py          — MCP client and server
+    app/update.py         — Version checking
+    tests/**              — Test suite
+
+  MARC27 Source-Available (proprietary):
+    crates/**             — All Rust crates (agent, CLI, client, compute,
+                            ingest, mesh, node, server, workflows, etc.)
+    frontend/**           — Ink TUI frontend
+    install.sh            — Installer
+    .github/**            — CI/CD workflows
+    docs/**               — Documentation
+
+If you are unsure which license applies to a specific file, the header
+comment in that file takes precedence. When no header is present, the
+table above applies.

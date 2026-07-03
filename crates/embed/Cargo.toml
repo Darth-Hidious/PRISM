@@ -1,0 +1,23 @@
+# Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+[package]
+name = "prism-embed"
+description = "Pluggable text-embedding port — native local ONNX by default, OpenAI-compatible HTTP endpoint as the open replacement port."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tracing.workspace = true
+dirs = { workspace = true }
+toml = { workspace = true }
+fastembed = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

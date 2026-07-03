@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v1 · 99 tools ─────────────────────────────────────────────────│ Workspace
+· PRISM v1                                                            │  Activity [Tools] Files
+                                                                      │
+> submit job                                                          │▸ ✗ compute_submit  1200ms
+                                                                      │  call_id: call-2
+⚙ Running compute_submit                                              │  status: Failed
+                                                                      │  approval: required
+⚙ compute_submit: Error: budget exceeded ($50.00 limit)               │  elapsed: 1200ms
+                                                                      │  type: error
+                                                                      │  output:
+                                                                      │   Error: budget exceeded ($5
+                                                                      │   0.00 limit)
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+  Ready  model: fake-backend   [WORKSPACE]                            │
+──────────────────────────────────────────────────────────────────────│
+Type a message... (press 'i' to focus input)                          │
+                                                                      │

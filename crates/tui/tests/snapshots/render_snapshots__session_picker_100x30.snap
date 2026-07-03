@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+         ┌ Sessions ──────────────────────────────────────────────────────────────────────┐
+         │> type to filter…    (2 shown)                                                  │
+         │                                                                                │
+         │ ● 2025-07-21 20:00   12t  gemma-4-12B-it-qat-UD…  sess-3  ◀                    │
+         │   2025-07-19 12:26    4t  anthropic/claude-sonn…  sess-2                       │
+         │                                                                                │
+         │  filter · j/k move · ↵ resume · Esc close                                      │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+         │                                                                                │
+┌ Prompt │                                                                                │
+│ Type a │                                                                                │
+│        └────────────────────────────────────────────────────────────────────────────────┘
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

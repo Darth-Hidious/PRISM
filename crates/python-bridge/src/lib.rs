@@ -1,0 +1,86 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+//! Python worker launch and supervision primitives.
+//!
+//! Makes the Python TAOR runtime an explicitly supervised child process rather
+//! than the top-level CLI shell. Handles subprocess spawning, venv discovery,
+//! environment variable injection, and stdio piping for JSON-RPC communication.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+
+use serde::{Deserialize, Serialize};
+use tokio::process::{Child, Command};
+
+pub mod tool_server;
+pub mod venv;
+pub use tool_server::{ToolServer, ToolServerHandle};
+pub use venv::ensure_venv;
+
+#[derive(Debug, thiserror::Error)]
+pub enum PythonBridgeError {
+    #[error("failed to spawn python worker: {0}")]
+    Spawn(#[from] std::io::Error),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PythonWorkerConfig {
+    pub python_bin: PathBuf,
+    pub module: String,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+impl PythonWorkerConfig {
+    pub fn backend(project_root: impl Into<PathBuf>) -> Self {
+        Self {
+            python_bin: PathBuf::from("python3"),
+            module: "app.backend".to_string(),
+            cwd: project_root.into(),
+            env: BTreeMap::new(),
+        }
+    }
+
+    pub fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.python_bin);
+        cmd.arg("-m")
+            .arg(&self.module)
+            .current_dir(&self.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+
+        cmd
+    }
+
+    pub async fn spawn(&self) -> Result<Child, PythonBridgeError> {
+        let child = self.command().spawn()?;
+        tracing::info!(
+            module = %self.module,
+            cwd = %self.cwd.display(),
+            "spawned python worker"
+        );
+        Ok(child)
+    }
+
+    pub fn stdio_command(&self) -> Command {
+        let mut cmd = Command::new(&self.python_bin);
+        cmd.arg("-m")
+            .arg(&self.module)
+            .current_dir(&self.cwd)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+
+        cmd
+    }
+}

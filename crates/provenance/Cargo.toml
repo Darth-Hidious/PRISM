@@ -1,0 +1,21 @@
+[package]
+name = "prism-provenance"
+description = "Provenance layer — Turso-backed audit trail for every action in the materials discovery pipeline."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+prism-embed = { path = "../embed" }
+turso = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+❯ You                                                              │  1. prompt "think about this" •
+▌ think about this                                                 │
+                                                                   │
+◇ [thinking… 56 chars — Ctrl-T to expand]                          │
+◆ PRISM                                                            │
+  Based on my reasoning, here is the answer.                       │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+┌ Prompt ─────────────────────────────────────────────────────────┐│
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)              ││
+│                                                                 ││
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend  [thinking · Ctrl-T]   [INPUT]    Ctrl│

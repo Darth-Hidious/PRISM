@@ -1,0 +1,189 @@
+//! mDNS-based local network node discovery using DNS-SD.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
+use uuid::Uuid;
+
+use crate::PeerNode;
+
+/// The DNS-SD service type for PRISM nodes.
+const SERVICE_TYPE: &str = "_prism._tcp.local.";
+
+/// Handles mDNS announcement and discovery on the local network.
+pub struct MdnsDiscovery {
+    daemon: ServiceDaemon,
+    instance_name: Option<String>,
+    port: u16,
+}
+
+impl MdnsDiscovery {
+    /// Create a new mDNS discovery handle.
+    pub fn new(_service_name: &str, port: u16) -> Result<Self> {
+        let daemon = ServiceDaemon::new().context("failed to create mDNS daemon")?;
+        Ok(Self {
+            daemon,
+            instance_name: None,
+            port,
+        })
+    }
+
+    /// Announce this node on the local network via mDNS.
+    /// The auth token is included in TXT records so peers can verify
+    /// this node is authenticated via MARC27.
+    pub fn announce(
+        &mut self,
+        node_id: Uuid,
+        name: &str,
+        capabilities: &[String],
+        auth_token: Option<&str>,
+    ) -> Result<()> {
+        let instance_name = format!("prism-{}", &node_id.to_string()[..8]);
+        let mut properties = HashMap::new();
+        properties.insert("node_id".to_string(), node_id.to_string());
+        properties.insert("name".to_string(), name.to_string());
+        properties.insert("caps".to_string(), capabilities.join(","));
+        // Include a short hash of the auth token so peers can verify
+        // this node is authenticated. Full token exchange happens over
+        // the encrypted mesh channel, not in mDNS plaintext.
+        if let Some(token) = auth_token {
+            let hash = simple_token_hash(token);
+            properties.insert("auth".to_string(), hash);
+        }
+
+        // Pass an explicit address list so mdns-sd advertises on BOTH
+        // loopback (so two prism processes on the same machine see
+        // each other) AND the host's primary IPv4 (so cross-machine
+        // discovery works). Empty-string auto-detect in mdns-sd 0.18
+        // omits 127.0.0.1, which broke local two-process discovery —
+        // see `prepare_announce: no valid addrs on interface lo0` in
+        // debug logs and SHIPPED.md / Bug #19.
+        //
+        // Format is space-separated IPs in the address-list slot.
+        let service = ServiceInfo::new(
+            SERVICE_TYPE,
+            &instance_name,
+            &format!("{instance_name}.local."),
+            "127.0.0.1",
+            self.port,
+            properties,
+        )
+        .context("failed to create mDNS service info")?
+        .enable_addr_auto();
+
+        self.daemon
+            .register(service)
+            .context("failed to register mDNS service")?;
+
+        self.instance_name = Some(instance_name.clone());
+        tracing::info!(%node_id, %name, port = self.port, "mDNS: announced as {instance_name}");
+        Ok(())
+    }
+
+    /// Scan the local network for other PRISM nodes via mDNS.
+    pub fn discover(&self, timeout: Duration) -> Result<Vec<PeerNode>> {
+        let receiver = self
+            .daemon
+            .browse(SERVICE_TYPE)
+            .context("failed to start mDNS browse")?;
+
+        let mut peers = Vec::new();
+        let deadline = std::time::Instant::now() + timeout;
+
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match receiver.recv_timeout(remaining) {
+                Ok(ServiceEvent::ServiceResolved(info)) => {
+                    if let Some(peer) = service_info_to_peer(&info) {
+                        // Skip self
+                        if self.instance_name.as_deref()
+                            == Some(info.get_fullname().split('.').next().unwrap_or(""))
+                        {
+                            continue;
+                        }
+                        tracing::debug!(peer_name = %peer.name, peer_id = %peer.node_id, "mDNS: discovered peer");
+                        peers.push(peer);
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        // Stop browsing
+        let _ = self.daemon.stop_browse(SERVICE_TYPE);
+        Ok(peers)
+    }
+
+    /// Stop mDNS announcements and shut down the daemon.
+    pub fn stop(self) -> Result<()> {
+        if let Some(ref name) = self.instance_name {
+            let fullname = format!("{name}.{SERVICE_TYPE}");
+            let _ = self.daemon.unregister(&fullname);
+            tracing::info!(service = %fullname, "mDNS: unregistered");
+        }
+        self.daemon
+            .shutdown()
+            .context("failed to shut down mDNS daemon")?;
+        Ok(())
+    }
+}
+
+/// Convert a resolved mDNS service into a `PeerNode`.
+///
+/// Takes `&ResolvedService` (mdns-sd 0.18 API) — the old `ServiceInfo`
+/// type was split: `ServiceInfo` is now publisher-side metadata for
+/// `register()`, `ResolvedService` is querier-side plain data emitted
+/// by `ServiceResolved` events. The accessor methods are the same.
+fn service_info_to_peer(info: &ResolvedService) -> Option<PeerNode> {
+    let node_id_str = info.get_property_val_str("node_id")?;
+    let node_id = Uuid::parse_str(node_id_str).ok()?;
+    let name = info
+        .get_property_val_str("name")
+        .unwrap_or("unknown")
+        .to_string();
+    let caps_str = info.get_property_val_str("caps").unwrap_or("");
+    let capabilities: Vec<String> = caps_str
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    // Check if the peer is authenticated (has auth hash in TXT records)
+    let auth_hash = info.get_property_val_str("auth").map(String::from);
+    let authenticated = auth_hash.is_some();
+
+    // `addresses` is `HashSet<ScopedIp>` in 0.18; extract any IP.
+    let address = info
+        .get_addresses()
+        .iter()
+        .next()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "127.0.0.1".into());
+
+    Some(PeerNode {
+        node_id,
+        name,
+        address,
+        port: info.get_port(),
+        last_seen: Utc::now(),
+        capabilities,
+        authenticated,
+        auth_hash,
+    })
+}
+
+/// Simple non-cryptographic hash of the auth token for mDNS TXT records.
+/// This is NOT a security mechanism — it's a quick "is this peer
+/// authenticated at all?" check. Full verification happens over the
+/// encrypted mesh channel via `federation::verify_peer`.
+fn simple_token_hash(token: &str) -> String {
+    let mut hash: u64 = 5381;
+    for byte in token.bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
+    }
+    format!("{hash:016x}")
+}

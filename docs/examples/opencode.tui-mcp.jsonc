@@ -1,0 +1,35 @@
+// Example OpenCode config for TUI MCP verification.
+//
+// Copy this into your ~/.config/opencode/opencode.json (or the project
+// .opencode/opencode.json) to enable the TUI MCP server for PRISM
+// TUI visual verification.  Keep it disabled by default and enable
+// only when running the verifier agent.
+//
+// Usage:
+//   1. Copy this file to your opencode config location.
+//   2. Set "enabled": true when you want to run TUI verification.
+//   3. Run: prism tui --fake-backend --scenario basic_chat
+//   4. Use the TUI MCP tools to interact with the TUI.
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "mcp": {
+    "tui": {
+      "type": "local",
+      "command": ["npx", "-y", "tui-mcp"],
+      "enabled": true,
+      "timeout": 10000
+    }
+  },
+
+  "permission": {
+    "bash": "ask",
+    "edit": "ask",
+    "write": "ask"
+  },
+
+  "instructions": [
+    "AGENTS.md",
+    "PRISM_TUI_VERIFY.md"
+  ]
+}

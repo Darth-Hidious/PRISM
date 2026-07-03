@@ -1,0 +1,16 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New ses│ Workspace
+               ▲│ [Activity] Tools Files
+❯ You          ║│
+▌ Hello        █│  1. prompt "Hello" •
+               ║│
+◆ PRISM        ▼│
+┌ Prompt ──────┐│
+│ Type a messag││
+│              ││
+│              ││
+└──────────────┘│
+  Ready  model: │

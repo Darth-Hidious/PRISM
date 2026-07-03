@@ -1,0 +1,43 @@
+[package]
+name = "prism-mesh"
+description = "Node discovery and data federation — mDNS, platform-mediated cross-org, and pub/sub subscriptions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+mdns-sd = { workspace = true }
+rdkafka = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+prism-client = { path = "../client" }
+prism-proto = { path = "../proto" }
+
+[dev-dependencies]
+prism-audit = { path = "../audit" }
+prism-policy = { path = "../policy" }
+rand = { workspace = true }
+tempfile = "3"
+
+# F6 — cross-site inference demo.
+# Wires F1 (identity) + F1c3 (lookups) + F2 (policy) + F3 (locality)
+# + F4 (burst routing) + F5 (audit) end-to-end in a single binary.
+[[example]]
+name = "cross_site_inference"
+path = "examples/cross_site_inference.rs"

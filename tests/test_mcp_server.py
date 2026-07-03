@@ -1,0 +1,123 @@
+"""Tests for MCP server."""
+import asyncio
+import json
+import pytest
+from fastmcp import Client
+from app.mcp_server import create_mcp_server
+
+
+class TestMCPServer:
+    def test_server_creation(self):
+        server = create_mcp_server()
+        assert server is not None
+        assert server.name == "prism"
+
+    def test_server_has_tools(self):
+        server = create_mcp_server()
+        client = Client(server)
+
+        async def run():
+            async with client:
+                tools = await client.list_tools()
+                return [t.name for t in tools]
+
+        tool_names = asyncio.run(run())
+        # After Round 4-7 collapses:
+        #   search_materials → materials_search (canonical federated)
+        #   export_results_csv → dataset(action='export')
+        #   predict_property → predict(target=...)
+        assert "materials_search" in tool_names
+        assert "query_materials_project" in tool_names
+        assert "dataset" in tool_names
+        assert "predict" in tool_names
+        assert "list_models" in tool_names
+        assert len(tool_names) >= 10
+
+    def test_server_has_resources(self):
+        server = create_mcp_server()
+        client = Client(server)
+
+        async def run():
+            async with client:
+                resources = await client.list_resources()
+                return [str(r.uri) for r in resources]
+
+        uris = asyncio.run(run())
+        # Sessions moved to Rust agent — MCP server exposes tools + datasets
+        assert any("tools" in u for u in uris)
+
+    def test_tool_schema_has_descriptions(self):
+        """Tool schemas should include parameter descriptions from input_schema."""
+        server = create_mcp_server()
+        client = Client(server)
+
+        async def run():
+            async with client:
+                tools = await client.list_tools()
+                return {t.name: t.inputSchema for t in tools}
+
+        schemas = asyncio.run(run())
+        # materials_search has elements with a description (was search_materials
+        # pre-Round 7; canonical federated tool now)
+        search_schema = schemas["materials_search"]
+        assert "elements" in search_schema["properties"]
+        assert search_schema["properties"]["elements"]["type"] == "array"
+        # elements is optional (no required fields for materials_search)
+        assert "elements" not in search_schema.get("required", [])
+
+    def test_tool_schema_required_optional(self):
+        """Required and optional params should be correctly marked in schema."""
+        server = create_mcp_server()
+        client = Client(server)
+
+        async def run():
+            async with client:
+                tools = await client.list_tools()
+                return {t.name: t.inputSchema for t in tools}
+
+        schemas = asyncio.run(run())
+        # Unified `predict` tool: target is required; formula/property_name/etc.
+        # are optional (validated by the dispatcher per-target).
+        predict_schema = schemas["predict"]
+        assert "target" in predict_schema.get("required", [])
+        assert "formula" not in predict_schema.get("required", [])
+
+    def test_tools_resource_returns_json(self):
+        server = create_mcp_server()
+        client = Client(server)
+
+        async def run():
+            async with client:
+                result = await client.read_resource("prism://tools")
+                return result
+
+        result = asyncio.run(run())
+        # Result should be parseable JSON with tool names
+        text = str(result)
+        assert "materials_search" in text  # was search_materials pre-Round 7
+        assert "list_models" in text
+
+    def test_server_has_dataset_and_model_resources(self):
+        server = create_mcp_server()
+        client = Client(server)
+
+        async def run():
+            async with client:
+                resources = await client.list_resources()
+                return [str(r.uri) for r in resources]
+
+        uris = asyncio.run(run())
+        assert any("datasets" in u for u in uris)
+        assert any("models" in u for u in uris)
+
+    def test_server_has_dataset_template_resource(self):
+        server = create_mcp_server()
+        client = Client(server)
+
+        async def run():
+            async with client:
+                templates = await client.list_resource_templates()
+                return [str(t.uriTemplate) for t in templates]
+
+        templates = asyncio.run(run())
+        assert any("datasets" in t for t in templates)

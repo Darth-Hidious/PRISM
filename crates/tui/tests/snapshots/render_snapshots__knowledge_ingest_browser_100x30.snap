@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+                                                                   │  (no activity yet)
+                                                                   │
+              ┌ Knowledge ───────────────────────────────────────────────────────────┐
+              │ Search  [Ingest]                                                     │
+              │                                                                      │
+              │  /data/papers   (.pdf .csv .json)                                    │
+              │                                                                      │
+              │    ../                                                               │
+              │    reviews/                                                          │
+              │    lpbf_params.csv                                                   │
+              │  ▸ niti_sma.pdf  ◀                                                   │
+              │    phase_graph.json                                                  │
+              │                                                                      │
+              │  Tab mode · ↑↓ move · ↵ open/pick · ←/Bksp up · Esc close            │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+┌ Prompt ─────│                                                                      │
+│ Type a messa└──────────────────────────────────────────────────────────────────────┘
+│                                                                 ││
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

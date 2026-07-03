@@ -1,0 +1,140 @@
+"""Tests for SearchEngine orchestrator — federated async fan-out, caching, audit trail."""
+import asyncio
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from app.tools.search_engine.cache.engine import SearchCache
+from app.tools.search_engine.query import MaterialSearchQuery, PropertyRange
+from app.tools.search_engine.resilience.circuit_breaker import HealthManager
+from app.tools.search_engine.result import Material, PropertyValue
+
+
+def _mock_material(pid="mp", formula="Fe2O3"):
+    return Material(
+        id=f"{pid}-1", formula=formula, elements=["Fe", "O"],
+        n_elements=2, sources=[pid],
+        band_gap=PropertyValue(value=2.2, source=f"optimade:{pid}", unit="eV"),
+    )
+
+
+def _isolated_engine(registry):
+    """Create a SearchEngine with no disk persistence (fully isolated)."""
+    from app.tools.search_engine.engine import SearchEngine
+    return SearchEngine(
+        registry=registry,
+        cache=SearchCache(disk_dir=None),
+        health_manager=HealthManager(persist_path=None),
+    )
+
+
+def test_engine_creates():
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    engine = _isolated_engine(ProviderRegistry())
+    assert engine is not None
+
+
+def test_engine_search_empty_registry():
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    engine = _isolated_engine(ProviderRegistry())
+    q = MaterialSearchQuery(elements=["Fe"])
+    result = asyncio.run(engine.search(q))
+    assert result.total_count == 0
+    assert result.warnings  # should warn no providers
+
+
+def test_engine_search_with_mock_provider():
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+
+    class MockProvider(Provider):
+        id = "mock"
+        name = "Mock"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+        async def search(self, query):
+            return [_mock_material("mock")]
+
+    reg = ProviderRegistry()
+    reg.register(MockProvider())
+    engine = _isolated_engine(reg)
+    q = MaterialSearchQuery(elements=["Fe", "O"])
+    result = asyncio.run(engine.search(q))
+    assert result.total_count == 1
+    assert result.materials[0].formula == "Fe2O3"
+    assert len(result.query_log) == 1
+    assert result.query_log[0].status == "success"
+
+
+def test_engine_search_provider_failure_graceful():
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+
+    class FailProvider(Provider):
+        id = "fail"
+        name = "Fail"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+        async def search(self, query):
+            raise ConnectionError("Provider down")
+
+    class GoodProvider(Provider):
+        id = "good"
+        name = "Good"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+        async def search(self, query):
+            return [_mock_material("good")]
+
+    reg = ProviderRegistry()
+    reg.register(FailProvider())
+    reg.register(GoodProvider())
+    engine = _isolated_engine(reg)
+    q = MaterialSearchQuery(elements=["Fe"])
+    result = asyncio.run(engine.search(q))
+    assert result.total_count == 1
+    assert len(result.query_log) == 2
+    statuses = {log.provider_id: log.status for log in result.query_log}
+    assert statuses["fail"] in ("http_error", "timeout")
+    assert statuses["good"] == "success"
+
+
+def test_engine_caches_result():
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+
+    call_count = 0
+    class CountingProvider(Provider):
+        id = "counter"
+        name = "Counter"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+        async def search(self, query):
+            nonlocal call_count
+            call_count += 1
+            return [_mock_material("counter")]
+
+    reg = ProviderRegistry()
+    reg.register(CountingProvider())
+    engine = _isolated_engine(reg)
+    q = MaterialSearchQuery(elements=["Fe"])
+    r1 = asyncio.run(engine.search(q))
+    r2 = asyncio.run(engine.search(q))
+    assert call_count == 1
+    assert r2.cached is True
+
+
+def test_engine_audit_trail_has_url():
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+
+    class MockProvider(Provider):
+        id = "mock"
+        name = "Mock Provider"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+        async def search(self, query):
+            return []
+
+    reg = ProviderRegistry()
+    reg.register(MockProvider())
+    engine = _isolated_engine(reg)
+    q = MaterialSearchQuery(elements=["Fe"])
+    result = asyncio.run(engine.search(q))
+    assert len(result.query_log) == 1
+    assert result.query_log[0].provider_id == "mock"

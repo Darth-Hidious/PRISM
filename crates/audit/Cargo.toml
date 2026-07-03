@@ -1,0 +1,23 @@
+[package]
+name = "prism-audit"
+description = "Signed cross-org audit envelopes — append-only, Ed25519-signed records of cross-org events for after-the-fact verification."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = "3"

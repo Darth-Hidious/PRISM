@@ -1,0 +1,24 @@
+PRISM
+Copyright 2026 MARC27
+
+This product includes software developed by Tailcall (https://tailcall.run)
+licensed under the Apache License, Version 2.0:
+
+    Forge / ForgeCode
+    Copyright tailcallhq and contributors
+    https://github.com/tailcallhq/forgecode
+
+The vendored crates under crates/forge_* are derived from ForgeCode and
+remain under the Apache License, Version 2.0. See LICENSE-APACHE-2.0 for the
+full license text.
+
+PRISM-specific code (crates/agent, crates/cli, crates/client, crates/compute,
+crates/core, crates/ingest, crates/ipc, crates/llm, crates/mesh, crates/node,
+crates/orch, crates/policy, crates/proto, crates/python-bridge, crates/runtime,
+crates/server, crates/workflows) is licensed under the dual MIT / MARC27
+Source-Available license documented in LICENSE-MIT and LICENSE-MARC27.
+
+Modifications to ForgeCode in this distribution include:
+- Removal of PostHog telemetry from forge_tracker
+- Removal of forge_ci (CI helpers)
+- Workspace integration with PRISM

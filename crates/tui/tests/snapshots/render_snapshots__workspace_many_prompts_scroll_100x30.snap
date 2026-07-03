@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v1 · 99 tools ─────────────────────────────────────────────────│  10. prompt "prompt numbe…"
+· PRISM v1                                                            │  11. prompt "prompt numbe…"
+                                                                      │  12. prompt "prompt numbe…"
+                                                                      │  13. prompt "prompt numbe…"
+                                                                      │  14. prompt "prompt numbe…"
+                                                                      │  15. prompt "prompt numbe…"
+                                                                      │  16. prompt "prompt numbe…"
+                                                                      │  17. prompt "prompt numbe…"
+                                                                      │  18. prompt "prompt numbe…"
+                                                                      │  19. prompt "prompt numbe…"
+                                                                      │  20. prompt "prompt numbe…"
+                                                                      │  21. prompt "prompt numbe…"
+                                                                      │  22. prompt "prompt numbe…"
+                                                                      │  23. prompt "prompt numbe…"
+                                                                      │  24. prompt "prompt numbe…"
+                                                                      │  25. prompt "prompt numbe…"
+                                                                      │  26. prompt "prompt numbe…"
+                                                                      │  27. prompt "prompt numbe…"
+                                                                      │  28. prompt "prompt numbe…"
+                                                                      │  29. prompt "prompt numbe…"
+                                                                      │▸ 30. prompt "prompt numbe…"
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+                                                                      │
+  Ready  model: fake-backend   [WORKSPACE]                            │
+──────────────────────────────────────────────────────────────────────│
+Type a message... (press 'i' to focus input)                          │
+                                                                      │

@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ PRISM v1 · 99 tools ─────────────────────────────────────────────────│ Workspace
+· PRISM v1                                                            │  Activity [Tools] Files
+                                                                      │
+> run big tool                                                        │▸ ✓ materials_search  412ms
+                                                                      │  call_id: call-3
+⚙ Running materials_search                                            │  status: Succeeded
+                                                                      │  approval: no
+⚙ materials_search: candidate candidate candidate candidate candidate │  elapsed: 412ms
+candidate candidate candidate candidate candidate candidate candidate │  type: results
+candidate candidate candidate candidate candidate candidate candidate │  output:
+candidate candidate candidate candidate candidate candidate candidate │   candidate candidate candid
+candidate candidate candidate candidate candidate candidate candidate │   ate candidate candidate ca
+candidate candidate candidate candidate candidate candidate candidate │   ndidate candidate candidat
+candidate candidate candidate candidate candidate candidate candidate │   e candidate candidate cand
+candidate candidate candidate candidate candidate candidate candidate │   idate candidate candidate
+candidate candidate candidate candidate candidate candidate candidate │   candidate candidate candid
+candidate candidate candidate candidate candidate candidate candidate │   …
+candidate candidate candidate candidate candidate candidate candidate │  [truncated]
+candidate candidate candidate candidate candidate candidate candidate │
+candidate candidate candidate candidate candidate candidate candidate │
+candidate candidate candidate candidate candidate candidate candidate │
+candidate candidate candidate candidate candidate candidate candidate │
+candidate candidate candidate candidate candidate candidate candidate │
+candidate candidate candidate candidate candidate candidate candidate │
+candidate candidate candidate candidate candidate candidate candidate │
+candidate candidate candidate candidate candidate candidate candidate │
+  Ready  model: fake-backend   [WORKSPACE]                            │
+──────────────────────────────────────────────────────────────────────│
+Type a message... (press 'i' to focus input)                          │
+                                                                      │

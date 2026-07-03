@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+❯ You                                                              │  1. prompt "compare these so… •
+▌ compare these sources                                            │
+                                                                   │
+◆ PRISM       ┌ Links ───────────────────────────────────────────────────────────────┐
+  See alpha an│  2 link(s) in the transcript — newest first                          │
+              │                                                                      │
+              │  1 https://alpha.example.org/a  ◀                                    │
+              │  2 https://beta.example.org/b                                        │
+              │                                                                      │
+              │  1-9 open · j/k move · ↵ open · Esc close                            │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              │                                                                      │
+              └──────────────────────────────────────────────────────────────────────┘
+┌ Prompt ─────────────────────────────────────────────────────────┐│
+│type a message…  (press i to focus · ↵ send)                     ││
+│                                                                 ││
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [CHAT]    Ctrl-C quit               │

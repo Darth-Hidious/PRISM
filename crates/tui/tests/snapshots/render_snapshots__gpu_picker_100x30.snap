@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+           ┌ Procure GPU compute ───────────────────────────────────────────────────────┐
+           │   GPU                   VRAM  Region    Provider         $/hr              │
+           │                                                                            │
+           │ ● RTX-4090             24 GB  US        runpod       $0.44/hr  ◀           │
+           │ ● L40S                 48 GB  EU        datacrunch   $0.89/hr              │
+           │ ● A100-80GB            80 GB  US        runpod       $1.64/hr              │
+           │ ● H100-SXM5            80 GB  EU        datacrunch   $2.19/hr              │
+           │ ○ B200                192 GB  US        nebius       $4.80/hr  unavailable │
+           │                                                                            │
+           │  ↑↓ · ↵ use · Esc                                                          │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+┌ Prompt ──│                                                                            │
+│ Type a me│                                                                            │
+│          └────────────────────────────────────────────────────────────────────────────┘
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │
