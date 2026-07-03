@@ -133,6 +133,19 @@ pub struct ModelPicker {
     pub loading: bool,
 }
 
+/// Preferred models shown in the `/model` picker's default (empty-query)
+/// view, in display order, so opening it isn't a wall of ~550 rows.
+/// IDs match the live MARC27 catalog; typing searches the full list.
+/// Kept in step with the CLI onboarding shortlist (`cli/onboarding.rs`).
+const CURATED_MODEL_IDS: &[&str] = &[
+    "anthropic/claude-sonnet-5",
+    "anthropic/claude-haiku-4.5",
+    "anthropic/claude-opus-4.7",
+    "anthropic/claude-fable-5",
+    "gpt-5.5",
+    "google/gemma-4-31b-it:free",
+];
+
 /// GPU picker state — the live compute-procurement catalog (palette entry
 /// `compute.gpus`). Populated from the `ui.gpu.list` notification; Enter
 /// pre-fills the prompt with a provision request for the selected offer.
@@ -1528,6 +1541,38 @@ impl App {
     /// Indices of models matching the query (subsequence fuzzy), in order.
     pub fn model_filtered_indices(&self) -> Vec<usize> {
         let q = self.model_picker.query.trim().to_lowercase();
+
+        // Empty query → a curated shortlist, not the full ~550-model
+        // catalog. Typing anything switches to a full fuzzy search over
+        // every hosted model, so power users still reach all of them.
+        if q.is_empty() {
+            let find = |id: &str| {
+                self.model_picker
+                    .models
+                    .iter()
+                    .position(|m| m.get("id").and_then(|v| v.as_str()) == Some(id))
+            };
+            let mut out: Vec<usize> = Vec::new();
+            for pref in CURATED_MODEL_IDS {
+                if let Some(i) = find(pref) {
+                    out.push(i);
+                }
+            }
+            // Always surface the active model, even if it is off-shortlist.
+            if !self.model_picker.current.is_empty()
+                && let Some(i) = find(&self.model_picker.current)
+                && !out.contains(&i)
+            {
+                out.push(i);
+            }
+            // Never render a blank picker: if the catalog carried none of
+            // the preferred ids (e.g. a mock/offline list), show all.
+            if out.is_empty() {
+                return (0..self.model_picker.models.len()).collect();
+            }
+            return out;
+        }
+
         let needle: Vec<char> = q.chars().collect();
         let mut matched: Vec<(String, String, usize)> = self
             .model_picker
@@ -1535,9 +1580,6 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, m)| {
-                if needle.is_empty() {
-                    return true;
-                }
                 let hay = format!(
                     "{} {} {}",
                     m.get("id").and_then(|v| v.as_str()).unwrap_or(""),

@@ -11,6 +11,7 @@ mod doctor;
 mod forge_chat;
 mod mcp_server_native;
 mod notebook;
+mod onboarding;
 mod platform_bridge;
 mod pyiron_cmd;
 mod tool_sync;
@@ -1563,17 +1564,30 @@ async fn main() -> Result<()> {
                         provider_key.or(api_key),
                     )
                 }
-                // Marc27 cloud: base URL from prism.toml [llm]; the model is
-                // the one the user picked via `prism use marc27 --model …`,
-                // which is persisted on the chat target. Previously the
-                // target's model was discarded (`Marc27 { .. }`), so the
-                // backend always served prism.toml/gpt-5.5 even though
-                // `/use show` reported the user's selection — the status bar
-                // then showed gpt-5.5 while the palette said sonnet.
+                // Marc27 cloud. Two bugs were hiding here:
+                //
+                //   1. The picked model was discarded (`Marc27 { .. }`), so
+                //      the backend served the default even when `/use show`
+                //      reported a selection (status bar said gpt-5.5 while
+                //      the palette said sonnet).
+                //   2. The base URL fell through to `cfg_llm.url`, whose
+                //      default is `http://localhost:8080` (llama.cpp). With
+                //      no prism.toml the "cloud" chat therefore ran on a
+                //      LOCAL model — silently, with the header still showing
+                //      the cloud model and credits never moving. It only
+                //      "worked" because a local llama.cpp happened to be up;
+                //      its 16k context is what produced the mystery
+                //      exceed_context_size_error.
+                //
+                // Now the base URL is the signed-in project's MARC27 LLM
+                // endpoint. The agent's LLM client recognises the `/llm`
+                // segment and drives it over MARC27's native `/stream` SSE
+                // protocol, so the cloud picks the real model and enforces
+                // its real context + output limits.
                 crate::chat_config::ChatTarget::Marc27 {
                     model: target_model,
                 } => (
-                    std::env::var("LLM_BASE_URL").unwrap_or_else(|_| cfg_llm.url.clone()),
+                    marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url),
                     resolve_marc27_model(
                         std::env::var("LLM_MODEL").ok(),
                         target_model.as_deref(),
@@ -1583,11 +1597,21 @@ async fn main() -> Result<()> {
                 ),
             };
 
+            // The model's real limits from the platform catalog. Drives
+            // the agent's context budget: compaction fires on token
+            // pressure against THIS window, not a guessed constant.
+            // (None, None) for unknown models (local llama.cpp, offline)
+            // → the agent falls back to turn-count compaction.
+            let (context_window, max_output_tokens) = fetch_model_limits(&paths, &model).await;
+            tracing::info!(?context_window, ?max_output_tokens, model = %model, "model limits");
+
             let llm_config = LlmConfig {
                 base_url,
                 model,
                 api_key,
                 embedding_model: cfg_llm.embedding_model.clone(),
+                context_window,
+                max_output_tokens,
                 ..Default::default()
             };
 
@@ -2067,8 +2091,7 @@ async fn main() -> Result<()> {
                         model,
                         api_key,
                         embedding_model: node_config.indexer.embedding_model.clone(),
-                        max_sample_rows: 10,
-                        timeout_secs: 300,
+                        ..Default::default()
                     });
                 }
 
@@ -3204,6 +3227,13 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
+            // First-run onboarding. A brand-new user (no credentials on
+            // disk) gets a guided sign-in + model pick instead of being
+            // dropped into the TUI on silent defaults — the reason a
+            // fresh install used to show `gpt-5.5` with nobody logged in.
+            // No-ops on repeat launches and in non-interactive contexts.
+            onboarding::run_if_first_launch(&paths, &endpoints, &python).await?;
+
             // Auto-refresh + refresh-on-rejection. Mirrors the `prism
             // setup` path — see comments there for design notes.
             // The two triggers (proactive expiry + reactive 401) keep
@@ -4154,8 +4184,8 @@ fn build_llm_config(
         model,
         api_key,
         embedding_model: llm.embedding_model.clone(),
-        max_sample_rows: 10,
         timeout_secs: llm.timeout_secs,
+        ..Default::default()
     })
 }
 
@@ -7495,7 +7525,93 @@ fn resolve_marc27_model(
     env_model
         .or_else(|| target_model.map(str::to_string))
         .or_else(|| cfg_model.map(str::to_string))
-        .unwrap_or_else(|| "gpt-5.5".to_string())
+        .unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string())
+}
+
+/// The per-project MARC27 LLM base URL. The agent's LLM client recognises
+/// the trailing `/llm` and drives it over MARC27's native `/stream` SSE
+/// endpoint (`{api_base}/projects/{id}/llm/stream`). Pure so the join is
+/// unit-testable.
+fn marc27_llm_url_for_project(api_base: &str, project_id: &str) -> String {
+    format!(
+        "{}/projects/{}/llm",
+        api_base.trim_end_matches('/'),
+        project_id
+    )
+}
+
+/// Look up the active model's context/token limits in the platform
+/// catalog (`GET /projects/{id}/llm/models`, same endpoint as `prism
+/// models list`). Fail-open on every path — offline, no auth, network
+/// error, model not in catalog — returning `(None, None)`: the agent
+/// then uses conservative fallback behavior instead of a wrong number.
+/// Bounded by a short timeout so backend startup is never held hostage.
+async fn fetch_model_limits(paths: &PrismPaths, model_id: &str) -> (Option<u64>, Option<u64>) {
+    if std::env::var("PRISM_OFFLINE").as_deref() == Ok("1") {
+        return (None, None);
+    }
+    let Ok((api_base, auth)) = resolve_agent_auth() else {
+        return (None, None);
+    };
+    let Ok(project_id) = resolve_active_project_id(paths) else {
+        return (None, None);
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        return (None, None);
+    };
+    let response: serde_json::Value = match auth
+        .apply(client.get(format!("{api_base}/projects/{project_id}/llm/models")))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+    {
+        Ok(resp) => match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return (None, None),
+        },
+        Err(_) => return (None, None),
+    };
+    let models = value_array(&response, &["models", "items", "data"])
+        .cloned()
+        .unwrap_or_default();
+    let Some(entry) = models
+        .iter()
+        .find(|m| value_string(m, &["model_id", "id"]) == Some(model_id))
+    else {
+        return (None, None);
+    };
+    (
+        entry.get("context_window").and_then(|v| v.as_u64()),
+        entry.get("max_output_tokens").and_then(|v| v.as_u64()),
+    )
+}
+
+/// Resolve the base URL for the MARC27-cloud chat target.
+///
+/// `LLM_BASE_URL` overrides everything (power users, local-model dev, the
+/// micro-server test). Otherwise route at the signed-in project's MARC27
+/// LLM endpoint so the cloud enforces each model's real context window +
+/// output cap. Only when there is no usable session (no creds / no
+/// project) do we fall back to `cfg_llm.url` — whose default is
+/// `http://localhost:8080` (llama.cpp). Using that fallback
+/// unconditionally is exactly what made "MARC27 cloud" chat run on a
+/// local 16k model.
+fn marc27_llm_base_url(paths: &PrismPaths, api_base: &str, fallback_url: &str) -> String {
+    if let Ok(explicit) = std::env::var("LLM_BASE_URL") {
+        return explicit;
+    }
+    if let Some(project_id) = paths
+        .load_cli_state()
+        .ok()
+        .and_then(|s| s.credentials)
+        .and_then(|c| c.project_id)
+    {
+        return marc27_llm_url_for_project(api_base, &project_id);
+    }
+    fallback_url.to_string()
 }
 
 #[cfg(test)]
@@ -7510,8 +7626,12 @@ mod tests {
             "claude-sonnet-4",
             "the user's `prism use marc27 --model` pick must win over the default"
         );
-        // No selection anywhere → compiled default.
-        assert_eq!(resolve_marc27_model(None, None, None), "gpt-5.5");
+        // No selection anywhere → compiled default (Claude Sonnet 5,
+        // the MARC27 platform default — not an OpenAI model).
+        assert_eq!(
+            resolve_marc27_model(None, None, None),
+            "anthropic/claude-sonnet-5"
+        );
         // prism.toml [llm].model used when the target carries no model.
         assert_eq!(
             resolve_marc27_model(None, None, Some("mistral-large-latest")),
@@ -7521,6 +7641,21 @@ mod tests {
         assert_eq!(
             resolve_marc27_model(Some("gpt-5.5".into()), Some("claude-sonnet-4"), None),
             "gpt-5.5"
+        );
+    }
+
+    #[test]
+    fn marc27_llm_url_targets_the_project_stream_endpoint() {
+        // `{api_base}/projects/{id}/llm` — the agent client appends
+        // `/stream`, giving the real route the API exposes.
+        assert_eq!(
+            marc27_llm_url_for_project("https://api.marc27.com/api/v1", "proj-123"),
+            "https://api.marc27.com/api/v1/projects/proj-123/llm"
+        );
+        // A trailing slash on the api_base must not double up.
+        assert_eq!(
+            marc27_llm_url_for_project("https://api.marc27.com/api/v1/", "proj-123"),
+            "https://api.marc27.com/api/v1/projects/proj-123/llm"
         );
     }
 

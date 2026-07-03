@@ -156,8 +156,8 @@ fn llm_config(base_url: String) -> LlmConfig {
         model: "stub-model".to_string(),
         api_key: None,
         embedding_model: None,
-        max_sample_rows: 10,
         timeout_secs: 30,
+        ..Default::default()
     }
 }
 

@@ -33,6 +33,15 @@ pub struct LlmConfig {
     /// Request timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// The model's context window in tokens, from the platform catalog.
+    /// `None` = unknown (e.g. local llama.cpp) — consumers must fall back
+    /// to conservative behavior, never assume a size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// The model's max output tokens, from the platform catalog. Used to
+    /// reserve room for the response when budgeting input context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
 }
 
 fn default_max_sample_rows() -> usize {
@@ -53,6 +62,8 @@ impl Default for LlmConfig {
             embedding_model: None,
             max_sample_rows: 10,
             timeout_secs: 300,
+            context_window: None,
+            max_output_tokens: None,
         }
     }
 }

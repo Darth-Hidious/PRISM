@@ -1060,8 +1060,7 @@ async fn run_llm_step(
         api_key,
         model,
         embedding_model: None,
-        max_sample_rows: 10,
-        timeout_secs: 300,
+        ..Default::default()
     };
     let model_name = config.model.clone();
     let client = prism_llm::LlmClient::new(config);

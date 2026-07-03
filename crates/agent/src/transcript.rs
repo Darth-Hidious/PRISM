@@ -12,13 +12,35 @@ use regex::Regex;
 
 // ── TurnBudget ─────────────────────────────────────────────────────
 
+/// When the current prompt reaches this fraction of the model's usable
+/// context, compaction fires. Leaves headroom for the next turn's user
+/// message + tool results on top of the compacted history.
+const COMPACT_AT_CONTEXT_PCT: f64 = 0.75;
+
+/// Output-token reservation when the catalog doesn't report the model's
+/// max output. Deliberately modest — reserving too much shrinks the
+/// usable input window on small local models.
+const DEFAULT_RESERVED_OUTPUT_TOKENS: u64 = 8_192;
+
 /// Limits for a conversation session.
+///
+/// Two distinct token concerns live here — do not conflate them:
+/// - `max_input_tokens` is a **cumulative spend guard** (sum of prompt
+///   tokens across every call in the session; drives `exhausted`/warn).
+/// - `context_window` is the model's **per-request** limit from the
+///   platform catalog; it drives compaction. `None` = unknown (e.g.
+///   local llama.cpp) → compaction falls back to the turn counter.
 #[derive(Debug, Clone)]
 pub struct TurnBudget {
     pub max_turns: usize,
     pub max_input_tokens: u64,
     pub compact_after_turns: usize,
     pub warn_at_token_pct: f64,
+    /// The active model's context window (tokens), if known.
+    pub context_window: Option<u64>,
+    /// Tokens reserved for the model's response when computing the
+    /// usable input window.
+    pub reserved_output_tokens: u64,
 }
 
 impl Default for TurnBudget {
@@ -28,18 +50,42 @@ impl Default for TurnBudget {
             max_input_tokens: 200_000,
             compact_after_turns: 20,
             warn_at_token_pct: 0.8,
+            context_window: None,
+            reserved_output_tokens: DEFAULT_RESERVED_OUTPUT_TOKENS,
         }
     }
 }
 
 impl TurnBudget {
+    /// Budget for a specific model, from platform-catalog metadata.
+    /// `None`s are honest unknowns — they select the fallback behavior,
+    /// they never assume a size.
+    #[must_use]
+    pub fn for_model(context_window: Option<u64>, max_output_tokens: Option<u64>) -> Self {
+        Self {
+            context_window,
+            reserved_output_tokens: max_output_tokens.unwrap_or(DEFAULT_RESERVED_OUTPUT_TOKENS),
+            ..Self::default()
+        }
+    }
+
+    /// Tokens available for input once the response reservation is
+    /// subtracted. `None` when the window is unknown.
+    #[must_use]
+    pub fn usable_context(&self) -> Option<u64> {
+        self.context_window
+            .map(|w| w.saturating_sub(self.reserved_output_tokens))
+    }
+
     /// Check if the budget is exhausted.
     #[must_use]
     pub fn exhausted(&self, turns: usize, input_tokens: u64) -> bool {
         turns >= self.max_turns || input_tokens >= self.max_input_tokens
     }
 
-    /// Check if compaction should be triggered.
+    /// Turn-count compaction check — the fallback when the model's
+    /// context window is unknown. When it IS known, token pressure
+    /// decides instead (see `TranscriptStore::should_compact`).
     #[must_use]
     pub fn should_compact(&self, turns: usize) -> bool {
         turns >= self.compact_after_turns
@@ -172,6 +218,10 @@ pub struct TranscriptStore {
     pub cost: CostTracker,
     pub session_id: String,
     compacted: bool,
+    /// Prompt size (tokens) of the most recent LLM call — the actual
+    /// context pressure against the model's window. Updated from
+    /// provider-reported usage via `record_cost`.
+    last_prompt_tokens: u64,
 }
 
 impl TranscriptStore {
@@ -184,6 +234,7 @@ impl TranscriptStore {
             cost: CostTracker::default(),
             session_id: generate_session_id(),
             compacted: false,
+            last_prompt_tokens: 0,
         }
     }
 
@@ -196,15 +247,34 @@ impl TranscriptStore {
         self.compacted = false;
     }
 
-    /// Record a cost event.
+    /// Record a cost event. LLM calls (nonzero input) also update the
+    /// current context-pressure reading.
     pub fn record_cost(&mut self, label: impl Into<String>, input_tokens: u64, output_tokens: u64) {
+        if input_tokens > 0 {
+            self.last_prompt_tokens = input_tokens;
+        }
         self.cost.record(label, input_tokens, output_tokens);
     }
 
     /// Check if compaction should be triggered.
+    ///
+    /// Primary signal: **token pressure against the model's real
+    /// window** — the last prompt reaching `COMPACT_AT_CONTEXT_PCT` of
+    /// the usable input space. Three fat tool results on a 16k model
+    /// compact after a couple of turns; twenty tiny turns on a 200k
+    /// model don't compact at all. Only when the window is unknown do
+    /// we fall back to the old turn counter.
     #[must_use]
     pub fn should_compact(&self) -> bool {
-        self.budget.should_compact(self.turn_count) && !self.compacted
+        if self.compacted {
+            return false;
+        }
+        match self.budget.usable_context() {
+            Some(usable) if usable > 0 => {
+                self.last_prompt_tokens >= (usable as f64 * COMPACT_AT_CONTEXT_PCT) as u64
+            }
+            _ => self.budget.should_compact(self.turn_count),
+        }
     }
 
     /// Compact older entries into a structured summary, keeping last N.
@@ -505,6 +575,67 @@ mod tests {
         assert!(!b.exhausted(10, 100));
         assert!(b.exhausted(30, 100));
         assert!(b.exhausted(10, 200_000));
+    }
+
+    #[test]
+    fn small_window_compacts_on_token_pressure_not_turns() {
+        // The live failure this guards: a 16k model (local llama.cpp)
+        // accumulated 18k of tool results in 3 turns and crashed with
+        // exceed_context_size_error because compaction only counted turns.
+        let mut store = TranscriptStore::new(Some(TurnBudget::for_model(Some(16_384), None)));
+        store.append(TranscriptEntry::new("user", "research question"));
+        store.append(TranscriptEntry::new("assistant", "calling tools"));
+        assert!(!store.should_compact(), "no pressure yet");
+        // usable = 16384 - 8192 reserved = 8192; threshold = 75% = 6144.
+        // A 7k-token prompt exceeds it.
+        store.record_cost("llm_turn", 7_000, 200);
+        assert!(
+            store.should_compact(),
+            "token pressure on a small window must compact after 2 turns, \
+             long before the 20-turn counter"
+        );
+    }
+
+    #[test]
+    fn big_window_does_not_compact_at_20_turns_with_tiny_usage() {
+        // The owner's rule: "16k tokens does not mean you compact
+        // immediately" — turn count alone must NOT trigger compaction
+        // when the model has plenty of window left.
+        let mut store =
+            TranscriptStore::new(Some(TurnBudget::for_model(Some(200_000), Some(16_384))));
+        for i in 0..25 {
+            store.append(TranscriptEntry::new("user", format!("q{i}")));
+            store.append(TranscriptEntry::new("assistant", format!("a{i}")));
+            store.record_cost("llm_turn", 2_000, 100); // tiny prompts
+        }
+        assert!(
+            !store.should_compact(),
+            "25 turns at 2k tokens on a 200k window is 1% pressure — \
+             compacting here would be the old turn-counter bug"
+        );
+    }
+
+    #[test]
+    fn unknown_window_falls_back_to_turn_count() {
+        // Local/offline models with no catalog entry keep the old
+        // conservative behavior rather than assuming a size.
+        let mut store = TranscriptStore::new(Some(TurnBudget::for_model(None, None)));
+        for i in 0..21 {
+            store.append(TranscriptEntry::new("user", format!("q{i}")));
+            store.append(TranscriptEntry::new("assistant", format!("a{i}")));
+        }
+        assert!(store.should_compact(), "turn-count fallback must survive");
+    }
+
+    #[test]
+    fn usable_context_reserves_output() {
+        let b = TurnBudget::for_model(Some(200_000), Some(32_000));
+        assert_eq!(b.usable_context(), Some(168_000));
+        // Reservation larger than the window saturates to zero, never
+        // underflows.
+        let tiny = TurnBudget::for_model(Some(4_096), Some(8_192));
+        assert_eq!(tiny.usable_context(), Some(0));
+        assert_eq!(TurnBudget::for_model(None, None).usable_context(), None);
     }
 
     #[test]

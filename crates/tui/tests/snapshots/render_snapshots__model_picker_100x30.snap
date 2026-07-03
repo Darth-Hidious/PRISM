@@ -7,14 +7,14 @@ expression: rendered
                                                                    │
            ┌ Switch model ──────────────────────────────────────────────────────────────┐
            │  current: gemma-4-12B-it-qat-UD-Q4_K_XL.gguf                               │
-           │> type to filter (provider / id / name)…    (2 shown)                       │
+           │> recommended — type to search all 2 models…    (1 shown)                   │
            │                                                                            │
-           │ anthropic                                                                  │
-           │   Claude Sonnet 4  anthropic/claude-sonnet-4  ◀                            │
            │ local                                                                      │
-           │ ● Gemma 4 12B (local)  gemma-4-12B-it-qat-UD-Q4_K_… free                   │
+           │ ● Gemma 4 12B (local)  gemma-4-12B-it-qat-UD-Q4_K_… free  ◀                │
            │                                                                            │
            │  filter · j/k move · ↵ switch · Esc close                                  │
+           │                                                                            │
+           │                                                                            │
            │                                                                            │
            │                                                                            │
            │                                                                            │

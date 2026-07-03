@@ -26,26 +26,20 @@ use crate::platform_bridge;
 
 const DEFAULT_PROVIDER_ID: &str = "openai_compatible";
 
-/// Default chat model. Switched from `gemini-3.1-flash-lite-preview`
-/// to `gpt-5.5` because:
-///   1. Gemini's OpenAI-compat shim has a documented year-old bug with
-///      streaming tool_calls (the `index` field is missing from delta
-///      chunks, breaking every parser that follows the OpenAI spec).
-///      Refs:
-///        - https://discuss.ai.google.dev/t/gemini-openai-compatibility-issue-with-tool-call-streaming/59886
-///        - https://github.com/openai/openai-python/issues/2806
-///   2. `gpt-4o*` is being deprecated and the user explicitly asked not
-///      to use it as a default.
-///   3. `gpt-5.5` is OpenAI's reference implementation — clean
-///      streaming + clean tool_calls — and supports `reasoning_effort`
-///      (none / low / medium / high / xhigh) so we can pick fast paths
-///      for chat and deeper reasoning paths for discourse.
-///   4. MARC27 fronts gpt-5.5 at $2/M input, $8/M output — reasonable
-///      for materials-research workloads.
+/// Default chat model: `anthropic/claude-sonnet-5`. MARC27 is a
+/// Claude-first platform and already serves Sonnet 5 as its own
+/// grounded-chat default, so the client default now matches the
+/// server — the TUI header and the model palette agree instead of the
+/// client forcing an OpenAI model the server never picked. MARC27
+/// normalizes every upstream (Anthropic included) to the OpenAI
+/// streaming shape, so tool_calls stream cleanly regardless of
+/// provider. At $2/M input, $10/M output it is the cheapest capable
+/// Claude tier — on par with the previous gpt-5.5 default ($2/$8) and
+/// far below Fable ($10/$50).
 ///
-/// Users override per-session via the upcoming `prism use marc27
-/// --model <name>` (and the in-chat `/use` slash command).
-const DEFAULT_MODEL_ID: &str = "gpt-5.5";
+/// Users override per-session via `prism use marc27 --model <name>`
+/// (and the in-chat `/use` slash command); a stored pick always wins.
+const DEFAULT_MODEL_ID: &str = "anthropic/claude-sonnet-5";
 
 const PRISM_BANNER: &str = "\x1b[38;2;0;255;255m\
 ██████╗ ██████╗ ██╗███████╗███╗   ███╗

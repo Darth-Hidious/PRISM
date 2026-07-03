@@ -1799,11 +1799,12 @@ fn draw_model_picker(f: &mut Frame, app: &App) {
         ]));
     }
 
+    let total_catalog = app.model_picker.models.len();
     let qdisp = if app.model_picker.query.is_empty() {
         if app.model_picker.loading {
             "loading catalog…".to_string()
         } else {
-            "type to filter (provider / id / name)…".to_string()
+            format!("recommended — type to search all {total_catalog} models…")
         }
     } else {
         app.model_picker.query.clone()

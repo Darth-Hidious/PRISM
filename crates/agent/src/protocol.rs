@@ -41,7 +41,7 @@ use crate::scratchpad::Scratchpad;
 use crate::session::{RuntimeSessionState, SessionStore};
 use crate::tool_catalog::ToolCatalog;
 use crate::transcript::{
-    TranscriptEntry, TranscriptStore, extract_key_files, extract_pending_work,
+    TranscriptEntry, TranscriptStore, TurnBudget, extract_key_files, extract_pending_work,
 };
 use crate::types::{AgentConfig, AgentEvent};
 
@@ -6511,12 +6511,24 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
     };
     tracing::info!(session_id = %session_id, "started new session");
 
+    // Context budget from the active model's real limits (platform
+    // catalog, resolved by the CLI at backend launch). Unknown limits
+    // (local llama.cpp, offline) leave `None`s — the transcript then
+    // falls back to turn-count compaction instead of assuming a size.
+    let turn_budget =
+        TurnBudget::for_model(llm_config.context_window, llm_config.max_output_tokens);
+    tracing::info!(
+        context_window = ?llm_config.context_window,
+        max_output_tokens = ?llm_config.max_output_tokens,
+        "session context budget"
+    );
+
     let mut runtime = Some(ServerRuntime {
         tool_server,
         command_tool_runtime,
         llm_config,
         history: Vec::new(),
-        transcript: TranscriptStore::new(None),
+        transcript: TranscriptStore::new(Some(turn_budget)),
         session_mode,
         plan_state,
         permission_overrides,

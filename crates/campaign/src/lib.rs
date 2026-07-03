@@ -521,8 +521,7 @@ impl Campaign {
             api_key,
             model: model.clone(),
             embedding_model: None,
-            max_sample_rows: 10,
-            timeout_secs: 300,
+            ..Default::default()
         };
         let client = prism_llm::LlmClient::new(config);
 
