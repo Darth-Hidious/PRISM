@@ -95,6 +95,11 @@ pub struct NodeState {
     pub node_id: OnceLock<Uuid>,
     /// Federated query client for dispatching queries to mesh peers.
     pub federation: OnceLock<prism_mesh::federated_query::FederatedQuery>,
+    /// Conversational agent service backing `POST /api/chat` — the SAME
+    /// agent loop the TUI backend runs, exposed over HTTP. Set once after
+    /// boot when an LLM is configured and the Python tool server spawns;
+    /// unset ⇒ the chat endpoints return 503.
+    pub chat: OnceLock<Arc<prism_agent::service::ChatService>>,
 }
 
 /// A running service tracked by the server.
@@ -128,6 +133,7 @@ impl NodeState {
             kafka_producer: OnceLock::new(),
             node_id: OnceLock::new(),
             federation: OnceLock::new(),
+            chat: OnceLock::new(),
         }
     }
 

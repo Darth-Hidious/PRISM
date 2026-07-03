@@ -10,6 +10,7 @@ pub mod permissions;
 pub mod prompts;
 pub mod protocol;
 pub mod scratchpad;
+pub mod service;
 pub mod session;
 pub mod tool_catalog;
 pub mod transcript;

@@ -1067,16 +1067,15 @@ async fn main() -> Result<()> {
             | Some(Commands::Resume { .. })
             | Some(Commands::Campaign { .. })
             | None
-    ) {
-        if let Ok(state) = paths.load_cli_state() {
-            let token = state.credentials.as_ref().map(|c| c.access_token.clone());
-            let platform = if let Some(t) = &token {
-                prism_client::api::PlatformClient::new(&endpoints.api_base).with_token(t)
-            } else {
-                prism_client::api::PlatformClient::new(&endpoints.api_base)
-            };
-            crate::tool_sync::spawn_background_sync_owned(platform);
-        }
+    ) && let Ok(state) = paths.load_cli_state()
+    {
+        let token = state.credentials.as_ref().map(|c| c.access_token.clone());
+        let platform = if let Some(t) = &token {
+            prism_client::api::PlatformClient::new(&endpoints.api_base).with_token(t)
+        } else {
+            prism_client::api::PlatformClient::new(&endpoints.api_base)
+        };
+        crate::tool_sync::spawn_background_sync_owned(platform);
     }
 
     // --offline applies to EVERY command, not just the bare-TUI shortcut:
@@ -1472,7 +1471,7 @@ async fn main() -> Result<()> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs_f64();
-                    println!("{:<8} {:<8} {:<10} {}", "PID", "PORT", "UPTIME", "URL");
+                    println!("{:<8} {:<8} {:<10} URL", "PID", "PORT", "UPTIME");
                     for s in &sessions {
                         let up = now - s.started_at;
                         let h = (up as u64) / 3600;
@@ -1588,12 +1587,16 @@ async fn main() -> Result<()> {
             let mut tool_server_env = std::collections::BTreeMap::new();
             tool_server_env.insert("PRISM_ENABLE_MCP".to_string(), "1".to_string());
 
-            // Pass platform auth token to Python tool server so tools can call MARC27 API
-            if let Ok(state) = paths.load_cli_state()
-                && let Some(creds) = &state.credentials
-            {
-                tool_server_env.insert("MARC27_API_KEY".to_string(), creds.access_token.clone());
-            }
+            // Platform auth for the Python tool server: do NOT export the
+            // session JWT as MARC27_API_KEY. That env var is the X-API-Key
+            // channel (stable `m27_*` keys); the server rejects a JWT there
+            // with 401 "invalid API key", which broke every Python platform
+            // tool (knowledge semantic/graph, research) while Rust-side
+            // Bearer calls kept working. The Python side reads the rotating
+            // JWT itself from ~/.prism/credentials.json (kept in sync by
+            // login/refresh) and re-reads it on 401, which a frozen env
+            // snapshot can never do. A genuine user-set MARC27_API_KEY still
+            // reaches the tool server through normal env inheritance.
             tool_server_env.insert("MARC27_API_URL".to_string(), endpoints.api_base.clone());
 
             // Pass through any API keys the user has set
@@ -2134,6 +2137,56 @@ async fn main() -> Result<()> {
                     "  \u{2713} {:<12} http://localhost:{}",
                     "Dashboard", dashboard_port
                 );
+
+                // ── Conversational agent service (POST /api/chat) ──
+                // Chat-app parity: the SAME agent loop the TUI backend runs
+                // (prism_agent::service::ChatService shares build_agent_seed
+                // + agent_loop::run_turn with `prism backend`), exposed as an
+                // HTTP service on this node. Spawned in the background AFTER
+                // the listener is up so the command-tool catalog's node probe
+                // sees the dashboard live and a slow Python spawn never
+                // delays node boot. On failure /api/chat answers 503.
+                if server_state.llm.is_some() {
+                    println!(
+                        "  ~ {:<12} http://localhost:{}/api/chat (starting)",
+                        "Chat", dashboard_port
+                    );
+                    let chat_state = server_state.clone();
+                    let chat_python = python.clone();
+                    let chat_project_root = project_root.clone();
+                    let chat_api_base = endpoints.api_base.clone();
+                    tokio::spawn(async move {
+                        let llm_config = chat_state
+                            .llm
+                            .clone()
+                            .expect("checked is_some before spawn");
+                        let tool_server = prism_python_bridge::ToolServer {
+                            python_bin: chat_python,
+                            project_root: chat_project_root,
+                            env: prism_agent::service::default_tool_server_env(&chat_api_base),
+                        };
+                        match prism_agent::service::ChatService::spawn(
+                            llm_config,
+                            tool_server,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(service) => {
+                                let _ = chat_state.chat.set(std::sync::Arc::new(service));
+                                tracing::info!("chat service ready — POST /api/chat");
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "chat service failed to start — /api/chat returns 503"
+                                );
+                            }
+                        }
+                    });
+                } else {
+                    tracing::warn!("no LLM configured — /api/chat disabled (503)");
+                }
                 println!();
 
                 // ── V1: Run the platform daemon (heartbeat, job dispatch) ──
@@ -3136,8 +3189,8 @@ async fn main() -> Result<()> {
                     std::env::current_exe().context("failed to locate current prism executable")?;
                 prism_tui::run(
                     prism_bin.to_str().unwrap(),
-                    &project_root.to_string_lossy().to_string(),
-                    &python.to_string_lossy().to_string(),
+                    project_root.to_string_lossy().as_ref(),
+                    python.to_string_lossy().as_ref(),
                 )
                 .await?;
                 return Ok(());
@@ -3221,8 +3274,8 @@ async fn main() -> Result<()> {
                 std::env::current_exe().context("failed to locate current prism executable")?;
             prism_tui::run(
                 prism_bin.to_str().unwrap(),
-                &project_root.to_string_lossy().to_string(),
-                &python.to_string_lossy().to_string(),
+                project_root.to_string_lossy().as_ref(),
+                python.to_string_lossy().as_ref(),
             )
             .await?;
         }
@@ -5923,6 +5976,9 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
     Ok(())
 }
 
+// No production caller since research moved to the prism-client API path;
+// kept because the unit tests below pin the raw research SSE/JSON body format.
+#[allow(dead_code)]
 fn parse_research_response_body(body: &str) -> Result<serde_json::Value> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -6064,6 +6120,8 @@ fn normalize_stream_events(events: Vec<serde_json::Value>) -> Vec<serde_json::Va
     normalized
 }
 
+// Only reachable from parse_research_response_body above; same test-pinned status.
+#[allow(dead_code)]
 fn extract_research_answer(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     for key in ["answer", "text", "content", "message"] {
         if let Some(value) = obj.get(key).and_then(|value| value.as_str()) {

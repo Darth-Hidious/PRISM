@@ -2299,9 +2299,43 @@ async fn execute_workflow_command(
     Ok(result)
 }
 
+/// Tools that hit the LOCAL graph/vector stores (Neo4j/Qdrant behind the
+/// local node) or the local node dashboard. Offering them while the node is
+/// down produced dead-end failures for every semantic/graph call, so they
+/// are only listed in the default catalog when the node is reachable. The
+/// specs stay registered — `execute_command_tool` still resolves them — so
+/// nothing breaks if an older transcript or client calls one by name.
+const LOCAL_NODE_TOOLS: &[&str] = &["query", "query_local", "query_federated"];
+
+/// Lookalikes folded into the platform-backed `knowledge` tool (the single
+/// default knowledge path). Never offered in the catalog, but kept
+/// executable as compatibility aliases.
+const CATALOG_ALIAS_ONLY: &[&str] = &["query_platform"];
+
+/// Cheap connectivity probe for the local node dashboard — the same
+/// `127.0.0.1:7327` endpoint the boot checks use. TCP-level only: a refused
+/// connection on localhost fails in microseconds, so building the catalog
+/// is not delayed when the node is down.
+fn local_node_reachable() -> bool {
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 7327));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok()
+}
+
+/// Default tool catalog entries: local-store tools appear only when the
+/// local node is actually running.
 pub fn command_tools() -> Vec<LoadedTool> {
+    command_tools_filtered(local_node_reachable())
+}
+
+/// Deterministic variant of [`command_tools`] for callers (and tests) that
+/// already know whether the local node is up.
+#[must_use]
+pub fn command_tools_filtered(local_node_online: bool) -> Vec<LoadedTool> {
     COMMAND_TOOLS
         .iter()
+        .filter(|spec| !CATALOG_ALIAS_ONLY.contains(&spec.name))
+        .filter(|spec| local_node_online || !LOCAL_NODE_TOOLS.contains(&spec.name))
         .map(|spec| LoadedTool {
             name: spec.name.to_string(),
             description: spec.description.to_string(),
@@ -2360,7 +2394,7 @@ mod tests {
 
     #[test]
     fn builds_internal_command_tools() {
-        let tools = command_tools();
+        let tools = command_tools_filtered(true);
         let workflow_run = tools
             .iter()
             .find(|tool| tool.name == "workflow_run")
@@ -2369,18 +2403,71 @@ mod tests {
             .iter()
             .find(|tool| tool.name == "query")
             .expect("query should exist");
-        let query_platform = tools
-            .iter()
-            .find(|tool| tool.name == "query_platform")
-            .expect("query_platform should exist");
 
         assert!(tools.len() >= 30);
         assert_eq!(query.permission_mode, PermissionMode::ReadOnly);
         assert!(!query.requires_approval);
-        assert_eq!(query_platform.permission_mode, PermissionMode::ReadOnly);
         assert_eq!(
             workflow_run.input_schema["properties"]["values"]["type"],
             serde_json::json!("object")
+        );
+    }
+
+    #[test]
+    fn local_store_tools_hidden_when_node_offline() {
+        let tools = command_tools_filtered(false);
+        for name in ["query", "query_local", "query_federated", "query_platform"] {
+            assert!(
+                tools.iter().all(|tool| tool.name != name),
+                "{name} must not be offered while the local node is offline"
+            );
+        }
+        // Capability is gated, not deleted: every hidden tool still resolves
+        // and executes if called by name (older transcripts, aliases).
+        for name in ["query", "query_local", "query_federated", "query_platform"] {
+            assert!(is_command_tool(name), "{name} must remain executable");
+        }
+    }
+
+    #[test]
+    fn local_store_tools_offered_when_node_online() {
+        let tools = command_tools_filtered(true);
+        for name in ["query", "query_local", "query_federated"] {
+            assert!(
+                tools.iter().any(|tool| tool.name == name),
+                "{name} should be offered when the local node is running"
+            );
+        }
+        // The platform lookalike stays folded into `knowledge` either way.
+        assert!(tools.iter().all(|tool| tool.name != "query_platform"));
+    }
+
+    #[test]
+    fn default_catalog_offline_has_exactly_one_knowledge_tool() {
+        // Same assembly protocol::run_server performs: python tool-server
+        // catalog (which carries the unified `knowledge` tool) extended
+        // with the gated command tools.
+        let tools_json = json!({
+            "tools": [{
+                "name": "knowledge",
+                "description": "MARC27 Knowledge Plane — graph + semantic search over the live knowledge service.",
+                "input_schema": { "type": "object", "properties": {} },
+                "requires_approval": false,
+                "source": "python"
+            }]
+        });
+        let mut catalog = crate::tool_catalog::ToolCatalog::from_tool_server_json(&tools_json);
+        catalog.extend(command_tools_filtered(false));
+
+        let knowledge_paths: Vec<&str> = catalog
+            .iter()
+            .filter(|tool| tool.name == "knowledge" || tool.name.starts_with("query"))
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(
+            knowledge_paths,
+            vec!["knowledge"],
+            "the default offline catalog must expose exactly one knowledge tool"
         );
     }
 

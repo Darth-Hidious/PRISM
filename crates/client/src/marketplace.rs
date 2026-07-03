@@ -28,6 +28,16 @@ pub struct MarketplaceTool {
     pub status: String,
     #[serde(default)]
     pub license: Option<String>,
+    /// How the resource is served: `on_demand` (endpoint-based, deployed on
+    /// request) vs artifact-backed. Endpoint-hosted resources have nothing
+    /// to download.
+    #[serde(default)]
+    pub hosting: String,
+    /// Storage location of the downloadable artifact. `None`/empty means the
+    /// marketplace holds no artifact for this resource — the install
+    /// endpoint 422s for such resources, so sync must skip them.
+    #[serde(default)]
+    pub storage_path: Option<String>,
 }
 
 /// A single hit from the semantic find_resource search. Mirrors the

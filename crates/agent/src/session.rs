@@ -155,55 +155,7 @@ impl SessionStore {
     pub fn resume_session(&mut self, reference: &str) -> Option<(String, Vec<serde_json::Value>)> {
         let sid = self.resolve_ref(reference)?;
         let path = self.sessions_dir.join(format!("{sid}.jsonl"));
-        if !path.exists() {
-            return None;
-        }
-
-        let text = fs::read_to_string(&path).ok()?;
-        let mut messages = Vec::new();
-        let mut loaded_meta: Option<SessionMeta> = None;
-
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let entry: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            if entry.get("type").and_then(|t| t.as_str()) == Some("meta") {
-                if let Some(data) = entry.get("data") {
-                    loaded_meta = serde_json::from_value(data.clone()).ok();
-                }
-                continue;
-            }
-
-            let role = entry.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            if !role.is_empty() && !content.is_empty() {
-                let mut msg = serde_json::json!({ "role": role, "content": content });
-                if let Some(cid) = entry.get("call_id").and_then(|v| v.as_str())
-                    && !cid.is_empty()
-                {
-                    msg["tool_call_id"] = serde_json::Value::String(cid.to_string());
-                }
-                if let Some(tn) = entry.get("tool_name").and_then(|v| v.as_str())
-                    && !tn.is_empty()
-                {
-                    msg["tool_name"] = serde_json::Value::String(tn.to_string());
-                }
-                if let Some(data) = entry.get("data")
-                    && let Some(obj) = data.as_object()
-                {
-                    for (k, v) in obj {
-                        msg[k] = v.clone();
-                    }
-                }
-                messages.push(msg);
-            }
-        }
+        let (messages, loaded_meta) = parse_session_file(&path)?;
 
         self.current_id = Some(sid.clone());
         self.current_path = Some(path);
@@ -212,6 +164,19 @@ impl SessionStore {
         }
         self.update_latest(&sid);
         Some((sid, messages))
+    }
+
+    /// Read a session's messages WITHOUT switching the store's current
+    /// session (read-only counterpart to [`Self::resume_session`], used by
+    /// the HTTP chat endpoints to serve `GET /api/chat/sessions/{id}`).
+    pub fn load_messages(&self, session_id: &str) -> Option<Vec<serde_json::Value>> {
+        let path = self.sessions_dir.join(format!("{session_id}.jsonl"));
+        parse_session_file(&path).map(|(messages, _)| messages)
+    }
+
+    /// Directory where session `.jsonl` files live.
+    pub fn dir(&self) -> &Path {
+        &self.sessions_dir
     }
 
     /// Fork the current session into a new one with parent tracking.
@@ -483,6 +448,62 @@ impl SessionStore {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// Parse a session JSONL file into (messages, meta). Shared by
+/// [`SessionStore::resume_session`] (which also switches the current
+/// session) and [`SessionStore::load_messages`] (read-only).
+fn parse_session_file(path: &Path) -> Option<(Vec<serde_json::Value>, Option<SessionMeta>)> {
+    if !path.exists() {
+        return None;
+    }
+    let text = fs::read_to_string(path).ok()?;
+    let mut messages = Vec::new();
+    let mut loaded_meta: Option<SessionMeta> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if entry.get("type").and_then(|t| t.as_str()) == Some("meta") {
+            if let Some(data) = entry.get("data") {
+                loaded_meta = serde_json::from_value(data.clone()).ok();
+            }
+            continue;
+        }
+
+        let role = entry.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if !role.is_empty() && !content.is_empty() {
+            let mut msg = serde_json::json!({ "role": role, "content": content });
+            if let Some(cid) = entry.get("call_id").and_then(|v| v.as_str())
+                && !cid.is_empty()
+            {
+                msg["tool_call_id"] = serde_json::Value::String(cid.to_string());
+            }
+            if let Some(tn) = entry.get("tool_name").and_then(|v| v.as_str())
+                && !tn.is_empty()
+            {
+                msg["tool_name"] = serde_json::Value::String(tn.to_string());
+            }
+            if let Some(data) = entry.get("data")
+                && let Some(obj) = data.as_object()
+            {
+                for (k, v) in obj {
+                    msg[k] = v.clone();
+                }
+            }
+            messages.push(msg);
+        }
+    }
+
+    Some((messages, loaded_meta))
+}
 
 fn unix_now() -> f64 {
     SystemTime::now()

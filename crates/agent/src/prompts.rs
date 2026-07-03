@@ -68,17 +68,16 @@ pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> S
         );
     }
 
-    if has_any_tools(
-        &tool_names,
-        &[
-            "query",
-            "query_platform",
-            "query_federated",
-            "research_query",
-        ],
-    ) {
+    if has_tool(&tool_names, "query") {
         bullets.push(
             "Use `query` for directed retrieval and graph lookup. Use `research_query` only when the task genuinely needs an iterative retrieval-and-synthesis loop instead of a one-shot search."
+                .to_string(),
+        );
+    } else if has_all_tools(&tool_names, &["knowledge", "research_query"]) {
+        // Local node offline: `query` is not offered — the platform-backed
+        // `knowledge` tool is the single knowledge path.
+        bullets.push(
+            "Use the `knowledge` tool for one-shot knowledge lookups. Use `research_query` only when the task genuinely needs an iterative retrieval-and-synthesis loop."
                 .to_string(),
         );
     }

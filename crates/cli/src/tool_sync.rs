@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use prism_client::marketplace::MarketplaceClient;
+use prism_client::marketplace::{MarketplaceClient, MarketplaceTool};
 
 /// `~/.prism/tools/.manifest.json` — maps tool slug → last-installed metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -51,6 +51,9 @@ pub struct SyncReport {
     pub added: Vec<String>,
     pub unchanged: Vec<String>,
     pub failed: Vec<(String, String)>,
+    /// Endpoint-hosted resources with no downloadable artifact — nothing to
+    /// sync, by design (not an error).
+    pub skipped: Vec<String>,
 }
 
 impl SyncReport {
@@ -86,6 +89,17 @@ fn save_manifest(m: &ToolManifest) -> Result<()> {
     let s = serde_json::to_string_pretty(m)?;
     std::fs::write(&p, s)?;
     Ok(())
+}
+
+/// True when the marketplace actually stores a downloadable artifact for
+/// this resource. Endpoint-hosted resources (`hosting = on_demand`) carry no
+/// `storage_path` in the listing; asking the install endpoint for them is a
+/// guaranteed 422 ("resource has no downloadable artifact"), so the sync
+/// path must not even try.
+fn has_downloadable_artifact(tool: &MarketplaceTool) -> bool {
+    tool.storage_path
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty())
 }
 
 /// Validate a marketplace slug for safe filesystem use. Rejects path
@@ -129,6 +143,19 @@ pub async fn sync_tools(marketplace: &MarketplaceClient<'_>) -> Result<SyncRepor
         };
         if safe_slug(&slug).is_none() {
             warn!(%slug, "skipping tool with unsafe slug");
+            continue;
+        }
+
+        // Endpoint-hosted resources have no artifact to download — skipping
+        // them is normal operation, not a failure (E2: every such resource
+        // used to land in `failed` and log an ERROR at startup).
+        if !has_downloadable_artifact(&tool) {
+            debug!(
+                tool = %slug,
+                hosting = %tool.hosting,
+                "skipping: endpoint-hosted, nothing to download"
+            );
+            report.skipped.push(slug);
             continue;
         }
 
@@ -205,6 +232,7 @@ pub async fn sync_tools(marketplace: &MarketplaceClient<'_>) -> Result<SyncRepor
         updated = report.updated.len(),
         added = report.added.len(),
         unchanged = report.unchanged.len(),
+        skipped = report.skipped.len(),
         failed = report.failed.len(),
         "tool sync complete"
     );
@@ -286,6 +314,12 @@ pub fn print_report(r: &SyncReport) {
             }
         }
     }
+    if !r.skipped.is_empty() {
+        println!(
+            "Skipped {} endpoint-hosted resource(s) (no artifact to download).",
+            r.skipped.len()
+        );
+    }
     if !r.failed.is_empty() {
         eprintln!("Failed to sync {} tool(s):", r.failed.len());
         for (slug, err) in &r.failed {
@@ -309,6 +343,11 @@ pub async fn check_for_updates(
             tool.name.clone()
         };
         if safe_slug(&slug).is_none() {
+            continue;
+        }
+        // Same rule as `sync_tools`: endpoint-hosted resources can never be
+        // downloaded, so they are never "pending updates" either.
+        if !has_downloadable_artifact(&tool) {
             continue;
         }
         let local_version = manifest
@@ -376,5 +415,46 @@ mod tests {
     fn empty_manifest_deserializes_to_default() {
         let m: ToolManifest = serde_json::from_str("{}").unwrap();
         assert!(m.tools.is_empty());
+    }
+
+    /// Build a `MarketplaceTool` the same way the sync path does: by
+    /// deserializing the platform's listing JSON.
+    fn listing_tool(storage_path: serde_json::Value, hosting: &str) -> MarketplaceTool {
+        serde_json::from_value(serde_json::json!({
+            "name": "quantum-espresso",
+            "slug": "quantum-espresso",
+            "resource_type": "cli_tool",
+            "version": "1.0.0",
+            "hosting": hosting,
+            "storage_path": storage_path,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn endpoint_hosted_resources_have_no_artifact() {
+        // All 16 live marketplace resources look like this today:
+        // hosting=on_demand, storage_path=null. They must be skipped, not
+        // reported as sync failures.
+        let on_demand = listing_tool(serde_json::Value::Null, "on_demand");
+        assert!(!has_downloadable_artifact(&on_demand));
+
+        // An empty-string storage_path is equally not downloadable.
+        let empty = listing_tool(serde_json::json!(""), "on_demand");
+        assert!(!has_downloadable_artifact(&empty));
+
+        // Listings without the field at all (older platform) are skipped too.
+        let absent: MarketplaceTool = serde_json::from_value(serde_json::json!({
+            "name": "quantum-espresso",
+            "slug": "quantum-espresso",
+        }))
+        .unwrap();
+        assert!(!has_downloadable_artifact(&absent));
+    }
+
+    #[test]
+    fn artifact_backed_resources_are_syncable() {
+        let backed = listing_tool(serde_json::json!("tools/quantum-espresso.py"), "artifact");
+        assert!(has_downloadable_artifact(&backed));
     }
 }

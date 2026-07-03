@@ -331,18 +331,18 @@ impl Campaign {
             }
 
             // Check budget
-            if let Some(budget) = self.state.config.budget_usd {
-                if self.state.total_cost_usd >= budget {
-                    self.state.completed = true;
-                    self.state.completion_reason = "budget_exhausted".into();
-                    info!(
-                        campaign = %self.state.campaign_id,
-                        spent = self.state.total_cost_usd,
-                        budget,
-                        "campaign hit budget limit"
-                    );
-                    break;
-                }
+            if let Some(budget) = self.state.config.budget_usd
+                && self.state.total_cost_usd >= budget
+            {
+                self.state.completed = true;
+                self.state.completion_reason = "budget_exhausted".into();
+                info!(
+                    campaign = %self.state.campaign_id,
+                    spent = self.state.total_cost_usd,
+                    budget,
+                    "campaign hit budget limit"
+                );
+                break;
             }
 
             // Check approval gate
@@ -364,7 +364,7 @@ impl Campaign {
             // Checkpoint
             if self.state.config.checkpoint_every > 0
                 && iter > 0
-                && iter % self.state.config.checkpoint_every == 0
+                && iter.is_multiple_of(self.state.config.checkpoint_every)
             {
                 self.checkpoint()?;
             }
@@ -387,7 +387,7 @@ impl Campaign {
         self.checkpoint()?;
 
         // Build result
-        let winners: Vec<Candidate> = self.state.top_n(10).iter().cloned().collect();
+        let winners: Vec<Candidate> = self.state.top_n(10).to_vec();
 
         let summary = self.build_summary(&winners);
 
@@ -613,12 +613,12 @@ impl Campaign {
         }
 
         // Try to find a JSON array anywhere in the text.
-        if let Some(start) = text.find('[') {
-            if let Some(end) = text[start..].find(']') {
-                let json = &text[start..start + end + 1];
-                if let Ok(arr) = serde_json::from_str::<Vec<String>>(json) {
-                    return arr;
-                }
+        if let Some(start) = text.find('[')
+            && let Some(end) = text[start..].find(']')
+        {
+            let json = &text[start..start + end + 1];
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json) {
+                return arr;
             }
         }
 
@@ -667,8 +667,7 @@ impl Campaign {
                     .cycle()
                     .skip(offset)
                     .take(n)
-                    .enumerate()
-                    .map(|(_, el)| format!("{}{:.1}", el, 1.0 / n as f64))
+                    .map(|el| format!("{}{:.1}", el, 1.0 / n as f64))
                     .collect::<Vec<_>>()
                     .join(" ")
             })

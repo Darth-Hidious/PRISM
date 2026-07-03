@@ -171,7 +171,7 @@ impl ProvenanceStore {
         let output_json = rec
             .output_json
             .as_ref()
-            .map(|v| serde_json::to_string(v))
+            .map(serde_json::to_string)
             .transpose()?;
 
         self.conn
