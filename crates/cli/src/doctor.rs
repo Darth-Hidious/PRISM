@@ -72,13 +72,12 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
         ));
     }
 
-    // 4. Python venv (used by prism-python MCP server)
+    // 4. Python venv (used by prism-python MCP server). A venv directory
+    //    alone proves nothing — [OK] means the PRISM tool platform actually
+    //    imports. (Fresh boxes used to get an empty venv that a bare
+    //    exists() check happily blessed.)
     let venv_python = prism_dir.join("venv/bin/python3");
-    checks.push(check_file(
-        "PRISM Python venv",
-        &venv_python,
-        "run `prism setup` to provision",
-    ));
+    checks.push(check_venv_tools(&venv_python));
 
     // 5. PRISM credentials (auth state) — newer prism uses cli-state.json,
     //    older builds wrote credentials.json. Either is fine.
@@ -175,6 +174,46 @@ fn check_binary(name: &str, candidates: &[&str]) -> BootCheck {
         ok: false,
         dots: 4,
         delay_ms: 0,
+    }
+}
+
+/// Venv check that verifies the tool platform is importable, not merely
+/// that a directory exists. Auto-heals on next `prism` launch, so the
+/// hint points there first.
+fn check_venv_tools(venv_python: &std::path::Path) -> BootCheck {
+    let name = "PRISM Python venv";
+    if !venv_python.exists() {
+        return BootCheck {
+            name: name.to_string(),
+            result: "missing — provisioned on next `prism` launch".to_string(),
+            ok: false,
+            dots: 4,
+            delay_ms: 0,
+        };
+    }
+    let importable = std::process::Command::new(venv_python)
+        .args(["-c", "import app"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if importable {
+        BootCheck {
+            name: name.to_string(),
+            result: format!("{} (tools importable)", venv_python.display()),
+            ok: true,
+            dots: 4,
+            delay_ms: 0,
+        }
+    } else {
+        BootCheck {
+            name: name.to_string(),
+            result: "venv exists but tools missing — next `prism` launch self-heals".to_string(),
+            ok: false,
+            dots: 4,
+            delay_ms: 0,
+        }
     }
 }
 
