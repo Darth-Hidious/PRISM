@@ -1564,15 +1564,22 @@ async fn main() -> Result<()> {
                         provider_key.or(api_key),
                     )
                 }
-                // Marc27 cloud: use prism.toml [llm] as before.
-                crate::chat_config::ChatTarget::Marc27 { .. } => (
+                // Marc27 cloud: base URL from prism.toml [llm]; the model is
+                // the one the user picked via `prism use marc27 --model …`,
+                // which is persisted on the chat target. Previously the
+                // target's model was discarded (`Marc27 { .. }`), so the
+                // backend always served prism.toml/gpt-5.5 even though
+                // `/use show` reported the user's selection — the status bar
+                // then showed gpt-5.5 while the palette said sonnet.
+                crate::chat_config::ChatTarget::Marc27 {
+                    model: target_model,
+                } => (
                     std::env::var("LLM_BASE_URL").unwrap_or_else(|_| cfg_llm.url.clone()),
-                    std::env::var("LLM_MODEL").unwrap_or_else(|_| {
-                        cfg_llm
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| "gpt-5.5".to_string())
-                    }),
+                    resolve_marc27_model(
+                        std::env::var("LLM_MODEL").ok(),
+                        target_model.as_deref(),
+                        cfg_llm.model.as_deref(),
+                    ),
                     api_key,
                 ),
             };
@@ -7407,9 +7414,47 @@ async fn handle_report(
     Ok(())
 }
 
+/// Resolve the MARC27-cloud chat model with explicit precedence:
+/// `LLM_MODEL` env override → the model the user selected via
+/// `prism use marc27 --model …` (persisted on the chat target) →
+/// prism.toml `[llm].model` → the compiled-in default. Pure so the
+/// precedence is unit-testable.
+fn resolve_marc27_model(
+    env_model: Option<String>,
+    target_model: Option<&str>,
+    cfg_model: Option<&str>,
+) -> String {
+    env_model
+        .or_else(|| target_model.map(str::to_string))
+        .or_else(|| cfg_model.map(str::to_string))
+        .unwrap_or_else(|| "gpt-5.5".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marc27_model_prefers_user_selection_over_default() {
+        // The reported bug: user picked sonnet, backend served gpt-5.5.
+        assert_eq!(
+            resolve_marc27_model(None, Some("claude-sonnet-4"), None),
+            "claude-sonnet-4",
+            "the user's `prism use marc27 --model` pick must win over the default"
+        );
+        // No selection anywhere → compiled default.
+        assert_eq!(resolve_marc27_model(None, None, None), "gpt-5.5");
+        // prism.toml [llm].model used when the target carries no model.
+        assert_eq!(
+            resolve_marc27_model(None, None, Some("mistral-large-latest")),
+            "mistral-large-latest"
+        );
+        // Explicit LLM_MODEL env overrides everything.
+        assert_eq!(
+            resolve_marc27_model(Some("gpt-5.5".into()), Some("claude-sonnet-4"), None),
+            "gpt-5.5"
+        );
+    }
 
     #[test]
     fn default_project_name_uses_display_name_when_present() {
