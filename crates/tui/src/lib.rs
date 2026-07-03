@@ -41,6 +41,7 @@ pub mod form;
 pub mod gh;
 pub mod keymap;
 pub mod knowledge;
+pub mod latex;
 pub mod markdown;
 pub mod msg;
 /// Render module — public for integration snapshot tests only.

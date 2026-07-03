@@ -5,7 +5,8 @@
 //! inline code, fenced code blocks, links, and GFM tables. The input
 //! arrives as a stream, so the parser must be resilient to partially-
 //! streamed markdown: any unmatched marker renders literally instead of
-//! eating text. LaTeX and other notations pass through untouched.
+//! eating text. Inline/display LaTeX math (`$…$`, `$$…$$`, `\(…\)`,
+//! `\[…\]`) is converted to a Unicode approximation via [`crate::latex`].
 //!
 //! All colors come from the active [`Theme`] so markdown recolors with
 //! the rest of the UI.
@@ -322,6 +323,56 @@ fn inline_spans(text: &str, t: Theme, base: Style) -> Vec<Span<'static>> {
     }
 
     while i < chars.len() {
+        // Escaped dollar (`\$`) → a literal `$`, never a math delimiter.
+        if chars[i] == '\\' && chars.get(i + 1) == Some(&'$') {
+            plain.push('$');
+            i += 2;
+            continue;
+        }
+        // Display math `$$…$$` (single line). Checked before inline `$…$`.
+        if chars[i] == '$'
+            && chars.get(i + 1) == Some(&'$')
+            && let Some(close) = find_double_dollar(&chars, i + 2)
+        {
+            flush(&mut plain, &mut spans, base);
+            let inner: String = chars[i + 2..close].iter().collect();
+            spans.push(Span::styled(crate::latex::render_math(&inner), base));
+            i = close + 2;
+            continue;
+        }
+        // Inline math `$…$` — a lone `$` (e.g. "$5") stays literal.
+        if chars[i] == '$'
+            && let Some(close) = find_char(&chars, i + 1, '$')
+            && close > i + 1
+        {
+            flush(&mut plain, &mut spans, base);
+            let inner: String = chars[i + 1..close].iter().collect();
+            spans.push(Span::styled(crate::latex::render_math(&inner), base));
+            i = close + 1;
+            continue;
+        }
+        // Inline math `\( … \)`.
+        if chars[i] == '\\'
+            && chars.get(i + 1) == Some(&'(')
+            && let Some(close) = find_escaped(&chars, i + 2, ')')
+        {
+            flush(&mut plain, &mut spans, base);
+            let inner: String = chars[i + 2..close].iter().collect();
+            spans.push(Span::styled(crate::latex::render_math(&inner), base));
+            i = close + 2;
+            continue;
+        }
+        // Display math `\[ … \]`.
+        if chars[i] == '\\'
+            && chars.get(i + 1) == Some(&'[')
+            && let Some(close) = find_escaped(&chars, i + 2, ']')
+        {
+            flush(&mut plain, &mut spans, base);
+            let inner: String = chars[i + 2..close].iter().collect();
+            spans.push(Span::styled(crate::latex::render_math(&inner), base));
+            i = close + 2;
+            continue;
+        }
         // `code`
         if chars[i] == '`'
             && let Some(close) = find_char(&chars, i + 1, '`')
@@ -391,6 +442,30 @@ fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
     let mut i = from;
     while i + 1 < chars.len() {
         if chars[i] == '*' && chars[i + 1] == '*' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the next `$$` at or after `from`, if any (display-math close).
+fn find_double_dollar(chars: &[char], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < chars.len() {
+        if chars[i] == '$' && chars[i + 1] == '$' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of an escaped closer `\<closer>` (e.g. `\)`/`\]`) at/after `from`.
+fn find_escaped(chars: &[char], from: usize, closer: char) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < chars.len() {
+        if chars[i] == '\\' && chars[i + 1] == closer {
             return Some(i);
         }
         i += 1;
@@ -527,9 +602,37 @@ mod tests {
     }
 
     #[test]
-    fn latex_passes_through_untouched() {
+    fn latex_inline_renders_unicode() {
         let lines = markdown_lines(r"the $\gamma'$ phase", t(), W);
-        assert_eq!(text_of(&lines[0]), r"the $\gamma'$ phase");
+        assert_eq!(text_of(&lines[0]), "the γ′ phase");
+    }
+
+    #[test]
+    fn latex_display_and_paren_forms_render() {
+        assert_eq!(
+            text_of(&markdown_lines(r"$$E = mc^2$$", t(), W)[0]),
+            "E = mc²"
+        );
+        assert_eq!(
+            text_of(&markdown_lines(r"energy \(E=mc^2\) here", t(), W)[0]),
+            "energy E=mc² here"
+        );
+        assert_eq!(
+            text_of(&markdown_lines(r"\[\alpha + \beta\]", t(), W)[0]),
+            "α + β"
+        );
+    }
+
+    #[test]
+    fn lone_dollar_stays_literal() {
+        let lines = markdown_lines("cost is $5 today", t(), W);
+        assert_eq!(text_of(&lines[0]), "cost is $5 today");
+    }
+
+    #[test]
+    fn escaped_dollar_is_literal() {
+        let lines = markdown_lines(r"price \$5 net", t(), W);
+        assert_eq!(text_of(&lines[0]), "price $5 net");
     }
 
     #[test]
