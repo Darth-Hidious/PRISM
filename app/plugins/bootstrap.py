@@ -27,7 +27,6 @@ def build_full_registry(
     from app.tools.dataset import create_dataset_tool
     from app.tools.platform_status import create_platform_status_tools
     from app.tools.agent_capabilities import create_agent_capabilities_tool
-    from app.tools.knowledge_search import create_knowledge_search_tool
     from app.tools.knowledge_write import create_knowledge_write_tool
     from app.tools.platform_jobs import create_platform_jobs_tools
     from app.tools.platform_workflows import create_platform_workflows_tools
@@ -52,11 +51,6 @@ def build_full_registry(
     create_platform_status_tools(registry)
     # Self-discovery: GET /agent/capabilities. Read-only.
     create_agent_capabilities_tool(registry)
-    # Knowledge graph READ side (semantic corpus search / graph entities /
-    # recall) — the platform's own corpora (NASA propulsion, MatKG, alloy
-    # datasheets, …) answered by meaning. Read-only, no approval gate. The
-    # old research.py read tool was lost in a refactor; this restores it.
-    create_knowledge_search_tool(registry)
     # Knowledge graph WRITE side (embed/seed/ingest/research-web-search).
     # Closes the read/write asymmetry. Approval-gated as a single tool.
     create_knowledge_write_tool(registry)

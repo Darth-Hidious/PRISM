@@ -130,7 +130,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "query",
         aliases: &[],
         kind: CommandToolKind::QueryPlatform,
-        description: "Search the MARC27 platform knowledge graph. Plain text runs a graph-entity search ('find Ti-6Al-4V'); `semantic=true` runs pgvector similarity for conceptual asks ('high-strength aerospace alloy'). This is the default platform search path — use `knowledge_entity`/`knowledge_paths` for one-entity neighbors or relationship paths.",
+        description: "Search the MARC27 platform's OWN knowledge base — embedded corpora (NASA propulsion technical reports, Materials Project, JARVIS-DFT, MatKG, alloy/superalloy datasheets, additive-manufacturing and fatigue datasets) plus the materials knowledge graph. PREFER this before external literature searches (prior_art_search/web) for materials, alloy, propulsion, and manufacturing questions — the platform often already holds the answer with provenance. Plain text runs a graph-entity search ('find Ti-6Al-4V'); `semantic=true` searches corpus chunks by meaning ('materials for oxygen-rich preburner environments'). Use `knowledge_entity`/`knowledge_paths` for one-entity neighbors or relationship paths.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
