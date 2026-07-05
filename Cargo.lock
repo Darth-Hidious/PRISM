@@ -4874,6 +4874,7 @@ dependencies = [
  "prism-core",
  "prism-ingest",
  "prism-mesh",
+ "prism-workflows",
  "rust-embed",
  "serde",
  "serde_json",

@@ -123,6 +123,42 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
             Permission::ExecuteTools,
         )));
 
+    // ── Goals / workflows / deployments — first-class surfaces for apps
+    // built on the PRISM server (reads open; runs/mutations need
+    // ExecuteTools like chat, since they execute real work) ──────────
+    let goal_workflow_read_routes = Router::new()
+        .route("/api/goals", get(handlers::goals::list_goals))
+        .route("/api/goals/{id}", get(handlers::goals::get_goal))
+        .route("/api/workflows", get(handlers::workflows::list_workflows))
+        .route(
+            "/api/workflows/{name}",
+            get(handlers::workflows::get_workflow),
+        )
+        .route(
+            "/api/deployments",
+            get(handlers::deployments::list_deployments),
+        )
+        .route(
+            "/api/deployments/{id}",
+            get(handlers::deployments::get_deployment),
+        );
+    let goal_workflow_exec_routes = Router::new()
+        .route(
+            "/api/workflows/{name}/run",
+            post(handlers::workflows::run_workflow),
+        )
+        .route(
+            "/api/deployments",
+            post(handlers::deployments::create_deployment),
+        )
+        .route(
+            "/api/deployments/{id}",
+            delete(handlers::deployments::stop_deployment),
+        )
+        .layer(middleware::from_fn(require_permission(
+            Permission::ExecuteTools,
+        )));
+
     // ── User management (auth required, ManageUsers permission) ─────
     let user_routes = Router::new()
         .route("/api/users", get(handlers::users::list_users))
@@ -157,6 +193,8 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
         .merge(user_routes)
         .merge(audit_routes)
         .merge(session_routes)
+        .merge(goal_workflow_read_routes)
+        .merge(goal_workflow_exec_routes)
         .layer(api_rate)
         .layer(role_stack)
         .layer(auth_stack)

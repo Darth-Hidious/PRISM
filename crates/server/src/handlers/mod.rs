@@ -1,9 +1,12 @@
 pub mod audit;
 pub mod chat;
 pub mod data;
+pub mod deployments;
+pub mod goals;
 pub mod mesh;
 pub mod node;
 pub mod query;
 pub mod sessions;
 pub mod tools;
 pub mod users;
+pub mod workflows;
