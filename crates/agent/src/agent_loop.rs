@@ -78,6 +78,32 @@ fn process_large_result(content: &str, result_store: &mut HashMap<String, String
     )
 }
 
+// ── Trajectory injection ──────────────────────────────────────────
+//
+// Long research turns die when the model forgets (or ignores) what it
+// already did — memory tools are opt-in for the LLM, so recall is
+// probabilistic. This makes the recent past DETERMINISTIC: the harness
+// itself shows the last N executed steps (as one-line pointers, not
+// payloads) in a system block every iteration. Owner design 2026-07-05.
+
+const TRAJECTORY_SHOWN_STEPS: usize = 5;
+
+fn trajectory_block(steps: &[String]) -> Option<String> {
+    if steps.is_empty() {
+        return None;
+    }
+    let start = steps.len().saturating_sub(TRAJECTORY_SHOWN_STEPS);
+    let mut out = String::from(
+        "TRAJECTORY — steps already executed this turn (deterministic record). \
+         Do not repeat a step that succeeded; build on its result. Truncated \
+         results can be expanded with recall(query=\"<keywords>\").\n",
+    );
+    for (idx, step) in steps.iter().enumerate().skip(start) {
+        out.push_str(&format!("  #{} {}\n", idx + 1, step));
+    }
+    Some(out)
+}
+
 // ── Doom-loop detection ───────────────────────────────────────────
 
 fn doom_loop_signature(tool_name: &str, args: &Value) -> String {
@@ -569,6 +595,9 @@ pub async fn run_turn(
 
     let mut total_usage = UsageInfo::default();
     let mut result_store: HashMap<String, String> = HashMap::new();
+    // One line per executed tool step — feeds the deterministic TRAJECTORY
+    // block injected into every iteration's context.
+    let mut traj_steps: Vec<String> = Vec::new();
     let mut recent_sigs: VecDeque<String> = VecDeque::with_capacity(DOOM_LOOP_WINDOW + 1);
     // Track consecutive empty results per tool name
     let mut empty_result_streak: HashMap<String, usize> = HashMap::new();
@@ -693,6 +722,16 @@ pub async fn run_turn(
             messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: Some(skills_menu),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        // Deterministic trajectory: the harness (not the model's memory) keeps
+        // the last executed steps in front of the model every iteration.
+        if let Some(traj) = trajectory_block(&traj_steps) {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(traj),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -1188,6 +1227,7 @@ pub async fn run_turn(
 
             // ── h9. Log to scratchpad ─────────────────────────────
             let summary = summarize_tool_result(tool_name, preview.as_deref(), &content, is_error);
+            traj_steps.push(summary.clone());
             scratchpad.log(
                 "tool_call",
                 Some(tool_name.as_str()),
@@ -1608,6 +1648,24 @@ mod tests {
         // Stored value is the full content
         let stored = store.values().next().unwrap();
         assert_eq!(stored.len(), 40_000);
+    }
+
+    #[test]
+    fn test_trajectory_block_empty() {
+        assert!(trajectory_block(&[]).is_none());
+    }
+
+    #[test]
+    fn test_trajectory_block_shows_last_five_with_global_numbering() {
+        let steps: Vec<String> = (1..=8).map(|i| format!("tool_{i}: ok")).collect();
+        let block = trajectory_block(&steps).unwrap();
+        // Only the last TRAJECTORY_SHOWN_STEPS appear…
+        assert!(!block.contains("#3 tool_3"));
+        assert!(block.contains("#4 tool_4"));
+        assert!(block.contains("#8 tool_8"));
+        // …numbered by their global step index, and framed as a directive.
+        assert!(block.contains("Do not repeat a step that succeeded"));
+        assert!(block.contains("recall"));
     }
 
     #[test]
