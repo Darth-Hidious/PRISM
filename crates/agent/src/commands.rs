@@ -285,6 +285,18 @@ const CLI_BACKED_ROOTS: &[&str] = &[
     "discourse",
     "publish",
     "configure",
+    // Capability roots surfaced in-app so `/<root> …` works WITHOUT leaving the
+    // TUI (see docs/design/TUI_REACHABILITY_AUDIT.md + memory prism-no-exit-to-cli).
+    // Each spawns `prism <root>` with a per-root timeout + graceful degradation;
+    // long-lived subcommands (e.g. `campaign start`) get a proper pane/agent-tool
+    // next. `use` is intentionally NOT here — it needs live chat-target hot-swap,
+    // not a config-only subprocess that the running session would ignore.
+    "compute",
+    "campaign",
+    "notebook",
+    "pyiron",
+    "billing",
+    "federation",
 ];
 
 pub fn builtin_help_text() -> String {

@@ -1,7 +1,7 @@
 """Collect materials data from OPTIMADE and Materials Project."""
 from typing import Dict, List, Optional
 
-from app.tools.data_collectors.base_collector import DataCollector
+from app.tools.data_collectors.base_collector import CollectorConfigError, DataCollector
 
 
 def _get_fallback_providers():
@@ -84,7 +84,13 @@ class MPCollector(DataCollector):
         import os
         api_key = os.getenv("MP_API_KEY")
         if not api_key:
-            return []
+            # Misconfiguration, not "no materials found" — raise so the caller
+            # records the skip instead of the agent reading an empty result as
+            # "Materials Project has nothing".
+            raise CollectorConfigError(
+                "mp source requires MP_API_KEY (Materials Project) — not configured; "
+                "run `prism login` to use the platform proxy instead"
+            )
         try:
             from mp_api.client import MPRester
             with MPRester(api_key) as mpr:

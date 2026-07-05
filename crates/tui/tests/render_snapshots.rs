@@ -66,8 +66,14 @@ fn render_app_to_string(app: &App, width: u16, height: u16) -> String {
 }
 
 /// Create an `App` with a fake backend (no subprocess spawned).
+///
+/// Snapshots capture post-launch UI states, so this dismisses the Mission
+/// Control home (the launch overlay). The launch home itself is captured by
+/// `snapshot_home_launch_100x30`.
 fn fake_app() -> App {
-    App::new(BackendHandle::fake(FakeScenario::BasicChat))
+    let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+    app.home.open = false;
+    app
 }
 
 /// Assert that the rendered string contains no unsafe terminal control
@@ -89,6 +95,15 @@ fn snapshot_empty_launch_100x30() {
     let app = fake_app();
     let rendered = render_app_to_string(&app, 100, 30);
     insta::assert_snapshot!("empty_launch_100x30", rendered);
+}
+
+/// Snapshot: the Mission Control home — the actual launch screen (chat demoted).
+#[test]
+fn snapshot_home_launch_100x30() {
+    let app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+    assert!(app.home.open, "home must be open on launch");
+    let rendered = render_app_to_string(&app, 100, 30);
+    insta::assert_snapshot!("home_launch_100x30", rendered);
 }
 
 /// Snapshot: basic chat after response at 100x30.

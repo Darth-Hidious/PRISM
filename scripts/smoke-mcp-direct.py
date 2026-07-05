@@ -69,7 +69,6 @@ PLANS: dict[str, Plan] = {
 
     # Read-only Python tools (direct-callable with zero args)
     "knowledge_stats":              Plan({},                                  True),
-    "discover_capabilities":        Plan({},                                  True),
     "compute_gpus":                 Plan({},                                  True),
     "compute_providers":            Plan({},                                  True),
     "list_corpora":                 Plan({},                                  True),

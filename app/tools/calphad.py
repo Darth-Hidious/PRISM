@@ -184,7 +184,8 @@ def _calphad(**kwargs) -> dict:
 
 
 def _calphad_compute(**kwargs) -> dict:
-    """Money/compute-spending CALPHAD dispatcher. Approval-gated.
+    """Compute-heavy local CALPHAD dispatcher (pycalphad). Approval-gated —
+    runs locally, no credits charged.
 
     Replaces calculate_phase_diagram / calculate_equilibrium /
     calculate_gibbs_energy. All three are real CALPHAD calculations
@@ -244,8 +245,8 @@ _CALPHAD_DESCRIPTION = (
 
 _CALPHAD_COMPUTE_DESCRIPTION = (
     "CALPHAD thermodynamic calculations. ONE tool, three actions. "
-    "MONEY/COMPUTE-SPENDING — requires_approval=True; the harness will "
-    "prompt before each call.\n"
+    "COMPUTE-HEAVY (runs locally via pycalphad, no credits charged) — "
+    "requires_approval=True; the harness will prompt before each call.\n"
     "  • action='phase_diagram' — calculate a binary/ternary phase diagram. "
     "Required: `database_name`, `components` (e.g. ['Al', 'Ni']). "
     "Optional: `phases`, `temperature_range` (default [300, 2000, 50]), "
@@ -272,7 +273,7 @@ def create_calphad_tools(registry: ToolRegistry) -> None:
         calculate_gibbs_energy → calphad_compute(action=…)
 
     The split mirrors compute / compute_submit and bash_task / stop_bash_task:
-    destructive or money-spending actions stay isolated for per-tool
+    destructive or compute-heavy actions stay isolated for per-tool
     approval gating.
     """
     registry.register(Tool(

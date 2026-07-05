@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # via `record_artifacts=False`. This module also has a name-based
 # safety net for tools that for whatever reason didn't set the flag.
 _NEVER_RECORD: frozenset[str] = frozenset({
-    "recall",
+    "search_artifacts",
     "fetch_artifact",
     "list_artifacts",
     "show_scratchpad",

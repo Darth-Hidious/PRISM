@@ -150,6 +150,36 @@ pub fn sanitize_env_vars(env_vars: &BTreeMap<String, String>) -> Result<BTreeMap
     Ok(safe)
 }
 
+/// Make sure an image is available: try to pull, and when the pull fails fall
+/// back to a locally present image (pre-loaded nodes, air-gapped facilities,
+/// images built on the node itself). Bail only when the image is nowhere.
+async fn ensure_image_available(runtime: ContainerRuntime, image: &str) -> Result<()> {
+    let pull = Command::new(runtime.binary())
+        .args(["pull", image])
+        .output()
+        .await
+        .with_context(|| format!("failed to pull image with {}", runtime.binary()))?;
+
+    if pull.status.success() {
+        return Ok(());
+    }
+
+    let local = Command::new(runtime.binary())
+        .args(["image", "inspect", image])
+        .output()
+        .await;
+    if matches!(local, Ok(ref out) if out.status.success()) {
+        tracing::warn!(%image, "image pull failed but a local copy exists — using it");
+        return Ok(());
+    }
+
+    let err = String::from_utf8_lossy(&pull.stderr);
+    bail!(
+        "{} pull failed and no local copy of '{image}' exists: {err}",
+        runtime.binary()
+    );
+}
+
 pub async fn execute_container_job(
     runtime: ContainerRuntime,
     spec: &ContainerJobSpec,
@@ -158,16 +188,7 @@ pub async fn execute_container_job(
     verify_runtime_available(runtime).await?;
 
     on_progress(0.0, "Pulling image...");
-    let pull = Command::new(runtime.binary())
-        .args(["pull", &spec.image])
-        .output()
-        .await
-        .with_context(|| format!("failed to pull image with {}", runtime.binary()))?;
-
-    if !pull.status.success() {
-        let err = String::from_utf8_lossy(&pull.stderr);
-        bail!("{} pull failed: {err}", runtime.binary());
-    }
+    ensure_image_available(runtime, &spec.image).await?;
 
     on_progress(0.1, "Starting container...");
 
@@ -303,16 +324,7 @@ pub async fn start_container_deployment(
 
     let handle = deployment_handle(spec.deployment_id);
 
-    let pull = Command::new(runtime.binary())
-        .args(["pull", &spec.image])
-        .output()
-        .await
-        .with_context(|| format!("failed to pull image with {}", runtime.binary()))?;
-
-    if !pull.status.success() {
-        let err = String::from_utf8_lossy(&pull.stderr);
-        bail!("{} pull failed: {err}", runtime.binary());
-    }
+    ensure_image_available(runtime, &spec.image).await?;
 
     let mut args = vec![
         "run".to_string(),

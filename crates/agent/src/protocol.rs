@@ -1237,7 +1237,7 @@ async fn run_cli_backed_slash_command_raw(
         return Ok(RawCliSlashOutput {
             invocation: format!("prism {}", args.join(" ")),
             stdout: format!(
-                "`/{root}` is not available inside the embedded REPL. Run `prism {root}` from your shell."
+                "`/{root}` runs as part of PRISM itself and isn't a slash command here."
             ),
             stderr: String::new(),
             success: true,
@@ -1266,7 +1266,7 @@ async fn run_cli_backed_slash_command_raw(
             return Ok(RawCliSlashOutput {
                 invocation,
                 stdout: format!(
-                    "`{root}` is still running after {timeout_secs} seconds. Run it in your shell for an interactive or long-lived session."
+                    "`{root}` is still running after {timeout_secs}s — long-lived commands aren't wired for in-app execution yet (tracked as a reachability gap)."
                 ),
                 stderr: String::new(),
                 success: false,
@@ -6963,7 +6963,9 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
 
                 let approval = match response_str {
                     "y" | "yes" | "allow" => agent_loop::ApprovalResponse::Allow,
-                    "a" | "all" | "always" | "allow-session" => agent_loop::ApprovalResponse::Allow,
+                    "a" | "all" | "always" | "allow-session" => {
+                        agent_loop::ApprovalResponse::AllowAll
+                    }
                     _ => agent_loop::ApprovalResponse::Deny,
                 };
                 let _ = approval_tx.try_send(approval);

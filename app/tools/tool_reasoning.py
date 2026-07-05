@@ -76,7 +76,7 @@ TOOL_GRAPH = {
                 "when": "User wants to store or export results",
             },
             {
-                "tool": "recall",
+                "tool": "search_artifacts",
                 "description": "Search past evaluations for comparison",
                 "input_mapping": "",
                 "when": "User asks 'how does this compare to previous results'",
@@ -85,7 +85,7 @@ TOOL_GRAPH = {
     },
 
     # ── Knowledge graph → reasoning chains ──────────────────────────
-    "knowledge": {
+    "query_platform": {
         "outputs": ["results", "entities", "relationships"],
         "feeds_into": [
             {
@@ -161,7 +161,7 @@ LOGICAL_FORMS = [
         "tool_sequence": [
             {"tool": "search_materials", "role": "primary",
              "reason": "Federated OPTIMADE search across 20+ providers"},
-            {"tool": "knowledge", "role": "complement",
+            {"tool": "query_platform", "role": "complement",
              "reason": "Search MARC27 knowledge graph"},
             {"tool": "alpha_predict", "role": "followup",
              "reason": "Evaluate search results"},
@@ -209,14 +209,14 @@ LOGICAL_FORMS = [
             r"\b(recall|remember|show me.*results)\b",
         ],
         "tool_sequence": [
-            {"tool": "recall", "role": "primary",
+            {"tool": "search_artifacts", "role": "primary",
              "reason": "Hybrid search over past tool outputs"},
             {"tool": "list_artifacts", "role": "complement",
              "reason": "List by metadata (tool, session, time)"},
             {"tool": "fetch_artifact", "role": "followup",
              "reason": "Get full content of a recalled artifact"},
         ],
-        "data_flow": "recall → fetch_artifact",
+        "data_flow": "search_artifacts → fetch_artifact",
     },
 ]
 
@@ -301,7 +301,7 @@ def _keyword_tool_suggestions(query: str) -> list[dict]:
         "modulus": ["alpha_predict"],
         "density": ["alpha_predict"],
         "stability": ["alpha_predict"],
-        "search": ["search_materials", "knowledge"],
+        "search": ["search_materials", "query_platform"],
         "discover": ["search_materials", "alpha_predict"],
         "compute": ["compute", "compute_submit"],
         "mesh": ["mesh_health", "mesh_peers", "mesh_subscriptions"],

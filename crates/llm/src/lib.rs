@@ -842,10 +842,10 @@ impl LlmClient {
 ///
 /// Instead of dumping all 108 tool definitions (11K+ tokens), we give the model:
 /// 1. A categorized summary of what's available
-/// 2. Instructions to call `discover_capabilities` for specifics
+/// 2. Instructions to call `find_tools` for specifics
 /// 3. The tool calling syntax
 ///
-/// Full tool definitions are injected only after discover_capabilities returns.
+/// Full tool definitions are injected only after find_tools returns.
 fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
     // Categorize tools by prefix/name patterns
     let mut categories: std::collections::BTreeMap<&str, Vec<&str>> =
@@ -936,7 +936,7 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         {\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n\
         ```\n\n\
         **CRITICAL rules:**\n\
-        - Call `discover_capabilities` first if you need to see what tools exist\n\
+        - Call `find_tools` (with a `query`) first if you need to discover what tools exist\n\
         - Output ONE ```tool_call block, then STOP IMMEDIATELY. Do not write anything after it.\n\
         - Do NOT output multiple tool_call blocks in one response.\n\
         - Do NOT guess, fabricate, or hallucinate tool results. EVER.\n\
@@ -948,17 +948,17 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         - If a tool returns a missing-API-key error (e.g. \"MP_API_KEY not set\"), \
         immediately try a keyless alternative: `materials_search` (OPTIMADE federation, \
         no key needed) or `prior_art_search` (literature) before giving up.\n\
-        - If a tool returns \"unknown tool\", call `discover_capabilities` to see real \
+        - If a tool returns \"unknown tool\", call `find_tools` to see real \
         names, then try the closest match. Do not give up.\n\
-        - If two tools have failed for the same goal, call `discover_capabilities` again, \
+        - If two tools have failed for the same goal, call `find_tools` again, \
         then propose the next-best tool. The user expects multiple tool attempts on \
         failure — silence is the worst outcome.\n\
         - NEVER respond with empty content + no tool call after a tool error. Either \
         try a different tool, or explicitly tell the user which tools you tried and \
         why none of them worked.\n\n\
         ## Quick reference (most common tools)\n\n\
-        - `discover_capabilities` — see all available tools, providers, models, corpora\n\
-        - `knowledge` — search/manage the MARC27 knowledge graph (211K+ entities)\n\
+        - `find_tools` — discover tools by capability/keyword (progressive tool discovery)\n\
+        - `query_platform` — search the MARC27 knowledge graph (plain text = graph, semantic=true = vector)\n\
         - `materials_search` — federated search across 20+ materials databases (OPTIMADE)\n\
         - `predict` — predict a material property from composition (ML)\n\
         - `execute_python` — run Python code for analysis\n\
@@ -966,7 +966,7 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         - `prior_art_search` — search arXiv, Semantic Scholar, and patents (Lens.org)\n\
         - `research` — iterative research loop via the MARC27 platform\n\n\
         Names above MUST match the actual registry. If a tool you'd expect \
-        isn't in this list, call `discover_capabilities` instead of guessing.\n\n\
+        isn't in this list, call `find_tools` instead of guessing.\n\n\
         ## Tool-composition patterns (USE THESE for the common tasks)\n\n\
         PRISM is a materials-discovery strategy engine, not just a chat model. \
         For non-trivial questions you should COMPOSE multiple tools instead of \
@@ -1060,6 +1060,105 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
 }
 
 /// Parse ```tool_call blocks from response text.
+/// Return the byte index just past the `}` that closes the JSON object
+/// starting at `start` (which must be a `{`), respecting string literals and
+/// escapes. `None` if the object is unbalanced. Only ever returns indices at
+/// ASCII `}` positions, so the result is a valid char boundary.
+fn balanced_object_end(text: &str, start: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    if b.get(start) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut i = start;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// If a loose tool-call marker token (`tool_call`, `_call`, `call`,
+/// `function_call`, optionally back-ticked / colon-suffixed) immediately
+/// precedes the JSON object at `obj_start`, return the marker's start offset so
+/// callers can strip it too; otherwise return `obj_start`.
+fn marker_start_before(text: &str, obj_start: usize) -> usize {
+    const MARKERS: &[&str] = &["tool_call", "_call", "call", "function_call"];
+    let trimmed = text[..obj_start].trim_end();
+    let token_start = trimmed
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let norm = trimmed[token_start..]
+        .trim_matches('`')
+        .trim_end_matches(':')
+        .to_ascii_lowercase();
+    if MARKERS.contains(&norm.as_str()) {
+        token_start
+    } else {
+        obj_start
+    }
+}
+
+/// Recover a bare (un-fenced) JSON tool call: the first `{...}` object that
+/// deserializes and carries a non-empty, whitespace-free `name` plus an
+/// `arguments` **object**. Returns `(region_start, name, arguments_json)` where
+/// `region_start` includes any immediately-preceding loose marker line.
+///
+/// This is the recovery path for models that drop the ```tool_call fence.
+/// Observed live on the MARC27 `/stream` text-tool-calling path: after a
+/// natural-language preamble, Claude emitted `_call\n{"name":...}` with no
+/// backticks, so the fenced/XML parsers missed it and the call silently leaked
+/// into visible text and ended the turn. The guards (name shape + arguments is
+/// an object) keep incidental prose JSON from being mistaken for a call.
+fn find_bare_json_tool_call(text: &str) -> Option<(usize, String, String)> {
+    let mut from = 0;
+    while let Some(rel) = text[from..].find('{') {
+        let obj_start = from + rel;
+        if let Some(obj_end) = balanced_object_end(text, obj_start)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[obj_start..obj_end])
+        {
+            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let args_is_obj = v.get("arguments").map(|a| a.is_object()).unwrap_or(false);
+            if !name.is_empty() && !name.contains(char::is_whitespace) && args_is_obj {
+                let arguments = v
+                    .get("arguments")
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "{}".to_string());
+                let region_start = marker_start_before(text, obj_start);
+                return Some((region_start, name.to_string(), arguments));
+            }
+        }
+        from = obj_start + 1;
+    }
+    None
+}
+
 fn parse_text_tool_calls(text: &str) -> Vec<ToolCallResponse> {
     let mut calls = Vec::new();
     let mut call_idx = 0;
@@ -1149,6 +1248,20 @@ fn parse_text_tool_calls(text: &str) -> Vec<ToolCallResponse> {
         }
     }
 
+    // Format 3: bare JSON tool call — recovery for a dropped/mangled
+    // ```tool_call fence. Observed on the MARC27 /stream path: after a prose
+    // preamble the model emitted `_call\n{"name":...,"arguments":{...}}` with no
+    // backticks, so Formats 1-2 missed it and the call silently leaked as text.
+    if calls.is_empty()
+        && let Some((_, name, arguments)) = find_bare_json_tool_call(text)
+    {
+        calls.push(ToolCallResponse {
+            id: format!("tc_{call_idx}"),
+            call_type: "function".to_string(),
+            function: FunctionCall { name, arguments },
+        });
+    }
+
     calls
 }
 
@@ -1173,12 +1286,10 @@ fn strip_tool_call_blocks(text: &str) -> String {
     // Handle both ```tool_call (Claude/Gemini) and <tool_call> (Nvidia/Llama)
     let fenced = text.find("```tool_call");
     let xml = text.find("<tool_call>");
-    let first = match (fenced, xml) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
+    // Also strip a bare/mangled-fence tool call (Format 3), truncating at its
+    // marker so `_call\n{...}` doesn't survive into visible content.
+    let bare = find_bare_json_tool_call(text).map(|(start, _, _)| start);
+    let first = [fenced, xml, bare].into_iter().flatten().min();
     if let Some(start) = first {
         return text[..start].trim().to_string();
     }
@@ -1227,6 +1338,61 @@ mod tests {
         assert!(client.auth_header().is_none());
     }
 
+    #[test]
+    fn format1_fenced_tool_call_still_parses() {
+        // Regression: the well-formed fence must keep working unchanged.
+        let text = "Let me search.\n```tool_call\n{\"name\": \"web\", \"arguments\": {\"query\": \"x\"}}\n```";
+        let calls = parse_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "web");
+        assert_eq!(strip_tool_call_blocks(text), "Let me search.");
+    }
+
+    #[test]
+    fn format3_recovers_mangled_underscore_call_marker() {
+        // The exact live failure: after a prose preamble Claude dropped the
+        // ```tool_call fence and emitted `_call\n{...}`. Must be recovered.
+        let text = "The prior_art results were noisy — not useful. I'll cross-check \
+                    the knowledge graph directly.\n\n_call\n{\"name\": \"knowledge\", \
+                    \"arguments\": {\"action\": \"search\", \"query\": \"HfC-TaC\"}}";
+        let calls = parse_text_tool_calls(text);
+        assert_eq!(calls.len(), 1, "mangled-marker call must be recovered");
+        assert_eq!(calls[0].function.name, "knowledge");
+        assert!(calls[0].function.arguments.contains("\"action\""));
+    }
+
+    #[test]
+    fn format3_recovers_bare_json_with_no_marker() {
+        let text = "Let me look that up.\n{\"name\": \"web\", \"arguments\": \
+                    {\"action\": \"search\", \"query\": \"x\"}}";
+        let calls = parse_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "web");
+    }
+
+    #[test]
+    fn format3_ignores_prose_json_that_is_not_a_tool_call() {
+        // arguments is a string, not an object → not a call.
+        assert!(
+            parse_text_tool_calls("A record: {\"name\": \"Alice\", \"arguments\": \"none\"}.")
+                .is_empty()
+        );
+        // no `arguments` key at all → not a call.
+        assert!(parse_text_tool_calls("Config: {\"name\": \"widget\", \"value\": 3}").is_empty());
+        // name contains whitespace → not a tool name.
+        assert!(parse_text_tool_calls("{\"name\": \"John Smith\", \"arguments\": {}}").is_empty());
+    }
+
+    #[test]
+    fn strip_removes_mangled_call_region_keeps_preamble() {
+        let text = "Cross-checking the graph directly.\n\n_call\n\
+                    {\"name\": \"knowledge\", \"arguments\": {\"action\": \"search\"}}";
+        assert_eq!(
+            strip_tool_call_blocks(text),
+            "Cross-checking the graph directly."
+        );
+    }
+
     /// Pin the curated tool names in the system-prompt quick-reference.
     ///
     /// Each name below MUST be a real tool registered in `app/tools/*.py`
@@ -1242,8 +1408,8 @@ mod tests {
     /// A future `boot_checks` entry can run the actual cross-check
     /// against `tool_server.list_tools()` at startup.
     const QUICK_REFERENCE_TOOL_NAMES: &[&str] = &[
-        "discover_capabilities",
-        "knowledge",
+        "find_tools",
+        "query_platform",
         "materials_search",
         "predict",
         "execute_python",
@@ -1460,18 +1626,28 @@ mod tests {
             );
         }
 
+        // Spine tools live in Rust, not app/tools/*.py: `find_tools` is an
+        // always-on meta-tool (crates/agent/src/meta_tools.rs); `query_platform`
+        // and `research` are Rust command-tools (crates/agent/src/command_tools.rs)
+        // that replaced retired Python tools (knowledge.py / research.py). They
+        // are real, just not Python-registered — exempt them from the Python
+        // cross-check (the anti-dead-tool intent still covers the rest).
+        const RUST_NATIVE: &[&str] = &["find_tools", "query_platform", "research"];
+
         let missing: Vec<&str> = QUICK_REFERENCE_TOOL_NAMES
             .iter()
             .copied()
+            .filter(|n| !RUST_NATIVE.contains(n))
             .filter(|n| !registered.contains(*n))
             .collect();
 
         assert!(
             missing.is_empty(),
-            "tool name(s) in quick-reference are NOT registered in app/tools/: {:?}\n\
+            "tool name(s) in quick-reference are NOT registered in app/tools/ or RUST_NATIVE: {:?}\n\
              registered names found: {:?}\n\
-             Either restore the registration in Python or remove the name from \
-             both QUICK_REFERENCE_TOOL_NAMES and build_tool_prompt_block.",
+             Either restore the registration in Python, add it to RUST_NATIVE if it is a \
+             Rust command/meta tool, or remove the name from both \
+             QUICK_REFERENCE_TOOL_NAMES and build_tool_prompt_block.",
             missing,
             registered.iter().take(20).collect::<Vec<_>>()
         );

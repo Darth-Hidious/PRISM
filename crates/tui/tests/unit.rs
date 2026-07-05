@@ -45,7 +45,11 @@ fn test_app() -> App {
         drop(tx);
     });
     let handle = BackendHandle::from_parts(child, stdin, rx, 1);
-    App::new(handle)
+    let mut app = App::new(handle);
+    // These tests exercise post-launch behavior; dismiss the Mission Control
+    // home (the launch overlay) so global keys reach their handlers.
+    app.home.open = false;
+    app
 }
 
 // ── parse_notification ─────────────────────────────────────────────

@@ -216,6 +216,17 @@ pub struct StatusWindow {
     pub open: bool,
 }
 
+/// Mission Control home — the launch screen (see docs/design/PLATFORM_ARCHITECTURE.md §3).
+/// A glanceable, honest dashboard of the platform: workflows · tools · notebooks ·
+/// systems · ingestion. Built from live App state only — it never fabricates a field
+/// the backend didn't send; sections without a live client surface say so plainly.
+/// Shown on launch and reopenable ("Mission Control" in the palette); single letters
+/// jump into a section's window, ⏎/Esc drop into the chat prompt.
+#[derive(Default)]
+pub struct Home {
+    pub open: bool,
+}
+
 /// Bespoke Config window — a file viewer for prism.toml / .mcp.json /
 /// ~/.prism/config.toml / credentials (redacted), with file switching + scroll.
 #[derive(Debug, Clone, Default)]
@@ -412,6 +423,8 @@ pub struct App {
     pub tools_window: ToolsWindow,
     /// Bespoke Status window.
     pub status_window: StatusWindow,
+    /// Mission Control home (launch screen).
+    pub home: Home,
     /// Bespoke Config window (file viewer).
     pub config_window: ConfigWindow,
     /// API-key window.
@@ -481,6 +494,7 @@ impl App {
             tool_catalog: Vec::new(),
             tools_window: ToolsWindow::default(),
             status_window: StatusWindow::default(),
+            home: Home { open: true },
             config_window: ConfigWindow::default(),
             apikey_window: ApiKeyWindow::default(),
             link_picker: LinkPicker::default(),
@@ -585,6 +599,12 @@ impl App {
         // API-key window intercepts keys while open.
         if self.apikey_window.open {
             self.handle_apikey_key(key);
+            return;
+        }
+
+        // Mission Control home intercepts keys while open (the launch screen).
+        if self.home.open {
+            self.handle_home_key(key);
             return;
         }
 
@@ -1810,6 +1830,14 @@ impl App {
         let _ = self.backend.send_command("/sessions");
     }
 
+    /// Resume a specific conversation by id at launch — used by
+    /// `prism resume <id>`, which jumps straight in rather than opening
+    /// the picker. Mirrors the picker's Enter action.
+    pub fn resume_session(&mut self, id: &str) {
+        self.toast(format!("resuming {id}…"), ToastKind::Info);
+        let _ = self.backend.send_command(&format!("/resume {id}"));
+    }
+
     fn close_sessions(&mut self) {
         self.session_picker.open = false;
     }
@@ -2030,6 +2058,57 @@ impl App {
             || key.code == KeyCode::Esc;
         if cancel {
             self.close_status_window();
+        }
+    }
+
+    // ── Mission Control home (launch screen, from live state) ───────
+
+    pub fn open_home(&mut self) {
+        self.home.open = true;
+    }
+    fn close_home(&mut self) {
+        self.home.open = false;
+    }
+    /// The launch screen is glanceable, not a form: Esc/⏎ drop into the chat
+    /// prompt ("talk to the agent"); single letters jump into a section's own
+    /// window; sections without a live client surface yet answer with an honest
+    /// toast rather than a fabricated pane.
+    fn handle_home_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => self.close_home(),
+            KeyCode::Char('c') if ctrl => self.close_home(),
+            KeyCode::Char('p') if ctrl => {
+                self.close_home();
+                self.open_palette();
+            }
+            KeyCode::Char('t') => {
+                self.close_home();
+                self.open_tools_window();
+            }
+            KeyCode::Char('s') => {
+                self.close_home();
+                self.open_status_window();
+            }
+            KeyCode::Char('?') => {
+                self.close_home();
+                self.open_which_key();
+            }
+            KeyCode::Char('w') => {
+                self.close_home();
+                self.toast(
+                    "Workflows: no live run list wired yet — start one by talking to the agent.",
+                    ToastKind::Info,
+                );
+            }
+            KeyCode::Char('n') => {
+                self.close_home();
+                self.toast(
+                    "In-app notebooks are coming — agent-watched + editable, running cloud/local/your hardware.",
+                    ToastKind::Info,
+                );
+            }
+            _ => {}
         }
     }
 
@@ -2383,7 +2462,7 @@ impl App {
             "sci.ingest" => self.open_knowledge_pane(KnowledgeTab::Ingest),
             "sci.notebook" => {
                 self.toast(
-                    "notebooks run via CLI: prism notebook start",
+                    "In-app notebooks are coming — agent-watched + editable (not wired yet).",
                     ToastKind::Info,
                 );
             }
@@ -2395,6 +2474,7 @@ impl App {
             "sessions.show" => self.open_sessions(),
             "tools.show" => self.open_tools_window(),
             "status.show" => self.open_status_window(),
+            "home.show" => self.open_home(),
             "config.show" => self.open_config_window(),
             "apikey.show" => self.open_apikey_window(),
             "session.new" => self.new_session(),
@@ -3208,7 +3288,30 @@ mod tests {
     }
 
     fn fresh() -> App {
-        App::new(BackendHandle::fake(FakeScenario::BasicChat))
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        // These tests exercise post-launch behavior; dismiss the Mission Control
+        // home (the launch overlay) so global keys reach their handlers — exactly
+        // as they would once the user dismisses it. Launch behavior itself is
+        // covered by `home_opens_on_launch_and_intercepts_keys`.
+        app.home.open = false;
+        app
+    }
+
+    #[test]
+    fn home_opens_on_launch_and_intercepts_keys() {
+        // The Mission Control home is the launch screen.
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        assert!(app.home.open, "home must open on launch");
+        // While open it follows the overlay convention: Ctrl-C cancels the
+        // overlay (does NOT quit), like the palette.
+        app.handle_key(ctrl('c'));
+        assert!(!app.home.open, "Ctrl-C dismisses the home");
+        assert!(!app.should_quit, "Ctrl-C on the home must not quit");
+        // A section letter jumps into that section's window and closes home.
+        let mut app2 = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app2.handle_key(key(KeyCode::Char('t')));
+        assert!(!app2.home.open, "'t' closes the home");
+        assert!(app2.tools_window.open, "'t' opens the tools window");
     }
 
     #[test]

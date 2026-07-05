@@ -23,9 +23,13 @@ def _acquire_materials(**kwargs) -> dict:
         filter_string = elem_filter
 
     all_records = []
+    skipped = []  # sources that errored / were misconfigured — surfaced to the agent
 
     # Build a collector registry with all built-in collectors
-    from app.tools.data_collectors.base_collector import get_default_collector_registry
+    from app.tools.data_collectors.base_collector import (
+        CollectorConfigError,
+        get_default_collector_registry,
+    )
 
     collector_reg = get_default_collector_registry()
 
@@ -61,11 +65,19 @@ def _acquire_materials(**kwargs) -> dict:
             else:
                 records = collector.collect()
             all_records.extend(records)
-        except Exception:
-            pass
+        except CollectorConfigError as e:
+            # Missing credential — record the skip so the agent sees "mp was
+            # unavailable" rather than silently getting fewer sources.
+            skipped.append({"source": src, "reason": str(e)})
+        except Exception as e:
+            skipped.append({"source": src, "reason": f"{type(e).__name__}: {e}"})
 
     if not all_records:
-        return {"error": "No records collected from any source", "sources": sources}
+        return {
+            "error": "No records collected from any source",
+            "sources": sources,
+            "skipped": skipped,
+        }
 
     # Normalize and deduplicate
     from app.tools.data_collectors.normalizer import normalize_records
@@ -91,6 +103,7 @@ def _acquire_materials(**kwargs) -> dict:
         "total_records": len(df),
         "columns": list(df.columns),
         "sources_queried": sources,
+        "skipped": skipped,
     }
 
 

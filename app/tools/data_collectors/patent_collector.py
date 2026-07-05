@@ -4,7 +4,7 @@ from typing import Dict, List
 
 import requests
 
-from app.tools.data_collectors.base_collector import DataCollector
+from app.tools.data_collectors.base_collector import CollectorConfigError, DataCollector
 
 
 class PatentCollector(DataCollector):
@@ -18,7 +18,12 @@ class PatentCollector(DataCollector):
             return []
         token = os.getenv("LENS_API_TOKEN")
         if not token:
-            return []
+            # Missing credential is a misconfiguration, not "no patents found".
+            # Raising lets prior_art_search report `patents_error` so the agent
+            # knows the source was skipped rather than genuinely empty.
+            raise CollectorConfigError(
+                "patents source requires LENS_API_TOKEN (Lens.org) — not configured"
+            )
 
         try:
             headers = {

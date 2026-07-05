@@ -97,7 +97,13 @@ pub struct ProvenanceStore {
 
 impl ProvenanceStore {
     pub async fn open(path: &Path) -> Result<Self> {
-        let path_str = path.to_str().unwrap_or(":memory:");
+        // A non-UTF-8 path must be a hard error, never a silent ":memory:"
+        // fallback — that would make the whole session's provenance vanish on
+        // exit with no warning (AUDIT_BACKLOG 0.4). A caller that genuinely
+        // wants in-memory passes the UTF-8 string ":memory:", which is fine.
+        let path_str = path.to_str().ok_or_else(|| {
+            anyhow::anyhow!("provenance database path is not valid UTF-8: {path:?}")
+        })?;
         let db = turso::Builder::new_local(path_str)
             .build()
             .await

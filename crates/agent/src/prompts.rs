@@ -35,9 +35,9 @@ pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> S
 
     let mut bullets = Vec::new();
 
-    if has_tool(&tool_names, "discover_capabilities") {
+    if has_tool(&tool_names, "agent_capabilities") {
         bullets.push(
-            "Use `discover_capabilities` early when the task depends on live providers, corpora, plugins, hosted models, or platform connectivity.".to_string(),
+            "Use `agent_capabilities` early when the task depends on live providers, corpora, plugins, hosted models, or platform connectivity; use `find_tools` to discover tools by capability.".to_string(),
         );
     }
 
@@ -73,11 +73,11 @@ pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> S
             "Use `query` for directed retrieval and graph lookup. Use `research_query` only when the task genuinely needs an iterative retrieval-and-synthesis loop instead of a one-shot search."
                 .to_string(),
         );
-    } else if has_all_tools(&tool_names, &["knowledge", "research_query"]) {
-        // Local node offline: `query` is not offered — the platform-backed
-        // `knowledge` tool is the single knowledge path.
+    } else if has_all_tools(&tool_names, &["query_platform", "research_query"]) {
+        // Local node offline: `query` is not offered — `query_platform` is the
+        // platform-backed knowledge search path (graph + semantic).
         bullets.push(
-            "Use the `knowledge` tool for one-shot knowledge lookups. Use `research_query` only when the task genuinely needs an iterative retrieval-and-synthesis loop."
+            "Use `query_platform` for one-shot platform knowledge lookups (plain text = graph search, `semantic=true` = vector search); `knowledge_entity`/`knowledge_paths` for one-entity neighbors or relationship paths. Use `research_query` only when the task genuinely needs an iterative retrieval-and-synthesis loop."
                 .to_string(),
         );
     }
@@ -259,7 +259,7 @@ const INTERACTIVE_PROMPT: &str = r#"You are PRISM, an interactive agent for mate
 - Use deploy for persistent serving or target-based deployment rather than ad hoc shell processes.
 - Use node to inspect or prepare local capability, and use mesh for discovery/publication/subscription between nodes.
 - Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless the user explicitly asks for low-level control.
-- Use discover_capabilities, status, and tools when you need to inspect the current environment before planning.
+- Use find_tools to discover tools, agent_capabilities to inspect providers/models/connectivity, and status/tools for the local environment before planning.
 - Keep local, MARC27-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
 
 # Tool Use
@@ -319,7 +319,7 @@ const AUTONOMOUS_PROMPT: &str = r#"You are PRISM, an autonomous agent for materi
 - Use deploy for persistent serving or target-based deployment rather than ad hoc shell processes.
 - Use node to inspect or prepare local capability, and use mesh for discovery/publication/subscription between nodes.
 - Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless low-level control is explicitly required by the task.
-- Use discover_capabilities, status, and tools when you need to inspect the current environment before planning.
+- Use find_tools to discover tools, agent_capabilities to inspect providers/models/connectivity, and status/tools for the local environment before planning.
 - Keep local, MARC27-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
 
 # Tool Use
@@ -383,7 +383,7 @@ mod tests {
                 source_detail: None,
             },
             LoadedTool {
-                name: "discover_capabilities".to_string(),
+                name: "agent_capabilities".to_string(),
                 description: "Inspect capabilities".to_string(),
                 input_schema: json!({ "type": "object" }),
                 requires_approval: false,
@@ -396,7 +396,7 @@ mod tests {
         let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
         assert!(prompt.contains("# Loaded Tool Strategy"));
         assert!(prompt.contains("Treat workflows as the primary orchestration surface"));
-        assert!(prompt.contains("discover_capabilities"));
+        assert!(prompt.contains("agent_capabilities"));
     }
 
     #[test]

@@ -79,35 +79,9 @@ pub fn print_check_lines(checks: &[BootCheck]) {
 
 // ── Shared styling for section-style output ──────────────────────────
 
-/// One styled status line in the same visual language as `boot_sequence`.
-///
-/// Status: ok=true → green [OK], ok=false → red [--], pending=Some(label) →
-/// cyan label (e.g. `[..]`). Detail is shown dimmed in parens at the end.
-pub fn status_line(name: &str, ok: bool, detail: &str) {
-    let marker = if ok {
-        "\x1b[38;2;0;255;0m[OK]\x1b[0m"
-    } else {
-        "\x1b[38;2;255;80;80m[--]\x1b[0m"
-    };
-    println!(
-        "\x1b[38;2;100;100;255m \u{251c}\u{2500}\u{2500} \x1b[38;2;255;255;255m{name} \x1b[38;2;100;100;100m\u{2026}\u{2026}\u{2026}\u{2026}\u{2026}\x1b[0m {marker} \x1b[38;2;100;100;100m({detail})\x1b[0m"
-    );
-}
-
 /// "Pending" status — something is in progress. Returns a closure that, when
 /// called with (ok, final_detail), updates the line in place. Falls back to
 /// a fresh line on terminals that don't support carriage-return overwrites.
 pub fn section(title: &str) {
     println!("\n\x1b[38;2;0;255;255m[PRISM]\x1b[0m \x1b[38;2;200;200;200m{title}\x1b[0m");
-}
-
-/// Print a single bullet without a status marker — for plain progress text.
-#[allow(dead_code)]
-pub fn bullet(text: &str) {
-    println!("\x1b[38;2;100;100;255m \u{251c}\u{2500}\u{2500} \x1b[38;2;200;200;200m{text}\x1b[0m");
-}
-
-/// A nicely-coloured warning the user should notice but isn't fatal.
-pub fn warn(text: &str) {
-    println!("\x1b[38;2;100;100;255m \u{2502}   \x1b[38;2;255;200;100m\u{26A0}  {text}\x1b[0m");
 }

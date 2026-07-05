@@ -8,11 +8,9 @@ mod boot;
 mod boot_checks;
 mod chat_config;
 mod doctor;
-mod forge_chat;
 mod mcp_server_native;
 mod notebook;
 mod onboarding;
-mod platform_bridge;
 mod pyiron_cmd;
 mod tool_sync;
 mod use_command;
@@ -372,6 +370,25 @@ enum Commands {
     /// `{"error": "..."}` and still exit 0 so callers always get exactly
     /// one JSON document.
     Gpus,
+    /// One-shot compute-broker jobs (GPU/CPU) on the MARC27 platform.
+    ///
+    /// Read actions (gpus/providers/estimate/status) and cancel are safe;
+    /// `submit` dispatches a real, billable job. Every subcommand prints one
+    /// JSON document on stdout — machine-readable by design for agents.
+    Compute {
+        #[command(subcommand)]
+        command: ComputeCommands,
+    },
+    /// Knowledge-plane reads + platform ingest (MARC27 knowledge graph).
+    ///
+    /// entity/paths/corpora are read-only graph/catalog lookups; `ingest`
+    /// submits a background extraction job. Every subcommand prints one JSON
+    /// document on stdout. Graph search + semantic search live under
+    /// `prism query --platform`; graph stats under `prism ingest --status`.
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommands,
+    },
     /// Run multi-agent discourse workflows backed by the MARC27 platform.
     Discourse {
         #[command(subcommand)]
@@ -703,6 +720,12 @@ enum MeshCommands {
         #[arg(long, default_value = "http://127.0.0.1:7327")]
         dashboard_url: String,
     },
+    /// Quick health check: online status, node ID, peer count.
+    Health {
+        /// Dashboard URL of the running node.
+        #[arg(long, default_value = "http://127.0.0.1:7327")]
+        dashboard_url: String,
+    },
 }
 
 /// Read-only commands for inspecting PRISM Fabric state.
@@ -808,9 +831,11 @@ enum DeployCommands {
         /// Target deployment backend: `local`, `mesh`, `runpod`, `lambda`, or `prism_node`.
         #[arg(long, default_value = "local")]
         target: String,
-        /// GPU type to request.
-        #[arg(long, default_value = "A100-80GB")]
-        gpu: String,
+        /// GPU type to request. Omit for CPU-only deployments — a silent GPU
+        /// default would claim hardware the target may not have and price the
+        /// deployment at that GPU's rate.
+        #[arg(long)]
+        gpu: Option<String>,
         /// Optional maximum budget in USD.
         #[arg(long)]
         budget: Option<f64>,
@@ -1240,23 +1265,26 @@ async fn main() -> Result<()> {
                 }
             }
             boot::boot_sequence(&boot_checks);
-            // Splash skipped: it used an alternate-screen ratatui animation
-            // that caused a visible screen jump before forge UI loaded.
-            // Boot checklist now flows directly into the forge banner.
-            // `python` is unused here for now; tool integration goes via forge MCP.
-            let _ = &python;
-            if let Err(e) =
-                forge_chat::run(&project_root, state.credentials.as_ref(), &python).await
-            {
-                tracing::debug!(error = %e, "forge chat failed, showing help");
-                println!("\n  PRISM v{}", env!("CARGO_PKG_VERSION"));
-                println!("  Use CLI commands:");
-                println!("    prism query --platform \"nickel superalloys\"");
-                println!("    prism research \"high entropy alloys\" --depth 1");
-                println!("    prism ingest ./data.csv");
-                println!("    prism models list");
-                println!("    prism --help\n");
-            }
+            // Setup complete → drop straight into the interactive TUI, exactly
+            // like `prism tui`: the native prism_tui frontend spawns `prism
+            // backend` (the prism_agent loop). (Previously launched the
+            // vendored forge chat surface.)
+            let prism_bin =
+                std::env::current_exe().context("failed to locate current prism executable")?;
+            let platform = state.credentials.as_ref().map(|c| prism_tui::PlatformAuth {
+                base_url: endpoints.api_base.clone(),
+                token: c.access_token.clone(),
+            });
+            let config = prism_tui::RunConfig {
+                backend_mode: prism_tui::BackendMode::Real {
+                    prism_binary: prism_bin.to_str().unwrap().to_string(),
+                    project_root: project_root.to_string_lossy().to_string(),
+                    python_bin: python.to_string_lossy().to_string(),
+                },
+                platform,
+                resume: None,
+            };
+            prism_tui::run_with_config(config).await?;
         }
         Commands::Login { token, no_browser } => {
             let mode = match token {
@@ -3014,6 +3042,12 @@ async fn main() -> Result<()> {
         Commands::Gpus => {
             handle_gpus_command().await;
         }
+        Commands::Compute { command } => {
+            handle_compute_command(command).await?;
+        }
+        Commands::Knowledge { command } => {
+            handle_knowledge_command(command).await?;
+        }
         Commands::Discourse { command } => {
             handle_discourse_command(command).await?;
         }
@@ -3207,6 +3241,7 @@ async fn main() -> Result<()> {
                 let config = prism_tui::RunConfig {
                     backend_mode: prism_tui::BackendMode::Fake { scenario: scen },
                     platform: None,
+                    resume: None,
                 };
                 prism_tui::run_with_config(config).await?;
                 return Ok(());
@@ -3323,23 +3358,15 @@ async fn main() -> Result<()> {
                     python_bin: python.to_string_lossy().to_string(),
                 },
                 platform,
+                resume: None,
             };
             prism_tui::run_with_config(config).await?;
         }
         Commands::Resume { id } => {
-            // Reuses the same Tui setup path: same auth refresh, same
-            // boot checklist, same forge_chat::run. The only difference
-            // is which conversation the chat lands on, signalled via
-            // env vars (PRISM_RESUME_ID for a direct UUID jump,
-            // PRISM_RESUME_PICKER for the conversation picker). Both
-            // env vars are read + cleared by forge_chat::run /
-            // forge_main::ui — see those for the consumer side.
-            unsafe {
-                match id.as_deref() {
-                    Some(raw_id) => std::env::set_var("PRISM_RESUME_ID", raw_id),
-                    None => std::env::set_var("PRISM_RESUME_PICKER", "1"),
-                }
-            }
+            // Reuses the same Tui setup path (auth refresh + boot checklist),
+            // then launches the native prism_tui with a resume request:
+            // `prism resume` (no id) opens the session picker; `prism resume
+            // <id>` jumps straight into that conversation.
 
             // Same auth-refresh + boot-check flow as the Tui branch.
             let mut state = paths.load_cli_state().ok().unwrap_or_default();
@@ -3409,8 +3436,22 @@ async fn main() -> Result<()> {
                     boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
             boot::boot_sequence(&boot_checks);
-            let _ = &python;
-            forge_chat::run(&project_root, state.credentials.as_ref(), &python).await?;
+            let prism_bin =
+                std::env::current_exe().context("failed to locate current prism executable")?;
+            let platform = state.credentials.as_ref().map(|c| prism_tui::PlatformAuth {
+                base_url: endpoints.api_base.clone(),
+                token: c.access_token.clone(),
+            });
+            let config = prism_tui::RunConfig {
+                backend_mode: prism_tui::BackendMode::Real {
+                    prism_binary: prism_bin.to_str().unwrap().to_string(),
+                    project_root: project_root.to_string_lossy().to_string(),
+                    python_bin: python.to_string_lossy().to_string(),
+                },
+                platform,
+                resume: Some(id.unwrap_or_default()),
+            };
+            prism_tui::run_with_config(config).await?;
         }
         Commands::Billing { command } => {
             let (api_base, auth) = resolve_agent_auth()?;
@@ -4008,6 +4049,25 @@ async fn handle_mesh_command(
                 }
                 _ => println!("  (none)"),
             }
+        }
+        MeshCommands::Health { dashboard_url } => {
+            let url = format!("{dashboard_url}/api/mesh/nodes");
+            let resp = reqwest::get(&url)
+                .await
+                .with_context(|| format!("Failed to reach node at {url}"))?;
+            let body = resp.text().await?;
+            let status: serde_json::Value = serde_json::from_str(&body)?;
+
+            if !status["online"].as_bool().unwrap_or(false) {
+                println!("Mesh: offline");
+                return Ok(());
+            }
+            let peer_count = status["peers"].as_array().map(|p| p.len()).unwrap_or(0);
+            println!(
+                "Mesh: online — node {} — {} peer(s)",
+                status["node_id"].as_str().unwrap_or("?"),
+                peer_count,
+            );
         }
     }
     Ok(())
@@ -5575,7 +5635,9 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 "target".to_string(),
                 serde_json::Value::String(target.to_string()),
             );
-            body.insert("gpu_type".to_string(), serde_json::Value::String(gpu));
+            if let Some(gpu) = gpu {
+                body.insert("gpu_type".to_string(), serde_json::Value::String(gpu));
+            }
             body.insert(
                 "deploy_config".to_string(),
                 serde_json::json!({
@@ -5696,6 +5758,297 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[derive(Debug, Subcommand)]
+enum ComputeCommands {
+    /// List purchasable GPU offers (type, VRAM, region, provider, $/hr).
+    Gpus,
+    /// List registered compute providers/backends.
+    Providers,
+    /// Preview the cost of a job without dispatching it (FREE).
+    Estimate {
+        /// Container image or marketplace slug to price.
+        #[arg(long)]
+        image: String,
+        /// GPU class, e.g. A100-80GB. Omit to let the broker choose.
+        #[arg(long)]
+        gpu: Option<String>,
+        /// Wall-time cap in seconds (default 3600).
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Poll one compute job by ID.
+    Status {
+        /// Job ID returned by `compute submit`.
+        job_id: String,
+    },
+    /// Cancel a queued/running compute job by ID (idempotent).
+    Cancel {
+        /// Job ID to cancel.
+        job_id: String,
+    },
+    /// Dispatch a real, BILLABLE containerized GPU/CPU job.
+    Submit {
+        /// Container image or marketplace slug.
+        #[arg(long)]
+        image: String,
+        /// JSON input payload for the container (default '{}').
+        #[arg(long, default_value = "{}")]
+        inputs: String,
+        /// GPU class, e.g. A100-80GB.
+        #[arg(long)]
+        gpu: Option<String>,
+        /// Hard cost cap in USD; broker refuses dispatch if the estimate exceeds it.
+        #[arg(long)]
+        budget: Option<f64>,
+        /// Routing: cheapest (default), fastest, or a provider name.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Wall-time cap in seconds (default 3600).
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Environment variables (repeatable): --env KEY=VALUE.
+        #[arg(long = "env")]
+        env: Vec<String>,
+    },
+}
+
+/// `prism compute …` — one-shot compute-broker jobs. Every subcommand prints
+/// exactly one JSON document on stdout (agent-facing / machine-readable); the
+/// broker endpoints live under `{api_base}/compute/*`. This is the Rust CLI
+/// home for compute dispatch — the old Python `compute`/`compute_submit` tools
+/// (which needed an uninstalled `marc27` SDK) were retired in its favour.
+async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let response: serde_json::Value = match command {
+        ComputeCommands::Gpus => auth
+            .apply(client.get(format!("{api_base}/compute/gpus")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?,
+        ComputeCommands::Providers => auth
+            .apply(client.get(format!("{api_base}/compute/providers")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?,
+        ComputeCommands::Estimate {
+            image,
+            gpu,
+            timeout,
+        } => {
+            let mut body = serde_json::Map::new();
+            body.insert("image".to_string(), serde_json::Value::String(image));
+            body.insert("inputs".to_string(), serde_json::json!({}));
+            if let Some(gpu) = gpu {
+                body.insert("gpu_type".to_string(), serde_json::Value::String(gpu));
+            }
+            if let Some(timeout) = timeout {
+                body.insert("timeout_seconds".to_string(), serde_json::json!(timeout));
+            }
+            auth.apply(client.post(format!("{api_base}/compute/estimate")))
+                .json(&serde_json::Value::Object(body))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
+        ComputeCommands::Status { job_id } => auth
+            .apply(client.get(format!("{api_base}/compute/{job_id}")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?,
+        ComputeCommands::Cancel { job_id } => {
+            auth.apply(client.post(format!("{api_base}/compute/{job_id}/cancel")))
+                .send()
+                .await?
+                .error_for_status()?;
+            serde_json::json!({ "job_id": job_id, "status": "cancel_requested" })
+        }
+        ComputeCommands::Submit {
+            image,
+            inputs,
+            gpu,
+            budget,
+            provider,
+            timeout,
+            env,
+        } => {
+            let inputs_value: serde_json::Value = serde_json::from_str(&inputs)
+                .map_err(|e| anyhow!("--inputs must be valid JSON: {e}"))?;
+            let mut body = serde_json::Map::new();
+            body.insert("image".to_string(), serde_json::Value::String(image));
+            body.insert("inputs".to_string(), inputs_value);
+            if let Some(gpu) = gpu {
+                body.insert("gpu_type".to_string(), serde_json::Value::String(gpu));
+            }
+            if let Some(budget) = budget {
+                body.insert("budget_max_usd".to_string(), serde_json::json!(budget));
+            }
+            if let Some(provider) = provider {
+                body.insert(
+                    "provider_preference".to_string(),
+                    serde_json::Value::String(provider),
+                );
+            }
+            if let Some(timeout) = timeout {
+                body.insert("timeout_seconds".to_string(), serde_json::json!(timeout));
+            }
+            if !env.is_empty() {
+                body.insert(
+                    "env_vars".to_string(),
+                    serde_json::Value::Object(parse_string_map_arg(&env, "--env")?),
+                );
+            }
+            auth.apply(client.post(format!("{api_base}/compute/submit")))
+                .json(&serde_json::Value::Object(body))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
+    };
+
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+#[derive(Debug, Subcommand)]
+enum KnowledgeCommands {
+    /// Look up one entity plus its 1-hop neighbors in the knowledge graph.
+    Entity {
+        /// Entity name to resolve.
+        name: String,
+        /// Max neighbors to return.
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
+    /// Shortest hop-paths between two entities ("how does X relate to Y?").
+    Paths {
+        /// Start entity.
+        from: String,
+        /// End entity.
+        to: String,
+        /// Max path length in hops.
+        #[arg(long, default_value = "3")]
+        max_hops: usize,
+    },
+    /// List available corpora from the platform catalog.
+    Corpora {
+        /// Filter by domain (materials/chemistry/biomedical/physics).
+        #[arg(long)]
+        domain: Option<String>,
+        /// Filter by kind (structured_db/knowledge_graph/literature/ontology).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Max results.
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Submit a background extraction job from a URL or free-text query.
+    Ingest {
+        /// Source URL to fetch and extract.
+        #[arg(long)]
+        url: Option<String>,
+        /// Free-text query to extract entities/embeddings from.
+        #[arg(long)]
+        query: Option<String>,
+        /// Extraction mode: graph, embed, or full.
+        #[arg(long, default_value = "full")]
+        mode: String,
+    },
+}
+
+/// `prism knowledge …` — knowledge-graph reads + platform ingest. Every
+/// subcommand prints exactly one JSON document on stdout (agent-facing /
+/// machine-readable); the endpoints live under `{api_base}/knowledge/*`. This
+/// is the Rust CLI home for the knowledge plane — the old Python `knowledge`
+/// tool (which drove a thin `_platform_client` and needed the uninstalled
+/// `marc27` SDK for some paths) was retired in its favour. Graph + semantic
+/// search stay under `prism query --platform`; graph stats under
+/// `prism ingest --status`.
+async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let response: serde_json::Value = match command {
+        KnowledgeCommands::Entity { name, limit } => auth
+            .apply(client.get(format!("{api_base}/knowledge/graph/entity/{name}")))
+            .query(&[("limit", limit.to_string())])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?,
+        KnowledgeCommands::Paths {
+            from,
+            to,
+            max_hops,
+        } => auth
+            .apply(client.get(format!("{api_base}/knowledge/graph/paths")))
+            .query(&[
+                ("from", from),
+                ("to", to),
+                ("max_hops", max_hops.to_string()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?,
+        KnowledgeCommands::Corpora {
+            domain,
+            kind,
+            limit,
+        } => {
+            let mut params: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+            if let Some(domain) = domain {
+                params.push(("domain", domain));
+            }
+            if let Some(kind) = kind {
+                params.push(("kind", kind));
+            }
+            auth.apply(client.get(format!("{api_base}/knowledge/catalog")))
+                .query(&params)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
+        KnowledgeCommands::Ingest { url, query, mode } => {
+            let source = match (url, query) {
+                (Some(url), _) => serde_json::json!({ "type": "url", "url": url }),
+                (None, Some(query)) => serde_json::json!({ "type": "query", "query": query }),
+                (None, None) => bail!("`knowledge ingest` requires --url or --query"),
+            };
+            let body = serde_json::json!({ "mode": mode, "source": source });
+            auth.apply(client.post(format!("{api_base}/knowledge/ingest-job")))
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
+    };
+
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
@@ -6023,167 +6376,61 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
     Ok(())
 }
 
-// No production caller since research moved to the prism-client API path;
-// kept because the unit tests below pin the raw research SSE/JSON body format.
-#[allow(dead_code)]
-fn parse_research_response_body(body: &str) -> Result<serde_json::Value> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        bail!("research endpoint returned an empty response body");
-    }
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        return Ok(value);
-    }
-
-    let events = normalize_stream_events(parse_sse_json_events(trimmed)?);
-    if events.is_empty() {
-        bail!("research endpoint returned a non-JSON response body");
-    }
-
-    let mut result = serde_json::Map::new();
-    let mut answer = None;
-    let mut sources = None;
-    let mut complete = None;
-
-    for event in &events {
-        if let Some(obj) = event.as_object() {
-            let step = obj.get("step").and_then(|value| value.as_str());
-            let event_answer = extract_research_answer(obj);
-            if step == Some("answer") {
-                answer = event_answer.or(answer);
-            } else if answer.is_none() {
-                answer = event_answer;
-            }
-            if sources.is_none()
-                && let Some(found) = obj.get("sources").and_then(|value| value.as_array())
-            {
-                sources = Some(serde_json::Value::Array(found.clone()));
-            }
-            if complete.is_none()
-                && obj.get("step").and_then(|value| value.as_str()) == Some("complete")
-            {
-                complete = Some(event.clone());
-            }
-        }
-    }
-
-    result.insert("events".to_string(), serde_json::Value::Array(events));
-    if let Some(answer) = answer {
-        result.insert("answer".to_string(), serde_json::Value::String(answer));
-    }
-    if let Some(sources) = sources {
-        result.insert("sources".to_string(), sources);
-    }
-    if let Some(complete) = complete {
-        result.insert("complete".to_string(), complete);
-    }
-
-    Ok(serde_json::Value::Object(result))
-}
-
+/// Parse a Server-Sent-Events stream body into JSON event objects. Each
+/// `data:` line is decoded as one JSON value (our backends emit one compact
+/// JSON object per `data:` line); `[DONE]` sentinels, comments, and non-JSON
+/// keep-alive lines are skipped.
+///
+/// If the body carries no SSE `data:` events at all, it is treated as a plain
+/// JSON document (array → its elements, object → a single event) so a
+/// non-streamed error/response body still surfaces to the caller instead of
+/// silently vanishing.
 fn parse_sse_json_events(body: &str) -> Result<Vec<serde_json::Value>> {
-    fn flush_sse_event(
-        events: &mut Vec<serde_json::Value>,
-        event_name: &Option<String>,
-        data_lines: &mut Vec<String>,
-    ) {
-        if data_lines.is_empty() {
-            return;
-        }
-
-        let payload = data_lines.join("\n");
-        data_lines.clear();
+    let mut events = Vec::new();
+    for line in body.lines() {
+        let Some(payload) = line.trim_end().strip_prefix("data:") else {
+            continue;
+        };
         let payload = payload.trim();
         if payload.is_empty() || payload == "[DONE]" {
-            return;
-        }
-
-        let mut value = serde_json::from_str::<serde_json::Value>(payload)
-            .unwrap_or_else(|_| serde_json::json!({ "text": payload }));
-        if let Some(name) = event_name {
-            if let Some(obj) = value.as_object_mut() {
-                obj.entry("event".to_string())
-                    .or_insert_with(|| serde_json::Value::String(name.clone()));
-            } else {
-                value = serde_json::json!({
-                    "event": name,
-                    "data": value,
-                });
-            }
-        }
-        events.push(value);
-    }
-
-    let mut events = Vec::new();
-    let mut event_name = None;
-    let mut data_lines = Vec::new();
-
-    for raw_line in body.lines() {
-        let line = raw_line.trim_end_matches('\r');
-        if line.is_empty() {
-            flush_sse_event(&mut events, &event_name, &mut data_lines);
-            event_name = None;
             continue;
         }
-        if let Some(name) = line.strip_prefix("event:") {
-            event_name = Some(name.trim().to_string());
-            continue;
-        }
-        if let Some(data) = line.strip_prefix("data:") {
-            // Some platform streams send one JSON payload per `data:` line without
-            // blank-line separators. When that happens, treat each new `data:` line
-            // as a fresh event so discourse/research JSON stays structured.
-            if event_name.is_none() && !data_lines.is_empty() {
-                flush_sse_event(&mut events, &event_name, &mut data_lines);
-            }
-            data_lines.push(data.trim_start().to_string());
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+            events.push(value);
         }
     }
-    flush_sse_event(&mut events, &event_name, &mut data_lines);
+
+    if events.is_empty() && !body.trim().is_empty() {
+        match serde_json::from_str::<serde_json::Value>(body.trim()) {
+            Ok(serde_json::Value::Array(items)) => events = items,
+            Ok(value) => events.push(value),
+            Err(err) => return Err(anyhow!("stream response was neither SSE nor JSON: {err}")),
+        }
+    }
 
     Ok(events)
 }
 
+/// Unwrap events that arrived as `{ "text": "data: {...}" }` — the shape the
+/// marc27 text-marker stream path emits — into the inner JSON object. Events
+/// without a JSON-object-bearing `text` field pass through unchanged.
 fn normalize_stream_events(events: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
-    let mut normalized = Vec::new();
-
-    for event in events {
-        // Some routes hand back transport-level `data: {...}` strings inside a
-        // generic `text` field. Unwrap those so downstream code sees the real
-        // event objects, not opaque transport wrappers.
-        if let Some(text) = event.get("text").and_then(|value| value.as_str())
-            && let Some(payload) = text.trim().strip_prefix("data:")
-        {
-            let payload = payload.trim();
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
-                normalized.push(value);
-                continue;
-            }
-        }
-
-        normalized.push(event);
-    }
-
-    normalized
-}
-
-// Only reachable from parse_research_response_body above; same test-pinned status.
-#[allow(dead_code)]
-fn extract_research_answer(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
-    for key in ["answer", "text", "content", "message"] {
-        if let Some(value) = obj.get(key).and_then(|value| value.as_str()) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-
-    if let Some(data) = obj.get("data").and_then(|value| value.as_object()) {
-        return extract_research_answer(data);
-    }
-
-    None
+    events
+        .into_iter()
+        .map(|event| {
+            let unwrapped = value_string(&event, &["text"]).and_then(|text| {
+                let payload = text
+                    .strip_prefix("data:")
+                    .map(str::trim_start)
+                    .unwrap_or(text)
+                    .trim();
+                serde_json::from_str::<serde_json::Value>(payload)
+                    .ok()
+                    .filter(serde_json::Value::is_object)
+            });
+            unwrapped.unwrap_or(event)
+        })
+        .collect()
 }
 
 #[derive(serde::Deserialize)]
@@ -7925,51 +8172,6 @@ mod tests {
             }
             _ => panic!("expected Publish command"),
         }
-    }
-
-    #[test]
-    fn parse_research_response_body_accepts_plain_json() {
-        let parsed = parse_research_response_body(
-            r#"{"answer":"Nickel Oxide","sources":[{"title":"Paper","url":"https://example.com"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(parsed["answer"], "Nickel Oxide");
-        assert_eq!(parsed["sources"][0]["title"], "Paper");
-    }
-
-    #[test]
-    fn parse_research_response_body_accepts_sse_events() {
-        let parsed = parse_research_response_body(
-            "event: step\n\
-data: {\"step\":\"started\",\"session_id\":\"abc\"}\n\
-\n\
-event: step\n\
-data: {\"step\":\"answer\",\"answer\":\"Nickel oxide\"}\n\
-\n\
-event: step\n\
-data: {\"step\":\"complete\",\"graph_queries\":2}\n\
-\n",
-        )
-        .unwrap();
-
-        assert_eq!(parsed["answer"], "Nickel oxide");
-        assert_eq!(parsed["events"].as_array().unwrap().len(), 3);
-        assert_eq!(parsed["complete"]["step"], "complete");
-    }
-
-    #[test]
-    fn parse_research_response_body_prefers_final_answer_step() {
-        let parsed = parse_research_response_body(
-            "event: step\n\
-data: {\"step\":\"reasoning\",\"data\":{\"text\":\"thinking\"}}\n\
-\n\
-event: step\n\
-data: {\"step\":\"answer\",\"data\":{\"text\":\"final answer\"}}\n\
-\n",
-        )
-        .unwrap();
-
-        assert_eq!(parsed["answer"], "final answer");
     }
 
     #[test]

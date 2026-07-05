@@ -1,1 +1,0 @@
-Request to remove a file at the specified path. Use when you need to delete an existing file. The path must be absolute. This operation can be undone using the `{{tool_names.undo}}` tool.

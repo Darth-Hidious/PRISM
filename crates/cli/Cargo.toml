@@ -44,21 +44,6 @@ prism-workflows = { path = "../workflows" }
 prism-campaign = { path = "../campaign" }
 prism-tui = { path = "../tui" }
 
-# Forge harness — chat UI + agent loop. Apache-2.0, vendored from tailcallhq/forgecode.
-forge_main.workspace = true
-forge_api.workspace = true
-forge_config.workspace = true
-forge_domain.workspace = true
-rustls.workspace = true
-
-# MARC27 ↔ OpenAI proxy
-axum.workspace = true
-async-stream.workspace = true
-futures-util.workspace = true
-
-# Stage 2: semantic tool retrieval
-prism_tool_router = { path = "../prism_tool_router" }
-
 # URL parsing for `prism use local --url ...` validation
 url.workspace = true
 

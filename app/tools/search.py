@@ -22,16 +22,32 @@ first because it has a richer description.
 from app.tools.base import Tool, ToolRegistry
 
 
+def _compact_abstract(text, limit: int = 400) -> str:
+    """Trim abstracts so a 20-result payload stays well under the agent's
+    tool-result budget — a full-abstract payload got truncated to its first
+    entries, making every query look like it returned the same thing."""
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
+
+
 def _literature_search_impl(**kwargs) -> dict:
     """Run the LiteratureCollector. Internal helper for both the unified
     `prior_art_search` and the legacy `literature_search` alias."""
     from app.tools.data_collectors.literature_collector import LiteratureCollector
     collector = LiteratureCollector()
-    results = collector.collect(**kwargs)
+    out = collector.collect_with_status(
+        query=kwargs.get("query", ""),
+        max_results=kwargs.get("max_results", 20),
+        sources=kwargs.get("sources"),
+    )
+    results = out["results"]
+    for r in results:
+        r["abstract"] = _compact_abstract(r.get("abstract"))
     return {
         "results": results,
         "count": len(results),
         "source": "literature",
+        "source_status": out["source_status"],
     }
 
 
@@ -83,6 +99,7 @@ def _prior_art_search(**kwargs) -> dict:
             )
             out["papers"] = lit.get("results", [])
             out["counts"]["papers"] = lit.get("count", 0)
+            out["source_status"] = lit.get("source_status", {})
         except Exception as exc:
             out["papers_error"] = str(exc)
 

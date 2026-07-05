@@ -1,8 +1,0 @@
-{
-  "id": "test-model",
-  "name": "Test Model",
-  "pricing": {
-    "prompt": "0.001",
-    "completion": "0.002"
-  }
-}

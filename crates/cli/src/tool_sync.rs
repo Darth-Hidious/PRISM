@@ -244,33 +244,6 @@ pub async fn sync_tools(marketplace: &MarketplaceClient<'_>) -> Result<SyncRepor
     Ok(report)
 }
 
-/// Lightweight startup probe. Fetches only the catalog and kicks off a
-/// background sync task if any versions differ from the manifest. Does
-/// NOT block the caller — the actual downloads happen in a detached
-/// tokio task so `prism backend` / `prism tui` startup isn't delayed.
-///
-/// Silently no-ops when the marketplace is unreachable (offline mode).
-///
-/// Callers must use [`spawn_background_sync_owned`] (the owned-client
-/// variant); this borrowed variant is retained for tests and future
-/// callers that already hold a `&'static PlatformClient`.
-#[allow(dead_code)]
-pub fn spawn_background_sync(marketplace: MarketplaceClient<'static>, _token: Option<String>) {
-    tokio::spawn(async move {
-        match sync_tools(&marketplace).await {
-            Ok(r) if r.total_changes() > 0 => {
-                info!(
-                    updated = r.updated.len(),
-                    added = r.added.len(),
-                    "background tool sync applied updates"
-                );
-            }
-            Ok(_) => debug!("background tool sync: no changes"),
-            Err(e) => warn!(error = %e, "background tool sync failed (non-fatal)"),
-        }
-    });
-}
-
 /// Owned-client variant: build the marketplace client inside the task
 /// from an owned `PlatformClient`. This is the one callers should use
 /// from the startup path — it avoids lifetime gymnastics with the

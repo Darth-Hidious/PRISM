@@ -108,9 +108,9 @@ pub static CATALOG: &[Command] = &[
     Command {
         id: "sci.notebook",
         title: "Notebook",
-        description: "Jupyter via `prism notebook start`",
+        description: "Notebook session — coming in-app (agent-watched, editable)",
         category: "Science",
-        keybind: "CLI",
+        keybind: "soon",
         suggested: false,
     },
     Command {
@@ -217,6 +217,14 @@ pub static CATALOG: &[Command] = &[
         category: "Diagnostics",
         keybind: "/permissions",
         suggested: false,
+    },
+    Command {
+        id: "home.show",
+        title: "Mission Control",
+        description: "The launch dashboard — workflows, tools, systems",
+        category: "Display",
+        keybind: "palette",
+        suggested: true,
     },
     Command {
         id: "status.show",

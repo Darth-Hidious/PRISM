@@ -1,5 +1,6 @@
 """Code execution tool: run Python in a subprocess."""
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -10,8 +11,38 @@ from app.tools.base import Tool, ToolRegistry
 MAX_TIMEOUT = 300  # Hard cap: 5 minutes regardless of agent request
 
 
+def _signal_name(returncode: int) -> str:
+    """Map a negative subprocess return code (killed-by-signal) to its name."""
+    try:
+        return signal.Signals(-returncode).name
+    except (ValueError, TypeError):
+        return f"signal {-returncode}"
+
+
+def _child_env() -> dict:
+    """Environment for the code subprocess.
+
+    Two headless-safety defaults (caller env wins if already set):
+      - MPLBACKEND=Agg — the child is headless; matplotlib's default macOS
+        backend ('macosx') can crash on plot/savefig. Force non-interactive Agg.
+      - PYTHONFAULTHANDLER=1 — if a native library (numpy/torch/BLAS, …) segfaults
+        the child, dump a C-level traceback to stderr so the crash is diagnosable
+        instead of a bare exit code.
+    """
+    env = {**os.environ}
+    env.setdefault("MPLBACKEND", "Agg")
+    env.setdefault("PYTHONFAULTHANDLER", "1")
+    return env
+
+
 def _execute_python(code: str, timeout: int = 60, description: str = "") -> dict:
-    """Execute Python code in a subprocess. Returns stdout, stderr, exit code."""
+    """Execute Python code in a subprocess. Returns stdout, stderr, exit code.
+
+    Spawned via the default posix_spawn path — deliberately NO preexec_fn.
+    A preexec_fn forces the fork() path, which is macOS-fragile from the
+    multithreaded tool server and buys nothing here (subprocess.run's timeout
+    only kills the direct child, never the process group). See #68.
+    """
     timeout = min(timeout, MAX_TIMEOUT)
     cwd = str(Path.cwd())
     try:
@@ -21,11 +52,9 @@ def _execute_python(code: str, timeout: int = 60, description: str = "") -> dict
             text=True,
             timeout=timeout,
             cwd=cwd,
-            env={**os.environ},
-            # Kill entire process group on timeout
-            preexec_fn=os.setsid if sys.platform != "win32" else None,
+            env=_child_env(),
         )
-        return {
+        out = {
             "exit_code": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -34,6 +63,19 @@ def _execute_python(code: str, timeout: int = 60, description: str = "") -> dict
             "cwd": cwd,
             "timed_out": False,
         }
+        # Negative return code = killed by signal (e.g. -11 = SIGSEGV). Surface
+        # it as an actionable error instead of a bare code the model can't read.
+        if result.returncode < 0:
+            sig = _signal_name(result.returncode)
+            out["error"] = (
+                f"The code subprocess was killed by {sig}. This is almost always a "
+                f"crash inside a native library (numpy/torch/BLAS, a GUI plotting "
+                f"backend, etc.) in the executed code — not a PRISM failure. Check "
+                f"stderr for a fault traceback (PYTHONFAULTHANDLER is on), isolate "
+                f"the failing import/op, and retry. Plotting is headless "
+                f"(MPLBACKEND=Agg) — use plt.savefig(), never plt.show()."
+            )
+        return out
     except subprocess.TimeoutExpired as e:
         # subprocess.run already kills the child on timeout
         return {

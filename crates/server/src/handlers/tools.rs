@@ -1,6 +1,5 @@
 //! Tool invocation handlers.
 
-use axum::Extension;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Json;
@@ -8,7 +7,6 @@ use serde::Serialize;
 use std::sync::Arc;
 
 use crate::NodeState;
-use crate::middleware::AuthenticatedUser;
 
 #[derive(Serialize)]
 pub struct ToolInfo {
@@ -31,12 +29,6 @@ pub struct ToolArgInfo {
     pub arg_type: String,
     pub required: bool,
     pub description: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct RunResponse {
-    pub status: &'static str,
-    pub message: String,
 }
 
 #[derive(Serialize)]
@@ -81,45 +73,41 @@ pub async fn list_tools(State(state): State<Arc<NodeState>>) -> Json<Vec<ToolInf
     Json(tools)
 }
 
-/// POST /api/tools/:name/run — invoke a tool by name.
+/// POST /api/tools/:name/run — tool execution is NOT wired on this endpoint.
+///
+/// Honest 501: this handler never dispatched anything — no queue, no channel,
+/// no spawned task. It only checked the registry, wrote an audit entry falsely
+/// marked `Success`, and returned a fake `"accepted"`. Real execution runs
+/// through the TAOR agent loop (POST /api/chat) or the `prism run` CLI. We keep
+/// the genuine 404 so callers can still distinguish "no such tool" from "exists
+/// but not executable here", and no longer audit a success that never happened.
+/// See AUDIT_BACKLOG 0.2.
 pub async fn run_tool(
     State(state): State<Arc<NodeState>>,
-    user: Option<Extension<AuthenticatedUser>>,
     Path(name): Path<String>,
-) -> Result<Json<RunResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let registry = state
-        .tool_registry
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    if registry.get(&name).is_none() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Tool '{name}' not found in registry."),
-            }),
-        ));
+) -> (StatusCode, Json<ErrorResponse>) {
+    {
+        let registry = state
+            .tool_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if registry.get(&name).is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Tool '{name}' not found in registry."),
+                }),
+            );
+        }
     }
 
-    let user_id = user
-        .as_ref()
-        .map(|u| u.user_id.as_str())
-        .unwrap_or("anonymous");
-    state.audit_and_broadcast(&prism_core::audit::AuditEntry {
-        id: 0,
-        timestamp: chrono::Utc::now(),
-        user_id: user_id.to_string(),
-        action: prism_core::audit::AuditAction::ToolExecution,
-        target: name.clone(),
-        detail: None,
-        outcome: prism_core::audit::AuditOutcome::Success,
-    });
-
-    // Tool execution is a long-running operation — for now return acknowledgment.
-    // Full execution is handled by the TAOR agent loop.
-    Ok(Json(RunResponse {
-        status: "accepted",
-        message: format!(
-            "Tool '{name}' execution queued. Use `prism run` for interactive execution."
-        ),
-    }))
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ErrorResponse {
+            error: format!(
+                "Tool '{name}' exists but this endpoint does not execute tools. \
+                 Use POST /api/chat (agent loop) or `prism run` for execution."
+            ),
+        }),
+    )
 }

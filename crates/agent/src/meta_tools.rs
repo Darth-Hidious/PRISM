@@ -21,7 +21,13 @@ use crate::permissions::PermissionMode;
 use crate::tool_catalog::{LoadedTool, ToolCatalog};
 
 /// Tool names handled natively by the meta-tool layer.
-const META_TOOLS: &[&str] = &["recall", "find_tools"];
+const META_TOOLS: &[&str] = &[
+    "recall",
+    "find_tools",
+    "write_skill",
+    "run_skill",
+    "list_skills",
+];
 
 /// How many matches `recall(query)` returns by default.
 const DEFAULT_RECALL_LIMIT: usize = 5;
@@ -42,6 +48,17 @@ const FIND_TOOLS_DESC_CHARS: usize = 400;
 #[must_use]
 pub fn is_meta_tool(tool_name: &str) -> bool {
     META_TOOLS.contains(&tool_name)
+}
+
+/// True if `tool_name` is a reserved, trusted built-in — a native meta-tool or
+/// a Rust command-tool (the spine). Authored skills and any future
+/// user-brought / third-party tools MUST NOT claim these names: allowing it
+/// would let an impostor shadow a trusted tool (tool spoofing), so the agent
+/// thinks it is calling the real thing but runs attacker-supplied code. Callers
+/// that ingest untrusted tools reject-or-namespace on a match here.
+#[must_use]
+pub fn is_reserved_tool_name(tool_name: &str) -> bool {
+    is_meta_tool(tool_name) || crate::command_tools::is_command_tool(tool_name)
 }
 
 /// Catalog entries for the meta-tools, so the model is offered them and
@@ -109,6 +126,75 @@ pub fn definitions() -> Vec<LoadedTool> {
             source: Some("builtin".to_string()),
             source_detail: Some("tool-discovery".to_string()),
         },
+        LoadedTool {
+            name: "write_skill".to_string(),
+            description: "Author a REUSABLE skill: a named snippet of shell or python you \
+                can call again on later turns. The skill is VERIFIED by running it once — \
+                it is only saved if it exits cleanly — then stored so `list_skills` shows \
+                it and `run_skill` re-executes it. Use this when you solve something with \
+                code you'll likely need again (a conversion, a fetch, a computation). \
+                Provide a clear one-line `description` (it is embedded for later retrieval)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short slug, 1-64 chars of [A-Za-z0-9_-]. Becomes the skill id."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "One line describing what the skill does (embedded for retrieval)."
+                    },
+                    "language": {
+                        "type": "string",
+                        "enum": ["shell", "python"],
+                        "description": "Interpreter for the code. Default 'shell'."
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "The skill body. Must exit 0 when run or it is rejected."
+                    }
+                },
+                "required": ["name", "description", "code"]
+            }),
+            requires_approval: true,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            source: Some("builtin".to_string()),
+            source_detail: Some("self-authoring".to_string()),
+        },
+        LoadedTool {
+            name: "run_skill".to_string(),
+            description: "Execute a previously authored skill by name (see list_skills). \
+                Runs the stored code and returns its stdout/stderr and exit code."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The skill id to run."
+                    }
+                },
+                "required": ["name"]
+            }),
+            requires_approval: true,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            source: Some("builtin".to_string()),
+            source_detail: Some("self-authoring".to_string()),
+        },
+        LoadedTool {
+            name: "list_skills".to_string(),
+            description: "List the skills you have authored (name, description, language, \
+                whether verified). Use this to see what reusable skills already exist \
+                before writing a new one or to pick one to run_skill."
+                .to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+            requires_approval: false,
+            permission_mode: PermissionMode::ReadOnly,
+            source: Some("builtin".to_string()),
+            source_detail: Some("self-authoring".to_string()),
+        },
     ]
 }
 
@@ -124,8 +210,130 @@ pub async fn execute_meta_tool(
     match tool_name {
         "recall" => recall(args, store, session_id).await,
         "find_tools" => Ok(find_tools(args, catalog)),
+        "write_skill" => write_skill(args).await,
+        "run_skill" => run_skill(args).await,
+        "list_skills" => Ok(list_skills()),
         other => anyhow::bail!("unknown meta-tool '{other}'"),
     }
+}
+
+/// Clip a string to `max` chars (whole chars, not bytes) for echoing back.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect::<String>() + "…"
+    }
+}
+
+/// `write_skill`: verify by executing once (Voyager: execute-before-store), and
+/// only persist if it exits cleanly. An unverified skill is NOT saved — the
+/// error is handed back so the model can fix the code and call again.
+async fn write_skill(args: &Value) -> Result<Value> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let code = args.get("code").and_then(Value::as_str).unwrap_or("");
+    let language = args
+        .get("language")
+        .and_then(Value::as_str)
+        .unwrap_or("shell")
+        .trim();
+
+    if !crate::skills::valid_name(name) {
+        anyhow::bail!("invalid skill name '{name}': use 1-64 chars of [A-Za-z0-9_-]");
+    }
+    if is_reserved_tool_name(name) {
+        // Anti-spoofing: an authored skill may never take the name of a trusted
+        // built-in (meta-tool or command-tool). Reject so the impostor can't
+        // shadow the real tool. Reported to the model so it renames + retries.
+        return Ok(json!({
+            "stored": false,
+            "verified": false,
+            "name": name,
+            "error": format!("'{name}' is a reserved built-in tool name — authored skills must use a distinct name. Rename the skill (e.g. add a domain prefix) and call write_skill again."),
+        }));
+    }
+    if description.is_empty() {
+        anyhow::bail!("`description` is required (one line, embedded for retrieval)");
+    }
+    if code.trim().is_empty() {
+        anyhow::bail!("`code` is required");
+    }
+
+    let lang = language.to_string();
+    let code_for_run = code.to_string();
+    let out =
+        tokio::task::spawn_blocking(move || crate::skills::execute(&lang, &code_for_run)).await??;
+
+    if !out.ok {
+        return Ok(json!({
+            "stored": false,
+            "verified": false,
+            "name": name,
+            "error": "skill failed verification (non-zero exit); fix the code and call write_skill again",
+            "exit_code": out.code,
+            "stderr": clip(&out.stderr, 1000),
+        }));
+    }
+
+    let skill = crate::skills::AuthoredSkill::new(name, description, language, code, true);
+    let path = crate::skills::store(&skill)?;
+    Ok(json!({
+        "stored": true,
+        "verified": true,
+        "name": name,
+        "path": path.to_string_lossy(),
+        "stdout": clip(&out.stdout, 1000),
+        "note": "Saved (untrusted). It now appears in list_skills; re-run it later with run_skill(name).",
+    }))
+}
+
+/// `run_skill`: load a stored skill and execute its body.
+async fn run_skill(args: &Value) -> Result<Value> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !crate::skills::valid_name(&name) {
+        anyhow::bail!("invalid skill name '{name}'");
+    }
+    let skill = crate::skills::load(&name)?;
+    let (lang, code) = (skill.language.clone(), skill.code.clone());
+    let out = tokio::task::spawn_blocking(move || crate::skills::execute(&lang, &code)).await??;
+    Ok(json!({
+        "name": name,
+        "ok": out.ok,
+        "exit_code": out.code,
+        "stdout": clip(&out.stdout, 4000),
+        "stderr": clip(&out.stderr, 2000),
+    }))
+}
+
+/// `list_skills`: the authored-skill inventory.
+fn list_skills() -> Value {
+    let skills = crate::skills::load_all();
+    let items: Vec<Value> = skills
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "description": s.description,
+                "language": s.language,
+                "verified": s.verified,
+            })
+        })
+        .collect();
+    json!({ "count": items.len(), "skills": items })
 }
 
 /// Discovery over the full catalog. Returns matching tools (name + clipped
@@ -368,13 +576,58 @@ mod tests {
     }
 
     #[test]
-    fn meta_tools_are_read_only_and_no_approval() {
+    fn reserved_names_cover_meta_and_command_tools_but_not_arbitrary() {
+        // Anti-spoofing: both trusted layers are reserved against authored/user tools.
+        assert!(is_reserved_tool_name("recall")); // meta-tool
+        assert!(is_reserved_tool_name("mesh_publish")); // command-tool (spine)
+        assert!(is_reserved_tool_name("mesh_health")); // freshly-ported command-tool
+        assert!(is_reserved_tool_name("research")); // command-tool
+        // A normal, non-built-in skill name is allowed.
+        assert!(!is_reserved_tool_name("my_alloy_screener"));
+        assert!(!is_reserved_tool_name("summarize_dft_run"));
+    }
+
+    #[tokio::test]
+    async fn write_skill_rejects_reserved_names() {
+        // A skill trying to squat a trusted built-in name is refused BEFORE any
+        // execution or storage — the model is told to rename and retry.
+        for squat in ["recall", "mesh_publish", "research"] {
+            let out = write_skill(&json!({
+                "name": squat,
+                "description": "impostor",
+                "code": "echo hi",
+                "language": "shell",
+            }))
+            .await
+            .unwrap();
+            assert_eq!(out["stored"], json!(false), "{squat} must not be stored");
+            assert_eq!(out["verified"], json!(false), "{squat} must not run");
+            assert!(
+                out["error"].as_str().unwrap_or("").contains("reserved"),
+                "{squat} error should explain the reservation"
+            );
+        }
+    }
+
+    #[test]
+    fn meta_tool_permissions_match_their_effect() {
         let defs = definitions();
-        assert!(defs.iter().any(|t| t.name == "recall"));
-        assert!(defs.iter().any(|t| t.name == "find_tools"));
-        for t in &defs {
-            assert_eq!(t.permission_mode, PermissionMode::ReadOnly);
-            assert!(!t.requires_approval);
+        let by = |name: &str| defs.iter().find(|t| t.name == name).expect(name).clone();
+
+        // Read-only, no-approval: memory + discovery, and listing skills.
+        for name in ["recall", "find_tools", "list_skills"] {
+            let t = by(name);
+            assert_eq!(t.permission_mode, PermissionMode::ReadOnly, "{name}");
+            assert!(!t.requires_approval, "{name} must not need approval");
+        }
+        // Code-executing self-authoring tools are workspace-write + gated.
+        for name in ["write_skill", "run_skill"] {
+            let t = by(name);
+            assert_eq!(t.permission_mode, PermissionMode::WorkspaceWrite, "{name}");
+            assert!(
+                t.requires_approval,
+                "{name} executes code → must need approval"
+            );
         }
     }
 
@@ -548,5 +801,97 @@ mod tests {
         assert_eq!(out["matches"][0]["tool_name"], json!("file"));
         // Keyword matches carry no semantic score.
         assert!(out["matches"][0]["score"].is_null());
+    }
+
+    /// The self-authoring (Voyager) loop end to end through the meta-tool layer:
+    /// write_skill verifies-then-stores, a failing skill is rejected, list_skills
+    /// shows only the verified one, run_skill re-executes it, and it surfaces to
+    /// the capability/retrieval layer. Deterministic (shell only, temp dir).
+    // The env guard is held across `.await` only to serialize `PRISM_SKILLS_DIR`
+    // between tests; `#[tokio::test]` is single-threaded so this can't deadlock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn write_skill_verifies_stores_lists_and_runs() {
+        let (_g, _dir) = crate::skills::test_env_guard("meta-writeskill");
+        let catalog = ToolCatalog::from_tool_server_json(&json!({ "tools": [] }));
+
+        // 1. A valid shell skill: verified by running once, then stored.
+        let w = execute_meta_tool(
+            "write_skill",
+            &json!({
+                "name": "say_hi",
+                "description": "print a greeting to stdout",
+                "language": "shell",
+                "code": "echo hello-from-skill",
+            }),
+            None,
+            "",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(w["stored"], json!(true), "valid skill must store: {w}");
+        assert_eq!(w["verified"], json!(true));
+
+        // 2. A skill that exits non-zero is REJECTED, not stored.
+        let bad = execute_meta_tool(
+            "write_skill",
+            &json!({
+                "name": "broken",
+                "description": "exits non-zero",
+                "language": "shell",
+                "code": "exit 7",
+            }),
+            None,
+            "",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bad["stored"],
+            json!(false),
+            "failing skill must NOT store: {bad}"
+        );
+        assert_eq!(bad["verified"], json!(false));
+
+        // 3. Only the verified skill is listed.
+        let list = execute_meta_tool("list_skills", &json!({}), None, "", &catalog)
+            .await
+            .unwrap();
+        assert_eq!(
+            list["count"],
+            json!(1),
+            "only verified skill listed: {list}"
+        );
+        assert_eq!(list["skills"][0]["name"], json!("say_hi"));
+
+        // 4. run_skill re-executes the stored skill and returns its output.
+        let r = execute_meta_tool(
+            "run_skill",
+            &json!({ "name": "say_hi" }),
+            None,
+            "",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["ok"], json!(true), "run must succeed: {r}");
+        assert!(
+            r["stdout"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("hello-from-skill"),
+            "stdout must carry the skill output: {r}"
+        );
+
+        // 5. The stored skill surfaces to the capability/retrieval layer.
+        assert_eq!(
+            crate::skills::retrieval_entries(),
+            vec![(
+                "say_hi".to_string(),
+                "say_hi: print a greeting to stdout".to_string()
+            )]
+        );
     }
 }

@@ -42,11 +42,9 @@ pub enum ChatTarget {
     ///
     /// `model` is the upstream model id MARC27 should serve us
     /// (`gpt-5.5`, `claude-sonnet-4`, `mistral-large-latest`, …). When
-    /// `None`, PRISM falls back to its compiled-in default
-    /// (`forge_chat::DEFAULT_MODEL_ID`). Stored here so the same
-    /// session can be reproduced across restarts and so `/use marc27
-    /// --model x` can swap mid-session without forge needing its own
-    /// model state.
+    /// `None`, PRISM falls back to its compiled-in default. Stored here so
+    /// the same session can be reproduced across restarts and so `/use
+    /// marc27 --model x` can swap the model mid-session.
     Marc27 {
         #[serde(default)]
         model: Option<String>,

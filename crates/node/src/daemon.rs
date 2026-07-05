@@ -141,6 +141,13 @@ pub async fn run_daemon(
     paths: &PrismPaths,
     options: DaemonOptions,
 ) -> Result<()> {
+    // The daemon runs both standalone (prism-node) and in-process via the CLI
+    // (`prism node up`). Either binary's dep tree enables both rustls providers
+    // (ring + aws-lc-rs via aws-smithy), so rustls cannot auto-select — the
+    // first lazy TLS init (deployment HTTP client, health polls) would panic
+    // and kill the daemon. Ignore the error: something already installed one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli_state = paths.load_cli_state()?;
     let stored_credentials = cli_state.credentials.as_ref();
 

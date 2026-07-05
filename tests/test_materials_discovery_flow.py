@@ -153,7 +153,6 @@ class TestMaterialsDiscoveryFlow:
             "list_models",
             "dataset",  # action='import' / action='export'
             "execute_python",
-            "discover_capabilities",
         ]
         missing = [t for t in required if t not in tool_names]
         assert not missing, f"Missing tools for workflow: {missing}"
@@ -202,13 +201,3 @@ class TestMaterialsDiscoveryFlow:
         # but should not error
         assert "error" not in result, f"Search with filter failed: {result.get('error')}"
 
-    # ── Step 10: Capabilities discovery works ──────────────────────
-
-    def test_step10_discover_capabilities(self):
-        """discover_capabilities tool should report what's available."""
-        from app.tools.capabilities import discover_capabilities
-
-        result = discover_capabilities()
-        assert "error" not in result
-        # Should report on search providers, models, etc.
-        assert "search_providers" in result or "tools" in result or "capabilities" in result

@@ -1,6 +1,7 @@
 //! Data ingestion and retrieval handlers.
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -46,15 +47,22 @@ pub async fn list_sources(State(state): State<Arc<NodeState>>) -> Json<Vec<DataS
     Json(vec![])
 }
 
-/// POST /api/data/ingest — queue a data ingestion job.
-pub async fn ingest(Json(body): Json<IngestRequest>) -> Json<IngestResponse> {
-    // Ingest is a long-running operation — for now return acknowledgment.
-    // The full pipeline is invoked via `prism ingest` CLI.
+/// POST /api/data/ingest — ingestion is NOT wired on this node endpoint.
+///
+/// Honest 501: this handler never had a queue or pipeline behind it. The real
+/// ingestion path is the `prism ingest <file>` CLI (or the knowledge-service
+/// ingest API). Returning a fake "accepted" here made the caller believe work
+/// was queued when nothing happened — see AUDIT_BACKLOG 0.3.
+pub async fn ingest(Json(body): Json<IngestRequest>) -> (StatusCode, Json<IngestResponse>) {
     let source = body.source.unwrap_or_else(|| "(none)".into());
-    Json(IngestResponse {
-        status: "accepted",
-        message: format!(
-            "Ingest queued for source: {source}. Use `prism ingest <file>` for full pipeline."
-        ),
-    })
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(IngestResponse {
+            status: "not_implemented",
+            message: format!(
+                "Ingestion is not available on this endpoint (source: {source}). \
+                 Use `prism ingest <file>` or the knowledge-service ingest API."
+            ),
+        }),
+    )
 }

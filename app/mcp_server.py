@@ -137,9 +137,14 @@ def _register_resources(mcp):
 
     @mcp.resource("prism://capabilities")
     def capabilities_resource() -> str:
-        """Live snapshot of all available PRISM capabilities."""
-        from app.tools.capabilities import discover_capabilities
-        return json.dumps(discover_capabilities(), default=str)
+        """Live snapshot of platform capabilities (GET /agent/capabilities).
+
+        Was the retired `discover_capabilities` aggregator (dead — it needed the
+        uninstalled `marc27` SDK). Now backed by the working `agent_capabilities`
+        tool, which reads the same endpoint through `_platform_client`.
+        """
+        from app.tools.agent_capabilities import _agent_capabilities
+        return json.dumps(_agent_capabilities(), default=str)
 
     @mcp.resource("prism://skills")
     def list_skills_resource() -> str:

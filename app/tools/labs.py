@@ -1,7 +1,5 @@
 """Labs — UNIFIED tool collapsing 4 marketplace actions into one entry point.
 
-DRAFT for Round 4. Replaces app/tools/labs.py.
-
 Replaces (4 tools → 1):
   list_lab_services        → action='list'        (browse catalog)
   get_lab_service_info     → action='info'        (one service detail)

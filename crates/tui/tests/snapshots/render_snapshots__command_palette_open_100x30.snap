@@ -1,6 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 721
+assertion_line: 736
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
@@ -19,12 +19,12 @@ expression: rendered
                │    Predict properties      ML prediction for a composition palette │
                │    Procure GPU compute     Live GPU catalog with prices    palette │
                │    Run simulation          Relax/MD via MACE + pyiron      palette │
-               │    Notebook                Jupyter via `prism notebook start`  CLI │
+               │    Notebook                Notebook session — coming in-app … soon │
                │  ── DISPLAY ────────────────────────────────────────────────────── │
+               │    Mission Control         The launch dashboard — workflo… palette │
                │    Toggle thinking         Show/hide reasoning tokens       Ctrl-T │
                │  ── HELP ───────────────────────────────────────────────────────── │
-               │    Help                    Show keys & commands              /help │
-               │  … 33 more — ↓ to scroll or type to filter                         │
+               │  … 34 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│

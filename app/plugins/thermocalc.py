@@ -1,8 +1,11 @@
 """ThermoCalc plugin skeleton — built-in example for the plugin system.
 
-Registers ThermoCalc tools only if TC-Python is importable.
-This serves as a connector framework; full functionality requires
-a commercial ThermoCalc license and TC-Python SDK.
+This is a CONNECTOR STUB, not a working ThermoCalc integration. It shows how a
+plugin registers tools; the handlers do NOT compute anything. Real functionality
+requires a commercial ThermoCalc license + the TC-Python SDK and a proper
+implementation against it. The handlers return an explicit ``not_implemented``
+error rather than fabricated numbers, so a user who happens to have TC-Python
+installed is never handed echo-back data dressed up as a real calculation.
 """
 
 
@@ -15,41 +18,26 @@ def _check_tc_python() -> bool:
         return False
 
 
-def _tc_equilibrium(**kwargs) -> dict:
-    """Calculate equilibrium using ThermoCalc."""
-    try:
-        import tc_python
-        # Placeholder: actual implementation requires TC-Python SDK
-        database = kwargs.get("database", "TCFE12")
-        components = kwargs.get("components", [])
-        temperature = kwargs.get("temperature", 1000)
+def _not_implemented(calculation: str) -> dict:
+    """Honest response: the SDK may be present, but nothing was computed."""
+    return {
+        "status": "not_implemented",
+        "error": (
+            f"ThermoCalc {calculation} is a stub — TC-Python may be importable, "
+            "but no calculation is wired. No result was computed. Implement this "
+            "handler against the TC-Python SDK to enable the tool."
+        ),
+    }
 
-        return {
-            "note": "ThermoCalc equilibrium calculation",
-            "database": database,
-            "components": components,
-            "temperature": temperature,
-            "status": "requires_tc_python_license",
-        }
-    except Exception as e:
-        return {"error": f"ThermoCalc calculation failed: {e}"}
+
+def _tc_equilibrium(**kwargs) -> dict:
+    """Stub — returns not_implemented (does not call TC-Python)."""
+    return _not_implemented("equilibrium calculation")
 
 
 def _tc_phase_diagram(**kwargs) -> dict:
-    """Calculate phase diagram using ThermoCalc."""
-    try:
-        import tc_python
-        database = kwargs.get("database", "TCFE12")
-        components = kwargs.get("components", [])
-
-        return {
-            "note": "ThermoCalc phase diagram calculation",
-            "database": database,
-            "components": components,
-            "status": "requires_tc_python_license",
-        }
-    except Exception as e:
-        return {"error": f"ThermoCalc calculation failed: {e}"}
+    """Stub — returns not_implemented (does not call TC-Python)."""
+    return _not_implemented("phase diagram calculation")
 
 
 def register(registry):
@@ -61,7 +49,11 @@ def register(registry):
 
     registry.tool_registry.register(Tool(
         name="tc_equilibrium",
-        description="Calculate equilibrium using ThermoCalc (requires commercial license).",
+        description=(
+            "STUB (not implemented): ThermoCalc equilibrium connector example. "
+            "Returns not_implemented — no calculation is performed. Requires a "
+            "commercial license and a real TC-Python implementation."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -77,7 +69,11 @@ def register(registry):
 
     registry.tool_registry.register(Tool(
         name="tc_phase_diagram",
-        description="Calculate phase diagram using ThermoCalc (requires commercial license).",
+        description=(
+            "STUB (not implemented): ThermoCalc phase-diagram connector example. "
+            "Returns not_implemented — no calculation is performed. Requires a "
+            "commercial license and a real TC-Python implementation."
+        ),
         input_schema={
             "type": "object",
             "properties": {

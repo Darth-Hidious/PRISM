@@ -1,6 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 734
+assertion_line: 749
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
@@ -15,6 +15,7 @@ expression: rendered
                │    reference ▸ Tool catalog            Browse the agent t… palette │
                │  diagnostics ▸ Show tool permissions   Tool access &… /permissions │
                │   navigation ▸ Workspace: Tools        Switch sidebar to Tools ←/→ │
+               │      display ▸ Mission Control         The launch dashboa… palette │
                │      session ▸ Set goal                Standing goal… /goal <text> │
                │      display ▸ Switch theme            Pick a color theme  palette │
                │      session ▸ Compact conversation    Compact older con… /compact │
@@ -23,8 +24,7 @@ expression: rendered
                │     settings ▸ Config                  View prism.toml / … palette │
                │  diagnostics ▸ Run doctor checks       Runtime diagnostics /doctor │
                │      display ▸ Toggle metrics          Show/hide tok/s met… Ctrl-M │
-               │      session ▸ Model                   Active model + how … /model │
-               │  … 10 more — ↓ to scroll or type to filter                         │
+               │  … 12 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│

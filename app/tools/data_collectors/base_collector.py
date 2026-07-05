@@ -1,6 +1,17 @@
 """Base class and registry for data collectors."""
+import logging
 from abc import ABC, abstractmethod
 from typing import Dict, List
+
+logger = logging.getLogger(__name__)
+
+
+class CollectorConfigError(RuntimeError):
+    """A collector cannot run because required configuration — usually an API
+    credential — is missing. This is deliberately distinct from "ran fine,
+    found nothing": callers must surface it so the agent knows a source was
+    *skipped due to misconfiguration*, not that the source is genuinely empty.
+    """
 
 
 class DataCollector(ABC):
@@ -42,8 +53,11 @@ class CollectorRegistry:
                 try:
                     records = self._collectors[src].collect(**kwargs)
                     all_records.extend(records)
-                except Exception:
-                    pass
+                except CollectorConfigError as e:
+                    # Misconfigured source — log the skip; never swallow silently.
+                    logger.warning("collector %r skipped: %s", src, e)
+                except Exception as e:
+                    logger.warning("collector %r failed: %s", src, e)
         return all_records
 
 

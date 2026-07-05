@@ -97,6 +97,10 @@ pub struct RunConfig {
     pub backend_mode: BackendMode,
     /// When set, the status bar polls the org credit balance.
     pub platform: Option<PlatformAuth>,
+    /// Launch-time conversation resume. `None` = start fresh; `Some("")` =
+    /// open the session picker (`prism resume`); `Some(id)` = jump straight
+    /// into that conversation (`prism resume <id>`).
+    pub resume: Option<String>,
 }
 
 impl Default for RunConfig {
@@ -108,6 +112,7 @@ impl Default for RunConfig {
                 python_bin: "python3".into(),
             },
             platform: None,
+            resume: None,
         }
     }
 }
@@ -124,6 +129,7 @@ pub async fn run(prism_binary: &str, project_root: &str, python_bin: &str) -> Re
             python_bin: python_bin.to_string(),
         },
         platform: None,
+        resume: None,
     };
     run_with_config(config).await
 }
@@ -203,6 +209,16 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
 
     // Build app state
     let mut app = app::App::new(backend_handle);
+
+    // Launch-time resume (`prism resume` / `prism resume <id>`): an empty
+    // string opens the session picker; a concrete id jumps straight into
+    // that conversation. Both reuse the same `/sessions` + `/resume`
+    // backend commands the in-TUI picker already drives.
+    match config.resume.as_deref() {
+        Some("") => app.open_sessions(),
+        Some(id) => app.resume_session(id),
+        None => {}
+    }
 
     // Credits polling: a spawned task fetches the org balance and publishes it
     // via an atomic the loop reads (no extra select! branch needed). Fired at

@@ -16,17 +16,29 @@ class LiteratureCollector(DataCollector):
     def collect(self, query: str = "", max_results: int = 20,
                 sources: List[str] = None, **kwargs) -> List[Dict]:
         """Search arXiv and Semantic Scholar for papers."""
-        if not query:
-            return []
-        sources = sources or ["arxiv", "semantic_scholar"]
-        results = []
-        if "arxiv" in sources:
-            results.extend(self._search_arxiv(query, max_results))
-        if "semantic_scholar" in sources:
-            results.extend(self._search_s2(query, max_results))
-        return results[:max_results]
+        return self.collect_with_status(query, max_results, sources)["results"]
 
-    def _search_arxiv(self, query: str, max_results: int) -> List[Dict]:
+    def collect_with_status(self, query: str = "", max_results: int = 20,
+                            sources: List[str] = None) -> Dict:
+        """Like collect(), but also reports per-source outcomes so callers can
+        see WHICH source failed (e.g. Semantic Scholar 429s) instead of a
+        silently thinner result list."""
+        if not query:
+            return {"results": [], "source_status": {}}
+        sources = sources or ["arxiv", "semantic_scholar"]
+        results: List[Dict] = []
+        status: Dict[str, str] = {}
+        if "arxiv" in sources:
+            hits, err = self._search_arxiv(query, max_results)
+            results.extend(hits)
+            status["arxiv"] = err or f"ok ({len(hits)} results)"
+        if "semantic_scholar" in sources:
+            hits, err = self._search_s2(query, max_results)
+            results.extend(hits)
+            status["semantic_scholar"] = err or f"ok ({len(hits)} results)"
+        return {"results": results[:max_results], "source_status": status}
+
+    def _search_arxiv(self, query: str, max_results: int):
         try:
             params = {
                 "search_query": f"all:{query}",
@@ -35,9 +47,9 @@ class LiteratureCollector(DataCollector):
             }
             resp = requests.get(self.ARXIV_API, params=params, timeout=30)
             resp.raise_for_status()
-            return self._parse_arxiv_xml(resp.text)
-        except Exception:
-            return []
+            return self._parse_arxiv_xml(resp.text), None
+        except Exception as e:
+            return [], f"error: {type(e).__name__}: {e}"
 
     def _parse_arxiv_xml(self, xml_text: str) -> List[Dict]:
         ns = {"atom": "http://www.w3.org/2005/Atom"}
@@ -64,7 +76,7 @@ class LiteratureCollector(DataCollector):
             })
         return results
 
-    def _search_s2(self, query: str, max_results: int) -> List[Dict]:
+    def _search_s2(self, query: str, max_results: int):
         try:
             params = {
                 "query": query,
@@ -88,9 +100,9 @@ class LiteratureCollector(DataCollector):
                     "citations": paper.get("citationCount", 0),
                     "type": "paper",
                 })
-            return results
-        except Exception:
-            return []
+            return results, None
+        except Exception as e:
+            return [], f"error: {type(e).__name__}: {e}"
 
     def supported_params(self) -> List[str]:
         return ["query", "max_results", "sources"]

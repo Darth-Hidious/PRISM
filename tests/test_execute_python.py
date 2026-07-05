@@ -115,3 +115,39 @@ class TestCodeToolIntegration:
         result = _execute_python(code=code)
         assert result["success"] is True
         assert len(result["stdout"]) == 50001  # 50000 x's + newline
+
+
+class TestCrashHandling:
+    """#68: a child killed by a signal must surface as an actionable error,
+    not a bare negative exit code the model can't interpret."""
+
+    def test_signal_death_is_surfaced(self):
+        """A child that SIGSEGVs returns exit -11, success False, named error."""
+        result = _execute_python(
+            code="import os, signal; os.kill(os.getpid(), signal.SIGSEGV)"
+        )
+        assert result["exit_code"] == -11
+        assert result["success"] is False
+        assert "SIGSEGV" in result.get("error", "")
+
+    def test_signal_name_mapping(self):
+        from app.tools.code import _signal_name
+
+        assert _signal_name(-11) == "SIGSEGV"
+        assert _signal_name(-6) == "SIGABRT"
+        assert _signal_name(-999).startswith("signal ")  # unknown → graceful
+
+    def test_headless_env_defaults(self):
+        """Child gets a non-interactive plotting backend + faulthandler so a
+        native crash is diagnosable, without clobbering a caller override."""
+        from app.tools.code import _child_env
+
+        env = _child_env()
+        assert env["MPLBACKEND"] == "Agg"
+        assert env["PYTHONFAULTHANDLER"] == "1"
+
+    def test_normal_run_has_no_error_key(self):
+        """A clean run must not carry the crash error field."""
+        result = _execute_python(code='print("ok")')
+        assert result["success"] is True
+        assert "error" not in result

@@ -714,7 +714,8 @@ _SIM_RUN_DESCRIPTION = (
     "vasp, abinit, gpaw, qe), `potential` (interatomic potential name for "
     "LAMMPS — use `list_potentials` to discover), `parameters` (calc_type: "
     "'static'|'minimize'|'md', temperature, pressure, n_ionic_steps, ...).\n"
-    "MONEY/COMPUTE-SPENDING action — requires_approval=True. The harness "
+    "COMPUTE-HEAVY action (runs locally via pyiron — no credits charged) — "
+    "requires_approval=True. The harness "
     "prompts before each call. Use compute_estimate via `compute(action="
     "'estimate')` first if you need a cost preview for the cloud broker, "
     "though this tool dispatches via pyiron not the broker."
@@ -937,8 +938,8 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
             "before running a real production calc. Returns "
             "{parameter_values, energies} suitable for plotting. Different "
             "shape from sim_run (which runs ONE simulation); this dispatches "
-            "N simulations in sequence. Money/compute-spending — keep N "
-            "reasonable (3-7 values typically)."
+            "N simulations in sequence. Compute-heavy (runs locally, no "
+            "charge) — keep N reasonable (3-7 values typically)."
         ),
         input_schema={
             "type": "object",
@@ -969,7 +970,7 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
             "workflow internally dispatches multiple sim_run calls — "
             "this is the highest-level atomistic-sim entry point. NOT a "
             "substitute for sim_run (which runs ONE calc); use sim_run when "
-            "you want fine-grained control. Money/compute-spending."
+            "you want fine-grained control. Compute-heavy (runs locally, no charge)."
         ),
         input_schema={
             "type": "object",

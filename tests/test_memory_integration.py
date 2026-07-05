@@ -114,7 +114,7 @@ def test_e2e_record_recall_fetch(memory_env):
     assert len(result["results"]) == 4
 
     # Now recall — should hit the artifact via BM25 OR vector
-    recall = registry.get("recall")
+    recall = registry.get("search_artifacts")
     hits = recall.execute(query="aerospace alloys tensile", limit=5)
     assert hits["count"] >= 1, f"no hits, got {hits}"
     artifact_ids = {h["artifact_id"] for h in hits["hits"]}
@@ -171,7 +171,7 @@ def test_per_record_recall_and_fetch(memory_env):
     artifact_id = result["_artifact_id"]
 
     # Recall a record-level match
-    hits = registry.get("recall").execute(query="titanium aerospace", limit=10)
+    hits = registry.get("search_artifacts").execute(query="titanium aerospace", limit=10)
     # At least one hit should be record-level (has record_idx) and point at our artifact
     record_hits = [h for h in hits["hits"] if h.get("record_idx") is not None]
     assert any(h["artifact_id"] == artifact_id for h in record_hits), (
@@ -225,8 +225,8 @@ def test_memory_tools_opt_out(memory_env):
     initial_count = len(store.list_artifacts(session_id="test-session"))
 
     # Call recall + list multiple times
-    registry.get("recall").execute(query="anything", limit=5)
-    registry.get("recall").execute(query="more", limit=5)
+    registry.get("search_artifacts").execute(query="anything", limit=5)
+    registry.get("search_artifacts").execute(query="more", limit=5)
     registry.get("list_artifacts").execute()
     artifacts = store.list_artifacts(session_id="test-session")
     art_id = artifacts[0]["artifact_id"]
@@ -320,7 +320,7 @@ def test_cross_session_recall(memory_env):
     registry.get("tool_a").execute()  # still records — different session
 
     # From session B, scope='session' should not see alpha's content
-    hits_session = registry.get("recall").execute(
+    hits_session = registry.get("search_artifacts").execute(
         query="unique_alpha_token", scope="session", limit=10,
     )
     session_artifact_ids = {h["artifact_id"] for h in hits_session["hits"]}
@@ -336,7 +336,7 @@ def test_cross_session_recall(memory_env):
         )
 
     # scope='all' should include both
-    hits_all = registry.get("recall").execute(
+    hits_all = registry.get("search_artifacts").execute(
         query="unique_alpha_token", scope="all", limit=10,
     )
     all_artifact_ids = {h["artifact_id"] for h in hits_all["hits"]}

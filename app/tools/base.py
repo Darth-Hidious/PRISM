@@ -29,7 +29,7 @@ class Tool:
     source: str = "builtin"
     source_detail: Optional[str] = None
     # Memory subsystem opt-out. Tools that ARE the memory subsystem
-    # (recall, fetch_artifact, list_artifacts, show_scratchpad) MUST set
+    # (search_artifacts, fetch_artifact, list_artifacts, show_scratchpad) MUST set
     # this False to avoid pointless self-indexing and infinite recursion.
     record_artifacts: bool = True
 

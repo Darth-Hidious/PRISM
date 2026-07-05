@@ -118,4 +118,10 @@ def select_backend(
             return backends["platform"]
         if "hf_jobs" in backends:
             return backends["hf_jobs"]
-    return backends["fake"]
+    # Unreachable in normal assembly (mace_bridge always registers "local"),
+    # but fail loudly rather than silently returning fabricated "fake" physics.
+    # The deliberate fake path is the MACE_MCP_BACKEND env override above.
+    raise RuntimeError(
+        f"No MACE backend available for tool '{tool_name}' "
+        f"(registered: {sorted(backends)}); expected at least 'local'."
+    )

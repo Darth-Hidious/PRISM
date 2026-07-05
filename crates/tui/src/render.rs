@@ -87,6 +87,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_config_window(f, app);
     } else if app.apikey_window.open {
         draw_apikey_window(f, app);
+    } else if app.home.open {
+        draw_home(f, app);
     } else if let Some(modal) = app.modal {
         draw_modal(f, modal, app);
     }
@@ -1619,6 +1621,121 @@ fn draw_status_window(f: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(t.accent))
                 .title(Span::styled(
                     " Status ",
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                )),
+        );
+    f.render_widget(para, area);
+}
+
+/// Mission Control home — the launch screen. A glanceable, honest dashboard
+/// built from live App state only (see docs/design/PLATFORM_ARCHITECTURE.md §3):
+/// where a field isn't reported yet, it says so rather than inventing a number.
+fn draw_home(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let area = centered_rect(80, 80, f.area());
+    f.render_widget(Clear, area);
+
+    let section = |label: &str| -> Line<'static> {
+        Line::from(Span::styled(
+            format!("  {label}"),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ))
+    };
+    // A live tile row: status glyph · one-line real state · key hint.
+    let row = |glyph: &str, body: String, hint: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("   {glyph} "), Style::default().fg(t.ok)),
+            Span::styled(body, Style::default().fg(t.text)),
+            Span::styled(format!("   {hint}"), Style::default().fg(t.muted)),
+        ])
+    };
+    // An honest "not reported / not wired yet" line — never a fabricated number.
+    let muted = |s: String| -> Line<'static> {
+        Line::from(Span::styled(
+            format!("     {s}"),
+            Style::default().fg(t.muted),
+        ))
+    };
+
+    let total = app.tool_catalog.len();
+    let need_approval = app
+        .tool_catalog
+        .iter()
+        .filter(|x| x.get("approval").and_then(|v| v.as_bool()).unwrap_or(false))
+        .count();
+    let model = clean_model_name(&app.model);
+
+    // WORKFLOWS — no live run list wired to the client yet (honest).
+    let mut lines: Vec<Line> = vec![
+        Line::raw(""),
+        section("WORKFLOWS"),
+        muted("no live run list wired yet — talk to the agent to start one".to_string()),
+        Line::raw(""),
+        // TOOLS — real counts; location honestly "not reported" (no data path yet).
+        section("TOOLS"),
+    ];
+    if total == 0 {
+        lines.push(muted("loading tool catalog…".to_string()));
+    } else {
+        lines.push(row(
+            "▣",
+            format!(
+                "{total} tools · {need_approval} need approval · {} auto",
+                total.saturating_sub(need_approval)
+            ),
+            "t open",
+        ));
+        lines.push(muted(
+            "location (cloud/local/remote) not reported — pending tool tags".to_string(),
+        ));
+    }
+    lines.extend([
+        Line::raw(""),
+        // NOTEBOOKS — live entirely outside the agent world today (honest).
+        section("NOTEBOOKS"),
+        muted("not wired in-app yet — will be agent-watched + editable".to_string()),
+        Line::raw(""),
+        // SYSTEMS — live App state only.
+        section("SYSTEMS"),
+        row(
+            "●",
+            format!(
+                "model  {}",
+                if model.is_empty() {
+                    "—".to_string()
+                } else {
+                    model
+                }
+            ),
+            "s status",
+        ),
+        row(
+            "●",
+            format!("session cost  ${:.4}", app.session_cost),
+            "as of last checkpoint",
+        ),
+    ]);
+    lines.push(match app.credits {
+        Some(mc) => muted(format!("credits  {:.3}", mc as f64 / 1000.0)),
+        None => muted("credits  not reported (unauthed / not fetched)".to_string()),
+    });
+    lines.extend([
+        muted("compute · nodes · knowledge · ingestion — open via ⌘K".to_string()),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  ⏎ talk to the agent    t tools    s systems    ⌘K commands    ? keys",
+            Style::default().fg(t.muted),
+        )),
+    ]);
+
+    let para = Paragraph::new(lines)
+        .style(Style::default().bg(t.overlay_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.accent))
+                .title(Span::styled(
+                    " PRISM · materials research workspace ",
                     Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                 )),
         );

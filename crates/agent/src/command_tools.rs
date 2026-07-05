@@ -57,6 +57,7 @@ enum CommandToolKind {
     NodeStatus,
     NodeLogs,
     MeshDiscover,
+    MeshHealth,
     MeshPeers,
     MeshSubscriptions,
     MeshPublish,
@@ -64,6 +65,16 @@ enum CommandToolKind {
     MeshUnsubscribe,
     RunSubmit,
     PublishArtifact,
+    ComputeGpus,
+    ComputeProviders,
+    ComputeEstimate,
+    ComputeStatus,
+    ComputeCancel,
+    ComputeSubmit,
+    KnowledgeEntity,
+    KnowledgePaths,
+    KnowledgeCorpora,
+    KnowledgeIngest,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,7 +130,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "query",
         aliases: &[],
         kind: CommandToolKind::QueryPlatform,
-        description: "Query the MARC27 platform knowledge APIs instead of local Neo4j/Qdrant. Use `semantic=true` for vector search and `json=true` for machine-readable output.",
+        description: "Search the MARC27 platform knowledge graph. Plain text runs a graph-entity search ('find Ti-6Al-4V'); `semantic=true` runs pgvector similarity for conceptual asks ('high-strength aerospace alloy'). This is the default platform search path — use `knowledge_entity`/`knowledge_paths` for one-entity neighbors or relationship paths.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -264,6 +275,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &[],
         kind: CommandToolKind::MeshDiscover,
         description: "Discover PRISM mesh peers on the local network via mDNS. This is a typed read-only wrapper around `prism mesh discover`.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "mesh_health",
+        root: "mesh",
+        aliases: &[],
+        kind: CommandToolKind::MeshHealth,
+        description: "Quick health check for the mesh subsystem: online status, this node's ID, and peer count. Cheaper than mesh_peers — use this first to check the mesh is alive before listing peers or publishing. Requires a running local node (prism node up).",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -446,6 +466,96 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         description: "Stop a deployment by ID. Use this for cleanup or to halt a failed deployment loop.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "compute_gpus",
+        root: "compute",
+        aliases: &[],
+        kind: CommandToolKind::ComputeGpus,
+        description: "List purchasable GPU offers on the MARC27 compute broker (type, VRAM, region, provider, $/hr).",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "compute_providers",
+        root: "compute",
+        aliases: &[],
+        kind: CommandToolKind::ComputeProviders,
+        description: "List registered compute-broker providers/backends (PRISM mesh nodes, RunPod, Lambda, ...).",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "compute_estimate",
+        root: "compute",
+        aliases: &[],
+        kind: CommandToolKind::ComputeEstimate,
+        description: "Preview the cost of a compute-broker job WITHOUT dispatching it (free). Requires `image`.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "compute_status",
+        root: "compute",
+        aliases: &[],
+        kind: CommandToolKind::ComputeStatus,
+        description: "Poll one compute-broker job by ID; returns status, cost, and output when finished.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "compute_cancel",
+        root: "compute",
+        aliases: &[],
+        kind: CommandToolKind::ComputeCancel,
+        description: "Cancel a queued/running compute-broker job by ID (idempotent; stops further spend).",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "compute_submit",
+        root: "compute",
+        aliases: &[],
+        kind: CommandToolKind::ComputeSubmit,
+        description: "Dispatch a real, BILLABLE containerized GPU/CPU job to the MARC27 compute broker. Provide `image` and `inputs`; set `budget_max_usd` to cap spend.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "knowledge_entity",
+        root: "knowledge",
+        aliases: &[],
+        kind: CommandToolKind::KnowledgeEntity,
+        description: "Look up one entity plus its 1-hop neighbors in the MARC27 knowledge graph. Requires `name`. For plain term search use `query_platform`; for conceptual/vector search use `query_platform` with semantic=true.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "knowledge_paths",
+        root: "knowledge",
+        aliases: &[],
+        kind: CommandToolKind::KnowledgePaths,
+        description: "Find shortest hop-paths between two entities in the MARC27 knowledge graph ('how does X relate to Y?'). Requires `from_entity` and `to_entity`.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "knowledge_corpora",
+        root: "knowledge",
+        aliases: &[],
+        kind: CommandToolKind::KnowledgeCorpora,
+        description: "List available corpora from the MARC27 catalog (Materials Project, JARVIS-DFT, QMOF, MatKG, ...). Filter by `domain` or `kind`.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "knowledge_ingest",
+        root: "knowledge",
+        aliases: &[],
+        kind: CommandToolKind::KnowledgeIngest,
+        description: "Submit a background extraction job into the MARC27 knowledge graph from a `url` or free-text `query`. Entity extraction runs asynchronously server-side; poll graph growth via `ingest` --status.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: false,
     },
     CommandToolSpec {
         name: "models",
@@ -1009,6 +1119,85 @@ fn deploy_create_schema() -> Value {
     })
 }
 
+fn compute_estimate_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "image": { "type": "string", "description": "Container image or marketplace slug to price." },
+            "gpu": { "type": "string", "description": "GPU class, e.g. 'A100-80GB'. Omit to let the broker choose." },
+            "timeout": { "type": "integer", "description": "Wall-time cap in seconds (default 3600)." }
+        },
+        "required": ["image"],
+        "additionalProperties": false
+    })
+}
+
+fn compute_submit_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "image": { "type": "string", "description": "Container image (Docker tag) or marketplace slug." },
+            "inputs": { "type": "object", "description": "JSON input payload for the container. Pass {} if none." },
+            "gpu": { "type": "string", "description": "GPU class, e.g. 'A100-80GB'." },
+            "budget_max_usd": { "type": "number", "description": "Hard cost cap in USD; broker refuses dispatch above it." },
+            "provider": { "type": "string", "description": "Routing: 'cheapest' (default), 'fastest', or a provider name." },
+            "timeout": { "type": "integer", "description": "Wall-time cap in seconds (default 3600)." },
+            "env_vars": { "type": "object", "description": "Environment variables for the container (KEY: VALUE)." }
+        },
+        "required": ["image", "inputs"],
+        "additionalProperties": false
+    })
+}
+
+fn knowledge_entity_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "Entity name to resolve in the knowledge graph." },
+            "limit": { "type": "integer", "description": "Max neighbors to return (default 10)." }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+fn knowledge_paths_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "from_entity": { "type": "string", "description": "Path start entity." },
+            "to_entity": { "type": "string", "description": "Path end entity." },
+            "max_hops": { "type": "integer", "description": "Max path length in hops (default 3)." }
+        },
+        "required": ["from_entity", "to_entity"],
+        "additionalProperties": false
+    })
+}
+
+fn knowledge_corpora_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "domain": { "type": "string", "description": "Filter by domain: materials/chemistry/biomedical/physics." },
+            "kind": { "type": "string", "description": "Filter by kind: structured_db/knowledge_graph/literature/ontology." },
+            "limit": { "type": "integer", "description": "Max results (default 50)." }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn knowledge_ingest_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "url": { "type": "string", "description": "Source URL to fetch and extract. Provide this OR `query`." },
+            "query": { "type": "string", "description": "Free-text to extract entities/embeddings from. Provide this OR `url`." },
+            "mode": { "type": "string", "description": "Extraction mode: graph/embed/full (default full)." }
+        },
+        "additionalProperties": false
+    })
+}
+
 fn run_submit_schema() -> Value {
     json!({
         "type": "object",
@@ -1295,9 +1484,25 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
             "UUID of the discourse instance whose stored turns should be fetched.",
         ),
         CommandToolKind::PublishArtifact => publish_artifact_schema(),
+        CommandToolKind::ComputeGpus | CommandToolKind::ComputeProviders => empty_schema(),
+        CommandToolKind::ComputeEstimate => compute_estimate_schema(),
+        CommandToolKind::ComputeStatus => {
+            deploy_id_schema("job_id", "Compute-broker job ID returned by compute_submit.")
+        }
+        CommandToolKind::ComputeCancel => {
+            deploy_id_schema("job_id", "Compute-broker job ID to cancel.")
+        }
+        CommandToolKind::ComputeSubmit => compute_submit_schema(),
+        CommandToolKind::KnowledgeEntity => knowledge_entity_schema(),
+        CommandToolKind::KnowledgePaths => knowledge_paths_schema(),
+        CommandToolKind::KnowledgeCorpora => knowledge_corpora_schema(),
+        CommandToolKind::KnowledgeIngest => knowledge_ingest_schema(),
         CommandToolKind::NodeProbe | CommandToolKind::NodeStatus => empty_schema(),
         CommandToolKind::NodeLogs => node_logs_schema(),
         CommandToolKind::MeshDiscover => mesh_discover_schema(),
+        CommandToolKind::MeshHealth => {
+            dashboard_url_schema("Dashboard base URL for the running local node.")
+        }
         CommandToolKind::MeshPeers => {
             dashboard_url_schema("Dashboard base URL for the running local node.")
         }
@@ -1974,6 +2179,144 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args,
             })
         }
+        CommandToolKind::ComputeGpus => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["gpus".to_string()],
+        }),
+        CommandToolKind::ComputeProviders => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["providers".to_string()],
+        }),
+        CommandToolKind::ComputeEstimate => {
+            let mut args = vec![
+                "estimate".to_string(),
+                "--image".to_string(),
+                required_string(input, "image")?,
+            ];
+            if let Some(gpu) = optional_string(input, "gpu") {
+                args.push("--gpu".to_string());
+                args.push(gpu);
+            }
+            if let Some(timeout) = optional_usize(input, "timeout") {
+                args.push("--timeout".to_string());
+                args.push(timeout.to_string());
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::ComputeStatus => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["status".to_string(), required_string(input, "job_id")?],
+        }),
+        CommandToolKind::ComputeCancel => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["cancel".to_string(), required_string(input, "job_id")?],
+        }),
+        CommandToolKind::ComputeSubmit => {
+            let mut args = vec![
+                "submit".to_string(),
+                "--image".to_string(),
+                required_string(input, "image")?,
+            ];
+            let inputs = input.get("inputs").cloned().unwrap_or_else(|| json!({}));
+            args.push("--inputs".to_string());
+            args.push(serde_json::to_string(&inputs).unwrap_or_else(|_| "{}".to_string()));
+            if let Some(gpu) = optional_string(input, "gpu") {
+                args.push("--gpu".to_string());
+                args.push(gpu);
+            }
+            if let Some(budget) = optional_f64(input, "budget_max_usd") {
+                args.push("--budget".to_string());
+                args.push(budget.to_string());
+            }
+            if let Some(provider) = optional_string(input, "provider") {
+                args.push("--provider".to_string());
+                args.push(provider);
+            }
+            if let Some(timeout) = optional_usize(input, "timeout") {
+                args.push("--timeout".to_string());
+                args.push(timeout.to_string());
+            }
+            for (key, value) in parse_string_map(input, "env_vars")? {
+                args.push("--env".to_string());
+                args.push(format!("{key}={value}"));
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::KnowledgeEntity => {
+            let mut args = vec!["entity".to_string(), required_string(input, "name")?];
+            if let Some(limit) = optional_usize(input, "limit") {
+                args.push("--limit".to_string());
+                args.push(limit.to_string());
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::KnowledgePaths => {
+            let mut args = vec![
+                "paths".to_string(),
+                required_string(input, "from_entity")?,
+                required_string(input, "to_entity")?,
+            ];
+            if let Some(max_hops) = optional_usize(input, "max_hops") {
+                args.push("--max-hops".to_string());
+                args.push(max_hops.to_string());
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::KnowledgeCorpora => {
+            let mut args = vec!["corpora".to_string()];
+            if let Some(domain) = optional_string(input, "domain") {
+                args.push("--domain".to_string());
+                args.push(domain);
+            }
+            if let Some(kind) = optional_string(input, "kind") {
+                args.push("--kind".to_string());
+                args.push(kind);
+            }
+            if let Some(limit) = optional_usize(input, "limit") {
+                args.push("--limit".to_string());
+                args.push(limit.to_string());
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::KnowledgeIngest => {
+            let url = optional_string(input, "url");
+            let query = optional_string(input, "query");
+            if url.is_none() && query.is_none() {
+                bail!("knowledge_ingest requires `url` or `query`");
+            }
+            let mut args = vec!["ingest".to_string()];
+            if let Some(url) = url {
+                args.push("--url".to_string());
+                args.push(url);
+            }
+            if let Some(query) = query {
+                args.push("--query".to_string());
+                args.push(query);
+            }
+            if let Some(mode) = optional_string(input, "mode") {
+                args.push("--mode".to_string());
+                args.push(mode);
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
         CommandToolKind::NodeProbe => Ok(CommandExecution::Cli {
             root: spec.root,
             args: vec!["probe".to_string()],
@@ -1998,6 +2341,17 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             if let Some(timeout) = optional_usize(input, "timeout") {
                 args.push("--timeout".to_string());
                 args.push(timeout.to_string());
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::MeshHealth => {
+            let mut args = vec!["health".to_string()];
+            if let Some(dashboard_url) = optional_string(input, "dashboard_url") {
+                args.push("--dashboard-url".to_string());
+                args.push(dashboard_url);
             }
             Ok(CommandExecution::Cli {
                 root: spec.root,
@@ -2307,11 +2661,6 @@ async fn execute_workflow_command(
 /// nothing breaks if an older transcript or client calls one by name.
 const LOCAL_NODE_TOOLS: &[&str] = &["query", "query_local", "query_federated"];
 
-/// Lookalikes folded into the platform-backed `knowledge` tool (the single
-/// default knowledge path). Never offered in the catalog, but kept
-/// executable as compatibility aliases.
-const CATALOG_ALIAS_ONLY: &[&str] = &["query_platform"];
-
 /// Cheap connectivity probe for the local node dashboard — the same
 /// `127.0.0.1:7327` endpoint the boot checks use. TCP-level only: a refused
 /// connection on localhost fails in microseconds, so building the catalog
@@ -2334,7 +2683,6 @@ pub fn command_tools() -> Vec<LoadedTool> {
 pub fn command_tools_filtered(local_node_online: bool) -> Vec<LoadedTool> {
     COMMAND_TOOLS
         .iter()
-        .filter(|spec| !CATALOG_ALIAS_ONLY.contains(&spec.name))
         .filter(|spec| local_node_online || !LOCAL_NODE_TOOLS.contains(&spec.name))
         .map(|spec| LoadedTool {
             name: spec.name.to_string(),
@@ -2416,7 +2764,9 @@ mod tests {
     #[test]
     fn local_store_tools_hidden_when_node_offline() {
         let tools = command_tools_filtered(false);
-        for name in ["query", "query_local", "query_federated", "query_platform"] {
+        // Only the local-node tools are gated offline; query_platform hits the
+        // remote API and stays offered (see offline_catalog_offers_platform_knowledge_path).
+        for name in ["query", "query_local", "query_federated"] {
             assert!(
                 tools.iter().all(|tool| tool.name != name),
                 "{name} must not be offered while the local node is offline"
@@ -2424,7 +2774,7 @@ mod tests {
         }
         // Capability is gated, not deleted: every hidden tool still resolves
         // and executes if called by name (older transcripts, aliases).
-        for name in ["query", "query_local", "query_federated", "query_platform"] {
+        for name in ["query", "query_local", "query_federated"] {
             assert!(is_command_tool(name), "{name} must remain executable");
         }
     }
@@ -2438,37 +2788,142 @@ mod tests {
                 "{name} should be offered when the local node is running"
             );
         }
-        // The platform lookalike stays folded into `knowledge` either way.
-        assert!(tools.iter().all(|tool| tool.name != "query_platform"));
+        // query_platform hits the remote API, so it is offered in both states.
+        assert!(tools.iter().any(|tool| tool.name == "query_platform"));
     }
 
     #[test]
-    fn default_catalog_offline_has_exactly_one_knowledge_tool() {
-        // Same assembly protocol::run_server performs: python tool-server
-        // catalog (which carries the unified `knowledge` tool) extended
-        // with the gated command tools.
-        let tools_json = json!({
-            "tools": [{
-                "name": "knowledge",
-                "description": "MARC27 Knowledge Plane — graph + semantic search over the live knowledge service.",
-                "input_schema": { "type": "object", "properties": {} },
-                "requires_approval": false,
-                "source": "python"
-            }]
-        });
-        let mut catalog = crate::tool_catalog::ToolCatalog::from_tool_server_json(&tools_json);
-        catalog.extend(command_tools_filtered(false));
+    fn offline_catalog_offers_platform_knowledge_path() {
+        // The retired Python `knowledge` tool used to be the single offered
+        // platform search path (with query_platform hidden behind it). After
+        // the knowledge.py → Rust migration, query_platform IS the offered
+        // platform search surface, and the node-gated local query tools stay
+        // hidden when the local node is down.
+        let catalog = command_tools_filtered(false);
+        let names: Vec<&str> = catalog.iter().map(|tool| tool.name.as_str()).collect();
 
-        let knowledge_paths: Vec<&str> = catalog
-            .iter()
-            .filter(|tool| tool.name == "knowledge" || tool.name.starts_with("query"))
-            .map(|tool| tool.name.as_str())
-            .collect();
-        assert_eq!(
-            knowledge_paths,
-            vec!["knowledge"],
-            "the default offline catalog must expose exactly one knowledge tool"
+        // The platform search path is offered even with the local node down.
+        assert!(names.contains(&"query_platform"));
+        // Node-gated local query tools are hidden offline.
+        assert!(!names.contains(&"query_local"));
+        assert!(!names.contains(&"query_federated"));
+        // The typed knowledge command-tools are always offered (remote API).
+        for name in [
+            "knowledge_entity",
+            "knowledge_paths",
+            "knowledge_corpora",
+            "knowledge_ingest",
+        ] {
+            assert!(names.contains(&name), "{name} must be offered offline");
+        }
+        // The old unified Python `knowledge` tool is gone.
+        assert!(!names.contains(&"knowledge"));
+    }
+
+    #[test]
+    fn mesh_health_is_a_read_only_command_tool() {
+        // Ported from the retired Python mesh.py — mesh is spine, so it lives in
+        // Rust. Read-only health check that execs `prism mesh health`.
+        assert!(is_command_tool("mesh_health"));
+        let spec = spec_by_name("mesh_health").expect("mesh_health spec exists");
+        assert!(
+            matches!(spec.permission_mode, PermissionMode::ReadOnly),
+            "mesh_health is read-only"
         );
+        assert!(
+            !spec.requires_approval,
+            "a health check must not be approval-gated"
+        );
+        let preview = command_tool_preview("mesh_health", &json!({})).expect("preview renders");
+        assert_eq!(preview, "prism mesh health");
+    }
+
+    #[test]
+    fn compute_broker_lives_in_rust_command_tools() {
+        // Ported from the retired Python compute.py (which needed an uninstalled
+        // `marc27` SDK). Compute dispatch is spine → Rust command-tools calling
+        // `prism compute …`. Reads are safe; submit is money-spending → approval.
+        assert!(is_command_tool("compute_gpus"));
+        assert!(is_command_tool("compute_submit"));
+
+        let submit = spec_by_name("compute_submit").expect("compute_submit spec exists");
+        assert!(
+            matches!(submit.permission_mode, PermissionMode::FullAccess),
+            "compute_submit spends real money"
+        );
+        assert!(
+            submit.requires_approval,
+            "a billable job dispatch must be approval-gated"
+        );
+
+        let status = spec_by_name("compute_status").expect("compute_status spec exists");
+        assert!(
+            matches!(status.permission_mode, PermissionMode::ReadOnly),
+            "compute_status is a read-only poll"
+        );
+        assert!(!status.requires_approval);
+
+        assert_eq!(
+            command_tool_preview("compute_gpus", &json!({})).expect("preview renders"),
+            "prism compute gpus"
+        );
+        assert_eq!(
+            command_tool_preview("compute_status", &json!({ "job_id": "job_123" }))
+                .expect("preview renders"),
+            "prism compute status job_123"
+        );
+        let submit_preview =
+            command_tool_preview("compute_submit", &json!({ "image": "vasp:6.5.0", "inputs": {} }))
+                .expect("preview renders");
+        assert!(
+            submit_preview.starts_with("prism compute submit --image vasp:6.5.0 --inputs"),
+            "got: {submit_preview}"
+        );
+    }
+
+    #[test]
+    fn knowledge_plane_lives_in_rust_command_tools() {
+        // Ported from the retired Python knowledge.py (which drove a thin
+        // `_platform_client` and needed the `marc27` SDK for some paths).
+        // entity/paths/corpora are read-only graph/catalog lookups; ingest is
+        // an async platform write. search/semantic live under query_platform;
+        // graph stats under `ingest --status`; promote_artifact was dropped.
+        assert!(is_command_tool("knowledge_entity"));
+        assert!(is_command_tool("knowledge_paths"));
+        assert!(is_command_tool("knowledge_corpora"));
+        assert!(is_command_tool("knowledge_ingest"));
+
+        let entity = spec_by_name("knowledge_entity").expect("knowledge_entity spec exists");
+        assert!(matches!(entity.permission_mode, PermissionMode::ReadOnly));
+        assert!(!entity.requires_approval);
+
+        assert_eq!(
+            command_tool_preview("knowledge_entity", &json!({ "name": "Ti-6Al-4V" }))
+                .expect("preview renders"),
+            "prism knowledge entity Ti-6Al-4V"
+        );
+        assert_eq!(
+            command_tool_preview(
+                "knowledge_paths",
+                &json!({ "from_entity": "TiAl", "to_entity": "aerospace", "max_hops": 4 })
+            )
+            .expect("preview renders"),
+            "prism knowledge paths TiAl aerospace --max-hops 4"
+        );
+        assert_eq!(
+            command_tool_preview("knowledge_corpora", &json!({ "domain": "materials" }))
+                .expect("preview renders"),
+            "prism knowledge corpora --domain materials"
+        );
+        assert_eq!(
+            command_tool_preview("knowledge_ingest", &json!({ "url": "https://example.com/x" }))
+                .expect("preview renders"),
+            "prism knowledge ingest --url https://example.com/x"
+        );
+
+        // ingest with neither url nor query is a hard error (exec bails →
+        // preview is None), not a silent no-op.
+        assert!(command_tool_preview("knowledge_ingest", &json!({})).is_none());
     }
 
     #[test]

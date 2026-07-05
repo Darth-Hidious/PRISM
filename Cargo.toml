@@ -190,30 +190,3 @@ turso = "0.7.0-pre.10"
 # match the rest of the workspace; image models excluded — text-only.
 fastembed = { version = "5.17", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 
-# ─────────────────────────────────────────────────────────────────────
-# Internal crates — forge_* are Apache-2.0 (vendored from tailcallhq/forgecode)
-# ─────────────────────────────────────────────────────────────────────
-forge_embed = { path = "crates/forge_embed" }
-forge_api = { path = "crates/forge_api" }
-forge_app = { path = "crates/forge_app" }
-forge_display = { path = "crates/forge_display" }
-forge_domain = { path = "crates/forge_domain" }
-forge_fs = { path = "crates/forge_fs" }
-forge_infra = { path = "crates/forge_infra" }
-forge_repo = { path = "crates/forge_repo" }
-forge_main = { path = "crates/forge_main" }
-forge_services = { path = "crates/forge_services" }
-forge_snaps = { path = "crates/forge_snaps" }
-forge_spinner = { path = "crates/forge_spinner" }
-forge_stream = { path = "crates/forge_stream" }
-forge_template = { path = "crates/forge_template" }
-forge_tool_macros = { path = "crates/forge_tool_macros" }
-forge_tracker = { path = "crates/forge_tracker" }
-forge_walker = { path = "crates/forge_walker" }
-forge_json_repair = { path = "crates/forge_json_repair" }
-forge_select = { path = "crates/forge_select" }
-forge_test_kit = { path = "crates/forge_test_kit" }
-forge_markdown_stream = { path = "crates/forge_markdown_stream" }
-forge_config = { path = "crates/forge_config" }
-forge_eventsource = { path = "crates/forge_eventsource" }
-forge_eventsource_stream = { path = "crates/forge_eventsource_stream" }

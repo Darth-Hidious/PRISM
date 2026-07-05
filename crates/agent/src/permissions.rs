@@ -207,6 +207,14 @@ impl PermissionOverrides {
         self.deny_names.insert(lowered);
     }
 
+    /// Session-wide "approve everything from here on" — the user's `Allow All`
+    /// / `allow-session` choice. Inserts the `"*"` wildcard, mirroring the same
+    /// convention in `ToolPermissionContext::auto_approves`. Does NOT clear
+    /// explicit denials: a blocked tool stays blocked.
+    pub fn allow_all(&mut self) {
+        self.allow_names.insert("*".to_string());
+    }
+
     pub fn clear(&mut self, tool_name: &str) {
         let lowered = tool_name.to_ascii_lowercase();
         self.allow_names.remove(&lowered);
@@ -228,7 +236,8 @@ impl PermissionOverrides {
 
     #[must_use]
     pub fn is_allowed(&self, tool_name: &str) -> bool {
-        self.allow_names.contains(&tool_name.to_ascii_lowercase())
+        self.allow_names.contains("*")
+            || self.allow_names.contains(&tool_name.to_ascii_lowercase())
     }
 
     #[must_use]
@@ -411,6 +420,35 @@ mod tests {
         // 54 read-only + 22 workspace-write + 18 full-access = 94
         let perms = tool_permissions();
         assert_eq!(perms.len(), 94);
+    }
+
+    #[test]
+    fn allow_all_auto_approves_every_tool() {
+        // "Allow All" / allow-session: after allow_all(), decision_for() must
+        // report auto_approved for an arbitrary tool the user never named —
+        // this is what makes the AllowAll approval actually stick instead of
+        // silently degrading to "Allow Once".
+        let ctx = ToolPermissionContext::default();
+        let mut overrides = PermissionOverrides::default();
+        assert!(!ctx.decision_for("execute_bash", Some(&overrides)).auto_approved);
+        overrides.allow_all();
+        assert!(overrides.is_allowed("execute_bash"));
+        assert!(overrides.is_allowed("some_tool_never_seen"));
+        assert!(
+            ctx.decision_for("execute_bash", Some(&overrides))
+                .auto_approved
+        );
+    }
+
+    #[test]
+    fn allow_all_does_not_unblock_denied_tools() {
+        // Auto-approve must never override an explicit block: allow_all() means
+        // "stop prompting me", not "run things I forbade".
+        let ctx = ToolPermissionContext::default().with_deny(&["execute_python".to_string()], &[]);
+        let mut overrides = PermissionOverrides::default();
+        overrides.allow_all();
+        let decision = ctx.decision_for("execute_python", Some(&overrides));
+        assert!(decision.blocked);
     }
 
     #[test]

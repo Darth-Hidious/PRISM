@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use prism_embed::EmbedBackend;
 use prism_ingest::llm::{ChatMessage, LlmClient, ToolDefinition};
 use prism_python_bridge::tool_server::ToolServerHandle;
 use serde_json::Value;
@@ -61,11 +62,19 @@ fn process_large_result(content: &str, result_store: &mut HashMap<String, String
     }
     let result_id = uuid_hex8();
     result_store.insert(result_id.clone(), content.to_string());
-    let end = content.len().min(2000);
+    // A 2000-char cliff made every oversized result look identical to the
+    // agent (same first entries regardless of query) — keep enough of the
+    // payload to be distinguishing, and say exactly how much was dropped.
+    let mut end = content.len().min(8_000);
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
     let truncated = &content[..end];
+    let total = content.len();
     format!(
-        "{truncated}\n\n[Result truncated to {end} chars — earlier tool outputs are in \
-         durable memory; call recall(query=\"<keywords>\") to pull the full result back.]"
+        "{truncated}\n\n[Showing first {end} of {total} chars — the FULL result is in \
+         durable memory; call recall(query=\"<keywords>\") to pull the rest back. \
+         Refine the query or lower max_results for a result that fits whole.]"
     )
 }
 
@@ -367,6 +376,156 @@ pub(crate) fn compact_history(history: &mut Vec<ChatMessage>, summary: &str, kee
 
 // ── Main turn loop ────────────────────────────────────────────────
 
+/// Bias tool routing toward the CURRENT step, not just the turn's opening
+/// message: the original intent plus a clip of the last couple of messages
+/// (the model's latest reasoning / tool results). Lets the working set follow
+/// the task as it evolves instead of freezing on iteration 0.
+fn routing_query(user_message: &str, history: &[ChatMessage]) -> String {
+    let mut q = String::from(user_message);
+    for msg in history.iter().rev().take(2) {
+        if let Some(content) = &msg.content {
+            let clip: String = content.chars().take(200).collect();
+            q.push(' ');
+            q.push_str(&clip);
+        }
+    }
+    q
+}
+
+/// Assemble the tool list for one LLM request: the top-K tools relevant to
+/// `route`, the always-on meta-tools (recall + find_tools), and every tool the
+/// model has pinned via find_tools this turn — with FULL definitions so a
+/// discovered tool is actually callable. (find_tools previously returned
+/// name-only, so "call one by name" silently failed.)
+/// Given base capability names (priority order), produce the request tool list:
+/// base defs + always-on meta-tools (recall + find_tools) + pinned tools,
+/// deduped. Shared by the keyword and neural selection paths so the meta/pinned
+/// contract is identical either way.
+fn finalize_tools(
+    catalog: &ToolCatalog,
+    selected: &[String],
+    pinned: &std::collections::HashSet<String>,
+) -> Vec<ToolDefinition> {
+    let mut defs = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in selected {
+        // Meta-tool names (e.g. `recall`) are executed by the native meta-tool
+        // layer, which intercepts BEFORE the Python dispatch. If the Python
+        // catalog also defines one, its schema/description would be OFFERED
+        // while the meta-tool actually RUNS — a description/execution mismatch.
+        // Let the meta-tool loop below own these names so what's offered matches
+        // what runs (dedups the shadowed catalog copy, e.g. the artifact-store
+        // `recall` vs the provenance-store meta-tool `recall`).
+        if crate::meta_tools::is_meta_tool(name) {
+            continue;
+        }
+        if seen.insert(name.clone())
+            && let Some(tool) = catalog.find(name)
+        {
+            defs.push(tool.to_definition());
+        }
+    }
+    for def in crate::meta_tools::definitions()
+        .iter()
+        .map(|t| t.to_definition())
+    {
+        if seen.insert(def.function.name.clone()) {
+            defs.push(def);
+        }
+    }
+    for name in pinned {
+        if !seen.contains(name)
+            && let Some(tool) = catalog.find(name)
+        {
+            seen.insert(name.clone());
+            defs.push(tool.to_definition());
+        }
+    }
+    defs
+}
+
+/// Keyword selection (fallback path): top-K by keyword match on `route`, then
+/// meta-tools + pinned.
+fn assemble_request_tools(
+    catalog: &ToolCatalog,
+    route: &str,
+    pinned: &std::collections::HashSet<String>,
+    top_k: usize,
+) -> Vec<ToolDefinition> {
+    let selected: Vec<String> = catalog
+        .definitions_for_query(route, top_k)
+        .into_iter()
+        .map(|d| d.function.name)
+        .collect();
+    finalize_tools(catalog, &selected, pinned)
+}
+
+/// Neural selection (`PRISM_NEURAL_TOOLS`): embedding retrieval over the
+/// capability index for the top-K relevant to `route`, then meta-tools +
+/// pinned. Falls back to keyword selection when retrieval yields nothing (no
+/// embeddings ready / backend error) — so it can never do worse than today.
+async fn assemble_request_tools_neural(
+    catalog: &ToolCatalog,
+    route: &str,
+    pinned: &std::collections::HashSet<String>,
+    top_k: usize,
+    backend: &dyn EmbedBackend,
+) -> Vec<ToolDefinition> {
+    let entries: Vec<(String, String)> = catalog
+        .iter()
+        .map(|t| (t.name.clone(), format!("{}: {}", t.name, t.description)))
+        .collect();
+    let index = crate::capability::global_index(entries, backend).await;
+    let selected = index.retrieve(route, top_k, backend).await;
+    if selected.is_empty() {
+        tracing::debug!(
+            "tool selection: neural retrieval empty (embeddings not ready) — keyword fallback"
+        );
+        return assemble_request_tools(catalog, route, pinned, top_k);
+    }
+    tracing::debug!(
+        retrieved = selected.len(),
+        "tool selection: neural embedding retrieval used"
+    );
+    finalize_tools(catalog, &selected, pinned)
+}
+
+/// Whether neural (embedding) tool selection is enabled. **ON by default**; set
+/// `PRISM_NEURAL_TOOLS=0` / `false` / `off` to force the legacy keyword path.
+/// Safe either way: on a cold turn (backend still warming) or when no embed
+/// backend is available at all, neural selection falls back to keyword
+/// automatically, so default-on can never do worse than the keyword path.
+fn neural_tools_enabled() -> bool {
+    match std::env::var("PRISM_NEURAL_TOOLS") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
+}
+
+/// `(name, "name: description")` entries for the neural index / L1 menu.
+fn catalog_entries(catalog: &ToolCatalog) -> Vec<(String, String)> {
+    catalog
+        .iter()
+        .map(|t| (t.name.clone(), format!("{}: {}", t.name, t.description)))
+        .collect()
+}
+
+/// Warm the neural stack in the BACKGROUND (never on the turn path): load the
+/// embed model if needed, then build+embed the capability index. Both are
+/// process-global caches, so this is a no-op once warm; the whole-catalog embed
+/// (seconds on CPU) therefore never stalls a turn — the turn serves keyword
+/// until the index is ready, then flips to neural.
+fn spawn_neural_warm(entries: Vec<(String, String)>) {
+    tokio::spawn(async move {
+        if let Some(backend) = crate::embeddings::backend().await {
+            let _ = crate::capability::global_index(entries, backend.as_ref()).await;
+        }
+    });
+}
+
 /// Run a single conversational turn through the full TAOR pipeline.
 ///
 /// Flow:
@@ -413,6 +572,10 @@ pub async fn run_turn(
     let mut recent_sigs: VecDeque<String> = VecDeque::with_capacity(DOOM_LOOP_WINDOW + 1);
     // Track consecutive empty results per tool name
     let mut empty_result_streak: HashMap<String, usize> = HashMap::new();
+    // Tools the model discovered via find_tools this turn — pinned so their
+    // FULL definitions stay in the request every later iteration. Without this,
+    // find_tools returned names the model could never actually call.
+    let mut pinned_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // ── 2. TAOR iteration loop ────────────────────────────────────
     for iteration in 0..config.max_iterations {
@@ -436,37 +599,105 @@ pub async fn run_turn(
             return Ok(());
         }
 
-        // ── 2b. Build messages ────────────────────────────────────
+        // ── 2b. Tool selection ────────────────────────────────────
+        // Filter to top-K relevant tools to avoid "tool stuffing" (all tool
+        // definitions = tens of thousands of tokens every turn). Route from the
+        // CURRENT step (not just the opening message) and fold in tools pinned
+        // via find_tools, so discovery makes tools actually callable and the
+        // working set follows the task. Done before message assembly so the L1
+        // capability menu can reflect what's already callable.
+        let route = routing_query(user_message, history);
+        // Neural selection needs BOTH the embed model and the embedded capability
+        // index warm. Building that index embeds the whole catalog (seconds on
+        // CPU), so we NEVER build it on the turn path: if it isn't ready we kick a
+        // one-time background warm (model → index) and serve the fast keyword path
+        // this turn. Neural then engages a turn or two later with no stall.
+        let relevant_tools = if neural_tools_enabled() {
+            let entries = catalog_entries(tool_catalog);
+            match crate::capability::global_index_if_ready(&entries)
+                .and(crate::embeddings::backend_if_ready())
+            {
+                Some(backend) => {
+                    tracing::debug!("tool selection: neural path (model + index ready)");
+                    assemble_request_tools_neural(
+                        tool_catalog,
+                        &route,
+                        &pinned_tools,
+                        crate::tool_catalog::MAX_TOOLS_PER_REQUEST,
+                        backend.as_ref(),
+                    )
+                    .await
+                }
+                None => {
+                    tracing::debug!(
+                        "tool selection: keyword path (neural model/index warming in background)"
+                    );
+                    spawn_neural_warm(entries);
+                    assemble_request_tools(
+                        tool_catalog,
+                        &route,
+                        &pinned_tools,
+                        crate::tool_catalog::MAX_TOOLS_PER_REQUEST,
+                    )
+                }
+            }
+        } else {
+            assemble_request_tools(
+                tool_catalog,
+                &route,
+                &pinned_tools,
+                crate::tool_catalog::MAX_TOOLS_PER_REQUEST,
+            )
+        };
+        tracing::debug!(
+            total_tools = tool_catalog.len(),
+            selected_tools = relevant_tools.len(),
+            "tool selection for LLM call"
+        );
+
+        // ── 2c. Build messages ────────────────────────────────────
+        // L1 progressive disclosure (neural mode only): a compact metadata menu
+        // of capabilities beyond the callable top-K, so the model is AWARE of
+        // the wider catalog without paying the full-schema token cost. Off by
+        // default → messages are byte-identical to before.
+        let capability_menu = if neural_tools_enabled() {
+            let included: std::collections::HashSet<String> = relevant_tools
+                .iter()
+                .map(|d| d.function.name.clone())
+                .collect();
+            let entries = catalog_entries(tool_catalog);
+            crate::capability::capability_menu(&entries, &included, 150, 80)
+        } else {
+            None
+        };
+
         let mut messages = vec![ChatMessage {
             role: "system".to_string(),
             content: Some(config.system_prompt.clone()),
             tool_calls: None,
             tool_call_id: None,
         }];
+        if let Some(menu) = &capability_menu {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(menu.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        // Progressive disclosure for the agent's OWN authored skills (P3 slice b):
+        // surfaced every turn (independent of the neural flag) with the correct
+        // `run_skill` call instruction, so a skill written earlier stays visible
+        // without the model having to call list_skills. None when none exist.
+        if let Some(skills_menu) = crate::skills::skills_menu(50) {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(skills_menu),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
         messages.extend(history.iter().cloned());
-
-        // ── 2c. Call LLM ─────────────────────────────────────────
-        // Tool selection: filter to top-K relevant tools based on the
-        // latest user message to avoid "tool stuffing" (sending all 99
-        // tool definitions = 21K tokens every turn). On iteration 0 we
-        // use the user's message; on later iterations the LLM may be
-        // calling tools based on prior results, so we include the tools
-        // it has already called plus top-K for the original query.
-        let mut relevant_tools = tool_catalog
-            .definitions_for_query(user_message, crate::tool_catalog::MAX_TOOLS_PER_REQUEST);
-        // Always offer the native meta-tools (recall + find_tools) so the model
-        // can pull earlier results back from durable memory and discover tools
-        // beyond the top-K selection.
-        relevant_tools.extend(
-            crate::meta_tools::definitions()
-                .iter()
-                .map(|t| t.to_definition()),
-        );
-        tracing::debug!(
-            total_tools = tool_catalog.len(),
-            selected_tools = relevant_tools.len(),
-            "tool selection for LLM call"
-        );
 
         // Stream tokens incrementally — collect deltas from the
         // streaming callback and emit them after the call completes.
@@ -774,8 +1005,15 @@ pub async fn run_turn(
                             // Proceed with this tool call
                         }
                         Some(ApprovalResponse::AllowAll) => {
-                            // Switch to auto-approve for rest of session
-                            // (handled by not entering this branch again)
+                            // Approve this call AND auto-approve every later one
+                            // for the rest of the session. Persist into the
+                            // shared session overrides so the gate at the top of
+                            // this loop skips future prompts (survives across
+                            // turns; explicit denials are left untouched). Before
+                            // this, "Allow All" silently behaved like "Allow Once".
+                            if let Some(overrides) = live_permission_overrides.as_ref() {
+                                overrides.write().await.allow_all();
+                            }
                         }
                         Some(ApprovalResponse::Deny) | None => {
                             let denied_msg = format!("Tool '{tool_name}' denied by user.");
@@ -839,6 +1077,23 @@ pub async fn run_turn(
                     .await
                     .map_err(Into::into)
             };
+
+            // Auto-pin tools surfaced by find_tools so their full definitions
+            // become callable next iteration (the "now available" hint used to
+            // be false — names came back but were never wired into the request).
+            if tool_name == "find_tools"
+                && let Ok(v) = &result
+                && let Some(matches) = v
+                    .get("result")
+                    .and_then(|r| r.get("matches"))
+                    .and_then(|m| m.as_array())
+            {
+                for m in matches {
+                    if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                        pinned_tools.insert(name.to_string());
+                    }
+                }
+            }
             let elapsed_ms = start.elapsed().as_millis() as u64;
 
             let (raw_content, is_error): (String, bool) = match result {
@@ -1008,6 +1263,280 @@ pub fn tools_to_definitions(tools_json: &serde_json::Value) -> Vec<ToolDefinitio
 mod tests {
     use super::*;
 
+    fn tool_json(name: &str, desc: &str) -> serde_json::Value {
+        serde_json::json!({ "name": name, "description": desc, "input_schema": { "type": "object" } })
+    }
+
+    #[test]
+    fn assemble_pins_discovered_tool_even_when_keywords_miss() {
+        let catalog = crate::tool_catalog::ToolCatalog::from_tool_server_json(&serde_json::json!({
+            "tools": [
+                tool_json("mace_compute_elastic", "predict the elastic tensor of a structure"),
+                tool_json("knowledge", "search the knowledge graph"),
+                tool_json("web", "search the open web"),
+            ]
+        }));
+        let mut pinned = std::collections::HashSet::new();
+        pinned.insert("mace_compute_elastic".to_string());
+        // top_k=2 < 3 tools forces keyword filtering; the query matches none.
+        let defs = assemble_request_tools(&catalog, "hello there friend", &pinned, 2);
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(
+            names.contains(&"mace_compute_elastic"),
+            "pinned tool must be callable even with no keyword match: {names:?}"
+        );
+        assert!(
+            names.contains(&"find_tools"),
+            "meta-tool must always be present: {names:?}"
+        );
+    }
+
+    #[test]
+    fn assemble_does_not_duplicate_pinned_and_selected() {
+        let catalog = crate::tool_catalog::ToolCatalog::from_tool_server_json(&serde_json::json!({
+            "tools": [ tool_json("web", "search the open web") ]
+        }));
+        let mut pinned = std::collections::HashSet::new();
+        pinned.insert("web".to_string());
+        let defs = assemble_request_tools(&catalog, "web search", &pinned, 15);
+        assert_eq!(
+            defs.iter().filter(|d| d.function.name == "web").count(),
+            1,
+            "a pinned+selected tool must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn finalize_prefers_meta_tool_over_colliding_catalog_name() {
+        // The Python catalog also ships a `recall` (the artifact-store tool), but
+        // the native meta-tool `recall` (provenance store) is what actually
+        // executes via the intercept. The OFFERED definition must therefore be
+        // the meta-tool's, not the shadowed catalog copy.
+        let catalog = crate::tool_catalog::ToolCatalog::from_tool_server_json(&serde_json::json!({
+            "tools": [ tool_json("recall", "PYTHON ARTIFACT STORE recall — shadowed at runtime") ]
+        }));
+        let pinned = std::collections::HashSet::new();
+        let defs = finalize_tools(&catalog, &["recall".to_string()], &pinned);
+        let recall = defs
+            .iter()
+            .find(|d| d.function.name == "recall")
+            .expect("recall must be offered");
+        assert!(
+            !recall
+                .function
+                .description
+                .contains("PYTHON ARTIFACT STORE"),
+            "the shadowed catalog recall must not be the offered definition"
+        );
+        assert!(
+            recall.function.description.contains("durable memory"),
+            "offered recall must match the executed meta-tool: {}",
+            recall.function.description
+        );
+        assert_eq!(
+            defs.iter().filter(|d| d.function.name == "recall").count(),
+            1,
+            "recall must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn routing_query_folds_in_recent_step() {
+        let history = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some("find alloys".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("now compute the elastic tensor".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let q = routing_query("find alloys", &history);
+        assert!(q.contains("find alloys"));
+        assert!(
+            q.contains("elastic"),
+            "recent step context must bias routing: {q}"
+        );
+    }
+
+    struct KwEmbed;
+
+    #[async_trait::async_trait]
+    impl EmbedBackend for KwEmbed {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let t = t.to_lowercase();
+                    let elastic = f32::from(t.contains("elastic") || t.contains("stiffness"));
+                    let web = f32::from(t.contains("web") || t.contains("online"));
+                    vec![elastic, web]
+                })
+                .collect())
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn id(&self) -> &str {
+            "test:kw-embed"
+        }
+    }
+
+    #[tokio::test]
+    async fn neural_assemble_retrieves_semantically_relevant_tool() {
+        let catalog = crate::tool_catalog::ToolCatalog::from_tool_server_json(&serde_json::json!({
+            "tools": [
+                tool_json("mace_compute_elastic", "predict the elastic stiffness tensor"),
+                tool_json("web", "search the web online"),
+                tool_json("analyze_phases", "calphad phase equilibrium check"),
+            ]
+        }));
+        let pinned = std::collections::HashSet::new();
+        let backend = KwEmbed;
+        // "stiffness" shares no substring with the elastic tool's name; only the
+        // neural path can surface it. Args: (catalog, route, pinned, top_k, backend).
+        let defs =
+            assemble_request_tools_neural(&catalog, "compute the stiffness", &pinned, 1, &backend)
+                .await;
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(
+            names.contains(&"mace_compute_elastic"),
+            "neural retrieval should surface the elastic tool: {names:?}"
+        );
+        assert!(
+            names.contains(&"find_tools"),
+            "meta-tools must still be present: {names:?}"
+        );
+    }
+
+    /// Live-verify the WIRED tool-selection path (P1 neural selection + P2 L1
+    /// menu) against the REAL local ONNX embedder, in the regime that actually
+    /// bites: a catalog larger than `MAX_TOOLS_PER_REQUEST`. With <=15 tools both
+    /// paths return everything, so the fix is invisible; the "200 tools, agent
+    /// calls 5" bug only exists when filtering kicks in.
+    ///
+    /// Construction: one needle whose *name/description* is semantically about
+    /// mechanical stiffness ("elastic_stiffness_probe"), and a paraphrase route
+    /// ("rigidity ... resistance to bending under load") that shares NO literal
+    /// token with the needle's name or description — so the keyword scorer gives
+    /// it 0 and drops it even with a 15-slot budget, while neural ranks it top-3
+    /// out of 20. Names are suffixed `_wv` so this test's name-set is unique and
+    /// `global_index`'s process-global cache can't hand back another test's
+    /// (stub-embedded) index.
+    ///
+    /// Ignored by default (needs the ~128 MB model). Run with:
+    ///   `cargo test -p prism-agent --lib -- --ignored real_backend_wired`
+    #[tokio::test]
+    #[ignore = "requires the local ONNX embed model; run with --ignored"]
+    async fn real_backend_wired_selection_drops_from_keyword_survives_neural() {
+        let needle = "elastic_stiffness_probe_wv";
+        let mut tools = vec![tool_json(
+            needle,
+            "predict how a crystalline solid resists being squeezed or sheared",
+        )];
+        // 19 fillers in far-off domains; unique `_wv` names.
+        for (n, d) in [
+            ("web_fetch_wv", "search the open web and fetch a page"),
+            ("send_email_wv", "compose and send an email message"),
+            (
+                "calendar_create_wv",
+                "create a calendar event with attendees",
+            ),
+            (
+                "currency_convert_wv",
+                "convert an amount between world currencies",
+            ),
+            (
+                "weather_lookup_wv",
+                "get the current weather forecast for a city",
+            ),
+            ("flight_booking_wv", "find and book airline flights"),
+            ("pdf_merge_wv", "merge several pdf documents into one file"),
+            (
+                "image_resize_wv",
+                "resize and crop an image to given dimensions",
+            ),
+            ("sql_query_wv", "run a read-only sql query on a database"),
+            ("git_blame_wv", "show git blame history for a source file"),
+            ("dns_lookup_wv", "resolve dns records for a hostname"),
+            (
+                "timezone_convert_wv",
+                "convert a timestamp between time zones",
+            ),
+            ("qr_generate_wv", "generate a qr code for a url"),
+            (
+                "markdown_lint_wv",
+                "lint a markdown document for style issues",
+            ),
+            ("uuid_generate_wv", "generate a random unique identifier"),
+            ("base64_encode_wv", "encode or decode base64 text"),
+            (
+                "translate_text_wv",
+                "translate text between human languages",
+            ),
+            ("spellcheck_wv", "check spelling and grammar in a paragraph"),
+            ("color_palette_wv", "suggest a color palette for a design"),
+        ] {
+            tools.push(tool_json(n, d));
+        }
+        let catalog = crate::tool_catalog::ToolCatalog::from_tool_server_json(
+            &serde_json::json!({ "tools": tools }),
+        );
+        assert!(
+            catalog.len() > crate::tool_catalog::MAX_TOOLS_PER_REQUEST,
+            "catalog must exceed the per-request cap for filtering to engage"
+        );
+
+        let backend = prism_embed::NativeOnnx::new().expect("load local embed model");
+        let pinned = std::collections::HashSet::new();
+        let route = routing_query(
+            "quantify the material's rigidity and its resistance to bending under load",
+            &[],
+        );
+
+        // Keyword path, generous 15-slot budget: the needle shares no token with
+        // the route, scores 0, and is dropped.
+        let kw = assemble_request_tools(&catalog, &route, &pinned, 15);
+        let kw_names: Vec<&str> = kw.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(
+            !kw_names.contains(&needle),
+            "keyword filtering must DROP the paraphrase-only needle even with 15 slots: {kw_names:?}"
+        );
+
+        // Neural path, tight top-3: the needle is a top-3 semantic pick out of 20.
+        let neural = assemble_request_tools_neural(&catalog, &route, &pinned, 3, &backend).await;
+        let neural_names: Vec<&str> = neural.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(
+            neural_names.contains(&needle),
+            "neural retrieval must SURFACE the needle in its top-3: {neural_names:?}"
+        );
+
+        // P2 menu: given the neural-callable set, the L1 menu advertises the
+        // excluded capabilities (so the model is AWARE), and does NOT re-list the
+        // already-callable needle.
+        let included: std::collections::HashSet<String> =
+            neural.iter().map(|d| d.function.name.clone()).collect();
+        let entries: Vec<(String, String)> = catalog
+            .iter()
+            .map(|t| (t.name.clone(), format!("{}: {}", t.name, t.description)))
+            .collect();
+        let menu = crate::capability::capability_menu(&entries, &included, 150, 80)
+            .expect("menu must advertise the excluded capabilities");
+        assert!(
+            menu.contains("currency_convert_wv"),
+            "L1 menu must advertise an excluded capability: {menu}"
+        );
+        assert!(
+            !menu.contains(needle),
+            "the callable needle must not be re-advertised in the menu"
+        );
+    }
+
     #[test]
     fn tool_preview_covers_web_and_meta_tools() {
         let p = |name: &str, args: serde_json::Value| tool_preview(name, &args);
@@ -1073,7 +1602,7 @@ mod tests {
         let mut store = HashMap::new();
         let content = "x".repeat(40_000);
         let result = process_large_result(&content, &mut store);
-        assert!(result.contains("[Result truncated"));
+        assert!(result.contains("[Showing first 8000 of 40000 chars"));
         assert!(result.contains("recall"));
         assert_eq!(store.len(), 1);
         // Stored value is the full content

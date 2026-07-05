@@ -24,15 +24,14 @@ def build_full_registry(
     from app.tools.property_selection import create_property_selection_tools
     from app.tools.code import create_code_tools
     from app.tools.bash import create_bash_tools
-    from app.tools.capabilities import create_capabilities_tools
     from app.tools.dataset import create_dataset_tool
     from app.tools.platform_status import create_platform_status_tools
     from app.tools.agent_capabilities import create_agent_capabilities_tool
+    from app.tools.knowledge_search import create_knowledge_search_tool
     from app.tools.knowledge_write import create_knowledge_write_tool
     from app.tools.platform_jobs import create_platform_jobs_tools
     from app.tools.platform_workflows import create_platform_workflows_tools
     from app.tools.mcp_services import create_mcp_services_tools
-    from app.tools.mesh import create_mesh_tools
 
     registry = ToolRegistry()
     create_system_tools(registry)
@@ -43,13 +42,21 @@ def build_full_registry(
     create_property_selection_tools(registry)
     create_code_tools(registry)
     create_bash_tools(registry)
-    create_capabilities_tools(registry)
+    # NOTE: the old `discover_capabilities` aggregator (app/tools/capabilities.py)
+    # was retired 2026-07-04 — dead (needed the uninstalled `marc27` SDK) and
+    # redundant: its reads are covered by `agent_capabilities` (/agent/capabilities),
+    # `models_list`, `prism ingest --status` (graph stats), and the platform-status tools below.
     # Platform-status tools (policy/usage/billing reads). Closes three
     # GAP-HIGH endpoints from the v2.7.2 endpoint-coverage audit. All
     # three are read-only — no approval gate.
     create_platform_status_tools(registry)
     # Self-discovery: GET /agent/capabilities. Read-only.
     create_agent_capabilities_tool(registry)
+    # Knowledge graph READ side (semantic corpus search / graph entities /
+    # recall) — the platform's own corpora (NASA propulsion, MatKG, alloy
+    # datasheets, …) answered by meaning. Read-only, no approval gate. The
+    # old research.py read tool was lost in a refactor; this restores it.
+    create_knowledge_search_tool(registry)
     # Knowledge graph WRITE side (embed/seed/ingest/research-web-search).
     # Closes the read/write asymmetry. Approval-gated as a single tool.
     create_knowledge_write_tool(registry)
@@ -62,9 +69,6 @@ def build_full_registry(
     # Platform-hosted MCP service discovery + invocation. Read in
     # `mcp_services`, proxy/scale state-changes in `mcp_services_invoke`.
     create_mcp_services_tools(registry)
-    # Mesh networking — peers, health, subscriptions (read) + publish,
-    # subscribe, unsubscribe (approval-gated cross-node operations).
-    create_mesh_tools(registry)
     # KAG-style tool reasoning — helps the agent plan tool sequences
     # before executing. Classifies intent, recommends tools, shows data flow.
     # Session context builder — running knowledge base that survives
@@ -119,23 +123,20 @@ def build_full_registry(
     except Exception:
         pass
 
-    # MARC27 Knowledge Plane tools (graph search, semantic search, ingest)
-    try:
-        from app.tools.knowledge import create_knowledge_tools
+    # Knowledge plane is SPINE and lives in Rust: `query_platform` (graph +
+    # semantic search), `knowledge_entity`/`knowledge_paths`/`knowledge_corpora`
+    # (graph/catalog reads) and `knowledge_ingest` (background extraction job)
+    # command-tools drive `prism query --platform` / `prism knowledge …` →
+    # /knowledge/*. The old Python `knowledge` tool drove a thin
+    # `_platform_client` (and needed the uninstalled `marc27` SDK for some
+    # paths); its `promote_artifact` action was dropped (the Rust recall store
+    # is a flat provenance ledger with no artifact abstraction to rebind to).
+    # Retired 2026-07-04. Graph stats: `prism ingest --status`.
 
-        create_knowledge_tools(registry)
-    except Exception:
-        pass
-
-    # MARC27 RLM Research tool — server-side recursive LLM that explores
-    # the knowledge graph + vector store + academic web. Real-money tool.
-    # See app/tools/research.py for the SSE protocol + cost notes.
-    try:
-        from app.tools.research import create_research_tools
-
-        create_research_tools(registry)
-    except Exception:
-        pass
+    # Research is SPINE and lives in Rust: the `research` / `research_query`
+    # command-tools drive marc27_core::research::engine via /agent-runs. The
+    # old Python `research` tool (POST /knowledge/research/query) hit the SAME
+    # backend engine — a redundant shadow — so it was retired (2026-07-04).
 
     # Background research runs — the platform's long-running agent
     # (/agent-runs, Nemotron via NVIDIA Build). The non-blocking sibling of
@@ -147,13 +148,11 @@ def build_full_registry(
     except Exception:
         pass
 
-    # MARC27 Compute Broker tools (GPU dispatch, job management)
-    try:
-        from app.tools.compute import create_compute_tools
-
-        create_compute_tools(registry)
-    except Exception:
-        pass
+    # Compute broker is SPINE and lives in Rust: the `compute_gpus`,
+    # `compute_providers`, `compute_estimate`, `compute_status`, `compute_cancel`
+    # and `compute_submit` command-tools drive `prism compute …` → /compute/*.
+    # The old Python `compute`/`compute_submit` tools needed an uninstalled
+    # `marc27` SDK (dead on this checkout) — retired 2026-07-04.
 
     # Premium labs tools (marketplace services)
     from app.tools.labs import create_labs_tools

@@ -1,0 +1,35 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+assertion_line: 106
+expression: rendered
+---
+ ‹ back  New session    0 tools    Ctrl-P · ?                      │ Workspace
+                                                                   │ [Activity] Tools Files
+                                                                   │
+          ┌ PRISM · materials research workspace ────────────────────────────────────────┐
+          │                                                                              │
+          │  WORKFLOWS                                                                   │
+          │     no live run list wired yet — talk to the agent to start one              │
+          │                                                                              │
+          │  TOOLS                                                                       │
+          │     loading tool catalog…                                                    │
+          │                                                                              │
+          │  NOTEBOOKS                                                                   │
+          │     not wired in-app yet — will be agent-watched + editable                  │
+          │                                                                              │
+          │  SYSTEMS                                                                     │
+          │   ● model  —   s status                                                      │
+          │   ● session cost  $0.0000   as of last checkpoint                            │
+          │     credits  not reported (unauthed / not fetched)                           │
+          │     compute · nodes · knowledge · ingestion — open via ⌘K                    │
+          │                                                                              │
+          │  ⏎ talk to the agent    t tools    s systems    ⌘K commands    ? keys        │
+          │                                                                              │
+          │                                                                              │
+          │                                                                              │
+┌ Prompt ─│                                                                              │
+│ Type a m│                                                                              │
+│         └──────────────────────────────────────────────────────────────────────────────┘
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: —   [INPUT]    Ctrl-C quit                         │

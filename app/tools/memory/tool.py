@@ -181,7 +181,7 @@ _RECALL_SCHEMA = {
             "type": "string",
             "description": (
                 "Optional: only return artifacts produced by this exact "
-                "tool name (e.g. 'materials_search', 'compute', 'knowledge')."
+                "tool name (e.g. 'materials_search', 'predict', 'research')."
             ),
         },
         "limit": {
@@ -233,7 +233,7 @@ _LIST_DESCRIPTION = (
     "List artifacts by metadata (tool, session, time) — non-semantic, "
     "ordered by creation time descending. Use when the user asks 'what "
     "have we done so far', 'show recent results', or to enumerate all "
-    "outputs from a specific tool. For semantic search use `recall` "
+    "outputs from a specific tool. For semantic search use `search_artifacts` "
     "instead. Default: current session, 20 most recent."
 )
 
@@ -250,7 +250,7 @@ _LIST_SCHEMA = {
         "tool": {
             "type": "string",
             "description": (
-                "Filter by tool name (e.g. 'compute', 'knowledge', "
+                "Filter by tool name (e.g. 'research', 'predict', "
                 "'materials_search')."
             ),
         },
@@ -282,7 +282,7 @@ def create_memory_tools(registry: ToolRegistry) -> None:
     infinite recursion.
     """
     registry.register(Tool(
-        name="recall",
+        name="search_artifacts",
         description=_RECALL_DESCRIPTION,
         input_schema=_RECALL_SCHEMA,
         func=_recall,

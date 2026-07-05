@@ -312,7 +312,7 @@ _WEB_DESCRIPTION = (
     "(if configured) or DuckDuckGo.\n"
     "Typical sequence: action='search' → pick the best URL → action='read' on "
     "that URL. NOT for scientific papers (use prior_art_search for better "
-    "metadata + DOIs) and NOT for the MARC27 KG (use knowledge(action='search'))."
+    "metadata + DOIs) and NOT for the MARC27 KG (use query_platform)."
 )
 
 

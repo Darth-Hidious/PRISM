@@ -68,6 +68,12 @@ enum KeyCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The dep tree enables both rustls providers (ring via workspace, aws-lc-rs
+    // via aws-smithy tls-rustls), so rustls cannot auto-select one — without
+    // this, the first lazy TLS init (e.g. the deployment HTTP client) panics
+    // and kills the whole daemon. Ignore the error: already installed is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
