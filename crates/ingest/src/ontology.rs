@@ -43,10 +43,36 @@ struct RawRelationship {
     from: String,
     rel: String,
     to: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_f64")]
     weight: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u32")]
     order: Option<u32>,
+}
+
+/// Accept a number, a numeric string ("3.5"), or anything else → None.
+///
+/// Alloy compositions routinely carry NON-numeric weights for the remainder
+/// element — "balance", "bal.", "trace" — and LLM extractors faithfully emit
+/// them (live failure: claude-sonnet-5 returned `weight: "balance"` for the
+/// Ni fraction of Inconel 718 and the strict f64 field failed the WHOLE
+/// document). One odd value must not sink an extraction.
+fn lenient_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    })
+}
+
+/// Same leniency for integer fields (e.g. `order: "2"`).
+fn lenient_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|x| u32::try_from(x).ok()),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    })
 }
 
 impl LlmOntologyConstructor {
@@ -511,6 +537,37 @@ mod tests {
         let parsed: ExtractionOutput = serde_json::from_str(json).unwrap();
         assert!(parsed.relationships[0].weight.is_none());
         assert!(parsed.relationships[0].order.is_none());
+    }
+
+    #[test]
+    fn extraction_output_tolerates_non_numeric_weight() {
+        // The live failure: composition remainders come back as "balance"
+        // (Ni-bal.) — a domain-correct string in a numeric slot. It must
+        // parse as None, not fail the whole document.
+        let json = r#"{
+            "entities": [],
+            "relationships": [
+                {"from": "IN718", "rel": "CONTAINS", "to": "Ni", "weight": "balance"},
+                {"from": "IN718", "rel": "CONTAINS", "to": "Cr", "weight": "19.0"},
+                {"from": "IN718", "rel": "CONTAINS", "to": "Nb", "weight": 5.1, "order": "2"}
+            ]
+        }"#;
+        let parsed: ExtractionOutput = serde_json::from_str(json).unwrap();
+        assert!(
+            parsed.relationships[0].weight.is_none(),
+            "\"balance\" → None"
+        );
+        assert_eq!(
+            parsed.relationships[1].weight,
+            Some(19.0),
+            "numeric string parses"
+        );
+        assert_eq!(parsed.relationships[2].weight, Some(5.1));
+        assert_eq!(
+            parsed.relationships[2].order,
+            Some(2),
+            "string order parses"
+        );
     }
 
     #[test]

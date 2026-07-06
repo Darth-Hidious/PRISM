@@ -402,6 +402,16 @@ impl LlmClient {
 
     /// Generate text and parse as JSON (uses response_format).
     pub async fn generate_json(&self, prompt: &str) -> Result<String> {
+        // MARC27 platform: this method used to skip the is_marc27() branch
+        // that chat()/chat_with_tools() have, so ingest ontology extraction
+        // against a platform URL hit `{base}/v1/chat/completions` → 404
+        // (the platform speaks `/stream`). The stream path has no
+        // response_format, so fenced output is tolerated instead.
+        if self.is_marc27() {
+            let msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
+            let text = self.chat_marc27_simple(&msgs).await?;
+            return Ok(Self::strip_json_fences(&text).to_string());
+        }
         let url = self.chat_completions_url();
         let body = serde_json::json!({
             "model": self.config.model,
@@ -415,6 +425,23 @@ impl LlmClient {
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
         Self::extract_json_content(&data["choices"][0])
+    }
+
+    /// Strip a Markdown code fence (```json … ``` or ``` … ```) from around
+    /// a JSON payload. Providers without a JSON response mode (the MARC27
+    /// `/stream` path) often fence their JSON; the parser downstream wants
+    /// the bare object. Text without a fence is returned unchanged.
+    fn strip_json_fences(text: &str) -> &str {
+        let trimmed = text.trim();
+        let Some(rest) = trimmed.strip_prefix("```") else {
+            return trimmed;
+        };
+        // Drop an optional language tag (e.g. `json`) up to the first newline.
+        let body = match rest.split_once('\n') {
+            Some((_lang, body)) => body,
+            None => rest,
+        };
+        body.strip_suffix("```").map_or(body, str::trim).trim()
     }
 
     /// Embed a single text string. Returns the embedding vector.
@@ -1759,6 +1786,27 @@ mod tests {
              QUICK_REFERENCE_TOOL_NAMES and build_tool_prompt_block.",
             missing,
             registered.iter().take(20).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn strip_json_fences_variants() {
+        // Fenced with language tag — the common Claude/marc27 shape.
+        assert_eq!(
+            LlmClient::strip_json_fences("```json\n{\"a\":1}\n```"),
+            "{\"a\":1}"
+        );
+        // Fenced without a tag.
+        assert_eq!(
+            LlmClient::strip_json_fences("```\n{\"a\":1}\n```"),
+            "{\"a\":1}"
+        );
+        // Bare JSON passes through untouched.
+        assert_eq!(LlmClient::strip_json_fences("  {\"a\":1} "), "{\"a\":1}");
+        // Unterminated fence: still yields the body rather than erroring.
+        assert_eq!(
+            LlmClient::strip_json_fences("```json\n{\"a\":1}"),
+            "{\"a\":1}"
         );
     }
 }
