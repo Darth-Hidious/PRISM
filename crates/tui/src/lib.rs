@@ -255,7 +255,7 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         }
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = handle_sigint as usize;
+            sa.sa_sigaction = handle_sigint as *const () as usize;
             sa.sa_flags = 0;
             libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
         }
