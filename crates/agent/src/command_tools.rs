@@ -72,6 +72,10 @@ enum CommandToolKind {
     ComputeCancel,
     ComputeSubmit,
     Predict,
+    GoalStart,
+    GoalStatus,
+    GoalList,
+    GoalResume,
     KnowledgeEntity,
     KnowledgePaths,
     KnowledgeCorpora,
@@ -528,6 +532,42 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &["run_model", "model_predict"],
         kind: CommandToolKind::Predict,
         description: "Run a marketplace model on the cloud in ONE call (BILLABLE): reuses a running deployment of the model or creates one (waits until ready), POSTs your inputs to it, returns the model's real result, and auto-stops anything it created. Discover models with `models_search`/`marketplace_search`. `model` = marketplace slug (e.g. 'mace-mh-1'); `task` e.g. 'single_point'|'relax'|'md'; `inputs` = the model's JSON inputs (e.g. {\"structure\": {...}}). Optional `node_id` pins a specific mesh node; default lets the platform pick.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "goal_start",
+        root: "campaign",
+        aliases: &["campaign_start", "start_goal"],
+        kind: CommandToolKind::GoalStart,
+        description: "Start a LONG-RUNNING research goal (discovery campaign): propose → evaluate → rank loops that keep working across turns (BILLABLE — LLM + compute per iteration). The goal becomes a durable object: checkpointed to disk, visible at GET /api/goals, resumable after restarts. Use for open-ended discovery ('find a W-Mo alloy with better creep resistance'), NOT for one-shot questions (use research/search tools for those). Set `budget_usd` to cap spend and `approval_gates` to pause for human sign-off at given iterations.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "goal_status",
+        root: "campaign",
+        aliases: &["campaign_status"],
+        kind: CommandToolKind::GoalStatus,
+        description: "Show a long-running goal's progress from its checkpoint: iteration, candidates evaluated, best-so-far, spend. Use goal_list to find ids.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "goal_list",
+        root: "campaign",
+        aliases: &["campaign_list", "list_goals"],
+        kind: CommandToolKind::GoalList,
+        description: "List all long-running goals (discovery campaigns) on this node with their ids and progress.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "goal_resume",
+        root: "campaign",
+        aliases: &["campaign_resume"],
+        kind: CommandToolKind::GoalResume,
+        description: "Resume a paused long-running goal from its checkpoint (BILLABLE — iterations continue spending). Goals pause at approval gates or on budget/iteration caps.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -1176,6 +1216,34 @@ fn compute_submit_schema() -> Value {
     })
 }
 
+fn goal_start_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "goal": { "type": "string", "description": "Natural-language description of what to discover, e.g. 'refractory alloy with creep resistance beyond CMSX-4 above 1100C'." },
+            "elements": { "type": "array", "items": {"type": "string"}, "description": "Allowed elements, e.g. [\"W\",\"Mo\",\"Ta\",\"Nb\"]. Omit for no restriction." },
+            "objective": { "type": "string", "description": "What to optimize, e.g. 'maximize creep resistance', 'minimize density'." },
+            "max_iterations": { "type": "integer", "description": "Hard cap on discovery iterations (default 50)." },
+            "batch_size": { "type": "integer", "description": "Candidates proposed per iteration (default 10)." },
+            "budget_usd": { "type": "number", "description": "USD spend cap; the goal stops when cumulative compute cost exceeds it." },
+            "approval_gates": { "type": "array", "items": {"type": "integer"}, "description": "Iteration numbers to pause at for human approval, e.g. [10, 25]." }
+        },
+        "required": ["goal"],
+        "additionalProperties": false
+    })
+}
+
+fn goal_id_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "description": description }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    })
+}
+
 fn knowledge_entity_schema() -> Value {
     json!({
         "type": "object",
@@ -1522,6 +1590,14 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         }
         CommandToolKind::ComputeSubmit => compute_submit_schema(),
         CommandToolKind::Predict => predict_schema(),
+        CommandToolKind::GoalStart => goal_start_schema(),
+        CommandToolKind::GoalStatus => {
+            goal_id_schema("Goal (campaign) id from goal_list or goal_start output.")
+        }
+        CommandToolKind::GoalList => empty_schema(),
+        CommandToolKind::GoalResume => {
+            goal_id_schema("Goal (campaign) id to resume from its checkpoint.")
+        }
         CommandToolKind::KnowledgeEntity => knowledge_entity_schema(),
         CommandToolKind::KnowledgePaths => knowledge_paths_schema(),
         CommandToolKind::KnowledgeCorpora => knowledge_corpora_schema(),
@@ -2278,6 +2354,68 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args,
             })
         }
+        CommandToolKind::GoalStart => {
+            let mut args = vec![
+                "start".to_string(),
+                "--goal".to_string(),
+                required_string(input, "goal")?,
+            ];
+            if let Some(elements) = input.get("elements").and_then(Value::as_array) {
+                let list = elements
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if !list.is_empty() {
+                    args.push("--elements".to_string());
+                    args.push(list);
+                }
+            }
+            if let Some(objective) = optional_string(input, "objective") {
+                args.push("--objective".to_string());
+                args.push(objective);
+            }
+            if let Some(n) = optional_usize(input, "max_iterations") {
+                args.push("--max-iterations".to_string());
+                args.push(n.to_string());
+            }
+            if let Some(n) = optional_usize(input, "batch_size") {
+                args.push("--batch-size".to_string());
+                args.push(n.to_string());
+            }
+            if let Some(budget) = optional_f64(input, "budget_usd") {
+                args.push("--budget".to_string());
+                args.push(budget.to_string());
+            }
+            if let Some(gates) = input.get("approval_gates").and_then(Value::as_array) {
+                let list = gates
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .map(|g| g.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if !list.is_empty() {
+                    args.push("--approval-gates".to_string());
+                    args.push(list);
+                }
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::GoalStatus => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["status".to_string(), required_string(input, "id")?],
+        }),
+        CommandToolKind::GoalList => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["list".to_string()],
+        }),
+        CommandToolKind::GoalResume => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["resume".to_string(), required_string(input, "id")?],
+        }),
         CommandToolKind::ComputeSubmit => {
             let mut args = vec![
                 "submit".to_string(),
@@ -2944,6 +3082,47 @@ mod tests {
 
         // Missing model → honest arg error, no execution.
         assert!(build_execution(spec_by_name("predict").unwrap(), &json!({"inputs": {}})).is_err());
+    }
+
+    #[test]
+    fn goal_tools_unify_agent_with_campaign_engine() {
+        // Goal unification: the agent gets the SAME campaign engine the CLI
+        // has. Starting/resuming spends money → approval-gated; status/list
+        // are read-only and free.
+        assert!(is_command_tool("goal_start"));
+        assert!(is_command_tool("campaign_start"), "alias must resolve");
+        assert_eq!(command_tool_requires_approval("goal_start"), Some(true));
+        assert_eq!(command_tool_requires_approval("goal_resume"), Some(true));
+        assert_eq!(command_tool_requires_approval("goal_status"), Some(false));
+        assert_eq!(command_tool_requires_approval("goal_list"), Some(false));
+
+        let preview = command_tool_preview(
+            "goal_start",
+            &json!({
+                "goal": "W-Mo alloy with creep resistance beyond CMSX-4",
+                "elements": ["W", "Mo", "Ta"],
+                "objective": "maximize creep resistance",
+                "max_iterations": 20,
+                "budget_usd": 5.0,
+                "approval_gates": [10]
+            }),
+        )
+        .expect("preview renders");
+        assert!(
+            preview.starts_with("prism campaign start --goal"),
+            "{preview}"
+        );
+        assert!(preview.contains("--elements W,Mo,Ta"), "{preview}");
+        assert!(preview.contains("--max-iterations 20"), "{preview}");
+        assert!(preview.contains("--budget 5"), "{preview}");
+        assert!(preview.contains("--approval-gates 10"), "{preview}");
+
+        let status = command_tool_preview("goal_status", &json!({"id": "camp_abc"}))
+            .expect("status preview");
+        assert_eq!(status, "prism campaign status camp_abc");
+
+        // Missing goal → honest arg error, no execution.
+        assert!(build_execution(spec_by_name("goal_start").unwrap(), &json!({})).is_err());
     }
 
     #[test]
