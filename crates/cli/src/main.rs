@@ -4888,7 +4888,37 @@ fn print_ingest_summary(summary: &serde_json::Value) {
         }
     }
 
-    println!("\n  Done.");
+    // Honest closing: a pipeline step failure means data did NOT land for
+    // that step — never print a clean "Done." over it (audit critical #2:
+    // dead backends used to print "Done." with exit 0 having stored nothing).
+    let step_errors: Vec<&str> = summary
+        .get("result")
+        .and_then(|r| r.get("errors"))
+        .or_else(|| summary.get("errors"))
+        .and_then(|e| e.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if step_errors.is_empty() {
+        println!("\n  Done.");
+    } else {
+        println!("\n  FAILED STEPS ({}):", step_errors.len());
+        for e in &step_errors {
+            println!("    ! {e}");
+        }
+        println!("\n  Completed WITH ERRORS — data for the failed steps was NOT stored.");
+    }
+}
+
+/// Step failures from an ingest summary (either local-pipeline shape
+/// `{result:{errors:[..]}}` or top-level). Non-empty ⇒ exit non-zero.
+fn ingest_summary_errors(summary: &serde_json::Value) -> usize {
+    summary
+        .get("result")
+        .and_then(|r| r.get("errors"))
+        .or_else(|| summary.get("errors"))
+        .and_then(|e| e.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0)
 }
 
 async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> {
@@ -5077,6 +5107,8 @@ async fn handle_ingest(
         summaries.push(summary);
     }
 
+    let total_step_errors: usize = summaries.iter().map(ingest_summary_errors).sum();
+
     if json_output {
         let payload = if summaries.len() == 1 {
             summaries.into_iter().next().unwrap_or_default()
@@ -5091,6 +5123,13 @@ async fn handle_ingest(
             }
             print_ingest_summary(summary);
         }
+    }
+
+    // Exit non-zero when configured steps failed — agents and scripts key
+    // off the exit code, and the old exit-0-having-stored-nothing was the
+    // audit's #2 critical.
+    if total_step_errors > 0 {
+        bail!("{total_step_errors} ingest step(s) failed — see errors above/in JSON");
     }
 
     Ok(())

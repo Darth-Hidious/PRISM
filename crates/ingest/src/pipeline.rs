@@ -33,6 +33,12 @@ pub struct IngestResult {
     /// Populated when Qdrant embedding upsert runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<EmbeddingBatch>,
+    /// Step failures. NON-EMPTY means configured pipeline steps did NOT
+    /// complete — callers must surface these and exit non-zero. The old
+    /// behavior (audit critical: log-and-None) made `prism ingest` print
+    /// "Done." with exit 0 while storing nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 /// Configuration for a full ingest pipeline run.
@@ -145,6 +151,7 @@ impl IngestPipeline {
         }
 
         // Step 3: LLM entity extraction (if configured)
+        let mut errors: Vec<String> = Vec::new();
         let entities = if let Some(ref llm_config) = self.config.llm {
             let constructor = LlmOntologyConstructor::new(llm_config.clone());
             let sample_rows = extract_sample_rows(&df, self.config.max_sample_rows);
@@ -168,7 +175,8 @@ impl IngestPipeline {
                     Some(entities)
                 }
                 Err(e) => {
-                    tracing::error!("LLM extraction failed: {e}");
+                    tracing::error!("LLM extraction failed: {e:#}");
+                    errors.push(format!("LLM extraction failed: {e:#}"));
                     None
                 }
             }
@@ -190,7 +198,8 @@ impl IngestPipeline {
                     Some(update)
                 }
                 Err(e) => {
-                    tracing::error!("Neo4j upsert failed: {e}");
+                    tracing::error!("Neo4j upsert failed: {e:#}");
+                    errors.push(format!("Neo4j graph upsert failed: {e:#}"));
                     None
                 }
             }
@@ -212,14 +221,18 @@ impl IngestPipeline {
                             Some(batch)
                         }
                         Err(e) => {
-                            tracing::error!("Qdrant upsert failed: {e}");
-                            Some(batch) // still return embeddings even if store failed
+                            // Do NOT return the batch as if stored — that made the
+                            // CLI print "Embeddings: N vectors" for a failed store.
+                            tracing::error!("Qdrant upsert failed: {e:#}");
+                            errors.push(format!("Qdrant vector store failed: {e:#}"));
+                            None
                         }
                     }
                 }
                 Ok(batch) => Some(batch),
                 Err(e) => {
-                    tracing::error!("embedding generation failed: {e}");
+                    tracing::error!("embedding generation failed: {e:#}");
+                    errors.push(format!("embedding generation failed: {e:#}"));
                     None
                 }
             }
@@ -236,6 +249,7 @@ impl IngestPipeline {
             entities,
             graph,
             embeddings,
+            errors,
         })
     }
 }
@@ -323,11 +337,23 @@ mod tests {
             entities: None,
             graph: None,
             embeddings: None,
+            errors: Vec::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
         // None fields should not appear in JSON.
         assert!(!json.contains("entities"));
         assert!(!json.contains("graph"));
         assert!(!json.contains("embeddings"));
+        // No errors ⇒ no errors key either (clean success stays clean)…
+        assert!(!json.contains("errors"));
+        // …but step failures MUST be visible in the JSON (the old shape hid
+        // failed steps entirely — audit critical #2).
+        let failed = IngestResult {
+            errors: vec!["Neo4j graph upsert failed: connection refused".into()],
+            ..result
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains("errors"));
+        assert!(json.contains("connection refused"));
     }
 }
