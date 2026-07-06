@@ -306,7 +306,8 @@ mod tests {
             detected_types: vec!["string".into(), "float".into()],
         };
         let rows = vec![vec!["Nb25Mo25Ta25W25".into(), "542".into()]];
-        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &rows, None);
+        let prompt =
+            LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &rows, None);
 
         assert!(prompt.contains("Composition (string)"));
         assert!(prompt.contains("Hardness_HV (float)"));
@@ -370,7 +371,8 @@ mod tests {
             columns: vec!["Composition".into()],
             detected_types: vec!["string".into()],
         };
-        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
+        let prompt =
+            LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
         // Must still include schema and instructions — just no row data.
         assert!(prompt.contains("Composition (string)"));
         assert!(prompt.contains("CONTAINS"));
@@ -386,7 +388,8 @@ mod tests {
             columns,
             detected_types: types,
         };
-        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
+        let prompt =
+            LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
         // All 12 columns must appear.
         for i in 0..12 {
             assert!(prompt.contains(&format!("col_{i}")));
@@ -399,7 +402,8 @@ mod tests {
             columns: vec!["X".into()],
             detected_types: vec!["int".into()],
         };
-        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
+        let prompt =
+            LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
         assert!(prompt.contains("## Instructions"));
         assert!(prompt.contains("Return ONLY valid JSON"));
     }
