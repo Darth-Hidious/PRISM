@@ -360,6 +360,46 @@ impl LlmClient {
         })
     }
 
+    /// Token budget for `generate_json`. Honors `LlmConfig::max_output_tokens`
+    /// (fetched from the platform model catalog) instead of a fixed guess —
+    /// a reasoning/"thinking" model can burn its entire budget on
+    /// `reasoning_content` before writing any JSON, and the caller may know
+    /// the model needs more room than the old hardcoded 4096.
+    fn json_extraction_max_tokens(&self) -> u64 {
+        self.config.max_output_tokens.unwrap_or(4096)
+    }
+
+    /// Extract strict JSON output from a chat-completions choice.
+    ///
+    /// Unlike [`Self::extract_content`] (used for human-readable chat, where
+    /// falling back to `reasoning_content` is a reasonable best-effort),
+    /// JSON extraction must NEVER return reasoning text: it is never valid
+    /// JSON, so silently returning it only turns this into an opaque
+    /// "invalid JSON" parse error one layer up. When `content` is empty we
+    /// diagnose *why* and bail with an actionable message instead
+    /// (AUDIT_BACKLOG #6 / INGESTION_AUDIT #6 — a thinking model hitting
+    /// `finish_reason: "length"` while reasoning silently broke every
+    /// extraction on that hardware).
+    fn extract_json_content(choice: &serde_json::Value) -> Result<String> {
+        let msg = &choice["message"];
+        let content = msg["content"].as_str().unwrap_or_default();
+        if !content.is_empty() {
+            return Ok(content.to_string());
+        }
+        let finish_reason = choice["finish_reason"].as_str().unwrap_or("unknown");
+        let reasoning_len = msg["reasoning_content"].as_str().unwrap_or_default().len();
+        if finish_reason == "length" && reasoning_len > 0 {
+            bail!(
+                "LLM produced no JSON output: it hit max_tokens before finishing, having \
+                 spent the whole budget on {reasoning_len} chars of reasoning_content \
+                 (finish_reason=length). This model is running in 'thinking' mode — raise \
+                 max_output_tokens in the LLM config, or disable thinking for extraction \
+                 requests if the backend supports it."
+            );
+        }
+        bail!("LLM returned empty content for JSON extraction (finish_reason={finish_reason})");
+    }
+
     /// Generate text and parse as JSON (uses response_format).
     pub async fn generate_json(&self, prompt: &str) -> Result<String> {
         let url = self.chat_completions_url();
@@ -369,12 +409,12 @@ impl LlmClient {
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
-            "max_tokens": 4096,
+            "max_tokens": self.json_extraction_max_tokens(),
             "response_format": {"type": "json_object"},
         });
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
-        Ok(Self::extract_content(&data))
+        Self::extract_json_content(&data["choices"][0])
     }
 
     /// Embed a single text string. Returns the embedding vector.
@@ -1336,6 +1376,75 @@ mod tests {
         let config = LlmConfig::default();
         let client = LlmClient::new(config);
         assert!(client.auth_header().is_none());
+    }
+
+    #[test]
+    fn json_extraction_max_tokens_defaults_to_4096() {
+        let client = LlmClient::new(LlmConfig::default());
+        assert_eq!(client.json_extraction_max_tokens(), 4096);
+    }
+
+    #[test]
+    fn json_extraction_max_tokens_honors_config() {
+        let config = LlmConfig {
+            max_output_tokens: Some(16_384),
+            ..Default::default()
+        };
+        let client = LlmClient::new(config);
+        assert_eq!(client.json_extraction_max_tokens(), 16_384);
+    }
+
+    #[test]
+    fn extract_json_content_returns_real_content() {
+        let choice = serde_json::json!({
+            "finish_reason": "stop",
+            "message": {"content": "{\"entities\": []}", "reasoning_content": ""}
+        });
+        assert_eq!(
+            LlmClient::extract_json_content(&choice).unwrap(),
+            "{\"entities\": []}"
+        );
+    }
+
+    #[test]
+    fn extract_json_content_never_falls_back_to_reasoning() {
+        // Empty content + finish_reason "stop" (not length) with reasoning
+        // text present must still fail rather than return the reasoning
+        // text as if it were JSON.
+        let choice = serde_json::json!({
+            "finish_reason": "stop",
+            "message": {"content": "", "reasoning_content": "I am thinking about it..."}
+        });
+        let err = LlmClient::extract_json_content(&choice).unwrap_err();
+        assert!(err.to_string().contains("empty content"));
+    }
+
+    #[test]
+    fn extract_json_content_diagnoses_thinking_model_length_cutoff() {
+        // The live failure mode this fixes: a reasoning model burns the
+        // whole max_tokens budget on reasoning_content and never emits
+        // JSON content, ending with finish_reason=length.
+        let choice = serde_json::json!({
+            "finish_reason": "length",
+            "message": {
+                "content": "",
+                "reasoning_content": "a very long chain of thought".repeat(100),
+            }
+        });
+        let err = LlmClient::extract_json_content(&choice).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("thinking"), "message was: {msg}");
+        assert!(msg.contains("max_output_tokens"), "message was: {msg}");
+    }
+
+    #[test]
+    fn extract_json_content_generic_empty_response_is_honest() {
+        let choice = serde_json::json!({
+            "finish_reason": "stop",
+            "message": {"content": ""}
+        });
+        let err = LlmClient::extract_json_content(&choice).unwrap_err();
+        assert!(err.to_string().contains("finish_reason=stop"));
     }
 
     #[test]
