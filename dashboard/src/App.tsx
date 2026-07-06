@@ -1,22 +1,28 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Routes, Route, NavLink } from "react-router-dom";
 import NodeStatus from "./pages/NodeStatus";
 import Goals from "./pages/Goals";
 import Workflows from "./pages/Workflows";
 import Tools from "./pages/Tools";
+import Activity, { type ActivityItem } from "./pages/Activity";
 import QueryPage from "./pages/QueryPage";
 import Datasets from "./pages/Datasets";
 import AuditLog from "./pages/AuditLog";
 import Users from "./pages/Users";
 import MeshStatus from "./pages/MeshStatus";
 import { bootstrapSessionTokenFromUrl, clearSessionToken, getSessionToken } from "./lib/session";
-import { useWebSocket } from "./hooks/useWebSocket";
+import { useWebSocket, type WsEvent } from "./hooks/useWebSocket";
+
+// Keep at most this many live events in memory — this is an ephemeral feed,
+// not a log store (persistent history lives in the Audit tab).
+const MAX_LIVE_EVENTS = 100;
 
 const navItems = [
   { to: "/", label: "Node" },
   { to: "/goals", label: "Goals" },
   { to: "/workflows", label: "Workflows" },
   { to: "/tools", label: "Tools" },
+  { to: "/activity", label: "Activity" },
   { to: "/query", label: "Query" },
   { to: "/datasets", label: "Datasets" },
   { to: "/mesh", label: "Mesh" },
@@ -37,7 +43,18 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, []);
 
-  const { connected } = useWebSocket({ token: token ?? "" });
+  // Capture the live WS events off the single app-level connection into a
+  // rolling buffer for the Activity page. `handleEvent` MUST keep a stable
+  // identity (empty deps) — the hook rebuilds its socket whenever onEvent
+  // changes, so an inline lambda here would reconnect on every render.
+  const [events, setEvents] = useState<ActivityItem[]>([]);
+  const seq = useRef(0);
+  const handleEvent = useCallback((event: WsEvent) => {
+    const item: ActivityItem = { id: seq.current++, event, at: new Date() };
+    setEvents((prev) => [item, ...prev].slice(0, MAX_LIVE_EVENTS));
+  }, []);
+
+  const { connected } = useWebSocket({ token: token ?? "", onEvent: handleEvent });
   const sessionState = useMemo(() => {
     if (!token) {
       return {
@@ -136,6 +153,10 @@ export default function App() {
           <Route path="/goals" element={<Goals authenticated={Boolean(token)} />} />
           <Route path="/workflows" element={<Workflows authenticated={Boolean(token)} />} />
           <Route path="/tools" element={<Tools authenticated={Boolean(token)} />} />
+          <Route
+            path="/activity"
+            element={<Activity events={events} connected={connected} authenticated={Boolean(token)} />}
+          />
           <Route path="/query" element={<QueryPage authenticated={Boolean(token)} />} />
           <Route path="/datasets" element={<Datasets authenticated={Boolean(token)} />} />
           <Route path="/mesh" element={<MeshStatus />} />
