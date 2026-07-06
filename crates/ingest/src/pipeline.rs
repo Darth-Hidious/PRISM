@@ -27,6 +27,11 @@ pub struct IngestResult {
     /// Populated when LLM extraction runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entities: Option<EntitySet>,
+    /// SHACL-lite structural check on the extracted entities/relationships
+    /// (orphan rels, unknown types, weight-sum sanity, etc.), run before the
+    /// Neo4j write. `None` only when no entities were extracted at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_validation: Option<crate::graph_validation::GraphValidationReport>,
     /// Populated when Neo4j graph upsert runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph: Option<GraphUpdate>,
@@ -184,8 +189,30 @@ impl IngestPipeline {
             None
         };
 
-        // Step 4: Neo4j graph upsert (if configured and entities exist)
-        let graph = if let (Some(neo4j_config), Some(entity_set)) = (&self.config.neo4j, &entities)
+        // Step 3.5: Graph quality validation (SHACL-lite) — this used to be a
+        // documented "runs before writing to Neo4j" gate with zero callers
+        // (AUDIT_BACKLOG 20 / INGESTION_AUDIT #20), so LLM extraction output
+        // went straight to Neo4j unchecked. Run it whenever entities exist,
+        // and refuse the Neo4j write on Error-severity issues (orphan
+        // relationships, empty names) rather than upserting garbage.
+        let graph_validation = entities.as_ref().map(|entity_set| {
+            let (report, blocking_error) = validate_before_graph_write(entity_set);
+            if let Some(msg) = blocking_error {
+                tracing::error!(issues = report.issues.len(), "{msg}");
+                errors.push(msg);
+            } else if !report.issues.is_empty() {
+                tracing::warn!(
+                    issues = report.issues.len(),
+                    "graph validation found non-blocking issues"
+                );
+            }
+            report
+        });
+        let graph_validation_passed = graph_validation.as_ref().is_none_or(|r| r.passed);
+
+        // Step 4: Neo4j graph upsert (if configured, entities exist, and validation passed)
+        let graph = if graph_validation_passed
+            && let (Some(neo4j_config), Some(entity_set)) = (&self.config.neo4j, &entities)
         {
             let store = Neo4jGraphStore::new(neo4j_config.clone());
             match store.upsert(entity_set).await {
@@ -247,6 +274,7 @@ impl IngestPipeline {
             row_count,
             column_count,
             entities,
+            graph_validation,
             graph,
             embeddings,
             errors,
@@ -258,6 +286,34 @@ impl Default for IngestPipeline {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Run graph-quality validation on extracted entities and decide whether the
+/// Neo4j write should proceed. Returns the full report plus, when
+/// Error-severity issues are present, a message describing why the write
+/// was blocked (`None` means the write may proceed).
+fn validate_before_graph_write(
+    entity_set: &EntitySet,
+) -> (
+    crate::graph_validation::GraphValidationReport,
+    Option<String>,
+) {
+    let report = crate::graph_validation::validate_graph(entity_set);
+    if report.passed {
+        return (report, None);
+    }
+    let error_issues: Vec<&str> = report
+        .issues
+        .iter()
+        .filter(|i| i.severity == crate::graph_validation::GraphSeverity::Error)
+        .map(|i| i.message.as_str())
+        .collect();
+    let msg = format!(
+        "graph validation failed ({} error-severity issue(s)): {}",
+        error_issues.len(),
+        error_issues.join("; ")
+    );
+    (report, Some(msg))
 }
 
 /// Extract up to `max_rows` sample rows from a DataFrame as `Vec<Vec<String>>`.
@@ -310,6 +366,48 @@ mod tests {
     }
 
     #[test]
+    fn validate_before_graph_write_blocks_on_orphan_relationship() {
+        use crate::{Entity, Relationship};
+        // "Fe" is referenced by the relationship but never extracted as an
+        // entity — this used to reach Neo4j unchecked (AUDIT_BACKLOG 20).
+        let entity_set = EntitySet {
+            entities: vec![Entity {
+                entity_type: "Alloy".into(),
+                name: "Steel".into(),
+                properties: serde_json::json!({}),
+            }],
+            relationships: vec![Relationship {
+                from: "Steel".into(),
+                rel_type: "CONTAINS".into(),
+                to: "Fe".into(),
+                weight: None,
+                order: None,
+            }],
+        };
+        let (report, blocking_error) = validate_before_graph_write(&entity_set);
+        assert!(!report.passed);
+        let msg = blocking_error.expect("orphan relationship must block the Neo4j write");
+        assert!(msg.contains("graph validation failed"));
+        assert!(msg.contains("Fe"));
+    }
+
+    #[test]
+    fn validate_before_graph_write_allows_clean_entities() {
+        use crate::Entity;
+        let entity_set = EntitySet {
+            entities: vec![Entity {
+                entity_type: "Alloy".into(),
+                name: "Steel".into(),
+                properties: serde_json::json!({}),
+            }],
+            relationships: vec![],
+        };
+        let (report, blocking_error) = validate_before_graph_write(&entity_set);
+        assert!(report.passed);
+        assert!(blocking_error.is_none());
+    }
+
+    #[test]
     fn pipeline_config_default_has_all_backends() {
         let cfg = PipelineConfig::default();
         assert!(cfg.llm.is_some());
@@ -335,6 +433,7 @@ mod tests {
             row_count: 10,
             column_count: 1,
             entities: None,
+            graph_validation: None,
             graph: None,
             embeddings: None,
             errors: Vec::new(),
@@ -342,6 +441,7 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         // None fields should not appear in JSON.
         assert!(!json.contains("entities"));
+        assert!(!json.contains("graph_validation"));
         assert!(!json.contains("graph"));
         assert!(!json.contains("embeddings"));
         // No errors ⇒ no errors key either (clean success stays clean)…
