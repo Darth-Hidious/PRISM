@@ -320,6 +320,25 @@ pub enum FormTarget {
     /// Deep-research launch (palette `sci.research`) — composes a
     /// `start_background_research` instruction into the prompt box.
     Research,
+    /// Launch a long-running discovery campaign (palette `campaign.start`).
+    /// Every field the CLI needs is on the form, so submit dispatches
+    /// `/campaign start ...` directly — the same reachable path a human
+    /// typing the command would hit, just discoverable from the palette.
+    CampaignStart,
+    /// Look up one campaign's progress (palette `campaign.status`).
+    CampaignStatus,
+    /// Resume a paused campaign (palette `campaign.resume`).
+    CampaignResume,
+    /// Inspect one workflow's spec (palette `workflow.show`).
+    WorkflowShow,
+    /// Run (or dry-run) a workflow by name (palette `workflow.run`).
+    WorkflowRun,
+    /// Search the marketplace (palette `marketplace.search`).
+    MarketplaceSearch,
+    /// Semantic marketplace discovery (palette `marketplace.find`).
+    MarketplaceFind,
+    /// Install a marketplace item (palette `marketplace.install`).
+    MarketplaceInstall,
 }
 
 /// An open form pane: the widget plus what submit dispatches to.
@@ -1196,6 +1215,78 @@ impl App {
                 let prompt = research_prompt(&pane.form);
                 self.prefill_prompt(&prompt);
             }
+            FormTarget::CampaignStart => match campaign_start_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                    self.toast(
+                        "goal launched — check Goals: List for status",
+                        ToastKind::Ok,
+                    );
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
+            FormTarget::CampaignStatus => match campaign_status_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
+            FormTarget::CampaignResume => match campaign_resume_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                    self.toast("resuming — check Goals: Status for progress", ToastKind::Ok);
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
+            FormTarget::WorkflowShow => match workflow_show_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
+            FormTarget::WorkflowRun => match workflow_run_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
+            FormTarget::MarketplaceSearch => {
+                let cmd = marketplace_search_command(&pane.form);
+                let _ = self.backend.send_command(&cmd);
+            }
+            FormTarget::MarketplaceFind => match marketplace_find_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
+            FormTarget::MarketplaceInstall => match marketplace_install_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
         }
     }
 
@@ -1239,6 +1330,106 @@ impl App {
             ],
         );
         self.open_form(form, FormTarget::Goal);
+    }
+
+    /// Palette `campaign.start` — every field `prism campaign start` takes,
+    /// so submit can dispatch the CLI-backed slash command directly (same
+    /// path a human typing it would hit; see `submit_form`).
+    pub fn open_campaign_start_form(&mut self) {
+        let form = Form::new(
+            "Start goal — long-running discovery campaign",
+            "launch",
+            vec![
+                FormField::text("goal", "Goal", "").with_note("what to discover"),
+                FormField::text("objective", "Objective", "")
+                    .with_note("optional — what to optimize"),
+                FormField::stepper("max_iterations", "Max iterations", 50, 1, 500),
+                FormField::text("budget_usd", "Budget (USD)", "").with_note("optional cap"),
+            ],
+        );
+        self.open_form(form, FormTarget::CampaignStart);
+    }
+
+    /// Palette `campaign.status` — one field: which goal to check.
+    pub fn open_campaign_status_form(&mut self) {
+        let form = Form::new(
+            "Goal status",
+            "check",
+            vec![FormField::text("id", "Goal id", "").with_note("from Goals: List")],
+        );
+        self.open_form(form, FormTarget::CampaignStatus);
+    }
+
+    /// Palette `campaign.resume` — one field: which paused goal to continue.
+    pub fn open_campaign_resume_form(&mut self) {
+        let form = Form::new(
+            "Resume goal",
+            "resume",
+            vec![FormField::text("id", "Goal id", "").with_note("must be paused, not completed")],
+        );
+        self.open_form(form, FormTarget::CampaignResume);
+    }
+
+    /// Palette `workflow.show` — one field: which workflow to inspect.
+    pub fn open_workflow_show_form(&mut self) {
+        let form = Form::new(
+            "Show workflow",
+            "show",
+            vec![FormField::text("name", "Workflow name", "").with_note("from Workflows: List")],
+        );
+        self.open_form(form, FormTarget::WorkflowShow);
+    }
+
+    /// Palette `workflow.run` — name, optional `--set key=value` pairs, and
+    /// whether to actually execute (default stays a dry run).
+    pub fn open_workflow_run_form(&mut self) {
+        let form = Form::new(
+            "Run workflow",
+            "run",
+            vec![
+                FormField::text("name", "Workflow name", ""),
+                FormField::text("values", "Values", "").with_note("key=value, key2=value2"),
+                FormField::toggle("execute", "Execute", false).with_note("off = dry run"),
+            ],
+        );
+        self.open_form(form, FormTarget::WorkflowRun);
+    }
+
+    /// Palette `marketplace.search` — lexical search; empty query browses
+    /// the default listing (mirrors `prism marketplace search`).
+    pub fn open_marketplace_search_form(&mut self) {
+        let form = Form::new(
+            "Marketplace search",
+            "search",
+            vec![FormField::text("query", "Query", "").with_note("empty browses everything")],
+        );
+        self.open_form(form, FormTarget::MarketplaceSearch);
+    }
+
+    /// Palette `marketplace.find` — semantic discovery by what a resource
+    /// does, for when `marketplace.search`'s lexical match comes up empty.
+    pub fn open_marketplace_find_form(&mut self) {
+        let form = Form::new(
+            "Marketplace find — semantic discovery",
+            "find",
+            vec![FormField::text("query", "Describe what you need", "")],
+        );
+        self.open_form(form, FormTarget::MarketplaceFind);
+    }
+
+    /// Palette `marketplace.install` — install a tool (default) or workflow
+    /// by exact slug (mirrors `prism marketplace install <name> [--workflow]`).
+    pub fn open_marketplace_install_form(&mut self) {
+        let form = Form::new(
+            "Marketplace install",
+            "install",
+            vec![
+                FormField::text("name", "Item name", "").with_note("exact slug from search/find"),
+                FormField::toggle("workflow", "As workflow", false)
+                    .with_note("off installs as a Python tool"),
+            ],
+        );
+        self.open_form(form, FormTarget::MarketplaceInstall);
     }
 
     // ── Knowledge pane (Search | Ingest) ─────────────────────────────
@@ -2484,6 +2675,23 @@ impl App {
             "compute.gpus" => self.open_gpu_picker(),
             "mcp.show" => self.modal = Some(Modal::Tools),
             "goal.set" => self.open_goal_form(),
+            "campaign.start" => self.open_campaign_start_form(),
+            "campaign.status" => self.open_campaign_status_form(),
+            "campaign.resume" => self.open_campaign_resume_form(),
+            "campaign.list" => {
+                let _ = self.backend.send_command("/campaign list");
+            }
+            "workflow.list" => {
+                let _ = self.backend.send_command("/workflow list");
+            }
+            "workflow.show" => self.open_workflow_show_form(),
+            "workflow.run" => self.open_workflow_run_form(),
+            "marketplace.search" => self.open_marketplace_search_form(),
+            "marketplace.find" => self.open_marketplace_find_form(),
+            "marketplace.install" => self.open_marketplace_install_form(),
+            "use.show" => {
+                let _ = self.backend.send_command("/use show");
+            }
             "chat.clear" => {
                 self.messages.clear();
                 self.toast("chat cleared", ToastKind::Info);
@@ -3186,6 +3394,176 @@ fn open_url_detached(url: &str) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// Shell-quote one CLI argv token for embedding in a slash-command string.
+///
+/// The agent backend re-splits the string with `shlex` (POSIX-style), so
+/// this mirrors the same single-quote idiom the agent's own
+/// `shell_command_join` uses (`crates/agent/src/{protocol,command_tools}.rs`)
+/// — kept as a small local copy since `prism-tui` doesn't depend on
+/// `prism-agent`.
+fn quote_arg(token: &str) -> String {
+    if token.is_empty() {
+        return "''".to_string();
+    }
+    if !token
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\'))
+    {
+        return token.to_string();
+    }
+    format!("'{}'", token.replace('\'', "'\"'\"'"))
+}
+
+/// Build a `/root arg1 arg2 ...` slash-command string from argv tokens,
+/// quoting each so free-text fields (a goal description, a search query)
+/// survive the round trip through the backend's shlex parser intact.
+fn build_slash_command(tokens: &[String]) -> String {
+    format!(
+        "/{}",
+        tokens
+            .iter()
+            .map(|t| quote_arg(t))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+/// Build `/campaign start ...` from the `campaign.start` form fields, or
+/// return the validation message to show instead (caller keeps the form
+/// open on `Err`).
+fn campaign_start_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let goal = form.text_value("goal").trim().to_string();
+    if goal.is_empty() {
+        return Err("enter a goal description first");
+    }
+    let budget = form.text_value("budget_usd").trim().to_string();
+    if !budget.is_empty() && !budget.parse::<f64>().is_ok_and(|b| b > 0.0) {
+        return Err("budget must be a positive number");
+    }
+    let mut args = vec![
+        "campaign".to_string(),
+        "start".to_string(),
+        "--goal".to_string(),
+        goal,
+    ];
+    let objective = form.text_value("objective").trim().to_string();
+    if !objective.is_empty() {
+        args.push("--objective".to_string());
+        args.push(objective);
+    }
+    args.push("--max-iterations".to_string());
+    args.push(form.stepper_value("max_iterations").to_string());
+    if !budget.is_empty() {
+        args.push("--budget".to_string());
+        args.push(budget);
+    }
+    // Long-research semantics (matches the agent's own goal_start tool):
+    // return the goal id immediately, don't block the TUI for hours.
+    args.push("--detach".to_string());
+    Ok(build_slash_command(&args))
+}
+
+/// Build `/campaign status <id>` from the `campaign.status` form.
+fn campaign_status_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let id = form.text_value("id").trim().to_string();
+    if id.is_empty() {
+        return Err("enter a goal id first");
+    }
+    Ok(build_slash_command(&[
+        "campaign".to_string(),
+        "status".to_string(),
+        id,
+    ]))
+}
+
+/// Build `/campaign resume <id> --detach` from the `campaign.resume` form.
+fn campaign_resume_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let id = form.text_value("id").trim().to_string();
+    if id.is_empty() {
+        return Err("enter a goal id first");
+    }
+    Ok(build_slash_command(&[
+        "campaign".to_string(),
+        "resume".to_string(),
+        id,
+        "--detach".to_string(),
+    ]))
+}
+
+/// Build `/workflow show <name>` from the `workflow.show` form.
+fn workflow_show_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let name = form.text_value("name").trim().to_string();
+    if name.is_empty() {
+        return Err("enter a workflow name first");
+    }
+    Ok(build_slash_command(&[
+        "workflow".to_string(),
+        "show".to_string(),
+        name,
+    ]))
+}
+
+/// Build `/workflow run <name> [--set k=v ...] [--execute]` from the
+/// `workflow.run` form. `values` is a comma-separated `key=value` list.
+fn workflow_run_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let name = form.text_value("name").trim().to_string();
+    if name.is_empty() {
+        return Err("enter a workflow name first");
+    }
+    let values = form.text_value("values").trim().to_string();
+    let mut args = vec!["workflow".to_string(), "run".to_string(), name];
+    for pair in values.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if !pair.contains('=') {
+            return Err("values must be comma-separated key=value pairs");
+        }
+        args.push("--set".to_string());
+        args.push(pair.to_string());
+    }
+    if form.toggle_value("execute") {
+        args.push("--execute".to_string());
+    }
+    Ok(build_slash_command(&args))
+}
+
+/// Build `/marketplace search [<query>]` from the `marketplace.search`
+/// form. An empty query browses the default listing (never a validation
+/// error — that's how `prism marketplace search` itself behaves).
+fn marketplace_search_command(form: &crate::form::Form) -> String {
+    let query = form.text_value("query").trim().to_string();
+    let mut args = vec!["marketplace".to_string(), "search".to_string()];
+    if !query.is_empty() {
+        args.push(query);
+    }
+    build_slash_command(&args)
+}
+
+/// Build `/marketplace find <query>` from the `marketplace.find` form.
+fn marketplace_find_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let query = form.text_value("query").trim().to_string();
+    if query.is_empty() {
+        return Err("enter what you're looking for first");
+    }
+    Ok(build_slash_command(&[
+        "marketplace".to_string(),
+        "find".to_string(),
+        query,
+    ]))
+}
+
+/// Build `/marketplace install <name> [--workflow]` from the
+/// `marketplace.install` form.
+fn marketplace_install_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let name = form.text_value("name").trim().to_string();
+    if name.is_empty() {
+        return Err("enter a marketplace item name first");
+    }
+    let mut args = vec!["marketplace".to_string(), "install".to_string(), name];
+    if form.toggle_value("workflow") {
+        args.push("--workflow".to_string());
+    }
+    Ok(build_slash_command(&args))
+}
+
 /// Compose the exact chat instruction the research form launches.
 ///
 /// The engine contract is `{question, depth}` (app/tools/agent_runs.py),
@@ -3723,6 +4101,275 @@ mod tests {
             "web off must force the local-only depth: {prompt}"
         );
         assert!(!prompt.contains("web]"), "web must not be listed: {prompt}");
+    }
+
+    // ── Slash-command quoting ─────────────────────────────────────────
+
+    #[test]
+    fn quote_arg_leaves_simple_tokens_bare() {
+        assert_eq!(
+            quote_arg("campaign-20260706-120000"),
+            "campaign-20260706-120000"
+        );
+        assert_eq!(quote_arg(""), "''");
+    }
+
+    #[test]
+    fn quote_arg_wraps_tokens_with_whitespace_or_quotes() {
+        assert_eq!(quote_arg("W-Mo alloy"), "'W-Mo alloy'");
+        assert_eq!(quote_arg("it's here"), "'it'\"'\"'s here'");
+    }
+
+    #[test]
+    fn build_slash_command_quotes_only_where_needed() {
+        let cmd = build_slash_command(&[
+            "campaign".to_string(),
+            "start".to_string(),
+            "--goal".to_string(),
+            "W-Mo alloy with creep resistance".to_string(),
+        ]);
+        assert_eq!(
+            cmd,
+            "/campaign start --goal 'W-Mo alloy with creep resistance'"
+        );
+    }
+
+    // ── Goals (campaign) palette ───────────────────────────────────────
+
+    #[test]
+    fn campaign_start_dispatch_opens_form_with_defaults() {
+        let mut app = fresh();
+        app.dispatch_command("campaign.start");
+        let pane = app.form.as_ref().expect("campaign.start must open a form");
+        assert_eq!(pane.target, FormTarget::CampaignStart);
+        let names: Vec<&str> = pane.form.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["goal", "objective", "max_iterations", "budget_usd"]);
+        assert_eq!(pane.form.stepper_value("max_iterations"), 50);
+    }
+
+    #[test]
+    fn campaign_start_requires_goal() {
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("goal", "Goal", ""),
+                FormField::text("objective", "Objective", ""),
+                FormField::stepper("max_iterations", "Max iterations", 50, 1, 500),
+                FormField::text("budget_usd", "Budget", ""),
+            ],
+        );
+        assert_eq!(
+            campaign_start_command(&form),
+            Err("enter a goal description first")
+        );
+    }
+
+    #[test]
+    fn campaign_start_rejects_non_positive_budget() {
+        let mut form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("goal", "Goal", "W-Mo alloy"),
+                FormField::text("objective", "Objective", ""),
+                FormField::stepper("max_iterations", "Max iterations", 50, 1, 500),
+                FormField::text("budget_usd", "Budget", "not-a-number"),
+            ],
+        );
+        assert_eq!(
+            campaign_start_command(&form),
+            Err("budget must be a positive number")
+        );
+        form.fields[3] = FormField::text("budget_usd", "Budget", "-5");
+        assert_eq!(
+            campaign_start_command(&form),
+            Err("budget must be a positive number")
+        );
+    }
+
+    #[test]
+    fn campaign_start_builds_full_invocation() {
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("goal", "Goal", "W-Mo alloy with creep resistance"),
+                FormField::text("objective", "Objective", "maximize creep resistance"),
+                FormField::stepper("max_iterations", "Max iterations", 20, 1, 500),
+                FormField::text("budget_usd", "Budget", "5"),
+            ],
+        );
+        let cmd = campaign_start_command(&form).expect("valid form must build a command");
+        assert_eq!(
+            cmd,
+            "/campaign start --goal 'W-Mo alloy with creep resistance' \
+             --objective 'maximize creep resistance' --max-iterations 20 \
+             --budget 5 --detach"
+        );
+    }
+
+    #[test]
+    fn campaign_status_and_resume_require_id() {
+        let form = Form::new("t", "go", vec![FormField::text("id", "Goal id", "")]);
+        assert_eq!(campaign_status_command(&form), Err("enter a goal id first"));
+        assert_eq!(campaign_resume_command(&form), Err("enter a goal id first"));
+
+        let form = Form::new(
+            "t",
+            "go",
+            vec![FormField::text("id", "Goal id", "camp_abc")],
+        );
+        assert_eq!(
+            campaign_status_command(&form).unwrap(),
+            "/campaign status camp_abc"
+        );
+        assert_eq!(
+            campaign_resume_command(&form).unwrap(),
+            "/campaign resume camp_abc --detach"
+        );
+    }
+
+    #[test]
+    fn campaign_list_dispatch_sends_directly_without_a_form() {
+        let mut app = fresh();
+        app.dispatch_command("campaign.list");
+        assert!(app.form.is_none(), "list is read-only — no form needed");
+    }
+
+    // ── Workflows palette ────────────────────────────────────────────────
+
+    #[test]
+    fn workflow_show_requires_name() {
+        let form = Form::new("t", "go", vec![FormField::text("name", "Name", "")]);
+        assert_eq!(
+            workflow_show_command(&form),
+            Err("enter a workflow name first")
+        );
+
+        let form = Form::new("t", "go", vec![FormField::text("name", "Name", "forge")]);
+        assert_eq!(
+            workflow_show_command(&form).unwrap(),
+            "/workflow show forge"
+        );
+    }
+
+    #[test]
+    fn workflow_run_builds_set_flags_and_execute() {
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("name", "Name", "forge"),
+                FormField::text("values", "Values", "paper=alpha, mode = draft"),
+                FormField::toggle("execute", "Execute", true),
+            ],
+        );
+        let cmd = workflow_run_command(&form).expect("valid form must build a command");
+        assert_eq!(
+            cmd,
+            "/workflow run forge --set paper=alpha --set 'mode = draft' --execute"
+        );
+    }
+
+    #[test]
+    fn workflow_run_rejects_malformed_values() {
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("name", "Name", "forge"),
+                FormField::text("values", "Values", "not-a-pair"),
+                FormField::toggle("execute", "Execute", false),
+            ],
+        );
+        assert_eq!(
+            workflow_run_command(&form),
+            Err("values must be comma-separated key=value pairs")
+        );
+    }
+
+    // ── Marketplace palette ──────────────────────────────────────────────
+
+    #[test]
+    fn marketplace_search_allows_empty_query() {
+        let form = Form::new("t", "go", vec![FormField::text("query", "Query", "")]);
+        assert_eq!(marketplace_search_command(&form), "/marketplace search");
+
+        let form = Form::new(
+            "t",
+            "go",
+            vec![FormField::text("query", "Query", "elastic moduli")],
+        );
+        assert_eq!(
+            marketplace_search_command(&form),
+            "/marketplace search 'elastic moduli'"
+        );
+    }
+
+    #[test]
+    fn marketplace_find_requires_query() {
+        let form = Form::new("t", "go", vec![FormField::text("query", "Query", "")]);
+        assert_eq!(
+            marketplace_find_command(&form),
+            Err("enter what you're looking for first")
+        );
+    }
+
+    #[test]
+    fn marketplace_install_builds_workflow_flag() {
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("name", "Name", "forge"),
+                FormField::toggle("workflow", "As workflow", true),
+            ],
+        );
+        assert_eq!(
+            marketplace_install_command(&form).unwrap(),
+            "/marketplace install forge --workflow"
+        );
+    }
+
+    #[test]
+    fn marketplace_install_requires_name() {
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("name", "Name", ""),
+                FormField::toggle("workflow", "As workflow", false),
+            ],
+        );
+        assert_eq!(
+            marketplace_install_command(&form),
+            Err("enter a marketplace item name first")
+        );
+    }
+
+    // ── Billing & use show (direct-dispatch palette entries) ────────────
+
+    #[test]
+    fn billing_and_use_show_are_palette_reachable() {
+        let ids: Vec<&str> = command::fuzzy_sorted("billing")
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(ids.contains(&"slash.billing"), "got: {ids:?}");
+
+        let ids: Vec<&str> = command::fuzzy_sorted("chat target")
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(ids.contains(&"use.show"), "got: {ids:?}");
+    }
+
+    #[test]
+    fn use_show_dispatch_does_not_open_a_form() {
+        let mut app = fresh();
+        app.dispatch_command("use.show");
+        assert!(app.form.is_none(), "use.show is read-only — no form needed");
     }
 
     // ── Knowledge pane ───────────────────────────────────────────────
