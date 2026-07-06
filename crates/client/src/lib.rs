@@ -10,6 +10,7 @@ pub mod billing;
 pub mod knowledge;
 pub mod marketplace;
 pub mod node_registry;
+pub mod node_session;
 
 pub use api::PlatformClient;
 pub use auth::DeviceFlowAuth;

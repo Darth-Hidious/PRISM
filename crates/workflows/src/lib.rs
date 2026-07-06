@@ -565,6 +565,10 @@ pub async fn execute_workflow_with_policy(
         );
     }
 
+    // Never surface the injected loopback credential: strip it before the
+    // context is returned (it's serialized into WorkflowRunResult.context,
+    // which the CLI renders and the agent returns as a tool result).
+    context.remove("_node_token");
     result.context = context;
     Ok(result)
 }
@@ -828,9 +832,24 @@ async fn run_tool_step(
         "inputs": inputs,
     });
 
-    let resp = client
-        .post(&url)
-        .json(&body)
+    // Authenticate to the local node. When the node is online it gates
+    // `/api/tools/{name}/run` behind a session token (+ ExecuteTools), so a
+    // tokenless call 401s. The caller (CLI `workflow run`, or the agent)
+    // injects a loopback-minted session token into the context under the
+    // reserved `_node_token` key; we forward it as a Bearer credential. The
+    // key is stripped from the returned context so it never leaks into
+    // rendered output or the agent's tool result. Absent token ⇒ no header
+    // (works in offline mode, and fails honestly with 401 when online).
+    let mut req = client.post(&url).json(&body);
+    if let Some(token) = context
+        .get("_node_token")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+    {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let resp = req
         .send()
         .await
         .with_context(|| format!("failed to call tool '{tool_name}' at {url}"))?;
@@ -2358,6 +2377,37 @@ steps:
     #[test]
     fn llm_step_in_known_actions() {
         assert!(KNOWN_ACTIONS.contains(&"llm"));
+    }
+
+    #[test]
+    fn node_token_is_stripped_from_returned_context() {
+        // The reserved `_node_token` credential — injected by the CLI/agent to
+        // authenticate `tool` steps to the local node — must never leak back
+        // out in the returned context, which the CLI renders and the agent
+        // returns as its tool result. A single `message` step keeps this run
+        // tool-free so no HTTP call is attempted.
+        let yaml = r#"
+name: token-strip
+description: test
+command_name: token-strip
+steps:
+  - id: note
+    action: message
+    text: "hello"
+"#;
+        let spec = load_workflow_from_str(yaml, "test.yaml").unwrap();
+        let mut values = BTreeMap::new();
+        values.insert(
+            "_node_token".to_string(),
+            "secret-loopback-token".to_string(),
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(execute_workflow(&spec, &values, true)).unwrap();
+        assert!(
+            !result.context.contains_key("_node_token"),
+            "injected _node_token leaked into returned context: {:?}",
+            result.context.keys().collect::<Vec<_>>()
+        );
     }
 
     // ── loop step tests ─────────────────────────────────────────────

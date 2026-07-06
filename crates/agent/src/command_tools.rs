@@ -2614,6 +2614,24 @@ async fn execute_cli_command(
     }))
 }
 
+/// Mint a best-effort loopback session token so a workflow's `tool` steps can
+/// authenticate to the local node's `/api/tools/{name}/run` endpoint (auth- and
+/// `ExecuteTools`-gated when the node is online). Injected into the workflow
+/// context under the reserved `_node_token` key, which `run_tool_step` forwards
+/// as a Bearer credential and strips from the returned context.
+///
+/// Returns `None` when the agent isn't logged in or the node is unreachable —
+/// the workflow then runs tokenless (tool-free workflows are unaffected; an
+/// online tool step fails honestly with 401 rather than silently succeeding).
+async fn mint_agent_node_token() -> Option<String> {
+    let paths = prism_runtime::PrismPaths::discover().ok()?;
+    let state = paths.load_cli_state().ok()?;
+    let user_id = state.credentials.as_ref()?.user_id.clone()?;
+    prism_client::node_session::mint_local_session("http://127.0.0.1:7327", &user_id, None)
+        .await
+        .ok()
+}
+
 async fn execute_workflow_command(
     runtime: &CommandToolRuntime,
     execution: &CommandExecution,
@@ -2679,10 +2697,16 @@ async fn execute_workflow_command(
             execute,
         } => {
             let specs = discover_workflows(Some(&runtime.project_root))?;
+            // Authenticate the workflow's `tool` steps to the local node.
+            // Execute mode only — dry runs plan without calling tools.
+            let mut values = values.clone();
+            if *execute && let Some(token) = mint_agent_node_token().await {
+                values.insert("_node_token".to_string(), token);
+            }
             match find_workflow(&specs, name) {
                 Some(spec) => match execute_workflow_with_policy(
                     spec,
-                    values,
+                    &values,
                     *execute,
                     policy,
                     Some("agent"),

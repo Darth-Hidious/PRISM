@@ -1363,7 +1363,7 @@ async fn main() -> Result<()> {
             );
         }
         Commands::Workflow { command } => {
-            handle_workflow_command(command, &project_root).await?;
+            handle_workflow_command(command, &project_root, &paths).await?;
         }
         Commands::Campaign { command } => {
             use prism_campaign::{Campaign, CampaignConfig, CampaignGoal};
@@ -3697,7 +3697,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::External(args) => {
-            if try_run_workflow_alias(&project_root, &args).await? {
+            if try_run_workflow_alias(&project_root, &paths, &args).await? {
                 return Ok(());
             }
             // Python CLI has been removed. Show help for unknown commands.
@@ -3711,7 +3711,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_workflow_command(command: WorkflowCommands, project_root: &Path) -> Result<()> {
+async fn handle_workflow_command(
+    command: WorkflowCommands,
+    project_root: &Path,
+    paths: &prism_runtime::PrismPaths,
+) -> Result<()> {
     let specs = discover_workflows(Some(project_root))?;
     match command {
         WorkflowCommands::List => {
@@ -3735,7 +3739,11 @@ async fn handle_workflow_command(command: WorkflowCommands, project_root: &Path)
         } => {
             let spec = find_workflow(&specs, &name)
                 .ok_or_else(|| anyhow!("Workflow not found: {name}"))?;
-            let values = parse_set_pairs(&pairs)?;
+            let mut values = parse_set_pairs(&pairs)?;
+            // Only execute-mode runs actually call tools (dry runs plan only).
+            if execute && let Some(token) = mint_workflow_node_token(paths).await {
+                values.insert("_node_token".to_string(), token);
+            }
             let result = execute_workflow(spec, &values, execute).await?;
             render_workflow_result(spec, &result);
         }
@@ -3743,7 +3751,11 @@ async fn handle_workflow_command(command: WorkflowCommands, project_root: &Path)
     Ok(())
 }
 
-async fn try_run_workflow_alias(project_root: &Path, args: &[String]) -> Result<bool> {
+async fn try_run_workflow_alias(
+    project_root: &Path,
+    paths: &prism_runtime::PrismPaths,
+    args: &[String],
+) -> Result<bool> {
     if args.is_empty() {
         return Ok(false);
     }
@@ -3752,7 +3764,14 @@ async fn try_run_workflow_alias(project_root: &Path, args: &[String]) -> Result<
     let Some(spec) = find_workflow(&specs, &request.name) else {
         return Ok(false);
     };
-    let result = execute_workflow(spec, &request.values, request.execute).await?;
+    let mut values = request.values;
+    // Only execute-mode runs actually call tools (dry runs plan only).
+    if request.execute
+        && let Some(token) = mint_workflow_node_token(paths).await
+    {
+        values.insert("_node_token".to_string(), token);
+    }
+    let result = execute_workflow(spec, &values, request.execute).await?;
     render_workflow_result(spec, &result);
     Ok(true)
 }
@@ -6766,6 +6785,26 @@ async fn create_dashboard_session_for_user(
 
     let session: DashboardSessionResponse = resp.json().await?;
     Ok(session.session_id)
+}
+
+/// Mint a loopback session token so a workflow's `tool` steps can authenticate
+/// to the local node's `/api/tools/{name}/run` endpoint, which is auth- and
+/// `ExecuteTools`-gated when the node is online. The token is injected into the
+/// workflow context under the reserved `_node_token` key; `run_tool_step`
+/// forwards it as a Bearer credential and strips it from the returned context.
+///
+/// Best-effort: returns `None` when the caller isn't logged in or the node
+/// isn't reachable. A tokenless workflow still runs — tool-free workflows are
+/// unaffected, and an online tool step fails honestly with 401 rather than
+/// silently.
+async fn mint_workflow_node_token(paths: &prism_runtime::PrismPaths) -> Option<String> {
+    match create_dashboard_session("http://127.0.0.1:7327", paths).await {
+        Ok(token) => Some(token),
+        Err(e) => {
+            tracing::debug!(error = %e, "workflow: no local node session (running tokenless)");
+            None
+        }
+    }
 }
 
 /// Query the MARC27 platform API (graph search or semantic search).
