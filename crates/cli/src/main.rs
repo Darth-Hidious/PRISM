@@ -1110,6 +1110,51 @@ async fn main() -> Result<()> {
         ensure_venv(&prism_dir, &project_root).await?
     };
 
+    // ── Env-var mutations happen HERE, before ANY task is detached ──
+    // POSIX setenv is not thread-safe against concurrent getenv; the first
+    // detached task (tool auto-sync below) could read env while we write
+    // (audit T3d: UB/torn reads). Hoisting also FIXES --offline for the
+    // sync task itself: it checks PRISM_OFFLINE, which used to be set only
+    // AFTER the task had already spawned.
+    //
+    // --offline applies to EVERY command, not just the bare-TUI shortcut:
+    // it sets PRISM_OFFLINE=1, which PlatformClient's request helpers and
+    // resolve_agent_auth() check before any platform HTTP. Pre-fix the flag
+    // was parsed but never enforced — `prism --offline billing` happily hit
+    // the live API (break-test defect H-3). The env var also propagates to
+    // the spawned Python tool server so its platform client obeys too.
+    if cli.offline {
+        unsafe {
+            std::env::set_var("PRISM_OFFLINE", "1");
+        }
+    }
+
+    // Top-level flag shortcuts (--resume, --model, --auto-approve) when no
+    // subcommand is given: they launch the TUI with the specified options.
+    if cli.command.is_none() {
+        if let Some(resume_id) = cli.resume.take() {
+            // `prism --resume` or `prism --resume <id>` → acts like `prism resume`
+            unsafe {
+                match resume_id.as_deref() {
+                    Some(raw_id) => std::env::set_var("PRISM_RESUME_ID", raw_id),
+                    None => std::env::set_var("PRISM_RESUME_PICKER", "1"),
+                }
+            }
+        }
+        // --model override: set env var that build_llm_config reads
+        if let Some(ref model) = cli.model {
+            unsafe {
+                std::env::set_var("LLM_MODEL", model);
+            }
+        }
+        // --auto-approve: set env var that the backend reads
+        if cli.auto_approve {
+            unsafe {
+                std::env::set_var("PRISM_AUTO_APPROVE", "1");
+            }
+        }
+    }
+
     // Tool auto-sync: on every prism invocation, kick off a background
     // task that pulls tool updates from the MARC27 marketplace. This is
     // non-blocking — the actual sync happens in a detached tokio task
@@ -1137,45 +1182,6 @@ async fn main() -> Result<()> {
             prism_client::api::PlatformClient::new(&endpoints.api_base)
         };
         crate::tool_sync::spawn_background_sync_owned(platform);
-    }
-
-    // --offline applies to EVERY command, not just the bare-TUI shortcut:
-    // it sets PRISM_OFFLINE=1, which PlatformClient's request helpers and
-    // resolve_agent_auth() check before any platform HTTP. Pre-fix the flag
-    // was parsed but never enforced — `prism --offline billing` happily hit
-    // the live API (break-test defect H-3). The env var also propagates to
-    // the spawned Python tool server so its platform client obeys too.
-    if cli.offline {
-        unsafe {
-            std::env::set_var("PRISM_OFFLINE", "1");
-        }
-    }
-
-    // Handle top-level flags (--resume, --model, --auto-approve, --offline)
-    // when no subcommand is given. These are shortcuts that launch the
-    // TUI with the specified options, avoiding the need for a subcommand.
-    if cli.command.is_none() {
-        if let Some(resume_id) = cli.resume.take() {
-            // `prism --resume` or `prism --resume <id>` → acts like `prism resume`
-            unsafe {
-                match resume_id.as_deref() {
-                    Some(raw_id) => std::env::set_var("PRISM_RESUME_ID", raw_id),
-                    None => std::env::set_var("PRISM_RESUME_PICKER", "1"),
-                }
-            }
-        }
-        // --model override: set env var that build_llm_config reads
-        if let Some(ref model) = cli.model {
-            unsafe {
-                std::env::set_var("LLM_MODEL", model);
-            }
-        }
-        // --auto-approve: set env var that the backend reads
-        if cli.auto_approve {
-            unsafe {
-                std::env::set_var("PRISM_AUTO_APPROVE", "1");
-            }
-        }
     }
 
     match cli.command.unwrap_or(Commands::Tui {

@@ -77,20 +77,25 @@ pub async fn ws_upgrade(
         t.clone()
     };
 
-    // Enforce connection concurrency limit
-    let current = state
+    // Enforce the connection concurrency limit ATOMICALLY: reserve the slot
+    // with a compare-and-swap. The old load-then-add was a TOCTOU race — two
+    // simultaneous upgrades both passed the check and both incremented,
+    // letting the live count exceed MAX_WS_CONNECTIONS (audit T3d).
+    let reserved = state
         .ws_connections
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if current >= MAX_WS_CONNECTIONS {
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| (current < MAX_WS_CONNECTIONS).then_some(current + 1),
+        )
+        .is_ok();
+    if !reserved {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many WebSocket connections.",
         )
             .into_response();
     }
-    state
-        .ws_connections
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Look up the connected user's role to scope audit-event broadcasts.
     // Without this, every WS client (Engineer, Analyst, Viewer) saw every
