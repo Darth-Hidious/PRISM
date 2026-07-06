@@ -198,6 +198,8 @@ mod tests {
             embedding_model: Some("nomic-embed-text".into()),
             max_sample_rows: 5,
             timeout_secs: 60,
+            context_window: None,
+            max_output_tokens: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: LlmConfig = serde_json::from_str(&json).unwrap();

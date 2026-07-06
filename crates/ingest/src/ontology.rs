@@ -75,11 +75,6 @@ impl LlmOntologyConstructor {
         self.client.embed(texts).await
     }
 
-    /// Build the extraction prompt from schema + sample rows.
-    fn build_extraction_prompt(schema: &SchemaAnalysis, sample_rows: &[Vec<String>]) -> String {
-        Self::build_extraction_prompt_with_mapping(schema, sample_rows, None)
-    }
-
     fn build_extraction_prompt_with_mapping(
         schema: &SchemaAnalysis,
         sample_rows: &[Vec<String>],
@@ -183,49 +178,18 @@ impl OntologyConstructor for LlmOntologyConstructor {
         _source: &DataSource,
         schema: &SchemaAnalysis,
     ) -> Result<EntitySet> {
-        // In a real pipeline, sample rows come from the DataFrame via the connector.
-        // For now we pass an empty sample — callers should use extract_entities_with_samples.
-        tracing::info!(
-            columns = schema.columns.len(),
-            "extracting entities via LLM"
-        );
-
-        let prompt = Self::build_extraction_prompt(schema, &[]);
-        let response = self.generate(&prompt).await?;
-
-        let raw: ExtractionOutput =
-            serde_json::from_str(&response).context("LLM returned invalid extraction JSON")?;
-
-        let entities = raw
-            .entities
-            .into_iter()
-            .map(|e| Entity {
-                entity_type: e.entity_type,
-                name: e.name,
-                properties: if e.properties.is_null() {
-                    serde_json::Value::Object(Default::default())
-                } else {
-                    e.properties
-                },
-            })
-            .collect();
-
-        let relationships = raw
-            .relationships
-            .into_iter()
-            .map(|r| Relationship {
-                from: r.from,
-                rel_type: r.rel,
-                to: r.to,
-                weight: r.weight,
-                order: r.order,
-            })
-            .collect();
-
-        Ok(EntitySet {
-            entities,
-            relationships,
-        })
+        // Blind extraction (zero sample rows) made the LLM invent entities
+        // from column names alone — plausible-looking garbage that callers
+        // couldn't distinguish from real extraction (audit 1.1). The pipeline
+        // path is `extract_entities_with_samples`, which feeds real rows.
+        // Refuse honestly instead of guessing.
+        anyhow::bail!(
+            "blind entity extraction (no sample rows) is not supported — it produces \
+             fabricated entities from column names alone. Use \
+             extract_entities_with_samples with real rows from the connector \
+             (schema has {} columns).",
+            schema.columns.len()
+        )
     }
 
     async fn build_graph(&self, entities: &EntitySet) -> Result<GraphUpdate> {
@@ -342,7 +306,7 @@ mod tests {
             detected_types: vec!["string".into(), "float".into()],
         };
         let rows = vec![vec!["Nb25Mo25Ta25W25".into(), "542".into()]];
-        let prompt = LlmOntologyConstructor::build_extraction_prompt(&schema, &rows);
+        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &rows, None);
 
         assert!(prompt.contains("Composition (string)"));
         assert!(prompt.contains("Hardness_HV (float)"));
@@ -406,7 +370,7 @@ mod tests {
             columns: vec!["Composition".into()],
             detected_types: vec!["string".into()],
         };
-        let prompt = LlmOntologyConstructor::build_extraction_prompt(&schema, &[]);
+        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
         // Must still include schema and instructions — just no row data.
         assert!(prompt.contains("Composition (string)"));
         assert!(prompt.contains("CONTAINS"));
@@ -422,7 +386,7 @@ mod tests {
             columns,
             detected_types: types,
         };
-        let prompt = LlmOntologyConstructor::build_extraction_prompt(&schema, &[]);
+        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
         // All 12 columns must appear.
         for i in 0..12 {
             assert!(prompt.contains(&format!("col_{i}")));
@@ -435,7 +399,7 @@ mod tests {
             columns: vec!["X".into()],
             detected_types: vec!["int".into()],
         };
-        let prompt = LlmOntologyConstructor::build_extraction_prompt(&schema, &[]);
+        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
         assert!(prompt.contains("## Instructions"));
         assert!(prompt.contains("Return ONLY valid JSON"));
     }
