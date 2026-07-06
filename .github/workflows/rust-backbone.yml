@@ -113,6 +113,20 @@ jobs:
           - windows-latest
     steps:
       - uses: actions/checkout@v4
+      # macos-latest ships Xcode 16.4 whose clang-17 toolchain dir is missing
+      # clang_rt.osx — release links die with "library 'clang_rt.osx' not
+      # found". Pin the newest Xcode on the image that still bundles it.
+      - name: Pin a working Xcode (clang_rt.osx present)
+        if: runner.os == 'macOS'
+        run: |
+          for v in 16.2 16.1 16.0 15.4; do
+            if [ -d "/Applications/Xcode_${v}.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_${v}.app"
+              echo "Selected Xcode ${v}"
+              break
+            fi
+          done
+          xcodebuild -version
       - name: Install Linux system deps (rdkafka needs libcurl)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev protobuf-compiler
