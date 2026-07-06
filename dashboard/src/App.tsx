@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { Routes, Route, NavLink } from "react-router-dom";
 import NodeStatus from "./pages/NodeStatus";
+import Goals from "./pages/Goals";
+import Workflows from "./pages/Workflows";
+import Tools from "./pages/Tools";
 import QueryPage from "./pages/QueryPage";
 import Datasets from "./pages/Datasets";
 import AuditLog from "./pages/AuditLog";
@@ -11,6 +14,9 @@ import { useWebSocket } from "./hooks/useWebSocket";
 
 const navItems = [
   { to: "/", label: "Node" },
+  { to: "/goals", label: "Goals" },
+  { to: "/workflows", label: "Workflows" },
+  { to: "/tools", label: "Tools" },
   { to: "/query", label: "Query" },
   { to: "/datasets", label: "Datasets" },
   { to: "/mesh", label: "Mesh" },
@@ -127,6 +133,9 @@ export default function App() {
       <main className="mx-auto w-full max-w-[1560px] px-6 py-8">
         <Routes>
           <Route path="/" element={<NodeStatus connected={connected} authenticated={Boolean(token)} />} />
+          <Route path="/goals" element={<Goals authenticated={Boolean(token)} />} />
+          <Route path="/workflows" element={<Workflows authenticated={Boolean(token)} />} />
+          <Route path="/tools" element={<Tools authenticated={Boolean(token)} />} />
           <Route path="/query" element={<QueryPage authenticated={Boolean(token)} />} />
           <Route path="/datasets" element={<Datasets authenticated={Boolean(token)} />} />
           <Route path="/mesh" element={<MeshStatus />} />
