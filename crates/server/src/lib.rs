@@ -207,7 +207,14 @@ pub async fn start_server(
     });
 
     let handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        // ConnectInfo lets handlers distinguish loopback from remote callers
+        // (the session-mint gate treats them differently).
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        {
             error!(%e, "Server exited with error");
         }
     });
