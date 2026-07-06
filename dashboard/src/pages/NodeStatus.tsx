@@ -53,13 +53,18 @@ export default function NodeStatus({
     );
   }
 
-  const [node, mesh, audit, users, datasets] = useQueries({
+  const [node, mesh, audit, users, datasets, goals, workflows, tools] = useQueries({
     queries: [
       { queryKey: ["node-info"], queryFn: api.getNodeInfo, enabled: authenticated },
       { queryKey: ["mesh-nodes"], queryFn: api.getMeshNodes, enabled: authenticated },
       { queryKey: ["audit"], queryFn: api.getAuditLog, enabled: authenticated },
       { queryKey: ["users"], queryFn: api.getUsers, enabled: authenticated },
       { queryKey: ["data-sources"], queryFn: api.getDataSources, enabled: authenticated },
+      // Same query keys the dedicated pages use, so the cache is shared and
+      // this overview costs no extra requests.
+      { queryKey: ["goals"], queryFn: api.getGoals, enabled: authenticated },
+      { queryKey: ["workflows"], queryFn: api.getWorkflows, enabled: authenticated },
+      { queryKey: ["tools"], queryFn: api.getTools, enabled: authenticated },
     ],
   });
 
@@ -95,6 +100,14 @@ export default function NodeStatus({
       return counts;
     }, new Map<string, number>()),
   ).sort((a, b) => b[1] - a[1]);
+
+  // Honest count strings: a dash means the endpoint errored (e.g. the goal
+  // engine isn't running) — never a fake zero. The dedicated tab shows why.
+  const countValue = (loading: boolean, errored: boolean, n: number | undefined) =>
+    loading ? "…" : errored || n == null ? "—" : String(n);
+  const goalsValue = countValue(goals.isLoading, Boolean(goals.error), goals.data?.count);
+  const workflowsValue = countValue(workflows.isLoading, Boolean(workflows.error), workflows.data?.count);
+  const toolsValue = countValue(tools.isLoading, Boolean(tools.error), tools.data?.length);
 
   return (
     <div className="space-y-7">
@@ -152,6 +165,27 @@ export default function NodeStatus({
           value={usersCount.toString()}
           detail={usersCount > 0 ? "RBAC entries available for this node." : "No dashboard users returned."}
           tone={usersCount > 0 ? "good" : "neutral"}
+        />
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <SummaryStat
+          label="Research Goals"
+          value={goalsValue}
+          detail={goals.error ? "Unavailable — open the Goals tab for the reason." : "Long-running campaigns on this node."}
+          tone={goals.data?.count ? "good" : "neutral"}
+        />
+        <SummaryStat
+          label="Workflows"
+          value={workflowsValue}
+          detail={workflows.error ? "Unavailable — open the Workflows tab." : "Declarative specs discovered on this node."}
+          tone={workflows.data?.count ? "good" : "neutral"}
+        />
+        <SummaryStat
+          label="Registered Tools"
+          value={toolsValue}
+          detail={tools.error ? "Unavailable — open the Tools tab." : "Capabilities in the node's tool registry."}
+          tone={tools.data?.length ? "good" : "neutral"}
         />
       </div>
 
