@@ -104,6 +104,79 @@ fn trajectory_block(steps: &[String]) -> Option<String> {
     Some(out)
 }
 
+// ── Session memory injection (trajectory v2) ──────────────────────
+//
+// v1 makes the CURRENT turn deterministic; v2 extends the window across
+// turns and resumed sessions: at turn start the harness loads this
+// session's durable provenance records and injects the most recent ones
+// as POINTERS — real record ids the model can expand with recall(id=…) —
+// plus the running position ("resuming at step K+1"). Deterministic, not
+// recall-dependent: the model doesn't have to remember to ask.
+
+const SESSION_MEMORY_SHOWN: usize = 5;
+const SESSION_MEMORY_HINT_CHARS: usize = 100;
+
+/// Compact single-line hint of a JSON value, truncated on a char boundary.
+fn compact_json_hint(value: &Value, max_chars: usize) -> String {
+    let s = serde_json::to_string(value).unwrap_or_default();
+    if s.chars().count() > max_chars {
+        let mut out: String = s.chars().take(max_chars).collect();
+        out.push('…');
+        out
+    } else {
+        s
+    }
+}
+
+fn session_memory_block(records: &[prism_provenance::ProvenanceRecord]) -> Option<String> {
+    if records.is_empty() {
+        return None;
+    }
+    let start = records.len().saturating_sub(SESSION_MEMORY_SHOWN);
+    let mut out = format!(
+        "SESSION MEMORY — {} steps recorded in this session before this turn \
+         (durable provenance record, deterministic). You are resuming at step \
+         {}. Pointers below are expandable with recall(id=\"<id>\"); do not \
+         redo work they already cover.\n",
+        records.len(),
+        records.len() + 1,
+    );
+    for (idx, rec) in records.iter().enumerate().skip(start) {
+        let tool = rec.tool_name.as_deref().unwrap_or("(no tool)");
+        let hint = compact_json_hint(&rec.input_json, SESSION_MEMORY_HINT_CHARS);
+        out.push_str(&format!("  step {} [{}] {tool} {hint}\n", idx + 1, rec.id));
+    }
+    Some(out)
+}
+
+/// Load this session's durable records for the SESSION MEMORY block. Any
+/// failure (no store, no session id, query error) degrades to `None` — the
+/// block is an enhancement and must never fail or stall a turn.
+async fn load_session_memory() -> Option<String> {
+    let session_id = crate::hooks::provenance_session_id();
+    if session_id == "unknown" {
+        // No real session context — the "unknown" bucket aggregates
+        // unrelated writes, so injecting it would show foreign steps.
+        return None;
+    }
+    let db_path = dirs::home_dir()
+        .map(|h| h.join(".prism/provenance.db"))
+        .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+    match prism_provenance::ProvenanceStore::open(&db_path).await {
+        Ok(store) => match store.query_by_session(&session_id).await {
+            Ok(records) => session_memory_block(&records),
+            Err(e) => {
+                tracing::debug!("session memory query failed: {e:#}");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::debug!("session memory store open failed: {e:#}");
+            None
+        }
+    }
+}
+
 // ── Doom-loop detection ───────────────────────────────────────────
 
 fn doom_loop_signature(tool_name: &str, args: &Value) -> String {
@@ -598,6 +671,10 @@ pub async fn run_turn(
     // One line per executed tool step — feeds the deterministic TRAJECTORY
     // block injected into every iteration's context.
     let mut traj_steps: Vec<String> = Vec::new();
+    // Trajectory v2: durable cross-turn pointers, loaded ONCE per turn (a
+    // local Turso open — the same cost the provenance hook already pays per
+    // tool call). Missing store/session degrades to no block, never an error.
+    let session_memory: Option<String> = load_session_memory().await;
     let mut recent_sigs: VecDeque<String> = VecDeque::with_capacity(DOOM_LOOP_WINDOW + 1);
     // Track consecutive empty results per tool name
     let mut empty_result_streak: HashMap<String, usize> = HashMap::new();
@@ -722,6 +799,17 @@ pub async fn run_turn(
             messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: Some(skills_menu),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        // Trajectory v2: durable pointers from previous turns/sessions —
+        // injected before the current turn's trajectory so the model reads
+        // past→present in order.
+        if let Some(mem) = &session_memory {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(mem.clone()),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -1666,6 +1754,59 @@ mod tests {
         // …numbered by their global step index, and framed as a directive.
         assert!(block.contains("Do not repeat a step that succeeded"));
         assert!(block.contains("recall"));
+    }
+
+    fn mem_record(session: &str, tool: &str, input: Value) -> prism_provenance::ProvenanceRecord {
+        prism_provenance::new_record(
+            session,
+            prism_provenance::ActionType::ToolCall,
+            prism_provenance::Actor::Agent,
+            Some(tool),
+            None,
+            input,
+        )
+    }
+
+    #[test]
+    fn session_memory_block_empty_is_none() {
+        assert!(session_memory_block(&[]).is_none());
+    }
+
+    #[test]
+    fn session_memory_block_shows_pointers_and_resume_position() {
+        let records: Vec<_> = (1..=8)
+            .map(|i| {
+                mem_record(
+                    "sess",
+                    &format!("tool_{i}"),
+                    serde_json::json!({"q": format!("input {i}")}),
+                )
+            })
+            .collect();
+        let block = session_memory_block(&records).unwrap();
+        // Position framing: 8 prior steps → resuming at step 9.
+        assert!(block.contains("8 steps recorded"));
+        assert!(block.contains("resuming at step 9"));
+        // Only the last SESSION_MEMORY_SHOWN appear, with global numbering…
+        assert!(!block.contains("tool_3"));
+        assert!(block.contains("step 4 ["));
+        assert!(block.contains("tool_4"));
+        assert!(block.contains("tool_8"));
+        // …each pointer carries the REAL record id so recall(id=…) can expand it.
+        assert!(block.contains(&records[7].id));
+        // …and the input hint is visible.
+        assert!(block.contains("input 8"));
+        assert!(block.contains("recall(id="));
+    }
+
+    #[test]
+    fn compact_json_hint_truncates_on_char_boundary() {
+        let long = serde_json::json!({"text": "é".repeat(200)});
+        let hint = compact_json_hint(&long, 50);
+        assert_eq!(hint.chars().count(), 51, "50 chars + ellipsis");
+        assert!(hint.ends_with('…'));
+        let short = serde_json::json!({"a": 1});
+        assert_eq!(compact_json_hint(&short, 50), "{\"a\":1}");
     }
 
     #[test]
