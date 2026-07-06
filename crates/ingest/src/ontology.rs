@@ -250,6 +250,20 @@ impl LlmOntologyConstructor {
             sample_rows
         };
 
+        // Drop ignore_columns from what the LLM actually sees, instead of
+        // only mentioning them in the prompt as a hint the model was free
+        // to disregard (AUDIT_BACKLOG 21 / INGESTION_AUDIT #21 —
+        // `should_ignore` had zero production callers).
+        let (owned_schema, owned_rows);
+        let (schema, rows): (&SchemaAnalysis, &[Vec<String>]) = if let Some(m) = mapping {
+            let (s, r) = m.filter_ignored_columns(schema, rows);
+            owned_schema = s;
+            owned_rows = r;
+            (&owned_schema, owned_rows.as_slice())
+        } else {
+            (schema, rows)
+        };
+
         tracing::info!(
             columns = schema.columns.len(),
             sample_rows = rows.len(),
@@ -262,7 +276,7 @@ impl LlmOntologyConstructor {
         let raw: ExtractionOutput =
             serde_json::from_str(&response).context("LLM returned invalid extraction JSON")?;
 
-        let entities = raw
+        let mut entities: Vec<Entity> = raw
             .entities
             .into_iter()
             .map(|e| Entity {
@@ -276,7 +290,7 @@ impl LlmOntologyConstructor {
             })
             .collect();
 
-        let relationships = raw
+        let mut relationships: Vec<Relationship> = raw
             .relationships
             .into_iter()
             .map(|r| Relationship {
@@ -287,6 +301,21 @@ impl LlmOntologyConstructor {
                 order: r.order,
             })
             .collect();
+
+        // Apply alias expansion (e.g. "Nb" -> "Niobium") to entity names and
+        // to every relationship endpoint referencing those names, so the two
+        // stay consistent — expanding only one side would silently turn a
+        // real relationship into an orphan (AUDIT_BACKLOG 21 / INGESTION_AUDIT
+        // #21 — `expand_alias` had zero production callers).
+        if let Some(m) = mapping {
+            for entity in &mut entities {
+                entity.name = m.expand_alias(&entity.name);
+            }
+            for rel in &mut relationships {
+                rel.from = m.expand_alias(&rel.from);
+                rel.to = m.expand_alias(&rel.to);
+            }
+        }
 
         Ok(EntitySet {
             entities,

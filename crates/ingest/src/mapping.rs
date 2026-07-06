@@ -39,6 +39,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::SchemaAnalysis;
+
 /// User-provided ontology mapping rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OntologyMapping {
@@ -109,6 +111,46 @@ impl OntologyMapping {
             .get(name)
             .cloned()
             .unwrap_or_else(|| name.to_string())
+    }
+
+    /// Drop `ignore_columns` from a schema + sample-rows pair *before* they
+    /// reach the LLM, instead of only mentioning them in the prompt as a
+    /// hint the model was free to disregard (AUDIT_BACKLOG 21 /
+    /// INGESTION_AUDIT #21 — `should_ignore` had zero production callers).
+    pub fn filter_ignored_columns(
+        &self,
+        schema: &SchemaAnalysis,
+        sample_rows: &[Vec<String>],
+    ) -> (SchemaAnalysis, Vec<Vec<String>>) {
+        if self.ignore_columns.is_empty() {
+            return (schema.clone(), sample_rows.to_vec());
+        }
+
+        let keep: Vec<usize> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| !self.should_ignore(col))
+            .map(|(i, _)| i)
+            .collect();
+
+        let filtered_schema = SchemaAnalysis {
+            columns: keep.iter().map(|&i| schema.columns[i].clone()).collect(),
+            detected_types: keep
+                .iter()
+                .map(|&i| schema.detected_types[i].clone())
+                .collect(),
+        };
+        let filtered_rows = sample_rows
+            .iter()
+            .map(|row| {
+                keep.iter()
+                    .map(|&i| row.get(i).cloned().unwrap_or_default())
+                    .collect()
+            })
+            .collect();
+
+        (filtered_schema, filtered_rows)
     }
 
     /// Generate a prompt supplement describing the mapping rules to the LLM.
@@ -205,6 +247,43 @@ entity_rules:
         assert!(mapping.should_ignore("id"));
         assert!(mapping.should_ignore("notes"));
         assert!(!mapping.should_ignore("Hardness"));
+    }
+
+    #[test]
+    fn filter_ignored_columns_drops_ignored_and_keeps_others() {
+        let mapping = OntologyMapping {
+            ignore_columns: vec!["id".into(), "notes".into()],
+            ..Default::default()
+        };
+        let schema = SchemaAnalysis {
+            columns: vec!["id".into(), "Composition".into(), "notes".into()],
+            detected_types: vec!["int".into(), "string".into(), "string".into()],
+        };
+        let rows = vec![
+            vec!["1".into(), "NbMoTaW".into(), "n/a".into()],
+            vec!["2".into(), "TiAlV".into(), "checked".into()],
+        ];
+
+        let (filtered_schema, filtered_rows) = mapping.filter_ignored_columns(&schema, &rows);
+
+        assert_eq!(filtered_schema.columns, vec!["Composition".to_string()]);
+        assert_eq!(filtered_schema.detected_types, vec!["string".to_string()]);
+        assert_eq!(filtered_rows, vec![vec!["NbMoTaW"], vec!["TiAlV"]]);
+    }
+
+    #[test]
+    fn filter_ignored_columns_is_noop_without_ignore_rules() {
+        let mapping = OntologyMapping::default();
+        let schema = SchemaAnalysis {
+            columns: vec!["a".into(), "b".into()],
+            detected_types: vec!["string".into(), "string".into()],
+        };
+        let rows = vec![vec!["1".into(), "2".into()]];
+
+        let (filtered_schema, filtered_rows) = mapping.filter_ignored_columns(&schema, &rows);
+
+        assert_eq!(filtered_schema.columns, schema.columns);
+        assert_eq!(filtered_rows, rows);
     }
 
     #[test]
