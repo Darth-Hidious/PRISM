@@ -36,6 +36,7 @@ enum CommandToolKind {
     MarketplaceSearch,
     MarketplaceInfo,
     MarketplaceInstall,
+    MarketplaceFind,
     IngestFile,
     IngestWatch,
     ResearchQuery,
@@ -80,6 +81,10 @@ enum CommandToolKind {
     KnowledgePaths,
     KnowledgeCorpora,
     KnowledgeIngest,
+    BillingBalance,
+    BillingUsage,
+    BillingHistory,
+    BillingPrices,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +114,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &["prism_tools"],
         kind: CommandToolKind::RootArgs,
         description: "Run `prism tools ...` through PRISM's Rust CLI. Use this when you need PRISM's own tool inventory or diagnostics.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "doctor",
+        root: "doctor",
+        aliases: &["prism_doctor"],
+        kind: CommandToolKind::RootArgs,
+        description: "Run `prism doctor` — a full runtime diagnostic: local setup (binaries, models, venv, credentials) plus platform connectivity (auth, knowledge graph, models, compute, marketplace, local node, policy engine). Use this first when something feels broken before guessing at a fix.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -237,6 +251,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         description: "Install a marketplace tool or workflow into the local PRISM environment. Set `workflow=true` to install a YAML workflow instead of a Python tool.",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "marketplace_find",
+        root: "marketplace",
+        aliases: &[],
+        kind: CommandToolKind::MarketplaceFind,
+        description: "Semantic discovery over the marketplace — find tools/models/datasets by what they do, not by exact name (RBAC-aware cosine search). Use this when marketplace_search's lexical match comes up empty; the marketplace has a long tail (custom predictors, vendor MCPs, user-uploaded skills) not worth listing in the prompt. Optionally restrict by `types` (resource_type values).",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
     },
     CommandToolSpec {
         name: "ingest",
@@ -724,6 +747,51 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
+    CommandToolSpec {
+        name: "billing",
+        root: "billing",
+        aliases: &["prism_billing"],
+        kind: CommandToolKind::RootArgs,
+        description: "Run `prism billing ...` for MARC27 credits: balance, usage, history, prices, or topup. Prefer `billing_balance`/`billing_usage`/`billing_history`/`billing_prices` for the common read-only checks; use this raw form only for `topup`, which opens a real Stripe checkout.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "billing_balance",
+        root: "billing",
+        aliases: &[],
+        kind: CommandToolKind::BillingBalance,
+        description: "Check the current MARC27 credits balance and dollar value for the active org. Use before starting a billable action (goal_start, predict, deploy, ...) so spend is never a surprise.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "billing_usage",
+        root: "billing",
+        aliases: &[],
+        kind: CommandToolKind::BillingUsage,
+        description: "Show credits spent this billing period, broken down by service.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "billing_history",
+        root: "billing",
+        aliases: &[],
+        kind: CommandToolKind::BillingHistory,
+        description: "Show recent MARC27 credit transactions (charges and top-ups) for the active org.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "billing_prices",
+        root: "billing",
+        aliases: &[],
+        kind: CommandToolKind::BillingPrices,
+        description: "Show the current MARC27 credit price sheet (credits per unit and markup) for every metered service.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -951,6 +1019,30 @@ fn marketplace_install_schema() -> Value {
             }
         },
         "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+fn marketplace_find_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Natural-language description of what you're looking for, e.g. \"predict elastic moduli of a Ti-Al alloy\"."
+            },
+            "types": {
+                "type": "array",
+                "description": "Restrict to specific resource_type values (OR'd). Omit to search every type.",
+                "items": { "type": "string" }
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max number of hits to return. Typical: 3-10.",
+                "default": 5
+            }
+        },
+        "required": ["query"],
         "additionalProperties": false
     })
 }
@@ -1543,6 +1635,7 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
             marketplace_query_schema("Marketplace item name to inspect.", true)
         }
         CommandToolKind::MarketplaceInstall => marketplace_install_schema(),
+        CommandToolKind::MarketplaceFind => marketplace_find_schema(),
         CommandToolKind::IngestFile => {
             ingest_schema("File or local path to ingest into PRISM's graph/vector pipeline.")
         }
@@ -1602,6 +1695,10 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::KnowledgePaths => knowledge_paths_schema(),
         CommandToolKind::KnowledgeCorpora => knowledge_corpora_schema(),
         CommandToolKind::KnowledgeIngest => knowledge_ingest_schema(),
+        CommandToolKind::BillingBalance
+        | CommandToolKind::BillingUsage
+        | CommandToolKind::BillingHistory
+        | CommandToolKind::BillingPrices => empty_schema(),
         CommandToolKind::NodeProbe | CommandToolKind::NodeStatus => empty_schema(),
         CommandToolKind::NodeLogs => node_logs_schema(),
         CommandToolKind::MeshDiscover => mesh_discover_schema(),
@@ -2018,6 +2115,26 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args,
             })
         }
+        CommandToolKind::MarketplaceFind => {
+            let mut args = vec!["find".to_string(), required_string(input, "query")?];
+            if let Some(types) = input.get("types").and_then(Value::as_array) {
+                for t in types.iter().filter_map(Value::as_str) {
+                    args.push("--type".to_string());
+                    args.push(t.to_string());
+                }
+            }
+            if let Some(limit) = optional_usize(input, "limit") {
+                args.push("--limit".to_string());
+                args.push(limit.to_string());
+            }
+            // Structured output — this tool is agent-only, never rendered
+            // raw to a human, so always request JSON.
+            args.push("--json".to_string());
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
         CommandToolKind::IngestFile => Ok(CommandExecution::Cli {
             root: spec.root,
             args: build_ingest_args(input, false)?,
@@ -2426,6 +2543,22 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 // the tool call on a resumed multi-hour loop.
                 "--detach".to_string(),
             ],
+        }),
+        CommandToolKind::BillingBalance => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec![],
+        }),
+        CommandToolKind::BillingUsage => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["usage".to_string()],
+        }),
+        CommandToolKind::BillingHistory => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["history".to_string()],
+        }),
+        CommandToolKind::BillingPrices => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["prices".to_string()],
         }),
         CommandToolKind::ComputeSubmit => {
             let mut args = vec![
@@ -3140,6 +3273,85 @@ mod tests {
 
         // Missing goal → honest arg error, no execution.
         assert!(build_execution(spec_by_name("goal_start").unwrap(), &json!({})).is_err());
+    }
+
+    #[test]
+    fn doctor_is_a_read_only_command_tool() {
+        // Parity drain (GAP-A #5): the agent had no self-diagnostic tool.
+        assert!(is_command_tool("doctor"));
+        assert_eq!(command_tool_requires_approval("doctor"), Some(false));
+        let preview = command_tool_preview("doctor", &json!({})).expect("doctor preview renders");
+        assert_eq!(preview, "prism doctor");
+    }
+
+    #[test]
+    fn marketplace_find_is_semantic_discovery_and_always_requests_json() {
+        // Parity drain (GAP-A #4): marketplace's semantic-discovery verb had
+        // no agent tool, even though its own CLI help says "useful from
+        // agent tools" and ships a --json flag for exactly this caller.
+        assert!(is_command_tool("marketplace_find"));
+        assert_eq!(
+            command_tool_requires_approval("marketplace_find"),
+            Some(false)
+        );
+
+        let preview = command_tool_preview(
+            "marketplace_find",
+            &json!({
+                "query": "predict elastic moduli of a Ti-Al alloy",
+                "types": ["model", "tool"],
+                "limit": 3
+            }),
+        )
+        .expect("preview renders");
+        assert!(preview.starts_with("prism marketplace find"), "{preview}");
+        assert!(preview.contains("--type model"), "{preview}");
+        assert!(preview.contains("--type tool"), "{preview}");
+        assert!(preview.contains("--limit 3"), "{preview}");
+        assert!(preview.contains("--json"), "{preview}");
+
+        // Missing query → honest arg error, no execution.
+        assert!(build_execution(spec_by_name("marketplace_find").unwrap(), &json!({})).is_err());
+    }
+
+    #[test]
+    fn billing_read_tools_are_free_and_unapproved() {
+        // Parity drain (GAP-A #3): the agent could not check spend before a
+        // billable op. These four are pure reads — no approval gate.
+        for name in [
+            "billing_balance",
+            "billing_usage",
+            "billing_history",
+            "billing_prices",
+        ] {
+            assert!(is_command_tool(name), "{name} must be registered");
+            assert_eq!(
+                command_tool_requires_approval(name),
+                Some(false),
+                "{name} is read-only and must not require approval"
+            );
+        }
+
+        assert_eq!(
+            command_tool_preview("billing_balance", &json!({})).unwrap(),
+            "prism billing"
+        );
+        assert_eq!(
+            command_tool_preview("billing_usage", &json!({})).unwrap(),
+            "prism billing usage"
+        );
+        assert_eq!(
+            command_tool_preview("billing_history", &json!({})).unwrap(),
+            "prism billing history"
+        );
+        assert_eq!(
+            command_tool_preview("billing_prices", &json!({})).unwrap(),
+            "prism billing prices"
+        );
+
+        // The raw `billing` root-args tool can reach `topup`, which spends
+        // real money via a Stripe checkout — that one stays approval-gated.
+        assert_eq!(command_tool_requires_approval("billing"), Some(true));
     }
 
     #[test]
