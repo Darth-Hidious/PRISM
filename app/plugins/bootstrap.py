@@ -81,12 +81,19 @@ def build_full_registry(
     # VISUALIZE_SKILL Tool registrations. See app/tools/dataset.py.
     create_dataset_tool(registry)
 
-    # Stateful tool memory — auto-record meaningful tool outputs as artifacts
-    # and expose recall/fetch/list as tools. Opt-out via PRISM_DISABLE_MEMORY=1
-    # for tests or memory-free CLI modes. The artifact store + recorder are
-    # always graceful: any failure inside record_if_enabled is logged and the
-    # original tool result passes through unchanged. See
-    # docs/stateful_tools_2026.md for the architecture.
+    # Stateful tool memory — search/fetch/list over the artifact store.
+    # Opt-out via PRISM_DISABLE_MEMORY=1 for tests or memory-free CLI modes.
+    #
+    # One-memory-spine consolidation (2026-07): the Rust provenance store
+    # (~/.prism/provenance.db, written by the agent's after-hook for EVERY
+    # tool call, surfaced via the `recall` meta-tool + trajectory injection)
+    # is the canonical recorder. Duplicate artifact RECORDING here is
+    # therefore off by default — the store stays configured read-only so
+    # search_artifacts/fetch_artifact/list_artifacts keep serving historical
+    # artifacts. Re-enable the duplicate writer with PRISM_ARTIFACT_RECORDING=1
+    # (e.g. to compare recall quality). The recorder stays graceful either
+    # way: any failure inside record_if_enabled is logged and the original
+    # tool result passes through unchanged. See docs/stateful_tools_2026.md.
     import os as _os
 
     if _os.environ.get("PRISM_DISABLE_MEMORY", "").strip().lower() not in {
@@ -103,8 +110,11 @@ def build_full_registry(
                 default_db_path,
             )
 
+            _record = _os.environ.get(
+                "PRISM_ARTIFACT_RECORDING", ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
             _store = ArtifactStore(default_db_path())
-            _configure_memory(store=_store)
+            _configure_memory(store=_store, record_enabled=_record)
             create_memory_tools(registry)
         except Exception as e:
             logger.warning("memory subsystem disabled: %s", e)

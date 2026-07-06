@@ -110,6 +110,12 @@ _CONFIG: dict[str, Any] = {
     "embedder": None,
     "session_id": None,
     "embed_async": True,
+    # Whether record_if_enabled actually WRITES. A configured store with
+    # record_enabled=False serves reads (search/fetch/list over historical
+    # artifacts) without duplicating new outputs — the Rust provenance store
+    # (~/.prism/provenance.db, written by the agent's after-hook) is the
+    # canonical recorder since the 2026-07 one-memory-spine consolidation.
+    "record_enabled": True,
 }
 
 
@@ -122,14 +128,16 @@ def configure(
     embedder: Optional[Embedder] = None,
     session_id: Optional[str] = None,
     embed_async: Any = _UNSET,
+    record_enabled: Any = _UNSET,
 ) -> None:
     """Set the recorder's runtime configuration.
 
     Each parameter is independently set-or-leave. Passing `None` means
-    "leave unchanged" for store/embedder/session_id; for `embed_async`,
-    the sentinel `_UNSET` is used instead of None because False is a
-    valid value. Called once by bootstrap, may be called again to
-    update specific fields (e.g. switch session_id mid-run).
+    "leave unchanged" for store/embedder/session_id; for `embed_async`
+    and `record_enabled`, the sentinel `_UNSET` is used instead of None
+    because False is a valid value. Called once by bootstrap, may be
+    called again to update specific fields (e.g. switch session_id
+    mid-run).
     """
     with _LOCK:
         if store is not None:
@@ -140,6 +148,8 @@ def configure(
             _CONFIG["session_id"] = session_id
         if embed_async is not _UNSET:
             _CONFIG["embed_async"] = bool(embed_async)
+        if record_enabled is not _UNSET:
+            _CONFIG["record_enabled"] = bool(record_enabled)
 
 
 def is_configured() -> bool:
@@ -172,6 +182,7 @@ def reset() -> None:
         _CONFIG["embedder"] = None
         _CONFIG["session_id"] = None
         _CONFIG["embed_async"] = True
+        _CONFIG["record_enabled"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +241,7 @@ def record_if_enabled(
     must NEVER raise.
     """
     store = _CONFIG["store"]
-    if store is None:
+    if store is None or not _CONFIG["record_enabled"]:
         return result
     if not should_record(result, tool_name=tool_name):
         return result

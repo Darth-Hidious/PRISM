@@ -240,6 +240,42 @@ def test_memory_tools_opt_out(memory_env):
 
 
 # ---------------------------------------------------------------------------
+# Scenario 4b: record_enabled=False → reads work, writes don't (one-spine mode)
+# ---------------------------------------------------------------------------
+
+def test_record_disabled_serves_reads_only(memory_env):
+    """One-memory-spine mode (the bootstrap default since 2026-07): the store
+    is configured for READS (historical artifacts stay searchable/fetchable)
+    but new tool outputs are NOT duplicated here — the Rust provenance store
+    is the canonical recorder."""
+    registry, store = memory_env
+
+    # Seed one artifact while recording is on (the "historical" artifact).
+    _register_dummy_tool(registry, "seed",
+                         {"results": [{"a": i, "padding": "x" * 30} for i in range(20)]})
+    seeded = registry.get("seed").execute()
+    assert "_artifact_id" in seeded
+
+    # Flip to read-only mode — same store stays configured.
+    configure_memory(record_enabled=False)
+
+    # A recording-eligible result must pass through unrecorded…
+    _register_dummy_tool(registry, "post_cutover",
+                         {"results": [{"b": i, "padding": "y" * 30} for i in range(20)]})
+    r = registry.get("post_cutover").execute()
+    assert "_artifact_id" not in r, "record_enabled=False must not write artifacts"
+    assert len(store.list_artifacts(session_id="test-session")) == 1
+
+    # …while the historical artifact remains fully readable via the tools
+    # (fetch_artifact returns the artifact row itself).
+    fetched = registry.get("fetch_artifact").execute(
+        artifact_id=seeded["_artifact_id"])
+    assert fetched.get("artifact_id") == seeded["_artifact_id"], (
+        f"historical artifact must stay fetchable: {fetched}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Scenario 5: graceful degradation when memory is not configured
 # ---------------------------------------------------------------------------
 
