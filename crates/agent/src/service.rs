@@ -243,6 +243,68 @@ impl ChatService {
             .collect::<Vec<_>>()
     }
 
+    /// Execute one named tool once — deterministically, with no LLM and no
+    /// conversation. This is the *same* execution surface the agent loop
+    /// uses for a single tool call: command-tool dispatch first (Rust CLI
+    /// shellouts + workflow ops), otherwise the Python/MCP tool server. The
+    /// result is byte-for-byte what the tool would return mid-chat, minus
+    /// the model deciding to call it.
+    ///
+    /// Two consumers share this executor:
+    ///   1. the platform→node tool-call relay (`PlatformMessage::InvokeTool`),
+    ///      where a remote principal runs an owner's local tool through the
+    ///      node, and
+    ///   2. `POST /api/tools/{name}/run`, which workflow `action: tool` steps
+    ///      call.
+    ///
+    /// `caller` is the real principal on whose behalf the tool runs. Node
+    /// reachability/visibility is authorized upstream (the platform relay
+    /// gate, or the HTTP auth+RBAC stack); this method records the caller for
+    /// audit but does not itself re-derive authorization.
+    ///
+    /// Meta-tools (`recall` / `find_tools`) operate on live agent/session
+    /// state and have no meaning as a one-shot relayed call, so they are
+    /// rejected honestly rather than returning a fabricated empty result.
+    pub async fn invoke_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        caller: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        if crate::meta_tools::is_meta_tool(name) {
+            anyhow::bail!(
+                "'{name}' is a meta-tool that operates on live agent state; \
+                 it is not invocable through the single-tool executor"
+            );
+        }
+
+        tracing::info!(
+            tool = %name,
+            caller = caller.unwrap_or("<unspecified>"),
+            "invoke_tool: single-tool execution"
+        );
+
+        let mut inner = self.inner.lock().await;
+        let ChatInner {
+            tool_server,
+            command_tool_runtime,
+            policy,
+            ..
+        } = &mut *inner;
+
+        if crate::command_tools::is_command_tool(name) {
+            crate::command_tools::execute_command_tool(
+                command_tool_runtime,
+                name,
+                &args,
+                policy.as_mut(),
+            )
+            .await
+        } else {
+            tool_server.call_tool(name, args).await.map_err(Into::into)
+        }
+    }
+
     /// Run one user turn through `agent_loop::run_turn` — the same entry
     /// point the TUI backend dispatches through. Events stream into
     /// `events` as the turn progresses; the final `done`/`error` event is

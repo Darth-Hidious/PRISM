@@ -2247,6 +2247,34 @@ async fn main() -> Result<()> {
                 }
                 println!();
 
+                // ── Tool-call relay executor ──────────────────────────────
+                // The daemon (prism-node) stays thin: it forwards each relayed
+                // `InvokeTool` over this channel. Here — where we own the
+                // ChatService — we run the named tool through the SAME executor
+                // the agent loop uses (`invoke_tool`) and reply. This is the
+                // "someone in Poland runs a tool on my Mac through the node"
+                // path: platform gates node visibility, the tool runs locally,
+                // the real caller is propagated for audit.
+                let (tool_invoke_tx, mut tool_invoke_rx) =
+                    tokio::sync::mpsc::channel::<prism_node::daemon::ToolInvocationRequest>(32);
+                let relay_state = server_state.clone();
+                tokio::spawn(async move {
+                    while let Some(req) = tool_invoke_rx.recv().await {
+                        let caller = req.caller_user_id.to_string();
+                        let result = match relay_state.chat.get() {
+                            Some(chat) => chat
+                                .invoke_tool(&req.tool, req.args, Some(caller.as_str()))
+                                .await
+                                .map_err(|e| e.to_string()),
+                            None => Err("tool executor not ready \
+                                 (chat service still starting, or node has no LLM configured)"
+                                .to_string()),
+                        };
+                        // Receiver gone (daemon task cancelled / timed out) is fine.
+                        let _ = req.reply.send(result);
+                    }
+                });
+
                 // ── V1: Run the platform daemon (heartbeat, job dispatch) ──
                 let daemon_options = prism_node::daemon::DaemonOptions {
                     name: node_name,
@@ -2265,6 +2293,7 @@ async fn main() -> Result<()> {
                     rbac_db_path: daemon_rbac_db_path,
                     org_id: daemon_org_id,
                     offline,
+                    tool_invoker: Some(tool_invoke_tx),
                 };
 
                 // ── Start mesh networking (mDNS discovery + optional broadcast) ──

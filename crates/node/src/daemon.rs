@@ -45,6 +45,27 @@ pub struct DaemonOptions {
     /// `prism node up --offline` and for local two-node mesh tests
     /// where the platform isn't reachable.
     pub offline: bool,
+    /// Sink for relayed tool invocations ([`PlatformMessage::InvokeTool`]).
+    /// `Some` when the node runs a local tool executor (the ChatService owned
+    /// by the CLI); `None` (e.g. no LLM configured) makes `InvokeTool` fail
+    /// honestly with "no local tool executor". Keeping this a channel keeps
+    /// the daemon crate thin — it never links the agent/tool crates.
+    pub tool_invoker: Option<mpsc::Sender<ToolInvocationRequest>>,
+}
+
+/// A single tool invocation relayed from the platform to the node's local
+/// executor. The daemon hands one of these to the CLI-owned ChatService (which
+/// actually runs the tool) and awaits the reply, then answers the platform with
+/// [`NodeMessage::ToolInvokeResult`].
+#[derive(Debug)]
+pub struct ToolInvocationRequest {
+    pub tool: String,
+    pub args: serde_json::Value,
+    /// Real principal the tool runs on behalf of — propagated for audit.
+    pub caller_user_id: Uuid,
+    /// One-shot result: `Ok(value)` on success, `Err(message)` with an honest
+    /// error otherwise. A dropped sender surfaces as an executor error.
+    pub reply: tokio::sync::oneshot::Sender<std::result::Result<serde_json::Value, String>>,
 }
 
 impl Default for DaemonOptions {
@@ -62,6 +83,7 @@ impl Default for DaemonOptions {
             rbac_db_path: None,
             org_id: None,
             offline: false,
+            tool_invoker: None,
         }
     }
 }
@@ -251,6 +273,7 @@ pub async fn run_daemon(
             platform_node_id.as_deref(),
             rbac_db_path.as_deref(),
             rbac_org_id.as_deref(),
+            options.tool_invoker.as_ref(),
         )
         .await
         {
@@ -437,6 +460,7 @@ async fn connect_and_run(
     platform_node_id: Option<&str>,
     rbac_db_path: Option<&Path>,
     rbac_org_id: Option<&str>,
+    tool_invoker: Option<&mpsc::Sender<ToolInvocationRequest>>,
 ) -> Result<ShutdownReason> {
     let url = format!("{}?token={}", endpoints.node_ws, token);
     tracing::info!(url = %endpoints.node_ws, "connecting to platform");
@@ -576,6 +600,7 @@ async fn connect_and_run(
                             &active_jobs,
                             &running_jobs,
                             &running_deployments,
+                            tool_invoker,
                         ).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -609,6 +634,7 @@ async fn handle_platform_message(
     active_jobs: &Arc<AtomicU32>,
     running_jobs: &RunningJobs,
     running_deployments: &RunningDeployments,
+    tool_invoker: Option<&mpsc::Sender<ToolInvocationRequest>>,
 ) {
     let msg: PlatformMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -872,6 +898,94 @@ async fn handle_platform_message(
                 )
                 .await;
             }
+        }
+        PlatformMessage::InvokeTool {
+            invocation_id,
+            tool,
+            args,
+            caller_user_id,
+            timeout_secs,
+        } => {
+            tracing::info!(
+                %invocation_id, %tool, %caller_user_id,
+                "tool invocation relayed from platform"
+            );
+
+            // No local executor (e.g. node started without an LLM → no
+            // ChatService). Fail honestly rather than pretend the tool ran.
+            let Some(invoker) = tool_invoker.cloned() else {
+                send_msg(
+                    outgoing_tx,
+                    &NodeMessage::ToolInvokeResult {
+                        invocation_id,
+                        ok: false,
+                        result: serde_json::json!({
+                            "error": "node has no local tool executor \
+                                      (chat/tools not enabled on this node)"
+                        }),
+                    },
+                )
+                .await;
+                return;
+            };
+
+            // Bound the wait: honour the platform's request but never block the
+            // daemon loop. Run in a task so heartbeats and other messages keep
+            // flowing while the tool executes (same as container jobs).
+            let timeout = Duration::from_secs(timeout_secs.clamp(1, 600));
+            let tx = outgoing_tx.clone();
+            tokio::spawn(async move {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let request = ToolInvocationRequest {
+                    tool,
+                    args,
+                    caller_user_id,
+                    reply: reply_tx,
+                };
+                if invoker.send(request).await.is_err() {
+                    send_msg(
+                        &tx,
+                        &NodeMessage::ToolInvokeResult {
+                            invocation_id,
+                            ok: false,
+                            result: serde_json::json!({
+                                "error": "local tool executor unavailable"
+                            }),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+
+                let (ok, result) = match tokio::time::timeout(timeout, reply_rx).await {
+                    Ok(Ok(Ok(value))) => (true, value),
+                    Ok(Ok(Err(message))) => (false, serde_json::json!({ "error": message })),
+                    Ok(Err(_)) => (
+                        false,
+                        serde_json::json!({
+                            "error": "tool executor dropped the request without replying"
+                        }),
+                    ),
+                    Err(_) => (
+                        false,
+                        serde_json::json!({
+                            "error": format!(
+                                "tool invocation timed out after {}s", timeout.as_secs()
+                            )
+                        }),
+                    ),
+                };
+
+                send_msg(
+                    &tx,
+                    &NodeMessage::ToolInvokeResult {
+                        invocation_id,
+                        ok,
+                        result,
+                    },
+                )
+                .await;
+            });
         }
     }
 }
@@ -1988,5 +2102,134 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("POST /deploy "));
         assert!(requests[1].starts_with("DELETE /deploy/"));
+    }
+
+    fn test_paths(tmp: &TempDir) -> PrismPaths {
+        PrismPaths {
+            config_dir: tmp.path().join("config"),
+            cache_dir: tmp.path().join("cache"),
+            data_dir: tmp.path().join("data"),
+            state_dir: tmp.path().join("state"),
+        }
+    }
+
+    /// Relay happy path: an `InvokeTool` message is forwarded to the executor
+    /// channel, and the executor's reply comes back as a `ToolInvokeResult`
+    /// carrying the real result — verified against a distinctive value so a
+    /// canned/echoed response could not pass by accident.
+    #[tokio::test]
+    async fn invoke_tool_relay_forwards_to_executor_and_replies() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let active_jobs = Arc::new(AtomicU32::new(0));
+        let running_jobs: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        let running_deployments: RunningDeployments = Arc::new(Mutex::new(HashMap::new()));
+
+        // Fake executor: proves the caller + args actually reach it by echoing
+        // them back in the result, rather than returning a fixed constant.
+        let (inv_tx, mut inv_rx) = mpsc::channel::<ToolInvocationRequest>(4);
+        tokio::spawn(async move {
+            while let Some(req) = inv_rx.recv().await {
+                let echoed = serde_json::json!({
+                    "tool": req.tool,
+                    "args": req.args,
+                    "ran_as": req.caller_user_id.to_string(),
+                });
+                let _ = req.reply.send(Ok(echoed));
+            }
+        });
+
+        let invocation_id = Uuid::new_v4();
+        let caller = Uuid::new_v4();
+        let msg = PlatformMessage::InvokeTool {
+            invocation_id,
+            tool: "evaluate_material".into(),
+            args: serde_json::json!({"formula": "Fe2O3"}),
+            caller_user_id: caller,
+            timeout_secs: 30,
+        };
+        let text = serde_json::to_string(&msg).unwrap();
+
+        handle_platform_message(
+            &paths,
+            &text,
+            &tx,
+            &active_jobs,
+            &running_jobs,
+            &running_deployments,
+            Some(&inv_tx),
+        )
+        .await;
+
+        let reply: NodeMessage =
+            serde_json::from_str(&rx.recv().await.expect("a reply must be sent")).unwrap();
+        match reply {
+            NodeMessage::ToolInvokeResult {
+                invocation_id: id,
+                ok,
+                result,
+            } => {
+                assert_eq!(id, invocation_id);
+                assert!(ok, "executor returned Ok, so ok must be true");
+                assert_eq!(result["tool"], "evaluate_material");
+                assert_eq!(result["args"]["formula"], "Fe2O3");
+                assert_eq!(result["ran_as"], caller.to_string());
+            }
+            other => panic!("expected ToolInvokeResult, got {other:?}"),
+        }
+    }
+
+    /// A node with no local executor (no ChatService — e.g. no LLM configured)
+    /// must fail the relay honestly instead of fabricating a result.
+    #[tokio::test]
+    async fn invoke_tool_relay_without_executor_fails_honestly() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let active_jobs = Arc::new(AtomicU32::new(0));
+        let running_jobs: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        let running_deployments: RunningDeployments = Arc::new(Mutex::new(HashMap::new()));
+
+        let invocation_id = Uuid::new_v4();
+        let msg = PlatformMessage::InvokeTool {
+            invocation_id,
+            tool: "evaluate_material".into(),
+            args: serde_json::json!({}),
+            caller_user_id: Uuid::new_v4(),
+            timeout_secs: 30,
+        };
+        let text = serde_json::to_string(&msg).unwrap();
+
+        handle_platform_message(
+            &paths,
+            &text,
+            &tx,
+            &active_jobs,
+            &running_jobs,
+            &running_deployments,
+            None, // no executor wired
+        )
+        .await;
+
+        let reply: NodeMessage =
+            serde_json::from_str(&rx.recv().await.expect("a reply must be sent")).unwrap();
+        match reply {
+            NodeMessage::ToolInvokeResult {
+                invocation_id: id,
+                ok,
+                result,
+            } => {
+                assert_eq!(id, invocation_id);
+                assert!(!ok, "no executor → must not report success");
+                assert!(
+                    result["error"]
+                        .as_str()
+                        .is_some_and(|e| e.contains("no local tool executor")),
+                    "error must honestly name the missing executor, got {result}"
+                );
+            }
+            other => panic!("expected ToolInvokeResult, got {other:?}"),
+        }
     }
 }

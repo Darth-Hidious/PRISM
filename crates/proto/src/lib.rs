@@ -188,6 +188,14 @@ pub enum NodeMessage {
         deployment_id: Uuid,
         reason: String,
     },
+    /// Result of a relayed tool invocation ([`PlatformMessage::InvokeTool`]).
+    ToolInvokeResult {
+        invocation_id: Uuid,
+        /// False when the tool errored, RBAC denied the caller, or the node
+        /// could not run it — `result` then carries the honest error.
+        ok: bool,
+        result: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -219,6 +227,18 @@ pub enum PlatformMessage {
     },
     StopDeployment {
         deployment_id: Uuid,
+    },
+    /// Invoke a tool registered on this node (the tool-call relay). The node
+    /// runs it via its LOCAL tool runner AS `caller_user_id` (node-side RBAC
+    /// and audit see the real principal) and answers with
+    /// [`NodeMessage::ToolInvokeResult`].
+    InvokeTool {
+        invocation_id: Uuid,
+        tool: String,
+        #[serde(default)]
+        args: serde_json::Value,
+        caller_user_id: Uuid,
+        timeout_secs: u64,
     },
     Ping,
     Error {
@@ -542,6 +562,51 @@ mod tests {
         } else {
             panic!("expected SubmitJob");
         }
+    }
+
+    #[test]
+    fn platform_message_invoke_tool_roundtrip() {
+        let msg = PlatformMessage::InvokeTool {
+            invocation_id: Uuid::new_v4(),
+            tool: "evaluate_material".into(),
+            args: serde_json::json!({"formula": "Fe2O3"}),
+            caller_user_id: Uuid::new_v4(),
+            timeout_secs: 60,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: PlatformMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "invoke_tool");
+        // args defaults to null when omitted on the wire.
+        let no_args = r#"{"type":"invoke_tool","invocation_id":"00000000-0000-0000-0000-000000000000","tool":"status","caller_user_id":"00000000-0000-0000-0000-000000000000","timeout_secs":30}"#;
+        let parsed: PlatformMessage = serde_json::from_str(no_args).unwrap();
+        if let PlatformMessage::InvokeTool { args, .. } = parsed {
+            assert!(args.is_null());
+        } else {
+            panic!("expected InvokeTool");
+        }
+    }
+
+    #[test]
+    fn node_message_tool_invoke_result_roundtrip() {
+        let ok = NodeMessage::ToolInvokeResult {
+            invocation_id: Uuid::new_v4(),
+            ok: true,
+            result: serde_json::json!({"energy": -5.3411}),
+        };
+        let json = serde_json::to_string(&ok).unwrap();
+        let back: NodeMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ok);
+
+        let err = NodeMessage::ToolInvokeResult {
+            invocation_id: Uuid::new_v4(),
+            ok: false,
+            result: serde_json::json!({"error": "unknown tool 'foo'"}),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let back: NodeMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, err);
     }
 
     #[test]

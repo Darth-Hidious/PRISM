@@ -145,6 +145,11 @@ async fn main() -> Result<()> {
                 rbac_db_path: None,
                 org_id: None,
                 offline: false,
+                // Standalone daemon has no in-process ChatService, so tool
+                // relay is honestly unavailable here (InvokeTool → "no local
+                // tool executor"). The rich path is `prism node up` (CLI),
+                // which owns the executor and wires this.
+                tool_invoker: None,
             };
 
             prism_node::daemon::run_daemon(&endpoints, &paths, options).await?;
