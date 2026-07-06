@@ -278,37 +278,45 @@ impl ChatService {
         caller: Option<&str>,
         approve: bool,
     ) -> Result<serde_json::Value> {
-        if crate::meta_tools::is_meta_tool(name) {
-            anyhow::bail!(
+        // Pre-execution rejections. Computed (not early-returned) so REFUSALS
+        // reach the audit trail below — a denied attempt is at least as
+        // audit-worthy as a successful run.
+        let rejection: Option<String> = if crate::meta_tools::is_meta_tool(name) {
+            Some(format!(
                 "'{name}' is a meta-tool that operates on live agent state; \
                  it is not invocable through the single-tool executor"
-            );
-        }
-
-        // Approval gate. Catalog lookup covers Python + offered command tools;
-        // the command-tool fallback covers specs hidden from the catalog
-        // (hidden ≠ unexecutable — see LOCAL_NODE_TOOLS).
-        let gated = self
-            .tools
-            .find(name)
-            .map(|tool| tool.requires_approval)
-            .or_else(|| crate::command_tools::command_tool_requires_approval(name));
-        if gated == Some(true) && !approve {
-            anyhow::bail!(
-                "'{name}' is approval-gated and cannot run through the \
-                 single-tool executor without explicit approval \
-                 (pass approve=true from an authenticated local caller; \
-                 remote relay callers cannot approve)"
-            );
-        }
+            ))
+        } else {
+            // Approval gate. Catalog lookup covers Python + offered command
+            // tools; the command-tool fallback covers specs hidden from the
+            // catalog (hidden ≠ unexecutable — see LOCAL_NODE_TOOLS).
+            let gated = self
+                .tools
+                .find(name)
+                .map(|tool| tool.requires_approval)
+                .or_else(|| crate::command_tools::command_tool_requires_approval(name));
+            if gated == Some(true) && !approve {
+                Some(format!(
+                    "'{name}' is approval-gated and cannot run through the \
+                     single-tool executor without explicit approval \
+                     (pass approve=true from an authenticated local caller; \
+                     remote relay callers cannot approve)"
+                ))
+            } else {
+                None
+            }
+        };
 
         tracing::info!(
             tool = %name,
             caller = caller.unwrap_or("<unspecified>"),
+            refused = rejection.is_some(),
             "invoke_tool: single-tool execution"
         );
 
-        let result = {
+        let result = if let Some(message) = rejection {
+            Err(anyhow::anyhow!(message))
+        } else {
             let mut inner = self.inner.lock().await;
             let ChatInner {
                 tool_server,
@@ -353,6 +361,11 @@ impl ChatService {
             record.tags = vec![
                 "single-tool-executor".to_string(),
                 format!("caller:{}", caller.unwrap_or("unspecified")),
+                if result.is_ok() {
+                    "outcome:ok".to_string()
+                } else {
+                    "outcome:error".to_string()
+                },
             ];
             let db_path = dirs::home_dir()
                 .map(|h| h.join(".prism/provenance.db"))
