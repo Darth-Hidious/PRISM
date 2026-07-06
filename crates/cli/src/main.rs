@@ -3932,6 +3932,32 @@ fn render_workflow_result(spec: &WorkflowSpec, result: &WorkflowRunResult) {
             "{}\t{}\t{}\t{}",
             step.id, step.action, step.status, step.summary
         );
+        // Surface the tool's REAL output for completed steps — a compute step
+        // that only prints "HTTP 200" hides the very result the run exists to
+        // produce. The node wraps it as {status_code, output:{tool, result}};
+        // show `result` compactly so `workflow run --execute` is self-evidently
+        // real (and legible in a recording), not a silent success.
+        if let Some(out) = step
+            .data
+            .get("output")
+            .and_then(|o| o.get("result"))
+            .filter(|r| !r.is_null())
+        {
+            let rendered = match out.as_str() {
+                Some(s) => s.to_string(),
+                None => serde_json::to_string(out).unwrap_or_default(),
+            };
+            let trimmed = rendered.trim();
+            if !trimmed.is_empty() {
+                let shown: String = trimmed.chars().take(600).collect();
+                let ellipsis = if trimmed.chars().count() > 600 {
+                    " …"
+                } else {
+                    ""
+                };
+                println!("    ↳ {shown}{ellipsis}");
+            }
+        }
     }
 }
 
