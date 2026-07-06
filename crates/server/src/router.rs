@@ -143,6 +143,8 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
             get(handlers::deployments::get_deployment),
         );
     let goal_workflow_exec_routes = Router::new()
+        .route("/api/goals", post(handlers::goals::create_goal))
+        .route("/api/goals/{id}/resume", post(handlers::goals::resume_goal))
         .route(
             "/api/workflows/{name}/run",
             post(handlers::workflows::run_workflow),

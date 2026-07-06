@@ -2399,6 +2399,11 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                     args.push(list);
                 }
             }
+            // Long-research semantics: the tool call returns the goal id
+            // immediately; a detached worker owns the loop and the agent
+            // polls goal_status across turns. A blocking multi-hour tool
+            // call would freeze the whole conversation.
+            args.push("--detach".to_string());
             Ok(CommandExecution::Cli {
                 root: spec.root,
                 args,
@@ -2414,7 +2419,13 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
         }),
         CommandToolKind::GoalResume => Ok(CommandExecution::Cli {
             root: spec.root,
-            args: vec!["resume".to_string(), required_string(input, "id")?],
+            args: vec![
+                "resume".to_string(),
+                required_string(input, "id")?,
+                // Same long-research semantics as goal_start: never block
+                // the tool call on a resumed multi-hour loop.
+                "--detach".to_string(),
+            ],
         }),
         CommandToolKind::ComputeSubmit => {
             let mut args = vec![
@@ -3116,10 +3127,16 @@ mod tests {
         assert!(preview.contains("--max-iterations 20"), "{preview}");
         assert!(preview.contains("--budget 5"), "{preview}");
         assert!(preview.contains("--approval-gates 10"), "{preview}");
+        // Long-research semantics: goal tools NEVER block the tool call.
+        assert!(preview.contains("--detach"), "{preview}");
 
         let status = command_tool_preview("goal_status", &json!({"id": "camp_abc"}))
             .expect("status preview");
         assert_eq!(status, "prism campaign status camp_abc");
+
+        let resume = command_tool_preview("goal_resume", &json!({"id": "camp_abc"}))
+            .expect("resume preview");
+        assert_eq!(resume, "prism campaign resume camp_abc --detach");
 
         // Missing goal → honest arg error, no execution.
         assert!(build_execution(spec_by_name("goal_start").unwrap(), &json!({})).is_err());

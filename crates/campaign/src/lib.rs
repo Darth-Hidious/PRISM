@@ -761,7 +761,12 @@ impl Campaign {
     }
 
     /// Save campaign state to a checkpoint file.
-    fn checkpoint(&mut self) -> Result<()> {
+    /// Persist current state to the checkpoint file. Public so a caller can
+    /// write the INITIAL checkpoint before detaching the loop into a
+    /// background process — the goal id must exist on disk (and thus at
+    /// `GET /api/goals`) the moment `--detach` returns, not only after the
+    /// first `checkpoint_every` iterations.
+    pub fn checkpoint(&mut self) -> Result<()> {
         self.state.last_checkpoint_at = Utc::now().to_rfc3339();
         if let Some(parent) = self.checkpoint_path.parent() {
             std::fs::create_dir_all(parent)?;

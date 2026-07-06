@@ -544,10 +544,25 @@ enum CampaignCommands {
         /// Pause for human approval at these iterations (comma-separated).
         #[arg(long)]
         approval_gates: Option<String>,
+        /// Detach: write the initial checkpoint, hand the loop to a
+        /// background process, and return the goal id immediately. Poll with
+        /// `campaign status` / GET /api/goals.
+        #[arg(long)]
+        detach: bool,
     },
     /// Resume a paused campaign from its checkpoint.
     Resume {
         /// Campaign ID to resume.
+        id: String,
+        /// Detach: hand the resumed loop to a background process and return
+        /// immediately.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Continue a campaign loop in the foreground from its checkpoint
+    /// (the worker half of `--detach`; also usable directly).
+    Continue {
+        /// Campaign ID to continue.
         id: String,
     },
     /// Show the status of a campaign (from its checkpoint).
@@ -1378,6 +1393,7 @@ async fn main() -> Result<()> {
                     budget,
                     checkpoint_every,
                     approval_gates,
+                    detach,
                 } => {
                     let elements_vec = elements
                         .as_ref()
@@ -1430,21 +1446,68 @@ async fn main() -> Result<()> {
                     println!();
 
                     let mut campaign = Campaign::new(campaign_goal, config, campaign_id.clone());
-                    let result = campaign.run().await?;
 
-                    println!("\n{}", result.summary);
-                    println!("\nCheckpoint: ~/.prism/campaigns/{campaign_id}.json");
+                    if detach {
+                        // Long-research mode: the goal id must exist on disk
+                        // (and thus at GET /api/goals) before we return, then
+                        // a background worker owns the loop. The caller —
+                        // agent tool, HTTP endpoint, or a human — polls
+                        // `campaign status` instead of blocking for hours.
+                        campaign.checkpoint()?;
+                        spawn_campaign_worker(&campaign_id)?;
+                        println!("Detached: {campaign_id}");
+                        println!("Checkpoint: ~/.prism/campaigns/{campaign_id}.json");
+                        println!("Poll: prism campaign status {campaign_id}");
+                    } else {
+                        let result = campaign.run().await?;
+                        println!("\n{}", result.summary);
+                        println!("\nCheckpoint: ~/.prism/campaigns/{campaign_id}.json");
+                    }
                 }
-                CampaignCommands::Resume { id } => {
+                CampaignCommands::Resume { id, detach } => {
                     let home = std::env::var("HOME").unwrap_or_default();
                     let path = PathBuf::from(&home)
                         .join(".prism")
                         .join("campaigns")
                         .join(format!("{id}.json"));
                     let mut campaign = Campaign::from_checkpoint(&path)?;
-                    println!("Resuming campaign: {id}");
-                    let result = campaign.resume().await?;
-                    println!("\n{}", result.summary);
+                    if detach {
+                        // Validate resumability BEFORE detaching so the
+                        // caller gets the honest error, not a dead worker.
+                        if campaign.state().completed {
+                            anyhow::bail!(
+                                "campaign '{id}' is completed ({}) — nothing to resume",
+                                campaign.state().completion_reason
+                            );
+                        }
+                        spawn_campaign_worker(&id)?;
+                        println!("Detached: {id}");
+                        println!("Poll: prism campaign status {id}");
+                    } else {
+                        println!("Resuming campaign: {id}");
+                        let result = campaign.resume().await?;
+                        println!("\n{}", result.summary);
+                    }
+                }
+                CampaignCommands::Continue { id } => {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let path = PathBuf::from(&home)
+                        .join(".prism")
+                        .join("campaigns")
+                        .join(format!("{id}.json"));
+                    let mut campaign = Campaign::from_checkpoint(&path)?;
+                    if campaign.state().completed {
+                        println!(
+                            "Campaign '{id}' already completed: {}",
+                            campaign.state().completion_reason
+                        );
+                    } else if campaign.state().paused {
+                        let result = campaign.resume().await?;
+                        println!("\n{}", result.summary);
+                    } else {
+                        let result = campaign.run().await?;
+                        println!("\n{}", result.summary);
+                    }
                 }
                 CampaignCommands::Status { id } => {
                     let home = std::env::var("HOME").unwrap_or_default();
@@ -6785,6 +6848,34 @@ async fn create_dashboard_session_for_user(
 
     let session: DashboardSessionResponse = resp.json().await?;
     Ok(session.session_id)
+}
+
+/// Spawn the detached background worker that owns a campaign loop:
+/// `prism campaign continue <id>` with stdio detached, in its own process
+/// group so it survives the parent CLI (or an agent tool call) exiting. The
+/// checkpoint file is the only communication channel — the worker updates
+/// it, everyone else polls it.
+fn spawn_campaign_worker(campaign_id: &str) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to locate current prism executable")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["campaign", "continue", campaign_id])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd
+        .spawn()
+        .context("failed to spawn detached campaign worker")?;
+    tracing::info!(
+        campaign_id,
+        worker_pid = child.id(),
+        "campaign worker detached"
+    );
+    Ok(())
 }
 
 /// Mint a loopback session token so a workflow's `tool` steps can authenticate
