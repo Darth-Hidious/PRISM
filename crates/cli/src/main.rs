@@ -362,6 +362,41 @@ enum Commands {
         #[command(subcommand)]
         command: ModelsCommands,
     },
+    /// Run a marketplace model on the cloud, one call: ensure a deployment
+    /// exists (reuse a running one, else create + wait ready), POST the
+    /// inputs to its /predict endpoint, print the model's real result.
+    ///
+    /// Deployments this command CREATES are auto-stopped after the result
+    /// (no silent per-minute billing) unless `--keep` is passed; reused
+    /// deployments are never stopped. Default target lets the platform pick
+    /// a node; `--node-id` pins a specific mesh target (the dashboard's
+    /// "select a target from the mesh" case). Prints one JSON document.
+    Predict {
+        /// Marketplace model slug (e.g. "mace-mh-1", "chgnet").
+        model: String,
+        /// Model task, e.g. "single_point", "relax", "md".
+        #[arg(long, default_value = "single_point")]
+        task: String,
+        /// Model inputs as a JSON object (e.g. '{"structure": {...}}').
+        #[arg(long, default_value = "{}")]
+        input: String,
+        /// Pin the deployment to a specific PRISM node UUID (mesh target).
+        #[arg(long)]
+        node_id: Option<String>,
+        /// GPU type to request for a NEW deployment (omit for CPU).
+        #[arg(long)]
+        gpu: Option<String>,
+        /// Budget cap (USD) for a NEW deployment.
+        #[arg(long)]
+        budget: Option<f64>,
+        /// Seconds to wait for a new deployment to become ready.
+        #[arg(long, default_value_t = 900)]
+        ready_timeout_secs: u64,
+        /// Keep a newly-created deployment running after the result
+        /// (it keeps billing per minute until stopped).
+        #[arg(long)]
+        keep: bool,
+    },
     /// List GPU offers purchasable through the MARC27 compute platform.
     ///
     /// Prints the live catalog (type, VRAM, region, provider, $/hr) as one
@@ -3067,6 +3102,28 @@ async fn main() -> Result<()> {
         Commands::Deploy { command } => {
             handle_deploy_command(command).await?;
         }
+        Commands::Predict {
+            model,
+            task,
+            input,
+            node_id,
+            gpu,
+            budget,
+            ready_timeout_secs,
+            keep,
+        } => {
+            handle_predict(
+                &model,
+                &task,
+                &input,
+                node_id.as_deref(),
+                gpu.as_deref(),
+                budget,
+                ready_timeout_secs,
+                keep,
+            )
+            .await?;
+        }
         Commands::Models { command } => {
             handle_models_command(&paths, command).await?;
         }
@@ -5631,6 +5688,182 @@ fn print_discourse_run_events(events: &[serde_json::Value]) {
             }
         }
     }
+}
+
+/// `prism predict` — the agent's one-call "run this marketplace model on the
+/// cloud" path, riding the PROVEN deployment spine (deploy → /predict HTTP):
+/// ensure a deployment (reuse running, else create + wait ready), POST the
+/// inputs, return the model's real result, auto-stop what we created unless
+/// `--keep`. Always prints exactly one JSON document on stdout (agents parse
+/// it); hard failures return an `{"error": ...}` document with exit 1.
+#[allow(clippy::too_many_arguments)]
+async fn handle_predict(
+    model: &str,
+    task: &str,
+    input_json: &str,
+    node_id: Option<&str>,
+    gpu: Option<&str>,
+    budget: Option<f64>,
+    ready_timeout_secs: u64,
+    keep: bool,
+) -> Result<()> {
+    let inputs: serde_json::Value = serde_json::from_str(input_json)
+        .with_context(|| "--input is not valid JSON".to_string())?;
+    if !inputs.is_object() {
+        bail!("--input must be a JSON object");
+    }
+
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+
+    // 1. Reuse a RUNNING deployment of this model when one exists — repeat
+    //    predictions then cost one HTTP call, not a container start. Match on
+    //    the deployment name (this command names its deployments = the slug).
+    let list: serde_json::Value = auth
+        .apply(client.get(format!("{api_base}/compute/deployments")))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let running = list
+        .as_array()
+        .or_else(|| list.get("deployments").and_then(|d| d.as_array()))
+        .map(|deployments| {
+            deployments
+                .iter()
+                .filter(|d| d.get("name").and_then(|n| n.as_str()) == Some(model))
+                .filter(|d| d.get("status").and_then(|s| s.as_str()) == Some("running"))
+                .find(|d| {
+                    d.get("endpoint_url")
+                        .and_then(|u| u.as_str())
+                        .is_some_and(|u| !u.is_empty())
+                })
+                .cloned()
+        })
+        .unwrap_or(None);
+
+    let (deployment_id, endpoint_url, reused) = if let Some(dep) = running {
+        (
+            dep["id"].as_str().unwrap_or_default().to_string(),
+            dep["endpoint_url"].as_str().unwrap_or_default().to_string(),
+            true,
+        )
+    } else {
+        // 2. Create a deployment from the marketplace slug. Default target
+        //    lets the platform pick any registered node; --node-id pins one.
+        let mut body = serde_json::json!({
+            "resource_slug": model,
+            "name": model,
+            "target": "prism_node",
+        });
+        if let Some(nid) = node_id {
+            body["node_id"] = serde_json::json!(nid);
+        }
+        if let Some(gpu) = gpu {
+            body["gpu_type"] = serde_json::json!(gpu);
+        }
+        if let Some(budget) = budget {
+            body["budget_max_usd"] = serde_json::json!(budget);
+        }
+
+        let created: serde_json::Value = auth
+            .apply(client.post(format!("{api_base}/compute/deployments")))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let id = created["id"]
+            .as_str()
+            .or_else(|| created["deployment_id"].as_str())
+            .context("deployment create response has no id")?
+            .to_string();
+
+        // 3. Wait (bounded) for running + endpoint. Failed/stopped is a
+        //    terminal honest error, not a wait-forever.
+        let deadline = std::time::Instant::now() + Duration::from_secs(ready_timeout_secs);
+        let endpoint = loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let status: serde_json::Value = auth
+                .apply(client.get(format!("{api_base}/compute/deployments/{id}")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let state = status["status"].as_str().unwrap_or("unknown");
+            match state {
+                "running" => {
+                    if let Some(url) = status["endpoint_url"].as_str().filter(|u| !u.is_empty()) {
+                        break url.to_string();
+                    }
+                }
+                "failed" | "stopped" | "unhealthy" => {
+                    bail!(
+                        "deployment {id} for model '{model}' ended in state '{state}' \
+                         before serving — check `prism deploy status {id}`"
+                    );
+                }
+                _ => {}
+            }
+            if std::time::Instant::now() > deadline {
+                bail!(
+                    "deployment {id} for model '{model}' not ready after \
+                     {ready_timeout_secs}s (last state '{state}'); it is still \
+                     provisioning — poll `prism deploy status {id}` or re-run \
+                     with a larger --ready-timeout-secs"
+                );
+            }
+        };
+        (id, endpoint, false)
+    };
+
+    // 4. The actual prediction: same JSON body as the serving images' batch
+    //    mode — {"task": ..., ...inputs} → POST {endpoint}/predict.
+    let mut payload = inputs.clone();
+    payload["task"] = serde_json::json!(task);
+    payload["model"] = serde_json::json!(model);
+    let predict_url = format!("{}/predict", endpoint_url.trim_end_matches('/'));
+    let result: serde_json::Value = client
+        .post(&predict_url)
+        .json(&payload)
+        .timeout(Duration::from_secs(600))
+        .send()
+        .await
+        .with_context(|| format!("prediction request to {predict_url} failed"))?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    // 5. Auto-stop what WE created (no silent per-minute billing) unless
+    //    --keep; a reused deployment belongs to whoever started it.
+    let mut auto_stopped = false;
+    if !reused && !keep {
+        auto_stopped = auth
+            .apply(client.delete(format!("{api_base}/compute/deployments/{deployment_id}")))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "model": model,
+            "task": task,
+            "deployment_id": deployment_id,
+            "reused_running_deployment": reused,
+            "auto_stopped": auto_stopped,
+            "kept_running": !auto_stopped,
+            "result": result,
+        }))?
+    );
+    Ok(())
 }
 
 async fn handle_deploy_command(command: DeployCommands) -> Result<()> {

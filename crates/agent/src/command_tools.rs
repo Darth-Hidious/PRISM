@@ -71,6 +71,7 @@ enum CommandToolKind {
     ComputeStatus,
     ComputeCancel,
     ComputeSubmit,
+    Predict,
     KnowledgeEntity,
     KnowledgePaths,
     KnowledgeCorpora,
@@ -518,6 +519,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &[],
         kind: CommandToolKind::ComputeSubmit,
         description: "Dispatch a real, BILLABLE containerized GPU/CPU job to the MARC27 compute broker. Provide `image` and `inputs`; set `budget_max_usd` to cap spend.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "predict",
+        root: "predict",
+        aliases: &["run_model", "model_predict"],
+        kind: CommandToolKind::Predict,
+        description: "Run a marketplace model on the cloud in ONE call (BILLABLE): reuses a running deployment of the model or creates one (waits until ready), POSTs your inputs to it, returns the model's real result, and auto-stops anything it created. Discover models with `models_search`/`marketplace_search`. `model` = marketplace slug (e.g. 'mace-mh-1'); `task` e.g. 'single_point'|'relax'|'md'; `inputs` = the model's JSON inputs (e.g. {\"structure\": {...}}). Optional `node_id` pins a specific mesh node; default lets the platform pick.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -1132,6 +1142,23 @@ fn compute_estimate_schema() -> Value {
     })
 }
 
+fn predict_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "model": { "type": "string", "description": "Marketplace model slug (e.g. 'mace-mh-1', 'chgnet'). Discover with models_search/marketplace_search." },
+            "task": { "type": "string", "description": "Model task: 'single_point' (default), 'relax', 'md', 'predict_property', 'generate', ..." },
+            "inputs": { "type": "object", "description": "Model inputs as a JSON object, e.g. {\"structure\": {\"atoms\": [...], \"coords\": [...]}}. Pass {} if none." },
+            "node_id": { "type": "string", "description": "Pin execution to a specific PRISM node UUID (mesh target). Omit to let the platform pick." },
+            "gpu": { "type": "string", "description": "GPU class for a NEW deployment, e.g. 'A100-80GB'. Omit for CPU models." },
+            "budget_max_usd": { "type": "number", "description": "Budget cap (USD) for a NEW deployment." },
+            "keep_alive": { "type": "boolean", "description": "Keep a newly-created deployment running after the result (bills per minute until stopped). Default false: auto-stop." }
+        },
+        "required": ["model", "inputs"],
+        "additionalProperties": false
+    })
+}
+
 fn compute_submit_schema() -> Value {
     json!({
         "type": "object",
@@ -1493,6 +1520,7 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
             deploy_id_schema("job_id", "Compute-broker job ID to cancel.")
         }
         CommandToolKind::ComputeSubmit => compute_submit_schema(),
+        CommandToolKind::Predict => predict_schema(),
         CommandToolKind::KnowledgeEntity => knowledge_entity_schema(),
         CommandToolKind::KnowledgePaths => knowledge_paths_schema(),
         CommandToolKind::KnowledgeCorpora => knowledge_corpora_schema(),
@@ -2214,6 +2242,41 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             root: spec.root,
             args: vec!["cancel".to_string(), required_string(input, "job_id")?],
         }),
+        CommandToolKind::Predict => {
+            // `predict` is a TOP-LEVEL prism verb (root "predict"), so the
+            // model slug is the first positional arg, not a subcommand.
+            let mut args = vec![required_string(input, "model")?];
+            if let Some(task) = optional_string(input, "task") {
+                args.push("--task".to_string());
+                args.push(task);
+            }
+            let inputs = input.get("inputs").cloned().unwrap_or_else(|| json!({}));
+            args.push("--input".to_string());
+            args.push(serde_json::to_string(&inputs).unwrap_or_else(|_| "{}".to_string()));
+            if let Some(node_id) = optional_string(input, "node_id") {
+                args.push("--node-id".to_string());
+                args.push(node_id);
+            }
+            if let Some(gpu) = optional_string(input, "gpu") {
+                args.push("--gpu".to_string());
+                args.push(gpu);
+            }
+            if let Some(budget) = optional_f64(input, "budget_max_usd") {
+                args.push("--budget".to_string());
+                args.push(budget.to_string());
+            }
+            if input
+                .get("keep_alive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                args.push("--keep".to_string());
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
         CommandToolKind::ComputeSubmit => {
             let mut args = vec![
                 "submit".to_string(),
@@ -2826,6 +2889,36 @@ mod tests {
         }
         // The old unified Python `knowledge` tool is gone.
         assert!(!names.contains(&"knowledge"));
+    }
+
+    #[test]
+    fn predict_is_a_billable_approval_gated_tool_with_correct_invocation() {
+        // The one-call "run a marketplace model on the cloud" surface: it
+        // creates real billable deployments, so it MUST be approval-gated.
+        assert!(is_command_tool("predict"));
+        assert!(is_command_tool("run_model"), "alias must resolve");
+        assert_eq!(command_tool_requires_approval("predict"), Some(true));
+
+        let preview = command_tool_preview(
+            "predict",
+            &json!({
+                "model": "mace-mh-1",
+                "task": "relax",
+                "inputs": {"structure": {"atoms": ["Si"]}},
+                "node_id": "1f0c2a2e-0000-4000-8000-000000000001",
+                "keep_alive": true
+            }),
+        )
+        .expect("preview renders");
+        // Top-level verb, slug positional, inputs as one JSON arg.
+        assert!(preview.starts_with("prism predict mace-mh-1"), "{preview}");
+        assert!(preview.contains("--task relax"), "{preview}");
+        assert!(preview.contains("--input"), "{preview}");
+        assert!(preview.contains("--node-id"), "{preview}");
+        assert!(preview.contains("--keep"), "{preview}");
+
+        // Missing model → honest arg error, no execution.
+        assert!(build_execution(spec_by_name("predict").unwrap(), &json!({"inputs": {}})).is_err());
     }
 
     #[test]
