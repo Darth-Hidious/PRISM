@@ -2262,8 +2262,10 @@ async fn main() -> Result<()> {
                     while let Some(req) = tool_invoke_rx.recv().await {
                         let caller = req.caller_user_id.to_string();
                         let result = match relay_state.chat.get() {
+                            // approve=false ALWAYS: a remote relay caller can
+                            // never run approval-gated tools on this machine.
                             Some(chat) => chat
-                                .invoke_tool(&req.tool, req.args, Some(caller.as_str()))
+                                .invoke_tool(&req.tool, req.args, Some(caller.as_str()), false)
                                 .await
                                 .map_err(|e| e.to_string()),
                             None => Err("tool executor not ready \

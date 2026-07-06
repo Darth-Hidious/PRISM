@@ -2700,6 +2700,14 @@ pub fn is_command_tool(tool_name: &str) -> bool {
     spec_by_name(tool_name).is_some()
 }
 
+/// Whether a command tool is approval-gated (`None` if no such command tool).
+/// Used by the single-tool executor to refuse approval-gated tools for callers
+/// with nobody at the keyboard (e.g. the platform relay) — even when the tool
+/// is hidden from the offered catalog (hidden ≠ unexecutable).
+pub fn command_tool_requires_approval(tool_name: &str) -> Option<bool> {
+    spec_by_name(tool_name).map(|spec| spec.requires_approval)
+}
+
 pub fn command_tool_preview(tool_name: &str, args: &Value) -> Option<String> {
     let spec = spec_by_name(tool_name)?;
     let execution = build_execution(spec, args).ok()?;
@@ -2818,6 +2826,22 @@ mod tests {
         }
         // The old unified Python `knowledge` tool is gone.
         assert!(!names.contains(&"knowledge"));
+    }
+
+    #[test]
+    fn requires_approval_lookup_matches_specs() {
+        // Read-only tools are not gated; unknown names are None (not false —
+        // "no such tool" must stay distinguishable from "not gated").
+        assert_eq!(command_tool_requires_approval("mesh_health"), Some(false));
+        assert_eq!(command_tool_requires_approval("query"), Some(false));
+        assert_eq!(command_tool_requires_approval("no_such_tool"), None);
+        // Every spec answers, and the answer mirrors the spec itself.
+        for spec in COMMAND_TOOLS {
+            assert_eq!(
+                command_tool_requires_approval(spec.name),
+                Some(spec.requires_approval)
+            );
+        }
     }
 
     #[test]

@@ -96,9 +96,12 @@ fn build_tool_args(body: &Value) -> Value {
 
     let has_envelope = body.get("inputs").is_some() || body.get("command").is_some();
     if !has_envelope {
-        // No envelope keys → treat the entire object as the args.
-        return if body.is_object() {
-            body.clone()
+        // No envelope keys → treat the entire object as the args, minus the
+        // `approve` envelope flag (it's for the handler, not the tool).
+        return if let Value::Object(map) = body {
+            let mut args = map.clone();
+            args.remove("approve");
+            Value::Object(args)
         } else {
             Value::Object(Default::default())
         };
@@ -148,9 +151,13 @@ pub async fn run_tool(
     };
 
     let body = body.map(|Json(v)| v).unwrap_or_else(|| Value::Object(Default::default()));
+    // Approval-gated tools need the caller to say so explicitly — this is an
+    // authenticated, RBAC-gated (ExecuteTools) local endpoint, so `"approve":
+    // true` in the body stands in for the interactive approval of a chat turn.
+    let approve = body.get("approve").and_then(Value::as_bool).unwrap_or(false);
     let args = build_tool_args(&body);
 
-    match service.invoke_tool(&name, args, Some(&user.user_id)).await {
+    match service.invoke_tool(&name, args, Some(&user.user_id), approve).await {
         Ok(result) => Json(serde_json::json!({ "tool": name, "result": result })).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -192,6 +199,12 @@ mod tests {
     fn bare_object_is_the_args() {
         let body = json!({ "formula": "Si", "relax": true });
         assert_eq!(build_tool_args(&body), json!({ "formula": "Si", "relax": true }));
+    }
+
+    #[test]
+    fn approve_flag_never_leaks_into_bare_args() {
+        let body = json!({ "formula": "Si", "approve": true });
+        assert_eq!(build_tool_args(&body), json!({ "formula": "Si" }));
     }
 
     #[test]

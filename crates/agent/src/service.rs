@@ -265,16 +265,40 @@ impl ChatService {
     /// Meta-tools (`recall` / `find_tools`) operate on live agent/session
     /// state and have no meaning as a one-shot relayed call, so they are
     /// rejected honestly rather than returning a fabricated empty result.
+    ///
+    /// `approve` stands in for the interactive approval a chat turn would
+    /// collect: approval-gated tools (e.g. `execute_bash`, `write_skill`) run
+    /// only when the caller explicitly passed approval. The platform relay
+    /// always passes `false` — a remote principal must never get an
+    /// approval-gated tool on the owner's machine with nobody at the keyboard.
     pub async fn invoke_tool(
         &self,
         name: &str,
         args: serde_json::Value,
         caller: Option<&str>,
+        approve: bool,
     ) -> Result<serde_json::Value> {
         if crate::meta_tools::is_meta_tool(name) {
             anyhow::bail!(
                 "'{name}' is a meta-tool that operates on live agent state; \
                  it is not invocable through the single-tool executor"
+            );
+        }
+
+        // Approval gate. Catalog lookup covers Python + offered command tools;
+        // the command-tool fallback covers specs hidden from the catalog
+        // (hidden ≠ unexecutable — see LOCAL_NODE_TOOLS).
+        let gated = self
+            .tools
+            .find(name)
+            .map(|tool| tool.requires_approval)
+            .or_else(|| crate::command_tools::command_tool_requires_approval(name));
+        if gated == Some(true) && !approve {
+            anyhow::bail!(
+                "'{name}' is approval-gated and cannot run through the \
+                 single-tool executor without explicit approval \
+                 (pass approve=true from an authenticated local caller; \
+                 remote relay callers cannot approve)"
             );
         }
 
