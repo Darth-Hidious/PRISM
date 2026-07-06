@@ -308,25 +308,68 @@ impl ChatService {
             "invoke_tool: single-tool execution"
         );
 
-        let mut inner = self.inner.lock().await;
-        let ChatInner {
-            tool_server,
-            command_tool_runtime,
-            policy,
-            ..
-        } = &mut *inner;
-
-        if crate::command_tools::is_command_tool(name) {
-            crate::command_tools::execute_command_tool(
+        let result = {
+            let mut inner = self.inner.lock().await;
+            let ChatInner {
+                tool_server,
                 command_tool_runtime,
-                name,
-                &args,
-                policy.as_mut(),
-            )
-            .await
-        } else {
-            tool_server.call_tool(name, args).await.map_err(Into::into)
+                policy,
+                ..
+            } = &mut *inner;
+
+            if crate::command_tools::is_command_tool(name) {
+                crate::command_tools::execute_command_tool(
+                    command_tool_runtime,
+                    name,
+                    &args,
+                    policy.as_mut(),
+                )
+                .await
+            } else {
+                tool_server
+                    .call_tool(name, args.clone())
+                    .await
+                    .map_err(Into::into)
+            }
+        };
+
+        // Durable per-caller audit. This executor runs OUTSIDE the agent loop,
+        // so the provenance after-hook never fires for it — without this write
+        // a relayed invocation would leave no durable record of who ran what.
+        // Failures are logged, never swallowed into the tool result.
+        {
+            let mut record = prism_provenance::new_record(
+                &format!("invoke:{}", caller.unwrap_or("unspecified")),
+                prism_provenance::ActionType::ToolCall,
+                prism_provenance::Actor::User,
+                Some(name),
+                None,
+                args,
+            );
+            record.output_json = Some(match &result {
+                Ok(value) => value.clone(),
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+            });
+            record.tags = vec![
+                "single-tool-executor".to_string(),
+                format!("caller:{}", caller.unwrap_or("unspecified")),
+            ];
+            let db_path = dirs::home_dir()
+                .map(|h| h.join(".prism/provenance.db"))
+                .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+            match prism_provenance::ProvenanceStore::open(&db_path).await {
+                Ok(store) => {
+                    if let Err(e) = store.record(&record).await {
+                        tracing::warn!(error = %e, tool = %name, "invoke_tool audit write failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "invoke_tool audit store open failed");
+                }
+            }
         }
+
+        result
     }
 
     /// Run one user turn through `agent_loop::run_turn` — the same entry
