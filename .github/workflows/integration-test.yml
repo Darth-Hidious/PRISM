@@ -55,7 +55,14 @@ jobs:
           else
             echo "Sentinel present — target/ already cache-busted"
           fi
+      # CARGO_PROFILE_TEST_DEBUG=0: the workspace's test binaries (polars,
+      # axum, fastembed…) OOM-killed the runner's linker with full debuginfo
+      # ("ld terminated with signal 9"). Debuginfo off in CI tests — locally
+      # unchanged.
       - run: cargo test --workspace
+        env:
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   dashboard-build:
