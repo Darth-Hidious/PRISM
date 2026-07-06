@@ -9,7 +9,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::NodeState;
@@ -35,10 +35,7 @@ pub async fn list_deployments(
     State(state): State<Arc<NodeState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let client = state.platform_client.as_ref().ok_or_else(no_platform)?;
-    let deployments: Value = client
-        .get("/compute/deployments")
-        .await
-        .map_err(upstream)?;
+    let deployments: Value = client.get("/compute/deployments").await.map_err(upstream)?;
     Ok(Json(deployments))
 }
 

@@ -236,8 +236,7 @@ impl PermissionOverrides {
 
     #[must_use]
     pub fn is_allowed(&self, tool_name: &str) -> bool {
-        self.allow_names.contains("*")
-            || self.allow_names.contains(&tool_name.to_ascii_lowercase())
+        self.allow_names.contains("*") || self.allow_names.contains(&tool_name.to_ascii_lowercase())
     }
 
     #[must_use]
@@ -430,7 +429,10 @@ mod tests {
         // silently degrading to "Allow Once".
         let ctx = ToolPermissionContext::default();
         let mut overrides = PermissionOverrides::default();
-        assert!(!ctx.decision_for("execute_bash", Some(&overrides)).auto_approved);
+        assert!(
+            !ctx.decision_for("execute_bash", Some(&overrides))
+                .auto_approved
+        );
         overrides.allow_all();
         assert!(overrides.is_allowed("execute_bash"));
         assert!(overrides.is_allowed("some_tool_never_seen"));

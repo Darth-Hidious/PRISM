@@ -114,7 +114,8 @@ fn build_tool_args(body: &Value) -> Value {
     if let (Value::Object(map), Some(cmd)) = (&mut args, body.get("command"))
         && !cmd.is_null()
     {
-        map.entry("command".to_string()).or_insert_with(|| cmd.clone());
+        map.entry("command".to_string())
+            .or_insert_with(|| cmd.clone());
     }
     args
 }
@@ -150,14 +151,22 @@ pub async fn run_tool(
             .into_response();
     };
 
-    let body = body.map(|Json(v)| v).unwrap_or_else(|| Value::Object(Default::default()));
+    let body = body
+        .map(|Json(v)| v)
+        .unwrap_or_else(|| Value::Object(Default::default()));
     // Approval-gated tools need the caller to say so explicitly — this is an
     // authenticated, RBAC-gated (ExecuteTools) local endpoint, so `"approve":
     // true` in the body stands in for the interactive approval of a chat turn.
-    let approve = body.get("approve").and_then(Value::as_bool).unwrap_or(false);
+    let approve = body
+        .get("approve")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let args = build_tool_args(&body);
 
-    match service.invoke_tool(&name, args, Some(&user.user_id), approve).await {
+    match service
+        .invoke_tool(&name, args, Some(&user.user_id), approve)
+        .await
+    {
         Ok(result) => Json(serde_json::json!({ "tool": name, "result": result })).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -182,7 +191,8 @@ mod tests {
 
     #[test]
     fn workflow_inputs_and_command_folded() {
-        let body = json!({ "command": "train", "inputs": { "data": "d.csv", "target": "hardness" } });
+        let body =
+            json!({ "command": "train", "inputs": { "data": "d.csv", "target": "hardness" } });
         assert_eq!(
             build_tool_args(&body),
             json!({ "data": "d.csv", "target": "hardness", "command": "train" })
@@ -198,7 +208,10 @@ mod tests {
     #[test]
     fn bare_object_is_the_args() {
         let body = json!({ "formula": "Si", "relax": true });
-        assert_eq!(build_tool_args(&body), json!({ "formula": "Si", "relax": true }));
+        assert_eq!(
+            build_tool_args(&body),
+            json!({ "formula": "Si", "relax": true })
+        );
     }
 
     #[test]

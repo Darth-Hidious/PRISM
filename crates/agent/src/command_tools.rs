@@ -1513,9 +1513,10 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::PublishArtifact => publish_artifact_schema(),
         CommandToolKind::ComputeGpus | CommandToolKind::ComputeProviders => empty_schema(),
         CommandToolKind::ComputeEstimate => compute_estimate_schema(),
-        CommandToolKind::ComputeStatus => {
-            deploy_id_schema("job_id", "Compute-broker job ID returned by compute_submit.")
-        }
+        CommandToolKind::ComputeStatus => deploy_id_schema(
+            "job_id",
+            "Compute-broker job ID returned by compute_submit.",
+        ),
         CommandToolKind::ComputeCancel => {
             deploy_id_schema("job_id", "Compute-broker job ID to cancel.")
         }
@@ -2989,9 +2990,11 @@ mod tests {
                 .expect("preview renders"),
             "prism compute status job_123"
         );
-        let submit_preview =
-            command_tool_preview("compute_submit", &json!({ "image": "vasp:6.5.0", "inputs": {} }))
-                .expect("preview renders");
+        let submit_preview = command_tool_preview(
+            "compute_submit",
+            &json!({ "image": "vasp:6.5.0", "inputs": {} }),
+        )
+        .expect("preview renders");
         assert!(
             submit_preview.starts_with("prism compute submit --image vasp:6.5.0 --inputs"),
             "got: {submit_preview}"
@@ -3033,8 +3036,11 @@ mod tests {
             "prism knowledge corpora --domain materials"
         );
         assert_eq!(
-            command_tool_preview("knowledge_ingest", &json!({ "url": "https://example.com/x" }))
-                .expect("preview renders"),
+            command_tool_preview(
+                "knowledge_ingest",
+                &json!({ "url": "https://example.com/x" })
+            )
+            .expect("preview renders"),
             "prism knowledge ingest --url https://example.com/x"
         );
 

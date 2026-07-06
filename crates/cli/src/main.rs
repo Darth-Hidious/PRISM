@@ -6091,20 +6091,22 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
         .build()?;
 
     let response: serde_json::Value = match command {
-        ComputeCommands::Gpus => auth
-            .apply(client.get(format!("{api_base}/compute/gpus")))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?,
-        ComputeCommands::Providers => auth
-            .apply(client.get(format!("{api_base}/compute/providers")))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?,
+        ComputeCommands::Gpus => {
+            auth.apply(client.get(format!("{api_base}/compute/gpus")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
+        ComputeCommands::Providers => {
+            auth.apply(client.get(format!("{api_base}/compute/providers")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
         ComputeCommands::Estimate {
             image,
             gpu,
@@ -6127,13 +6129,14 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                 .json()
                 .await?
         }
-        ComputeCommands::Status { job_id } => auth
-            .apply(client.get(format!("{api_base}/compute/{job_id}")))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?,
+        ComputeCommands::Status { job_id } => {
+            auth.apply(client.get(format!("{api_base}/compute/{job_id}")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
         ComputeCommands::Cancel { job_id } => {
             auth.apply(client.post(format!("{api_base}/compute/{job_id}/cancel")))
                 .send()
@@ -6251,30 +6254,28 @@ async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
         .build()?;
 
     let response: serde_json::Value = match command {
-        KnowledgeCommands::Entity { name, limit } => auth
-            .apply(client.get(format!("{api_base}/knowledge/graph/entity/{name}")))
-            .query(&[("limit", limit.to_string())])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?,
-        KnowledgeCommands::Paths {
-            from,
-            to,
-            max_hops,
-        } => auth
-            .apply(client.get(format!("{api_base}/knowledge/graph/paths")))
-            .query(&[
-                ("from", from),
-                ("to", to),
-                ("max_hops", max_hops.to_string()),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?,
+        KnowledgeCommands::Entity { name, limit } => {
+            auth.apply(client.get(format!("{api_base}/knowledge/graph/entity/{name}")))
+                .query(&[("limit", limit.to_string())])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
+        KnowledgeCommands::Paths { from, to, max_hops } => {
+            auth.apply(client.get(format!("{api_base}/knowledge/graph/paths")))
+                .query(&[
+                    ("from", from),
+                    ("to", to),
+                    ("max_hops", max_hops.to_string()),
+                ])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?
+        }
         KnowledgeCommands::Corpora {
             domain,
             kind,
