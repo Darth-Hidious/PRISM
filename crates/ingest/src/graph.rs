@@ -49,6 +49,15 @@ struct CypherStatement {
     statement: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     parameters: Option<serde_json::Value>,
+    /// Ask Neo4j to return real write counters (`stats.nodes_created`,
+    /// `stats.relationships_created`, ...) for this statement. Without this,
+    /// the only thing we can count client-side is how many MERGE statements
+    /// we *sent* — a MERGE that matched an existing node creates nothing,
+    /// so that count was never a creation count (AUDIT_BACKLOG 49 /
+    /// INGESTION_AUDIT #49: re-ingesting the same file reported the same
+    /// "N nodes written" every time even though nothing new was created).
+    #[serde(rename = "includeStats")]
+    include_stats: bool,
 }
 
 /// Neo4j HTTP API response.
@@ -63,6 +72,20 @@ struct CypherResult {
     #[allow(dead_code)]
     columns: Vec<String>,
     data: Vec<CypherRow>,
+    /// Present only when the statement set `includeStats: true`.
+    #[serde(default)]
+    stats: Option<CypherStats>,
+}
+
+/// The subset of Neo4j's per-statement write stats we care about.
+/// Neo4j's `stats` object has more fields (properties_set, labels_added,
+/// ...); unknown fields are ignored by serde, so we only declare what we use.
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+struct CypherStats {
+    #[serde(default)]
+    nodes_created: usize,
+    #[serde(default)]
+    relationships_created: usize,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +152,7 @@ impl Neo4jGraphStore {
         self.execute(vec![CypherStatement {
             statement: cypher.to_string(),
             parameters: params,
+            include_stats: false,
         }])
         .await
     }
@@ -143,6 +167,7 @@ impl Neo4jGraphStore {
                 "name": entity.name,
                 "props": entity.properties,
             })),
+            include_stats: true,
         }
     }
 
@@ -176,7 +201,19 @@ impl Neo4jGraphStore {
                 "to": rel.to,
                 "props": props,
             })),
+            include_stats: true,
         }
+    }
+
+    /// Sum a per-statement stats counter across every statement in a
+    /// transaction response (statements without `stats` — because the
+    /// caller didn't request `includeStats` — contribute 0).
+    fn sum_stat(resp: &CypherResponse, f: impl Fn(&CypherStats) -> usize) -> usize {
+        resp.results
+            .iter()
+            .filter_map(|r| r.stats.as_ref())
+            .map(f)
+            .sum()
     }
 
     /// Check connectivity to Neo4j.
@@ -272,24 +309,28 @@ impl GraphStore for Neo4jGraphStore {
         let mut nodes_created = 0usize;
         let mut edges_created = 0usize;
 
-        // Upsert nodes in batches of 50.
+        // Upsert nodes in batches of 50. `nodes_created` counts real Neo4j
+        // node creations (via includeStats), not MERGE statements sent — a
+        // MERGE that matches an existing node creates nothing.
         for chunk in entities.entities.chunks(50) {
             let statements: Vec<CypherStatement> =
                 chunk.iter().map(Self::entity_merge_cypher).collect();
-            let count = statements.len();
-            self.execute(statements).await?;
-            nodes_created += count;
-            tracing::debug!(batch_size = count, "upserted entity batch");
+            let batch_size = statements.len();
+            let resp = self.execute(statements).await?;
+            let created = Self::sum_stat(&resp, |s| s.nodes_created);
+            nodes_created += created;
+            tracing::debug!(batch_size, created, "upserted entity batch");
         }
 
-        // Upsert relationships in batches of 50.
+        // Upsert relationships in batches of 50 (same real-count caveat).
         for chunk in entities.relationships.chunks(50) {
             let statements: Vec<CypherStatement> =
                 chunk.iter().map(Self::relationship_merge_cypher).collect();
-            let count = statements.len();
-            self.execute(statements).await?;
-            edges_created += count;
-            tracing::debug!(batch_size = count, "upserted relationship batch");
+            let batch_size = statements.len();
+            let resp = self.execute(statements).await?;
+            let created = Self::sum_stat(&resp, |s| s.relationships_created);
+            edges_created += created;
+            tracing::debug!(batch_size, created, "upserted relationship batch");
         }
 
         tracing::info!(nodes_created, edges_created, "graph upsert complete");
@@ -399,6 +440,83 @@ mod tests {
         assert!(stmt.statement.contains("MERGE"));
         assert!(stmt.statement.contains(":Alloy"));
         assert!(stmt.statement.contains("$name"));
+    }
+
+    #[test]
+    fn entity_merge_cypher_requests_stats() {
+        // Without includeStats:true, Neo4j never returns a `stats` object,
+        // and node/edge counts silently degrade back to "statements sent".
+        let entity = Entity {
+            entity_type: "Alloy".into(),
+            name: "NbMoTaW".into(),
+            properties: serde_json::json!({}),
+        };
+        let stmt = Neo4jGraphStore::entity_merge_cypher(&entity);
+        assert!(stmt.include_stats);
+        let serialized = serde_json::to_string(&stmt).unwrap();
+        assert!(serialized.contains("\"includeStats\":true"));
+    }
+
+    #[test]
+    fn relationship_merge_cypher_requests_stats() {
+        let rel = Relationship {
+            from: "A".into(),
+            rel_type: "RELATED_TO".into(),
+            to: "B".into(),
+            weight: None,
+            order: None,
+        };
+        let stmt = Neo4jGraphStore::relationship_merge_cypher(&rel);
+        assert!(stmt.include_stats);
+    }
+
+    #[test]
+    fn sum_stat_counts_real_creations_not_statements_sent() {
+        // Real Neo4j HTTP transactional-Cypher response shape with
+        // includeStats:true. Two statements were sent (one MERGE hit an
+        // existing node and created nothing, one created a new node) — the
+        // creation count must be 1, not 2 (the old "statements.len()" bug).
+        let resp: CypherResponse = serde_json::from_str(
+            r#"{
+                "results": [
+                    {
+                        "columns": ["n.name"],
+                        "data": [{"row": ["Fe"]}],
+                        "stats": {
+                            "contains_updates": false,
+                            "nodes_created": 0,
+                            "properties_set": 0,
+                            "relationships_created": 0
+                        }
+                    },
+                    {
+                        "columns": ["n.name"],
+                        "data": [{"row": ["Cr"]}],
+                        "stats": {
+                            "contains_updates": true,
+                            "nodes_created": 1,
+                            "properties_set": 2,
+                            "relationships_created": 0
+                        }
+                    }
+                ],
+                "errors": []
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(Neo4jGraphStore::sum_stat(&resp, |s| s.nodes_created), 1);
+    }
+
+    #[test]
+    fn sum_stat_is_zero_when_stats_not_requested() {
+        // execute_one() (health checks, arbitrary queries) never sets
+        // includeStats, so `stats` is absent — must not panic, must be 0.
+        let resp: CypherResponse = serde_json::from_str(
+            r#"{"results": [{"columns": ["x"], "data": [{"row": [1]}]}], "errors": []}"#,
+        )
+        .unwrap();
+        assert_eq!(Neo4jGraphStore::sum_stat(&resp, |s| s.nodes_created), 0);
     }
 
     #[test]
