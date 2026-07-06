@@ -1101,6 +1101,14 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Project `.env` (the documented `.env.example` contract: provider API
+    // keys, LLM_PROVIDER, LLM_MODEL) becomes env-var fallbacks for every
+    // subcommand. dotenvy never overrides already-set vars, so real env
+    // always wins. This file was previously dead — dotenvy sat unused in the
+    // workspace deps and nothing loaded it, so `.env` settings silently did
+    // nothing while compiled-in defaults took over.
+    let _ = dotenvy::dotenv();
+
     // Provider keys saved via the TUI API-key window (~/.prism/api_keys.json)
     // become env-var fallbacks for every subcommand — chat, backend, doctor.
     // Real env vars always win.
@@ -1656,19 +1664,31 @@ async fn main() -> Result<()> {
             // so `prism use local` actually affects `prism backend`.
             let chat_target = crate::chat_config::load().unwrap_or_default().chat;
 
+            // The session's platform JWT — the credential the MARC27 LLM
+            // proxy authenticates.
+            let platform_token = paths
+                .load_cli_state()
+                .ok()
+                .and_then(|s| s.credentials)
+                .map(|c| c.access_token);
+
+            // Generic key chain for the local/direct-provider targets.
+            // Provider keys (ANTHROPIC/OPENAI) belong ONLY here — never on
+            // the marc27 arm: now that the project `.env` is actually
+            // loaded, an ANTHROPIC_API_KEY in it would otherwise shadow the
+            // platform JWT and 401 every platform LLM call.
             let api_key = std::env::var("LLM_API_KEY")
                 .or_else(|_| std::env::var("MARC27_TOKEN"))
                 .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .ok()
                 .or_else(|| cfg_llm.resolve_api_key())
-                .or_else(|| {
-                    paths
-                        .load_cli_state()
-                        .ok()
-                        .and_then(|s| s.credentials)
-                        .map(|c| c.access_token)
-                });
+                .or_else(|| platform_token.clone());
+
+            // Platform model catalog, fetched ONCE (fail-open: empty when
+            // offline). Serves both marc27 model resolution and the limits
+            // lookup below.
+            let catalog = fetch_model_catalog(&paths).await;
 
             // Resolve base_url, model, and api_key from the chat target
             // when it overrides the prism.toml [llm] defaults.
@@ -1716,17 +1736,45 @@ async fn main() -> Result<()> {
                 // segment and drives it over MARC27's native `/stream` SSE
                 // protocol, so the cloud picks the real model and enforces
                 // its real context + output limits.
+                //
+                // The model is resolved on TWO separate axes — LLM_PROVIDER
+                // and LLM_MODEL (from the env / project .env) — against the
+                // platform catalog, because the same model can be served by
+                // more than one provider at different prices and billing
+                // paths (claude-sonnet-5 direct-anthropic vs the OpenRouter
+                // entry). Nothing is hardcoded: with no preference anywhere
+                // the platform's own `default` catalog alias decides.
                 crate::chat_config::ChatTarget::Marc27 {
                     model: target_model,
-                } => (
-                    marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url),
-                    resolve_marc27_model(
+                } => {
+                    let preference = resolve_marc27_model(
                         std::env::var("LLM_MODEL").ok(),
                         target_model.as_deref(),
                         cfg_llm.model.as_deref(),
-                    ),
-                    api_key,
-                ),
+                    );
+                    let provider = std::env::var("LLM_PROVIDER").ok();
+                    let model =
+                        resolve_catalog_model(&catalog, provider.as_deref(), preference.as_deref())
+                            .unwrap_or_else(|| {
+                                // Catalog unavailable (offline) or no match: send
+                                // the preference verbatim; with none at all, send
+                                // the literal `default` alias — the platform
+                                // resolves it server-side.
+                                preference.unwrap_or_else(|| "default".to_string())
+                            });
+                    // Bearer for the platform: deliberate overrides
+                    // (LLM_API_KEY, MARC27_TOKEN) → the session JWT.
+                    // Provider keys are NOT platform credentials.
+                    let marc27_key = std::env::var("LLM_API_KEY")
+                        .or_else(|_| std::env::var("MARC27_TOKEN"))
+                        .ok()
+                        .or_else(|| platform_token.clone());
+                    (
+                        marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url),
+                        model,
+                        marc27_key,
+                    )
+                }
             };
 
             // The model's real limits from the platform catalog. Drives
@@ -1734,7 +1782,7 @@ async fn main() -> Result<()> {
             // pressure against THIS window, not a guessed constant.
             // (None, None) for unknown models (local llama.cpp, offline)
             // → the agent falls back to turn-count compaction.
-            let (context_window, max_output_tokens) = fetch_model_limits(&paths, &model).await;
+            let (context_window, max_output_tokens) = model_limits(&catalog, &model);
             tracing::info!(?context_window, ?max_output_tokens, model = %model, "model limits");
 
             let llm_config = LlmConfig {
@@ -8260,20 +8308,76 @@ async fn handle_report(
     Ok(())
 }
 
-/// Resolve the MARC27-cloud chat model with explicit precedence:
-/// `LLM_MODEL` env override → the model the user selected via
+/// The user's MARC27-cloud model *preference*, with explicit precedence:
+/// `LLM_MODEL` env (incl. the project `.env`) → the model selected via
 /// `prism use marc27 --model …` (persisted on the chat target) →
-/// prism.toml `[llm].model` → the compiled-in default. Pure so the
-/// precedence is unit-testable.
+/// prism.toml `[llm].model`. `None` = no preference anywhere — the caller
+/// falls back to the platform catalog's `default` alias, so NO model name
+/// is compiled into the client. Pure so the precedence is unit-testable.
 fn resolve_marc27_model(
     env_model: Option<String>,
     target_model: Option<&str>,
     cfg_model: Option<&str>,
-) -> String {
+) -> Option<String> {
     env_model
         .or_else(|| target_model.map(str::to_string))
         .or_else(|| cfg_model.map(str::to_string))
-        .unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string())
+}
+
+/// Pick the exact platform-catalog entry for a (provider, model) pair and
+/// return its `model_id` — the string the platform bills by.
+///
+/// Provider and model are SEPARATE axes on purpose: the same model can be
+/// served by more than one provider at different prices and different
+/// billing paths (e.g. `claude-sonnet-5` provider=anthropic vs
+/// `anthropic/claude-sonnet-5` provider=openrouter). A single conflated
+/// slug picked between those silently; making the provider an explicit
+/// filter (`LLM_PROVIDER`) puts that routing choice in configuration where
+/// it belongs.
+///
+/// Matching, within the provider filter (no filter = all entries):
+/// 1. exact `model_id`
+/// 2. catalog alias (e.g. `default`)
+/// 3. bare-name suffix — `claude-sonnet-5` matches a router's
+///    `anthropic/claude-sonnet-5`
+///
+/// No preference at all → the entry carrying the platform's `default`
+/// alias. `None` = no catalog match (caller decides the fallback).
+fn resolve_catalog_model(
+    models: &[serde_json::Value],
+    provider: Option<&str>,
+    preference: Option<&str>,
+) -> Option<String> {
+    let id_of = |m: &serde_json::Value| value_string(m, &["model_id", "id"]).map(str::to_string);
+    let has_alias = |m: &serde_json::Value, alias: &str| {
+        m.get("aliases")
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(alias)))
+    };
+    let candidates: Vec<&serde_json::Value> = models
+        .iter()
+        .filter(|m| {
+            provider.is_none_or(|p| value_string(m, &["provider_slug", "provider"]) == Some(p))
+        })
+        .collect();
+
+    match preference {
+        Some(pref) => candidates
+            .iter()
+            .find(|m| value_string(m, &["model_id", "id"]) == Some(pref))
+            .or_else(|| candidates.iter().find(|m| has_alias(m, pref)))
+            .or_else(|| {
+                let suffix = format!("/{pref}");
+                candidates.iter().find(|m| {
+                    value_string(m, &["model_id", "id"]).is_some_and(|id| id.ends_with(&suffix))
+                })
+            })
+            .and_then(|m| id_of(m)),
+        None => candidates
+            .iter()
+            .find(|m| has_alias(m, "default"))
+            .and_then(|m| id_of(m)),
+    }
 }
 
 /// The per-project MARC27 LLM base URL. The agent's LLM client recognises
@@ -8294,21 +8398,25 @@ fn marc27_llm_url_for_project(api_base: &str, project_id: &str) -> String {
 /// error, model not in catalog — returning `(None, None)`: the agent
 /// then uses conservative fallback behavior instead of a wrong number.
 /// Bounded by a short timeout so backend startup is never held hostage.
-async fn fetch_model_limits(paths: &PrismPaths, model_id: &str) -> (Option<u64>, Option<u64>) {
+/// Fetch the platform model catalog once (`GET /projects/{id}/llm/models`,
+/// same endpoint as `prism models list`). Fail-open on every path —
+/// offline, no auth, network error → empty Vec. One fetch serves BOTH
+/// model resolution (`resolve_catalog_model`) and limits (`model_limits`).
+async fn fetch_model_catalog(paths: &PrismPaths) -> Vec<serde_json::Value> {
     if std::env::var("PRISM_OFFLINE").as_deref() == Ok("1") {
-        return (None, None);
+        return Vec::new();
     }
     let Ok((api_base, auth)) = resolve_agent_auth() else {
-        return (None, None);
+        return Vec::new();
     };
     let Ok(project_id) = resolve_active_project_id(paths) else {
-        return (None, None);
+        return Vec::new();
     };
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
     else {
-        return (None, None);
+        return Vec::new();
     };
     let response: serde_json::Value = match auth
         .apply(client.get(format!("{api_base}/projects/{project_id}/llm/models")))
@@ -8318,13 +8426,19 @@ async fn fetch_model_limits(paths: &PrismPaths, model_id: &str) -> (Option<u64>,
     {
         Ok(resp) => match resp.json().await {
             Ok(v) => v,
-            Err(_) => return (None, None),
+            Err(_) => return Vec::new(),
         },
-        Err(_) => return (None, None),
+        Err(_) => return Vec::new(),
     };
-    let models = value_array(&response, &["models", "items", "data"])
+    value_array(&response, &["models", "items", "data"])
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// The model's context/output limits from an already-fetched catalog.
+/// (None, None) for unknown models (local llama.cpp, offline) → the agent
+/// falls back to turn-count compaction.
+fn model_limits(models: &[serde_json::Value], model_id: &str) -> (Option<u64>, Option<u64>) {
     let Some(entry) = models
         .iter()
         .find(|m| value_string(m, &["model_id", "id"]) == Some(model_id))
@@ -8370,25 +8484,93 @@ mod tests {
     fn marc27_model_prefers_user_selection_over_default() {
         // The reported bug: user picked sonnet, backend served gpt-5.5.
         assert_eq!(
-            resolve_marc27_model(None, Some("claude-sonnet-4"), None),
-            "claude-sonnet-4",
+            resolve_marc27_model(None, Some("claude-sonnet-4"), None).as_deref(),
+            Some("claude-sonnet-4"),
             "the user's `prism use marc27 --model` pick must win over the default"
         );
-        // No selection anywhere → compiled default (Claude Sonnet 5,
-        // the MARC27 platform default — not an OpenAI model).
-        assert_eq!(
-            resolve_marc27_model(None, None, None),
-            "anthropic/claude-sonnet-5"
-        );
+        // No selection anywhere → None: NO model name is compiled in; the
+        // caller falls back to the platform catalog's `default` alias.
+        assert_eq!(resolve_marc27_model(None, None, None), None);
         // prism.toml [llm].model used when the target carries no model.
         assert_eq!(
-            resolve_marc27_model(None, None, Some("mistral-large-latest")),
-            "mistral-large-latest"
+            resolve_marc27_model(None, None, Some("mistral-large-latest")).as_deref(),
+            Some("mistral-large-latest")
         );
         // Explicit LLM_MODEL env overrides everything.
         assert_eq!(
-            resolve_marc27_model(Some("gpt-5.5".into()), Some("claude-sonnet-4"), None),
-            "gpt-5.5"
+            resolve_marc27_model(Some("gpt-5.5".into()), Some("claude-sonnet-4"), None).as_deref(),
+            Some("gpt-5.5")
+        );
+    }
+
+    /// Fixture mirroring the live catalog shape that caused the billing
+    /// bug: the SAME model served by two providers under different ids.
+    fn catalog_fixture() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "model_id": "claude-sonnet-5",
+                "provider_slug": "anthropic",
+                "aliases": ["default"],
+            }),
+            serde_json::json!({
+                "model_id": "anthropic/claude-sonnet-5",
+                "provider_slug": "openrouter",
+                "aliases": [],
+            }),
+            serde_json::json!({
+                "model_id": "gpt-5.5",
+                "provider_slug": "openai",
+                "aliases": [],
+            }),
+        ]
+    }
+
+    #[test]
+    fn catalog_model_provider_axis_disambiguates_same_model() {
+        let cat = catalog_fixture();
+        // Same LLM_MODEL, different LLM_PROVIDER → different catalog entry.
+        // This is the whole point of the two-axis config: the provider
+        // choice (billing route + price) is explicit, never inferred from
+        // an opaque combined slug.
+        assert_eq!(
+            resolve_catalog_model(&cat, Some("anthropic"), Some("claude-sonnet-5")).as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(
+            resolve_catalog_model(&cat, Some("openrouter"), Some("claude-sonnet-5")).as_deref(),
+            Some("anthropic/claude-sonnet-5"),
+            "bare name must suffix-match the router's prefixed id"
+        );
+        // Provider filter with no matching model → None (caller falls back).
+        assert_eq!(
+            resolve_catalog_model(&cat, Some("openai"), Some("claude-sonnet-5")),
+            None
+        );
+    }
+
+    #[test]
+    fn catalog_model_no_preference_uses_platform_default_alias() {
+        let cat = catalog_fixture();
+        // Nothing configured anywhere → the platform's `default` alias
+        // decides. No model name lives in the client.
+        assert_eq!(
+            resolve_catalog_model(&cat, None, None).as_deref(),
+            Some("claude-sonnet-5")
+        );
+        // Alias is also resolvable as an explicit preference.
+        assert_eq!(
+            resolve_catalog_model(&cat, None, Some("default")).as_deref(),
+            Some("claude-sonnet-5")
+        );
+        // Exact id beats alias/suffix when no provider filter is given.
+        assert_eq!(
+            resolve_catalog_model(&cat, None, Some("anthropic/claude-sonnet-5")).as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        // Empty catalog (offline) → None.
+        assert_eq!(
+            resolve_catalog_model(&[], None, Some("claude-sonnet-5")),
+            None
         );
     }
 
