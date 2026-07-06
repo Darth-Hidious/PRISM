@@ -4,34 +4,49 @@ use tracing::debug;
 
 use crate::api::PlatformClient;
 
+/// Deserialize a field the platform may send as JSON `null` into `T::default`.
+///
+/// `#[serde(default)]` alone only covers a *missing* key — an explicit `null`
+/// still errors with "invalid type: null, expected a string" and takes down the
+/// whole listing. The marketplace legitimately returns `null` for optional text
+/// (e.g. HF-imported resources with no `description`), so coerce null → default
+/// rather than failing every resource because one field is empty.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// A resource listing from the MARC27 marketplace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplaceTool {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub slug: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub resource_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub version: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub description: String,
     #[serde(default)]
     pub author: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub pricing: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub tags: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub download_count: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub status: String,
     #[serde(default)]
     pub license: Option<String>,
     /// How the resource is served: `on_demand` (endpoint-based, deployed on
     /// request) vs artifact-backed. Endpoint-hosted resources have nothing
     /// to download.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub hosting: String,
     /// Storage location of the downloadable artifact. `None`/empty means the
     /// marketplace holds no artifact for this resource — the install
@@ -46,20 +61,20 @@ pub struct MarketplaceTool {
 pub struct MarketplaceFindHit {
     /// Canonical name the agent invokes (e.g. `predict.elastic_moduli.mace`).
     pub canonical_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub display_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub description: String,
     /// Resource type (e.g. `model`, `cli_tool`, `procedural_skill`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub category: String,
     /// How the tool dispatches when invoked: `inference`, `local_shell`,
     /// `mcp_server`, etc. Empty when not applicable to this resource type.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub execution_target: String,
     /// Cosine similarity in [0, 1]; higher = closer to the query. Used by
     /// the agent to decide whether to invoke or fall back.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub score: f32,
 }
 
@@ -191,3 +206,63 @@ fn urlencoding(s: &str) -> String {
 }
 
 const HEX: [u8; 16] = *b"0123456789ABCDEF";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marketplace_tool_tolerates_null_text_fields() {
+        // Reproduces the prod failure: `GET /marketplace/resources` returns
+        // `"description": null` for HF-imported resources with no description.
+        // Before the null_to_default coercion this errored with
+        // "invalid type: null, expected a string" and killed the whole listing.
+        let json = r#"{
+            "name": "PsiBotAI/SynData",
+            "slug": "hf-dataset-psibotai-syndata",
+            "resource_type": "dataset",
+            "description": null,
+            "owner_id": null,
+            "org_id": null,
+            "pricing": null,
+            "status": null,
+            "hosting": null,
+            "tags": null,
+            "download_count": null
+        }"#;
+        let tool: MarketplaceTool = serde_json::from_str(json).expect("null text must not fail");
+        assert_eq!(tool.name, "PsiBotAI/SynData");
+        assert_eq!(tool.description, "");
+        assert_eq!(tool.pricing, "");
+        assert_eq!(tool.tags, Vec::<String>::new());
+        assert_eq!(tool.download_count, 0);
+    }
+
+    #[test]
+    fn marketplace_tool_still_reads_present_fields() {
+        let json = r#"{
+            "name": "uip-mace",
+            "description": "Universal MACE potential",
+            "download_count": 42,
+            "tags": ["materials", "mlip"]
+        }"#;
+        let tool: MarketplaceTool = serde_json::from_str(json).unwrap();
+        assert_eq!(tool.description, "Universal MACE potential");
+        assert_eq!(tool.download_count, 42);
+        assert_eq!(tool.tags, vec!["materials", "mlip"]);
+    }
+
+    #[test]
+    fn find_hit_tolerates_null_fields() {
+        let json = r#"{
+            "canonical_name": "predict.elastic_moduli.mace",
+            "display_name": null,
+            "description": null,
+            "score": null
+        }"#;
+        let hit: MarketplaceFindHit = serde_json::from_str(json).unwrap();
+        assert_eq!(hit.canonical_name, "predict.elastic_moduli.mace");
+        assert_eq!(hit.display_name, "");
+        assert_eq!(hit.score, 0.0);
+    }
+}
