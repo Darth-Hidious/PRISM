@@ -1233,6 +1233,24 @@ async fn run_cli_backed_slash_command_raw(
         bail!("Unsupported slash command root: {root}");
     }
 
+    spawn_prism_cli(args, slash_ctx).await
+}
+
+/// Spawn `prism <args>` as a subprocess and collect its output.
+///
+/// This is the mechanical half of [`run_cli_backed_slash_command_raw`],
+/// split out so a caller that already knows exactly which fixed,
+/// human-typed-equivalent command it wants to run — e.g. the `/use show`
+/// handler below — can invoke it directly without going through the
+/// [`is_cli_backed_slash_root`] allowlist gate. That gate exists to stop
+/// an *arbitrary* typed root from reaching the shell; it isn't needed
+/// when the caller hardcodes the argv itself.
+async fn spawn_prism_cli(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<RawCliSlashOutput> {
+    let root = args[0].as_str();
+
     if matches!(root, "setup" | "backend") {
         return Ok(RawCliSlashOutput {
             invocation: format!("prism {}", args.join(" ")),
@@ -6275,6 +6293,59 @@ async fn handle_command(
             let output =
                 format_doctor_report(slash_ctx, llm_config, transcript, tools, *session_mode);
             emit_view("doctor", "Doctor", &output, "warning");
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        // `/use show` — read-only, so it's safe to run through the CLI
+        // directly. The switching variants (`local`/`provider`/`marc27`/
+        // `reset`) are deliberately NOT wired here: `prism use ...` only
+        // persists to `~/.prism/config.toml`, and this session's live chat
+        // route lives in a different process's memory. Running the switch
+        // as a subprocess would print "\u{2713} Chat: ..." as if it took
+        // effect now, when it actually only applies on the next launch —
+        // an honest-looking lie. `show` has no such gap: it only reads.
+        _ if trimmed == "/use" || trimmed == "/use show" => {
+            let raw =
+                spawn_prism_cli(&[String::from("use"), String::from("show")], slash_ctx).await?;
+            let output = format_cli_output(
+                &raw.invocation,
+                &raw.stdout,
+                &raw.stderr,
+                raw.success,
+                raw.code,
+            );
+            emit_view("use", "Chat target", &output, "info");
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        _ if trimmed == "/billing" => {
+            let balance = run_cli_backed_slash_command(&[String::from("billing")], slash_ctx)
+                .await
+                .unwrap_or_else(|e| format!("Balance unavailable: {e}"));
+            let usage = run_cli_backed_slash_command(
+                &[String::from("billing"), String::from("usage")],
+                slash_ctx,
+            )
+            .await
+            .unwrap_or_else(|e| format!("Usage unavailable: {e}"));
+            let prices = run_cli_backed_slash_command(
+                &[String::from("billing"), String::from("prices")],
+                slash_ctx,
+            )
+            .await
+            .unwrap_or_else(|e| format!("Prices unavailable: {e}"));
+            emit_tabbed_view(
+                "billing",
+                "Billing & Credits",
+                &[
+                    ("balance", "Balance", &balance, "info"),
+                    ("usage", "Usage", &usage, "accent"),
+                    ("prices", "Prices", &prices, "info"),
+                ],
+                "balance",
+                "info",
+                "tab switch • esc close • /billing history · /billing topup <package> for more",
+            );
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }

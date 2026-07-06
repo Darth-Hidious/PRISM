@@ -260,6 +260,16 @@ const BUILTIN_COMMANDS: &[SlashCommandSpec] = &[
         description: "Inspect stored discourse turns",
         category: "Settings",
     },
+    SlashCommandSpec {
+        usage: "/billing",
+        description: "Show MARC27 credits balance, usage, and prices",
+        category: "Settings",
+    },
+    SlashCommandSpec {
+        usage: "/use show",
+        description: "Show the active chat target (MARC27 / local / provider)",
+        category: "Settings",
+    },
 ];
 
 const CLI_BACKED_ROOTS: &[&str] = &[
@@ -324,6 +334,8 @@ pub fn builtin_help_text() -> String {
     lines.push("  /models list [--provider google]".to_string());
     lines.push("  /gpus".to_string());
     lines.push("  /discourse list".to_string());
+    lines.push("  /campaign start --goal \"...\" [--budget 5]".to_string());
+    lines.push("  /campaign status <id>".to_string());
 
     lines.join("\n")
 }
@@ -342,6 +354,11 @@ mod tests {
         assert!(help.contains("/context"));
         assert!(help.contains("/usage"));
         assert!(help.contains("Most `prism` CLI subcommands also work here"));
+        // Parity drain: billing visibility and the read-only /use show are
+        // discoverable from /help, not just from the source.
+        assert!(help.contains("/billing"));
+        assert!(help.contains("/use show"));
+        assert!(help.contains("/campaign start"));
     }
 
     #[test]
