@@ -4605,6 +4605,7 @@ async fn extract_platform_ingest_text(
 
 async fn submit_platform_ingest_chunk(
     chunk: &str,
+    doc_id: &str,
     corpus: Option<&str>,
     model: Option<&str>,
 ) -> Result<serde_json::Value> {
@@ -4613,8 +4614,11 @@ async fn submit_platform_ingest_chunk(
         .timeout(Duration::from_secs(120))
         .build()?;
 
+    // "text" = inline document ingestion (IngestSource::Text). The old
+    // "query" type made the platform WEB-SEARCH the document's text instead
+    // of ingesting it — documents never landed (ingestion audit, critical #1).
     let mut body = serde_json::json!({
-        "source": { "type": "query", "query": chunk },
+        "source": { "type": "text", "text": chunk, "doc_id": doc_id },
         "mode": "full",
     });
     if let Some(corpus) = corpus {
@@ -4725,7 +4729,8 @@ async fn run_platform_ingest_file(
     let mut jobs = Vec::new();
     if !schema_only {
         for (index, chunk) in chunks.iter().enumerate() {
-            let mut job = submit_platform_ingest_chunk(chunk, corpus, model).await?;
+            let doc_id = format!("{}#{}", path.display(), index);
+            let mut job = submit_platform_ingest_chunk(chunk, &doc_id, corpus, model).await?;
             if let Some(obj) = job.as_object_mut() {
                 obj.insert("chunk_index".to_string(), serde_json::json!(index));
                 obj.insert(
