@@ -32,7 +32,7 @@ use prism_python_bridge::{ToolServer, ensure_venv};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
     WorkflowRunResult, WorkflowSpec, discover_workflows, execute_workflow, find_workflow,
-    parse_workflow_command_args,
+    load_workflow_from_str, parse_workflow_command_args,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -3800,8 +3800,16 @@ async fn handle_workflow_command(
             pairs,
             execute,
         } => {
-            let spec = find_workflow(&specs, &name)
-                .ok_or_else(|| anyhow!("Workflow not found: {name}"))?;
+            // Accept ONE self-contained .yaml fed directly (owner: "one .yaml
+            // file that has to be fed" — no dropping it in ~/.prism/workflows
+            // first). If `name` is a path to an existing yaml/yml, load that
+            // spec wholesale; otherwise resolve it as a registered name.
+            let file_spec = load_workflow_file(&name)?;
+            let spec = match &file_spec {
+                Some(s) => s,
+                None => find_workflow(&specs, &name)
+                    .ok_or_else(|| anyhow!("Workflow not found: {name}"))?,
+            };
             let mut values = parse_set_pairs(&pairs)?;
             // Only execute-mode runs actually call tools (dry runs plan only).
             if execute && let Some(token) = mint_workflow_node_token(paths).await {
@@ -3837,6 +3845,28 @@ async fn try_run_workflow_alias(
     let result = execute_workflow(spec, &values, request.execute).await?;
     render_workflow_result(spec, &result);
     Ok(true)
+}
+
+/// If `name` points at an existing `.yaml`/`.yml` file, load and parse it as a
+/// single self-contained workflow spec. Returns `None` when it's not a yaml
+/// path (so the caller falls back to registry-name lookup). A path that looks
+/// like yaml but fails to read/parse is a hard error — the user clearly meant
+/// to feed that file.
+fn load_workflow_file(name: &str) -> Result<Option<WorkflowSpec>> {
+    let path = Path::new(name);
+    let is_yaml = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"))
+        .unwrap_or(false);
+    if !is_yaml || !path.is_file() {
+        return Ok(None);
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading workflow file {name}"))?;
+    let spec = load_workflow_from_str(&text, name)
+        .with_context(|| format!("parsing workflow file {name}"))?;
+    Ok(Some(spec))
 }
 
 fn parse_set_pairs(pairs: &[String]) -> Result<BTreeMap<String, String>> {

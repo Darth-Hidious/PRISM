@@ -806,6 +806,19 @@ async fn run_tool_step(
         context,
     )?;
 
+    // Approval gate. Approval-gated tools (execute_python, compute_submit,
+    // predict, research, sim_run, …) refuse to run headless unless the caller
+    // pre-approves them by name. A workflow author who writes `approve: true`
+    // on a tool step IS that pre-approval — the deterministic equivalent of a
+    // chat turn's interactive OK — and the node's `/api/tools/{name}/run`
+    // endpoint already honours a top-level `approve` in the body. This is NOT a
+    // policy bypass: every tool step is still checked by OPA, which gates
+    // destructive tools by role regardless of this flag. Aliases mirror the
+    // natural things an author (or LLM) writes.
+    let approve = config_first(&step.config, &["approve", "approved", "auto_approve"])
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     if dry_run {
         return Ok(WorkflowStepResult {
             id: step.id.clone(),
@@ -816,6 +829,7 @@ async fn run_tool_step(
                 "tool": tool_name,
                 "command": command,
                 "inputs": inputs,
+                "approve": approve,
             }),
         });
     }
@@ -830,6 +844,7 @@ async fn run_tool_step(
     let body = serde_json::json!({
         "command": command,
         "inputs": inputs,
+        "approve": approve,
     });
 
     // Authenticate to the local node. When the node is online it gates
@@ -1709,6 +1724,18 @@ fn resolve_path(
     context: &BTreeMap<String, serde_json::Value>,
     path: &str,
 ) -> Result<serde_json::Value> {
+    // `args.` is a documented convention, not a real container: docs/workflows.md
+    // promises `{{ args.formula }}` ≡ `{{ formula }}`, and every LLM-authoring
+    // example writes the `args.` form. Arguments/values land in the context flat
+    // (keyed by bare name), so strip a leading `args.` before resolving — unless
+    // a workflow genuinely put an `args` object in context, in which case honor
+    // that literal. Without this, workflows written straight from the guide fail
+    // their first render with "unknown workflow context path".
+    let path = if path.starts_with("args.") && !context.contains_key("args") {
+        path.strip_prefix("args.").unwrap_or(path)
+    } else {
+        path
+    };
     let mut current = context
         .get(path.split('.').next().unwrap_or_default())
         .cloned()
@@ -2613,5 +2640,100 @@ steps:
         for step in &result.steps {
             assert_eq!(step.status, "planned");
         }
+    }
+
+    // ── `args.` prefix convention ─────────────────────────────────────
+    //
+    // docs/workflows.md promises `{{ args.x }}` ≡ `{{ x }}`. Arguments land
+    // in context flat, so resolve_path must strip a leading `args.`.
+
+    #[test]
+    fn resolve_path_strips_args_prefix() {
+        let mut ctx = BTreeMap::new();
+        ctx.insert("formula".to_string(), serde_json::json!("Ni"));
+        // Both spellings resolve to the same flat value.
+        assert_eq!(
+            resolve_path(&ctx, "formula").unwrap(),
+            serde_json::json!("Ni")
+        );
+        assert_eq!(
+            resolve_path(&ctx, "args.formula").unwrap(),
+            serde_json::json!("Ni")
+        );
+    }
+
+    #[test]
+    fn resolve_path_honors_literal_args_object() {
+        // If a workflow genuinely has an `args` object in context, the literal
+        // wins over the strip-the-prefix convention.
+        let mut ctx = BTreeMap::new();
+        ctx.insert("args".to_string(), serde_json::json!({ "formula": "Fe" }));
+        ctx.insert("formula".to_string(), serde_json::json!("Ni"));
+        assert_eq!(
+            resolve_path(&ctx, "args.formula").unwrap(),
+            serde_json::json!("Fe")
+        );
+    }
+
+    #[test]
+    fn workflow_default_arg_renders_via_args_prefix() {
+        // End-to-end: an arg with a default, referenced as `{{ args.x }}`,
+        // renders in dry-run (the shape every LLM-authored workflow uses).
+        let result = dry_run(
+            r#"
+name: t
+arguments:
+  - name: formula
+    default: "Ni"
+steps:
+  - id: predict
+    action: tool
+    name: predict
+    inputs:
+      formula: "{{ args.formula }}"
+"#,
+        );
+        assert_eq!(result.steps[0].status, "planned");
+        assert_eq!(result.steps[0].data["inputs"]["formula"], "Ni");
+    }
+
+    // ── approval forwarding ───────────────────────────────────────────
+    //
+    // Approval-gated tools (execute_python, compute_submit, …) run headless
+    // only when pre-approved. `approve: true` on a tool step IS that approval
+    // and must reach the node endpoint. Dry-run records it so it's visible.
+
+    #[test]
+    fn tool_step_forwards_approve_flag() {
+        let result = dry_run(
+            r#"
+name: t
+steps:
+  - id: run_py
+    action: tool
+    name: execute_python
+    approve: true
+    inputs:
+      code: "print(1)"
+"#,
+        );
+        assert_eq!(result.steps[0].data["approve"], true);
+    }
+
+    #[test]
+    fn tool_step_approve_defaults_false() {
+        let result = dry_run(
+            r#"
+name: t
+steps:
+  - id: search
+    action: tool
+    name: knowledge
+    inputs:
+      action: search
+      term: "Ni"
+"#,
+        );
+        assert_eq!(result.steps[0].data["approve"], false);
     }
 }
