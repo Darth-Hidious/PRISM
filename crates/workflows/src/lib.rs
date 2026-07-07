@@ -306,8 +306,16 @@ pub async fn execute_workflow(
     values: &BTreeMap<String, String>,
     execute: bool,
 ) -> Result<WorkflowRunResult> {
-    execute_workflow_with_policy(spec, values, execute, None, None).await
+    execute_workflow_with_policy(spec, values, execute, None, None, None).await
 }
+
+/// Least-privileged role defined by the policy crate. Used as the fail-closed
+/// default when a caller runs a workflow under an active policy engine without
+/// supplying an authenticated role. The policy denies `workflow.execute` and
+/// `tool.call` for `viewer`, so a missing role safely denies rather than
+/// silently inheriting elevated privileges. Every real caller passes the
+/// authenticated role explicitly; this constant only guards the gap.
+const LEAST_PRIVILEGED_ROLE: &str = "viewer";
 
 /// Execute a workflow with optional OPA policy enforcement.
 ///
@@ -316,14 +324,21 @@ pub async fn execute_workflow(
 /// 2. Whether each `tool` step is allowed before execution
 ///
 /// The `principal` should be the user ID or "agent" for autonomous execution.
+///
+/// The `role` MUST come from the authenticated caller context — never from the
+/// caller-supplied `values` map (which the workflow author/invoker controls and
+/// could set to `admin` to escalate). When `None`, the least-privileged role is
+/// used so an unauthenticated caller is denied rather than escalated.
 pub async fn execute_workflow_with_policy(
     spec: &WorkflowSpec,
     values: &BTreeMap<String, String>,
     execute: bool,
     mut policy: Option<&mut prism_policy::PolicyEngine>,
     principal: Option<&str>,
+    role: Option<&str>,
 ) -> Result<WorkflowRunResult> {
     let principal = principal.unwrap_or("agent");
+    let role = role.unwrap_or(LEAST_PRIVILEGED_ROLE);
 
     // Check workflow-level policy and collect obligations
     let mut workflow_obligations: Vec<String> = Vec::new();
@@ -331,10 +346,8 @@ pub async fn execute_workflow_with_policy(
         let input = prism_policy::PolicyInput {
             action: "workflow.execute".into(),
             principal: principal.into(),
-            role: values
-                .get("role")
-                .cloned()
-                .unwrap_or_else(|| "operator".into()),
+            // Role comes from the authenticated context, NOT from `values`.
+            role: role.into(),
             resource: spec.name.clone(),
             context: serde_json::json!({
                 "execute": execute,
@@ -416,10 +429,8 @@ pub async fn execute_workflow_with_policy(
             let input = prism_policy::PolicyInput {
                 action: "tool.call".into(),
                 principal: principal.into(),
-                role: values
-                    .get("role")
-                    .cloned()
-                    .unwrap_or_else(|| "operator".into()),
+                // Role comes from the authenticated context, NOT from `values`.
+                role: role.into(),
                 resource: tool_name.into(),
                 context: config_first(&step.config, &["inputs", "args", "with", "params"])
                     .cloned()
@@ -499,6 +510,7 @@ pub async fn execute_workflow_with_policy(
                         !execute,
                         policy.as_deref_mut(),
                         principal,
+                        role,
                     )
                     .await
                 }
@@ -1401,6 +1413,7 @@ async fn run_workflow_step(
     dry_run: bool,
     policy: Option<&mut prism_policy::PolicyEngine>,
     principal: &str,
+    role: &str,
 ) -> Result<WorkflowStepResult> {
     // Aliases: `name` (canonical) | `workflow`
     let workflow_name = config_first(&step.config, &["name", "workflow"])
@@ -1456,6 +1469,7 @@ async fn run_workflow_step(
         true,
         policy,
         Some(principal),
+        Some(role),
     ))
     .await?;
 
@@ -1859,6 +1873,61 @@ mod tests {
         assert_eq!(parsed.name, "forge");
         assert!(parsed.execute);
         assert_eq!(parsed.values.get("paper").unwrap(), "arxiv:2106.09685");
+    }
+
+    #[test]
+    fn workflow_role_not_read_from_values() {
+        // Defect 2: the policy role MUST come from the authenticated context,
+        // never from the caller-supplied `values` map. A caller stuffing
+        // role=admin into values must NOT escalate.
+        let spec = load_workflow_from_str(
+            r#"
+name: escalation_probe
+command_name: escalation_probe
+steps:
+  - id: hello
+    action: message
+    text: "hi"
+"#,
+            "inline:escalation_probe",
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // Attacker sets role=admin in the caller-supplied values map while
+        // authenticated only as the least-privileged viewer.
+        let mut values = BTreeMap::new();
+        values.insert("role".to_string(), "admin".to_string());
+
+        let mut engine = prism_policy::PolicyEngine::new().unwrap();
+        let denied = rt.block_on(execute_workflow_with_policy(
+            &spec,
+            &values,
+            false,
+            Some(&mut engine),
+            Some("attacker"),
+            Some("viewer"),
+        ));
+        assert!(
+            denied.is_err(),
+            "values role=admin must NOT escalate a viewer: {denied:?}"
+        );
+
+        // Positive control: an authenticated admin runs the same workflow.
+        let mut engine = prism_policy::PolicyEngine::new().unwrap();
+        let allowed = rt.block_on(execute_workflow_with_policy(
+            &spec,
+            &BTreeMap::new(),
+            false,
+            Some(&mut engine),
+            Some("admin-user"),
+            Some("admin"),
+        ));
+        assert!(
+            allowed.is_ok(),
+            "authenticated admin should run workflow: {allowed:?}"
+        );
     }
 
     #[test]
