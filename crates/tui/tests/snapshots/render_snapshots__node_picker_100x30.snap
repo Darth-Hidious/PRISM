@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+           ┌ Nodes — 2 of 4 online ─────────────────────────────────────────────────────┐
+           │   Node                Hardware                  Access   Last seen         │
+           │                                                                            │
+           │ ● lab-hpc-01          2× A100-80GB · 64 cores … org      online now  ◀     │
+           │ ● studio-mac          12 cores · 24 GB · aarch… private  online now        │
+           │ ● edge-box-eu         8 cores · 16 GB           private  provisioning…     │
+           │ ○ old-worker                                    private  offline           │
+           │                                                                            │
+           │  ↑↓ · Esc                                                                  │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+           │                                                                            │
+┌ Prompt ──│                                                                            │
+│ Type a me│                                                                            │
+│          └────────────────────────────────────────────────────────────────────────────┘
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

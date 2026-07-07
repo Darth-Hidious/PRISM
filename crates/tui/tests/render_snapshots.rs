@@ -883,6 +883,29 @@ fn snapshot_gpu_picker_100x30() {
     insta::assert_snapshot!("gpu_picker_100x30", rendered);
 }
 
+/// Snapshot: Nodes view populated from a fake ui.nodes.list.
+/// Covers online (GPU + CPU) / provisioning / offline states and a sparse
+/// profile — all time-independent so the snapshot stays deterministic.
+#[test]
+fn snapshot_node_picker_100x30() {
+    let mut app = app_with_welcome();
+    app.open_node_picker();
+    app.apply_agent_msg(prism_tui::msg::AgentMsg::NodeList {
+        nodes: vec![
+            serde_json::json!({"name":"lab-hpc-01","status":"online","visibility":"org","last_seen_at":"2026-04-06T02:00:00Z","profile":{"cpu_cores":64,"ram_gb":256,"gpus":["A100-80GB","A100-80GB"],"labels":{"arch":"x86_64"}}}),
+            serde_json::json!({"name":"studio-mac","status":"online","visibility":"private","last_seen_at":"2026-04-06T02:00:00Z","profile":{"cpu_cores":12,"ram_gb":24,"labels":{"arch":"aarch64"}}}),
+            serde_json::json!({"name":"edge-box-eu","status":"provisioning","visibility":"private","profile":{"cpu_cores":8,"ram_gb":16}}),
+            serde_json::json!({"name":"old-worker","status":"offline","visibility":"private","profile":{}}),
+        ],
+        error: None,
+    });
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("node_picker_100x30", rendered);
+}
+
 /// Snapshot: GitHub panel open (Issues) populated from a fake ui.gh.data.
 #[test]
 fn snapshot_gh_panel_100x30() {

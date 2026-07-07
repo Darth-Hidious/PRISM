@@ -73,6 +73,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_model_picker(f, app);
     } else if app.gpu_picker.open {
         draw_gpu_picker(f, app);
+    } else if app.node_picker.open {
+        draw_node_picker(f, app);
     } else if app.account.open {
         draw_account(f, app);
     } else if app.session_picker.open {
@@ -2149,6 +2151,201 @@ fn draw_gpu_picker(f: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(t.accent))
                 .title(Span::styled(
                     " Procure GPU compute ",
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                )),
+        );
+    f.render_widget(para, area);
+}
+
+/// GPU name from a `profile.gpus[]` element, which may be a bare string
+/// (`"A100-80GB"`) or an object (`{"name": ...}` / `{"model": ...}`).
+fn node_gpu_name(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    v.get("name")
+        .or_else(|| v.get("model"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+}
+
+/// Short hardware summary from a node's free-form `profile` — e.g.
+/// `"1× A100-80GB · 12 cores · 24 GB · aarch64"`. Every field is optional;
+/// missing pieces are simply dropped (older/sparse profiles never panic).
+fn node_hw_summary(profile: Option<&serde_json::Value>) -> String {
+    let Some(profile) = profile.filter(|v| v.is_object()) else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(gpus) = profile.get("gpus").and_then(|v| v.as_array())
+        && !gpus.is_empty()
+    {
+        let name = node_gpu_name(&gpus[0]).unwrap_or_else(|| "GPU".to_string());
+        parts.push(format!("{}× {}", gpus.len(), name));
+    }
+    if let Some(cores) = profile.get("cpu_cores").and_then(|v| v.as_u64()) {
+        parts.push(format!("{cores} cores"));
+    }
+    if let Some(ram) = profile.get("ram_gb").and_then(|v| v.as_f64()) {
+        parts.push(format!("{} GB", ram.round() as u64));
+    }
+    if let Some(arch) = profile
+        .get("labels")
+        .and_then(|l| l.get("arch"))
+        .and_then(|a| a.as_str())
+    {
+        parts.push(arch.to_string());
+    }
+    parts.join(" · ")
+}
+
+/// Relative "last seen" for an offline node from an RFC 3339 timestamp.
+/// Best-effort: an unparseable/missing timestamp renders a plain "offline".
+fn fmt_last_seen(iso: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(iso) {
+        Ok(t) => {
+            let secs = (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds();
+            if secs < 60 {
+                "last seen just now".to_string()
+            } else if secs < 3600 {
+                format!("last seen {}m ago", secs / 60)
+            } else if secs < 86_400 {
+                format!("last seen {}h ago", secs / 3600)
+            } else if secs < 604_800 {
+                format!("last seen {}d ago", secs / 86_400)
+            } else {
+                format!("last seen {}w ago", secs / 604_800)
+            }
+        }
+        Err(_) => "offline".to_string(),
+    }
+}
+
+fn draw_node_picker(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let area = centered_rect(78, 80, f.area());
+    f.render_widget(Clear, area);
+
+    let total = app.node_picker.nodes.len();
+    let sel = app.node_picker.selected.min(total.saturating_sub(1));
+    let online = app
+        .node_picker
+        .nodes
+        .iter()
+        .filter(|n| model_field(n, "status") == "online")
+        .count();
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Column header — widths must stay in sync with the row spans below.
+    lines.push(Line::from(Span::styled(
+        format!(
+            "   {:<20}{:<26}{:<9}{}",
+            "Node", "Hardware", "Access", "Last seen"
+        ),
+        Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::raw(""));
+
+    if app.node_picker.loading && app.node_picker.nodes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  fetching your nodes…",
+            Style::default().fg(t.muted),
+        )));
+    } else if total == 0 {
+        lines.push(Line::from(Span::styled(
+            "  No nodes yet — run `node up` on a machine to connect it",
+            Style::default().fg(t.muted),
+        )));
+    } else {
+        // Scroll-windowed list that follows the selection.
+        let viewport = (area.height.saturating_sub(9)).max(6) as usize;
+        let (start, end) = scroll_window(sel, total, viewport);
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  ↑ {} above", start),
+                Style::default().fg(t.muted),
+            )));
+        }
+        for rank in start..end {
+            let n = &app.node_picker.nodes[rank];
+            let name = model_field(n, "name");
+            let status = model_field(n, "status");
+            let visibility = model_field(n, "visibility");
+            let hw = node_hw_summary(n.get("profile"));
+            let focused = rank == sel;
+
+            // Status drives the glyph + colour; offline rows render dimmed so
+            // live (reachable) nodes stand out.
+            let (mark, mark_fg, name_fg) = match status.as_str() {
+                "online" => ("●", t.ok, t.text),
+                "provisioning" => ("●", t.warn, t.text),
+                _ => ("○", t.muted, t.muted),
+            };
+            let seen = match status.as_str() {
+                "online" => "online now".to_string(),
+                "provisioning" => "provisioning…".to_string(),
+                _ => n
+                    .get("last_seen_at")
+                    .and_then(|v| v.as_str())
+                    .map(fmt_last_seen)
+                    .unwrap_or_else(|| "offline".to_string()),
+            };
+            let aux = if status == "online" || status == "provisioning" {
+                t.dim
+            } else {
+                t.muted
+            };
+
+            let mut spans = vec![
+                Span::styled(format!(" {mark} "), Style::default().fg(mark_fg)),
+                Span::styled(
+                    format!("{:<20}", clip(&name, 19)),
+                    Style::default().fg(name_fg),
+                ),
+                Span::styled(format!("{:<26}", clip(&hw, 25)), Style::default().fg(aux)),
+                Span::styled(
+                    format!("{:<9}", clip(&visibility, 8)),
+                    Style::default().fg(aux),
+                ),
+                Span::styled(seen, Style::default().fg(aux)),
+            ];
+            if focused {
+                spans.push(Span::styled("  ◀", Style::default().fg(t.accent)));
+            }
+            let mut row = Line::from(spans);
+            if focused {
+                row = row.style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+            lines.push(row);
+        }
+        if end < total {
+            lines.push(Line::from(Span::styled(
+                format!("  ↓ {} below", total - end),
+                Style::default().fg(t.muted),
+            )));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ · Esc",
+        Style::default().fg(t.muted),
+    )));
+
+    let title = if total == 0 {
+        " Nodes ".to_string()
+    } else {
+        format!(" Nodes — {online} of {total} online ")
+    };
+    let para = Paragraph::new(lines)
+        .style(Style::default().bg(t.overlay_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.accent))
+                .title(Span::styled(
+                    title,
                     Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                 )),
         );

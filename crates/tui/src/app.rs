@@ -158,6 +158,18 @@ pub struct GpuPicker {
     pub loading: bool,
 }
 
+/// Nodes view state — the user's connected platform nodes (palette entry
+/// `nodes.show`). Populated from the `ui.nodes.list` notification; this is a
+/// read-only viewer (no Enter action). The visible window follows `selected`
+/// (model-picker style scrolling).
+#[derive(Debug, Clone, Default)]
+pub struct NodePicker {
+    pub open: bool,
+    pub nodes: Vec<Value>,
+    pub selected: usize,
+    pub loading: bool,
+}
+
 /// Account status read from `~/.prism/credentials.json` (client-side).
 #[derive(Debug, Clone, Default)]
 pub struct AccountStatus {
@@ -430,6 +442,8 @@ pub struct App {
     pub model_picker: ModelPicker,
     /// GPU picker state (live compute catalog → provision prompt).
     pub gpu_picker: GpuPicker,
+    /// Nodes view state (the user's connected platform nodes).
+    pub node_picker: NodePicker,
     /// Account dialog (MARC27 login/logout + status).
     pub account: AccountDialog,
     /// Session picker (list/resume).
@@ -507,6 +521,7 @@ impl App {
             gh: GhPanel::default(),
             model_picker: ModelPicker::default(),
             gpu_picker: GpuPicker::default(),
+            node_picker: NodePicker::default(),
             account: AccountDialog::default(),
             session_picker: SessionPicker::default(),
             view: ViewPanel::default(),
@@ -576,6 +591,12 @@ impl App {
         // GPU picker intercepts keys while open.
         if self.gpu_picker.open {
             self.handle_gpu_picker_key(key);
+            return;
+        }
+
+        // Nodes view intercepts keys while open.
+        if self.node_picker.open {
+            self.handle_node_picker_key(key);
             return;
         }
 
@@ -1931,6 +1952,38 @@ impl App {
         }
     }
 
+    // ── Nodes view ──────────────────────────────────────────────────
+
+    /// Open the Nodes view and request the user's node list (`/nodes`).
+    pub fn open_node_picker(&mut self) {
+        self.node_picker.open = true;
+        self.node_picker.loading = true;
+        self.node_picker.selected = 0;
+        let _ = self.backend.send_command("/nodes");
+    }
+
+    fn handle_node_picker_key(&mut self, key: KeyEvent) {
+        let cancel = (key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c'))
+            || key.code == KeyCode::Esc;
+        if cancel {
+            self.node_picker.open = false;
+            return;
+        }
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.node_picker.nodes.is_empty() {
+                    self.node_picker.selected =
+                        (self.node_picker.selected + 1).min(self.node_picker.nodes.len() - 1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.node_picker.selected = self.node_picker.selected.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
     // ── Account (MARC27 login/logout) ───────────────────────────────
 
     /// Read `~/.prism/credentials.json` for the current login status.
@@ -2673,6 +2726,7 @@ impl App {
             "cost.show" => self.modal = Some(Modal::Cost),
             "model.show" => self.open_model_picker(),
             "compute.gpus" => self.open_gpu_picker(),
+            "nodes.show" => self.open_node_picker(),
             "mcp.show" => self.modal = Some(Modal::Tools),
             "goal.set" => self.open_goal_form(),
             "campaign.start" => self.open_campaign_start_form(),
@@ -2935,6 +2989,19 @@ impl App {
                 }
                 if let Some(err) = error {
                     self.toast(format!("gpus: {err}"), ToastKind::Warn);
+                }
+            }
+            AgentMsg::NodeList { nodes, error } => {
+                // Populate the Nodes view; open it if not already (so a
+                // `/nodes` from the input also surfaces the view).
+                self.node_picker.nodes = nodes;
+                self.node_picker.loading = false;
+                self.node_picker.selected = 0;
+                if !self.node_picker.open {
+                    self.node_picker.open = true;
+                }
+                if let Some(err) = error {
+                    self.toast(format!("nodes: {err}"), ToastKind::Warn);
                 }
             }
             AgentMsg::ToolsCatalog { tools } => {

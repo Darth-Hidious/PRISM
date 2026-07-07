@@ -561,6 +561,18 @@ impl FakeBackend {
             self.notify("ui.turn.complete", serde_json::json!({}));
             return;
         }
+        // Nodes view: `/nodes` → deterministic `ui.nodes.list`.
+        if command == "/nodes" || command.starts_with("/nodes ") {
+            let nodes = vec![
+                serde_json::json!({"name":"lab-hpc-01","status":"online","visibility":"org","last_seen_at":"2026-04-06T02:00:00Z","profile":{"cpu_cores":64,"ram_gb":256,"gpus":["A100-80GB","A100-80GB"],"labels":{"arch":"x86_64"}}}),
+                serde_json::json!({"name":"studio-mac","status":"online","visibility":"private","last_seen_at":"2026-04-06T02:00:00Z","profile":{"cpu_cores":12,"ram_gb":24,"labels":{"arch":"aarch64"}}}),
+                serde_json::json!({"name":"edge-box-eu","status":"provisioning","visibility":"private","profile":{"cpu_cores":8,"ram_gb":16}}),
+                serde_json::json!({"name":"old-worker","status":"offline","visibility":"private","profile":{}}),
+            ];
+            self.notify("ui.nodes.list", serde_json::json!({"nodes": nodes}));
+            self.notify("ui.turn.complete", serde_json::json!({}));
+            return;
+        }
         // Session picker: `/sessions` → deterministic `ui.session.list`.
         if command == "/sessions" {
             let sessions = vec![

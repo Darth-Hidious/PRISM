@@ -3675,6 +3675,62 @@ async fn handle_gpus_slash_command(
     Ok(true)
 }
 
+/// `/nodes` — the user's connected platform nodes for the TUI Nodes view.
+///
+/// Fetches the live node list through the platform REST client
+/// [`prism_client::node_registry::NodeRegistryClient::list_nodes`] (`GET
+/// /nodes`) and emits a structured `ui.nodes.list` notification the Nodes view
+/// renders directly. On any failure (no credentials, network, auth) it emits
+/// `ui.nodes.list` with an `error` string — an honest failure, never a crash.
+async fn handle_nodes_slash_command(args: &[String]) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("nodes") {
+        return Ok(false);
+    }
+
+    let creds = PrismPaths::discover()
+        .ok()
+        .and_then(|paths| paths.load_cli_state().ok())
+        .and_then(|state| state.credentials);
+
+    let (nodes, error) = match creds {
+        None => (
+            Vec::new(),
+            Some("Not signed in — log in from the account view to see your nodes.".to_string()),
+        ),
+        Some(creds) => {
+            let endpoints = PlatformEndpoints::from_env();
+            let platform = PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
+            let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
+            match registry.list_nodes(None).await {
+                Ok(nodes) => (nodes, None),
+                Err(error) => (Vec::new(), Some(format!("{error}"))),
+            }
+        }
+    };
+
+    // Re-key `last_seen` → `last_seen_at` so the payload matches the /nodes
+    // contract the view renders (the client aliases it back on the way in).
+    let norm: Vec<Value> = nodes
+        .iter()
+        .map(|n| {
+            let mut v = serde_json::to_value(n).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = v.as_object_mut()
+                && let Some(seen) = obj.remove("last_seen")
+            {
+                obj.insert("last_seen_at".to_string(), seen);
+            }
+            v
+        })
+        .collect();
+
+    emit_notification(
+        "ui.nodes.list",
+        serde_json::json!({ "nodes": norm, "error": error }),
+    );
+    emit_notification("ui.turn.complete", serde_json::json!({}));
+    Ok(true)
+}
+
 /// `/gh` — GitHub inside the TUI. Backs the Issues / PRs / Status / Bug panel.
 /// Shells to the authenticated `gh` CLI and emits a single structured
 /// `ui.gh.data` notification the TUI renders. The repo is auto-detected from
@@ -6422,6 +6478,9 @@ async fn handle_command(
                 return Ok(true);
             }
             if handle_gpus_slash_command(&args, slash_ctx).await? {
+                return Ok(true);
+            }
+            if handle_nodes_slash_command(&args).await? {
                 return Ok(true);
             }
             if handle_gh_slash_command(&args, slash_ctx).await? {

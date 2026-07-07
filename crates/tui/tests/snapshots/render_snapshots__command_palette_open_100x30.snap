@@ -1,6 +1,5 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 736
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
@@ -16,15 +15,15 @@ expression: rendered
                │    Deep research           Multi-step research with citat… palette │
                │    Knowledge               Search & ingest — one pane      palette │
                │    Material properties     Structure, lattice, moduli, ba… palette │
+               │    Nodes                   See your connected nodes        palette │
                │    Predict properties      ML prediction for a composition palette │
                │    Procure GPU compute     Live GPU catalog with prices    palette │
                │    Run simulation          Relax/MD via MACE + pyiron      palette │
+               │    Goal status             Check a discovery campaign's p… palette │
+               │    List goals              Discovery campaigns on this no… palette │
                │    Notebook                Notebook session — coming in-app … soon │
-               │  ── DISPLAY ────────────────────────────────────────────────────── │
-               │    Mission Control         The launch dashboard — workflo… palette │
-               │    Toggle thinking         Show/hide reasoning tokens       Ctrl-T │
-               │  ── HELP ───────────────────────────────────────────────────────── │
-               │  … 34 more — ↓ to scroll or type to filter                         │
+               │    Resume goal             Continue a paused discovery ca… palette │
+               │  … 45 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│

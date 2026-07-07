@@ -106,6 +106,14 @@ pub static CATALOG: &[Command] = &[
         suggested: true,
     },
     Command {
+        id: "nodes.show",
+        title: "Nodes",
+        description: "See your connected nodes",
+        category: "Science",
+        keybind: "palette",
+        suggested: true,
+    },
+    Command {
         id: "sci.notebook",
         title: "Notebook",
         description: "Notebook session — coming in-app (agent-watched, editable)",

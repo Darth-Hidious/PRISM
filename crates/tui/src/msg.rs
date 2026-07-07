@@ -72,6 +72,15 @@ pub enum AgentMsg {
         error: Option<String>,
     },
 
+    /// `ui.nodes.list` — the user's platform nodes (response to `/nodes`),
+    /// rendered as the Nodes view. Each item is
+    /// `{name,status,visibility,profile,last_seen_at,price_per_hour_usd}`.
+    /// `error` is set if the node fetch failed.
+    NodeList {
+        nodes: Vec<Value>,
+        error: Option<String>,
+    },
+
     /// `ui.tools.catalog` — the live tool catalog (pushed by `/tools`), shown in
     /// the Workspace sidebar Tools tab. Each item is `{name,description,approval}`.
     ToolsCatalog { tools: Vec<Value> },
@@ -275,6 +284,19 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
         "ui.gpu.list" => AgentMsg::GpuList {
             gpus: params
                 .get("gpus")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            error: params
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        },
+
+        // ── Nodes view ───────────────────────────────────────────────
+        "ui.nodes.list" => AgentMsg::NodeList {
+            nodes: params
+                .get("nodes")
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default(),
