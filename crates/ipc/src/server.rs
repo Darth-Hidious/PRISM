@@ -1,7 +1,10 @@
-//! JSON-RPC stdio transport for TUI communication.
+//! JSON-RPC stdio transport for driving a child process.
 //!
-//! The Rust core binary spawns the Ink TUI as a child process. They communicate
-//! via JSON-RPC 2.0 over stdin/stdout (one JSON object per line).
+//! Spawns a child (e.g. `prism backend`) and exchanges JSON-RPC 2.0 messages
+//! with it over piped stdin/stdout — one JSON object per line. This is the
+//! client half used by [`crate::bridge::BackendBridge`] to drive the live
+//! agent backend; the child's stdout is the protocol channel, its stderr is
+//! inherited for diagnostics.
 
 use std::process::Stdio;
 
@@ -13,49 +16,50 @@ use tracing::{debug, error, info, warn};
 
 use crate::types::{RpcNotification, RpcRequest, RpcResponse};
 
-/// A running IPC connection to the Ink TUI child process.
+/// A running IPC connection to a child process spoken to over stdio.
 pub struct IpcServer {
     child: Child,
-    /// Send JSON-RPC messages to the TUI.
+    /// Send JSON-RPC messages to the child (its stdin).
     tx: mpsc::Sender<String>,
-    /// Receive JSON-RPC messages from the TUI.
+    /// Receive JSON-RPC messages from the child (its stdout).
     rx: mpsc::Receiver<String>,
 }
 
 impl IpcServer {
-    /// Spawn the TUI binary and set up stdio IPC channels.
-    pub async fn spawn(tui_binary: &str) -> Result<Self> {
-        let mut child = Command::new(tui_binary)
+    /// Spawn `program` with `args` and set up stdio IPC channels.
+    pub async fn spawn(program: &str, args: &[String]) -> Result<Self> {
+        let mut child = Command::new(program)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // TUI debug logs go to terminal
+            .stderr(Stdio::inherit()) // child diagnostics go to our stderr
             .spawn()
-            .with_context(|| format!("Failed to spawn TUI binary: {tui_binary}"))?;
+            .with_context(|| format!("Failed to spawn child process: {program}"))?;
 
         let child_stdin = child.stdin.take().context("No stdin on child")?;
         let child_stdout = child.stdout.take().context("No stdout on child")?;
 
-        // Channel: core → TUI (write to child stdin)
+        // Channel: us → child (write to child stdin)
         let (write_tx, mut write_rx) = mpsc::channel::<String>(64);
         tokio::spawn(async move {
             let mut writer = child_stdin;
             while let Some(line) = write_rx.recv().await {
                 if let Err(e) = writer.write_all(line.as_bytes()).await {
-                    error!("Failed to write to TUI stdin: {e}");
+                    error!("Failed to write to child stdin: {e}");
                     break;
                 }
                 if let Err(e) = writer.write_all(b"\n").await {
-                    error!("Failed to write newline to TUI stdin: {e}");
+                    error!("Failed to write newline to child stdin: {e}");
                     break;
                 }
                 if let Err(e) = writer.flush().await {
-                    error!("Failed to flush TUI stdin: {e}");
+                    error!("Failed to flush child stdin: {e}");
                     break;
                 }
             }
         });
 
-        // Channel: TUI → core (read from child stdout)
+        // Channel: child → us (read from child stdout)
         let (read_tx, read_rx) = mpsc::channel::<String>(64);
         tokio::spawn(async move {
             let reader = BufReader::new(child_stdout);
@@ -69,7 +73,7 @@ impl IpcServer {
                     break;
                 }
             }
-            debug!("TUI stdout reader ended");
+            debug!("child stdout reader ended");
         });
 
         Ok(Self {
@@ -79,27 +83,27 @@ impl IpcServer {
         })
     }
 
-    /// Send a JSON-RPC request to the TUI.
+    /// Send a JSON-RPC request to the child.
     pub async fn send_request(&self, request: &RpcRequest) -> Result<()> {
         let json = serde_json::to_string(request)?;
-        debug!(method = %request.method, "→ TUI");
+        debug!(method = %request.method, "→ child");
         self.tx
             .send(json)
             .await
             .map_err(|e| anyhow::anyhow!("IPC send failed: {e}"))
     }
 
-    /// Send a JSON-RPC notification (no response expected) to the TUI.
+    /// Send a JSON-RPC notification (no response expected) to the child.
     pub async fn send_notification(&self, notification: &RpcNotification) -> Result<()> {
         let json = serde_json::to_string(notification)?;
-        debug!(method = %notification.method, "→ TUI (notification)");
+        debug!(method = %notification.method, "→ child (notification)");
         self.tx
             .send(json)
             .await
             .map_err(|e| anyhow::anyhow!("IPC send failed: {e}"))
     }
 
-    /// Send a JSON-RPC response to the TUI.
+    /// Send a JSON-RPC response to the child.
     pub async fn send_response(&self, response: &RpcResponse) -> Result<()> {
         let json = serde_json::to_string(response)?;
         self.tx
@@ -108,7 +112,7 @@ impl IpcServer {
             .map_err(|e| anyhow::anyhow!("IPC send failed: {e}"))
     }
 
-    /// Receive the next JSON-RPC message from the TUI.
+    /// Receive the next JSON-RPC message (one line) from the child.
     pub async fn recv(&mut self) -> Option<String> {
         self.rx.recv().await
     }

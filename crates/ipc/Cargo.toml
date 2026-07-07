@@ -1,6 +1,6 @@
 [package]
 name = "prism-ipc"
-description = "JSON-RPC 2.0 IPC layer between the Rust CLI and the Ink TUI frontend."
+description = "JSON-RPC 2.0 stdio surface exposing the PRISM agent backend to external frontends (Desktop, IDE extensions)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

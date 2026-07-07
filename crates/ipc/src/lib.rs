@@ -1,17 +1,32 @@
 // Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
-//! JSON-RPC 2.0 IPC layer for PRISM.
+//! JSON-RPC 2.0 stdio surface for the PRISM agent backend.
 //!
-//! Bridges the Rust CLI process and the Ink TUI frontend over stdin/stdout.
-//! The [`IpcServer`] spawns the TUI binary as a child process, then sends and
-//! receives typed JSON-RPC messages through piped stdio channels.
+//! This crate lets **external frontends** — PRISM Desktop, IDE extensions —
+//! drive the PRISM agent over stdin/stdout, the same role an LSP server plays
+//! for an editor. [`serve_stdio`] reads JSON-RPC 2.0 requests on stdin and
+//! writes responses on stdout; [`dispatch`] maps a small, honest method set
+//! (`initialize`, `chat/send`, `tools/list`, `session/status`) onto an
+//! [`AgentBackend`]. The production [`BackendBridge`] implements that trait by
+//! driving a live `prism backend` child process.
+//!
+//! # Trust boundary
+//!
+//! stdio is a **same-user** channel — the caller already runs as the user, so
+//! the surface does no authentication and **opens no network socket**. Do not
+//! add a TCP/WebSocket listener here; that would cross a trust boundary this
+//! layer does not defend. See [`surface`] for details.
 //!
 //! Wire types: [`RpcRequest`], [`RpcResponse`], [`RpcNotification`], [`RpcError`].
 
+pub mod bridge;
 pub mod methods;
 pub mod server;
+pub mod surface;
 pub mod types;
 
+pub use bridge::BackendBridge;
 pub use server::IpcServer;
+pub use surface::{AgentBackend, dispatch, serve_stdio};
 pub use types::{RpcError, RpcNotification, RpcRequest, RpcResponse};
 
 #[cfg(test)]
