@@ -1058,13 +1058,10 @@ pub async fn run_turn(
                     resource: tool_name.clone(),
                     context: args.clone(),
                 };
-                match pe.evaluate(&policy_input) {
-                    Ok(decision) if !decision.allowed => {
-                        let reason = if decision.violations.is_empty() {
-                            decision.reason
-                        } else {
-                            decision.violations.join("; ")
-                        };
+                // Fail CLOSED via the shared gate helper: an evaluate() error
+                // denies the tool rather than letting it run unchecked.
+                match prism_policy::gate_outcome(pe.evaluate(&policy_input)) {
+                    prism_policy::GateOutcome::Deny { reason } => {
                         let denied_msg =
                             format!("Tool '{tool_name}' denied by OPA policy: {reason}");
                         emit(AgentEvent::ToolCallResult {
@@ -1084,22 +1081,15 @@ pub async fn run_turn(
                         });
                         continue;
                     }
-                    Ok(decision) => {
+                    prism_policy::GateOutcome::Allow { obligations } => {
                         // Log obligations (e.g. "audit_log")
-                        for obligation in &decision.obligations {
+                        for obligation in &obligations {
                             tracing::info!(
                                 tool = %tool_name,
                                 obligation = %obligation,
                                 "OPA policy obligation"
                             );
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            tool = %tool_name,
-                            error = %e,
-                            "OPA policy evaluation failed — allowing (fail-open)"
-                        );
                     }
                 }
             }

@@ -1074,15 +1074,15 @@ async fn execute_manual_tool_call(
             resource: tool_name.to_string(),
             context: args.clone(),
         };
-        if let Ok(decision) = pe.evaluate(&policy_input)
-            && !decision.allowed
-        {
-            let reason = if decision.violations.is_empty() {
-                decision.reason
-            } else {
-                decision.violations.join("; ")
-            };
-            let message = format!("Tool '{tool_name}' denied by policy: {reason}");
+        // Fail CLOSED via the shared gate helper: evaluate() returning Err
+        // must deny, not skip the gate.
+        let denied = match prism_policy::gate_outcome(pe.evaluate(&policy_input)) {
+            prism_policy::GateOutcome::Deny { reason } => {
+                Some(format!("Tool '{tool_name}' denied by policy: {reason}"))
+            }
+            prism_policy::GateOutcome::Allow { .. } => None,
+        };
+        if let Some(message) = denied {
             emit_agent_event(AgentEvent::ToolCallResult {
                 call_id: call_id.clone(),
                 tool_name: tool_name.to_string(),
@@ -3996,6 +3996,9 @@ async fn handle_workflow_slash_command(
 
     let specs = discover_workflows(Some(&slash_ctx.project_root))?;
     let action = args.get(1).map(String::as_str).unwrap_or("list");
+    // Auth for policy comes from the authenticated interactive context (env),
+    // not from workflow `--set` values.
+    let interactive_principal = interactive_policy_principal();
     let interactive_role = interactive_policy_role();
 
     match action {
@@ -4067,6 +4070,7 @@ async fn handle_workflow_slash_command(
                 &values,
                 execute,
                 policy_engine.as_mut(),
+                Some(interactive_principal.as_str()),
                 Some(interactive_role.as_str()),
             )
             .await?;
@@ -4085,6 +4089,7 @@ async fn handle_workflow_slash_command(
                 &request.values,
                 request.execute,
                 policy_engine.as_mut(),
+                Some(interactive_principal.as_str()),
                 Some(interactive_role.as_str()),
             )
             .await?;

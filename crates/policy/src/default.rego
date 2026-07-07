@@ -121,13 +121,27 @@ reason := sprintf("%s denied: %s", [input.action, concat("; ", deny)]) if {
 # Helper rules
 # =========================================================================
 
-# Tools that modify state — agent needs explicit approval
+# Tools that modify state, spend money, or change deployed systems — agent
+# needs explicit approval (admin role). Mirrors the FullAccess / ingest-write
+# classification in the agent's tool permission map (crates/agent permissions).
 destructive_tools := {
     "knowledge_ingest",
     "data_delete",
     "node_restart",
     "config_update",
     "user_manage",
+    # Compute jobs — submit/cancel real (billable) compute work.
+    "compute_submit",
+    "compute_cancel",
+    "submit_lab_job",
+    # Deployments — create/stop hosted model deployments.
+    "deploy",
+    "deploy_create",
+    "deploy_stop",
+    # Ingest-class writes — siblings of knowledge_ingest.
+    "ingest",
+    "ingest_file",
+    "ingest_watch",
 }
 
 tool_is_destructive if {

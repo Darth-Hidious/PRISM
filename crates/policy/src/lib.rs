@@ -95,6 +95,54 @@ pub mod intersect;
 pub use intersect::intersect_decisions;
 
 // ---------------------------------------------------------------------------
+// Enforcement-point (gate) helper
+// ---------------------------------------------------------------------------
+
+/// Outcome of a policy enforcement point (a "gate").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// Action permitted; caller must fulfill these obligations.
+    Allow { obligations: Vec<String> },
+    /// Action denied for this human-readable reason.
+    Deny { reason: String },
+}
+
+/// Interpret a [`PolicyEngine::evaluate`] result at an enforcement point,
+/// **fail-closed**.
+///
+/// Security-critical: a failed evaluation (`Err`) is treated as a DENY, never
+/// an allow. This is the single shared fail-closed decision point for every
+/// gate (agent loop, manual `/command` dispatch, ...), so the policy can never
+/// be bypassed by making evaluation error out. The underlying error is logged
+/// at error level for the operator.
+pub fn gate_outcome(result: Result<PolicyDecision>) -> GateOutcome {
+    match result {
+        Ok(decision) if decision.allowed => GateOutcome::Allow {
+            obligations: decision.obligations,
+        },
+        Ok(decision) => GateOutcome::Deny {
+            reason: gate_deny_reason(decision),
+        },
+        Err(e) => {
+            tracing::error!(error = %e, "policy evaluation failed — denying (fail-closed)");
+            GateOutcome::Deny {
+                reason: "policy evaluation failed — denied".to_string(),
+            }
+        }
+    }
+}
+
+/// Prefer the concrete violations list over the summary reason when explaining
+/// a denial.
+fn gate_deny_reason(decision: PolicyDecision) -> String {
+    if decision.violations.is_empty() {
+        decision.reason
+    } else {
+        decision.violations.join("; ")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
 
@@ -392,6 +440,92 @@ mod tests {
             context: serde_json::json!({}),
         };
         assert!(engine.require(&input).is_err());
+    }
+
+    #[test]
+    fn gate_fails_closed_on_evaluation_error() {
+        // Defect 1: an evaluate() error must DENY, never allow.
+        let outcome = gate_outcome(Err(anyhow::anyhow!("regorus blew up")));
+        match outcome {
+            GateOutcome::Deny { reason } => {
+                assert!(
+                    reason.contains("policy evaluation failed"),
+                    "reason: {reason}"
+                );
+            }
+            GateOutcome::Allow { .. } => panic!("evaluation error must fail closed (deny)"),
+        }
+    }
+
+    #[test]
+    fn gate_allows_permitted_action() {
+        let mut decision = PolicyDecision::allow("ok");
+        decision.obligations = vec!["audit_log".to_string()];
+        assert_eq!(
+            gate_outcome(Ok(decision)),
+            GateOutcome::Allow {
+                obligations: vec!["audit_log".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn gate_denies_disallowed_action_with_reason() {
+        let decision = PolicyDecision::deny("nope", vec!["rule X".into(), "rule Y".into()]);
+        assert_eq!(
+            gate_outcome(Ok(decision)),
+            GateOutcome::Deny {
+                reason: "rule X; rule Y".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn newly_classified_destructive_tools_gated() {
+        // Defect 4: compute-submit / deploy / ingest classes must be denied to
+        // the agent (non-admin) and permitted to admin — proving they are now
+        // classified destructive rather than blanket-blocked.
+        let newly_destructive = [
+            "compute_submit",
+            "compute_cancel",
+            "submit_lab_job",
+            "deploy",
+            "deploy_create",
+            "deploy_stop",
+            "ingest",
+            "ingest_file",
+            "ingest_watch",
+        ];
+        for tool in newly_destructive {
+            let mut engine = PolicyEngine::new().unwrap();
+            let agent = PolicyInput {
+                action: "tool.call".into(),
+                principal: "agent".into(),
+                role: "agent".into(),
+                resource: tool.into(),
+                context: serde_json::json!({}),
+            };
+            let decision = engine.evaluate(&agent).unwrap();
+            assert!(
+                !decision.allowed,
+                "{tool} must be denied to agent: {:?}",
+                decision
+            );
+
+            let admin = PolicyInput {
+                action: "tool.call".into(),
+                principal: "root".into(),
+                role: "admin".into(),
+                resource: tool.into(),
+                context: serde_json::json!({}),
+            };
+            let decision = engine.evaluate(&admin).unwrap();
+            assert!(
+                decision.allowed,
+                "{tool} must be allowed to admin: {:?}",
+                decision
+            );
+        }
     }
 
     #[test]

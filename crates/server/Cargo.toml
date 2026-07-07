@@ -25,6 +25,7 @@ mime_guess = { workspace = true }
 prism-ingest = { path = "../ingest" }
 prism-mesh = { path = "../mesh" }
 prism-workflows = { path = "../workflows" }
+prism-policy = { path = "../policy" }
 uuid = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }

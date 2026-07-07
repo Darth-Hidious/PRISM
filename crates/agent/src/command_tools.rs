@@ -2992,6 +2992,9 @@ async fn execute_workflow_command(
                     *execute,
                     policy,
                     Some("agent"),
+                    // Autonomous agent runs under the "agent" role — never a
+                    // role smuggled through `values`.
+                    Some("agent"),
                 )
                 .await
                 {
