@@ -146,6 +146,15 @@ enum Commands {
         #[arg(long, default_value = "python3")]
         python: PathBuf,
     },
+    /// Serve the agent over JSON-RPC on stdio for external frontends
+    /// (PRISM Desktop, IDE extensions) — the LSP-server role. Same-user
+    /// stdio trust boundary; opens no network socket.
+    IpcServe {
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        #[arg(long, default_value = "python3")]
+        python: PathBuf,
+    },
     /// Launch and manage Jupyter notebooks (local or remote compute).
     Notebook {
         #[command(subcommand)]
@@ -1830,6 +1839,26 @@ async fn main() -> Result<()> {
             };
 
             prism_agent::protocol::run_server(llm_config, tool_server).await?;
+        }
+        Commands::IpcServe {
+            project_root: ipc_pr,
+            python: ipc_py,
+        } => {
+            // Thin adapter: spawn `prism backend` (this same binary) and expose
+            // its native protocol to an external frontend as a minimal JSON-RPC
+            // surface on our stdin/stdout. Tracing already goes to stderr, so
+            // stdout stays a clean protocol channel.
+            let prism_bin =
+                std::env::current_exe().context("failed to locate current prism executable")?;
+            let bridge = prism_ipc::BackendBridge::spawn(
+                prism_bin
+                    .to_str()
+                    .context("prism executable path is not valid UTF-8")?,
+                &ipc_pr.to_string_lossy(),
+                &ipc_py.to_string_lossy(),
+            )
+            .await?;
+            prism_ipc::serve_stdio(bridge).await?;
         }
         Commands::Tools => {
             let mut tool_server_env = std::collections::BTreeMap::new();

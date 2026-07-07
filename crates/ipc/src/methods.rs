@@ -1,42 +1,57 @@
-//! Method constants for JSON-RPC IPC protocol.
+//! Method-name constants for the JSON-RPC IPC layer.
 //!
-//! These are the method names used between the Rust core and the Ink TUI.
+//! Two vocabularies live here:
+//!
+//! 1. The **external surface** (`initialize`, `chat/send`, `tools/list`,
+//!    `session/status`) that [`crate::surface`] serves to external frontends
+//!    such as PRISM Desktop and IDE extensions.
+//! 2. The **native backend protocol** that `prism backend` speaks over stdio.
+//!    [`crate::bridge::BackendBridge`] uses these to drive the real agent —
+//!    they are the same method names emitted/consumed by
+//!    `prism_agent::protocol`.
 
-/// Core → TUI: Initial handshake.
-pub const HELLO: &str = "ipc.hello";
+// ── External surface (frontend ⇄ `prism ipc-serve`) ─────────────────
 
-/// Core → TUI: Service status update.
-pub const SERVICE_STATUS: &str = "node.service_status";
+/// Frontend → server: handshake; returns version + capabilities.
+pub const INITIALIZE: &str = "initialize";
 
-/// Core → TUI: Node is fully ready.
-pub const NODE_READY: &str = "node.ready";
+/// Frontend → server: drive one agent turn with `params.text`.
+pub const CHAT_SEND: &str = "chat/send";
 
-/// Core → TUI: Streaming text delta from LLM.
-pub const TEXT_DELTA: &str = "ui.text.delta";
+/// Frontend → server: list the tools the agent can call.
+pub const TOOLS_LIST: &str = "tools/list";
 
-/// Core → TUI: Flush accumulated text.
-pub const TEXT_FLUSH: &str = "ui.text.flush";
+/// Frontend → server: current session status snapshot.
+pub const SESSION_STATUS: &str = "session/status";
 
-/// Core → TUI: Tool execution started.
-pub const TOOL_START: &str = "ui.tool.start";
+// ── Native backend protocol (`prism ipc-serve` ⇄ `prism backend`) ───
 
-/// Core → TUI: Tool result card.
-pub const CARD: &str = "ui.card";
+/// Server → backend: initialize the agent session.
+pub const BACKEND_INIT: &str = "init";
 
-/// Core → TUI: Token/cost update.
-pub const COST: &str = "ui.cost";
-
-/// Core → TUI: Approval prompt.
-pub const PROMPT: &str = "ui.prompt";
-
-/// Core → TUI: Turn completed.
-pub const TURN_COMPLETE: &str = "ui.turn.complete";
-
-/// TUI → Core: User sent a message.
+/// Server → backend: user message that starts a turn.
 pub const INPUT_MESSAGE: &str = "input.message";
 
-/// TUI → Core: User sent a slash command.
+/// Server → backend: slash command.
 pub const INPUT_COMMAND: &str = "input.command";
 
-/// TUI → Core: User responded to a prompt.
+/// Server → backend: response to an approval prompt.
 pub const INPUT_PROMPT_RESPONSE: &str = "input.prompt_response";
+
+/// Backend → server: welcome payload emitted after `init` (version, tool count).
+pub const UI_WELCOME: &str = "ui.welcome";
+
+/// Backend → server: full tool catalog emitted after `init`.
+pub const UI_TOOLS_CATALOG: &str = "ui.tools.catalog";
+
+/// Backend → server: status snapshot (model, session mode, message count).
+pub const UI_STATUS: &str = "ui.status";
+
+/// Backend → server: streaming text delta from the model.
+pub const UI_TEXT_DELTA: &str = "ui.text.delta";
+
+/// Backend → server: flush accumulated text.
+pub const UI_TEXT_FLUSH: &str = "ui.text.flush";
+
+/// Backend → server: turn finished — the sentinel that ends a turn drain.
+pub const UI_TURN_COMPLETE: &str = "ui.turn.complete";
