@@ -430,6 +430,43 @@ mod tests {
     }
 
     #[test]
+    fn agent_allowed_knowledge_ingest_for_research() {
+        // Owner decision 2026-07-07: the research agent may ingest into the
+        // knowledge graph without admin approval (write mode, not delete).
+        let mut engine = PolicyEngine::new().unwrap();
+        let input = PolicyInput {
+            action: "tool.call".into(),
+            principal: "agent".into(),
+            role: "agent".into(),
+            resource: "knowledge_ingest".into(),
+            context: serde_json::json!({"mode": "write"}),
+        };
+        let decision = engine.evaluate(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "research agent should be allowed knowledge_ingest: {:?}",
+            decision
+        );
+    }
+
+    #[test]
+    fn agent_still_denied_other_destructive_tools() {
+        // The knowledge_ingest exemption must not leak to its siblings.
+        let mut engine = PolicyEngine::new().unwrap();
+        for tool in ["ingest_file", "compute_submit", "deploy", "data_delete"] {
+            let input = PolicyInput {
+                action: "tool.call".into(),
+                principal: "agent".into(),
+                role: "agent".into(),
+                resource: tool.into(),
+                context: serde_json::json!({}),
+            };
+            let decision = engine.evaluate(&input).unwrap();
+            assert!(!decision.allowed, "{tool} must stay admin-gated");
+        }
+    }
+
+    #[test]
     fn require_returns_error_on_deny() {
         let mut engine = PolicyEngine::new().unwrap();
         let input = PolicyInput {
