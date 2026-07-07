@@ -101,7 +101,11 @@ impl ComputeBackend for LocalBackend {
         let active = self.active.read().await;
         let container_name = match active.get(&job_id) {
             Some(name) => name.clone(),
-            None => return Ok(JobStatus::Completed), // already cleaned up
+            // Unknown to this backend: never submitted, already cancelled, or
+            // already collected via `results()` (which cleans up `active`).
+            // Reporting `Completed` here would be a lie for jobs that never
+            // existed — the caller has no way to tell "done" from "made up".
+            None => bail!("no such local compute job: {job_id}"),
         };
         drop(active);
 
@@ -231,6 +235,28 @@ mod tests {
     fn detect_runtime_returns_something_or_none() {
         // Just verifies it doesn't panic.
         let _ = detect_runtime();
+    }
+
+    #[tokio::test]
+    async fn status_of_unknown_job_id_is_an_honest_error_not_completed() {
+        // A job ID that was never submitted (or was already cleaned up) must
+        // never be reported as `Completed` — that would be indistinguishable
+        // from an actual success and would mislead callers billing or acting
+        // on the result.
+        let backend = LocalBackend::with_runtime("docker");
+        let unknown_job = Uuid::new_v4();
+
+        let result = backend.status(unknown_job).await;
+
+        assert!(
+            result.is_err(),
+            "status of an untracked job must be an error, not Ok(Completed)"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains(&unknown_job.to_string()),
+            "error should identify which job id was not found: {message}"
+        );
     }
 
     // --- Edge-case tests ---

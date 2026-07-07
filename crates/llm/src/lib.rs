@@ -256,7 +256,7 @@ impl LlmClient {
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": 4096,
+            "max_tokens": self.configured_max_tokens(),
         });
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
@@ -269,6 +269,11 @@ impl LlmClient {
         let body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
+            // Was previously omitted entirely, letting the platform generate
+            // unbounded output (thousands of tokens observed) on every call —
+            // real, billed credits with no cap. Send the same configured
+            // budget every other chat path uses.
+            "max_tokens": self.configured_max_tokens(),
         });
         let resp = self.post(&url, &body).await?;
         let text = resp.text().await.context("failed to read MARC27 stream")?;
@@ -321,7 +326,7 @@ impl LlmClient {
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": 4096,
+            "max_tokens": self.configured_max_tokens(),
         });
 
         if !tools.is_empty() {
@@ -360,12 +365,15 @@ impl LlmClient {
         })
     }
 
-    /// Token budget for `generate_json`. Honors `LlmConfig::max_output_tokens`
-    /// (fetched from the platform model catalog) instead of a fixed guess —
-    /// a reasoning/"thinking" model can burn its entire budget on
-    /// `reasoning_content` before writing any JSON, and the caller may know
-    /// the model needs more room than the old hardcoded 4096.
-    fn json_extraction_max_tokens(&self) -> u64 {
+    /// Token budget shared by every chat/completion request this client
+    /// sends. Honors `LlmConfig::max_output_tokens` (fetched from the
+    /// platform model catalog) instead of a fixed guess — a reasoning/
+    /// "thinking" model can burn its entire budget on `reasoning_content`
+    /// before writing any JSON or visible text, and a caller may know the
+    /// model needs more (or less) room than a hardcoded 4096. Falls back to
+    /// 4096 only when the config doesn't carry a value (e.g. local llama.cpp
+    /// with no catalog entry).
+    fn configured_max_tokens(&self) -> u64 {
         self.config.max_output_tokens.unwrap_or(4096)
     }
 
@@ -419,7 +427,7 @@ impl LlmClient {
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
-            "max_tokens": self.json_extraction_max_tokens(),
+            "max_tokens": self.configured_max_tokens(),
             "response_format": {"type": "json_object"},
         });
         let resp = self.post(&url, &body).await?;
@@ -558,6 +566,10 @@ impl LlmClient {
             let body = serde_json::json!({
                 "model": self.config.model,
                 "messages": aug_messages,
+                // Same fix as chat_marc27_simple: this path previously sent
+                // no cap at all, so a tool-calling turn could generate an
+                // unbounded (and unbounded-billed) response.
+                "max_tokens": self.configured_max_tokens(),
             });
             // Use a direct request (not the retry-wrapper post()) so we control headers
             let mut req = self
@@ -690,7 +702,7 @@ impl LlmClient {
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": 4096,
+            "max_tokens": self.configured_max_tokens(),
             "stream": true,
         });
 
@@ -1406,19 +1418,19 @@ mod tests {
     }
 
     #[test]
-    fn json_extraction_max_tokens_defaults_to_4096() {
+    fn configured_max_tokens_defaults_to_4096() {
         let client = LlmClient::new(LlmConfig::default());
-        assert_eq!(client.json_extraction_max_tokens(), 4096);
+        assert_eq!(client.configured_max_tokens(), 4096);
     }
 
     #[test]
-    fn json_extraction_max_tokens_honors_config() {
+    fn configured_max_tokens_honors_config() {
         let config = LlmConfig {
             max_output_tokens: Some(16_384),
             ..Default::default()
         };
         let client = LlmClient::new(config);
-        assert_eq!(client.json_extraction_max_tokens(), 16_384);
+        assert_eq!(client.configured_max_tokens(), 16_384);
     }
 
     #[test]
