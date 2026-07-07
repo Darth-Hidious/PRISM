@@ -17,6 +17,7 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 prism-agent = { path = "../agent" }
+prism-audit = { path = "../audit" }
 prism-client = { path = "../client" }
 tokio-stream = { workspace = true }
 prism-core = { path = "../core" }
@@ -29,3 +30,6 @@ prism-policy = { path = "../policy" }
 uuid = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

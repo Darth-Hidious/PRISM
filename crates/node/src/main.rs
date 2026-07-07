@@ -150,6 +150,10 @@ async fn main() -> Result<()> {
                 // tool executor"). The rich path is `prism node up` (CLI),
                 // which owns the executor and wires this.
                 tool_invoker: None,
+                // Audit emitter is wired by `prism node up` (which loads the
+                // config's audit.enabled and shares one emitter with the
+                // HTTP server); the standalone daemon leaves it off.
+                audit_emitter: None,
             };
 
             prism_node::daemon::run_daemon(&endpoints, &paths, options).await?;

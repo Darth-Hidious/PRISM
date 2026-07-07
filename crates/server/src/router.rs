@@ -64,7 +64,7 @@ pub fn build_router(state: Arc<NodeState>) -> Router {
     // (RBAC DB lookup). Federation runs first so a peer call presents
     // its own identity before user-session machinery looks for a
     // session token that won't be there.
-    let federation_stack = middleware::from_fn(federation_layer);
+    let federation_stack = middleware::from_fn_with_state(state.clone(), federation_layer);
     let auth_stack = middleware::from_fn_with_state(state.clone(), auth_layer);
     let role_stack = middleware::from_fn_with_state(state.clone(), resolve_role_layer);
 

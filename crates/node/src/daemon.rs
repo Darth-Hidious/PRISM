@@ -51,6 +51,11 @@ pub struct DaemonOptions {
     /// honestly with "no local tool executor". Keeping this a channel keeps
     /// the daemon crate thin — it never links the agent/tool crates.
     pub tool_invoker: Option<mpsc::Sender<ToolInvocationRequest>>,
+    /// Signed cross-org audit emitter (F5). `Some` records a
+    /// `RequestReceived` + `WorkCompleted`/`WorkFailed` envelope for every
+    /// platform-relayed tool invocation this node handles. Built by the
+    /// caller so it shares one identity + one log with the HTTP server.
+    pub audit_emitter: Option<Arc<prism_audit::AuditEmitter>>,
 }
 
 /// A single tool invocation relayed from the platform to the node's local
@@ -84,6 +89,7 @@ impl Default for DaemonOptions {
             org_id: None,
             offline: false,
             tool_invoker: None,
+            audit_emitter: None,
         }
     }
 }
@@ -246,6 +252,7 @@ pub async fn run_daemon(
     let platform_node_id = options.platform_node_id.clone();
     let rbac_db_path = options.rbac_db_path.clone();
     let rbac_org_id = options.org_id.clone();
+    let audit_emitter = options.audit_emitter.clone();
 
     // Offline mode — never touch the platform. The dashboard, mesh,
     // and Kafka tasks were started by the caller; they keep running.
@@ -274,6 +281,7 @@ pub async fn run_daemon(
             rbac_db_path.as_deref(),
             rbac_org_id.as_deref(),
             options.tool_invoker.as_ref(),
+            audit_emitter.as_ref(),
         )
         .await
         {
@@ -461,6 +469,7 @@ async fn connect_and_run(
     rbac_db_path: Option<&Path>,
     rbac_org_id: Option<&str>,
     tool_invoker: Option<&mpsc::Sender<ToolInvocationRequest>>,
+    audit_emitter: Option<&Arc<prism_audit::AuditEmitter>>,
 ) -> Result<ShutdownReason> {
     let url = format!("{}?token={}", endpoints.node_ws, token);
     tracing::info!(url = %endpoints.node_ws, "connecting to platform");
@@ -601,6 +610,7 @@ async fn connect_and_run(
                             &running_jobs,
                             &running_deployments,
                             tool_invoker,
+                            audit_emitter,
                         ).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -627,6 +637,31 @@ async fn connect_and_run(
     }
 }
 
+/// [`prism_audit::EmitSpec`] for a platform-relayed tool invocation.
+///
+/// `target_*` are `None`: the relay hides the originating org/node from
+/// the node, so the real principal (`caller_user_id`) goes in `extra`
+/// instead. The action is the tool name and the resource its handle.
+fn relay_spec(
+    kind: prism_audit::EventKind,
+    tool: &str,
+    invocation_id: Uuid,
+    caller_user_id: Uuid,
+    decision: prism_audit::AuditDecision,
+) -> prism_audit::EmitSpec {
+    prism_audit::EmitSpec {
+        kind,
+        target_node_id: None,
+        target_org_id: None,
+        action: tool.to_string(),
+        resource: format!("tool://{tool}"),
+        decision,
+        correlation: Some(invocation_id),
+        extra: serde_json::json!({ "caller_user_id": caller_user_id }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_platform_message(
     paths: &PrismPaths,
     text: &str,
@@ -635,6 +670,7 @@ async fn handle_platform_message(
     running_jobs: &RunningJobs,
     running_deployments: &RunningDeployments,
     tool_invoker: Option<&mpsc::Sender<ToolInvocationRequest>>,
+    audit_emitter: Option<&Arc<prism_audit::AuditEmitter>>,
 ) {
     let msg: PlatformMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -911,9 +947,36 @@ async fn handle_platform_message(
                 "tool invocation relayed from platform"
             );
 
+            // Record receipt of the relayed cross-org invocation. Outcome
+            // (WorkCompleted/WorkFailed) is emitted once the tool resolves.
+            if let Some(em) = audit_emitter {
+                em.emit(relay_spec(
+                    prism_audit::EventKind::RequestReceived,
+                    &tool,
+                    invocation_id,
+                    caller_user_id,
+                    prism_audit::AuditDecision::Allowed {
+                        obligations: Vec::new(),
+                    },
+                ))
+                .await;
+            }
+
             // No local executor (e.g. node started without an LLM → no
             // ChatService). Fail honestly rather than pretend the tool ran.
             let Some(invoker) = tool_invoker.cloned() else {
+                if let Some(em) = audit_emitter {
+                    em.emit(relay_spec(
+                        prism_audit::EventKind::WorkFailed,
+                        &tool,
+                        invocation_id,
+                        caller_user_id,
+                        prism_audit::AuditDecision::Denied {
+                            reasons: vec!["node has no local tool executor".to_string()],
+                        },
+                    ))
+                    .await;
+                }
                 send_msg(
                     outgoing_tx,
                     &NodeMessage::ToolInvokeResult {
@@ -934,6 +997,8 @@ async fn handle_platform_message(
             // flowing while the tool executes (same as container jobs).
             let timeout = Duration::from_secs(timeout_secs.clamp(1, 600));
             let tx = outgoing_tx.clone();
+            let audit_task = audit_emitter.cloned();
+            let tool_name = tool.clone();
             tokio::spawn(async move {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let request = ToolInvocationRequest {
@@ -943,6 +1008,18 @@ async fn handle_platform_message(
                     reply: reply_tx,
                 };
                 if invoker.send(request).await.is_err() {
+                    if let Some(em) = &audit_task {
+                        em.emit(relay_spec(
+                            prism_audit::EventKind::WorkFailed,
+                            &tool_name,
+                            invocation_id,
+                            caller_user_id,
+                            prism_audit::AuditDecision::Denied {
+                                reasons: vec!["local tool executor unavailable".to_string()],
+                            },
+                        ))
+                        .await;
+                    }
                     send_msg(
                         &tx,
                         &NodeMessage::ToolInvokeResult {
@@ -975,6 +1052,34 @@ async fn handle_platform_message(
                         }),
                     ),
                 };
+
+                if let Some(em) = &audit_task {
+                    let decision = if ok {
+                        prism_audit::AuditDecision::NoOpinion
+                    } else {
+                        let reason = result
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool invocation failed")
+                            .to_string();
+                        prism_audit::AuditDecision::Denied {
+                            reasons: vec![reason],
+                        }
+                    };
+                    let kind = if ok {
+                        prism_audit::EventKind::WorkCompleted
+                    } else {
+                        prism_audit::EventKind::WorkFailed
+                    };
+                    em.emit(relay_spec(
+                        kind,
+                        &tool_name,
+                        invocation_id,
+                        caller_user_id,
+                        decision,
+                    ))
+                    .await;
+                }
 
                 send_msg(
                     &tx,
@@ -2151,6 +2256,14 @@ mod tests {
         };
         let text = serde_json::to_string(&msg).unwrap();
 
+        let emitter = Arc::new(prism_audit::AuditEmitter::new(
+            "node-local-01",
+            "org-local",
+            ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+            tmp.path().join("audit-envelopes.jsonl"),
+            true,
+        ));
+
         handle_platform_message(
             &paths,
             &text,
@@ -2159,6 +2272,7 @@ mod tests {
             &running_jobs,
             &running_deployments,
             Some(&inv_tx),
+            Some(&emitter),
         )
         .await;
 
@@ -2177,6 +2291,26 @@ mod tests {
                 assert_eq!(result["ran_as"], caller.to_string());
             }
             other => panic!("expected ToolInvokeResult, got {other:?}"),
+        }
+
+        // A signed RequestReceived → WorkCompleted pair was recorded for
+        // the relayed invocation, correlated to the invocation id.
+        let log = prism_audit::AuditLog::new(emitter.log_path());
+        let envelopes = log.read_all().await.unwrap();
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(
+            envelopes[0].event.kind,
+            prism_audit::EventKind::RequestReceived
+        );
+        assert_eq!(
+            envelopes[1].event.kind,
+            prism_audit::EventKind::WorkCompleted
+        );
+        for env in &envelopes {
+            env.verify_signature().unwrap();
+            assert_eq!(env.event.source_node_id, "node-local-01");
+            assert_eq!(env.event.correlation, Some(invocation_id));
+            assert_eq!(env.event.action, "evaluate_material");
         }
     }
 
@@ -2201,6 +2335,14 @@ mod tests {
         };
         let text = serde_json::to_string(&msg).unwrap();
 
+        let emitter = Arc::new(prism_audit::AuditEmitter::new(
+            "node-local-01",
+            "org-local",
+            ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]),
+            tmp.path().join("audit-envelopes.jsonl"),
+            true,
+        ));
+
         handle_platform_message(
             &paths,
             &text,
@@ -2209,6 +2351,7 @@ mod tests {
             &running_jobs,
             &running_deployments,
             None, // no executor wired
+            Some(&emitter),
         )
         .await;
 
@@ -2231,5 +2374,23 @@ mod tests {
             }
             other => panic!("expected ToolInvokeResult, got {other:?}"),
         }
+
+        // Even the honest no-executor failure is audited: RequestReceived
+        // followed by WorkFailed naming the missing executor.
+        let log = prism_audit::AuditLog::new(emitter.log_path());
+        let envelopes = log.read_all().await.unwrap();
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(
+            envelopes[0].event.kind,
+            prism_audit::EventKind::RequestReceived
+        );
+        assert_eq!(envelopes[1].event.kind, prism_audit::EventKind::WorkFailed);
+        match &envelopes[1].event.decision {
+            prism_audit::AuditDecision::Denied { reasons } => {
+                assert!(reasons.iter().any(|r| r.contains("no local tool executor")));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        envelopes[1].verify_signature().unwrap();
     }
 }

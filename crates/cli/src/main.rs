@@ -2324,6 +2324,44 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                // ── Cross-org audit envelopes (F5) ──
+                // Reuse the node's own Ed25519 identity key (the same one
+                // that signs federation + SSH claims) so envelopes verify
+                // against the node's platform-signed identity — never a
+                // second identity. One emitter is shared by the HTTP
+                // federation middleware (via NodeState) and the daemon's
+                // platform-relay handler (via DaemonOptions), so both
+                // cross-org receive paths write one identity + one
+                // append-only log. `audit.enabled = false` opts out.
+                let audit_emitter: Option<std::sync::Arc<prism_audit::AuditEmitter>> =
+                    if node_config.audit.enabled {
+                        match prism_node::crypto::load_or_generate_signing_key(state_dir) {
+                            Ok((signing_key, _)) => {
+                                let audit_node_id = daemon_platform_node_id
+                                    .clone()
+                                    .unwrap_or_else(|| node_name.clone());
+                                let audit_org_id =
+                                    daemon_org_id.clone().unwrap_or_else(|| "local".to_string());
+                                Some(std::sync::Arc::new(prism_audit::AuditEmitter::new(
+                                    audit_node_id,
+                                    audit_org_id,
+                                    signing_key,
+                                    state_dir.join("audit-envelopes.jsonl"),
+                                    true,
+                                )))
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  Warning: audit envelopes disabled (signing key load failed: {e})"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                server_node_state.federation_audit = audit_emitter.clone();
+
                 let daemon_rbac_db_path = server_node_state.rbac_db_path.clone();
                 let server_state = std::sync::Arc::new(server_node_state);
                 if let Some(ref handles) = service_handles {
@@ -2448,6 +2486,7 @@ async fn main() -> Result<()> {
                     org_id: daemon_org_id,
                     offline,
                     tool_invoker: Some(tool_invoke_tx),
+                    audit_emitter,
                 };
 
                 // ── Start mesh networking (mDNS discovery + optional broadcast) ──
