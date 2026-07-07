@@ -363,6 +363,136 @@ impl AuditLog {
 }
 
 // ---------------------------------------------------------------------------
+// Emitter — local identity + sink for producing signed envelopes
+// ---------------------------------------------------------------------------
+
+/// The variable parts of an audit event — everything the emitter does not
+/// already know from its own identity. Handed to [`AuditEmitter::emit`].
+#[derive(Debug, Clone)]
+pub struct EmitSpec {
+    pub kind: EventKind,
+    /// Peer node, if known. Absent when the counterparty is a platform
+    /// relay whose origin org/node isn't visible to the emitter.
+    pub target_node_id: Option<String>,
+    pub target_org_id: Option<String>,
+    pub action: String,
+    pub resource: String,
+    pub decision: AuditDecision,
+    /// Originating request id, so auditors can stitch a chain.
+    pub correlation: Option<Uuid>,
+    /// Free-form context (opaque to the verifier).
+    pub extra: serde_json::Value,
+}
+
+/// A node's local audit-emission handle: its own identity, its Ed25519
+/// signing key, and the append-only log to write to.
+///
+/// One per process, shared behind an `Arc`. Every [`emit`](Self::emit)
+/// builds an [`AuditEvent`] whose `source_*` fields are this node, signs
+/// it via [`AuditEnvelope::sign`], and appends it. Appends are serialised
+/// through an internal mutex so multiple tasks (e.g. the HTTP federation
+/// middleware and the platform-relay handler) can share one emitter
+/// without interleaving JSONL lines — honouring [`AuditLog`]'s
+/// single-writer-per-file contract.
+///
+/// Emission is best-effort observability: signing or write failures are
+/// logged and swallowed, never propagated into the request path. When
+/// `enabled` is false every `emit` is a no-op.
+pub struct AuditEmitter {
+    node_id: String,
+    org_id: String,
+    signing_key: SigningKey,
+    log: AuditLog,
+    write_lock: tokio::sync::Mutex<()>,
+    enabled: bool,
+}
+
+impl std::fmt::Debug for AuditEmitter {
+    /// Redacts the signing key — never print secret key material.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditEmitter")
+            .field("node_id", &self.node_id)
+            .field("org_id", &self.org_id)
+            .field("signing_key", &"<redacted>")
+            .field("log_path", &self.log.path())
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+impl AuditEmitter {
+    /// Assemble an emitter from this node's identity, signing key, and the
+    /// path of the append-only log. `enabled = false` makes every emit a
+    /// no-op (the `audit.enabled = false` opt-out).
+    pub fn new(
+        node_id: impl Into<String>,
+        org_id: impl Into<String>,
+        signing_key: SigningKey,
+        log_path: impl Into<PathBuf>,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            node_id: node_id.into(),
+            org_id: org_id.into(),
+            signing_key,
+            log: AuditLog::new(log_path),
+            write_lock: tokio::sync::Mutex::new(()),
+            enabled,
+        }
+    }
+
+    /// Whether this emitter writes anything (`audit.enabled`).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// This node's id — the `source_node_id` on every emitted event.
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    /// Path of the underlying append-only log.
+    pub fn log_path(&self) -> &Path {
+        self.log.path()
+    }
+
+    /// Build, sign, and append one envelope. Returns the signed envelope
+    /// on success (handy for callers that also want to forward it); `None`
+    /// when disabled or when signing/append failed (already logged).
+    pub async fn emit(&self, spec: EmitSpec) -> Option<AuditEnvelope> {
+        if !self.enabled {
+            return None;
+        }
+        let event = AuditEvent {
+            event_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind: spec.kind,
+            source_node_id: self.node_id.clone(),
+            source_org_id: self.org_id.clone(),
+            target_node_id: spec.target_node_id,
+            target_org_id: spec.target_org_id,
+            action: spec.action,
+            resource: spec.resource,
+            decision: spec.decision,
+            correlation: spec.correlation,
+            extra: spec.extra,
+        };
+        let envelope = match AuditEnvelope::sign(event, &self.node_id, &self.signing_key) {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to sign audit envelope");
+                return None;
+            }
+        };
+        let _guard = self.write_lock.lock().await;
+        if let Err(e) = self.log.append(&envelope).await {
+            tracing::warn!(error = %e, "failed to append audit envelope");
+        }
+        Some(envelope)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -567,5 +697,98 @@ mod tests {
         let d = AuditDecision::NoOpinion;
         let s = serde_json::to_string(&d).unwrap();
         assert!(s.contains("\"outcome\":\"no_opinion\""));
+    }
+
+    // ── Emitter ────────────────────────────────────────────────────
+
+    fn sample_spec() -> EmitSpec {
+        EmitSpec {
+            kind: EventKind::RequestReceived,
+            target_node_id: Some("node-munich-01".into()),
+            target_org_id: Some("org-munich".into()),
+            action: "inference.submit".into(),
+            resource: "node://munich-01/gpu-0".into(),
+            decision: AuditDecision::Allowed {
+                obligations: vec!["audit_log".into()],
+            },
+            correlation: Some(Uuid::new_v4()),
+            extra: serde_json::json!({"caller": "alice"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn emitter_signs_and_appends_verifiable_envelope() {
+        let tmp = TempDir::new().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let em = AuditEmitter::new(
+            "node-tokyo-01",
+            "org-tokyo",
+            key,
+            tmp.path().join("audit.jsonl"),
+            true,
+        );
+
+        // Returned envelope round-trips sign → verify (requirement a).
+        let env = em
+            .emit(sample_spec())
+            .await
+            .expect("enabled emitter returns the signed envelope");
+        env.verify_signature().unwrap();
+        assert_eq!(env.event.source_node_id, "node-tokyo-01");
+        assert_eq!(env.event.source_org_id, "org-tokyo");
+
+        // It was actually appended, and reads back verifiable (requirement b).
+        let log = AuditLog::new(em.log_path());
+        let back = log.read_all().await.unwrap();
+        assert_eq!(back.len(), 1);
+        back[0].verify_signature().unwrap();
+        assert_eq!(back[0], env);
+    }
+
+    #[tokio::test]
+    async fn disabled_emitter_writes_nothing() {
+        // audit.enabled = false opt-out (requirement c).
+        let tmp = TempDir::new().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let path = tmp.path().join("audit.jsonl");
+        let em = AuditEmitter::new("n", "o", key, &path, false);
+
+        assert!(!em.is_enabled());
+        assert!(em.emit(sample_spec()).await.is_none());
+        assert!(!path.exists(), "disabled emitter must not create the log");
+
+        let log = AuditLog::new(&path);
+        assert!(log.read_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn emitter_serialises_concurrent_appends() {
+        // Shared emitter under an Arc: two tasks appending must not
+        // interleave (each JSONL line stays whole and verifiable).
+        let tmp = TempDir::new().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let em = std::sync::Arc::new(AuditEmitter::new(
+            "node-a",
+            "org-a",
+            key,
+            tmp.path().join("audit.jsonl"),
+            true,
+        ));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let em = em.clone();
+            handles.push(tokio::spawn(async move { em.emit(sample_spec()).await }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let log = AuditLog::new(em.log_path());
+        let back = log.read_all().await.unwrap();
+        assert_eq!(back.len(), 8);
+        for env in &back {
+            env.verify_signature().unwrap();
+        }
     }
 }

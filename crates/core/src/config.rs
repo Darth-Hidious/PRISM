@@ -26,6 +26,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub auth: AuthSection,
     #[serde(default)]
+    pub audit: AuditSection,
+    #[serde(default)]
     pub llm: LlmSection,
     #[serde(default)]
     pub indexer: ModelServiceSection,
@@ -94,6 +96,24 @@ pub struct AuthSection {
     pub require_platform_auth: bool,
     #[serde(default = "default_true")]
     pub allow_local_users: bool,
+}
+
+/// Cross-org audit envelopes (F5). When enabled (the default), the node
+/// emits signed, append-only audit records for cross-org events it
+/// receives — relayed tool invocations and verified federation requests.
+/// Set `enabled = false` to opt out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditSection {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for AuditSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+        }
+    }
 }
 
 /// Unified LLM configuration — used by ingest, query, agent, and all tools.
@@ -513,6 +533,21 @@ mod tests {
         assert_eq!(config.ontology.llm_provider, "platform");
         assert_eq!(config.indexer.mode, "platform");
         assert_eq!(config.searcher.mode, "platform");
+    }
+
+    #[test]
+    fn audit_enabled_by_default() {
+        let config = NodeConfig::default();
+        assert!(config.audit.enabled);
+        // Absent [audit] section still defaults to on.
+        let config: NodeConfig = toml::from_str("[node]\nname = \"x\"\n").unwrap();
+        assert!(config.audit.enabled);
+    }
+
+    #[test]
+    fn audit_can_be_opted_out() {
+        let config: NodeConfig = toml::from_str("[audit]\nenabled = false\n").unwrap();
+        assert!(!config.audit.enabled);
     }
 
     #[test]

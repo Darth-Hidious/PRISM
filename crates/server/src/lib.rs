@@ -100,6 +100,11 @@ pub struct NodeState {
     /// boot when an LLM is configured and the Python tool server spawns;
     /// unset ⇒ the chat endpoints return 503.
     pub chat: OnceLock<Arc<prism_agent::service::ChatService>>,
+    /// Signed cross-org audit envelopes (F5). Set at boot when the node
+    /// has an identity + signing key; `None` (e.g. tests) disables
+    /// emission. Shared with the platform-relay handler so both cross-org
+    /// receive paths write to one identity + one append-only log.
+    pub federation_audit: Option<Arc<prism_audit::AuditEmitter>>,
 }
 
 /// A running service tracked by the server.
@@ -134,6 +139,7 @@ impl NodeState {
             node_id: OnceLock::new(),
             federation: OnceLock::new(),
             chat: OnceLock::new(),
+            federation_audit: None,
         }
     }
 

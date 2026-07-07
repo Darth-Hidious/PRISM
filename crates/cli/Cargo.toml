@@ -28,6 +28,7 @@ base64.workspace = true
 sysinfo.workspace = true
 uuid.workspace = true
 
+prism-audit = { path = "../audit" }
 prism-client = { path = "../client" }
 prism-compute = { path = "../compute" }
 prism-core = { path = "../core" }
