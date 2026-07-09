@@ -14,6 +14,7 @@ pub mod scratchpad;
 pub mod service;
 pub mod session;
 pub mod skills;
+pub mod task;
 pub mod tool_catalog;
 pub mod transcript;
 pub mod types;
