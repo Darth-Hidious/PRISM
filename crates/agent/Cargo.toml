@@ -13,6 +13,7 @@ prism-runtime = { path = "../runtime" }
 prism-workflows = { path = "../workflows" }
 prism-provenance = { path = "../provenance" }
 prism-embed = { path = "../embed" }
+prism-campaign = { path = "../campaign" }
 
 regex = "1"
 anyhow.workspace = true

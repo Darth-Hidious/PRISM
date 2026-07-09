@@ -244,6 +244,119 @@ pub fn task_context_block(task: &ResearchTaskContext) -> Option<String> {
     Some(out)
 }
 
+// ── Campaign ↔ agent bridge translation ─────────────────────────────
+//
+// These functions translate between the campaign crate's research types
+// (ResearchCampaignGoal / ResearchIterationContext / ResearchIterationOutcome)
+// and this module's ResearchTaskContext. They are pure and unit-tested; the
+// actual run_turn call lives at the call site (where the ServerRuntime and its
+// &mut borrows live), so the bridge stays testable without a live LLM.
+//
+// The flow per research iteration (TOOL_SURFACE_SPEC §5.4):
+//   1. from_campaign_goal + from_iteration_context build a ResearchTaskContext
+//      carrying the goal + accumulated artifact handles + notes.
+//   2. task_turn_message synthesizes the user_message for run_turn.
+//   3. run_turn(task: Some(&ctx), user_message) executes one research step.
+//   4. outcome_from_turn_result harvests artifacts/notes/progress for the
+//      campaign's next iteration + checkpoint.
+
+/// Build a task context from a research campaign goal + the running iteration
+/// state (prior artifacts/notes). The plan is left empty (pure ReAct-per-turn
+/// under a standing goal) — the model plans within each turn against the goal,
+/// constraints, and accumulated artifacts. A precomputed plan can be set later.
+#[must_use]
+pub fn task_context_from_research(
+    goal: &prism_campaign::ResearchCampaignGoal,
+    context: &prism_campaign::ResearchIterationContext,
+) -> ResearchTaskContext {
+    let mut task = ResearchTaskContext::new(&goal.objective);
+    task.constraints = goal.constraints.clone();
+    // Carry prior artifacts/notes forward as task-scoped state.
+    for id in &context.artifact_refs {
+        task.artifacts.push(ArtifactHandle {
+            id: id.clone(),
+            summary: String::new(), // summary filled when the handle was first recorded
+            bytes: 0,
+        });
+    }
+    task.notes = context.notes.clone();
+    task
+}
+
+/// Synthesize the user message for a task-driven research turn. When the goal
+/// has success criteria, reminds the model to assess progress toward them.
+#[must_use]
+pub fn task_turn_message(goal: &prism_campaign::ResearchCampaignGoal, iteration: usize) -> String {
+    let mut msg = format!(
+        "Continue the research task (iteration {}): {}",
+        iteration + 1,
+        goal.objective,
+    );
+    if !goal.success_criteria.is_empty() {
+        msg.push_str(&format!(
+            "\nSuccess criteria: {}. Report progress (0..1) toward done.",
+            goal.success_criteria.join("; "),
+        ));
+    }
+    msg
+}
+
+/// Assess whether the success criteria appear met, from the model's text output
+/// of a turn. Heuristic: the model is expected to state progress; this looks
+/// for explicit completion signals. Conservative (defaults to "not done").
+#[must_use]
+pub fn assess_research_progress(
+    goal: &prism_campaign::ResearchCampaignGoal,
+    turn_text: &str,
+) -> f64 {
+    if goal.success_criteria.is_empty() {
+        // No explicit criteria — progress is implicit; estimate from turn length
+        // that work happened, capped low (can't claim "done" without criteria).
+        return 0.1_f64.min(turn_text.len().min(2000) as f64 / 20_000.0);
+    }
+    let low = turn_text.to_ascii_lowercase();
+    // Strong completion signals.
+    for phrase in [
+        "task complete",
+        "research complete",
+        "all criteria met",
+        "done: ",
+    ] {
+        if low.contains(phrase) {
+            return 1.0;
+        }
+    }
+    // Partial signals.
+    for phrase in [
+        "criteria partially",
+        "preliminary findings",
+        "initial results",
+    ] {
+        if low.contains(phrase) {
+            return 0.4;
+        }
+    }
+    0.2 // work happened but no completion signal — modest progress
+}
+
+/// Build the campaign iteration outcome from a turn's harvested text + any new
+/// artifact handles + notes the turn produced.
+#[must_use]
+pub fn research_outcome_from_turn(
+    summary: String,
+    goal: &prism_campaign::ResearchCampaignGoal,
+    turn_text: &str,
+    new_artifact_refs: Vec<String>,
+    new_notes: Vec<String>,
+) -> prism_campaign::ResearchIterationOutcome {
+    prism_campaign::ResearchIterationOutcome {
+        progress: assess_research_progress(goal, turn_text),
+        summary,
+        artifact_refs: new_artifact_refs,
+        notes: new_notes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +518,98 @@ mod tests {
         // vector is byte-for-byte the prior chat behavior.
         let chat_task: Option<&ResearchTaskContext> = None;
         assert!(chat_task.and_then(task_context_block).is_none());
+    }
+
+    // ── Campaign ↔ agent bridge translation tests ───────────────────────
+
+    fn research_goal() -> prism_campaign::ResearchCampaignGoal {
+        prism_campaign::ResearchCampaignGoal {
+            objective: "Survey refractory HEAs for 1200C turbines".into(),
+            constraints: vec!["density < 12 g/cm^3".into()],
+            success_criteria: vec!["cited report with >=3 corroborated claims".into()],
+        }
+    }
+
+    #[test]
+    fn task_context_carries_goal_constraints_and_prior_state() {
+        let goal = research_goal();
+        let ctx = prism_campaign::ResearchIterationContext {
+            iteration: 2,
+            artifact_refs: vec!["prov:aaa".into(), "prov:bbb".into()],
+            notes: vec!["Ti-W-Mo looks promising".into()],
+        };
+        let task = task_context_from_research(&goal, &ctx);
+        assert_eq!(task.goal, goal.objective);
+        assert_eq!(task.constraints, goal.constraints);
+        assert_eq!(task.artifacts.len(), 2);
+        assert_eq!(task.artifacts[0].id, "prov:aaa");
+        assert_eq!(task.notes, ctx.notes);
+        // No precomputed plan → ReAct-per-turn under the standing goal.
+        assert!(task.plan.is_empty());
+    }
+
+    #[test]
+    fn turn_message_includes_iteration_and_criteria() {
+        let goal = research_goal();
+        let msg = task_turn_message(&goal, 3);
+        assert!(msg.contains("iteration 4"), "{msg}");
+        assert!(msg.contains(&goal.objective));
+        assert!(msg.contains("Success criteria"));
+        assert!(msg.contains("progress"));
+    }
+
+    #[test]
+    fn progress_assessment_detects_completion_signal() {
+        let goal = research_goal();
+        assert_eq!(
+            assess_research_progress(&goal, "All criteria met — see report below."),
+            1.0
+        );
+        assert_eq!(
+            assess_research_progress(&goal, "Task complete. Findings attached."),
+            1.0
+        );
+    }
+
+    #[test]
+    fn progress_assessment_partial_and_baseline() {
+        let goal = research_goal();
+        assert_eq!(
+            assess_research_progress(&goal, "Preliminary findings suggest..."),
+            0.4
+        );
+        // No signal — modest baseline progress (work happened, not done).
+        let baseline = assess_research_progress(&goal, "Ran 5 queries, reading papers.");
+        assert!(baseline > 0.0 && baseline < 0.4);
+    }
+
+    #[test]
+    fn progress_no_criteria_stays_low() {
+        // Without explicit success criteria we cannot claim "done".
+        let goal = prism_campaign::ResearchCampaignGoal {
+            objective: "open-ended exploration".into(),
+            ..Default::default()
+        };
+        let p = assess_research_progress(&goal, "explored many directions");
+        assert!(p <= 0.1, "progress without criteria must stay low: {p}");
+    }
+
+    #[test]
+    fn outcome_from_turn_packages_summary_artifacts_notes_progress() {
+        let goal = research_goal();
+        let outcome = research_outcome_from_turn(
+            "Found 3 papers on Ti-W-Mo creep resistance".into(),
+            &goal,
+            "All criteria met",
+            vec!["prov:paper1".into()],
+            vec!["Ti-W-Mo >2000K promising".into()],
+        );
+        assert_eq!(
+            outcome.summary,
+            "Found 3 papers on Ti-W-Mo creep resistance"
+        );
+        assert_eq!(outcome.artifact_refs, vec!["prov:paper1".to_string()]);
+        assert_eq!(outcome.notes, vec!["Ti-W-Mo >2000K promising".to_string()]);
+        assert_eq!(outcome.progress, 1.0); // "All criteria met" detected
     }
 }
