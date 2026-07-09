@@ -244,7 +244,106 @@ pub struct CampaignResult {
     pub provenance: Vec<ProvenanceRecord>,
 }
 
-// ── Campaign Engine ─────────────────────────────────────────────────
+// ── Research-campaign generalization ────────────────────────────────
+//
+// The campaign engine was born materials-discovery-shaped: CampaignGoal
+// carries `elements`/`objective`/`seeds` and run_iteration does propose→
+// evaluate→rank. Long-form literature/knowledge research (LONG_RESEARCH_PLAN
+// gap #4) is the SAME durable shape (checkpoint/budget/approval/resume) but a
+// DIFFERENT iteration body: search → read → extract → cite, driven by the LLM
+// tool-call loop (run_turn) rather than a hardcoded propose/evaluate.
+//
+// This block generalizes the goal and defines the iteration-executor seam so a
+// research campaign can delegate each iteration to the agent layer WITHOUT the
+// campaign crate depending on the agent crate (which would be circular). The
+// agent layer implements [`ResearchIterationExecutor`] and supplies it to the
+// campaign loop; the materials path is untouched.
+
+/// The kind of campaign, determining which iteration body runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CampaignGoalKind {
+    /// Materials discovery: propose compositions → evaluate → rank (the
+    /// original `run_iteration` body). The default/legacy path.
+    #[default]
+    Materials,
+    /// Long-running research: the agent's LLM tool-call loop drives each
+    /// iteration against a research goal, via a [`ResearchIterationExecutor`].
+    Research,
+}
+
+/// A research campaign goal — the non-materials counterpart of
+/// [`CampaignGoal`]. Natural-language objective + constraints + success
+/// criteria, no composition/elements. This is what a "research this topic"
+/// task packages into the durable checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ResearchCampaignGoal {
+    /// The research question or objective, in the user's words.
+    pub objective: String,
+    /// Hard constraints (e.g. "only primary sources", "last 5 years").
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    /// What "done" looks like (e.g. "a cited report with ≥3 corroborated
+    /// claims per conclusion"). The executor checks this each iteration.
+    #[serde(default)]
+    pub success_criteria: Vec<String>,
+}
+
+/// The outcome of one research iteration, reported by the executor back to the
+/// campaign loop. Mirrors how a materials iteration reports candidates/reward,
+/// but in research terms: findings, artifact references, and a self-assessed
+/// progress signal.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResearchIterationOutcome {
+    /// One-line summary of what this iteration accomplished (checkpointed).
+    pub summary: String,
+    /// Artifact references produced this iteration (provenance ids), to be
+    /// carried as handles into the next iteration's context.
+    #[serde(default)]
+    pub artifact_refs: Vec<String>,
+    /// The executor's self-assessed progress toward `success_criteria`
+    /// (0.0 = just started, 1.0 = criteria met → campaign can complete).
+    pub progress: f64,
+    /// Optional notes to fold into the task's working memory next iteration.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+/// Executor seam for research campaigns. Implemented by the agent layer
+/// (which owns `run_turn` and the tool catalog); the campaign loop calls
+/// `execute_iteration` once per iteration. Keeping this as a trait in the
+/// campaign crate avoids a circular `campaign → agent` dependency: the agent
+/// depends on campaign (it constructs the checkpoint), campaign depends only
+/// on this trait, not on the agent crate.
+///
+/// The single method returns a pinned boxed future rather than using
+/// `async_trait` to avoid pulling a new dependency for one seam.
+pub trait ResearchIterationExecutor: Send + Sync {
+    /// Run one research iteration against the given goal and the running
+    /// context (prior artifacts/notes). Returns the outcome; errors abort the
+    /// campaign with the error as the completion reason.
+    fn execute_iteration<'a>(
+        &'a self,
+        goal: &'a ResearchCampaignGoal,
+        context: &'a ResearchIterationContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ResearchIterationOutcome>> + Send + 'a>,
+    >;
+}
+
+/// The running context passed into each research iteration: what prior
+/// iterations produced. This is the campaign-side mirror of the agent's
+/// `ResearchTaskContext` artifact/notes state.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResearchIterationContext {
+    /// Iteration number (0-based) about to run.
+    pub iteration: usize,
+    /// Artifact references accumulated so far (provenance ids).
+    #[serde(default)]
+    pub artifact_refs: Vec<String>,
+    /// Working notes accumulated so far.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
 
 /// The campaign orchestrator.
 pub struct Campaign {
@@ -1103,5 +1202,90 @@ mod tests {
         assert_eq!(config.batch_size, 10);
         assert_eq!(config.checkpoint_every, 10);
         assert!(config.budget_usd.is_none());
+    }
+
+    // ── Research-campaign generalization tests ──────────────────────────
+
+    #[test]
+    fn research_goal_serde_roundtrip() {
+        // A research goal must survive checkpoint serialization (resume).
+        let goal = ResearchCampaignGoal {
+            objective: "Survey refractory HEAs for 1200C turbine blades".into(),
+            constraints: vec!["density < 12 g/cm^3".into()],
+            success_criteria: vec!["cited report with >=3 corroborated claims".into()],
+        };
+        let json = serde_json::to_string(&goal).expect("serialize");
+        let back: ResearchCampaignGoal = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(goal, back);
+    }
+
+    #[test]
+    fn research_goal_defaults_empty_optionals() {
+        // A minimal research goal (objective only) deserializes with empty
+        // optional fields — the common case for a quick research task.
+        let json = r#"{"objective":"quick lookup"}"#;
+        let goal: ResearchCampaignGoal =
+            serde_json::from_str(json).expect("deserialize minimal goal");
+        assert_eq!(goal.objective, "quick lookup");
+        assert!(goal.constraints.is_empty());
+        assert!(goal.success_criteria.is_empty());
+    }
+
+    #[test]
+    fn campaign_goal_kind_defaults_to_materials() {
+        // Backward compat: unspecified kind is the legacy materials path, so
+        // existing checkpoints and the shipping binary are unaffected.
+        assert_eq!(CampaignGoalKind::default(), CampaignGoalKind::Materials);
+    }
+
+    #[test]
+    fn goal_kind_serde_roundtrip_preserves_discriminator() {
+        for kind in [CampaignGoalKind::Materials, CampaignGoalKind::Research] {
+            let json = serde_json::to_string(&kind).expect("serialize");
+            let back: CampaignGoalKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(kind, back);
+        }
+    }
+
+    #[test]
+    fn research_executor_trait_object_can_be_invoked() {
+        // Verify the executor seam compiles and is object-safe: a stub
+        // executor implementing the trait can be boxed and awaited. The agent
+        // layer will implement this for real (driving run_turn per iteration).
+        struct StubExecutor;
+        impl ResearchIterationExecutor for StubExecutor {
+            fn execute_iteration<'a>(
+                &'a self,
+                _goal: &'a ResearchCampaignGoal,
+                ctx: &'a ResearchIterationContext,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ResearchIterationOutcome>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    Ok(ResearchIterationOutcome {
+                        summary: format!("stub iteration {}", ctx.iteration),
+                        artifact_refs: Vec::new(),
+                        progress: 0.5,
+                        notes: Vec::new(),
+                    })
+                })
+            }
+        }
+
+        let exec: Box<dyn ResearchIterationExecutor> = Box::new(StubExecutor);
+        let goal = ResearchCampaignGoal {
+            objective: "test".into(),
+            ..Default::default()
+        };
+        let ctx = ResearchIterationContext {
+            iteration: 0,
+            ..Default::default()
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let outcome = rt
+            .block_on(exec.execute_iteration(&goal, &ctx))
+            .expect("stub iteration succeeds");
+        assert_eq!(outcome.summary, "stub iteration 0");
+        assert!((0.0..=1.0).contains(&outcome.progress));
     }
 }
