@@ -140,14 +140,23 @@ def create_agent_run_tools(registry: ToolRegistry) -> None:
     ))
     registry.register(Tool(
         name="list_background_research",
-        description="List recent background research runs with status. Free / read-only.",
-        input_schema={"type": "object", "properties": {}},
+        description=(
+            "List recent background research runs with status. Use this to "
+            "discover run ids for check_background_research or "
+            "cancel_background_research. Takes no arguments. Free / read-only."
+        ),
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         func=_list,
         requires_approval=False,
     ))
     registry.register(Tool(
         name="cancel_background_research",
-        description="Cancel a running background research run.",
+        description=(
+            "Cancel a running background research run by id. Use this when a "
+            "detached research agent (started by start_background_research) "
+            "is spending budget you want to stop. Returns the cancelled run's "
+            "final status."
+        ),
         input_schema={
             "type": "object",
             "properties": {

@@ -924,7 +924,7 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
             "talks to the actual scheduler. Use to see what's pending in "
             "the queue, not what you've spawned locally."
         ),
-        input_schema={"type": "object", "properties": {}},
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         func=_check_hpc_queue,
     ))
 

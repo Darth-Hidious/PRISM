@@ -105,6 +105,8 @@ jobs:
               print(f'FAIL: {e}')
               sys.exit(1)
           "
+      - name: Lint tool schemas + descriptions (TOOL_SURFACE_SPEC D1-D4)
+        run: PRISM_DISABLE_MEMORY=1 python3 scripts/lint_tool_schemas.py
 
   ingest-pipeline:
     name: Ingest Pipeline (with services)

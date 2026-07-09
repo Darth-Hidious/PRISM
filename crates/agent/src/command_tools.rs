@@ -3610,4 +3610,98 @@ mod tests {
             "prism publish models/mace.ckpt --to marc27 --repo team/mace --private --json"
         );
     }
+
+    // ── TOOL_SURFACE_SPEC definition-of-ready gates (D2, D3) ─────────────
+    //
+    // These tests encode the schema + description floor from
+    // docs/TOOL_SURFACE_SPEC.md so the command-tool surface cannot silently
+    // regress. The `RootArgs` umbrella tools (generic `args: array<string>`)
+    // are tracked in `ROOTARGS_ALLOWLIST` — Batch 1 of the tool-surface
+    // upgrade converts them to typed/subcommand schemas and shrinks this
+    // list to zero. Until then, the list is the explicit, reviewed inventory
+    // of the known gap (audit §2.2).
+
+    /// Command-tools whose schema is the generic `args: array<string>` escape.
+    /// This is the audited gap; the list MUST only shrink over time.
+    const ROOTARGS_ALLOWLIST: &[&str] = &[
+        "agent", "billing", "deploy", "discourse", "doctor", "ingest",
+        "job-status", "marketplace", "mesh", "models", "node", "publish",
+        "query", "research", "run", "status", "tools", "workflow",
+    ];
+
+    #[test]
+    fn every_command_tool_has_a_real_schema_or_is_known_rootargs() {
+        // D3: a tool's schema is typed, honest-empty (additionalProperties:false),
+        // or — only for the explicit escape-hatch umbrellas — the generic
+        // RootArgs form. Any NEW tool landing in the generic form without being
+        // in the allowlist fails here, preventing the gap from growing.
+        let tools = command_tools_filtered(true);
+        assert!(!tools.is_empty());
+        for tool in &tools {
+            let schema = &tool.input_schema;
+            let is_rootargs = schema.get("properties")
+                .and_then(|p| p.as_object())
+                .and_then(|p| p.get("args"))
+                .is_some();
+            if is_rootargs {
+                assert!(
+                    ROOTARGS_ALLOWLIST.contains(&tool.name.as_str()),
+                    "tool `{}` uses the generic args schema but is not in \
+                     ROOTARGS_ALLOWLIST — give it a typed schema (SPEC D3) or \
+                     add it to the allowlist with a reason",
+                    tool.name
+                );
+                continue;
+            }
+            // Every other tool: schema must be an object. Honest-empty shapes
+            // (empty_schema()) set additionalProperties:false; typed shapes
+            // have ≥1 property. Both are accepted.
+            assert_eq!(
+                schema["type"], "object",
+                "tool `{}` schema is not type:object",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn empty_schema_tools_close_additional_properties() {
+        // D3b: a genuinely parameter-less tool must declare
+        // {type:object, properties:{}, additionalProperties:false} so the model
+        // is not invited to invent arguments.
+        let tools = command_tools_filtered(true);
+        for tool in &tools {
+            let props = tool.input_schema.get("properties")
+                .and_then(|p| p.as_object());
+            let Some(props) = props else { continue };
+            if props.is_empty() {
+                assert_eq!(
+                    tool.input_schema.get("additionalProperties"),
+                    Some(&serde_json::json!(false)),
+                    "tool `{}` has an empty properties object but does not set \
+                     additionalProperties:false (SPEC D3b)",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_command_tool_description_meets_the_floor() {
+        // D2 (spirit): a description must be long enough to carry a
+        // when-to-use / returns signal. The floor here is deliberately
+        // lenient (40 chars) to match the existing surface; Batch 3 of the
+        // upgrade raises the floor and the descriptions together.
+        const FLOOR: usize = 40;
+        let tools = command_tools_filtered(true);
+        for tool in &tools {
+            let len = tool.description.trim().len();
+            assert!(
+                len >= FLOOR,
+                "tool `{}` description is {len} chars (< {FLOOR}) — add a \
+                 when-to-use / returns signal (SPEC D2)",
+                tool.name
+            );
+        }
+    }
 }
