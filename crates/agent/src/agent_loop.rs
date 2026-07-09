@@ -648,6 +648,7 @@ pub async fn run_turn(
     tool_catalog: &ToolCatalog,
     config: &AgentConfig,
     user_message: &str,
+    task: Option<&crate::task::ResearchTaskContext>,
     transcript: &mut TranscriptStore,
     hooks: &HookRegistry,
     permissions: &ToolPermissionContext,
@@ -675,6 +676,12 @@ pub async fn run_turn(
     // local Turso open — the same cost the provenance hook already pays per
     // tool call). Missing store/session degrades to no block, never an error.
     let session_memory: Option<String> = load_session_memory().await;
+    // Task-driven research context (TOOL_SURFACE_SPEC §5.1): when a task is
+    // present, inject its deterministic TASK CONTEXT block every iteration so
+    // the model carries the goal/plan-position/artifacts/notes across the
+    // inner-loop cap and across turns. Chat turns (task=None) never build a
+    // block → chat output is byte-for-byte unchanged (chat-path-unchanged test).
+    let task_block = task.and_then(crate::task::task_context_block);
     let mut recent_sigs: VecDeque<String> = VecDeque::with_capacity(DOOM_LOOP_WINDOW + 1);
     // Track consecutive empty results per tool name
     let mut empty_result_streak: HashMap<String, usize> = HashMap::new();
@@ -783,6 +790,16 @@ pub async fn run_turn(
             tool_calls: None,
             tool_call_id: None,
         }];
+        // Task-driven context goes first (highest priority for a research task):
+        // goal + plan position + artifact handles + working notes, every turn.
+        if let Some(block) = &task_block {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(block.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
         if let Some(menu) = &capability_menu {
             messages.push(ChatMessage {
                 role: "system".to_string(),

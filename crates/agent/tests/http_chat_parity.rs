@@ -312,6 +312,7 @@ async fn http_chat_service_and_backend_share_loop_and_catalog() {
         tools.as_ref(),
         config.as_ref(),
         "hello",
+        None, // chat path — no task context
         &mut transcript,
         hooks.as_ref(),
         &permissions,

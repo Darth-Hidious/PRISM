@@ -567,6 +567,7 @@ impl ChatService {
             tools.as_ref(),
             &turn_config,
             &request.message,
+            None, // task-driven research context (chat path — no task)
             &mut transcript,
             hooks.as_ref(),
             permissions,
