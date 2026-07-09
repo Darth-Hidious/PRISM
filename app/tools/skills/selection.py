@@ -58,7 +58,9 @@ SELECT_SKILL = Skill(
     description=(
         "Filter and rank materials from a dataset by criteria "
         "(min/max thresholds), sort by a property, and save the "
-        "top N candidates as a new dataset."
+        "top N candidates as a new dataset. Use this when you need to "
+        "narrow a dataset to the best candidates. Returns the new "
+        "dataset name and selected/total counts."
     ),
     steps=[
         SkillStep("load_dataset", "Load dataset from DataStore", "internal"),

@@ -465,6 +465,6 @@ def create_prediction_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="list_models",
         description=_LIST_MODELS_DESCRIPTION,
-        input_schema={"type": "object", "properties": {}},
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         func=_list_models,
     ))

@@ -93,10 +93,23 @@ impl ToolCatalog {
                 continue;
             }
 
+            // TOOL_SURFACE_SPEC D3: a tool MUST carry a real input_schema. When
+            // it is absent we keep loading (so v1 doesn't break on an older
+            // tool server) but surface the gap loudly — a description-less or
+            // schema-less tool silently degrades model selection/arg-filling.
+            let schema_present = tool.get("input_schema").is_some();
             let input_schema = tool
                 .get("input_schema")
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+            if !schema_present {
+                tracing::warn!(
+                    tool = %name,
+                    "tool loaded without an input_schema — defaulting to empty \
+                     {{type:object}}. Give it a typed schema (SPEC D3) or an \
+                     explicit honest-empty with additionalProperties:false",
+                );
+            }
             let requires_approval = tool
                 .get("requires_approval")
                 .and_then(Value::as_bool)
