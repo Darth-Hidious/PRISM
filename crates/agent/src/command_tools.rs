@@ -26,6 +26,14 @@ pub struct CommandToolRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandToolKind {
     RootArgs,
+    /// An umbrella root (`prism <root> ...`) whose first argument is one of a
+    /// known, closed set of subcommands. This is the typed form of RootArgs:
+    /// the model picks a real verb via the `subcommand` enum, then passes any
+    /// verb-specific tokens via `args`. Execution prepends the subcommand.
+    /// (TOOL_SURFACE_SPEC §1.1.3 — replaces the generic args:array<string>.)
+    RootSubcommand {
+        subcommands: &'static [&'static str],
+    },
     QueryLocal,
     QueryPlatform,
     QueryFederated,
@@ -220,8 +228,10 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "marketplace",
         root: "marketplace",
         aliases: &["prism_marketplace"],
-        kind: CommandToolKind::RootArgs,
-        description: "Run `prism marketplace ...` to search, inspect, or install PRISM marketplace resources such as downloadable workflows and tools. Pass one CLI token per `args` entry.",
+        kind: CommandToolKind::RootSubcommand {
+            subcommands: &["search", "install", "info", "find", "update"],
+        },
+        description: "Run `prism marketplace <subcommand>` for marketplace resources (workflows, tools, models). Prefer the typed siblings marketplace_search / marketplace_find / marketplace_info / marketplace_install for those verbs; this umbrella covers `update` and any verb without a typed tool. Returns the CLI output (list, details, or install result).",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
     },
@@ -292,8 +302,18 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "mesh",
         root: "mesh",
         aliases: &["prism_mesh"],
-        kind: CommandToolKind::RootArgs,
-        description: "Run `prism mesh ...` for PRISM mesh operations. This is a PRISM-native operational command surface, not a shell command.",
+        kind: CommandToolKind::RootSubcommand {
+            subcommands: &[
+                "discover",
+                "peers",
+                "publish",
+                "subscribe",
+                "unsubscribe",
+                "subscriptions",
+                "health",
+            ],
+        },
+        description: "Run `prism mesh <subcommand>` for PRISM mesh operations. Prefer the typed siblings mesh_discover / mesh_health / mesh_peers / mesh_subscriptions / mesh_publish / mesh_subscribe / mesh_unsubscribe for those verbs; this umbrella exists only for any mesh verb without a typed tool. Read verbs are free; publish/subscribe mutate mesh state and are approval-gated.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -364,8 +384,10 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "node",
         root: "node",
         aliases: &["prism_node"],
-        kind: CommandToolKind::RootArgs,
-        description: "Run `prism node ...` for PRISM node operations. Pass structured argv tokens in `args`.",
+        kind: CommandToolKind::RootSubcommand {
+            subcommands: &["up", "down", "status", "probe", "logs", "key"],
+        },
+        description: "Run `prism node <subcommand>` for PRISM node fabric operations. Prefer the typed siblings node_probe / node_status / node_logs for those verbs; this umbrella covers `up`/`down` (start/stop the local node daemon) and `key` (node key management), which have no typed tool. `up`/`down` change node state and are approval-gated; `status`/`probe`/`logs` are read-only.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -445,8 +467,10 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "deploy",
         root: "deploy",
         aliases: &["prism_deploy"],
-        kind: CommandToolKind::RootArgs,
-        description: "Run `prism deploy ...` for PRISM deployment flows. Pass structured argv tokens in `args` and expect approval for real deployment actions.",
+        kind: CommandToolKind::RootSubcommand {
+            subcommands: &["create", "list", "status", "stop", "health"],
+        },
+        description: "Run `prism deploy <subcommand>` for PRISM deployment flows. Prefer the typed siblings deploy_list / deploy_status / deploy_health / deploy_create / deploy_stop for those verbs; this umbrella exists only for any deploy verb without a typed tool. Deployments spend compute and mutate platform state — approval-gated.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -634,8 +658,10 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "models",
         root: "models",
         aliases: &["prism_models"],
-        kind: CommandToolKind::RootArgs,
-        description: "Run `prism models ...` to inspect hosted model discovery for the active MARC27 project. Use this for provider/model lookup without falling back to shell commands.",
+        kind: CommandToolKind::RootSubcommand {
+            subcommands: &["list", "search", "info"],
+        },
+        description: "Run `prism models <subcommand>` for hosted model discovery for the active MARC27 project. Prefer the typed siblings models_list / models_search / models_info for those verbs; this umbrella exists only for any models verb without a typed tool. Read-only and free. Returns provider/model listings or details.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -670,8 +696,10 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "discourse",
         root: "discourse",
         aliases: &["prism_discourse"],
-        kind: CommandToolKind::RootArgs,
-        description: "Run `prism discourse ...` for multi-agent debate workflows backed by the platform discourse API. Use structured argv tokens in `args` rather than a shell string.",
+        kind: CommandToolKind::RootSubcommand {
+            subcommands: &["create", "list", "show", "run", "status", "turns"],
+        },
+        description: "Run `prism discourse <subcommand>` for multi-agent debate workflows backed by the platform discourse API. Prefer the typed siblings discourse_list / discourse_create / discourse_show / discourse_run / discourse_status / discourse_turns for those verbs; this umbrella exists only for any discourse verb without a typed tool. Running a discourse instance spends compute and is approval-gated; list/show/status/turns are read-only.",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
     },
@@ -751,8 +779,10 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "billing",
         root: "billing",
         aliases: &["prism_billing"],
-        kind: CommandToolKind::RootArgs,
-        description: "Run `prism billing ...` for MARC27 credits: balance, usage, history, prices, or topup. Prefer `billing_balance`/`billing_usage`/`billing_history`/`billing_prices` for the common read-only checks; use this raw form only for `topup`, which opens a real Stripe checkout.",
+        kind: CommandToolKind::RootSubcommand {
+            subcommands: &["usage", "history", "prices", "topup", "balance"],
+        },
+        description: "Run `prism billing <subcommand>` for MARC27 credits. Prefer the typed siblings billing_balance / billing_usage / billing_history / billing_prices for the common read-only checks; use this umbrella for `topup` (opens a real Stripe checkout and spends money — approval-gated) or any billing verb without a typed tool.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -829,6 +859,30 @@ fn root_args_schema(root: &str) -> Value {
                 "items": { "type": "string" }
             }
         },
+        "additionalProperties": false
+    })
+}
+
+/// Typed schema for an umbrella root whose first argument is a known
+/// subcommand. Gives the model a closed `subcommand` enum (real verbs) plus an
+/// `args` array for verb-specific tokens — far stronger selection/arg-filling
+/// signal than the generic `args: array<string>` escape. (SPEC §1.1.3.)
+fn root_subcommand_schema(root: &str, subcommands: &'static [&'static str]) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "subcommand": {
+                "type": "string",
+                "enum": subcommands,
+                "description": format!("The `prism {root}` verb to run. Pick the closest match; the tool prefers a typed sibling (e.g. billing_balance) when one exists for this verb.")
+            },
+            "args": {
+                "type": "array",
+                "description": "Optional verb-specific tokens after the subcommand (e.g. an id, --flags). One array element per token, not a shell string.",
+                "items": { "type": "string" }
+            }
+        },
+        "required": ["subcommand"],
         "additionalProperties": false
     })
 }
@@ -1620,6 +1674,9 @@ fn mesh_subscription_schema(action: &str) -> Value {
 fn schema_for_spec(spec: &CommandToolSpec) -> Value {
     match spec.kind {
         CommandToolKind::RootArgs => root_args_schema(spec.root),
+        CommandToolKind::RootSubcommand { subcommands } => {
+            root_subcommand_schema(spec.root, subcommands)
+        }
         CommandToolKind::QueryLocal => query_local_schema(),
         CommandToolKind::QueryPlatform => query_platform_schema(),
         CommandToolKind::QueryFederated => query_federated_schema(),
@@ -2053,6 +2110,25 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
     match spec.kind {
         CommandToolKind::RootArgs => {
             let args = parse_args(input)?;
+            if spec.root == "workflow" {
+                parse_workflow_execution_from_root_args(&args)
+            } else {
+                Ok(CommandExecution::Cli {
+                    root: spec.root,
+                    args,
+                })
+            }
+        }
+        CommandToolKind::RootSubcommand { .. } => {
+            // Typed umbrella: subcommand (required) + optional verb-specific
+            // tokens. Prepend the chosen subcommand, then run as a CLI command.
+            // `workflow` keeps its specialized parser (it has structured
+            // WorkflowList/Show/Run execution variants).
+            let subcommand = required_string(input, "subcommand")?;
+            let extra = parse_args(input)?;
+            let mut args = Vec::with_capacity(extra.len() + 1);
+            args.push(subcommand);
+            args.extend(extra);
             if spec.root == "workflow" {
                 parse_workflow_execution_from_root_args(&args)
             } else {
@@ -3622,11 +3698,22 @@ mod tests {
     // of the known gap (audit §2.2).
 
     /// Command-tools whose schema is the generic `args: array<string>` escape.
-    /// This is the audited gap; the list MUST only shrink over time.
+    /// This is the audited gap; the list MUST only shrink over time. Batch 1
+    /// converted the 7 highest-overlap umbrellas (billing, deploy, discourse,
+    /// marketplace, mesh, models, node) to typed `RootSubcommand` schemas;
+    /// the remaining entries are genuine few-purpose roots with low overlap.
     const ROOTARGS_ALLOWLIST: &[&str] = &[
-        "agent", "billing", "deploy", "discourse", "doctor", "ingest",
-        "job-status", "marketplace", "mesh", "models", "node", "publish",
-        "query", "research", "run", "status", "tools", "workflow",
+        "agent",
+        "doctor",
+        "ingest",
+        "job-status",
+        "publish",
+        "query",
+        "research",
+        "run",
+        "status",
+        "tools",
+        "workflow",
     ];
 
     #[test]
@@ -3639,11 +3726,15 @@ mod tests {
         assert!(!tools.is_empty());
         for tool in &tools {
             let schema = &tool.input_schema;
-            let is_rootargs = schema.get("properties")
-                .and_then(|p| p.as_object())
-                .and_then(|p| p.get("args"))
-                .is_some();
-            if is_rootargs {
+            // The generic RootArgs escape is a schema whose ONLY property is
+            // `args` (an untyped string array). RootSubcommand schemas also
+            // carry an `args` field but additionally have a `subcommand` enum,
+            // so they are NOT flagged here.
+            let props = schema.get("properties").and_then(|p| p.as_object());
+            let is_generic_rootargs = props.is_some_and(|p| {
+                p.len() == 1 && p.contains_key("args") && !p.contains_key("subcommand")
+            });
+            if is_generic_rootargs {
                 assert!(
                     ROOTARGS_ALLOWLIST.contains(&tool.name.as_str()),
                     "tool `{}` uses the generic args schema but is not in \
@@ -3671,7 +3762,9 @@ mod tests {
         // is not invited to invent arguments.
         let tools = command_tools_filtered(true);
         for tool in &tools {
-            let props = tool.input_schema.get("properties")
+            let props = tool
+                .input_schema
+                .get("properties")
                 .and_then(|p| p.as_object());
             let Some(props) = props else { continue };
             if props.is_empty() {
@@ -3702,6 +3795,64 @@ mod tests {
                  when-to-use / returns signal (SPEC D2)",
                 tool.name
             );
+        }
+    }
+
+    #[test]
+    fn root_subcommand_schema_is_typed_with_enum_and_prepend_execution() {
+        // SPEC §1.1.3: an umbrella converted to RootSubcommand exposes a
+        // closed `subcommand` enum (real verbs) and prepends the chosen verb
+        // at execution time. Verify the schema shape and the execution build
+        // for a representative converted umbrella (`billing`).
+        let billing = command_tools_filtered(true)
+            .into_iter()
+            .find(|t| t.name == "billing")
+            .expect("billing umbrella exists");
+
+        // D3c: schema has a subcommand enum, not a bare args array.
+        let props = billing.input_schema["properties"]
+            .as_object()
+            .expect("billing schema has properties");
+        assert!(
+            props.contains_key("subcommand"),
+            "billing schema must expose a subcommand field"
+        );
+        let enum_vals = billing.input_schema["properties"]["subcommand"]["enum"]
+            .as_array()
+            .expect("subcommand has an enum");
+        assert!(
+            enum_vals.iter().any(|v| v == "topup"),
+            "billing subcommand enum should include topup"
+        );
+        assert_eq!(
+            billing.input_schema["required"],
+            serde_json::json!(["subcommand"]),
+        );
+
+        // Execution: the chosen subcommand is prepended to the CLI argv.
+        let spec = spec_by_name("billing").unwrap();
+        let exec = build_execution(spec, &json!({"subcommand": "usage"}))
+            .expect("billing usage execution builds");
+        match exec {
+            CommandExecution::Cli { root, args } => {
+                assert_eq!(root, "billing");
+                assert_eq!(args, vec!["usage".to_string()]);
+            }
+            other => panic!("expected Cli, got {other:?}"),
+        }
+
+        // With extra verb-specific tokens, they follow the subcommand.
+        let exec2 = build_execution(
+            spec_by_name("marketplace").unwrap(),
+            &json!({"subcommand": "info", "args": ["acme-model"]}),
+        )
+        .expect("marketplace info execution builds");
+        match exec2 {
+            CommandExecution::Cli { root, args } => {
+                assert_eq!(root, "marketplace");
+                assert_eq!(args, vec!["info".to_string(), "acme-model".to_string()]);
+            }
+            other => panic!("expected Cli, got {other:?}"),
         }
     }
 }
