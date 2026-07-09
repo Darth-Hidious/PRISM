@@ -318,6 +318,7 @@ def create_data_tools(registry: ToolRegistry) -> None:
                     },
                 },
                 "required": [],
+                "additionalProperties": False,
             },
             func=_query_materials_project,
         )

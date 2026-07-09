@@ -120,6 +120,7 @@ DISCOVER_SKILL = Skill(
             },
         },
         "required": ["elements"],
+        "additionalProperties": False,
     },
     func=_materials_discovery,
     category="discovery",

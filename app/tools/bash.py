@@ -844,6 +844,7 @@ def create_bash_tools(registry: ToolRegistry) -> None:
                 },
             },
             "required": ["command"],
+            "additionalProperties": False,
         },
         func=_execute_bash,
         requires_approval=True,

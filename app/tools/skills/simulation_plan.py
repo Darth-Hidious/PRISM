@@ -151,6 +151,7 @@ SIM_PLAN_SKILL = Skill(
             },
         },
         "required": ["dataset_name"],
+        "additionalProperties": False,
     },
     func=_plan_simulations,
     category="simulation",

@@ -94,6 +94,7 @@ SELECT_SKILL = Skill(
             },
         },
         "required": ["dataset_name"],
+        "additionalProperties": False,
     },
     func=_select_materials,
     category="selection",

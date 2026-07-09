@@ -152,6 +152,7 @@ ACQUIRE_SKILL = Skill(
             },
         },
         "required": ["elements"],
+        "additionalProperties": False,
     },
     func=_acquire_materials,
     category="acquisition",
