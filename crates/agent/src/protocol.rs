@@ -4986,6 +4986,7 @@ fn spawn_agent_turn(
             tools.as_ref(),
             &turn_config,
             &user_text,
+            None, // task-driven research context (chat path — no task)
             &mut runtime.transcript,
             hooks.as_ref(),
             &runtime.permissions,

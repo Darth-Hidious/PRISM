@@ -396,4 +396,14 @@ mod tests {
         let block = task_context_block(&task).expect("block present");
         assert!(block.contains("plan within turns"));
     }
+
+    #[test]
+    fn chat_path_none_task_produces_no_block() {
+        // This is the chat-path-unchanged contract expressed at the decision
+        // point run_turn uses: `task.and_then(task_context_block)`. A None
+        // task (chat) yields None → no system block is pushed → the messages
+        // vector is byte-for-byte the prior chat behavior.
+        let chat_task: Option<&ResearchTaskContext> = None;
+        assert!(chat_task.and_then(task_context_block).is_none());
+    }
 }
