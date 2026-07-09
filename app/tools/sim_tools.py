@@ -909,6 +909,7 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
                 "potential_type": {"type": "string", "description": "Filter by type: eam, meam, tersoff, lj"},
             },
             "required": [],
+            "additionalProperties": False,
         },
         func=_list_potentials,
     ))
@@ -955,6 +956,7 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
                 },
             },
             "required": ["structure_id", "parameter_name", "parameter_values"],
+            "additionalProperties": False,
         },
         func=_run_convergence_test,
     ))
@@ -987,6 +989,7 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
                 },
             },
             "required": ["workflow_type", "structure_id"],
+            "additionalProperties": False,
         },
         func=_run_workflow,
     ))

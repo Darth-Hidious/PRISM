@@ -86,6 +86,7 @@ def create_property_selection_tools(registry: ToolRegistry) -> None:
                 },
             },
             "required": ["dataset_name"],
+            "additionalProperties": False,
         },
         func=_list_predictable_properties,
     ))

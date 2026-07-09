@@ -136,6 +136,7 @@ def create_code_tools(registry: ToolRegistry) -> None:
                 },
             },
             "required": ["code"],
+            "additionalProperties": False,
         },
         func=_execute_python,
         requires_approval=True,

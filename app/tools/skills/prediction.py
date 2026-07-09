@@ -160,6 +160,7 @@ PREDICT_SKILL = Skill(
             },
         },
         "required": ["dataset_name"],
+        "additionalProperties": False,
     },
     func=_predict_properties,
     category="prediction",

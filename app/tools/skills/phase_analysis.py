@@ -121,6 +121,7 @@ PHASE_ANALYSIS_SKILL = Skill(
             },
         },
         "required": ["database_name", "components"],
+        "additionalProperties": False,
     },
     func=_analyze_phases,
     category="thermodynamics",
