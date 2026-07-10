@@ -4978,6 +4978,8 @@ fn spawn_agent_turn(
         let mut turn_config = config.as_ref().clone();
         turn_config.auto_approve = auto_approve;
         let profile = profile_for_model(&runtime.llm_config.model);
+        turn_config.core_tools_only =
+            profile.tool_surface == crate::prompt_profile::ToolSurface::CoreSetPlusFind;
         turn_config.system_prompt = system_prompt_for_mode(
             runtime.session_mode,
             &config.system_prompt,
