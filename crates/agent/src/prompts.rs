@@ -28,7 +28,11 @@ pub fn build_system_prompt(interactive: bool) -> String {
 /// for this session. This keeps the prompt aligned with the runtime surface
 /// without dumping the full tool catalog into the prompt itself.
 #[must_use]
-pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> String {
+pub fn append_runtime_tool_guidance(
+    base_prompt: &str,
+    tools: &ToolCatalog,
+    profile: &PromptProfile,
+) -> String {
     let tool_names = tools
         .iter()
         .map(|tool| tool.name.as_str())
@@ -201,14 +205,13 @@ pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> S
         return base_prompt.to_string();
     }
 
-    format!(
-        "{base_prompt}\n\n# Loaded Tool Strategy\n{}",
-        bullets
-            .into_iter()
-            .map(|bullet| format!("- {bullet}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    )
+    let body = bullets
+        .into_iter()
+        .map(|bullet| format!("- {bullet}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let section = render_one_section("Loaded Tool Strategy", &body, profile.structure_style);
+    format!("{base_prompt}\n\n{section}")
 }
 
 fn has_tool(tool_names: &BTreeSet<&str>, name: &str) -> bool {
@@ -601,7 +604,7 @@ mod tests {
             },
         ]);
 
-        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert!(prompt.contains("# Loaded Tool Strategy"));
         assert!(prompt.contains("Treat workflows as the primary orchestration surface"));
         assert!(prompt.contains("agent_capabilities"));
@@ -640,7 +643,7 @@ mod tests {
             },
         ]);
 
-        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert!(prompt.contains("Use node tools to inspect local capability"));
         assert!(prompt.contains("Use marketplace tools"));
     }
@@ -648,7 +651,7 @@ mod tests {
     #[test]
     fn runtime_guidance_stays_empty_for_empty_catalog() {
         let catalog = ToolCatalog::default();
-        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert_eq!(prompt, SYSTEM_PROMPT);
     }
 
@@ -665,7 +668,7 @@ mod tests {
             source_detail: Some("atlas".to_string()),
         }]);
 
-        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert!(prompt.contains("external MCP servers"));
     }
 }

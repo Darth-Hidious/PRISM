@@ -36,7 +36,8 @@ use crate::hooks::{HookRegistry, build_default_hooks};
 use crate::permissions::{
     PermissionMode, PermissionOverrides, SharedPermissionOverrides, ToolPermissionContext,
 };
-use crate::prompts::{append_runtime_tool_guidance, build_system_prompt};
+use crate::prompt_profile::{profile_for_model, PromptProfile};
+use crate::prompts::{append_runtime_tool_guidance, build_system_prompt, render_system_prompt};
 use crate::scratchpad::Scratchpad;
 use crate::session::{RuntimeSessionState, SessionStore};
 use crate::tool_catalog::ToolCatalog;
@@ -1567,8 +1568,13 @@ fn system_prompt_for_mode(
     base_prompt: &str,
     plan_state: &PlanRuntimeState,
     tools: &ToolCatalog,
+    profile: &PromptProfile,
 ) -> String {
-    let base_prompt = append_runtime_tool_guidance(base_prompt, tools);
+    // Render the canonical base in this model's structure style, then append
+    // tool guidance in the same style. Resolving the profile per turn (from the
+    // live model) means /model switches re-shape the prompt for free.
+    let rendered_base = render_system_prompt(base_prompt, profile);
+    let base_prompt = append_runtime_tool_guidance(&rendered_base, tools, profile);
     match mode {
         SessionMode::Chat => {
             if let Some(approved_plan) = &plan_state.approved_plan_body {
@@ -4971,11 +4977,13 @@ fn spawn_agent_turn(
         let llm = LlmClient::new(runtime.llm_config.clone());
         let mut turn_config = config.as_ref().clone();
         turn_config.auto_approve = auto_approve;
+        let profile = profile_for_model(&runtime.llm_config.model);
         turn_config.system_prompt = system_prompt_for_mode(
             runtime.session_mode,
             &config.system_prompt,
             &runtime.plan_state,
             tools.as_ref(),
+            &profile,
         );
 
         let turn_result = agent_loop::run_turn(
@@ -5601,8 +5609,14 @@ async fn handle_command(
             Ok(true)
         }
         "/context" => {
-            let system_prompt =
-                system_prompt_for_mode(*session_mode, &config.system_prompt, plan_state, tools);
+            let profile = profile_for_model(&llm_config.model);
+            let system_prompt = system_prompt_for_mode(
+                *session_mode,
+                &config.system_prompt,
+                plan_state,
+                tools,
+                &profile,
+            );
             emit_context_screen(
                 slash_ctx,
                 session_store,
