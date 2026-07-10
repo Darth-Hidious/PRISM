@@ -49,6 +49,11 @@ jobs:
       # freshly wiped target — same race documented on the audit job below.
       # rust-cache still caches target/, so builds stay warm without it.
       RUSTC_WRAPPER: ""
+      # Runner slots share one work folder, and rust-cache's post-job prune
+      # in one workflow deletes files under the OTHER workflow's live build
+      # ("could not parse/generate dep info: No such file or directory").
+      # A per-workflow target dir removes the sharing entirely.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-backbone
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (rdkafka needs libcurl)
