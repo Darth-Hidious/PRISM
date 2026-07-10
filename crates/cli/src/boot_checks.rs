@@ -110,13 +110,7 @@ pub async fn run_boot_checks(
             .send()
             .await
             .ok()
-            .and_then(|r| {
-                if r.status().is_success() {
-                    Some(r)
-                } else {
-                    None
-                }
-            });
+            .filter(|r| r.status().is_success());
         let (kg_ok, kg_msg) = if let Some(resp) = stats {
             let data: serde_json::Value = resp.json().await.unwrap_or_default();
             let nodes = data.get("node_count").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -151,13 +145,7 @@ pub async fn run_boot_checks(
                 .send()
                 .await
                 .ok()
-                .and_then(|r| {
-                    if r.status().is_success() {
-                        Some(r)
-                    } else {
-                        None
-                    }
-                });
+                .filter(|r| r.status().is_success());
             let (m_ok, m_msg) = if let Some(resp) = models {
                 let data: serde_json::Value = resp.json().await.unwrap_or_default();
                 let count = if let Some(arr) = data.as_array() {
@@ -190,13 +178,7 @@ pub async fn run_boot_checks(
             .send()
             .await
             .ok()
-            .and_then(|r| {
-                if r.status().is_success() {
-                    Some(r)
-                } else {
-                    None
-                }
-            });
+            .filter(|r| r.status().is_success());
         let (c_ok, c_msg) = if let Some(resp) = gpus {
             let data: serde_json::Value = resp.json().await.unwrap_or_default();
             let count = data.as_array().map(|a| a.len()).unwrap_or(0);
@@ -221,13 +203,7 @@ pub async fn run_boot_checks(
             .send()
             .await
             .ok()
-            .and_then(|r| {
-                if r.status().is_success() {
-                    Some(r)
-                } else {
-                    None
-                }
-            });
+            .filter(|r| r.status().is_success());
         let (mk_ok, mk_msg) = if let Some(resp) = mkt {
             let data: serde_json::Value = resp.json().await.unwrap_or_default();
             let count = data.as_array().map(|a| a.len()).unwrap_or(0);
