@@ -14,6 +14,11 @@
 //! transport, and the proxy normalizes the system role. Do not re-add it
 //! speculatively.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use serde::Deserialize;
+
 use crate::models::get_model_config;
 
 /// How the rendered system prompt delimits its sections.
@@ -152,9 +157,22 @@ fn classify(model_id: &str, provider: &str) -> Family {
     }
 }
 
-/// Resolve the [`PromptProfile`] for a model id.
+/// Resolve the [`PromptProfile`] for a model id: the code default, with any
+/// matching overrides from `~/.prism/prompt_profiles.toml` applied on top.
 #[must_use]
 pub fn profile_for_model(model_id: &str) -> PromptProfile {
+    let mut profile = default_profile_for_model(model_id);
+    for (pattern, ov) in loaded_overrides() {
+        if glob_matches(pattern, model_id) {
+            ov.apply_to(&mut profile);
+        }
+    }
+    profile
+}
+
+/// The code-default profile for a model, before any TOML overrides.
+#[must_use]
+fn default_profile_for_model(model_id: &str) -> PromptProfile {
     let cfg = get_model_config(model_id);
     let family = classify(model_id, cfg.provider);
 
@@ -181,6 +199,120 @@ pub fn profile_for_model(model_id: &str) -> PromptProfile {
         reasoning_invocation,
         max_tokens_policy: MaxTokensPolicy::ModelMax,
     }
+}
+
+// ---------------------------------------------------------------------------
+// TOML override layer — ~/.prism/prompt_profiles.toml (owner: code defaults +
+// TOML override). Per-model / per-glob overrides merged over the code defaults.
+// A missing or malformed file is never fatal: it degrades to defaults with one
+// warning. Schema:
+//
+//   [profiles."glm-*"]        # exact id, or a trailing-`*` prefix glob
+//   structure  = "plain"      # xml | markdown | plain
+//   length     = "compact"    # full | compact
+//   tools      = "core"       # all | core
+//   reasoning  = "cot"        # native | cot | none
+//   max_tokens = 8192         # optional hard output cap; omit for model max
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ProfileOverride {
+    structure: Option<String>,
+    length: Option<String>,
+    tools: Option<String>,
+    reasoning: Option<String>,
+    max_tokens: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProfileOverridesFile {
+    #[serde(default)]
+    profiles: HashMap<String, ProfileOverride>,
+}
+
+impl ProfileOverride {
+    /// Apply the set fields over `profile`. Unset fields and unrecognized enum
+    /// values leave the corresponding dial untouched.
+    fn apply_to(&self, profile: &mut PromptProfile) {
+        if let Some(v) = self.structure.as_deref().and_then(parse_structure) {
+            profile.structure_style = v;
+        }
+        if let Some(v) = self.length.as_deref().and_then(parse_length) {
+            profile.length_budget = v;
+        }
+        if let Some(v) = self.tools.as_deref().and_then(parse_tools) {
+            profile.tool_surface = v;
+        }
+        if let Some(v) = self.reasoning.as_deref().and_then(parse_reasoning) {
+            profile.reasoning_invocation = v;
+        }
+        if let Some(n) = self.max_tokens {
+            profile.max_tokens_policy = MaxTokensPolicy::Capped(n);
+        }
+    }
+}
+
+fn parse_structure(s: &str) -> Option<StructureStyle> {
+    match s.to_ascii_lowercase().as_str() {
+        "xml" | "xmltags" => Some(StructureStyle::XmlTags),
+        "markdown" | "md" => Some(StructureStyle::MarkdownHeaders),
+        "plain" | "plainimperative" => Some(StructureStyle::PlainImperative),
+        _ => None,
+    }
+}
+
+fn parse_length(s: &str) -> Option<LengthBudget> {
+    match s.to_ascii_lowercase().as_str() {
+        "full" => Some(LengthBudget::Full),
+        "compact" => Some(LengthBudget::Compact),
+        _ => None,
+    }
+}
+
+fn parse_tools(s: &str) -> Option<ToolSurface> {
+    match s.to_ascii_lowercase().as_str() {
+        "all" => Some(ToolSurface::All),
+        "core" | "coresetplusfind" => Some(ToolSurface::CoreSetPlusFind),
+        _ => None,
+    }
+}
+
+fn parse_reasoning(s: &str) -> Option<ReasoningMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "native" | "nativethinking" => Some(ReasoningMode::NativeThinking),
+        "cot" | "promptedcot" => Some(ReasoningMode::PromptedCoT),
+        "none" => Some(ReasoningMode::None),
+        _ => None,
+    }
+}
+
+/// `glm-*` matches by prefix; anything else must equal the model id exactly.
+fn glob_matches(pattern: &str, model_id: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => model_id.starts_with(prefix),
+        None => pattern == model_id,
+    }
+}
+
+/// Overrides parsed once and cached. Missing file → empty. Malformed file →
+/// empty + one warning (never fatal).
+fn loaded_overrides() -> &'static Vec<(String, ProfileOverride)> {
+    static OVERRIDES: OnceLock<Vec<(String, ProfileOverride)>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| {
+        let Some(path) = dirs::home_dir().map(|h| h.join(".prism/prompt_profiles.toml")) else {
+            return Vec::new();
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        match toml::from_str::<ProfileOverridesFile>(&raw) {
+            Ok(file) => file.profiles.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!("ignoring malformed ~/.prism/prompt_profiles.toml: {e}");
+                Vec::new()
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -253,5 +385,55 @@ mod tests {
     fn core_tool_set_includes_find_tools() {
         assert!(CORE_TOOL_SET.contains(&"find_tools"));
         assert!(CORE_TOOL_SET.contains(&"read_file"));
+    }
+
+    #[test]
+    fn glob_matches_prefix_and_exact() {
+        assert!(glob_matches("glm-*", "glm-5"));
+        assert!(glob_matches("glm-*", "glm-4.5-air"));
+        assert!(!glob_matches("glm-*", "gpt-5"));
+        assert!(glob_matches("gpt-5", "gpt-5"));
+        assert!(!glob_matches("gpt-5", "gpt-5-mini"));
+    }
+
+    #[test]
+    fn override_from_toml_applies_over_default() {
+        // A user forcing a capable model into the compact/core regime.
+        let file: ProfileOverridesFile = toml::from_str(
+            r#"
+            [profiles."gpt-5"]
+            length = "compact"
+            tools = "core"
+            reasoning = "cot"
+            max_tokens = 8192
+            "#,
+        )
+        .unwrap();
+        let ov = &file.profiles["gpt-5"];
+
+        let mut profile = default_profile_for_model("gpt-5");
+        assert_eq!(profile.length_budget, LengthBudget::Full); // baseline
+        ov.apply_to(&mut profile);
+
+        assert_eq!(profile.length_budget, LengthBudget::Compact);
+        assert_eq!(profile.tool_surface, ToolSurface::CoreSetPlusFind);
+        assert_eq!(profile.reasoning_invocation, ReasoningMode::PromptedCoT);
+        assert_eq!(profile.max_tokens_policy, MaxTokensPolicy::Capped(8192));
+        // Unset dial (structure) is untouched — gpt-5 stays Markdown.
+        assert_eq!(profile.structure_style, StructureStyle::MarkdownHeaders);
+    }
+
+    #[test]
+    fn override_ignores_unknown_enum_values() {
+        let ov = ProfileOverride {
+            structure: Some("nonsense".into()),
+            length: Some("compact".into()),
+            ..Default::default()
+        };
+        let mut profile = default_profile_for_model("gpt-5");
+        ov.apply_to(&mut profile);
+        // Bad value ignored; the valid one still applies.
+        assert_eq!(profile.structure_style, StructureStyle::MarkdownHeaders);
+        assert_eq!(profile.length_budget, LengthBudget::Compact);
     }
 }
