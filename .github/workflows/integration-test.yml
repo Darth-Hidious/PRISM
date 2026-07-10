@@ -36,6 +36,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "2"
       RUSTC_WRAPPER: ""
+      # Per-workflow target dir: rust-cache's post-job prune in the sibling
+      # workflow otherwise deletes files under this job's live build.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-integration
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (rdkafka needs libcurl)
@@ -141,6 +144,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_BUILD_JOBS: "2"
       RUSTC_WRAPPER: ""
+      # Same dir as rust-tests (safe: needs:[rust-tests] serializes them);
+      # isolated from the backbone workflow's prune.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-integration
     services:
       neo4j:
         image: neo4j:5-community
@@ -193,7 +199,7 @@ jobs:
 
       - name: Test schema-only ingest
         run: |
-          ./target/debug/prism ingest tests/data/refractory_heas.csv --schema-only 2>&1 | tee /tmp/schema.out
+          "$CARGO_TARGET_DIR"/debug/prism ingest tests/data/refractory_heas.csv --schema-only 2>&1 | tee /tmp/schema.out
           grep -q "15 columns, 10 rows" /tmp/schema.out
 
       - name: Test Cypher query
@@ -203,12 +209,12 @@ jobs:
             http://localhost:7474/db/neo4j/tx/commit \
             -d '{"statements": [{"statement": "CREATE (a:Alloy {name: \"TestAlloy\"})-[:CONTAINS {weight: 0.5}]->(e:Element {name: \"Fe\"})"}]}'
 
-          ./target/debug/prism query --cypher "MATCH (a:Alloy) RETURN a.name AS name" 2>&1 | tee /tmp/cypher.out
+          "$CARGO_TARGET_DIR"/debug/prism query --cypher "MATCH (a:Alloy) RETURN a.name AS name" 2>&1 | tee /tmp/cypher.out
           grep -q "TestAlloy" /tmp/cypher.out
 
       - name: Test graph neighbor query
         run: |
-          ./target/debug/prism query "TestAlloy" 2>&1 | tee /tmp/graph.out
+          "$CARGO_TARGET_DIR"/debug/prism query "TestAlloy" 2>&1 | tee /tmp/graph.out
           grep -q "Fe" /tmp/graph.out
 
       - name: Test version flag
@@ -220,11 +226,11 @@ jobs:
           expected=$(grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml \
             | head -1 | sed -E 's/version = "([^"]+)"/\1/')
           echo "Expecting: prism $expected"
-          ./target/debug/prism --version 2>&1 | grep -F "prism $expected"
+          "$CARGO_TARGET_DIR"/debug/prism --version 2>&1 | grep -F "prism $expected"
 
       - name: Test node probe
         run: |
-          ./target/debug/prism node probe 2>&1 | python3 -c "
+          "$CARGO_TARGET_DIR"/debug/prism node probe 2>&1 | python3 -c "
           import sys, json
           d = json.load(sys.stdin)
           assert d['cpu_cores'] > 0
@@ -233,9 +239,9 @@ jobs:
           "
 
       - name: Test workflow list
-        run: ./target/debug/prism workflow list 2>&1 | grep "forge"
+        run: "$CARGO_TARGET_DIR"/debug/prism workflow list 2>&1 | grep "forge"
 
       - name: Test error handling
         run: |
-          ./target/debug/prism ingest /nonexistent.csv 2>&1 | grep -q "not found"
+          "$CARGO_TARGET_DIR"/debug/prism ingest /nonexistent.csv 2>&1 | grep -q "not found"
           echo "PASS: missing file error"
