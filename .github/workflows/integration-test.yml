@@ -25,6 +25,17 @@ jobs:
   rust-tests:
     name: Rust Unit Tests
     runs-on: [self-hosted, linux, ARM64]
+    env:
+      # The 15G runner OOM-kills `ld` (signal 9). Step-level debug=0 wasn't
+      # enough: the v1 cache still held debuginfo-fat rlibs, and parallel
+      # links stacked several multi-GB `ld`s. Job-wide debug=0 + jobs=2 +
+      # a v2 cache bust keep peak linker memory bounded. RUSTC_WRAPPER=""
+      # bypasses the runner's global sccache, whose /tmp race loses .d
+      # files mid-compile ("could not parse/generate dep info").
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (rdkafka needs libcurl)
@@ -37,7 +48,7 @@ jobs:
           # Bump suffix to invalidate cache after the runner cargo config
           # changed (mold removed in favor of default ld + debuginfo=1).
           # Self-hosted target dirs otherwise persist stale link-args.
-          prefix-key: "v1-rust-linker-fallback-no-mold"
+          prefix-key: "v2-rust-debuginfo0-jobs2"
           # Self-hosted runner shares CARGO_HOME across jobs. rust-cache's
           # default post-cleanup wipes ~/.cargo/bin to reduce cache size,
           # which deletes pre-installed cargo-audit and similar binaries.
@@ -46,9 +57,9 @@ jobs:
           cache-bin: "false"
       - name: Reset poisoned target dir (one-shot via runner-local sentinel)
         run: |
-          SENTINEL=$HOME/.cache/prism-runner-cache-bust-v1-no-mold
+          SENTINEL=$HOME/.cache/prism-runner-cache-bust-v2-integration
           if [ ! -f "$SENTINEL" ]; then
-            echo "Cache-bust v1: wiping target/ once for this runner"
+            echo "Cache-bust v2: wiping target/ once for this runner"
             rm -rf target
             mkdir -p "$HOME/.cache"
             touch "$SENTINEL"
@@ -124,6 +135,12 @@ jobs:
     # the python worker had spawned), so the underlying CI infra fix
     # is still validated.
     continue-on-error: true
+    env:
+      # Same linker-memory caps as rust-tests: this job links the full
+      # `prism` binary on the same 15G box.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
+      RUSTC_WRAPPER: ""
     services:
       neo4j:
         image: neo4j:5-community
@@ -162,7 +179,7 @@ jobs:
         with:
           # Match the other self-hosted rust-cache calls in this file
           # so the shared ~/.cargo/bin doesn't get wiped between jobs.
-          prefix-key: "v1-rust-linker-fallback-no-mold"
+          prefix-key: "v2-rust-debuginfo0-jobs2"
           cache-bin: "false"
 
       - name: Build CLI binary
