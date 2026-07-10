@@ -51,6 +51,11 @@ fn default_timeout_secs() -> u64 {
     300
 }
 
+/// Tokens kept free between the estimated prompt and the context window, so a
+/// requested `max_tokens` can never overrun the input. Feeds the client-side
+/// output clamp ([`LlmClient::effective_max_tokens`]).
+const CONTEXT_MARGIN_TOKENS: u64 = 1024;
+
 impl Default for LlmConfig {
     fn default() -> Self {
         // These are fallback defaults only — real values come from prism.toml
@@ -256,7 +261,7 @@ impl LlmClient {
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.configured_max_tokens(),
+            "max_tokens": self.effective_max_tokens(Self::estimate_tokens(&messages)),
         });
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
@@ -271,9 +276,9 @@ impl LlmClient {
             "messages": messages,
             // Was previously omitted entirely, letting the platform generate
             // unbounded output (thousands of tokens observed) on every call —
-            // real, billed credits with no cap. Send the same configured
+            // real, billed credits with no cap. Send the same context-clamped
             // budget every other chat path uses.
-            "max_tokens": self.configured_max_tokens(),
+            "max_tokens": self.effective_max_tokens(Self::estimate_tokens(messages)),
         });
         let resp = self.post(&url, &body).await?;
         let text = resp.text().await.context("failed to read MARC27 stream")?;
@@ -322,11 +327,13 @@ impl LlmClient {
         }
         let url = self.chat_completions_url();
 
+        let est = Self::estimate_tokens(&serde_json::to_value(messages).unwrap_or_default())
+            + Self::estimate_tokens(&serde_json::to_value(tools).unwrap_or_default());
         let mut body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.configured_max_tokens(),
+            "max_tokens": self.effective_max_tokens(est),
         });
 
         if !tools.is_empty() {
@@ -373,8 +380,30 @@ impl LlmClient {
     /// model needs more (or less) room than a hardcoded 4096. Falls back to
     /// 4096 only when the config doesn't carry a value (e.g. local llama.cpp
     /// with no catalog entry).
-    fn configured_max_tokens(&self) -> u64 {
-        self.config.max_output_tokens.unwrap_or(4096)
+    fn effective_max_tokens(&self, est_prompt_tokens: u64) -> u64 {
+        const FLOOR: u64 = 256;
+        let model_max = self.config.max_output_tokens.unwrap_or(4096);
+        // Clamp the requested output so it can never collide with the input:
+        // context_window − estimated prompt − margin. When the context window is
+        // unknown (local models), only the configured max applies. Unknown/local
+        // models also have no catalog max_output_tokens, so they naturally floor
+        // at 4096 — the same ceiling the compact profile's Capped(4096) would set,
+        // which is why no per-profile cap needs plumbing across the crate boundary.
+        let by_context = match self.config.context_window {
+            Some(cw) => cw
+                .saturating_sub(est_prompt_tokens)
+                .saturating_sub(CONTEXT_MARGIN_TOKENS),
+            None => model_max,
+        };
+        model_max.min(by_context).max(FLOOR)
+    }
+
+    /// Rough prompt-token estimate for a serialized request value (~4 chars per
+    /// token). Only feeds the [`Self::effective_max_tokens`] safety clamp, so a
+    /// slight under-count is harmless — the margin and the server-side clamp
+    /// absorb the slack.
+    fn estimate_tokens(value: &serde_json::Value) -> u64 {
+        value.to_string().len() as u64 / 4
     }
 
     /// Extract strict JSON output from a chat-completions choice.
@@ -427,7 +456,7 @@ impl LlmClient {
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
-            "max_tokens": self.configured_max_tokens(),
+            "max_tokens": self.effective_max_tokens(prompt.len() as u64 / 4),
             "response_format": {"type": "json_object"},
         });
         let resp = self.post(&url, &body).await?;
@@ -563,13 +592,16 @@ impl LlmClient {
                 }
             }
 
+            // Estimate before the body moves `aug_messages` into the request.
+            let est: u64 =
+                aug_messages.iter().map(|m| m.to_string().len() as u64).sum::<u64>() / 4;
             let body = serde_json::json!({
                 "model": self.config.model,
                 "messages": aug_messages,
                 // Same fix as chat_marc27_simple: this path previously sent
                 // no cap at all, so a tool-calling turn could generate an
                 // unbounded (and unbounded-billed) response.
-                "max_tokens": self.configured_max_tokens(),
+                "max_tokens": self.effective_max_tokens(est),
             });
             // Use a direct request (not the retry-wrapper post()) so we control headers
             let mut req = self
@@ -698,11 +730,13 @@ impl LlmClient {
         }
         let url = self.chat_completions_url();
 
+        let est = Self::estimate_tokens(&serde_json::to_value(messages).unwrap_or_default())
+            + Self::estimate_tokens(&serde_json::to_value(tools).unwrap_or_default());
         let mut body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.configured_max_tokens(),
+            "max_tokens": self.effective_max_tokens(est),
             "stream": true,
         });
 
@@ -1418,19 +1452,44 @@ mod tests {
     }
 
     #[test]
-    fn configured_max_tokens_defaults_to_4096() {
+    fn effective_max_tokens_defaults_to_4096() {
+        // No catalog max + unknown context (local model) → conservative 4096.
         let client = LlmClient::new(LlmConfig::default());
-        assert_eq!(client.configured_max_tokens(), 4096);
+        assert_eq!(client.effective_max_tokens(0), 4096);
     }
 
     #[test]
-    fn configured_max_tokens_honors_config() {
+    fn effective_max_tokens_honors_config_when_context_roomy() {
         let config = LlmConfig {
             max_output_tokens: Some(16_384),
+            context_window: Some(200_000),
             ..Default::default()
         };
         let client = LlmClient::new(config);
-        assert_eq!(client.configured_max_tokens(), 16_384);
+        // Small prompt, huge context → the model max is the binding limit.
+        assert_eq!(client.effective_max_tokens(1_000), 16_384);
+    }
+
+    #[test]
+    fn effective_max_tokens_clamps_to_context_remaining() {
+        // gpt-5-shaped: 128k max output but only 400k context. A 396k-token
+        // prompt leaves far less than 128k of room — the clamp must bind, and
+        // never exceed context − prompt − margin, nor drop below the floor.
+        let config = LlmConfig {
+            max_output_tokens: Some(128_000),
+            context_window: Some(400_000),
+            ..Default::default()
+        };
+        let client = LlmClient::new(config);
+
+        // Roomy prompt: model max binds.
+        assert_eq!(client.effective_max_tokens(10_000), 128_000);
+
+        // Tight prompt: context binds. 400k − 396k − 1024 margin = 2976.
+        assert_eq!(client.effective_max_tokens(396_000), 400_000 - 396_000 - 1024);
+
+        // Prompt bigger than the whole window: never underflows, floors at 256.
+        assert_eq!(client.effective_max_tokens(500_000), 256);
     }
 
     #[test]
