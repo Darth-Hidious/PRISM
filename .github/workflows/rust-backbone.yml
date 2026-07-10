@@ -38,6 +38,12 @@ jobs:
   lint-and-test:
     name: Rust Lint And Test
     runs-on: [self-hosted, linux, ARM64]
+    env:
+      # The 15G runner OOM-kills `ld` (signal 9) linking debuginfo'd test
+      # binaries (prism-agent + polars). CI clippy/tests don't need debuginfo,
+      # and capping build jobs bounds concurrent linker memory.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (rdkafka needs libcurl)
@@ -53,7 +59,7 @@ jobs:
           # changes (e.g. mold linker flag added/removed). The persistent
           # target dir on a self-hosted runner can otherwise carry stale
           # link-args baked into crate fingerprints across runs.
-          prefix-key: "v1-rust-linker-fallback-no-mold"
+          prefix-key: "v2-rust-debuginfo0-jobs2"
           # Self-hosted runner shares CARGO_HOME across jobs. rust-cache's
           # default post-cleanup wipes ~/.cargo/bin to reduce cache size,
           # which deletes pre-installed cargo-audit and similar binaries.
@@ -62,9 +68,9 @@ jobs:
           cache-bin: "false"
       - name: Reset poisoned target dir (one-shot via runner-local sentinel)
         run: |
-          SENTINEL=$HOME/.cache/prism-runner-cache-bust-v1-no-mold
+          SENTINEL=$HOME/.cache/prism-runner-cache-bust-v2-debuginfo0
           if [ ! -f "$SENTINEL" ]; then
-            echo "Cache-bust v1: wiping target/ once for this runner"
+            echo "Cache-bust v2: wiping target/ once for this runner"
             rm -rf target
             mkdir -p "$HOME/.cache"
             touch "$SENTINEL"
