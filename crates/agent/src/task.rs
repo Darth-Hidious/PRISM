@@ -516,7 +516,10 @@ mod tests {
         assert!(!task.artifacts.iter().any(|a| a.id == "prov:0"));
         assert!(!task.notes.iter().any(|n| n == "note 0"));
         // ...the most recent survive.
-        assert_eq!(task.artifacts.last().unwrap().id, format!("prov:{}", total - 1));
+        assert_eq!(
+            task.artifacts.last().unwrap().id,
+            format!("prov:{}", total - 1)
+        );
         assert_eq!(task.notes.last().unwrap(), &format!("note {}", total - 1));
     }
 

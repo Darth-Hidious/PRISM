@@ -98,12 +98,9 @@ impl ToolCatalog {
             // tool server) but surface the gap loudly — a description-less or
             // schema-less tool silently degrades model selection/arg-filling.
             let schema_present = tool.get("input_schema").is_some();
-            let input_schema = tool
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(
-                    || json!({ "type": "object", "properties": {}, "additionalProperties": false }),
-                );
+            let input_schema = tool.get("input_schema").cloned().unwrap_or_else(
+                || json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            );
             if !schema_present {
                 tracing::warn!(
                     tool = %name,
