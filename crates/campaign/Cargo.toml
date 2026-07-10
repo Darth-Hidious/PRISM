@@ -20,3 +20,6 @@ prism-workflows = { path = "../workflows" }
 prism-provenance = { path = "../provenance" }
 prism-llm = { path = "../llm" }
 reqwest.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

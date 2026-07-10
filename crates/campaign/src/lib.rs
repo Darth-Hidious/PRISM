@@ -161,11 +161,26 @@ pub struct Candidate {
 pub struct CampaignState {
     /// Unique campaign ID.
     pub campaign_id: String,
-    /// The goal being pursued.
+    /// The goal being pursued (materials campaigns). For research campaigns
+    /// (`kind == Research`) this carries the description only; the research
+    /// goal lives in `research_goal`.
     pub goal: CampaignGoal,
     /// The config (immutable for a given campaign).
     pub config: CampaignConfig,
+    /// What kind of campaign this is — determines the iteration body.
+    /// Defaults to Materials so existing checkpoints deserialize unchanged.
+    #[serde(default)]
+    pub kind: CampaignGoalKind,
+    /// The research goal (only set when `kind == Research`). None for
+    /// materials campaigns.
+    #[serde(default)]
+    pub research_goal: Option<ResearchCampaignGoal>,
+    /// Accumulated research outcomes (only used when `kind == Research`).
+    /// The materials analogue is `candidates`.
+    #[serde(default)]
+    pub research_outcomes: Vec<ResearchIterationOutcome>,
     /// All candidates evaluated so far, ranked by reward (best first).
+    /// (Materials campaigns only.)
     pub candidates: Vec<Candidate>,
     /// Current iteration number (0-based).
     pub current_iteration: usize,
@@ -191,6 +206,43 @@ impl CampaignState {
             campaign_id,
             goal,
             config,
+            kind: CampaignGoalKind::Materials,
+            research_goal: None,
+            research_outcomes: Vec::new(),
+            candidates: Vec::new(),
+            current_iteration: 0,
+            total_cost_usd: 0.0,
+            paused: false,
+            completed: false,
+            completion_reason: String::new(),
+            started_at: Utc::now().to_rfc3339(),
+            last_checkpoint_at: String::new(),
+        }
+    }
+
+    /// Create a research-campaign state. The `goal` field is synthesized from
+    /// the research objective (so materials-shaped result/summary paths still
+    /// have a description); the real goal lives in `research_goal`.
+    #[must_use]
+    pub fn new_research(
+        campaign_id: String,
+        research_goal: ResearchCampaignGoal,
+        config: CampaignConfig,
+    ) -> Self {
+        let materials_goal = CampaignGoal {
+            description: research_goal.objective.clone(),
+            elements: Vec::new(),
+            objective: String::new(),
+            constraints: Vec::new(),
+            seeds: Vec::new(),
+        };
+        Self {
+            campaign_id,
+            goal: materials_goal,
+            config,
+            kind: CampaignGoalKind::Research,
+            research_goal: Some(research_goal),
+            research_outcomes: Vec::new(),
             candidates: Vec::new(),
             current_iteration: 0,
             total_cost_usd: 0.0,
@@ -368,6 +420,27 @@ impl Campaign {
         }
     }
 
+    /// Create a new RESEARCH campaign with the given research goal + config.
+    /// The iteration body is supplied externally via [`run_research`] (an
+    /// executor implementing [`ResearchIterationExecutor`]).
+    pub fn new_research(
+        research_goal: ResearchCampaignGoal,
+        config: CampaignConfig,
+        campaign_id: String,
+    ) -> Self {
+        let checkpoint_dir = config.checkpoint_dir.clone().unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            PathBuf::from(home).join(".prism").join("campaigns")
+        });
+        let checkpoint_path = checkpoint_dir.join(format!("{campaign_id}.json"));
+
+        Self {
+            state: CampaignState::new_research(campaign_id, research_goal, config),
+            provenance: None,
+            checkpoint_path,
+        }
+    }
+
     /// Resume a campaign from a checkpoint file.
     pub fn from_checkpoint(path: &std::path::Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -520,6 +593,202 @@ impl Campaign {
             "campaign resumed from approval gate"
         );
         self.run().await
+    }
+
+    /// Run a RESEARCH campaign: the same durable loop (budget / iteration cap /
+    /// approval gate / checkpoint / provenance) as materials `run`, but each
+    /// iteration is driven by an external [`ResearchIterationExecutor`] (the
+    /// agent layer's `AgentResearchExecutor`, which runs a `run_turn` against
+    /// the research goal). The campaign completes when the executor reports
+    /// `progress >= 1.0` (success criteria met) OR the caps are hit.
+    ///
+    /// Reuses the materials loop's invariants (LONG_RESEARCH_PLAN): no
+    /// blocking calls inside the loop, the checkpoint is the truth, honest
+    /// degradation. The materials `run` path is untouched.
+    pub async fn run_research(
+        &mut self,
+        executor: &dyn ResearchIterationExecutor,
+    ) -> Result<CampaignResult> {
+        let research_goal = self
+            .state
+            .research_goal
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("run_research called on a non-research campaign"))?;
+
+        info!(
+            campaign = %self.state.campaign_id,
+            objective = %research_goal.objective,
+            max_iterations = self.state.config.max_iterations,
+            "research campaign started"
+        );
+
+        self.record_event(
+            "campaign.start",
+            serde_json::json!({
+                "kind": "research",
+                "objective": research_goal.objective,
+                "constraints": research_goal.constraints,
+                "success_criteria": research_goal.success_criteria,
+            }),
+        )
+        .await;
+
+        while !self.state.completed && !self.state.paused {
+            // Iteration cap.
+            if self.state.current_iteration >= self.state.config.max_iterations {
+                self.state.completed = true;
+                self.state.completion_reason = "iteration_limit".into();
+                info!(campaign = %self.state.campaign_id, "research campaign hit iteration limit");
+                break;
+            }
+            // Budget cap.
+            if let Some(budget) = self.state.config.budget_usd
+                && self.state.total_cost_usd >= budget
+            {
+                self.state.completed = true;
+                self.state.completion_reason = "budget_exhausted".into();
+                info!(campaign = %self.state.campaign_id, "research campaign hit budget limit");
+                break;
+            }
+            // Approval gate.
+            let iter = self.state.current_iteration;
+            if self.state.config.approval_gate_at.contains(&iter) && iter > 0 {
+                self.state.paused = true;
+                self.checkpoint()?;
+                break;
+            }
+
+            // Build the running context from accumulated outcomes.
+            let (prior_artifacts, prior_notes) = self.accumulated_research_state();
+            let context = ResearchIterationContext {
+                iteration: iter,
+                artifact_refs: prior_artifacts,
+                notes: prior_notes,
+            };
+
+            // Drive one research turn via the executor.
+            let outcome = executor.execute_iteration(&research_goal, &context).await?;
+            info!(
+                campaign = %self.state.campaign_id,
+                iteration = iter,
+                progress = outcome.progress,
+                summary = %outcome.summary,
+                "research iteration complete"
+            );
+
+            self.record_event(
+                "campaign.research.iter",
+                serde_json::json!({
+                    "iteration": iter,
+                    "summary": outcome.summary,
+                    "progress": outcome.progress,
+                    "artifacts": outcome.artifact_refs,
+                    "notes": outcome.notes,
+                }),
+            )
+            .await;
+
+            self.state.research_outcomes.push(outcome.clone());
+            self.state.current_iteration = iter + 1;
+
+            // Success-criteria completion: the executor signalled done.
+            if outcome.progress >= 1.0 {
+                self.state.completed = true;
+                self.state.completion_reason = "success_criteria_met".into();
+                info!(
+                    campaign = %self.state.campaign_id,
+                    "research campaign completed: success criteria met"
+                );
+            }
+
+            // Periodic checkpoint.
+            if self.state.config.checkpoint_every > 0
+                && iter > 0
+                && iter.is_multiple_of(self.state.config.checkpoint_every)
+            {
+                self.checkpoint()?;
+            }
+        }
+
+        if self.state.completed {
+            self.record_event(
+                "campaign.complete",
+                serde_json::json!({
+                    "reason": self.state.completion_reason,
+                    "iterations": self.state.current_iteration,
+                    "research_steps": self.state.research_outcomes.len(),
+                }),
+            )
+            .await;
+        }
+
+        self.checkpoint()?;
+
+        // Build a research-shaped result. winners/candidates are empty (those
+        // are materials concepts); the research summary + artifact refs live
+        // in `state.research_outcomes` and the summary string.
+        let summary = self.build_research_summary();
+        let provenance = if let Some(ref prov) = self.provenance {
+            prov.query_by_session(&self.state.campaign_id)
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        Ok(CampaignResult {
+            campaign_id: self.state.campaign_id.clone(),
+            goal: self.state.goal.clone(),
+            state: self.state.clone(),
+            winners: Vec::new(),
+            summary,
+            provenance,
+        })
+    }
+
+    /// Collect accumulated artifact refs + notes from prior research outcomes.
+    fn accumulated_research_state(&self) -> (Vec<String>, Vec<String>) {
+        let mut artifacts = Vec::new();
+        let mut notes = Vec::new();
+        for o in &self.state.research_outcomes {
+            artifacts.extend(o.artifact_refs.iter().cloned());
+            notes.extend(o.notes.iter().cloned());
+        }
+        (artifacts, notes)
+    }
+
+    /// Build a human-readable summary of a research campaign's progress.
+    fn build_research_summary(&self) -> String {
+        let outcomes = &self.state.research_outcomes;
+        let mut lines = vec![
+            format!("Research campaign: {}", self.state.goal.description),
+            format!("Iterations: {}", self.state.current_iteration),
+            format!("Status: {}", {
+                if self.state.completed {
+                    if self.state.completion_reason == "success_criteria_met" {
+                        "complete (success criteria met)".to_string()
+                    } else {
+                        format!("complete ({})", self.state.completion_reason)
+                    }
+                } else if self.state.paused {
+                    "paused at approval gate".to_string()
+                } else {
+                    "in progress".to_string()
+                }
+            }),
+        ];
+        if !outcomes.is_empty() {
+            lines.push("Steps:".into());
+            for (i, o) in outcomes.iter().enumerate() {
+                lines.push(format!(
+                    "  {}. [progress {:.0}%] {}",
+                    i + 1,
+                    o.progress * 100.0,
+                    o.summary
+                ));
+            }
+        }
+        lines.join("\n")
     }
 
     /// Run a single discovery iteration: propose → evaluate → rank.
@@ -1287,5 +1556,172 @@ mod tests {
             .expect("stub iteration succeeds");
         assert_eq!(outcome.summary, "stub iteration 0");
         assert!((0.0..=1.0).contains(&outcome.progress));
+    }
+
+    // ── run_research: the full research-campaign loop ───────────────────
+
+    /// An executor that reports partial progress for the first N iterations
+    /// then signals completion — simulating a research task that gathers
+    /// findings over several turns then declares success.
+    struct PhasedExecutor {
+        complete_at: usize,
+    }
+    impl ResearchIterationExecutor for PhasedExecutor {
+        fn execute_iteration<'a>(
+            &'a self,
+            _goal: &'a ResearchCampaignGoal,
+            ctx: &'a ResearchIterationContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ResearchIterationOutcome>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let iter = ctx.iteration;
+                let done = iter + 1 >= self.complete_at;
+                Ok(ResearchIterationOutcome {
+                    summary: format!("step {} findings", iter + 1),
+                    artifact_refs: vec![format!("prov:step{iter}")],
+                    progress: if done { 1.0 } else { 0.3 },
+                    notes: vec![format!("note from step {}", iter + 1)],
+                })
+            })
+        }
+    }
+
+    fn research_goal_for_run() -> ResearchCampaignGoal {
+        ResearchCampaignGoal {
+            objective: "Survey refractory HEAs for turbines".into(),
+            constraints: vec![],
+            success_criteria: vec!["cited report".into()],
+        }
+    }
+
+    #[test]
+    fn run_research_completes_when_executor_signals_success() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut config = CampaignConfig {
+            max_iterations: 10,
+            checkpoint_every: 0, // no checkpoint files during the test
+            ..Default::default()
+        };
+        config.checkpoint_dir = Some(temp.path().parent().unwrap().to_path_buf());
+        let mut campaign =
+            Campaign::new_research(research_goal_for_run(), config, "test-research-1".into());
+        // Completes at iteration 3 (0-indexed: iters 0,1,2,3 where 3 is done).
+        let executor = PhasedExecutor { complete_at: 3 };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt
+            .block_on(campaign.run_research(&executor))
+            .expect("research campaign runs");
+
+        assert!(result.state.completed);
+        assert_eq!(result.state.completion_reason, "success_criteria_met");
+        assert_eq!(result.state.research_outcomes.len(), 3);
+        // No materials candidates in a research campaign.
+        assert!(result.winners.is_empty());
+        assert!(result.summary.contains("success criteria met"));
+        // Artifact refs accumulated across iterations.
+        assert!(result.summary.contains("step"));
+    }
+
+    #[test]
+    fn run_research_hits_iteration_cap_without_completion() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut config = CampaignConfig {
+            max_iterations: 2,
+            checkpoint_every: 0,
+            ..Default::default()
+        };
+        config.checkpoint_dir = Some(temp.path().parent().unwrap().to_path_buf());
+        let mut campaign =
+            Campaign::new_research(research_goal_for_run(), config, "test-research-cap".into());
+        // Never completes — progress stays at 0.3 forever.
+        let executor = PhasedExecutor { complete_at: 100 };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt
+            .block_on(campaign.run_research(&executor))
+            .expect("runs to cap");
+
+        assert!(result.state.completed);
+        assert_eq!(result.state.completion_reason, "iteration_limit");
+        assert_eq!(result.state.research_outcomes.len(), 2);
+    }
+
+    #[test]
+    fn run_research_carries_prior_artifacts_into_later_iterations() {
+        // The accumulated_research_state helper must fold prior artifact refs
+        // + notes forward so iteration N sees what iterations 0..N produced.
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut config = CampaignConfig {
+            max_iterations: 3,
+            checkpoint_every: 0,
+            ..Default::default()
+        };
+        config.checkpoint_dir = Some(temp.path().parent().unwrap().to_path_buf());
+        let mut campaign =
+            Campaign::new_research(research_goal_for_run(), config, "test-research-ctx".into());
+
+        // An executor that asserts it sees accumulated prior state.
+        struct AssertingExecutor;
+        impl ResearchIterationExecutor for AssertingExecutor {
+            fn execute_iteration<'a>(
+                &'a self,
+                _goal: &'a ResearchCampaignGoal,
+                ctx: &'a ResearchIterationContext,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ResearchIterationOutcome>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    // Iteration N should see N prior artifact refs + N prior notes.
+                    assert_eq!(
+                        ctx.artifact_refs.len(),
+                        ctx.iteration,
+                        "iter {} should have {} prior artifacts",
+                        ctx.iteration,
+                        ctx.iteration
+                    );
+                    assert_eq!(ctx.notes.len(), ctx.iteration);
+                    Ok(ResearchIterationOutcome {
+                        summary: format!("iter {}", ctx.iteration),
+                        artifact_refs: vec![format!("prov:i{}", ctx.iteration)],
+                        progress: if ctx.iteration >= 2 { 1.0 } else { 0.2 },
+                        notes: vec![format!("note {}", ctx.iteration)],
+                    })
+                })
+            }
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt
+            .block_on(campaign.run_research(&AssertingExecutor))
+            .expect("runs");
+        assert!(result.state.completed);
+        assert_eq!(result.state.completion_reason, "success_criteria_met");
+    }
+
+    #[test]
+    fn research_checkpoint_roundtrip_preserves_outcomes() {
+        // A research campaign's checkpoint must survive save/load (resume).
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut config = CampaignConfig {
+            max_iterations: 5,
+            checkpoint_every: 0,
+            ..Default::default()
+        };
+        let dir = temp.path().parent().unwrap().to_path_buf();
+        config.checkpoint_dir = Some(dir.clone());
+        let mut campaign =
+            Campaign::new_research(research_goal_for_run(), config, "test-research-cp".into());
+        let executor = PhasedExecutor { complete_at: 2 };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _ = rt.block_on(campaign.run_research(&executor)).expect("runs");
+
+        let cp_path = dir.join("test-research-cp.json");
+        let resumed = Campaign::from_checkpoint(&cp_path).expect("checkpoint reloads");
+        assert_eq!(resumed.state.kind, CampaignGoalKind::Research);
+        assert!(resumed.state.research_goal.is_some());
+        assert_eq!(resumed.state.research_outcomes.len(), 2);
+        assert!(resumed.state.completed);
+        std::fs::remove_file(&cp_path).ok();
     }
 }
