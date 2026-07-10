@@ -227,6 +227,11 @@ research task from filling the context in 15 steps (research §4.3).
 
 ### 5.4 Long-running state persists and resumes
 
+> **STATUS: NOT YET WIRED.** The behavior below describes the target design. Today only
+> the types, pure translation functions, and unit tests exist — no code path drives
+> `run_turn(Some(task))` or persists `ResearchTaskContext` to a checkpoint. See
+> [`TOOL_SURFACE_AUDIT.md`](./TOOL_SURFACE_AUDIT.md).
+
 The durable spine is the **campaign checkpoint** (`~/.prism/campaigns/{id}.json`), extended
 for research goals. It holds: goal, plan (steps), plan position, artifact refs, budget /
 iteration caps, approval-gate state. On resume, `run_turn` is re-driven from the

@@ -148,14 +148,18 @@ impl ResearchTaskContext {
         !self.plan.is_empty() && self.plan.iter().all(|s| s.completed)
     }
 
-    /// Record an artifact handle produced this task.
+    /// Record an artifact handle produced this task. Drops the oldest entries
+    /// beyond `MAX_RETAINED_ENTRIES` so an arbitrarily long task's checkpoint
+    /// (`ResearchTaskContext` serializes into it whole, §5.4) stays bounded.
     pub fn record_artifact(&mut self, handle: ArtifactHandle) {
         self.artifacts.push(handle);
+        trim_to_cap(&mut self.artifacts);
     }
 
-    /// Append a working note.
+    /// Append a working note. Same front-eviction cap as `record_artifact`.
     pub fn add_note(&mut self, note: impl Into<String>) {
         self.notes.push(note.into());
+        trim_to_cap(&mut self.notes);
     }
 }
 
@@ -164,6 +168,23 @@ impl ResearchTaskContext {
 const ARTIFACTS_SHOWN: usize = 8;
 /// Cap the working notes shown (most-recent first).
 const NOTES_SHOWN: usize = 6;
+
+/// Hard cap on how many artifacts/notes a `ResearchTaskContext` retains at
+/// all (not just how many are *displayed* — `ARTIFACTS_SHOWN` / `NOTES_SHOWN`
+/// above). Without this, `record_artifact`/`add_note` are push-only and a
+/// long-running task (hundreds of steps) grows its checkpoint JSON without
+/// bound. 64 is 8x `ARTIFACTS_SHOWN` and ~10x `NOTES_SHOWN` — comfortable
+/// headroom so entries still within the displayed window are never at risk,
+/// while keeping the checkpoint's worst case small and predictable.
+const MAX_RETAINED_ENTRIES: usize = 64;
+
+/// Drop oldest entries (front of the vec) so `v.len() <= MAX_RETAINED_ENTRIES`.
+fn trim_to_cap<T>(v: &mut Vec<T>) {
+    if v.len() > MAX_RETAINED_ENTRIES {
+        let excess = v.len() - MAX_RETAINED_ENTRIES;
+        v.drain(0..excess);
+    }
+}
 
 /// Build the deterministic TASK CONTEXT system block (SPEC §5.1).
 ///
@@ -472,6 +493,31 @@ mod tests {
         assert!(block.contains(&format!("note {}", NOTES_SHOWN + 2)));
         assert!(!block.contains("note 0"));
         assert!(block.contains("working notes"));
+    }
+
+    #[test]
+    fn record_artifact_and_add_note_are_bounded() {
+        // A long-running task must not grow its checkpoint unboundedly:
+        // pushing well past MAX_RETAINED_ENTRIES keeps only the most recent
+        // entries, dropping the oldest first.
+        let mut task = ResearchTaskContext::new("g");
+        let total = MAX_RETAINED_ENTRIES + 20;
+        for i in 0..total {
+            task.record_artifact(ArtifactHandle {
+                id: format!("prov:{i}"),
+                summary: format!("artifact {i}"),
+                bytes: 1,
+            });
+            task.add_note(format!("note {i}"));
+        }
+        assert_eq!(task.artifacts.len(), MAX_RETAINED_ENTRIES);
+        assert_eq!(task.notes.len(), MAX_RETAINED_ENTRIES);
+        // Oldest entries were evicted...
+        assert!(!task.artifacts.iter().any(|a| a.id == "prov:0"));
+        assert!(!task.notes.iter().any(|n| n == "note 0"));
+        // ...the most recent survive.
+        assert_eq!(task.artifacts.last().unwrap().id, format!("prov:{}", total - 1));
+        assert_eq!(task.notes.last().unwrap(), &format!("note {}", total - 1));
     }
 
     #[test]
