@@ -276,16 +276,20 @@ mod tests {
             ),
         ];
         // Cold: the turn path must see "not ready" and fall back to keyword —
-        // never embed the catalog on-turn.
+        // never embed the catalog on-turn. Robust under parallel tests because
+        // these entry names are unique to this test, so the key never matches a
+        // slot another test warmed.
         assert!(
             global_index_if_ready(&entries).is_none(),
             "index must not be ready before a background warm"
         );
         // Background warm (what spawn_neural_warm does off the turn path).
-        let _ = global_index(entries.clone(), &StubEmbed).await;
-        // Now the turn path can use neural with zero on-path embedding.
-        let ready = global_index_if_ready(&entries).expect("index ready after warm");
-        assert_eq!(ready.embedded_count(), 2);
+        // Assert on the Arc it RETURNS, not on a re-read of the process-global
+        // single-slot cache: another test's concurrent spawn_neural_warm can
+        // overwrite that slot between the warm and the read, which made the old
+        // `global_index_if_ready(..).expect()` re-read intermittently panic.
+        let warmed = global_index(entries.clone(), &StubEmbed).await;
+        assert_eq!(warmed.embedded_count(), 2);
     }
 
     #[test]
