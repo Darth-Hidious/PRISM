@@ -426,7 +426,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled("tok/s:", Style::default().fg(t.system)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!("{:.1}", app.tokens_per_sec),
+            format!("~{:.1}", app.tokens_per_sec),
             Style::default().fg(t.ok),
         ));
         spans.push(Span::raw("  "));
@@ -1011,8 +1011,16 @@ fn cost_lines(app: &App, t: Theme) -> Vec<Line<'static>> {
         kv_row(t, "Model", if model.is_empty() { "—" } else { &model }),
         kv_row(t, "Session cost", &format!("${:.4}", app.session_cost)),
         kv_row(t, "This turn", &format!("${:.4}", app.turn_cost)),
-        kv_row(t, "Tokens (turn)", &format!("{}", app.tokens_received)),
-        kv_row(t, "Throughput", &format!("{:.1} tok/s", app.tokens_per_sec)),
+        kv_row(
+            t,
+            "Tokens (turn)",
+            &format!("~{} (est)", app.tokens_received),
+        ),
+        kv_row(
+            t,
+            "Throughput",
+            &format!("~{:.1} tok/s", app.tokens_per_sec),
+        ),
     ];
     if app.session_cost == 0.0 {
         lines.push(Line::raw(""));
@@ -1595,7 +1603,7 @@ fn draw_status_window(f: &mut Frame, app: &App) {
     lines.push(kv(
         "tokens (turn)",
         format!(
-            "{}  ·  {:.1} tok/s",
+            "~{}  ·  ~{:.1} tok/s (est)",
             app.tokens_received, app.tokens_per_sec
         ),
     ));
