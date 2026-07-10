@@ -101,7 +101,9 @@ impl ToolCatalog {
             let input_schema = tool
                 .get("input_schema")
                 .cloned()
-                .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+                .unwrap_or_else(
+                    || json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+                );
             if !schema_present {
                 tracing::warn!(
                     tool = %name,
