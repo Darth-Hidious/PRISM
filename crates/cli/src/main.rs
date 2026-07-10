@@ -3029,7 +3029,7 @@ async fn main() -> Result<()> {
                             println!();
                         }
                         println!(
-                            "{} resources found. Install with: prism marketplace install <slug>",
+                            "{} resources found. Install any by its [slug] — `marketplace install <slug>`, or ask the agent.",
                             tools.len()
                         );
                     }
@@ -3109,7 +3109,7 @@ async fn main() -> Result<()> {
                     } else if hits.is_empty() {
                         println!("No semantic matches for `{query}`.");
                         println!(
-                            "Try a different phrasing, or `prism marketplace search <query>` for \
+                            "Try a different phrasing, or `marketplace search <query>` for \
                              lexical search."
                         );
                     } else {

@@ -993,7 +993,7 @@ fn model_lines(app: &App, t: Theme) -> Vec<Line<'static>> {
             Style::default().fg(t.dim),
         )),
         Line::from(Span::styled(
-            "  or set it in your PRISM config / launch flags",
+            "  or ask the agent to list available models",
             Style::default().fg(t.dim),
         )),
         Line::raw(""),
