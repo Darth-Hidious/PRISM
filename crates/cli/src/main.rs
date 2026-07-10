@@ -1101,6 +1101,13 @@ struct SelectedContext {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the process-wide rustls CryptoProvider before ANY TLS can happen.
+    // `prism node up` makes its first HTTPS call in register_node (well before
+    // the node daemon, which was the only place this was installed), and rustls
+    // panics on the first handshake if no process default is set (#131). ok():
+    // a second install elsewhere returns Err harmlessly.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Tracing goes to STDERR, never stdout: `prism backend` speaks JSON-RPC
     // over stdout, and any log line there corrupts the protocol (the TUI
     // deadlocks at "Igniting core..."). Stderr is captured to
