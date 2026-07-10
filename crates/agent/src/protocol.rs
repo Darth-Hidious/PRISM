@@ -2775,10 +2775,29 @@ fn format_doctor_report(
         .budget_warning()
         .unwrap_or_else(|| "none".to_string());
 
+    // Resolve the model's PromptProfile so /doctor shows the fluid mechanism in
+    // effect — works turn-zero (no live conversation required). The endpoint
+    // shape doubles as a coarse auth/mode signal without extra plumbing.
+    let profile = profile_for_model(&llm_config.model);
+    let endpoint = &llm_config.base_url;
+    let mode_hint = if endpoint.contains("/llm") || endpoint.contains("api.marc27") {
+        "MARC27 cloud (signed-in endpoint)"
+    } else if endpoint.contains("localhost") || endpoint.contains("127.0.0.1") {
+        "local"
+    } else {
+        "direct provider"
+    };
+
     truncate_for_ui(
         &format!(
-            "Doctor\n  model: {}\n  session mode: {}\n  tool count: {}\n  project root: {}\n  python: {}\n  budget warning: {}\n  transcript entries: {}\n\nIf a command behaves unexpectedly, check:\n  1. active session mode and permissions\n  2. current model selection\n  3. python tool server availability\n  4. project root and working directory assumptions",
+            "Doctor\n  model: {}\n  llm endpoint: {} ({})\n  prompt profile: style={:?} length={:?} tools={:?} reasoning={:?}\n  session mode: {}\n  tool count: {}\n  project root: {}\n  python: {}\n  budget warning: {}\n  transcript entries: {}\n\nIf a command behaves unexpectedly, check:\n  1. active session mode and permissions\n  2. current model selection\n  3. python tool server availability\n  4. project root and working directory assumptions",
             llm_config.model,
+            endpoint,
+            mode_hint,
+            profile.structure_style,
+            profile.length_budget,
+            profile.tool_surface,
+            profile.reasoning_invocation,
             session_mode.as_str(),
             tools.len(),
             slash_ctx.project_root.display(),
