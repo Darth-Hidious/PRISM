@@ -76,7 +76,7 @@ jobs:
           SENTINEL=$HOME/.cache/prism-runner-cache-bust-v2-debuginfo0
           if [ ! -f "$SENTINEL" ]; then
             echo "Cache-bust v2: wiping target/ once for this runner"
-            rm -rf target
+            cargo clean
             mkdir -p "$HOME/.cache"
             touch "$SENTINEL"
           else
