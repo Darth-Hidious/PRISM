@@ -378,9 +378,135 @@ pub fn research_outcome_from_turn(
     }
 }
 
+// ── AgentResearchExecutor: drives run_turn per campaign iteration ─────
+//
+// The executor bridges the campaign loop and run_turn. It translates the
+// campaign's (goal, iteration context) into a ResearchTaskContext + a
+// synthesized user_message, delegates the actual turn to a TurnRunner (the
+// call site where the ServerRuntime's &mut borrows live), then harvests the
+// turn's text into a ResearchIterationOutcome for the next iteration + the
+// checkpoint.
+//
+// Why a TurnRunner trait and not a direct run_turn call here: run_turn takes
+// 17 parameters including &mut borrows on tool_server, history, scratchpad —
+// live objects owned by the caller's runtime, not holdable inside the
+// executor. The caller implements TurnRunner; this module owns the
+// campaign↔task translation, which is the testable, reusable core.
+
+/// The outcome of a single task-driven turn, returned by a [`TurnRunner`].
+/// Captures the assistant text (for progress assessment + the iteration
+/// summary) and any artifact handles / notes the turn produced.
+#[derive(Debug, Clone, Default)]
+pub struct TurnOutcome {
+    /// The assistant's full text for this turn (accumulated TextDelta +
+    /// TurnComplete.text). Used to assess progress toward success criteria.
+    pub text: String,
+    /// Artifact handles newly recorded this turn (provenance ids).
+    #[allow(clippy::vec_box)]
+    pub new_artifacts: Vec<ArtifactHandle>,
+    /// Working notes the model emitted this turn (if any).
+    pub new_notes: Vec<String>,
+}
+
+/// Run one task-driven turn against the agent loop. Implemented at the call
+/// site (where the LLM client, tool server, history, catalog, etc. live).
+/// The implementer builds run_turn's 17 parameters, passes
+/// `task: Some(ctx)` and `user_message`, accumulates the emitted
+/// `AgentEvent::TextDelta`s, captures `TurnComplete`, and returns the harvest.
+pub trait TurnRunner: Send + Sync {
+    /// Execute one turn. `user_message` is the synthesized task message;
+    /// `task` carries the goal/plan/artifacts/notes context to inject.
+    fn run_task_turn<'a>(
+        &'a self,
+        user_message: String,
+        task: ResearchTaskContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<TurnOutcome>> + Send + 'a>>;
+}
+
+/// The agent-side research-iteration executor. Holds a reference to a
+/// [`TurnRunner`] and implements the campaign crate's
+/// [`ResearchIterationExecutor`] by translating campaign state into a task
+/// context, running one turn, and packaging the outcome.
+pub struct AgentResearchExecutor<R: TurnRunner> {
+    runner: R,
+}
+
+impl<R: TurnRunner> AgentResearchExecutor<R> {
+    #[must_use]
+    pub fn new(runner: R) -> Self {
+        Self { runner }
+    }
+}
+
+impl<R: TurnRunner + 'static> prism_campaign::ResearchIterationExecutor
+    for AgentResearchExecutor<R>
+{
+    fn execute_iteration<'a>(
+        &'a self,
+        goal: &'a prism_campaign::ResearchCampaignGoal,
+        context: &'a prism_campaign::ResearchIterationContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<prism_campaign::ResearchIterationOutcome>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let iteration = context.iteration;
+            // 1. Translate campaign state → task context (goal, constraints,
+            //    accumulated artifacts + notes).
+            let task = task_context_from_research(goal, context);
+            // 2. Synthesize the task-driven user message.
+            let user_message = task_turn_message(goal, iteration);
+
+            // 3. Delegate the turn to the call site (run_turn + harvest).
+            let turn = self
+                .runner
+                .run_task_turn(user_message, task)
+                .await
+                .map_err(|e| anyhow::anyhow!("research turn {iteration} failed: {e:#}"))?;
+
+            // 4. Package the outcome: a short summary, new artifact refs, new
+            //    notes, and a progress signal assessed from the turn text.
+            let summary = if turn.text.trim().is_empty() {
+                format!("iteration {iteration}: (no assistant output)")
+            } else {
+                first_line(&turn.text)
+            };
+            Ok(research_outcome_from_turn(
+                summary,
+                goal,
+                &turn.text,
+                turn.new_artifacts.into_iter().map(|h| h.id).collect(),
+                turn.new_notes,
+            ))
+        })
+    }
+}
+
+/// First non-empty line of a text block, trimmed to a summary length.
+fn first_line(text: &str) -> String {
+    const MAX: usize = 160;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if trimmed.chars().count() <= MAX {
+                return trimmed.to_string();
+            }
+            let mut out: String = trimmed.chars().take(MAX).collect();
+            out.push('…');
+            return out;
+        }
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_campaign::ResearchIterationExecutor;
 
     fn step(desc: &str) -> PlanStep {
         PlanStep {
@@ -660,5 +786,120 @@ mod tests {
         assert_eq!(outcome.artifact_refs, vec!["prov:paper1".to_string()]);
         assert_eq!(outcome.notes, vec!["Ti-W-Mo >2000K promising".to_string()]);
         assert_eq!(outcome.progress, 1.0); // "All criteria met" detected
+    }
+
+    // ── AgentResearchExecutor tests (via a stub TurnRunner) ─────────────
+
+    /// A TurnRunner stub that returns a canned TurnOutcome without touching
+    /// the real agent loop — proves the executor wiring + translation is
+    /// correct independent of a live LLM.
+    struct StubTurnRunner {
+        reply: String,
+    }
+
+    impl TurnRunner for StubTurnRunner {
+        fn run_task_turn<'a>(
+            &'a self,
+            _user_message: String,
+            _task: ResearchTaskContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<TurnOutcome>> + Send + 'a>,
+        > {
+            let reply = self.reply.clone();
+            Box::pin(async move {
+                Ok(TurnOutcome {
+                    text: reply,
+                    new_artifacts: vec![ArtifactHandle {
+                        id: "prov:stub1".into(),
+                        summary: "stub artifact".into(),
+                        bytes: 99,
+                    }],
+                    new_notes: vec!["stub note".into()],
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn executor_drives_a_turn_and_packages_the_outcome() {
+        let goal = research_goal();
+        let ctx = prism_campaign::ResearchIterationContext {
+            iteration: 0,
+            artifact_refs: vec![],
+            notes: vec![],
+        };
+        let executor = AgentResearchExecutor::new(StubTurnRunner {
+            reply: "All criteria met: survey complete with 4 corroborated sources.".into(),
+        });
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let outcome = rt
+            .block_on(executor.execute_iteration(&goal, &ctx))
+            .expect("iteration executes");
+
+        // The stub returned an artifact + a note; they flow through.
+        assert_eq!(outcome.artifact_refs, vec!["prov:stub1".to_string()]);
+        assert_eq!(outcome.notes, vec!["stub note".to_string()]);
+        // "All criteria met" → completion signal detected.
+        assert_eq!(outcome.progress, 1.0);
+        // Summary is the first line of the reply.
+        assert!(outcome.summary.starts_with("All criteria met"));
+    }
+
+    #[test]
+    fn executor_empty_turn_text_gives_fallback_summary() {
+        let goal = prism_campaign::ResearchCampaignGoal {
+            objective: "x".into(),
+            ..Default::default()
+        };
+        let ctx = prism_campaign::ResearchIterationContext::default();
+        let executor = AgentResearchExecutor::new(StubTurnRunner {
+            reply: String::new(),
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let outcome = rt
+            .block_on(executor.execute_iteration(&goal, &ctx))
+            .expect("iteration executes");
+        assert!(outcome.summary.contains("no assistant output"));
+    }
+
+    #[test]
+    fn executor_carries_prior_artifacts_into_the_task_context() {
+        // Iteration 2 with a prior artifact: the executor's translation must
+        // pass prior refs through (the stub ignores the task, but a real
+        // TurnRunner would see them in task.artifacts).
+        let goal = research_goal();
+        let ctx = prism_campaign::ResearchIterationContext {
+            iteration: 2,
+            artifact_refs: vec!["prov:prior".into()],
+            notes: vec!["prior finding".into()],
+        };
+        // A runner that asserts the task it received carries the prior state.
+        struct AssertingRunner;
+        impl TurnRunner for AssertingRunner {
+            fn run_task_turn<'a>(
+                &'a self,
+                _msg: String,
+                task: ResearchTaskContext,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<TurnOutcome>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    assert_eq!(task.artifacts.len(), 1);
+                    assert_eq!(task.artifacts[0].id, "prov:prior");
+                    assert_eq!(task.notes, vec!["prior finding".to_string()]);
+                    Ok(TurnOutcome::default())
+                })
+            }
+        }
+        let executor = AgentResearchExecutor::new(AssertingRunner);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let outcome = rt
+            .block_on(executor.execute_iteration(&goal, &ctx))
+            .expect("iteration executes");
+        // Empty turn text + criteria present → modest baseline progress (0.2),
+        // not "done". The point of this test is the prior-state passthrough,
+        // which the AssertingRunner verified inside the turn.
+        assert!(outcome.progress < 0.4);
     }
 }
