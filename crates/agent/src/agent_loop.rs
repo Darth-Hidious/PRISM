@@ -2016,7 +2016,10 @@ mod tests {
             .collect();
         assert!(names.iter().any(|n| n == "read_file"), "core tool kept");
         assert!(names.iter().any(|n| n == "find_tools"), "meta tool kept");
-        assert!(names.iter().any(|n| n == "mesh_publish"), "pinned tool kept");
+        assert!(
+            names.iter().any(|n| n == "mesh_publish"),
+            "pinned tool kept"
+        );
         assert!(
             !names.iter().any(|n| n == "deploy_create"),
             "non-core non-pinned tool dropped"

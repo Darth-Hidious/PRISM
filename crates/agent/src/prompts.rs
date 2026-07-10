@@ -445,7 +445,11 @@ fn render_blocks(blocks: &[PromptBlock], profile: &PromptProfile) -> String {
                 {
                     continue;
                 }
-                parts.push(render_one_section(title, &block.body, profile.structure_style));
+                parts.push(render_one_section(
+                    title,
+                    &block.body,
+                    profile.structure_style,
+                ));
             }
         }
     }
@@ -481,7 +485,7 @@ pub fn render_system_prompt(canonical: &str, profile: &PromptProfile) -> String 
 mod tests {
     use super::*;
     use crate::permissions::PermissionMode;
-    use crate::prompt_profile::{profile_for_model, LengthBudget, MaxTokensPolicy, ToolSurface};
+    use crate::prompt_profile::{LengthBudget, MaxTokensPolicy, ToolSurface, profile_for_model};
     use crate::tool_catalog::{LoadedTool, ToolCatalog};
     use serde_json::json;
 
@@ -499,7 +503,10 @@ mod tests {
     /// byte-for-byte, so the default agent path is provably unchanged.
     #[test]
     fn markdown_full_is_byte_for_byte_canonical() {
-        assert_eq!(render_system_prompt(INTERACTIVE_PROMPT, &markdown_full()), INTERACTIVE_PROMPT);
+        assert_eq!(
+            render_system_prompt(INTERACTIVE_PROMPT, &markdown_full()),
+            INTERACTIVE_PROMPT
+        );
     }
 
     /// The section decomposition is faithful: rebuilding Markdown from the parsed

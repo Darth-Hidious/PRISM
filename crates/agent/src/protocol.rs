@@ -36,7 +36,7 @@ use crate::hooks::{HookRegistry, build_default_hooks};
 use crate::permissions::{
     PermissionMode, PermissionOverrides, SharedPermissionOverrides, ToolPermissionContext,
 };
-use crate::prompt_profile::{profile_for_model, PromptProfile};
+use crate::prompt_profile::{PromptProfile, profile_for_model};
 use crate::prompts::{append_runtime_tool_guidance, build_system_prompt, render_system_prompt};
 use crate::scratchpad::Scratchpad;
 use crate::session::{RuntimeSessionState, SessionStore};

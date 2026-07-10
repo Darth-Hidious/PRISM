@@ -593,8 +593,11 @@ impl LlmClient {
             }
 
             // Estimate before the body moves `aug_messages` into the request.
-            let est: u64 =
-                aug_messages.iter().map(|m| m.to_string().len() as u64).sum::<u64>() / 4;
+            let est: u64 = aug_messages
+                .iter()
+                .map(|m| m.to_string().len() as u64)
+                .sum::<u64>()
+                / 4;
             let body = serde_json::json!({
                 "model": self.config.model,
                 "messages": aug_messages,
@@ -1486,7 +1489,10 @@ mod tests {
         assert_eq!(client.effective_max_tokens(10_000), 128_000);
 
         // Tight prompt: context binds. 400k − 396k − 1024 margin = 2976.
-        assert_eq!(client.effective_max_tokens(396_000), 400_000 - 396_000 - 1024);
+        assert_eq!(
+            client.effective_max_tokens(396_000),
+            400_000 - 396_000 - 1024
+        );
 
         // Prompt bigger than the whole window: never underflows, floors at 256.
         assert_eq!(client.effective_max_tokens(500_000), 256);
