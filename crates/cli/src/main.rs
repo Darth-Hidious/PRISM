@@ -1786,7 +1786,7 @@ async fn main() -> Result<()> {
                         .ok()
                         .or_else(|| platform_token.clone());
                     (
-                        marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url),
+                        marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url)?,
                         model,
                         marc27_key,
                     )
@@ -8536,9 +8536,25 @@ fn model_limits(models: &[serde_json::Value], model_id: &str) -> (Option<u64>, O
 /// `http://localhost:8080` (llama.cpp). Using that fallback
 /// unconditionally is exactly what made "MARC27 cloud" chat run on a
 /// local 16k model.
-fn marc27_llm_base_url(paths: &PrismPaths, api_base: &str, fallback_url: &str) -> String {
+/// The built-in `[llm].url` default (core config.rs `default_llm_url`). When
+/// `fallback_url` still equals this, the user never configured an endpoint.
+const DEFAULT_LLM_URL: &str = "http://localhost:8080";
+
+/// Resolve the base URL for the MARC27 cloud chat target.
+///
+/// Order: explicit `LLM_BASE_URL` → the signed-in project's MARC27 endpoint →
+/// an explicitly-configured `[llm].url`. It deliberately does NOT silently fall
+/// back to the built-in localhost default: an unauthenticated user with no
+/// configured endpoint used to run "cloud" chat against a local model while the
+/// header showed the cloud model and credits never moved (#132). That case is
+/// now an honest error (owner policy: explicit-only local mode).
+fn marc27_llm_base_url(
+    paths: &PrismPaths,
+    api_base: &str,
+    fallback_url: &str,
+) -> anyhow::Result<String> {
     if let Ok(explicit) = std::env::var("LLM_BASE_URL") {
-        return explicit;
+        return Ok(explicit);
     }
     if let Some(project_id) = paths
         .load_cli_state()
@@ -8546,14 +8562,48 @@ fn marc27_llm_base_url(paths: &PrismPaths, api_base: &str, fallback_url: &str) -
         .and_then(|s| s.credentials)
         .and_then(|c| c.project_id)
     {
-        return marc27_llm_url_for_project(api_base, &project_id);
+        return Ok(marc27_llm_url_for_project(api_base, &project_id));
     }
-    fallback_url.to_string()
+    // Unauthenticated: honor only an explicitly-set url, refuse the default.
+    resolve_unauth_llm_url(fallback_url)
+}
+
+/// Unauthenticated-case policy (owner: explicit-only local mode). An `[llm].url`
+/// that differs from the built-in default is a deliberate local-mode choice and
+/// is honored; the untouched default is refused with an honest message rather
+/// than silently pointing "cloud" chat at localhost (#132).
+fn resolve_unauth_llm_url(fallback_url: &str) -> anyhow::Result<String> {
+    if fallback_url != DEFAULT_LLM_URL {
+        return Ok(fallback_url.to_string());
+    }
+    anyhow::bail!(
+        "Not signed in and no LLM endpoint configured. Sign in to use MARC27 cloud \
+         (run sign-in from the palette), or set `[llm].url` in prism.toml (or LLM_BASE_URL) \
+         to use a local model explicitly."
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unauth_llm_url_refuses_built_in_default() {
+        // #132: unauthenticated + untouched default must NOT silently become
+        // localhost — it errors instead.
+        assert!(resolve_unauth_llm_url(DEFAULT_LLM_URL).is_err());
+    }
+
+    #[test]
+    fn unauth_llm_url_honors_explicit_config() {
+        // A user who explicitly configured a local endpoint keeps local mode.
+        let explicit = "http://192.168.1.50:9000";
+        assert_eq!(
+            resolve_unauth_llm_url(explicit).unwrap(),
+            explicit,
+            "an explicitly-set [llm].url is a deliberate local-mode choice"
+        );
+    }
 
     #[test]
     fn marc27_model_prefers_user_selection_over_default() {
