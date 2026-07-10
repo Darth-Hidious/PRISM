@@ -160,6 +160,14 @@ jobs:
         run: mkdir -p dashboard/dist && echo '<html><body>placeholder</body></html>' > dashboard/dist/index.html
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Image rotations invalidate ABSOLUTE toolchain paths baked into
+          # cached build-script outputs: the restored cache linked with
+          # `-L /Applications/Xcode_16.2.app/...` (gone on the Xcode-26
+          # image) and a stale ort.pyke.io dfbin path, so `-lclang_rt.osx`
+          # failed even with a valid Xcode selected. Bump per image era to
+          # force fresh build scripts.
+          prefix-key: "v2-xcode26-era"
       # `release-fast` (defined in Cargo.toml) drops LTO and lifts
       # codegen-units so cross-platform CI smoke finishes in ~10 min
       # instead of 35+ min on macOS / Windows. Still opt-level=3, so
