@@ -44,6 +44,11 @@ jobs:
       # and capping build jobs bounds concurrent linker memory.
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_BUILD_JOBS: "2"
+      # Bypass the runner's global sccache wrapper: its /tmp IO race loses
+      # .d files mid-compile ("could not parse/generate dep info") even on a
+      # freshly wiped target — same race documented on the audit job below.
+      # rust-cache still caches target/, so builds stay warm without it.
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (rdkafka needs libcurl)
@@ -125,12 +130,17 @@ jobs:
       - name: Pin a working Xcode (clang_rt.osx present)
         if: runner.os == 'macOS'
         run: |
+          # Dir existence isn't enough — image updates have shipped Xcode
+          # versions whose toolchain lacks clang_rt.osx (16.4, then 16.2).
+          # Verify the library is actually bundled before selecting.
           for v in 16.2 16.1 16.0 15.4; do
-            if [ -d "/Applications/Xcode_${v}.app" ]; then
-              sudo xcode-select -s "/Applications/Xcode_${v}.app"
-              echo "Selected Xcode ${v}"
+            app="/Applications/Xcode_${v}.app"
+            if [ -d "$app" ] && ls "$app"/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/*/lib/darwin/libclang_rt.osx.a >/dev/null 2>&1; then
+              sudo xcode-select -s "$app"
+              echo "Selected Xcode ${v} (clang_rt.osx verified)"
               break
             fi
+            echo "Xcode ${v}: missing or lacks clang_rt.osx — skipping"
           done
           xcodebuild -version
       - name: Install Linux system deps (rdkafka needs libcurl)
