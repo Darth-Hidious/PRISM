@@ -130,18 +130,23 @@ jobs:
       - name: Pin a working Xcode (clang_rt.osx present)
         if: runner.os == 'macOS'
         run: |
-          # Dir existence isn't enough — image updates have shipped Xcode
-          # versions whose toolchain lacks clang_rt.osx (16.4, then 16.2).
-          # Verify the library is actually bundled before selecting.
-          for v in 16.2 16.1 16.0 15.4; do
-            app="/Applications/Xcode_${v}.app"
-            if [ -d "$app" ] && ls "$app"/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/*/lib/darwin/libclang_rt.osx.a >/dev/null 2>&1; then
+          # Hardcoded version lists rot when the image rotates (16.4 lacked
+          # clang_rt.osx, then 16.2, then the whole 15/16 series became
+          # stubs on the Xcode-26 image). Scan every installed Xcode,
+          # newest first, and select the first that actually bundles it.
+          selected=""
+          for app in $(ls -d /Applications/Xcode*.app | sort -Vr); do
+            if ls "$app"/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/*/lib/darwin/libclang_rt.osx.a >/dev/null 2>&1; then
               sudo xcode-select -s "$app"
-              echo "Selected Xcode ${v} (clang_rt.osx verified)"
+              selected="$app"
+              echo "Selected $app (clang_rt.osx verified)"
               break
             fi
-            echo "Xcode ${v}: missing or lacks clang_rt.osx — skipping"
+            echo "$app: lacks clang_rt.osx — skipping"
           done
+          if [ -z "$selected" ]; then
+            echo "WARNING: no installed Xcode bundles clang_rt.osx — using image default"
+          fi
           xcodebuild -version
       - name: Install Linux system deps (rdkafka needs libcurl)
         if: runner.os == 'Linux'
