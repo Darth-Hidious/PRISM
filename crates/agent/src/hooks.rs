@@ -333,6 +333,12 @@ fn provenance_hook() -> Hook {
                             warn!("provenance store open failed: {e}");
                         }
                     }
+                    // Mirror to the MARC27 platform so provenance is visible
+                    // online + on the platform, not just in the local db.
+                    // Independent of local-store health and fully fail-open —
+                    // never blocks or fails the turn. Disable with
+                    // PRISM_PROVENANCE_SYNC=0.
+                    crate::provenance_sync::try_push(&record).await;
                 });
             }
 
