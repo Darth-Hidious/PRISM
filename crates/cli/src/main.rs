@@ -502,11 +502,11 @@ enum BillingCommands {
     History,
     /// Show credit pricing table.
     Prices,
-    /// Buy credits (opens Stripe checkout in browser).
+    /// Buy credits — lists packs; with a slug, opens the checkout in a browser.
     Topup {
-        /// Package slug: starter, standard, pro, enterprise.
-        #[arg(default_value = "starter")]
-        package: String,
+        /// Package slug: starter, standard, pro, enterprise. Omit to just
+        /// list the available packs (no checkout is created).
+        package: Option<String>,
     },
 }
 
@@ -3829,7 +3829,7 @@ async fn main() -> Result<()> {
                     println!();
                 }
                 Some(BillingCommands::Topup { package }) => {
-                    // First show packages
+                    // Always show the available packs first.
                     let pkgs: serde_json::Value = client
                         .get(format!("{api_base}/billing/packages"))
                         .send()
@@ -3837,7 +3837,7 @@ async fn main() -> Result<()> {
                         .error_for_status()?
                         .json()
                         .await?;
-                    println!("\nAvailable packages:\n");
+                    println!("\nAvailable credit packs:\n");
                     if let Some(packages) = pkgs["packages"].as_array() {
                         for (i, p) in packages.iter().enumerate() {
                             println!(
@@ -3850,7 +3850,14 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    println!("\nOpening Stripe checkout for '{package}'...");
+                    // No slug: list-only. Never create a checkout the user
+                    // didn't ask for (the old default silently bought starter).
+                    let Some(package) = package else {
+                        println!("\nRun `/billing topup <slug>` (e.g. pro) to open a checkout.");
+                        return Ok(());
+                    };
+
+                    println!("\nOpening checkout for '{package}'...");
                     let resp: serde_json::Value = auth
                         .apply(client.post(format!("{api_base}/billing/topup")))
                         .json(&serde_json::json!({"package": package}))

@@ -366,6 +366,14 @@ pub static CATALOG: &[Command] = &[
         suggested: false,
     },
     Command {
+        id: "slash.billing topup",
+        title: "Buy credits",
+        description: "Open a credit-pack checkout in the browser",
+        category: "Settings",
+        keybind: "/billing topup",
+        suggested: false,
+    },
+    Command {
         id: "use.show",
         title: "Chat target",
         description: "Show the active chat route (MARC27 / local / provider)",
