@@ -1760,7 +1760,12 @@ async fn refresh_token(
         stored.expires_at = refreshed.expires_in.and_then(|secs| {
             chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
         });
-        paths.save_cli_state(&state)?;
+        // Persist to BOTH cli-state AND the `~/.prism/credentials.json` SDK
+        // mirror. Writing only cli-state here left the mirror holding the
+        // pre-rotation (now server-revoked) refresh token → forced re-login
+        // (see refresh_access_token in the CLI). persist_credentials keeps the
+        // two stores in lockstep on every node-side refresh.
+        paths.persist_credentials(stored)?;
     }
 
     Ok(refreshed.access_token)

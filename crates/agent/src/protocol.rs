@@ -405,44 +405,11 @@ async fn poll_native_device_login(
 }
 
 fn sync_sdk_credentials(creds: &StoredCredentials) {
-    let sdk_creds = serde_json::json!({
-        "access_token": creds.access_token,
-        "refresh_token": creds.refresh_token,
-        "platform_url": creds.platform_url,
-        "user_id": creds.user_id,
-        "org_id": creds.org_id,
-        "project_id": creds.project_id,
-    });
-    if let Some(home) = std::env::var_os("HOME") {
-        let sdk_path = PathBuf::from(home).join(".prism").join("credentials.json");
-        if let Some(parent) = sdk_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&sdk_creds) {
-            // 0600 on unix — file holds bearer + refresh tokens. Plain
-            // fs::write inherits the user's umask (typically 0644 = world-
-            // readable on most Linux distros), which would let any other
-            // local user read PRISM tokens.
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                if let Ok(mut file) = fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&sdk_path)
-                {
-                    let _ = file.write_all(json.as_bytes());
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = fs::write(&sdk_path, json);
-            }
-        }
-    }
+    // Single source of truth for the `~/.prism/credentials.json` SDK mirror —
+    // login (here) and silent refresh (CLI + node daemon) all go through the
+    // same writer so the two credential stores can never drift in shape or
+    // freshness. See PrismPaths::save_sdk_credentials.
+    PrismPaths::save_sdk_credentials(creds);
 }
 
 fn clear_sdk_credentials() {

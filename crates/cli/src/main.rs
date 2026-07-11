@@ -7796,6 +7796,16 @@ async fn refresh_access_token(
         chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
     });
 
+    // Mirror the rotated tokens to the SDK store (`~/.prism/credentials.json`)
+    // that the Python platform tools read. Every caller already re-saves
+    // `cli-state.json`, but the SDK mirror was left untouched on silent
+    // refresh — so after rotation it held a refresh token the server had
+    // REVOKED (single-use rotation). Replaying that stale token tripped the
+    // server's token-family invalidation and forced a device-flow re-login
+    // (the "re-login every ~24h" dance). Writing it here keeps both stores in
+    // lockstep on every refresh. Best-effort: a mirror hiccup never fails auth.
+    prism_runtime::PrismPaths::save_sdk_credentials(&new_creds);
+
     Ok(new_creds)
 }
 
