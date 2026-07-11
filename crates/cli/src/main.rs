@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! PRISM CLI — the main entry point for the `prism` binary.
 //!
 //! Handles command routing (setup, login, node, workflow, etc.), auth bootstrap

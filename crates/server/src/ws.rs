@@ -1,8 +1,11 @@
 //! WebSocket handler for real-time dashboard updates.
 //!
-//! Clients connect with `?token=<auth_token>` and receive [`WsEvent`]s
-//! as JSON text frames. The server subscribes to the [`NodeState::ws_broadcast`]
-//! channel and forwards events to each connected client.
+//! Clients authenticate with `Authorization: Bearer <token>` (preferred — the
+//! token never appears in the URL, so it can't be captured by request-path
+//! logging, proxies, or the tracing span) and fall back to `?token=<auth_token>`
+//! for browser clients that cannot set headers on a WebSocket upgrade. They then
+//! receive [`WsEvent`]s as JSON text frames. The server subscribes to the
+//! [`NodeState::ws_broadcast`] channel and forwards events to each client.
 
 use std::sync::Arc;
 
@@ -33,25 +36,44 @@ pub struct WsParams {
 
 /// Handle a WebSocket upgrade request.
 ///
-/// Requires a `?token=` query parameter containing a valid session ID.
-/// If `session_db_path` is configured, validates against SessionManager.
-/// Otherwise falls back to treating the token as a user_id (localhost mode).
+/// Accepts the auth token from `Authorization: Bearer <token>` (preferred; keeps
+/// the secret out of the URL — CWE-598) or the `?token=` query parameter
+/// (browser fallback). If `session_db_path` is configured, validates against
+/// SessionManager. Otherwise falls back to treating the token as a user_id
+/// (localhost mode).
 pub async fn ws_upgrade(
     State(state): State<Arc<NodeState>>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<WsParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let Some(ref t) = params.token else {
-        return (StatusCode::UNAUTHORIZED, "Missing token query parameter.").into_response();
+    // Prefer the Authorization header so the token never lands in the request
+    // URL (where TraceLayer / proxies / access logs would capture it). Fall
+    // back to ?token= for browsers, which can't set headers on a WS upgrade.
+    let header_token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim().to_string())
+        .filter(|s| !s.is_empty());
+    let token = header_token.or_else(|| {
+        params
+            .token
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    let Some(t) = token else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Missing auth token — send `Authorization: Bearer <token>` or `?token=`.",
+        )
+            .into_response();
     };
-    if t.is_empty() {
-        return (StatusCode::UNAUTHORIZED, "Empty token query parameter.").into_response();
-    }
 
     // Validate session if configured
     let user_id = if let Some(ref db_path) = state.session_db_path {
         match prism_core::session::SessionManager::new(db_path, chrono::Duration::hours(24)) {
-            Ok(mgr) => match mgr.validate_session(t) {
+            Ok(mgr) => match mgr.validate_session(&t) {
                 Ok(Some(session)) => session.user_id,
                 Ok(None) => {
                     return (StatusCode::UNAUTHORIZED, "Session expired or invalid.")

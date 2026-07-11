@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! LLM client — OpenAI-compatible + MARC27 platform proxy.
 //!
 //! Wire formats:

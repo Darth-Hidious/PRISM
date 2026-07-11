@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! Typed HTTP client for the MARC27 platform API.
 //!
 //! Provides [`PlatformClient`] for authenticated REST calls and [`DeviceFlowAuth`]

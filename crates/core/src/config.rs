@@ -120,7 +120,12 @@ impl Default for AuditSection {
 ///
 /// One config, propagated everywhere. CLI flags override config values.
 /// Set once with `prism configure --llm-*`, then every command uses it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// NOTE: `Debug` is implemented by hand (not derived) so `api_key` is REDACTED.
+/// This struct is embedded in `NodeConfig`, which is `tracing::debug!(?..)`-dumped
+/// into `node.log` on `node up`; a derived `Debug` would write the plaintext key
+/// into a shareable log at `RUST_LOG=debug` (CWE-532). Keep it hand-written.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmSection {
     /// Provider hint: "llamacpp" (default), "ollama", "openai", "marc27", "anthropic".
     /// All providers use OpenAI-compatible API — this just sets sensible defaults.
@@ -144,6 +149,22 @@ pub struct LlmSection {
     /// Request timeout in seconds.
     #[serde(default = "default_llm_timeout")]
     pub timeout_secs: u64,
+}
+
+impl std::fmt::Debug for LlmSection {
+    /// Hand-written so a secret never reaches a log. Every field is shown
+    /// EXCEPT `api_key`, which is reduced to whether it is set — never its value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmSection")
+            .field("provider", &self.provider)
+            .field("url", &self.url)
+            .field("model", &self.model)
+            .field("embedding_model", &self.embedding_model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_key_env", &self.api_key_env)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 impl Default for LlmSection {
