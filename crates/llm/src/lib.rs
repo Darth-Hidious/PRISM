@@ -578,8 +578,8 @@ impl LlmClient {
                 .post(&url)
                 .json(&body)
                 .header("Accept", "text/event-stream");
-            if let Some(auth) = self.auth_header() {
-                req = req.header("Authorization", auth);
+            if let Some((name, value)) = self.auth_header() {
+                req = req.header(name, value);
             }
             let resp = req
                 .send()
@@ -712,8 +712,8 @@ impl LlmClient {
         }
 
         let mut req = self.client.post(&url).json(&body);
-        if let Some(auth) = self.auth_header() {
-            req = req.header("Authorization", auth);
+        if let Some((name, value)) = self.auth_header() {
+            req = req.header(name, value);
         }
 
         let resp = req
@@ -856,8 +856,8 @@ impl LlmClient {
     pub async fn health_check(&self) -> Result<()> {
         let url = format!("{}/v1/models", self.config.base_url);
         let mut req = self.client.get(&url);
-        if let Some(auth) = self.auth_header() {
-            req = req.header("Authorization", auth);
+        if let Some((name, value)) = self.auth_header() {
+            req = req.header(name, value);
         }
         let resp = req.send().await.context("LLM not reachable")?;
         if !resp.status().is_success() {
@@ -875,20 +875,26 @@ impl LlmClient {
             .unwrap_or(&self.config.model)
     }
 
-    fn auth_header(&self) -> Option<String> {
-        self.config
-            .api_key
-            .as_ref()
-            .filter(|k| !k.is_empty())
-            .map(|k| format!("Bearer {k}"))
+    /// The auth header `(name, value)` for the configured credential, routing
+    /// by shape: `m27_*` MARC27 platform API keys go on `X-API-Key` (the
+    /// platform rejects them on Bearer); session JWTs and provider keys stay on
+    /// `Authorization: Bearer`. This lets a headless chat server reach the
+    /// MARC27 LLM proxy with a non-expiring API key — no login, no refresh.
+    fn auth_header(&self) -> Option<(&'static str, String)> {
+        let key = self.config.api_key.as_ref().filter(|k| !k.is_empty())?;
+        if key.starts_with("m27_") {
+            Some(("X-API-Key", key.clone()))
+        } else {
+            Some(("Authorization", format!("Bearer {key}")))
+        }
     }
 
     async fn post(&self, url: &str, body: &serde_json::Value) -> Result<reqwest::Response> {
         debug!(%url, "LLM request");
         for attempt in 0..3u32 {
             let mut req = self.client.post(url).json(body);
-            if let Some(auth) = self.auth_header() {
-                req = req.header("Authorization", auth);
+            if let Some((name, value)) = self.auth_header() {
+                req = req.header(name, value);
             }
             let resp = req
                 .send()
@@ -1408,7 +1414,26 @@ mod tests {
             ..Default::default()
         };
         let client = LlmClient::new(config);
-        assert_eq!(client.auth_header(), Some("Bearer sk-test123".to_string()));
+        assert_eq!(
+            client.auth_header(),
+            Some(("Authorization", "Bearer sk-test123".to_string()))
+        );
+    }
+
+    #[test]
+    fn auth_header_routes_m27_api_key_to_x_api_key() {
+        // `m27_*` platform keys must go on X-API-Key — the MARC27 backend
+        // rejects them on Bearer. This is what lets a headless chat server
+        // reach the LLM proxy with a non-expiring key.
+        let config = LlmConfig {
+            api_key: Some("m27_live_abc123".into()),
+            ..Default::default()
+        };
+        let client = LlmClient::new(config);
+        assert_eq!(
+            client.auth_header(),
+            Some(("X-API-Key", "m27_live_abc123".to_string()))
+        );
     }
 
     #[test]

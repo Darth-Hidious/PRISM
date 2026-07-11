@@ -1772,10 +1772,15 @@ async fn main() -> Result<()> {
                                 // resolves it server-side.
                                 preference.unwrap_or_else(|| "default".to_string())
                             });
-                    // Bearer for the platform: deliberate overrides
-                    // (LLM_API_KEY, MARC27_TOKEN) → the session JWT.
+                    // Credential for the platform LLM proxy, in precedence
+                    // order: explicit LLM_API_KEY override → the stable
+                    // `m27_*` API key (MARC27_API_KEY — no login, no expiry,
+                    // the headless-server/agent path) → MARC27_TOKEN → the
+                    // logged-in session JWT. The LLM client routes an `m27_*`
+                    // value onto X-API-Key and a JWT onto Bearer automatically.
                     // Provider keys are NOT platform credentials.
                     let marc27_key = std::env::var("LLM_API_KEY")
+                        .or_else(|_| std::env::var("MARC27_API_KEY"))
                         .or_else(|_| std::env::var("MARC27_TOKEN"))
                         .ok()
                         .or_else(|| platform_token.clone());
