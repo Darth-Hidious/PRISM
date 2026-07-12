@@ -706,6 +706,28 @@ enum NodeCommands {
         #[command(subcommand)]
         command: KeyCommands,
     },
+    /// Manage the durable node token — a stable, non-rotating API key that
+    /// keeps `node up` alive across session refresh-token rotation (the
+    /// rotating session token is what kills long-running nodes today).
+    Token {
+        #[command(subcommand)]
+        command: TokenCommands,
+    },
+}
+
+/// Durable node-token subcommands.
+#[derive(Debug, Subcommand)]
+enum TokenCommands {
+    /// Mint a stable node token (node-scoped API key) for a project and store
+    /// it locally so `node up` uses it instead of the rotating session token.
+    /// Uses the current session to mint once; the token itself never rotates.
+    Mint {
+        /// Project to scope the token to. Defaults to the active project.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Revoke the stored node token (deletes the platform key + the local file).
+    Revoke,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2817,6 +2839,14 @@ async fn main() -> Result<()> {
                             value_string(&response, &["your_public_key_received"]).unwrap_or("")
                         );
                     }
+                }
+            },
+            NodeCommands::Token { command } => match command {
+                TokenCommands::Mint { project } => {
+                    handle_node_token_mint(&paths, project.as_deref()).await?;
+                }
+                TokenCommands::Revoke => {
+                    handle_node_token_revoke(&paths).await?;
                 }
             },
         },
@@ -5663,6 +5693,99 @@ fn resolve_active_project_id(paths: &PrismPaths) -> Result<String> {
         .ok_or_else(|| {
             anyhow!("No active project selected. Run `prism login` or set MARC27_PROJECT_ID.")
         })
+}
+
+/// Mint a durable node token (a node-scoped API key) and store it locally so
+/// `node up` authenticates with a stable credential instead of the rotating
+/// session token. The current session is used once to mint; the token itself
+/// never rotates and is revocable via `node token revoke` (or the dashboard).
+async fn handle_node_token_mint(paths: &PrismPaths, project: Option<&str>) -> Result<()> {
+    let project_id = match project {
+        Some(p) => p.to_string(),
+        None => resolve_active_project_id(paths)?,
+    };
+
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    // POST /api-keys with node scope + no expiry → a stable, revocable token.
+    // (marc27-core's WS auth accepts API keys; the node scope marks it as a
+    // node credential for display/revocation.)
+    let created: serde_json::Value = auth
+        .apply(client.post(format!("{api_base}/api-keys")))
+        .json(&serde_json::json!({
+            "project_id": project_id,
+            "scopes": ["node"],
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let token = prism_runtime::StoredNodeToken {
+        key: created["key"]
+            .as_str()
+            .context("platform did not return a key")?
+            .to_string(),
+        id: created["id"].as_str().unwrap_or("").to_string(),
+        prefix: created["prefix"].as_str().unwrap_or("").to_string(),
+    };
+
+    paths.save_node_token(&token)?;
+
+    println!("Minted durable node token (prefix: {}).", token.prefix);
+    println!(
+        "Stored at {}. `prism node up` will now use it and survive",
+        paths.node_token_path().display()
+    );
+    println!("session token rotation. Revoke with `prism node token revoke`.");
+    Ok(())
+}
+
+/// Revoke the stored durable node token: delete the platform key, then remove
+/// the local file. Falls back to deleting just the local file if the platform
+/// id is unknown or the call fails (so a leaked token is still revocable).
+async fn handle_node_token_revoke(paths: &PrismPaths) -> Result<()> {
+    let Some(token) = paths.load_node_token() else {
+        println!("No durable node token stored.");
+        return Ok(());
+    };
+
+    let revoked_on_platform = match resolve_agent_auth() {
+        Ok((api_base, auth)) => {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()?;
+            match auth
+                .apply(client.delete(format!("{api_base}/api-keys/{}", token.id)))
+                .send()
+                .await
+            {
+                Ok(resp) => resp.status().is_success(),
+                Err(e) => {
+                    println!("Could not reach platform to revoke ({e}); removing local file only.");
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            println!("Not authenticated to revoke on platform ({e}); removing local file only.");
+            false
+        }
+    };
+
+    let removed = paths.clear_node_token();
+    if revoked_on_platform && removed {
+        println!("Node token revoked on platform and removed locally.");
+    } else if removed {
+        println!("Removed local node-token file (platform revoke skipped/failed).");
+    } else {
+        println!("Local node-token file was already gone.");
+    }
+    Ok(())
 }
 
 fn parse_string_map_arg(

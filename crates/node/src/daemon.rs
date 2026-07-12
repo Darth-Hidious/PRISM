@@ -1709,6 +1709,15 @@ async fn cleanup_orphaned_deployments(state_dir: &Path) -> Result<()> {
 }
 
 async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) -> Result<String> {
+    // Prefer a durable node token: a stable, non-rotating node-scoped API key.
+    // The platform accepts it for the node WS (authenticate_ws validates API
+    // keys), and it does NOT expire with the session — so the daemon survives
+    // refresh-token rotation (the reason long-running nodes kept dying).
+    if let Some(node_token) = paths.load_node_token() {
+        tracing::debug!("using durable node token (does not rotate)");
+        return Ok(node_token.key);
+    }
+
     // Headless/agent path: a stable `m27_*` API key needs no login and never
     // expires. The platform's node-WS handshake validates the `?token=` param
     // as a JWT first, then as an API key, so hand the key straight through —
@@ -1724,7 +1733,7 @@ async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) ->
     let creds = state
         .credentials
         .as_ref()
-        .context("not logged in — set MARC27_API_KEY or run `prism login` first")?;
+        .context("not logged in — run `prism login`, set MARC27_API_KEY, or `prism node token mint` for a stable node token")?;
 
     if let Some(expires_at) = creds.expires_at
         && chrono::Utc::now() >= expires_at
