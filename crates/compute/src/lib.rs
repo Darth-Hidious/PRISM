@@ -25,6 +25,7 @@ use uuid::Uuid;
 pub use backend::ComputeRouter;
 pub use job::JobTracker;
 pub use local::LocalBackend;
+pub use marc27::Marc27Auth;
 pub use marc27::Marc27Backend;
 
 /// Trait for compute dispatch backends.

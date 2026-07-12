@@ -291,8 +291,9 @@ enum Commands {
         /// Backend: local, marc27, or byoc.
         #[arg(long, default_value = "local")]
         backend: String,
-        /// MARC27 platform API URL (for marc27 backend).
-        #[arg(long, default_value = "https://platform.marc27.com/api/v1")]
+        /// MARC27 platform API URL (for marc27 backend). Defaults to the public
+        /// gateway; override only to point at a staging/self-hosted control plane.
+        #[arg(long, default_value = "https://api.marc27.com/api/v1")]
         platform_url: String,
         /// BYOC SSH target: user@host (enables SSH backend).
         #[arg(long)]
@@ -5601,6 +5602,21 @@ fn friendly_status(resp: reqwest::Response, action: &str) -> Result<reqwest::Res
     Ok(resp.error_for_status()?)
 }
 
+/// Default `--platform-url` for `prism run --backend marc27`. Kept as a const so
+/// `handle_run` can tell an explicit override from the default and pick the
+/// agent-resolved base otherwise.
+const DEFAULT_RUN_PLATFORM_URL: &str = "https://api.marc27.com/api/v1";
+
+/// Map the CLI's `PlatformAuth` (API key vs session Bearer) onto the compute
+/// crate's decoupled `Marc27Auth`. Same semantics: API keys → `X-API-Key`,
+/// sessions → `Authorization: Bearer`.
+fn marc27_auth_from(auth: PlatformAuth) -> prism_compute::Marc27Auth {
+    match auth {
+        PlatformAuth::ApiKey(key) => prism_compute::Marc27Auth::ApiKey(key),
+        PlatformAuth::Bearer(token) => prism_compute::Marc27Auth::Bearer(token),
+    }
+}
+
 /// Resolve platform auth for agents (MARC27_API_KEY env var → X-API-Key header).
 /// Decoupled from user auth — agents use API keys, users use JWT.
 /// Falls back to user auth if no API key is set (backward compat).
@@ -8161,14 +8177,25 @@ async fn handle_run(
     } else {
         match backend {
             "marc27" | "platform" => {
-                // Read token from credentials
-                let token = std::env::var("MARC27_API_TOKEN").unwrap_or_else(|_| "".to_string());
+                // Resolve auth exactly like `prism compute` does: API key first
+                // (MARC27_API_KEY → X-API-Key), else a Bearer session/token. The
+                // old code read only MARC27_API_TOKEN and sent it as Bearer, which
+                // 401'd for API-key agents.
+                let (resolved_base, platform_auth) = resolve_agent_auth()?;
+                let auth = marc27_auth_from(platform_auth);
+                // Honor an explicit --platform-url override; otherwise use the
+                // agent-resolved base (api.marc27.com/api/v1).
+                let api_base = if platform_url == DEFAULT_RUN_PLATFORM_URL {
+                    resolved_base
+                } else {
+                    platform_url.to_string()
+                };
                 (
-                    ComputeRouter::with_marc27(platform_url, &token),
+                    ComputeRouter::with_marc27(&api_base, auth),
                     "marc27",
                     serde_json::json!({
                         "kind": "marc27",
-                        "platform_url": platform_url,
+                        "platform_url": api_base,
                     }),
                 )
             }
@@ -8237,15 +8264,23 @@ async fn handle_job_status(job_id_str: &str) -> Result<()> {
         .parse()
         .with_context(|| format!("invalid job UUID: {job_id_str}"))?;
 
-    // Try local backend first
-    let router = prism_compute::backend::ComputeRouter::local_only();
-    match router.status(job_id).await {
-        Ok(status) => {
-            println!("Job: {job_id}");
-            println!("Status: {:?}", status);
-        }
-        Err(e) => {
-            println!("Job {job_id}: {e}");
+    // Jobs submitted via `prism run --backend marc27` (and the run/run_submit
+    // agent tools) live on the MARC27 compute broker, so query the live API.
+    // The local JobTracker is in-memory only and empty in a fresh process, so
+    // it cannot answer for a platform job.
+    let (api_base, platform_auth) = resolve_agent_auth()?;
+    let backend = prism_compute::Marc27Backend::new(&api_base, marc27_auth_from(platform_auth));
+    use prism_compute::ComputeBackend as _;
+
+    println!("Job: {job_id}");
+    let status = backend.status(job_id).await?;
+    println!("Status: {status:?}");
+    // Surface the output inline when the job is done, so `prism job-status`
+    // works end-to-end (status + result) the way the run hint promises.
+    if matches!(status, prism_compute::JobStatus::Completed) {
+        match backend.results(job_id).await {
+            Ok(output) => println!("Output: {output}"),
+            Err(e) => println!("Output: unavailable ({e})"),
         }
     }
 
