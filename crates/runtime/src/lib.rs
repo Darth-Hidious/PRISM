@@ -397,7 +397,10 @@ mod tests {
         // Store 2: SDK mirror exists with the exact 6-field shape the Python
         // platform tools read.
         let mirror_path = home.join(".prism").join("credentials.json");
-        assert!(mirror_path.exists(), "SDK mirror must be written on refresh");
+        assert!(
+            mirror_path.exists(),
+            "SDK mirror must be written on refresh"
+        );
         let mirror: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&mirror_path).unwrap()).unwrap();
         assert_eq!(mirror["access_token"], "at-new");
