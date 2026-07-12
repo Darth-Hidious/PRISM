@@ -129,6 +129,11 @@ pub struct AgentConfig {
     pub max_iterations: usize,
     pub auto_approve: bool,
     pub model: String,
+    /// When set (weak/unknown models via their PromptProfile), the per-request
+    /// tool set is restricted to the curated core set + find_tools + tools the
+    /// model has pinned via discovery. Default false = today's full top-K.
+    #[serde(default)]
+    pub core_tools_only: bool,
 }
 
 impl Default for AgentConfig {
@@ -138,6 +143,7 @@ impl Default for AgentConfig {
             max_iterations: 20,
             auto_approve: false,
             model: "claude-sonnet-4-6".to_string(),
+            core_tools_only: false,
         }
     }
 }

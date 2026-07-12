@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::prompt_profile::{LengthBudget, PromptProfile, ReasoningMode, StructureStyle};
 use crate::tool_catalog::ToolCatalog;
 
 /// Build the full base system prompt for either interactive or autonomous mode.
@@ -27,7 +28,11 @@ pub fn build_system_prompt(interactive: bool) -> String {
 /// for this session. This keeps the prompt aligned with the runtime surface
 /// without dumping the full tool catalog into the prompt itself.
 #[must_use]
-pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> String {
+pub fn append_runtime_tool_guidance(
+    base_prompt: &str,
+    tools: &ToolCatalog,
+    profile: &PromptProfile,
+) -> String {
     let tool_names = tools
         .iter()
         .map(|tool| tool.name.as_str())
@@ -200,14 +205,13 @@ pub fn append_runtime_tool_guidance(base_prompt: &str, tools: &ToolCatalog) -> S
         return base_prompt.to_string();
     }
 
-    format!(
-        "{base_prompt}\n\n# Loaded Tool Strategy\n{}",
-        bullets
-            .into_iter()
-            .map(|bullet| format!("- {bullet}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    )
+    let body = bullets
+        .into_iter()
+        .map(|bullet| format!("- {bullet}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let section = render_one_section("Loaded Tool Strategy", &body, profile.structure_style);
+    format!("{base_prompt}\n\n{section}")
 }
 
 fn has_tool(tool_names: &BTreeSet<&str>, name: &str) -> bool {
@@ -348,12 +352,224 @@ You may be running as a small local model. The harness compensates for that only
 /// compatibility with code that referenced `SYSTEM_PROMPT`.
 pub const SYSTEM_PROMPT: &str = INTERACTIVE_PROMPT;
 
+// ---------------------------------------------------------------------------
+// Profile-aware rendering — the "fluid mechanism".
+//
+// The canonical prompts above are authored in Markdown-header form. Every
+// `PromptProfile` style is produced by *transforming* that single source, so:
+//   - MarkdownHeaders + Full is byte-for-byte the canonical text (zero drift),
+//   - XmlTags / PlainImperative rewrite only the section *delimiters* — the
+//     section *bodies* are never edited, so no content is lost across styles,
+//   - Compact drops a small set of nice-to-have sections.
+// This keeps one source of truth and removes any transcription-drift risk.
+// ---------------------------------------------------------------------------
+
+/// Nice-to-have sections dropped under a `Compact` length budget. `Result
+/// Quality` is the most redundant for weak/local models — its no-hallucination
+/// guidance is already covered, more forcefully, by `Knowing Your Limits`.
+const COMPACT_DROP_SECTIONS: &[&str] = &["Result Quality"];
+
+/// A short chain-of-thought nudge appended only under `ReasoningMode::PromptedCoT`
+/// (models without native thinking). Rendered in the profile's structure style.
+const COT_TITLE: &str = "Reasoning";
+const COT_BODY: &str = "Think step by step before acting. In one or two lines, state what the user needs, which tool fits, and what could go wrong — then take a single concrete action. Reason briefly, then act; do not pad the answer.";
+
+/// A parsed section of a canonical prompt. `title == None` is the pre-header
+/// preamble (the identity line). `body` carries no trailing blank lines.
+struct PromptBlock {
+    title: Option<String>,
+    body: String,
+}
+
+/// Split a canonical Markdown-header prompt into ordered blocks. The text
+/// before the first `# ` header is the preamble; each `# Title` starts a new
+/// block whose body runs until the next header, trailing blank lines trimmed.
+fn split_into_blocks(canonical: &str) -> Vec<PromptBlock> {
+    let mut blocks: Vec<PromptBlock> = Vec::new();
+    let mut title: Option<String> = None;
+    let mut body: Vec<&str> = Vec::new();
+
+    let flush = |blocks: &mut Vec<PromptBlock>, title: &Option<String>, body: &[&str]| {
+        let mut end = body.len();
+        while end > 0 && body[end - 1].is_empty() {
+            end -= 1;
+        }
+        // Skip an empty leading preamble (a prompt that opens with a header).
+        if title.is_none() && end == 0 {
+            return;
+        }
+        blocks.push(PromptBlock {
+            title: title.clone(),
+            body: body[..end].join("\n"),
+        });
+    };
+
+    for line in canonical.lines() {
+        if let Some(rest) = line.strip_prefix("# ") {
+            flush(&mut blocks, &title, &body);
+            title = Some(rest.to_string());
+            body.clear();
+        } else {
+            body.push(line);
+        }
+    }
+    flush(&mut blocks, &title, &body);
+    blocks
+}
+
+/// Render one titled section in the given structure style.
+fn render_one_section(title: &str, body: &str, style: StructureStyle) -> String {
+    match style {
+        StructureStyle::XmlTags => {
+            let tag = xml_tag(title);
+            format!("<{tag}>\n{body}\n</{tag}>")
+        }
+        StructureStyle::MarkdownHeaders => format!("# {title}\n{body}"),
+        StructureStyle::PlainImperative => format!("{title}\n{body}"),
+    }
+}
+
+/// `Working Style` -> `working_style`.
+fn xml_tag(title: &str) -> String {
+    title.to_ascii_lowercase().replace(' ', "_")
+}
+
+fn render_blocks(blocks: &[PromptBlock], profile: &PromptProfile) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for block in blocks {
+        match &block.title {
+            None => parts.push(block.body.clone()),
+            Some(title) => {
+                if profile.length_budget == LengthBudget::Compact
+                    && COMPACT_DROP_SECTIONS.contains(&title.as_str())
+                {
+                    continue;
+                }
+                parts.push(render_one_section(
+                    title,
+                    &block.body,
+                    profile.structure_style,
+                ));
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// Render a canonical prompt for a specific model profile — the single entry
+/// point the "fluid mechanism" flows through.
+#[must_use]
+pub fn render_system_prompt(canonical: &str, profile: &PromptProfile) -> String {
+    // Fast path: the default style + full budget IS the canonical text. Returns
+    // it verbatim so the default agent path provably cannot drift.
+    let mut out = if profile.structure_style == StructureStyle::MarkdownHeaders
+        && profile.length_budget == LengthBudget::Full
+    {
+        canonical.to_string()
+    } else {
+        render_blocks(&split_into_blocks(canonical), profile)
+    };
+
+    if profile.reasoning_invocation == ReasoningMode::PromptedCoT {
+        out.push_str("\n\n");
+        out.push_str(&render_one_section(
+            COT_TITLE,
+            COT_BODY,
+            profile.structure_style,
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::permissions::PermissionMode;
+    use crate::prompt_profile::{LengthBudget, MaxTokensPolicy, ToolSurface, profile_for_model};
     use crate::tool_catalog::{LoadedTool, ToolCatalog};
     use serde_json::json;
+
+    fn markdown_full() -> PromptProfile {
+        PromptProfile {
+            structure_style: StructureStyle::MarkdownHeaders,
+            length_budget: LengthBudget::Full,
+            tool_surface: ToolSurface::All,
+            reasoning_invocation: ReasoningMode::None,
+            max_tokens_policy: MaxTokensPolicy::ModelMax,
+        }
+    }
+
+    /// Non-negotiable: the default style + full budget reproduces today's prompt
+    /// byte-for-byte, so the default agent path is provably unchanged.
+    #[test]
+    fn markdown_full_is_byte_for_byte_canonical() {
+        assert_eq!(
+            render_system_prompt(INTERACTIVE_PROMPT, &markdown_full()),
+            INTERACTIVE_PROMPT
+        );
+    }
+
+    /// The section decomposition is faithful: rebuilding Markdown from the parsed
+    /// blocks reproduces the canonical text (modulo the literal's trailing newline).
+    #[test]
+    fn block_decomposition_roundtrips() {
+        let blocks = split_into_blocks(INTERACTIVE_PROMPT);
+        let rebuilt = render_blocks(&blocks, &markdown_full());
+        assert_eq!(rebuilt, INTERACTIVE_PROMPT.trim_end_matches('\n'));
+    }
+
+    /// XML rendering wraps every section in tags and loses no body content.
+    #[test]
+    fn xml_render_wraps_sections_and_preserves_bodies() {
+        let profile = profile_for_model("claude-opus-4-6");
+        assert_eq!(profile.structure_style, StructureStyle::XmlTags);
+        let xml = render_system_prompt(INTERACTIVE_PROMPT, &profile);
+        assert!(xml.contains("<working_style>"));
+        assert!(xml.contains("</working_style>"));
+        assert!(xml.contains("<knowing_your_limits>"));
+        assert!(!xml.contains("# System"));
+        // Every non-header, non-blank line of the canonical prompt survives.
+        for line in INTERACTIVE_PROMPT.lines() {
+            if line.is_empty() || line.starts_with("# ") {
+                continue;
+            }
+            assert!(xml.contains(line), "XML render dropped line: {line}");
+        }
+    }
+
+    /// Plain rendering strips both header markers and tags but keeps body lines.
+    #[test]
+    fn plain_render_flattens_but_preserves_bodies() {
+        let profile = profile_for_model("some-local-model-7b");
+        assert_eq!(profile.structure_style, StructureStyle::PlainImperative);
+        let plain = render_system_prompt(INTERACTIVE_PROMPT, &profile);
+        assert!(!plain.contains("# System"));
+        assert!(!plain.contains("<working_style>"));
+        assert!(plain.contains("You are PRISM"));
+    }
+
+    /// Compact budget drops the designated nice-to-have section.
+    #[test]
+    fn compact_drops_result_quality() {
+        let mut profile = markdown_full();
+        profile.length_budget = LengthBudget::Compact;
+        let compact = render_system_prompt(INTERACTIVE_PROMPT, &profile);
+        assert!(!compact.contains("Result Quality"));
+        // But keeps the safety-critical section.
+        assert!(compact.contains("Knowing Your Limits"));
+    }
+
+    /// PromptedCoT appends a reasoning nudge; other modes do not.
+    #[test]
+    fn prompted_cot_appends_reasoning_section() {
+        let unknown = profile_for_model("some-local-model-7b");
+        assert_eq!(unknown.reasoning_invocation, ReasoningMode::PromptedCoT);
+        let with_cot = render_system_prompt(INTERACTIVE_PROMPT, &unknown);
+        assert!(with_cot.contains("Think step by step before acting"));
+
+        let no_cot = render_system_prompt(INTERACTIVE_PROMPT, &markdown_full());
+        assert!(!no_cot.contains("Think step by step before acting"));
+    }
 
     #[test]
     fn interactive_prompt_contains_interactive_guidance() {
@@ -395,7 +611,7 @@ mod tests {
             },
         ]);
 
-        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert!(prompt.contains("# Loaded Tool Strategy"));
         assert!(prompt.contains("Treat workflows as the primary orchestration surface"));
         assert!(prompt.contains("agent_capabilities"));
@@ -434,7 +650,7 @@ mod tests {
             },
         ]);
 
-        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert!(prompt.contains("Use node tools to inspect local capability"));
         assert!(prompt.contains("Use marketplace tools"));
     }
@@ -442,7 +658,7 @@ mod tests {
     #[test]
     fn runtime_guidance_stays_empty_for_empty_catalog() {
         let catalog = ToolCatalog::default();
-        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert_eq!(prompt, SYSTEM_PROMPT);
     }
 
@@ -459,7 +675,7 @@ mod tests {
             source_detail: Some("atlas".to_string()),
         }]);
 
-        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog);
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert!(prompt.contains("external MCP servers"));
     }
 }

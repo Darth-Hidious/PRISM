@@ -392,9 +392,17 @@ pub struct App {
     pub status_text: String,
     pub tool_count: u64,
     pub prism_version: String,
-    // Streaming performance metrics
+    // Streaming performance metrics. `tokens_received` is an ESTIMATE from
+    // visible-text bytes (~4 chars/token), NOT a real usage count — the backend
+    // does not forward per-turn usage over the UI channel yet. Rendered with a
+    // `~`. Thinking deltas are excluded; the rate is measured over the text
+    // phase (`first_text_time`), not from the first thinking token.
     pub tokens_received: u64,
+    /// Accumulated visible-text bytes this turn (feeds the token estimate).
+    pub output_bytes: u64,
     pub first_token_time: Option<std::time::Instant>,
+    /// First *visible-text* delta — the rate denominator (excludes thinking).
+    pub first_text_time: Option<std::time::Instant>,
     pub last_token_time: Option<std::time::Instant>,
     pub tokens_per_sec: f64,
     pub show_cost: bool,
@@ -496,7 +504,9 @@ impl App {
             prism_version: String::new(),
             max_messages: 500,
             tokens_received: 0,
+            output_bytes: 0,
             first_token_time: None,
+            first_text_time: None,
             last_token_time: None,
             tokens_per_sec: 0.0,
             show_cost: true,
@@ -2881,9 +2891,17 @@ impl App {
         self.is_thinking = true;
         self.status_text = "Thinking…".to_string();
         self.auto_scroll = true;
-        // Reset streaming metrics
+        self.reset_stream_metrics();
+    }
+
+    /// Clear the streaming throughput meter. Called at turn start and on any
+    /// turn error, so a failed/partial turn never leaves a stale or bogus rate
+    /// on screen.
+    fn reset_stream_metrics(&mut self) {
         self.tokens_received = 0;
+        self.output_bytes = 0;
         self.first_token_time = None;
+        self.first_text_time = None;
         self.last_token_time = None;
         self.tokens_per_sec = 0.0;
     }
@@ -3018,16 +3036,24 @@ impl App {
                 self.message_count = message_count;
             }
             AgentMsg::TextDelta(text) => {
-                // Track streaming metrics
                 let now = std::time::Instant::now();
                 if self.first_token_time.is_none() {
                     self.first_token_time = Some(now);
                 }
+                // Rate denominator starts at the first VISIBLE-text token, not
+                // the first thinking token, so a long reasoning phase doesn't
+                // deflate the reported text throughput.
+                if self.first_text_time.is_none() {
+                    self.first_text_time = Some(now);
+                }
                 self.last_token_time = Some(now);
-                self.tokens_received += 1;
+                // Estimate tokens from bytes (~4 chars/token). The old code
+                // counted each SSE *delta* as one token, conflating chunk count
+                // with token count — a meaningless rate.
+                self.output_bytes += text.len() as u64;
+                self.tokens_received = self.output_bytes / 4;
 
-                // Calculate tokens/sec
-                if let (Some(first), Some(last)) = (self.first_token_time, self.last_token_time) {
+                if let (Some(first), Some(last)) = (self.first_text_time, self.last_token_time) {
                     let elapsed = last.duration_since(first).as_secs_f64();
                     if elapsed > 0.0 {
                         self.tokens_per_sec = self.tokens_received as f64 / elapsed;
@@ -3039,21 +3065,13 @@ impl App {
                 self.is_thinking = false;
             }
             AgentMsg::ThinkingDelta(text) => {
-                // Reasoning tokens — track metrics but render separately
-                let now = std::time::Instant::now();
+                // Reasoning tokens are rendered separately and deliberately
+                // EXCLUDED from the visible-text throughput meter. Only track
+                // first_token_time so the "waiting" spinner clears on first
+                // activity.
                 if self.first_token_time.is_none() {
-                    self.first_token_time = Some(now);
+                    self.first_token_time = Some(std::time::Instant::now());
                 }
-                self.last_token_time = Some(now);
-                self.tokens_received += 1;
-
-                if let (Some(first), Some(last)) = (self.first_token_time, self.last_token_time) {
-                    let elapsed = last.duration_since(first).as_secs_f64();
-                    if elapsed > 0.0 {
-                        self.tokens_per_sec = self.tokens_received as f64 / elapsed;
-                    }
-                }
-
                 self.append_thinking_text(&text);
                 self.is_waiting = false;
             }
@@ -3199,9 +3217,12 @@ impl App {
                     (None, _) => "[error]".to_string(),
                 };
                 self.push_error(&format!("{prefix} {message}"));
+                // A failed turn must not leave a bogus throughput reading.
+                self.reset_stream_metrics();
             }
             AgentMsg::Error(e) => {
                 self.push_error(&e);
+                self.reset_stream_metrics();
             }
             AgentMsg::Unknown(_) => {}
         }

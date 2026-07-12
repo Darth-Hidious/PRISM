@@ -9,14 +9,14 @@ use uuid::Uuid;
 use crate::byoc::{ByocBackend, ByocTarget};
 use crate::job::JobTracker;
 use crate::local::LocalBackend;
-use crate::marc27::Marc27Backend;
+use crate::marc27::{Marc27Auth, Marc27Backend};
 use crate::{ComputeBackend, ExperimentPlan, JobStatus};
 
 /// Which backend to use for a given job.
 #[derive(Debug, Clone)]
 pub enum BackendKind {
     Local,
-    Marc27 { base_url: String, api_token: String },
+    Marc27 { api_base: String, auth: Marc27Auth },
     Byoc(ByocTarget),
 }
 
@@ -42,15 +42,18 @@ impl ComputeRouter {
     }
 
     /// Create a router with local + MARC27 platform backends.
-    pub fn with_marc27(base_url: &str, api_token: &str) -> Self {
+    ///
+    /// `api_base` is normalised by [`Marc27Backend`] so the `/api/v1` prefix
+    /// appears exactly once (a bare host or a prefixed base both work).
+    pub fn with_marc27(api_base: &str, auth: Marc27Auth) -> Self {
         Self {
             local: LocalBackend::new(),
-            marc27: Some(Marc27Backend::new(base_url, api_token)),
+            marc27: Some(Marc27Backend::new(api_base, auth.clone())),
             byoc: None,
             tracker: JobTracker::new(),
             default_backend: BackendKind::Marc27 {
-                base_url: base_url.to_string(),
-                api_token: api_token.to_string(),
+                api_base: api_base.to_string(),
+                auth,
             },
         }
     }
@@ -221,7 +224,10 @@ mod tests {
 
     #[test]
     fn marc27_image_routes_to_platform() {
-        let router = ComputeRouter::with_marc27("https://platform.marc27.com", "tok");
+        let router = ComputeRouter::with_marc27(
+            "https://api.marc27.com/api/v1",
+            Marc27Auth::Bearer("tok".into()),
+        );
         let plan = ExperimentPlan {
             name: "test".into(),
             image: "marc27/calphad-runner:latest".into(),
@@ -261,7 +267,10 @@ mod tests {
 
     #[test]
     fn backend_name_platform_in_image_routes_to_marc27_when_backend_present() {
-        let router = ComputeRouter::with_marc27("https://platform.marc27.com", "tok");
+        let router = ComputeRouter::with_marc27(
+            "https://api.marc27.com/api/v1",
+            Marc27Auth::Bearer("tok".into()),
+        );
         let plan = ExperimentPlan {
             name: "t".into(),
             image: "platform/experiment:v1".into(),

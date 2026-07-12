@@ -8,6 +8,7 @@ pub mod hooks;
 pub mod meta_tools;
 pub mod models;
 pub mod permissions;
+pub mod prompt_profile;
 pub mod prompts;
 pub mod protocol;
 pub mod scratchpad;

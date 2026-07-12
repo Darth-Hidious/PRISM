@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use tracing::debug;
@@ -73,15 +73,25 @@ impl PlatformClient {
         &self.client
     }
 
-    /// Build authorization headers if a token is set.
+    /// Build authorization headers if a credential is set.
+    ///
+    /// Routes by credential shape: non-expiring `m27_*` API keys authenticate
+    /// on the `X-API-Key` header, while rotating session JWTs use
+    /// `Authorization: Bearer`. The platform rejects each on the other's
+    /// channel, so a headless server or agent configured with an API key
+    /// (no login, no device flow, no refresh) authenticates correctly here.
     pub(crate) fn auth_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         if let Some(ref token) = self.access_token {
-            let val = HeaderValue::from_str(&format!("Bearer {token}"))
-                .context("invalid characters in access token")?;
-            headers.insert(AUTHORIZATION, val);
+            if token.starts_with("m27_") {
+                let val = HeaderValue::from_str(token).context("invalid characters in API key")?;
+                headers.insert(HeaderName::from_static("x-api-key"), val);
+            } else {
+                let val = HeaderValue::from_str(&format!("Bearer {token}"))
+                    .context("invalid characters in access token")?;
+                headers.insert(AUTHORIZATION, val);
+            }
         }
-        headers.try_reserve(0).ok(); // no-op, keeps borrow checker happy
         Ok(headers)
     }
 

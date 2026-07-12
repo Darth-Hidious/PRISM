@@ -543,6 +543,25 @@ fn finalize_tools(
     defs
 }
 
+/// Restrict a selected tool list to the curated [`CORE_TOOL_SET`], always
+/// keeping the meta-tools (find_tools + recall) and pinned (discovered) tools so
+/// a weak model can still reach the full catalog through find_tools. Used only
+/// when the model's PromptProfile asked for a core-only surface.
+fn tier_to_core(
+    tools: Vec<ToolDefinition>,
+    pinned: &std::collections::HashSet<String>,
+) -> Vec<ToolDefinition> {
+    tools
+        .into_iter()
+        .filter(|def| {
+            let name = def.function.name.as_str();
+            crate::prompt_profile::CORE_TOOL_SET.contains(&name)
+                || crate::meta_tools::is_meta_tool(name)
+                || pinned.contains(name)
+        })
+        .collect()
+}
+
 /// Keyword selection (fallback path): top-K by keyword match on `route`, then
 /// meta-tools + pinned.
 fn assemble_request_tools(
@@ -762,9 +781,20 @@ pub async fn run_turn(
                 crate::tool_catalog::MAX_TOOLS_PER_REQUEST,
             )
         };
+        // Core-set tiering (weak/unknown models via their PromptProfile): keep
+        // only the curated core tools, but ALWAYS keep the meta-tools
+        // (find_tools + recall) and anything the model pinned via discovery — so
+        // the model can still reach the full catalog through find_tools. Capable
+        // models keep the full relevance-ranked top-K.
+        let relevant_tools = if config.core_tools_only {
+            tier_to_core(relevant_tools, &pinned_tools)
+        } else {
+            relevant_tools
+        };
         tracing::debug!(
             total_tools = tool_catalog.len(),
             selected_tools = relevant_tools.len(),
+            core_only = config.core_tools_only,
             "tool selection for LLM call"
         );
 
@@ -1965,5 +1995,34 @@ mod tests {
         let defs = tools_to_definitions(&json);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].function.name, "search");
+    }
+
+    #[test]
+    fn tier_to_core_keeps_core_meta_and_pinned_only() {
+        let json = serde_json::json!({
+            "tools": [
+                { "name": "read_file", "description": "d", "input_schema": {"type":"object"} },
+                { "name": "deploy_create", "description": "d", "input_schema": {"type":"object"} },
+                { "name": "find_tools", "description": "d", "input_schema": {"type":"object"} },
+                { "name": "mesh_publish", "description": "d", "input_schema": {"type":"object"} }
+            ]
+        });
+        let defs = tools_to_definitions(&json);
+        let mut pinned = std::collections::HashSet::new();
+        pinned.insert("mesh_publish".to_string()); // discovered via find_tools → stays callable
+        let names: Vec<String> = tier_to_core(defs, &pinned)
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect();
+        assert!(names.iter().any(|n| n == "read_file"), "core tool kept");
+        assert!(names.iter().any(|n| n == "find_tools"), "meta tool kept");
+        assert!(
+            names.iter().any(|n| n == "mesh_publish"),
+            "pinned tool kept"
+        );
+        assert!(
+            !names.iter().any(|n| n == "deploy_create"),
+            "non-core non-pinned tool dropped"
+        );
     }
 }

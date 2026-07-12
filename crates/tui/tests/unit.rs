@@ -351,11 +351,14 @@ fn thinking_delta_appends_separately() {
 #[test]
 fn text_delta_tracks_streaming_metrics() {
     let mut app = test_app();
-    app.apply_agent_msg(AgentMsg::TextDelta("a".into()));
-    assert_eq!(app.tokens_received, 1);
-    assert!(app.first_token_time.is_some());
-    app.apply_agent_msg(AgentMsg::TextDelta("b".into()));
+    // Metrics are estimated from accumulated visible-text BYTES (~4 chars per
+    // token), not from the count of SSE deltas (which conflated chunk count
+    // with token count). 8 bytes ⇒ ~2 tokens.
+    app.apply_agent_msg(AgentMsg::TextDelta("abcdefgh".into()));
     assert_eq!(app.tokens_received, 2);
+    assert!(app.first_token_time.is_some());
+    app.apply_agent_msg(AgentMsg::TextDelta("ijklmnop".into()));
+    assert_eq!(app.tokens_received, 4); // 16 bytes / 4
 }
 
 #[test]

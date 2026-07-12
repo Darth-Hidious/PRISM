@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! PRISM CLI — the main entry point for the `prism` binary.
 //!
 //! Handles command routing (setup, login, node, workflow, etc.), auth bootstrap
@@ -290,8 +291,9 @@ enum Commands {
         /// Backend: local, marc27, or byoc.
         #[arg(long, default_value = "local")]
         backend: String,
-        /// MARC27 platform API URL (for marc27 backend).
-        #[arg(long, default_value = "https://platform.marc27.com/api/v1")]
+        /// MARC27 platform API URL (for marc27 backend). Defaults to the public
+        /// gateway; override only to point at a staging/self-hosted control plane.
+        #[arg(long, default_value = "https://api.marc27.com/api/v1")]
         platform_url: String,
         /// BYOC SSH target: user@host (enables SSH backend).
         #[arg(long)]
@@ -704,6 +706,28 @@ enum NodeCommands {
         #[command(subcommand)]
         command: KeyCommands,
     },
+    /// Manage the durable node token — a stable, non-rotating API key that
+    /// keeps `node up` alive across session refresh-token rotation (the
+    /// rotating session token is what kills long-running nodes today).
+    Token {
+        #[command(subcommand)]
+        command: TokenCommands,
+    },
+}
+
+/// Durable node-token subcommands.
+#[derive(Debug, Subcommand)]
+enum TokenCommands {
+    /// Mint a stable node token (node-scoped API key) for a project and store
+    /// it locally so `node up` uses it instead of the rotating session token.
+    /// Uses the current session to mint once; the token itself never rotates.
+    Mint {
+        /// Project to scope the token to. Defaults to the active project.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Revoke the stored node token (deletes the platform key + the local file).
+    Revoke,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1101,6 +1125,13 @@ struct SelectedContext {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the process-wide rustls CryptoProvider before ANY TLS can happen.
+    // `prism node up` makes its first HTTPS call in register_node (well before
+    // the node daemon, which was the only place this was installed), and rustls
+    // panics on the first handshake if no process default is set (#131). ok():
+    // a second install elsewhere returns Err harmlessly.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Tracing goes to STDERR, never stdout: `prism backend` speaks JSON-RPC
     // over stdout, and any log line there corrupts the protocol (the TUI
     // deadlocks at "Igniting core..."). Stderr is captured to
@@ -1771,15 +1802,20 @@ async fn main() -> Result<()> {
                                 // resolves it server-side.
                                 preference.unwrap_or_else(|| "default".to_string())
                             });
-                    // Bearer for the platform: deliberate overrides
-                    // (LLM_API_KEY, MARC27_TOKEN) → the session JWT.
+                    // Credential for the platform LLM proxy, in precedence
+                    // order: explicit LLM_API_KEY override → the stable
+                    // `m27_*` API key (MARC27_API_KEY — no login, no expiry,
+                    // the headless-server/agent path) → MARC27_TOKEN → the
+                    // logged-in session JWT. The LLM client routes an `m27_*`
+                    // value onto X-API-Key and a JWT onto Bearer automatically.
                     // Provider keys are NOT platform credentials.
                     let marc27_key = std::env::var("LLM_API_KEY")
+                        .or_else(|_| std::env::var("MARC27_API_KEY"))
                         .or_else(|_| std::env::var("MARC27_TOKEN"))
                         .ok()
                         .or_else(|| platform_token.clone());
                     (
-                        marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url),
+                        marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url)?,
                         model,
                         marc27_key,
                     )
@@ -2805,6 +2841,14 @@ async fn main() -> Result<()> {
                     }
                 }
             },
+            NodeCommands::Token { command } => match command {
+                TokenCommands::Mint { project } => {
+                    handle_node_token_mint(&paths, project.as_deref()).await?;
+                }
+                TokenCommands::Revoke => {
+                    handle_node_token_revoke(&paths).await?;
+                }
+            },
         },
         Commands::Ingest {
             path,
@@ -3022,7 +3066,7 @@ async fn main() -> Result<()> {
                             println!();
                         }
                         println!(
-                            "{} resources found. Install with: prism marketplace install <slug>",
+                            "{} resources found. Install any by its [slug] — `marketplace install <slug>`, or ask the agent.",
                             tools.len()
                         );
                     }
@@ -3102,7 +3146,7 @@ async fn main() -> Result<()> {
                     } else if hits.is_empty() {
                         println!("No semantic matches for `{query}`.");
                         println!(
-                            "Try a different phrasing, or `prism marketplace search <query>` for \
+                            "Try a different phrasing, or `marketplace search <query>` for \
                              lexical search."
                         );
                     } else {
@@ -5588,6 +5632,21 @@ fn friendly_status(resp: reqwest::Response, action: &str) -> Result<reqwest::Res
     Ok(resp.error_for_status()?)
 }
 
+/// Default `--platform-url` for `prism run --backend marc27`. Kept as a const so
+/// `handle_run` can tell an explicit override from the default and pick the
+/// agent-resolved base otherwise.
+const DEFAULT_RUN_PLATFORM_URL: &str = "https://api.marc27.com/api/v1";
+
+/// Map the CLI's `PlatformAuth` (API key vs session Bearer) onto the compute
+/// crate's decoupled `Marc27Auth`. Same semantics: API keys → `X-API-Key`,
+/// sessions → `Authorization: Bearer`.
+fn marc27_auth_from(auth: PlatformAuth) -> prism_compute::Marc27Auth {
+    match auth {
+        PlatformAuth::ApiKey(key) => prism_compute::Marc27Auth::ApiKey(key),
+        PlatformAuth::Bearer(token) => prism_compute::Marc27Auth::Bearer(token),
+    }
+}
+
 /// Resolve platform auth for agents (MARC27_API_KEY env var → X-API-Key header).
 /// Decoupled from user auth — agents use API keys, users use JWT.
 /// Falls back to user auth if no API key is set (backward compat).
@@ -5634,6 +5693,99 @@ fn resolve_active_project_id(paths: &PrismPaths) -> Result<String> {
         .ok_or_else(|| {
             anyhow!("No active project selected. Run `prism login` or set MARC27_PROJECT_ID.")
         })
+}
+
+/// Mint a durable node token (a node-scoped API key) and store it locally so
+/// `node up` authenticates with a stable credential instead of the rotating
+/// session token. The current session is used once to mint; the token itself
+/// never rotates and is revocable via `node token revoke` (or the dashboard).
+async fn handle_node_token_mint(paths: &PrismPaths, project: Option<&str>) -> Result<()> {
+    let project_id = match project {
+        Some(p) => p.to_string(),
+        None => resolve_active_project_id(paths)?,
+    };
+
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    // POST /api-keys with node scope + no expiry → a stable, revocable token.
+    // (marc27-core's WS auth accepts API keys; the node scope marks it as a
+    // node credential for display/revocation.)
+    let created: serde_json::Value = auth
+        .apply(client.post(format!("{api_base}/api-keys")))
+        .json(&serde_json::json!({
+            "project_id": project_id,
+            "scopes": ["node"],
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let token = prism_runtime::StoredNodeToken {
+        key: created["key"]
+            .as_str()
+            .context("platform did not return a key")?
+            .to_string(),
+        id: created["id"].as_str().unwrap_or("").to_string(),
+        prefix: created["prefix"].as_str().unwrap_or("").to_string(),
+    };
+
+    paths.save_node_token(&token)?;
+
+    println!("Minted durable node token (prefix: {}).", token.prefix);
+    println!(
+        "Stored at {}. `prism node up` will now use it and survive",
+        paths.node_token_path().display()
+    );
+    println!("session token rotation. Revoke with `prism node token revoke`.");
+    Ok(())
+}
+
+/// Revoke the stored durable node token: delete the platform key, then remove
+/// the local file. Falls back to deleting just the local file if the platform
+/// id is unknown or the call fails (so a leaked token is still revocable).
+async fn handle_node_token_revoke(paths: &PrismPaths) -> Result<()> {
+    let Some(token) = paths.load_node_token() else {
+        println!("No durable node token stored.");
+        return Ok(());
+    };
+
+    let revoked_on_platform = match resolve_agent_auth() {
+        Ok((api_base, auth)) => {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()?;
+            match auth
+                .apply(client.delete(format!("{api_base}/api-keys/{}", token.id)))
+                .send()
+                .await
+            {
+                Ok(resp) => resp.status().is_success(),
+                Err(e) => {
+                    println!("Could not reach platform to revoke ({e}); removing local file only.");
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            println!("Not authenticated to revoke on platform ({e}); removing local file only.");
+            false
+        }
+    };
+
+    let removed = paths.clear_node_token();
+    if revoked_on_platform && removed {
+        println!("Node token revoked on platform and removed locally.");
+    } else if removed {
+        println!("Removed local node-token file (platform revoke skipped/failed).");
+    } else {
+        println!("Local node-token file was already gone.");
+    }
+    Ok(())
 }
 
 fn parse_string_map_arg(
@@ -7795,6 +7947,16 @@ async fn refresh_access_token(
         chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
     });
 
+    // Mirror the rotated tokens to the SDK store (`~/.prism/credentials.json`)
+    // that the Python platform tools read. Every caller already re-saves
+    // `cli-state.json`, but the SDK mirror was left untouched on silent
+    // refresh — so after rotation it held a refresh token the server had
+    // REVOKED (single-use rotation). Replaying that stale token tripped the
+    // server's token-family invalidation and forced a device-flow re-login
+    // (the "re-login every ~24h" dance). Writing it here keeps both stores in
+    // lockstep on every refresh. Best-effort: a mirror hiccup never fails auth.
+    prism_runtime::PrismPaths::save_sdk_credentials(&new_creds);
+
     Ok(new_creds)
 }
 
@@ -8138,14 +8300,25 @@ async fn handle_run(
     } else {
         match backend {
             "marc27" | "platform" => {
-                // Read token from credentials
-                let token = std::env::var("MARC27_API_TOKEN").unwrap_or_else(|_| "".to_string());
+                // Resolve auth exactly like `prism compute` does: API key first
+                // (MARC27_API_KEY → X-API-Key), else a Bearer session/token. The
+                // old code read only MARC27_API_TOKEN and sent it as Bearer, which
+                // 401'd for API-key agents.
+                let (resolved_base, platform_auth) = resolve_agent_auth()?;
+                let auth = marc27_auth_from(platform_auth);
+                // Honor an explicit --platform-url override; otherwise use the
+                // agent-resolved base (api.marc27.com/api/v1).
+                let api_base = if platform_url == DEFAULT_RUN_PLATFORM_URL {
+                    resolved_base
+                } else {
+                    platform_url.to_string()
+                };
                 (
-                    ComputeRouter::with_marc27(platform_url, &token),
+                    ComputeRouter::with_marc27(&api_base, auth),
                     "marc27",
                     serde_json::json!({
                         "kind": "marc27",
-                        "platform_url": platform_url,
+                        "platform_url": api_base,
                     }),
                 )
             }
@@ -8214,15 +8387,23 @@ async fn handle_job_status(job_id_str: &str) -> Result<()> {
         .parse()
         .with_context(|| format!("invalid job UUID: {job_id_str}"))?;
 
-    // Try local backend first
-    let router = prism_compute::backend::ComputeRouter::local_only();
-    match router.status(job_id).await {
-        Ok(status) => {
-            println!("Job: {job_id}");
-            println!("Status: {:?}", status);
-        }
-        Err(e) => {
-            println!("Job {job_id}: {e}");
+    // Jobs submitted via `prism run --backend marc27` (and the run/run_submit
+    // agent tools) live on the MARC27 compute broker, so query the live API.
+    // The local JobTracker is in-memory only and empty in a fresh process, so
+    // it cannot answer for a platform job.
+    let (api_base, platform_auth) = resolve_agent_auth()?;
+    let backend = prism_compute::Marc27Backend::new(&api_base, marc27_auth_from(platform_auth));
+    use prism_compute::ComputeBackend as _;
+
+    println!("Job: {job_id}");
+    let status = backend.status(job_id).await?;
+    println!("Status: {status:?}");
+    // Surface the output inline when the job is done, so `prism job-status`
+    // works end-to-end (status + result) the way the run hint promises.
+    if matches!(status, prism_compute::JobStatus::Completed) {
+        match backend.results(job_id).await {
+            Ok(output) => println!("Output: {output}"),
+            Err(e) => println!("Output: unavailable ({e})"),
         }
     }
 
@@ -8529,9 +8710,25 @@ fn model_limits(models: &[serde_json::Value], model_id: &str) -> (Option<u64>, O
 /// `http://localhost:8080` (llama.cpp). Using that fallback
 /// unconditionally is exactly what made "MARC27 cloud" chat run on a
 /// local 16k model.
-fn marc27_llm_base_url(paths: &PrismPaths, api_base: &str, fallback_url: &str) -> String {
+/// The built-in `[llm].url` default (core config.rs `default_llm_url`). When
+/// `fallback_url` still equals this, the user never configured an endpoint.
+const DEFAULT_LLM_URL: &str = "http://localhost:8080";
+
+/// Resolve the base URL for the MARC27 cloud chat target.
+///
+/// Order: explicit `LLM_BASE_URL` → the signed-in project's MARC27 endpoint →
+/// an explicitly-configured `[llm].url`. It deliberately does NOT silently fall
+/// back to the built-in localhost default: an unauthenticated user with no
+/// configured endpoint used to run "cloud" chat against a local model while the
+/// header showed the cloud model and credits never moved (#132). That case is
+/// now an honest error (owner policy: explicit-only local mode).
+fn marc27_llm_base_url(
+    paths: &PrismPaths,
+    api_base: &str,
+    fallback_url: &str,
+) -> anyhow::Result<String> {
     if let Ok(explicit) = std::env::var("LLM_BASE_URL") {
-        return explicit;
+        return Ok(explicit);
     }
     if let Some(project_id) = paths
         .load_cli_state()
@@ -8539,14 +8736,48 @@ fn marc27_llm_base_url(paths: &PrismPaths, api_base: &str, fallback_url: &str) -
         .and_then(|s| s.credentials)
         .and_then(|c| c.project_id)
     {
-        return marc27_llm_url_for_project(api_base, &project_id);
+        return Ok(marc27_llm_url_for_project(api_base, &project_id));
     }
-    fallback_url.to_string()
+    // Unauthenticated: honor only an explicitly-set url, refuse the default.
+    resolve_unauth_llm_url(fallback_url)
+}
+
+/// Unauthenticated-case policy (owner: explicit-only local mode). An `[llm].url`
+/// that differs from the built-in default is a deliberate local-mode choice and
+/// is honored; the untouched default is refused with an honest message rather
+/// than silently pointing "cloud" chat at localhost (#132).
+fn resolve_unauth_llm_url(fallback_url: &str) -> anyhow::Result<String> {
+    if fallback_url != DEFAULT_LLM_URL {
+        return Ok(fallback_url.to_string());
+    }
+    anyhow::bail!(
+        "Not signed in and no LLM endpoint configured. Sign in to use MARC27 cloud \
+         (run sign-in from the palette), or set `[llm].url` in prism.toml (or LLM_BASE_URL) \
+         to use a local model explicitly."
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unauth_llm_url_refuses_built_in_default() {
+        // #132: unauthenticated + untouched default must NOT silently become
+        // localhost — it errors instead.
+        assert!(resolve_unauth_llm_url(DEFAULT_LLM_URL).is_err());
+    }
+
+    #[test]
+    fn unauth_llm_url_honors_explicit_config() {
+        // A user who explicitly configured a local endpoint keeps local mode.
+        let explicit = "http://192.168.1.50:9000";
+        assert_eq!(
+            resolve_unauth_llm_url(explicit).unwrap(),
+            explicit,
+            "an explicitly-set [llm].url is a deliberate local-mode choice"
+        );
+    }
 
     #[test]
     fn marc27_model_prefers_user_selection_over_default() {

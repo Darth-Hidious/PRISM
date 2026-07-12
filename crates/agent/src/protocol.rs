@@ -36,7 +36,8 @@ use crate::hooks::{HookRegistry, build_default_hooks};
 use crate::permissions::{
     PermissionMode, PermissionOverrides, SharedPermissionOverrides, ToolPermissionContext,
 };
-use crate::prompts::{append_runtime_tool_guidance, build_system_prompt};
+use crate::prompt_profile::{PromptProfile, profile_for_model};
+use crate::prompts::{append_runtime_tool_guidance, build_system_prompt, render_system_prompt};
 use crate::scratchpad::Scratchpad;
 use crate::session::{RuntimeSessionState, SessionStore};
 use crate::tool_catalog::ToolCatalog;
@@ -405,44 +406,11 @@ async fn poll_native_device_login(
 }
 
 fn sync_sdk_credentials(creds: &StoredCredentials) {
-    let sdk_creds = serde_json::json!({
-        "access_token": creds.access_token,
-        "refresh_token": creds.refresh_token,
-        "platform_url": creds.platform_url,
-        "user_id": creds.user_id,
-        "org_id": creds.org_id,
-        "project_id": creds.project_id,
-    });
-    if let Some(home) = std::env::var_os("HOME") {
-        let sdk_path = PathBuf::from(home).join(".prism").join("credentials.json");
-        if let Some(parent) = sdk_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&sdk_creds) {
-            // 0600 on unix — file holds bearer + refresh tokens. Plain
-            // fs::write inherits the user's umask (typically 0644 = world-
-            // readable on most Linux distros), which would let any other
-            // local user read PRISM tokens.
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                if let Ok(mut file) = fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&sdk_path)
-                {
-                    let _ = file.write_all(json.as_bytes());
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = fs::write(&sdk_path, json);
-            }
-        }
-    }
+    // Single source of truth for the `~/.prism/credentials.json` SDK mirror —
+    // login (here) and silent refresh (CLI + node daemon) all go through the
+    // same writer so the two credential stores can never drift in shape or
+    // freshness. See PrismPaths::save_sdk_credentials.
+    PrismPaths::save_sdk_credentials(creds);
 }
 
 fn clear_sdk_credentials() {
@@ -1567,8 +1535,13 @@ fn system_prompt_for_mode(
     base_prompt: &str,
     plan_state: &PlanRuntimeState,
     tools: &ToolCatalog,
+    profile: &PromptProfile,
 ) -> String {
-    let base_prompt = append_runtime_tool_guidance(base_prompt, tools);
+    // Render the canonical base in this model's structure style, then append
+    // tool guidance in the same style. Resolving the profile per turn (from the
+    // live model) means /model switches re-shape the prompt for free.
+    let rendered_base = render_system_prompt(base_prompt, profile);
+    let base_prompt = append_runtime_tool_guidance(&rendered_base, tools, profile);
     match mode {
         SessionMode::Chat => {
             if let Some(approved_plan) = &plan_state.approved_plan_body {
@@ -2769,10 +2742,29 @@ fn format_doctor_report(
         .budget_warning()
         .unwrap_or_else(|| "none".to_string());
 
+    // Resolve the model's PromptProfile so /doctor shows the fluid mechanism in
+    // effect — works turn-zero (no live conversation required). The endpoint
+    // shape doubles as a coarse auth/mode signal without extra plumbing.
+    let profile = profile_for_model(&llm_config.model);
+    let endpoint = &llm_config.base_url;
+    let mode_hint = if endpoint.contains("/llm") || endpoint.contains("api.marc27") {
+        "MARC27 cloud (signed-in endpoint)"
+    } else if endpoint.contains("localhost") || endpoint.contains("127.0.0.1") {
+        "local"
+    } else {
+        "direct provider"
+    };
+
     truncate_for_ui(
         &format!(
-            "Doctor\n  model: {}\n  session mode: {}\n  tool count: {}\n  project root: {}\n  python: {}\n  budget warning: {}\n  transcript entries: {}\n\nIf a command behaves unexpectedly, check:\n  1. active session mode and permissions\n  2. current model selection\n  3. python tool server availability\n  4. project root and working directory assumptions",
+            "Doctor\n  model: {}\n  llm endpoint: {} ({})\n  prompt profile: style={:?} length={:?} tools={:?} reasoning={:?}\n  session mode: {}\n  tool count: {}\n  project root: {}\n  python: {}\n  budget warning: {}\n  transcript entries: {}\n\nIf a command behaves unexpectedly, check:\n  1. active session mode and permissions\n  2. current model selection\n  3. python tool server availability\n  4. project root and working directory assumptions",
             llm_config.model,
+            endpoint,
+            mode_hint,
+            profile.structure_style,
+            profile.length_budget,
+            profile.tool_surface,
+            profile.reasoning_invocation,
             session_mode.as_str(),
             tools.len(),
             slash_ctx.project_root.display(),
@@ -4971,11 +4963,15 @@ fn spawn_agent_turn(
         let llm = LlmClient::new(runtime.llm_config.clone());
         let mut turn_config = config.as_ref().clone();
         turn_config.auto_approve = auto_approve;
+        let profile = profile_for_model(&runtime.llm_config.model);
+        turn_config.core_tools_only =
+            profile.tool_surface == crate::prompt_profile::ToolSurface::CoreSetPlusFind;
         turn_config.system_prompt = system_prompt_for_mode(
             runtime.session_mode,
             &config.system_prompt,
             &runtime.plan_state,
             tools.as_ref(),
+            &profile,
         );
 
         let turn_result = agent_loop::run_turn(
@@ -5601,8 +5597,14 @@ async fn handle_command(
             Ok(true)
         }
         "/context" => {
-            let system_prompt =
-                system_prompt_for_mode(*session_mode, &config.system_prompt, plan_state, tools);
+            let profile = profile_for_model(&llm_config.model);
+            let system_prompt = system_prompt_for_mode(
+                *session_mode,
+                &config.system_prompt,
+                plan_state,
+                tools,
+                &profile,
+            );
             emit_context_screen(
                 slash_ctx,
                 session_store,
