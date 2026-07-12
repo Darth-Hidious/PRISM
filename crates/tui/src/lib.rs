@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! PRISM TUI — full-screen Ratatui terminal UI for the AI agent.
 //!
 //! Architecture: The Elm Architecture (TEA)

@@ -1709,11 +1709,22 @@ async fn cleanup_orphaned_deployments(state_dir: &Path) -> Result<()> {
 }
 
 async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) -> Result<String> {
+    // Headless/agent path: a stable `m27_*` API key needs no login and never
+    // expires. The platform's node-WS handshake validates the `?token=` param
+    // as a JWT first, then as an API key, so hand the key straight through —
+    // no cli-state, no refresh, no 24h re-login.
+    if let Ok(key) = std::env::var("MARC27_API_KEY") {
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+
     let state = paths.load_cli_state()?;
     let creds = state
         .credentials
         .as_ref()
-        .context("not logged in — run `prism login` first")?;
+        .context("not logged in — set MARC27_API_KEY or run `prism login` first")?;
 
     if let Some(expires_at) = creds.expires_at
         && chrono::Utc::now() >= expires_at
@@ -1760,7 +1771,12 @@ async fn refresh_token(
         stored.expires_at = refreshed.expires_in.and_then(|secs| {
             chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
         });
-        paths.save_cli_state(&state)?;
+        // Persist to BOTH cli-state AND the `~/.prism/credentials.json` SDK
+        // mirror. Writing only cli-state here left the mirror holding the
+        // pre-rotation (now server-revoked) refresh token → forced re-login
+        // (see refresh_access_token in the CLI). persist_credentials keeps the
+        // two stores in lockstep on every node-side refresh.
+        paths.persist_credentials(stored)?;
     }
 
     Ok(refreshed.access_token)

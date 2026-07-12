@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! PRISM CLI — the main entry point for the `prism` binary.
 //!
 //! Handles command routing (setup, login, node, workflow, etc.), auth bootstrap
@@ -1778,10 +1779,15 @@ async fn main() -> Result<()> {
                                 // resolves it server-side.
                                 preference.unwrap_or_else(|| "default".to_string())
                             });
-                    // Bearer for the platform: deliberate overrides
-                    // (LLM_API_KEY, MARC27_TOKEN) → the session JWT.
+                    // Credential for the platform LLM proxy, in precedence
+                    // order: explicit LLM_API_KEY override → the stable
+                    // `m27_*` API key (MARC27_API_KEY — no login, no expiry,
+                    // the headless-server/agent path) → MARC27_TOKEN → the
+                    // logged-in session JWT. The LLM client routes an `m27_*`
+                    // value onto X-API-Key and a JWT onto Bearer automatically.
                     // Provider keys are NOT platform credentials.
                     let marc27_key = std::env::var("LLM_API_KEY")
+                        .or_else(|_| std::env::var("MARC27_API_KEY"))
                         .or_else(|_| std::env::var("MARC27_TOKEN"))
                         .ok()
                         .or_else(|| platform_token.clone());
@@ -7801,6 +7807,16 @@ async fn refresh_access_token(
     new_creds.expires_at = refreshed.expires_in.and_then(|secs| {
         chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
     });
+
+    // Mirror the rotated tokens to the SDK store (`~/.prism/credentials.json`)
+    // that the Python platform tools read. Every caller already re-saves
+    // `cli-state.json`, but the SDK mirror was left untouched on silent
+    // refresh — so after rotation it held a refresh token the server had
+    // REVOKED (single-use rotation). Replaying that stale token tripped the
+    // server's token-family invalidation and forced a device-flow re-login
+    // (the "re-login every ~24h" dance). Writing it here keeps both stores in
+    // lockstep on every refresh. Best-effort: a mirror hiccup never fails auth.
+    prism_runtime::PrismPaths::save_sdk_credentials(&new_creds);
 
     Ok(new_creds)
 }
