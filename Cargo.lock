@@ -4840,6 +4840,7 @@ dependencies = [
  "prism-embed",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "tracing",
  "turso",
