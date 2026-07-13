@@ -7409,6 +7409,121 @@ async fn handle_platform_query(
     Ok(())
 }
 
+/// Tenant every local single-user write uses (see the ingest pipeline's
+/// `write_local_graph` and `handle_text_ingest` — both stamp `"local"`).
+const LOCAL_ONTOLOGY_TENANT: &str = "local";
+
+/// Locally-ingested EMMO ontology matches read from the bundled Turso
+/// provenance store (`~/.prism/provenance.db`) — the store `prism ingest`
+/// writes into. This is what makes a local ingest visible to `prism query`
+/// without Neo4j running.
+struct LocalOntologyResults {
+    nodes: Vec<prism_provenance::GraphNode>,
+    edges: Vec<prism_provenance::GraphEdge>,
+    facts: Vec<prism_provenance::RecalledFact>,
+}
+
+/// Query the bundled Turso store for locally-ingested ontology.
+///
+/// Never errors: any failure (store unopenable, query error) degrades to
+/// `None` so the caller falls back to the existing Neo4j read. `None` is
+/// also returned when the store is fine but nothing matched (fresh
+/// install, unknown term) — same fallback.
+async fn local_ontology_lookup(
+    db_path: &Path,
+    text: &str,
+    limit: usize,
+) -> Option<LocalOntologyResults> {
+    let store = match prism_provenance::ProvenanceStore::open(db_path).await {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::debug!("local ontology store open failed: {e:#}");
+            return None;
+        }
+    };
+    let limit = limit.max(1) as i64;
+
+    // Exact/canonical entity name → 1-hop neighborhood (the Turso
+    // counterpart of Neo4j `neighbors`).
+    let (mut nodes, edges) = match store
+        .get_neighbors(text, None, LOCAL_ONTOLOGY_TENANT, limit)
+        .await
+    {
+        Ok(traversal) => (traversal.nodes, traversal.edges),
+        Err(e) => {
+            tracing::debug!("local ontology neighbor read failed: {e:#}");
+            (Vec::new(), Vec::new())
+        }
+    };
+
+    // No exact center → substring search over entity names.
+    if nodes.is_empty() {
+        nodes = match store.graph_search(text, LOCAL_ONTOLOGY_TENANT, limit).await {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                tracing::debug!("local ontology graph search failed: {e:#}");
+                Vec::new()
+            }
+        };
+    }
+
+    // Provenance-backed assertions mentioning the query term.
+    let facts = match store.recall(text, LOCAL_ONTOLOGY_TENANT, limit).await {
+        Ok(facts) => facts,
+        Err(e) => {
+            tracing::debug!("local ontology recall failed: {e:#}");
+            Vec::new()
+        }
+    };
+
+    if nodes.is_empty() && edges.is_empty() && facts.is_empty() {
+        return None;
+    }
+    Some(LocalOntologyResults {
+        nodes,
+        edges,
+        facts,
+    })
+}
+
+/// Render local-ontology matches in the same shape the Neo4j path prints:
+/// one `[type] name` line per entity, plus relationship and fact lines.
+fn format_local_ontology(results: &LocalOntologyResults) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if !results.nodes.is_empty() {
+        let _ = writeln!(
+            out,
+            "  Found {} matching entities (local ontology):\n",
+            results.nodes.len()
+        );
+        for node in &results.nodes {
+            let _ = writeln!(out, "  [{}] {}", node.entity_type, node.name);
+        }
+    }
+    if !results.edges.is_empty() {
+        let _ = writeln!(out, "\n  {} relationship(s):\n", results.edges.len());
+        for edge in &results.edges {
+            let _ = writeln!(
+                out,
+                "  {} -[{}]-> {}",
+                edge.source, edge.rel_type, edge.target
+            );
+        }
+    }
+    if !results.facts.is_empty() {
+        let _ = writeln!(out, "\n  {} recalled fact(s):\n", results.facts.len());
+        for fact in &results.facts {
+            let _ = writeln!(
+                out,
+                "  {} -[{}]-> {}  (confidence {:.2}, source {})",
+                fact.subject, fact.predicate, fact.object, fact.confidence, fact.source
+            );
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_query(
     text: &str,
@@ -7502,10 +7617,22 @@ async fn handle_query(
         }
     } else {
         // Natural language → graph traversal
-        // Find entities whose names match the query text, then traverse neighbors.
-        let store = Neo4jGraphStore::new(neo4j_config);
         println!("Querying knowledge graph: \"{text}\"\n");
 
+        // Local-first: `prism ingest` writes EMMO facts into the bundled
+        // Turso provenance store (~/.prism/provenance.db, tenant "local"),
+        // not Neo4j — so a locally-ingested ontology must be queryable
+        // without any running services. Read Turso first; fall back to the
+        // existing Neo4j read when it has nothing.
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let turso_db = PathBuf::from(home).join(".prism/provenance.db");
+        if let Some(local) = local_ontology_lookup(&turso_db, text, limit).await {
+            print!("{}", format_local_ontology(&local));
+            return Ok(());
+        }
+
+        // Find entities whose names match the query text, then traverse neighbors.
+        let store = Neo4jGraphStore::new(neo4j_config);
         let result = store.neighbors(text, 3).await?;
         if result.entities.is_empty() {
             println!("  No direct matches. Try --semantic for vector search.");
@@ -9246,5 +9373,148 @@ data: {\"step\":\"complete\",\"total_turns\":2}\n",
             }
             _ => panic!("expected Discourse::Run command"),
         }
+    }
+
+    // ── Local Turso ontology read (query fallback chain) ─────────────
+
+    /// Tempfile-backed Turso DB, removed (with WAL sidecars) on drop.
+    struct TempProvenanceDb {
+        path: PathBuf,
+    }
+
+    impl TempProvenanceDb {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("prism_cli_local_query_{}.db", uuid::Uuid::new_v4()));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempProvenanceDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.path.clone().into_os_string();
+                p.push(suffix);
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    #[test]
+    fn local_ontology_formatting_matches_neo4j_shape() {
+        let results = LocalOntologyResults {
+            nodes: vec![prism_provenance::GraphNode {
+                name: "Ti-6Al-4V".into(),
+                entity_type: "Matter".into(),
+                label: "Matter".into(),
+                tenant: "local".into(),
+            }],
+            edges: vec![prism_provenance::GraphEdge {
+                source: "Ti-6Al-4V".into(),
+                target: "alpha phase".into(),
+                rel_type: "hasPart".into(),
+                count: 1,
+            }],
+            facts: vec![prism_provenance::RecalledFact {
+                subject: "Ti-6Al-4V".into(),
+                predicate: "hasProperty".into(),
+                object: "tensile strength".into(),
+                confidence: 0.9,
+                source: "doc:test".into(),
+                agent: "prism-ingest".into(),
+            }],
+        };
+        let out = format_local_ontology(&results);
+        // Entity lines keep the Neo4j path's `[type] name` shape.
+        assert!(out.contains("  [Matter] Ti-6Al-4V"), "got: {out}");
+        assert!(
+            out.contains("Ti-6Al-4V -[hasPart]-> alpha phase"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains(
+                "Ti-6Al-4V -[hasProperty]-> tensile strength  (confidence 0.90, source doc:test)"
+            ),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_ontology_lookup_reads_ingested_facts_and_is_empty_safe() {
+        let db = TempProvenanceDb::new();
+
+        // Fresh (empty) store: clean miss, never an error.
+        assert!(
+            local_ontology_lookup(&db.path, "titanium", 10)
+                .await
+                .is_none(),
+            "empty store must be a clean miss"
+        );
+
+        // Write one EMMO fact the way `prism ingest` does (tenant "local").
+        let store = prism_provenance::ProvenanceStore::open(&db.path)
+            .await
+            .expect("open temp store");
+        let now = chrono::Utc::now().to_rfc3339();
+        let prov = prism_provenance::LocalProvenance {
+            activity_id: "act_test".into(),
+            agent_id: "prism-ingest".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: "doc:test".into(),
+            source_kind: "Document".into(),
+            tenant: LOCAL_ONTOLOGY_TENANT.into(),
+            started_at: now.clone(),
+            ended_at: now,
+            locality: "local".into(),
+        };
+        store.record_activity(&prov).await.expect("record activity");
+        store
+            .write_fact(
+                &prism_provenance::LocalFact {
+                    subject: "Ti-6Al-4V".into(),
+                    predicate: "hasPart".into(),
+                    object: "alpha phase".into(),
+                    value: None,
+                    unit: None,
+                    confidence: Some(0.9),
+                    kind: Some("contains".into()),
+                },
+                &prov,
+            )
+            .await
+            .expect("write fact");
+
+        // Exact name → neighbor traversal (nodes + edge). A "contains"
+        // fact is written as a CONTAINS_ELEMENT edge (see emmo write_fact).
+        let hit = local_ontology_lookup(&db.path, "Ti-6Al-4V", 10)
+            .await
+            .expect("ingested entity must be queryable");
+        assert!(hit.nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
+        assert!(
+            hit.edges
+                .iter()
+                .any(|e| e.rel_type == "CONTAINS_ELEMENT" && e.target == "alpha phase")
+        );
+
+        // Substring → graph_search fallback still finds the node.
+        let hit = local_ontology_lookup(&db.path, "6Al", 10)
+            .await
+            .expect("substring match must be queryable");
+        assert!(hit.nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
+
+        // Unknown term → clean miss (caller falls back to Neo4j).
+        assert!(
+            local_ontology_lookup(&db.path, "no-such-entity-xyz", 10)
+                .await
+                .is_none()
+        );
+
+        // Unopenable path (directory) → clean miss, never an error.
+        assert!(
+            local_ontology_lookup(&std::env::temp_dir(), "titanium", 10)
+                .await
+                .is_none(),
+            "store open failure must degrade to a miss"
+        );
     }
 }
