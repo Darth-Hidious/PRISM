@@ -19,6 +19,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 const BUILTIN_FORGE_YAML: &str = include_str!("../../../app/workflows/builtin/forge.yaml");
+const BUILTIN_INGEST_YAML: &str = include_str!("../../../app/workflows/builtin/ingest.yaml");
+const BUILTIN_MATERIALS_DISCOVERY_YAML: &str =
+    include_str!("../../../app/workflows/builtin/materials_discovery.yaml");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowArgument {
@@ -126,10 +129,14 @@ fn default_mode() -> String {
 }
 
 fn builtin_workflows() -> Result<Vec<WorkflowSpec>> {
-    Ok(vec![load_workflow_from_str(
-        BUILTIN_FORGE_YAML,
-        "builtin:forge.yaml",
-    )?])
+    Ok(vec![
+        load_workflow_from_str(BUILTIN_FORGE_YAML, "builtin:forge.yaml")?,
+        load_workflow_from_str(BUILTIN_INGEST_YAML, "builtin:ingest.yaml")?,
+        load_workflow_from_str(
+            BUILTIN_MATERIALS_DISCOVERY_YAML,
+            "builtin:materials_discovery.yaml",
+        )?,
+    ])
 }
 
 pub fn workflow_search_paths(project_root: Option<&Path>) -> Vec<PathBuf> {
@@ -480,6 +487,7 @@ pub async fn execute_workflow_with_policy(
                 "http" => run_http_step(step, &mut context, !execute, &client).await,
                 "tool" => run_tool_step(step, &mut context, !execute, &client).await,
                 "llm" => run_llm_step(step, &mut context, !execute).await,
+                "provenance" => run_provenance_step(step, &mut context, !execute).await,
                 "if" => {
                     run_if_step(
                         step,
@@ -832,6 +840,9 @@ async fn run_tool_step(
         .unwrap_or(false);
 
     if dry_run {
+        // Bind placeholder outputs so downstream steps that reference this
+        // step's declared outputs can still be planned.
+        bind_placeholder_outputs(step, context);
         return Ok(WorkflowStepResult {
             id: step.id.clone(),
             action: step.action.clone(),
@@ -846,10 +857,15 @@ async fn run_tool_step(
         });
     }
 
-    // Call the local PRISM node API
+    // Call the local PRISM node API. `node_port` may arrive as a number
+    // (set by a `set` step) or a string (CLI `--set node_port=8080` puts
+    // strings in the context) — accept both.
     let port = context
         .get("node_port")
-        .and_then(|v| v.as_u64())
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(7327);
 
     let url = format!("http://127.0.0.1:{port}/api/tools/{tool_name}/run");
@@ -902,12 +918,22 @@ async fn run_tool_step(
     });
     context.insert(step.id.clone(), stored.clone());
 
+    // Apply declared output bindings so downstream steps receive this
+    // tool's REAL outputs by name. The node wraps the tool's result as
+    // `{"tool": ..., "result": ...}` — bind against the inner result.
+    let result_value = resp_body.get("result").unwrap_or(&resp_body).clone();
+    let bindings = bind_step_outputs(step.config.get("outputs"), &result_value, context);
+
     Ok(WorkflowStepResult {
         id: step.id.clone(),
         action: step.action.clone(),
         status: "completed".to_string(),
         summary: format!("tool:{tool_name} → HTTP {status_code}"),
-        data: stored,
+        data: serde_json::json!({
+            "status_code": status_code,
+            "output": resp_body,
+            "bindings": bindings,
+        }),
     })
 }
 
@@ -1033,11 +1059,58 @@ async fn run_llm_step(
             .unwrap_or_else(|| serde_json::Value::String(String::new())),
         context,
     )?;
-    let prompt_str = if let Some(s) = prompt.as_str() {
+    let mut prompt_str = if let Some(s) = prompt.as_str() {
         s.to_string()
     } else {
         prompt.to_string()
     };
+
+    // Lowered skill steps carry `description` + `inputs` instead of a
+    // prompt: synthesize one from the step's natural-language description
+    // and the RENDERED inputs, so the model reasons over the real data
+    // produced by earlier steps.
+    if prompt_str.trim().is_empty() {
+        let description = step
+            .config
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if description.is_empty() {
+            bail!(
+                "llm step '{}' has neither `prompt` nor `description`",
+                step.id
+            );
+        }
+        let rendered_inputs = render_value(
+            config_first(&step.config, &["inputs", "args", "with", "params"])
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+            context,
+        )?;
+        prompt_str = format!(
+            "{description}\n\nInput data (JSON):\n{}",
+            serde_json::to_string_pretty(&rendered_inputs).unwrap_or_default()
+        );
+    }
+
+    // Declared outputs turn the response into a JSON contract: instruct
+    // the model to answer with exactly those keys, then parse and bind
+    // them into the context for downstream steps.
+    let output_fields: Vec<String> = step
+        .config
+        .get("outputs")
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    if !output_fields.is_empty() {
+        prompt_str.push_str(&format!(
+            "\n\nRespond with ONLY a single JSON object with exactly these keys: {}. \
+             No prose, no code fences.",
+            output_fields.join(", ")
+        ));
+    }
 
     let system = render_value(
         step.config
@@ -1072,6 +1145,7 @@ async fn run_llm_step(
         .to_string();
 
     if dry_run {
+        bind_placeholder_outputs(step, context);
         return Ok(WorkflowStepResult {
             id: step.id.clone(),
             action: step.action.clone(),
@@ -1086,12 +1160,25 @@ async fn run_llm_step(
         });
     }
 
-    // Build the LLM client from env/config. We use the same env vars
-    // that `prism backend` uses so a workflow running on a PRISM node
-    // hits the same LLM endpoint the agent uses.
-    let base_url = env::var("LLM_BASE_URL")
-        .or_else(|_| env::var("LLM_API_BASE"))
-        .unwrap_or_else(|_| "http://127.0.0.1:8081/v1".to_string());
+    // Build the LLM client from step config / context / env (first hit
+    // wins). The env vars are the same ones `prism backend` uses so a
+    // workflow running on a PRISM node hits the same LLM endpoint the
+    // agent uses; the config/context overrides let a workflow (or its
+    // caller) target a specific endpoint.
+    let base_url = step
+        .config
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            context
+                .get("llm_base_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| env::var("LLM_BASE_URL").ok())
+        .or_else(|| env::var("LLM_API_BASE").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8081/v1".to_string());
     let api_key = env::var("LLM_API_KEY")
         .or_else(|_| env::var("MARC27_TOKEN"))
         .ok();
@@ -1117,6 +1204,35 @@ async fn run_llm_step(
         .await
         .context("LLM call failed in workflow step")?;
 
+    // Bind declared outputs from the model's JSON answer. The model was
+    // explicitly instructed to return exactly these keys; an answer with
+    // none of them (or no JSON at all) is a REAL step failure — subject
+    // to the retry wrapper — never a silent success.
+    let mut bindings = serde_json::Value::Object(Default::default());
+    if !output_fields.is_empty() {
+        let parsed = extract_json_object(&response_text).ok_or_else(|| {
+            anyhow!(
+                "llm step '{}' expected a JSON object with keys [{}] but the \
+                 response contained no parseable JSON object: {}",
+                step.id,
+                output_fields.join(", "),
+                truncate_for_error(&response_text)
+            )
+        })?;
+        bindings = bind_step_outputs(step.config.get("outputs"), &parsed, context);
+        let bound_any = output_fields
+            .iter()
+            .any(|f| parsed.get(f.as_str()).is_some());
+        if !bound_any {
+            bail!(
+                "llm step '{}' returned JSON without any of the declared keys [{}]: {}",
+                step.id,
+                output_fields.join(", "),
+                truncate_for_error(&response_text)
+            );
+        }
+    }
+
     context.insert(
         output_key.clone(),
         serde_json::Value::String(response_text.clone()),
@@ -1139,6 +1255,143 @@ async fn run_llm_step(
             "prompt": &prompt_str,
             "response": response_text,
             "model": model_name,
+            "bindings": bindings,
+        }),
+    })
+}
+
+/// Truncate a possibly-huge LLM response for inclusion in an error message.
+fn truncate_for_error(text: &str) -> String {
+    const MAX: usize = 300;
+    if text.chars().count() <= MAX {
+        text.to_string()
+    } else {
+        let head: String = text.chars().take(MAX).collect();
+        format!("{head}… ({} chars total)", text.chars().count())
+    }
+}
+
+// ── Provenance step ──────────────────────────────────────────────────
+//
+// Writes a REAL, durable record into the local Turso provenance store
+// (`~/.prism/provenance.db` — the same spine the ingest pipeline and the
+// agent use). This is the deterministic execution of a skill_workflow
+// `skill: provenance` step (e.g. ingest.yaml's `record_provenance`).
+//
+// YAML (lowered form):
+//   - id: record_provenance
+//     action: provenance
+//     inputs:
+//       source_url: "{{ source }}"
+//       entities: "{{ entities }}"
+//       pipeline: ["web.read", "llm_extract", "knowledge_write.graph_ingest"]
+//       confidence: 0.85
+//
+// The db path resolves from context `provenance_db` (caller/test
+// override), then `$PRISM_PROVENANCE_DB`, then `~/.prism/provenance.db`.
+// The written record id is stored under the step id (and any declared
+// `outputs` binding for `record_id`).
+async fn run_provenance_step(
+    step: &WorkflowStep,
+    context: &mut BTreeMap<String, serde_json::Value>,
+    dry_run: bool,
+) -> Result<WorkflowStepResult> {
+    let inputs = render_value(
+        config_first(&step.config, &["inputs", "args", "with", "params"])
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+        context,
+    )?;
+
+    if dry_run {
+        bind_placeholder_outputs(step, context);
+        return Ok(WorkflowStepResult {
+            id: step.id.clone(),
+            action: step.action.clone(),
+            status: "planned".to_string(),
+            summary: "provenance record (planned)".to_string(),
+            data: serde_json::json!({ "inputs": inputs }),
+        });
+    }
+
+    let db_path = context
+        .get("provenance_db")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .or_else(|| env::var("PRISM_PROVENANCE_DB").ok().map(PathBuf::from))
+        .or_else(|| {
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".prism/provenance.db"))
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "provenance step '{}': cannot resolve a provenance db path \
+                 (no `provenance_db` in context, no $PRISM_PROVENANCE_DB, no $HOME)",
+                step.id
+            )
+        })?;
+    if let Some(parent) = db_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create provenance db directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let workflow_name = context
+        .get("workflow_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let session_id = context
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("workflow:{workflow_name}"));
+
+    let store = prism_provenance::ProvenanceStore::open(&db_path)
+        .await
+        .with_context(|| format!("failed to open provenance store {}", db_path.display()))?;
+
+    let mut record = prism_provenance::new_record(
+        &session_id,
+        prism_provenance::ActionType::Workflow,
+        prism_provenance::Actor::Agent,
+        Some(&step.id),
+        None,
+        inputs.clone(),
+    );
+    if let Some(confidence) = inputs.get("confidence").and_then(|v| v.as_f64()) {
+        record.confidence = confidence;
+    }
+    if let Some(material_ref) = inputs.get("material_ref").and_then(|v| v.as_str()) {
+        record.material_ref = Some(material_ref.to_string());
+    }
+    record.tags = vec!["workflow".to_string(), workflow_name];
+    store
+        .record(&record)
+        .await
+        .with_context(|| format!("failed to write provenance record for step '{}'", step.id))?;
+
+    let stored = serde_json::json!({
+        "record_id": record.id,
+        "session_id": session_id,
+        "db": db_path.display().to_string(),
+    });
+    context.insert(step.id.clone(), stored.clone());
+    let bindings = bind_step_outputs(step.config.get("outputs"), &stored, context);
+
+    Ok(WorkflowStepResult {
+        id: step.id.clone(),
+        action: step.action.clone(),
+        status: "completed".to_string(),
+        summary: format!("provenance record {} → {}", record.id, db_path.display()),
+        data: serde_json::json!({
+            "record": stored,
+            "inputs": inputs,
+            "bindings": bindings,
         }),
     })
 }
@@ -1533,7 +1786,16 @@ fn interpolated_display(value: &serde_json::Value) -> String {
 /// Known step actions. Used both for validation and for `did you mean?`
 /// suggestions on typos in LLM-generated workflows.
 const KNOWN_ACTIONS: &[&str] = &[
-    "set", "message", "http", "tool", "llm", "if", "loop", "parallel", "workflow",
+    "set",
+    "message",
+    "http",
+    "tool",
+    "llm",
+    "provenance",
+    "if",
+    "loop",
+    "parallel",
+    "workflow",
 ];
 
 /// Cheap edit-distance for "did you mean?" suggestions on action typos.
@@ -1589,11 +1851,14 @@ pub fn load_workflow_from_str(text: &str, source_path: &str) -> Result<WorkflowS
     let manifest: WorkflowManifest = serde_yaml::from_str(text)
         .with_context(|| format!("failed to decode workflow manifest from {source_path}"))?;
 
-    // Tolerate a few legacy / dialect aliases on `kind`. The agent's
-    // skill_workflow runner picks up `kind: skill_workflow` files via a
-    // different code path; here we only accept the deterministic
-    // `workflow` dialect, so report a clear error when the wrong
-    // dialect is fed to the wrong loader.
+    // Tolerate a few legacy / dialect aliases on `kind`. Two dialects are
+    // executable here:
+    //   * `workflow` — the deterministic dialect, steps are `id` + `action`.
+    //   * `skill_workflow` — steps are `name` + `skill`; each step is
+    //     LOWERED into a deterministic step (`tool` / `llm` / `provenance`)
+    //     before execution. `$var` templates become `{{ var }}` and the
+    //     declared `outputs:` become post-step context bindings, so real
+    //     data flows between steps. See docs/workflows.md.
     let kind = if manifest.kind.is_empty() {
         "workflow"
     } else {
@@ -1602,16 +1867,17 @@ pub fn load_workflow_from_str(text: &str, source_path: &str) -> Result<WorkflowS
     let kind_normalized = match kind {
         // Legacy / alternate spellings accepted as `workflow`
         "prism_workflow" | "prism-workflow" | "workflow" => "workflow",
+        "skill_workflow" | "skill-workflow" => "skill_workflow",
         other => other,
     };
-    if kind_normalized != "workflow" {
+    if kind_normalized != "workflow" && kind_normalized != "skill_workflow" {
         bail!(
-            "{source_path}: kind = '{kind}' is not the deterministic-workflow dialect \
-             this loader handles. Either set `kind: workflow` (or omit it) for the \
-             deterministic dialect, or move the file to a path picked up by the \
-             skill_workflow runner. See docs/workflows.md for the difference."
+            "{source_path}: kind = '{kind}' is not a dialect this loader handles. \
+             Set `kind: workflow` (or omit it) for the deterministic dialect, or \
+             `kind: skill_workflow` for the skill dialect. See docs/workflows.md."
         );
     }
+    let is_skill_dialect = kind_normalized == "skill_workflow";
 
     let name = manifest.name.unwrap_or_else(|| source_path.to_string());
     let command_name = manifest
@@ -1626,6 +1892,10 @@ pub fn load_workflow_from_str(text: &str, source_path: &str) -> Result<WorkflowS
     // friendly path. Action typos get a "did you mean?" suggestion.
     let mut steps = manifest.steps;
     for (idx, step) in steps.iter_mut().enumerate() {
+        if is_skill_dialect {
+            lower_skill_step(step, idx)
+                .with_context(|| format!("{source_path}: failed to lower skill step {idx}"))?;
+        }
         if step.id.is_empty() {
             // Synthesize a stable ID. Action included so it's
             // recognizable in logs (`tool_0`, `http_3`, etc.).
@@ -1668,6 +1938,253 @@ pub fn load_workflow_from_str(text: &str, source_path: &str) -> Result<WorkflowS
         steps,
         raw,
     })
+}
+
+// ── skill_workflow lowering ──────────────────────────────────────────
+//
+// The skill dialect describes steps as `name` + `skill` with `$var`
+// templates and declared `outputs:`. Lowering turns each skill step into
+// a deterministic step the engine executes for real:
+//
+//   * `skill: llm_*`      → `action: llm`   (prompt synthesized from the
+//                            step description + rendered inputs; declared
+//                            outputs become a JSON response contract)
+//   * `skill: provenance` → `action: provenance` (durable write to the
+//                            local Turso provenance store)
+//   * anything else       → `action: tool`  (the skill name IS the tool
+//                            name; executed via the node tool API)
+//
+// `$var` in input values becomes `{{ var }}` so the standard renderer
+// resolves it; `outputs: {field: "$var"}` is normalized to `{field: var}`
+// and applied after the step runs (see `bind_step_outputs`).
+fn lower_skill_step(step: &mut WorkflowStep, idx: usize) -> Result<()> {
+    // Mixed dialects: a step that already declares an `action` and no
+    // `skill` is a deterministic step embedded in a skill file — leave it.
+    let skill = step
+        .config
+        .get("skill")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let step_name = step
+        .config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    if step.id.is_empty()
+        && let Some(name) = &step_name
+    {
+        step.id = name.clone();
+    }
+    let Some(skill) = skill else {
+        if step.action.is_empty() {
+            bail!(
+                "skill_workflow step '{}' (index {idx}) has neither `skill` nor `action`",
+                step.id
+            );
+        }
+        return Ok(());
+    };
+    step.config.remove("skill");
+    step.config.remove("name");
+
+    // Canonicalize inputs under `inputs` with `$var` → `{{ var }}`.
+    if let Some(inputs) = config_first(&step.config, &["inputs", "args", "with", "params"]).cloned()
+    {
+        for alias in ["inputs", "args", "with", "params"] {
+            step.config.remove(alias);
+        }
+        step.config
+            .insert("inputs".to_string(), dollar_to_braces(inputs));
+    }
+
+    // Normalize outputs: `{field: "$var"}` → `{field: "var"}`.
+    if let Some(outputs) = step.config.get("outputs").cloned() {
+        let normalized = match outputs {
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (field, var) in map {
+                    let var_name = var
+                        .as_str()
+                        .map(|s| s.trim_start_matches('$').to_string())
+                        .unwrap_or_else(|| field.clone());
+                    if var_name.is_empty() {
+                        bail!(
+                            "skill_workflow step '{}' output '{field}' has an empty variable name",
+                            step.id
+                        );
+                    }
+                    out.insert(field, serde_json::Value::String(var_name));
+                }
+                serde_json::Value::Object(out)
+            }
+            other => bail!(
+                "skill_workflow step '{}' has non-object `outputs`: {other}",
+                step.id
+            ),
+        };
+        step.config.insert("outputs".to_string(), normalized);
+    }
+
+    step.action = if skill.starts_with("llm_") {
+        "llm".to_string()
+    } else if skill == "provenance" {
+        "provenance".to_string()
+    } else {
+        step.config
+            .insert("name".to_string(), serde_json::Value::String(skill));
+        "tool".to_string()
+    };
+    Ok(())
+}
+
+/// Convert `$var` references inside strings to `{{ var }}` templates,
+/// recursively through arrays and objects. Only `$` followed by an
+/// identifier start (`[A-Za-z_]`) is converted — `$5`, `US$` and similar
+/// stay literal.
+fn dollar_to_braces(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(dollar_string_to_braces(&s)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(dollar_to_braces).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, dollar_to_braces(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn dollar_string_to_braces(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        // Find the identifier following `$`.
+        let rest = &text[i + c.len_utf8()..];
+        let ident_len = rest
+            .char_indices()
+            .take_while(|(j, ch)| {
+                if *j == 0 {
+                    ch.is_ascii_alphabetic() || *ch == '_'
+                } else {
+                    ch.is_ascii_alphanumeric() || *ch == '_'
+                }
+            })
+            .last()
+            .map(|(j, ch)| j + ch.len_utf8())
+            .unwrap_or(0);
+        if ident_len == 0 {
+            out.push(c);
+            continue;
+        }
+        out.push_str("{{ ");
+        out.push_str(&rest[..ident_len]);
+        out.push_str(" }}");
+        // Skip the identifier chars we just consumed.
+        for _ in 0..rest[..ident_len].chars().count() {
+            chars.next();
+        }
+    }
+    out
+}
+
+/// Apply a step's declared `outputs` bindings to the context.
+///
+/// `outputs` maps a result FIELD name to a context VARIABLE name. For each
+/// pair the field is looked up in the step's result (top level, then under
+/// `data` / `output` — the envelopes command tools and the node use). A
+/// found field binds its value; a missing field binds the FULL result so
+/// real data still flows downstream — the fallback is recorded per
+/// variable in the returned bindings map (`"from": "full_result"`), never
+/// silently.
+fn bind_step_outputs(
+    outputs: Option<&serde_json::Value>,
+    result: &serde_json::Value,
+    context: &mut BTreeMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut bindings = serde_json::Map::new();
+    if let Some(map) = outputs.and_then(|v| v.as_object()) {
+        for (field, var) in map {
+            let var_name = var.as_str().unwrap_or(field).trim_start_matches('$');
+            match lookup_output_field(result, field) {
+                Some(value) => {
+                    context.insert(var_name.to_string(), value.clone());
+                    bindings.insert(var_name.to_string(), serde_json::json!({ "from": field }));
+                }
+                None => {
+                    context.insert(var_name.to_string(), result.clone());
+                    bindings.insert(
+                        var_name.to_string(),
+                        serde_json::json!({ "from": "full_result", "missing_field": field }),
+                    );
+                }
+            }
+        }
+    }
+    serde_json::Value::Object(bindings)
+}
+
+/// Bind PLACEHOLDER values for a step's declared outputs during dry runs,
+/// so downstream template rendering can be planned without executing
+/// anything. The placeholder names the producing step and field.
+fn bind_placeholder_outputs(
+    step: &WorkflowStep,
+    context: &mut BTreeMap<String, serde_json::Value>,
+) {
+    if let Some(map) = step.config.get("outputs").and_then(|v| v.as_object()) {
+        for (field, var) in map {
+            let var_name = var.as_str().unwrap_or(field).trim_start_matches('$');
+            context.insert(
+                var_name.to_string(),
+                serde_json::Value::String(format!("<pending:{}.{}>", step.id, field)),
+            );
+        }
+    }
+}
+
+fn lookup_output_field<'a>(
+    result: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(v) = result.get(field) {
+        return Some(v);
+    }
+    for envelope in ["data", "output", "result"] {
+        if let Some(v) = result.get(envelope).and_then(|e| e.get(field)) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Extract a JSON object from an LLM response — tolerates code fences and
+/// surrounding prose, but requires a real object to be present.
+fn extract_json_object(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|t| t.strip_suffix("```").unwrap_or(t))
+        .unwrap_or(trimmed)
+        .trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(unfenced)
+        && v.is_object()
+    {
+        return Some(v);
+    }
+    let start = unfenced.find('{')?;
+    let end = unfenced.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&unfenced[start..=end])
+        .ok()
+        .filter(|v| v.is_object())
 }
 
 fn render_value(
@@ -2102,22 +2619,204 @@ steps:
     }
 
     #[test]
-    fn rejects_skill_workflow_dialect_with_helpful_message() {
-        let err = load_workflow_from_str(
+    fn accepts_skill_workflow_dialect_and_lowers_steps() {
+        let spec = load_workflow_from_str(
             r#"
 kind: skill_workflow
 name: skill_test
 inputs:
   - name: q
+    required: true
+steps:
+  - name: search
+    skill: web
+    description: Search the web.
+    inputs:
+      action: search
+      query: "$q"
+      label: "run-$q"
+    outputs:
+      results: "$hits"
+  - name: analyze
+    skill: llm_analyze
+    description: Analyze the results.
+    inputs:
+      results: "$hits"
+    outputs:
+      verdict: "$verdict"
+  - name: record
+    skill: provenance
+    inputs:
+      source_url: "$q"
 "#,
             "inline:skill_test",
         )
+        .unwrap();
+
+        assert_eq!(spec.steps.len(), 3);
+
+        // Tool lowering: skill name becomes the tool `name`, step name the id.
+        let search = &spec.steps[0];
+        assert_eq!(search.id, "search");
+        assert_eq!(search.action, "tool");
+        assert_eq!(search.config.get("name").unwrap(), "web");
+        let inputs = search.config.get("inputs").unwrap();
+        assert_eq!(inputs["query"], "{{ q }}");
+        assert_eq!(inputs["label"], "run-{{ q }}");
+        // outputs normalized: `$hits` → `hits`
+        assert_eq!(search.config.get("outputs").unwrap()["results"], "hits");
+
+        // llm_* lowering
+        let analyze = &spec.steps[1];
+        assert_eq!(analyze.id, "analyze");
+        assert_eq!(analyze.action, "llm");
+        assert_eq!(
+            analyze.config.get("inputs").unwrap()["results"],
+            "{{ hits }}"
+        );
+
+        // provenance lowering
+        let record = &spec.steps[2];
+        assert_eq!(record.id, "record");
+        assert_eq!(record.action, "provenance");
+    }
+
+    #[test]
+    fn rejects_unknown_dialect_kind() {
+        let err = load_workflow_from_str(
+            r#"
+kind: mystery_dialect
+name: kind_test
+"#,
+            "inline:kind_test",
+        )
         .unwrap_err()
         .to_string();
-        assert!(
-            err.contains("skill_workflow") || err.contains("dialect"),
-            "got: {err}"
+        assert!(err.contains("dialect"), "got: {err}");
+    }
+
+    #[test]
+    fn dollar_conversion_edges() {
+        assert_eq!(
+            dollar_string_to_braces("discovery-$query"),
+            "discovery-{{ query }}"
         );
+        assert_eq!(dollar_string_to_braces("$source"), "{{ source }}");
+        assert_eq!(dollar_string_to_braces("costs $5 (US$)"), "costs $5 (US$)");
+        assert_eq!(
+            dollar_string_to_braces("$_x and $y2"),
+            "{{ _x }} and {{ y2 }}"
+        );
+        assert_eq!(dollar_string_to_braces("no refs"), "no refs");
+    }
+
+    #[test]
+    fn extract_json_object_variants() {
+        let plain = extract_json_object(r#"{"a": 1}"#).unwrap();
+        assert_eq!(plain["a"], 1);
+        let fenced = extract_json_object("```json\n{\"a\": 2}\n```").unwrap();
+        assert_eq!(fenced["a"], 2);
+        let prose = extract_json_object("Sure! Here you go: {\"a\": 3} — done.").unwrap();
+        assert_eq!(prose["a"], 3);
+        assert!(extract_json_object("no json here").is_none());
+        assert!(extract_json_object("[1, 2, 3]").is_none());
+    }
+
+    #[test]
+    fn output_binding_field_and_full_result_fallback() {
+        let mut context = BTreeMap::new();
+        let outputs = serde_json::json!({ "content": "content", "missing": "fallback" });
+        let result = serde_json::json!({ "content": "hello", "title": "t" });
+        let bindings = bind_step_outputs(Some(&outputs), &result, &mut context);
+        assert_eq!(context.get("content").unwrap(), "hello");
+        // Missing field binds the FULL result, recorded as such.
+        assert_eq!(context.get("fallback").unwrap(), &result);
+        assert_eq!(bindings["fallback"]["from"], "full_result");
+        assert_eq!(bindings["content"]["from"], "content");
+    }
+
+    #[test]
+    fn builtin_playbooks_all_load_and_lower() {
+        let ingest = load_workflow_from_str(BUILTIN_INGEST_YAML, "builtin:ingest.yaml").unwrap();
+        assert_eq!(
+            ingest
+                .steps
+                .iter()
+                .map(|s| (s.id.as_str(), s.action.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("discover", "tool"),
+                ("fetch", "tool"),
+                ("extract", "llm"),
+                ("store_graph", "tool"),
+                ("store_embeddings", "tool"),
+                ("record_provenance", "provenance"),
+            ]
+        );
+
+        let discovery = load_workflow_from_str(
+            BUILTIN_MATERIALS_DISCOVERY_YAML,
+            "builtin:materials_discovery.yaml",
+        )
+        .unwrap();
+        assert_eq!(discovery.steps.len(), 10);
+        for step in &discovery.steps {
+            assert!(
+                KNOWN_ACTIONS.contains(&step.action.as_str()),
+                "step {} lowered to unknown action {}",
+                step.id,
+                step.action
+            );
+        }
+
+        // All three builtins are discoverable.
+        let specs = discover_workflows(None).unwrap();
+        for name in ["forge", "ingest", "materials_discovery"] {
+            assert!(
+                find_workflow(&specs, name).is_some(),
+                "builtin '{name}' missing from discovery"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_playbooks_dry_run_end_to_end() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for (yaml, source, values) in [
+            (
+                BUILTIN_INGEST_YAML,
+                "builtin:ingest.yaml",
+                vec![("source", "https://example.com/ti64")],
+            ),
+            (
+                BUILTIN_MATERIALS_DISCOVERY_YAML,
+                "builtin:materials_discovery.yaml",
+                vec![("query", "titanium alloys")],
+            ),
+            (
+                BUILTIN_FORGE_YAML,
+                "builtin:forge.yaml",
+                vec![
+                    ("paper", "arxiv:2106.09685"),
+                    ("dataset", "materials-project"),
+                    ("target", "prism-node:local"),
+                    ("project_id", "test-project"),
+                ],
+            ),
+        ] {
+            let spec = load_workflow_from_str(yaml, source).unwrap();
+            let values: BTreeMap<String, String> = values
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let result = rt
+                .block_on(execute_workflow(&spec, &values, false))
+                .unwrap_or_else(|e| panic!("{source} dry run failed: {e:#}"));
+            assert_eq!(result.steps.len(), spec.steps.len(), "{source}");
+            for step in &result.steps {
+                assert_eq!(step.status, "planned", "{source} step {}", step.id);
+            }
+        }
     }
 
     #[test]
