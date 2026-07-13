@@ -2066,12 +2066,10 @@ async fn main() -> Result<()> {
                 let mut service_handles = None;
                 if !no_services {
                     let mut svc_config = prism_orch::ServiceConfig::default();
-                    if external_neo4j.is_some() || node_config.services.neo4j_uri.is_some() {
-                        svc_config.neo4j = None;
-                    }
-                    if external_qdrant.is_some() || node_config.services.qdrant_uri.is_some() {
-                        svc_config.vector_db = None;
-                    }
+                    // Neo4j/Qdrant are retired — the knowledge graph lives in
+                    // the bundled Turso store. Never launch their containers.
+                    svc_config.neo4j = None;
+                    svc_config.vector_db = None;
                     if with_kafka {
                         svc_config.kafka = Some(prism_orch::services::KafkaConfig::default());
                     }
@@ -2192,46 +2190,6 @@ async fn main() -> Result<()> {
                 }
 
                 // Wire backend configs — CLI flags > prism.toml > defaults
-                let managed_neo4j_running = service_handles.as_ref().is_some_and(|handles| {
-                    handles.services.iter().any(|handle| handle.name == "neo4j")
-                });
-                let managed_qdrant_running = service_handles.as_ref().is_some_and(|handles| {
-                    handles
-                        .services
-                        .iter()
-                        .any(|handle| handle.name == "qdrant")
-                });
-
-                if external_neo4j.is_some()
-                    || node_config.services.neo4j_uri.is_some()
-                    || managed_neo4j_running
-                {
-                    let neo4j_url = external_neo4j
-                        .clone()
-                        .or_else(|| node_config.services.neo4j_uri.clone())
-                        .unwrap_or_else(|| "http://localhost:7474".into());
-                    server_node_state.neo4j = Some(prism_ingest::Neo4jConfig {
-                        base_url: neo4j_url,
-                        database: "neo4j".into(),
-                        username: "neo4j".into(),
-                        password: "prism-local".into(),
-                    });
-                }
-                if external_qdrant.is_some()
-                    || node_config.services.qdrant_uri.is_some()
-                    || managed_qdrant_running
-                {
-                    let qdrant_url = external_qdrant
-                        .clone()
-                        .or_else(|| node_config.services.qdrant_uri.clone())
-                        .unwrap_or_else(|| "http://localhost:6333".into());
-                    server_node_state.qdrant = Some(prism_ingest::QdrantConfig {
-                        base_url: qdrant_url,
-                        collection: "prism_embeddings".into(),
-                        api_key: None,
-                    });
-                }
-
                 // Wire LLM config from config.toml [chat] (prism use local)
                 // falling back to prism.toml [indexer], then defaults.
                 {
