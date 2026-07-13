@@ -64,9 +64,9 @@ steps:
       query: "{{ args.input }}"
 ```
 
-### Dialect 2: `skill_workflow` (agent-orchestrated)
+### Dialect 2: `skill_workflow` (skill-oriented)
 
-You give the agent a procedural plan; the agent picks tools and parameters at each step using its own judgment. **Use for open-ended research workflows where the right tool depends on intermediate results.**
+Steps declare a `skill` plus a natural-language `description`, `$var` templates, and named `outputs`. The engine LOWERS each skill step into a deterministic step before execution — `skill: llm_*` becomes an `llm` step (the description + rendered inputs form the prompt, and declared outputs become a JSON response contract), `skill: provenance` becomes a durable write to the local provenance store, and any other skill becomes a `tool` step whose tool name is the skill name. Declared `outputs` are bound into the context after each step so real data flows downstream.
 
 ```yaml
 kind: skill_workflow
@@ -93,7 +93,7 @@ steps:
       materials: "$materials"
 ```
 
-**The key difference:** in `workflow`, you specify exact tool inputs; in `skill_workflow`, you describe intent and the agent fills in the inputs.
+**The key difference:** in `workflow`, you write the executable steps directly (`id` + `action`); in `skill_workflow`, you write `name` + `skill` with `$var` templates and declared `outputs`, and the loader lowers them onto the same deterministic executor.
 
 **When in doubt: use `workflow`.** It's predictable and easier to debug.
 
@@ -259,18 +259,32 @@ inputs:
 
 steps:
   - name: search
-    skill: materials_search   # or `tool`, `agent_action`, etc.
+    skill: materials_search   # a real tool name, `llm_*`, or `provenance`
     description: >
-      Search the federated material databases for things matching $query.
-      Use the user's query to choose elements + property ranges.
+      Search the federated material databases. Structured filters only —
+      the skill name must be a tool that exists on the node.
     inputs:
-      query: "$query"
+      elements: "$elements"
+      limit: "$limit"
     outputs:
       materials: "$materials"
-    llm_can_modify_inputs: true  # optional: agent may override inputs
 ```
 
-The agent runtime executes `skill_workflow` files. The agent reads each step's description, picks the right tool, and decides parameters.
+The workflow engine executes `skill_workflow` files by lowering each step
+onto the deterministic executor:
+
+| `skill:` value | Lowered to | Execution |
+|---|---|---|
+| `llm_*` (e.g. `llm_extract`, `llm_analyze`) | `action: llm` | Real LLM call. The prompt is the step `description` plus the rendered `inputs` as JSON. Declared `outputs` become a JSON response contract — the model must answer with those keys, which are parsed and bound into the context. A response without them fails the step. |
+| `provenance` | `action: provenance` | Durable record written to the local Turso provenance store (`~/.prism/provenance.db`, overridable via context `provenance_db` or `$PRISM_PROVENANCE_DB`). |
+| anything else | `action: tool` | The skill name IS the tool name, executed on the local node via `POST /api/tools/{name}/run`. `approve: true` on the step pre-approves approval-gated tools. |
+
+`$var` templates become `{{ var }}`; `outputs: {field: "$var"}` binds the
+field from the step's result into context variable `var` after the step
+runs (a missing field binds the full result, recorded as
+`"from": "full_result"` in the step's `bindings`). In dry-run mode,
+declared outputs bind `<pending:step.field>` placeholders so the whole
+plan renders without executing anything.
 
 ---
 

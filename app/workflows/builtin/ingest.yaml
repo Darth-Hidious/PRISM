@@ -2,9 +2,9 @@ kind: skill_workflow
 name: ingest
 description: >
   Ingest data from a source into the MARC27 Knowledge Plane.
-  The agent browses the web, reads content, extracts entities,
-  and stores everything with provenance.
-version: "1.0.0"
+  The workflow searches the web, reads content, extracts entities
+  with the LLM, and stores everything with provenance.
+version: "1.1.0"
 author: MARC27
 
 inputs:
@@ -18,24 +18,26 @@ inputs:
     default: "full"
   - name: corpus
     type: string
-    description: Corpus slug to associate with (for provenance)
+    description: Corpus UUID to associate with (for embeddings)
     required: false
 
 steps:
   - name: discover
-    skill: web_search
-    description: If source is a query, search the web to find URLs
+    skill: web
+    description: Search the web for the source to find related URLs and context.
     inputs:
+      action: search
       query: "$source"
+      limit: 5
     outputs:
-      urls: "$urls"
-    # Skip if source is already a URL
-    llm_can_modify_inputs: true
+      results: "$search_results"
+      count: "$search_count"
 
   - name: fetch
-    skill: web_read
+    skill: web
     description: Read the source URL and get clean text content
     inputs:
+      action: read
       url: "$source"
     outputs:
       content: "$content"
@@ -44,9 +46,11 @@ steps:
   - name: extract
     skill: llm_extract
     description: >
-      Use the LLM to extract structured entities and relationships
-      from the fetched content. Entity types: MAT, PRO, ELM, DSC,
-      SMT, CMT, APL, PUB, AUT, TOP, CMF.
+      Extract structured entities and relationships from the fetched
+      content. Entity types: MAT, PRO, ELM, DSC, SMT, CMT, APL, PUB,
+      AUT, TOP, CMF. Each entity is {name, entity_type, label,
+      properties?}; each relationship is {from_name, to_name, rel_type,
+      properties?}.
     inputs:
       text: "$content"
       title: "$title"
@@ -55,9 +59,11 @@ steps:
       relationships: "$relationships"
 
   - name: store_graph
-    skill: knowledge_ingest
-    description: Store extracted entities and relationships in the local knowledge graph
+    skill: knowledge_write
+    description: Store extracted entities and relationships in the knowledge graph
+    approve: true
     inputs:
+      action: graph_ingest
       entities: "$entities"
       relationships: "$relationships"
     outputs:
@@ -65,22 +71,27 @@ steps:
       relationships_created: "$relationships_created"
 
   - name: store_embeddings
-    skill: knowledge_embed
-    description: Embed the source text into pgvector for semantic search
+    skill: knowledge_write
+    description: Embed the source text for semantic search
+    approve: true
     inputs:
-      content: "$content"
+      action: embed
       doc_id: "$source"
+      content: "$content"
+      corpus_id: "$corpus"
     outputs:
       embedding_id: "$embedding_id"
-    # Only run if mode is "full" or "embed"
 
   - name: record_provenance
-    skill: knowledge_provenance
-    description: Record where this data came from
+    skill: provenance
+    description: Record where this data came from in the local provenance store
     inputs:
       entities: "$entities"
       source_url: "$source"
-      pipeline: ["web_read", "llm_extract", "graph_ingest"]
+      title: "$title"
+      pipeline: ["web.search", "web.read", "llm_extract", "knowledge_write.graph_ingest", "knowledge_write.embed"]
       confidence: 0.85
+    outputs:
+      record_id: "$provenance_record_id"
 
 on_fail: stabilize

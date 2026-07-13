@@ -4974,13 +4974,16 @@ name = "prism-workflows"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "prism-llm",
  "prism-policy",
+ "prism-provenance",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "tracing",
 ]
