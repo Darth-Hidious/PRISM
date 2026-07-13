@@ -22,6 +22,7 @@ pub mod graph_validation;
 /// and `prism_ingest::LlmConfig` continues to work.
 pub use prism_llm as llm;
 pub use prism_llm::LlmConfig;
+pub mod local_facts;
 pub mod mapping;
 pub mod nl_query;
 pub mod ontology;

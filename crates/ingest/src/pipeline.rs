@@ -1,13 +1,14 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use polars::prelude::*;
+use prism_provenance::{LocalProvenance, ProvenanceStore};
 use serde::{Deserialize, Serialize};
 use tracing;
 
 use crate::connectors::{CsvConnector, ParquetConnector};
 use crate::embeddings::{QdrantVectorStore, VectorStore};
-use crate::graph::{GraphStore, Neo4jGraphStore};
+use crate::local_facts::to_local_facts;
 use crate::ontology::LlmOntologyConstructor;
 use crate::schema::SchemaDetector;
 use crate::validation::{self, ValidationReport};
@@ -29,10 +30,11 @@ pub struct IngestResult {
     pub entities: Option<EntitySet>,
     /// SHACL-lite structural check on the extracted entities/relationships
     /// (orphan rels, unknown types, weight-sum sanity, etc.), run before the
-    /// Neo4j write. `None` only when no entities were extracted at all.
+    /// graph write. `None` only when no entities were extracted at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_validation: Option<crate::graph_validation::GraphValidationReport>,
-    /// Populated when Neo4j graph upsert runs.
+    /// Populated when the local EMMO graph write (bundled Turso store) runs.
+    /// Counts are upsert attempts, not net-new rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph: Option<GraphUpdate>,
     /// Populated when Qdrant embedding upsert runs.
@@ -59,6 +61,9 @@ pub struct PipelineConfig {
     pub max_sample_rows: usize,
     /// Custom ontology mapping rules (loaded from YAML).
     pub mapping: Option<crate::mapping::OntologyMapping>,
+    /// Path of the bundled Turso provenance store the extracted facts are
+    /// written to. If None, defaults to `~/.prism/provenance.db`.
+    pub provenance_db: Option<PathBuf>,
 }
 
 impl Default for PipelineConfig {
@@ -69,6 +74,7 @@ impl Default for PipelineConfig {
             qdrant: Some(QdrantConfig::default()),
             max_sample_rows: 10,
             mapping: None,
+            provenance_db: None,
         }
     }
 }
@@ -76,10 +82,11 @@ impl Default for PipelineConfig {
 /// Orchestrates the data ingestion pipeline:
 ///
 /// ```text
-/// Load → Schema Detection → Validation → LLM Extraction → Neo4j Graph → Qdrant Embeddings
+/// Load → Schema Detection → Validation → LLM Extraction → Local EMMO Graph (Turso) → Qdrant Embeddings
 /// ```
 ///
-/// Each downstream step (LLM, Neo4j, Qdrant) is optional — controlled by `PipelineConfig`.
+/// The downstream steps (LLM, Qdrant) are optional — controlled by `PipelineConfig`;
+/// the graph write runs whenever entities were extracted (the store is bundled).
 /// Without any configs, behaves like the original schema-only pipeline.
 pub struct IngestPipeline {
     config: PipelineConfig,
@@ -94,6 +101,7 @@ impl IngestPipeline {
                 qdrant: None,
                 max_sample_rows: 10,
                 mapping: None,
+                provenance_db: None,
             },
         }
     }
@@ -192,8 +200,8 @@ impl IngestPipeline {
         // Step 3.5: Graph quality validation (SHACL-lite) — this used to be a
         // documented "runs before writing to Neo4j" gate with zero callers
         // (AUDIT_BACKLOG 20 / INGESTION_AUDIT #20), so LLM extraction output
-        // went straight to Neo4j unchecked. Run it whenever entities exist,
-        // and refuse the Neo4j write on Error-severity issues (orphan
+        // went straight to the graph unchecked. Run it whenever entities
+        // exist, and refuse the graph write on Error-severity issues (orphan
         // relationships, empty names) rather than upserting garbage.
         let graph_validation = entities.as_ref().map(|entity_set| {
             let (report, blocking_error) = validate_before_graph_write(entity_set);
@@ -210,23 +218,25 @@ impl IngestPipeline {
         });
         let graph_validation_passed = graph_validation.as_ref().is_none_or(|r| r.passed);
 
-        // Step 4: Neo4j graph upsert (if configured, entities exist, and validation passed)
+        // Step 4: local EMMO graph write into the bundled Turso store (if
+        // entities exist and validation passed). This replaced the Neo4j
+        // upsert (Neo4j retirement, step 1) — the store is bundled, so no
+        // backend config gates the write.
         let graph = if graph_validation_passed
-            && let (Some(neo4j_config), Some(entity_set)) = (&self.config.neo4j, &entities)
+            && let Some(entity_set) = &entities
         {
-            let store = Neo4jGraphStore::new(neo4j_config.clone());
-            match store.upsert(entity_set).await {
+            match self.write_local_graph(entity_set, &source).await {
                 Ok(update) => {
                     tracing::info!(
                         nodes = update.nodes_created,
                         edges = update.edges_created,
-                        "graph upsert complete"
+                        "local graph write complete"
                     );
                     Some(update)
                 }
                 Err(e) => {
-                    tracing::error!("Neo4j upsert failed: {e:#}");
-                    errors.push(format!("Neo4j graph upsert failed: {e:#}"));
+                    tracing::error!("local graph write failed: {e:#}");
+                    errors.push(format!("local graph write failed: {e:#}"));
                     None
                 }
             }
@@ -280,6 +290,52 @@ impl IngestPipeline {
             errors,
         })
     }
+
+    /// Write the extracted entities/relationships as EMMO facts (with one
+    /// PROV-O activity for the run) into the bundled Turso provenance store.
+    async fn write_local_graph(
+        &self,
+        entity_set: &EntitySet,
+        source: &DataSource,
+    ) -> Result<GraphUpdate> {
+        let db_path = match &self.config.provenance_db {
+            Some(p) => p.clone(),
+            None => dirs::home_dir()
+                .map(|h| h.join(".prism/provenance.db"))
+                .unwrap_or_else(|| PathBuf::from("provenance.db")),
+        };
+        let store = ProvenanceStore::open(&db_path).await?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let prov = LocalProvenance {
+            activity_id: uuid::Uuid::new_v4().to_string(),
+            agent_id: self
+                .config
+                .llm
+                .as_ref()
+                .map(|l| l.model.clone())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "prism-ingest".into()),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: source.path.clone(),
+            source_kind: "Document".into(),
+            // Local single-user store — no per-pipeline tenancy (yet).
+            tenant: "local".into(),
+            started_at: now.clone(),
+            ended_at: now,
+            locality: "local".into(),
+        };
+        store.record_activity(&prov).await?;
+
+        let facts = to_local_facts(entity_set);
+        for fact in &facts {
+            store.write_fact(fact, &prov).await?;
+        }
+        Ok(GraphUpdate {
+            nodes_created: entity_set.entities.len(),
+            edges_created: facts.len(),
+        })
+    }
 }
 
 impl Default for IngestPipeline {
@@ -289,7 +345,7 @@ impl Default for IngestPipeline {
 }
 
 /// Run graph-quality validation on extracted entities and decide whether the
-/// Neo4j write should proceed. Returns the full report plus, when
+/// graph write should proceed. Returns the full report plus, when
 /// Error-severity issues are present, a message describing why the write
 /// was blocked (`None` means the write may proceed).
 fn validate_before_graph_write(
@@ -413,6 +469,95 @@ mod tests {
         assert!(cfg.llm.is_some());
         assert!(cfg.neo4j.is_some());
         assert!(cfg.qdrant.is_some());
+        // None ⇒ the bundled ~/.prism/provenance.db is used at write time.
+        assert!(cfg.provenance_db.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_local_graph_lands_facts_in_turso_store() {
+        use crate::{Entity, Relationship};
+
+        let db_path = std::env::temp_dir()
+            .join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            llm: None,
+            neo4j: None,
+            qdrant: None,
+            max_sample_rows: 10,
+            mapping: None,
+            provenance_db: Some(db_path.clone()),
+        });
+
+        let entity_set = EntitySet {
+            entities: vec![
+                Entity {
+                    entity_type: "Alloy".into(),
+                    name: "Steel".into(),
+                    properties: serde_json::json!({}),
+                },
+                Entity {
+                    entity_type: "Element".into(),
+                    name: "Fe".into(),
+                    properties: serde_json::json!({}),
+                },
+                Entity {
+                    entity_type: "Property".into(),
+                    name: "density".into(),
+                    properties: serde_json::json!({"value": 7.8, "unit": "g/cm3"}),
+                },
+            ],
+            relationships: vec![
+                Relationship {
+                    from: "Steel".into(),
+                    rel_type: "CONTAINS".into(),
+                    to: "Fe".into(),
+                    weight: Some(0.98),
+                    order: None,
+                },
+                Relationship {
+                    from: "Steel".into(),
+                    rel_type: "HAS_PROPERTY".into(),
+                    to: "density".into(),
+                    weight: None,
+                    order: None,
+                },
+            ],
+        };
+        let source = DataSource {
+            path: "/tmp/alloys.csv".into(),
+            format: "csv".into(),
+        };
+
+        let update = pipeline
+            .write_local_graph(&entity_set, &source)
+            .await
+            .unwrap();
+        assert_eq!(update.nodes_created, 3);
+        assert_eq!(update.edges_created, 2);
+
+        // Reopen the store and verify the facts actually landed, in the
+        // shapes the read API serves.
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let hits = store.graph_search("Steel", "local", 10).await.unwrap();
+        assert!(hits.iter().any(|n| n.name == "Steel" && n.label == "Matter"));
+        let tr = store
+            .get_neighbors("Steel", None, "local", 10)
+            .await
+            .unwrap();
+        assert!(tr.edges.iter().any(|e| e.rel_type == "CONTAINS_ELEMENT"));
+        assert!(tr.edges.iter().any(|e| e.rel_type == "HAS_MEASUREMENT"));
+        let facts = store.recall("Steel", "local", 10).await.unwrap();
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().all(|f| f.source == "/tmp/alloys.csv"));
+        assert!(facts.iter().all(|f| f.agent == "prism-ingest"));
+
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = db_path.clone().into_os_string();
+            p.push(suffix);
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]

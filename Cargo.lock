@@ -4691,9 +4691,12 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
+ "dirs",
  "futures-util",
  "polars",
  "prism-llm",
+ "prism-provenance",
  "reqwest",
  "serde",
  "serde_json",

@@ -36,8 +36,9 @@ pub struct LocalFact {
     pub unit: Option<String>,
     #[serde(default)]
     pub confidence: Option<f64>,
-    /// EMMO shape hint: measurement | phase | composition | processing |
-    /// structure | application. Unknown/None falls back to a generic edge.
+    /// EMMO shape hint: measurement | phase | composition | contains |
+    /// processing | structure | application. Unknown/None falls back to a
+    /// generic edge.
     #[serde(default)]
     pub kind: Option<String>,
 }
@@ -116,6 +117,14 @@ pub fn canonical_key(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// Label-qualified entity key ("{label}:{canonical name}"). Qualifying by
+/// label keeps one node per (label, name) — the same name extracted as e.g.
+/// both a Phase and a Matter stays two nodes instead of one label-churning
+/// row (mirrors core, which keeps a node per label).
+fn entity_key(label: &str, name: &str) -> String {
+    format!("{label}:{}", canonical_key(name))
 }
 
 /// Stable assertion id: SHA-256 of `canonical(subject)|predicate|canonical(object)`,
@@ -264,17 +273,18 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────
 
 impl ProvenanceStore {
-    /// UPSERT one typed entity, merging on its canonical key so re-ingest
-    /// never duplicates (mirrors core's MERGE-on-canonical-key). Last write
-    /// wins on name/label; `props_json` is only replaced when provided.
+    /// UPSERT one typed entity, merging on its label-qualified canonical key
+    /// so re-ingest never duplicates (mirrors core's MERGE-per-label).
+    /// Returns the key for edge writes. Last write wins on name;
+    /// `props_json` is only replaced when provided.
     async fn upsert_entity(
         &self,
-        key: &str,
         name: &str,
         label: &str,
         tenant: &str,
         props_json: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let key = entity_key(label, name);
         self.conn
             .execute(
                 r#"INSERT INTO emmo_entity
@@ -287,7 +297,7 @@ impl ProvenanceStore {
                        tenant = excluded.tenant,
                        props_json = COALESCE(excluded.props_json, emmo_entity.props_json)"#,
                 [
-                    Value::Text(key.to_string()),
+                    Value::Text(key.clone()),
                     Value::Text(name.to_string()),
                     Value::Text(label.to_string()),
                     // No separate short-code taxonomy locally — the EMMO label
@@ -302,11 +312,14 @@ impl ProvenanceStore {
                 ],
             )
             .await?;
-        Ok(())
+        Ok(key)
     }
 
     /// UPSERT one typed edge. The id is deterministic over
     /// (tenant, source, rel_type, target) so re-ingest updates in place.
+    /// `props_json` carries edge attributes (e.g. a composition fraction or
+    /// a processing-step order) and is only replaced when provided.
+    #[allow(clippy::too_many_arguments)]
     async fn upsert_edge(
         &self,
         source_key: &str,
@@ -315,16 +328,18 @@ impl ProvenanceStore {
         predicate: &str,
         confidence: f64,
         tenant: &str,
+        props_json: Option<&str>,
     ) -> Result<()> {
         let id = format!("{tenant}|{source_key}|{rel_type}|{target_key}");
         self.conn
             .execute(
                 r#"INSERT INTO emmo_edge
                    (id, source_key, target_key, rel_type, predicate, confidence, tenant, props_json)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                    ON CONFLICT(id) DO UPDATE SET
                        predicate = excluded.predicate,
-                       confidence = excluded.confidence"#,
+                       confidence = excluded.confidence,
+                       props_json = COALESCE(excluded.props_json, emmo_edge.props_json)"#,
                 [
                     Value::Text(id),
                     Value::Text(source_key.to_string()),
@@ -333,6 +348,10 @@ impl ProvenanceStore {
                     Value::Text(predicate.to_string()),
                     Value::Real(confidence),
                     Value::Text(tenant.to_string()),
+                    match props_json {
+                        Some(p) => Value::Text(p.to_string()),
+                        None => Value::Null,
+                    },
                 ],
             )
             .await?;
@@ -340,12 +359,10 @@ impl ProvenanceStore {
     }
 
     /// Write one fact as typed EMMO entities + edges, routing on `fact.kind`
-    /// exactly like core's six `write_*_fact` writers, then reify it as a
+    /// exactly like core's typed `write_*_fact` writers, then reify it as a
     /// PROV-O assertion so graph and audit trail stay consistent.
     pub async fn write_fact(&self, fact: &LocalFact, prov: &LocalProvenance) -> Result<()> {
         let confidence = fact.confidence.unwrap_or(0.5);
-        let subj_key = canonical_key(&fact.subject);
-        let obj_key = canonical_key(&fact.object);
         let tenant = prov.tenant.as_str();
 
         match fact.kind.as_deref() {
@@ -357,70 +374,109 @@ impl ProvenanceStore {
                     return Ok(());
                 };
                 let unit = fact.unit.clone().unwrap_or_default();
-                let meas_key = format!("meas_{subj_key}_{obj_key}_{value}");
+                let meas_name = format!(
+                    "meas_{}_{}_{value}",
+                    canonical_key(&fact.subject),
+                    canonical_key(&fact.object)
+                );
                 let props = serde_json::json!({
                     "value": value, "unit": unit, "confidence": confidence
                 });
-                self.upsert_entity(&subj_key, &fact.subject, "Matter", tenant, None)
+                let subj_key = self
+                    .upsert_entity(&fact.subject, "Matter", tenant, None)
                     .await?;
-                self.upsert_entity(&meas_key, &meas_key, "Measurement", tenant, Some(props.to_string()))
+                let meas_key = self
+                    .upsert_entity(&meas_name, "Measurement", tenant, Some(props.to_string()))
                     .await?;
-                self.upsert_entity(&obj_key, &fact.object, "Property", tenant, None)
+                let obj_key = self
+                    .upsert_entity(&fact.object, "Property", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &meas_key, "HAS_MEASUREMENT", &fact.predicate, confidence, tenant)
+                self.upsert_edge(&subj_key, &meas_key, "HAS_MEASUREMENT", &fact.predicate, confidence, tenant, None)
                     .await?;
-                self.upsert_edge(&meas_key, &obj_key, "OF_PROPERTY", &fact.predicate, confidence, tenant)
+                self.upsert_edge(&meas_key, &obj_key, "OF_PROPERTY", &fact.predicate, confidence, tenant, None)
                     .await?;
             }
             Some("phase") => {
-                self.upsert_entity(&subj_key, &fact.subject, "Matter", tenant, None)
+                let subj_key = self
+                    .upsert_entity(&fact.subject, "Matter", tenant, None)
                     .await?;
-                self.upsert_entity(&obj_key, &fact.object, "Phase", tenant, None)
+                let obj_key = self
+                    .upsert_entity(&fact.object, "Phase", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "HAS_PHASE", &fact.predicate, confidence, tenant)
+                self.upsert_edge(&subj_key, &obj_key, "HAS_PHASE", &fact.predicate, confidence, tenant, None)
                     .await?;
             }
             Some("composition") => {
                 let props = serde_json::json!({ "canonical_formula": &fact.object });
-                self.upsert_entity(&subj_key, &fact.subject, "Matter", tenant, None)
+                let subj_key = self
+                    .upsert_entity(&fact.subject, "Matter", tenant, None)
                     .await?;
-                self.upsert_entity(&obj_key, &fact.object, "Composition", tenant, Some(props.to_string()))
+                let obj_key = self
+                    .upsert_entity(&fact.object, "Composition", tenant, Some(props.to_string()))
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "HAS_COMPOSITION", &fact.predicate, confidence, tenant)
+                self.upsert_edge(&subj_key, &obj_key, "HAS_COMPOSITION", &fact.predicate, confidence, tenant, None)
+                    .await?;
+            }
+            // Mirrors core's Element node + CONTAINS_ELEMENT edge; the
+            // composition fraction (when `value` carries it) rides on the
+            // edge props, not on the nodes.
+            Some("contains") => {
+                let props = fact
+                    .value
+                    .map(|f| serde_json::json!({ "fraction": f }).to_string());
+                let subj_key = self
+                    .upsert_entity(&fact.subject, "Matter", tenant, None)
+                    .await?;
+                let obj_key = self
+                    .upsert_entity(&fact.object, "Element", tenant, None)
+                    .await?;
+                self.upsert_edge(&subj_key, &obj_key, "CONTAINS_ELEMENT", &fact.predicate, confidence, tenant, props.as_deref())
                     .await?;
             }
             Some("processing") => {
-                self.upsert_entity(&subj_key, &fact.subject, "Matter", tenant, None)
+                // The step order (when `value` carries it) rides on the edge.
+                let props = fact
+                    .value
+                    .map(|o| serde_json::json!({ "order": o }).to_string());
+                let subj_key = self
+                    .upsert_entity(&fact.subject, "Matter", tenant, None)
                     .await?;
-                self.upsert_entity(&obj_key, &fact.object, "Manufacturing", tenant, None)
+                let obj_key = self
+                    .upsert_entity(&fact.object, "Manufacturing", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "PROCESSED_BY", &fact.predicate, confidence, tenant)
+                self.upsert_edge(&subj_key, &obj_key, "PROCESSED_BY", &fact.predicate, confidence, tenant, props.as_deref())
                     .await?;
             }
             Some("structure") => {
                 let props = serde_json::json!({ "system": &fact.object });
-                self.upsert_entity(&subj_key, &fact.subject, "Matter", tenant, None)
+                let subj_key = self
+                    .upsert_entity(&fact.subject, "Matter", tenant, None)
                     .await?;
-                self.upsert_entity(&obj_key, &fact.object, "CrystalStructure", tenant, Some(props.to_string()))
+                let obj_key = self
+                    .upsert_entity(&fact.object, "CrystalStructure", tenant, Some(props.to_string()))
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "HAS_STRUCTURE", &fact.predicate, confidence, tenant)
+                self.upsert_edge(&subj_key, &obj_key, "HAS_STRUCTURE", &fact.predicate, confidence, tenant, None)
                     .await?;
             }
             Some("application") => {
-                self.upsert_entity(&subj_key, &fact.subject, "Matter", tenant, None)
+                let subj_key = self
+                    .upsert_entity(&fact.subject, "Matter", tenant, None)
                     .await?;
-                self.upsert_entity(&obj_key, &fact.object, "Application", tenant, None)
+                let obj_key = self
+                    .upsert_entity(&fact.object, "Application", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "USED_IN", &fact.predicate, confidence, tenant)
+                self.upsert_edge(&subj_key, &obj_key, "USED_IN", &fact.predicate, confidence, tenant, None)
                     .await?;
             }
             // Unknown kind: keep the fact as a generic edge, don't drop it.
             _ => {
-                self.upsert_entity(&subj_key, &fact.subject, "Matter", tenant, None)
+                let subj_key = self
+                    .upsert_entity(&fact.subject, "Matter", tenant, None)
                     .await?;
-                self.upsert_entity(&obj_key, &fact.object, "Entity", tenant, None)
+                let obj_key = self
+                    .upsert_entity(&fact.object, "Entity", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, &fact.predicate, &fact.predicate, confidence, tenant)
+                self.upsert_edge(&subj_key, &obj_key, &fact.predicate, &fact.predicate, confidence, tenant, None)
                     .await?;
             }
         }
@@ -599,7 +655,9 @@ impl ProvenanceStore {
 
     /// Edges incident to the named entity (resolved via its canonical key or
     /// exact display name) plus the adjacent nodes, optionally filtered by
-    /// relationship type.
+    /// relationship type. Keys are label-qualified, so one name may resolve
+    /// to several centers (e.g. the same name as Matter and as Phase) —
+    /// edges of all of them are returned.
     pub async fn get_neighbors(
         &self,
         name: &str,
@@ -607,92 +665,131 @@ impl ProvenanceStore {
         tenant: &str,
         limit: i64,
     ) -> Result<TraversalResult> {
-        // Resolve name → key (and grab the center node for the result).
-        let mut rows = self
-            .conn
-            .query(
-                r#"SELECT key, name, entity_type, label, tenant FROM emmo_entity
-                   WHERE tenant = ?1 AND (key = ?2 OR name = ?3) LIMIT 1"#,
-                [
-                    Value::Text(tenant.to_string()),
-                    Value::Text(canonical_key(name)),
-                    Value::Text(name.to_string()),
-                ],
-            )
-            .await?;
-        let Some(row) = rows.next().await? else {
+        // Resolve name → center keys/nodes: exact display name first
+        // (indexed), else compare the canonical part of each key in Rust
+        // (canonical_key is not expressible in SQL).
+        let mut centers: Vec<(String, GraphNode)> = Vec::new();
+        {
+            let mut rows = self
+                .conn
+                .query(
+                    r#"SELECT key, name, entity_type, label, tenant FROM emmo_entity
+                       WHERE tenant = ?1 AND name = ?2"#,
+                    [
+                        Value::Text(tenant.to_string()),
+                        Value::Text(name.to_string()),
+                    ],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                centers.push((get_str(&row, 0)?, row_to_node(&row, 1)?));
+            }
+        }
+        if centers.is_empty() {
+            let canon = canonical_key(name);
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT key, name, entity_type, label, tenant FROM emmo_entity \
+                     WHERE tenant = ?1",
+                    [Value::Text(tenant.to_string())],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let key = get_str(&row, 0)?;
+                // "{label}:{canonical}"; a pre-qualification key is the
+                // canonical name itself, so it still resolves.
+                let key_canon = key.split_once(':').map_or(key.as_str(), |(_, c)| c);
+                if key_canon == canon {
+                    let node = row_to_node(&row, 1)?;
+                    centers.push((key, node));
+                }
+            }
+        }
+        if centers.is_empty() {
             return Ok(TraversalResult {
                 nodes: Vec::new(),
                 edges: Vec::new(),
             });
-        };
-        let center_key = get_str(&row, 0)?;
-        let center = row_to_node(&row, 1)?;
-        // Exhaust the resolve cursor before issuing the next statement
-        // (turso pre-release is sensitive to interleaved open statements).
-        while rows.next().await?.is_some() {}
+        }
+
+        let mut nodes: Vec<GraphNode> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, node) in &centers {
+            if seen.insert(format!("{}:{}", node.label, node.name)) {
+                nodes.push(node.clone());
+            }
+        }
 
         const EDGE_COLS: &str = "e.rel_type, \
              s.name, s.entity_type, s.label, s.tenant, \
              t.name, t.entity_type, t.label, t.tenant";
-        let mut rows = match rel_type {
-            Some(rt) => {
-                self.conn
-                    .query(
-                        &format!(
-                            "SELECT {EDGE_COLS} FROM emmo_edge e \
-                             JOIN emmo_entity s ON s.key = e.source_key \
-                             JOIN emmo_entity t ON t.key = e.target_key \
-                             WHERE e.tenant = ?1 AND (e.source_key = ?2 OR e.target_key = ?3) \
-                               AND e.rel_type = ?4 LIMIT ?5"
-                        ),
-                        [
-                            Value::Text(tenant.to_string()),
-                            Value::Text(center_key.clone()),
-                            Value::Text(center_key.clone()),
-                            Value::Text(rt.to_string()),
-                            Value::Integer(limit),
-                        ],
-                    )
-                    .await?
-            }
-            None => {
-                self.conn
-                    .query(
-                        &format!(
-                            "SELECT {EDGE_COLS} FROM emmo_edge e \
-                             JOIN emmo_entity s ON s.key = e.source_key \
-                             JOIN emmo_entity t ON t.key = e.target_key \
-                             WHERE e.tenant = ?1 AND (e.source_key = ?2 OR e.target_key = ?3) \
-                             LIMIT ?4"
-                        ),
-                        [
-                            Value::Text(tenant.to_string()),
-                            Value::Text(center_key.clone()),
-                            Value::Text(center_key.clone()),
-                            Value::Integer(limit),
-                        ],
-                    )
-                    .await?
-            }
-        };
-
-        let mut nodes = vec![center];
-        let mut seen: std::collections::HashSet<String> =
-            nodes.iter().map(|n| n.name.clone()).collect();
-        let mut edges = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let source = row_to_node(&row, 1)?;
-            let target = row_to_node(&row, 5)?;
-            edges.push(GraphEdge {
-                source: source.name.clone(),
-                target: target.name.clone(),
-                rel_type: get_str(&row, 0)?,
-                count: 1,
-            });
-            for node in [source, target] {
-                if seen.insert(node.name.clone()) {
-                    nodes.push(node);
+        let mut edges: Vec<GraphEdge> = Vec::new();
+        let mut seen_edges: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        // One edge query per center, each cursor fully drained before the
+        // next statement (turso pre-release is sensitive to interleaved
+        // open statements).
+        for (center_key, _) in &centers {
+            let mut rows = match rel_type {
+                Some(rt) => {
+                    self.conn
+                        .query(
+                            &format!(
+                                "SELECT {EDGE_COLS} FROM emmo_edge e \
+                                 JOIN emmo_entity s ON s.key = e.source_key \
+                                 JOIN emmo_entity t ON t.key = e.target_key \
+                                 WHERE e.tenant = ?1 AND (e.source_key = ?2 OR e.target_key = ?3) \
+                                   AND e.rel_type = ?4 LIMIT ?5"
+                            ),
+                            [
+                                Value::Text(tenant.to_string()),
+                                Value::Text(center_key.clone()),
+                                Value::Text(center_key.clone()),
+                                Value::Text(rt.to_string()),
+                                Value::Integer(limit),
+                            ],
+                        )
+                        .await?
+                }
+                None => {
+                    self.conn
+                        .query(
+                            &format!(
+                                "SELECT {EDGE_COLS} FROM emmo_edge e \
+                                 JOIN emmo_entity s ON s.key = e.source_key \
+                                 JOIN emmo_entity t ON t.key = e.target_key \
+                                 WHERE e.tenant = ?1 AND (e.source_key = ?2 OR e.target_key = ?3) \
+                                 LIMIT ?4"
+                            ),
+                            [
+                                Value::Text(tenant.to_string()),
+                                Value::Text(center_key.clone()),
+                                Value::Text(center_key.clone()),
+                                Value::Integer(limit),
+                            ],
+                        )
+                        .await?
+                }
+            };
+            while let Some(row) = rows.next().await? {
+                let source = row_to_node(&row, 1)?;
+                let target = row_to_node(&row, 5)?;
+                let rel = get_str(&row, 0)?;
+                // An edge between two centers shows up in both queries.
+                if !seen_edges.insert((source.name.clone(), target.name.clone(), rel.clone())) {
+                    continue;
+                }
+                edges.push(GraphEdge {
+                    source: source.name.clone(),
+                    target: target.name.clone(),
+                    rel_type: rel,
+                    count: 1,
+                });
+                for node in [source, target] {
+                    if seen.insert(format!("{}:{}", node.label, node.name)) {
+                        nodes.push(node);
+                    }
                 }
             }
         }
@@ -816,6 +913,12 @@ mod tests {
             .unwrap_or(-1)
     }
 
+    async fn query_str(store: &ProvenanceStore, sql: &str) -> String {
+        let mut rows = store.conn.query(sql, ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        get_str(&row, 0).unwrap()
+    }
+
     #[tokio::test]
     async fn write_fact_each_kind_is_searchable_and_traversable() {
         let db = TempDb::new();
@@ -826,6 +929,7 @@ mod tests {
             ("measurement", "Ti-6Al-4V", "has_measurement", "UTS", "HAS_MEASUREMENT"),
             ("phase", "Ti-6Al-4V", "has_phase", "alpha-beta", "HAS_PHASE"),
             ("composition", "Inconel 718", "has_composition", "NiCr19Fe18", "HAS_COMPOSITION"),
+            ("contains", "Inconel 718", "contains", "Ni", "CONTAINS_ELEMENT"),
             ("processing", "Inconel 718", "processed_by", "LPBF", "PROCESSED_BY"),
             ("structure", "Ti-6Al-4V", "has_structure", "hexagonal", "HAS_STRUCTURE"),
             ("application", "Ti-6Al-4V", "used_in", "turbine blades", "USED_IN"),
@@ -871,6 +975,96 @@ mod tests {
             .unwrap()
             .edges
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_name_under_two_labels_keeps_two_entities() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        // "alpha" as a Phase (object) and as Matter (subject) — with
+        // unqualified keys these collapsed into one label-churning row.
+        store
+            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "alpha"), &prov)
+            .await
+            .unwrap();
+        store
+            .write_fact(&fact("phase", "alpha", "has_phase", "beta"), &prov)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM emmo_entity WHERE name = 'alpha'").await,
+            2
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Matter:alpha'").await,
+            1
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Phase:alpha'").await,
+            1
+        );
+
+        // Traversal from the shared name sees edges of BOTH labels.
+        let tr = store.get_neighbors("alpha", None, "t1", 10).await.unwrap();
+        assert_eq!(tr.edges.len(), 2, "expected one edge per label: {:?}", tr.edges);
+        assert!(tr.edges.iter().any(|e| e.source == "Ti-6Al-4V" && e.target == "alpha"));
+        assert!(tr.edges.iter().any(|e| e.source == "alpha" && e.target == "beta"));
+    }
+
+    #[tokio::test]
+    async fn contains_kind_writes_element_and_fraction_edge_props() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        let mut f = fact("contains", "Nb25Mo25Ta25W25", "contains", "Nb");
+        f.value = Some(0.25);
+        store.write_fact(&f, &prov).await.unwrap();
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Element:nb'").await,
+            1
+        );
+        let props = query_str(
+            &store,
+            "SELECT props_json FROM emmo_edge WHERE rel_type = 'CONTAINS_ELEMENT'",
+        )
+        .await;
+        let props: serde_json::Value = serde_json::from_str(&props).unwrap();
+        assert_eq!(props["fraction"].as_f64(), Some(0.25));
+
+        // Re-upsert WITHOUT a fraction must keep the stored props (COALESCE).
+        f.value = None;
+        store.write_fact(&f, &prov).await.unwrap();
+        let props = query_str(
+            &store,
+            "SELECT props_json FROM emmo_edge WHERE rel_type = 'CONTAINS_ELEMENT'",
+        )
+        .await;
+        let props: serde_json::Value = serde_json::from_str(&props).unwrap();
+        assert_eq!(props["fraction"].as_f64(), Some(0.25));
+    }
+
+    #[tokio::test]
+    async fn processing_order_lands_in_edge_props() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        let mut f = fact("processing", "Inconel 718", "processed_by", "annealing");
+        f.value = Some(2.0);
+        store.write_fact(&f, &prov).await.unwrap();
+
+        let props = query_str(
+            &store,
+            "SELECT props_json FROM emmo_edge WHERE rel_type = 'PROCESSED_BY'",
+        )
+        .await;
+        let props: serde_json::Value = serde_json::from_str(&props).unwrap();
+        assert_eq!(props["order"].as_f64(), Some(2.0));
     }
 
     #[tokio::test]

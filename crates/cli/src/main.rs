@@ -4850,6 +4850,7 @@ async fn run_local_ingest_file(
             qdrant: None,
             max_sample_rows: 10,
             mapping: None,
+            provenance_db: None,
         }
     } else {
         let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
@@ -4868,6 +4869,7 @@ async fn run_local_ingest_file(
             }),
             max_sample_rows: 10,
             mapping,
+            provenance_db: None,
         }
     };
 
