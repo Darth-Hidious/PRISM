@@ -4606,6 +4606,7 @@ name = "prism-campaign"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "prism-llm",
  "prism-provenance",

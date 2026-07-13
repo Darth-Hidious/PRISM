@@ -22,4 +22,5 @@ prism-llm = { path = "../llm" }
 reqwest.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 tempfile.workspace = true

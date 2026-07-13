@@ -35,12 +35,18 @@ fn summarize(id: &str, raw: &Value) -> Value {
     json!({
         "id": id,
         "goal": raw.get("goal").or_else(|| state.get("goal")),
+        "status": state.get("status"),
         "candidates_evaluated": state
             .get("candidates")
             .and_then(|c| c.as_array())
             .map(|a| a.len()),
-        "iteration": state.get("iteration"),
-        "created": raw.get("created_at").or_else(|| state.get("created_at")),
+        "iteration": state
+            .get("current_iteration")
+            .or_else(|| state.get("iteration")),
+        "created": state
+            .get("started_at")
+            .or_else(|| raw.get("created_at"))
+            .or_else(|| state.get("created_at")),
     })
 }
 
