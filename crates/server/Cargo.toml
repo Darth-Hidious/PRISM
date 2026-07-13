@@ -23,8 +23,11 @@ tokio-stream = { workspace = true }
 prism-core = { path = "../core" }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
+prism-embed = { path = "../embed" }
 prism-ingest = { path = "../ingest" }
 prism-mesh = { path = "../mesh" }
+prism-provenance = { path = "../provenance" }
+dirs = { workspace = true }
 prism-workflows = { path = "../workflows" }
 prism-policy = { path = "../policy" }
 uuid = { workspace = true }
