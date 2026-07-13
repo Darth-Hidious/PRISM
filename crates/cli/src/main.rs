@@ -4865,8 +4865,8 @@ async fn run_local_ingest_file(
     schema_only: bool,
     mapping_path: Option<&Path>,
 ) -> Result<serde_json::Value> {
+    use prism_ingest::Neo4jConfig;
     use prism_ingest::pipeline::{IngestPipeline, PipelineConfig};
-    use prism_ingest::{Neo4jConfig, QdrantConfig};
 
     let mapping = mapping_path
         .map(prism_ingest::mapping::OntologyMapping::from_file)
@@ -4891,11 +4891,7 @@ async fn run_local_ingest_file(
                 username: neo4j_user.into(),
                 password: neo4j_pass.into(),
             }),
-            qdrant: Some(QdrantConfig {
-                base_url: qdrant_url.into(),
-                collection: "prism_embeddings".into(),
-                api_key: None,
-            }),
+            qdrant: None,
             max_sample_rows: 10,
             mapping,
             provenance_db: None,

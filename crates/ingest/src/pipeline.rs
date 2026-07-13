@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use tracing;
 
 use crate::connectors::{CsvConnector, ParquetConnector};
-use crate::embeddings::{QdrantVectorStore, VectorStore};
 use crate::local_facts::to_local_facts;
 use crate::ontology::LlmOntologyConstructor;
 use crate::schema::SchemaDetector;
@@ -244,39 +243,9 @@ impl IngestPipeline {
             None
         };
 
-        // Step 5: Qdrant embedding generation + upsert (if configured and entities exist)
-        let embeddings = if let (Some(llm_config), Some(qdrant_config), Some(entity_set)) =
-            (&self.config.llm, &self.config.qdrant, &entities)
-        {
-            let constructor = LlmOntologyConstructor::new(llm_config.clone());
-            match constructor.generate_embeddings(entity_set).await {
-                Ok(batch) if !batch.vectors.is_empty() => {
-                    let vector_store = QdrantVectorStore::new(qdrant_config.clone());
-                    match vector_store.upsert(&batch).await {
-                        Ok(count) => {
-                            tracing::info!(count, "vectors stored in Qdrant");
-                            Some(batch)
-                        }
-                        Err(e) => {
-                            // Do NOT return the batch as if stored — that made the
-                            // CLI print "Embeddings: N vectors" for a failed store.
-                            tracing::error!("Qdrant upsert failed: {e:#}");
-                            errors.push(format!("Qdrant vector store failed: {e:#}"));
-                            None
-                        }
-                    }
-                }
-                Ok(batch) => Some(batch),
-                Err(e) => {
-                    tracing::error!("embedding generation failed: {e:#}");
-                    errors.push(format!("embedding generation failed: {e:#}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
+        // Entity vectors are written to the bundled Turso store by
+        // `write_local_graph` (embed_entities_best_effort); the old Qdrant
+        // upsert step was redundant and has been removed.
         Ok(IngestResult {
             source,
             schema,
@@ -286,7 +255,7 @@ impl IngestPipeline {
             entities,
             graph_validation,
             graph,
-            embeddings,
+            embeddings: None,
             errors,
         })
     }
