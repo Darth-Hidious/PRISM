@@ -11,10 +11,7 @@ use crate::local_facts::to_local_facts;
 use crate::ontology::LlmOntologyConstructor;
 use crate::schema::SchemaDetector;
 use crate::validation::{self, ValidationReport};
-use crate::{
-    DataSource, EmbeddingBatch, EntitySet, GraphUpdate, LlmConfig, Neo4jConfig, QdrantConfig,
-    SchemaAnalysis,
-};
+use crate::{DataSource, EmbeddingBatch, EntitySet, GraphUpdate, LlmConfig, SchemaAnalysis};
 
 /// Result of a complete ingest operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,12 +47,8 @@ pub struct IngestResult {
 /// Configuration for a full ingest pipeline run.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
-    /// LLM config for entity extraction + embedding generation.
+    /// LLM config for entity extraction. If None, extraction is skipped.
     pub llm: Option<LlmConfig>,
-    /// Neo4j config for graph storage. If None, graph step is skipped.
-    pub neo4j: Option<Neo4jConfig>,
-    /// Qdrant config for vector storage. If None, embedding step is skipped.
-    pub qdrant: Option<QdrantConfig>,
     /// Maximum sample rows to send to the LLM.
     pub max_sample_rows: usize,
     /// Custom ontology mapping rules (loaded from YAML).
@@ -69,8 +62,6 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             llm: Some(LlmConfig::default()),
-            neo4j: Some(Neo4jConfig::default()),
-            qdrant: Some(QdrantConfig::default()),
             max_sample_rows: 10,
             mapping: None,
             provenance_db: None,
@@ -81,12 +72,13 @@ impl Default for PipelineConfig {
 /// Orchestrates the data ingestion pipeline:
 ///
 /// ```text
-/// Load → Schema Detection → Validation → LLM Extraction → Local EMMO Graph (Turso) → Qdrant Embeddings
+/// Load → Schema Detection → Validation → LLM Extraction → Local EMMO Graph (Turso)
 /// ```
 ///
-/// The downstream steps (LLM, Qdrant) are optional — controlled by `PipelineConfig`;
-/// the graph write runs whenever entities were extracted (the store is bundled).
-/// Without any configs, behaves like the original schema-only pipeline.
+/// The LLM extraction step is optional — controlled by `PipelineConfig`;
+/// the graph write (with entity vectors) runs whenever entities were
+/// extracted (the store is bundled). Without any configs, behaves like the
+/// original schema-only pipeline.
 pub struct IngestPipeline {
     config: PipelineConfig,
 }
@@ -96,8 +88,6 @@ impl IngestPipeline {
         Self {
             config: PipelineConfig {
                 llm: None,
-                neo4j: None,
-                qdrant: None,
                 max_sample_rows: 10,
                 mapping: None,
                 provenance_db: None,
@@ -437,11 +427,9 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_config_default_has_all_backends() {
+    fn pipeline_config_default_has_llm_and_bundled_store() {
         let cfg = PipelineConfig::default();
         assert!(cfg.llm.is_some());
-        assert!(cfg.neo4j.is_some());
-        assert!(cfg.qdrant.is_some());
         // None ⇒ the bundled ~/.prism/provenance.db is used at write time.
         assert!(cfg.provenance_db.is_none());
     }
@@ -459,8 +447,6 @@ mod tests {
             .join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
         let pipeline = IngestPipeline::with_config(PipelineConfig {
             llm: None,
-            neo4j: None,
-            qdrant: None,
             max_sample_rows: 10,
             mapping: None,
             provenance_db: Some(db_path.clone()),

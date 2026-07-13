@@ -52,12 +52,6 @@ pub struct ServicesSection {
     /// "managed" (Docker) or "external" (user-provided URIs)
     #[serde(default = "default_managed")]
     pub mode: String,
-    /// External Neo4j URI (bolt://host:port) when mode=external
-    #[serde(default)]
-    pub neo4j_uri: Option<String>,
-    /// External Qdrant URI (http://host:port) when mode=external
-    #[serde(default)]
-    pub qdrant_uri: Option<String>,
     /// External Kafka URI when mode=external
     #[serde(default)]
     pub kafka_uri: Option<String>,
@@ -382,8 +376,6 @@ impl Default for ServicesSection {
     fn default() -> Self {
         Self {
             mode: default_managed(),
-            neo4j_uri: None,
-            qdrant_uri: None,
             kafka_uri: None,
         }
     }
@@ -584,8 +576,7 @@ data_dir = "/data/prism"
 
 [services]
 mode = "external"
-neo4j_uri = "bolt://db.internal:7687"
-qdrant_uri = "http://vectors.internal:6333"
+kafka_uri = "kafka://broker.internal:9092"
 
 [platform]
 url = "https://platform.marc27.com"
@@ -620,8 +611,8 @@ api_key_env = "ANTHROPIC_API_KEY"
         let config: NodeConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.services.mode, "external");
         assert_eq!(
-            config.services.neo4j_uri.as_deref(),
-            Some("bolt://db.internal:7687")
+            config.services.kafka_uri.as_deref(),
+            Some("kafka://broker.internal:9092")
         );
         assert_eq!(
             config.indexer.model.as_deref(),

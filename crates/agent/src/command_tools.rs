@@ -392,7 +392,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "node",
         aliases: &[],
         kind: CommandToolKind::NodeLogs,
-        description: "Tail logs from a managed node service such as neo4j, qdrant, or kafka.",
+        description: "Tail logs from a managed node service such as kafka, spark, or firecrawl.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -889,22 +889,6 @@ fn query_local_schema() -> Value {
                 "description": "Max number of results to return for semantic search.",
                 "minimum": 1
             },
-            "neo4j_url": {
-                "type": "string",
-                "description": "Override the local Neo4j HTTP endpoint."
-            },
-            "neo4j_user": {
-                "type": "string",
-                "description": "Override the local Neo4j username."
-            },
-            "neo4j_pass": {
-                "type": "string",
-                "description": "Override the local Neo4j password."
-            },
-            "qdrant_url": {
-                "type": "string",
-                "description": "Override the local Qdrant HTTP endpoint."
-            },
             "llm_url": {
                 "type": "string",
                 "description": "Override the local LLM base URL used for semantic embedding generation."
@@ -1074,22 +1058,6 @@ fn ingest_schema(path_description: &str) -> Value {
             "api_key": {
                 "type": "string",
                 "description": "Optional API key for authenticated LLM providers."
-            },
-            "neo4j_url": {
-                "type": "string",
-                "description": "Override Neo4j HTTP endpoint."
-            },
-            "neo4j_user": {
-                "type": "string",
-                "description": "Override Neo4j username."
-            },
-            "neo4j_pass": {
-                "type": "string",
-                "description": "Override Neo4j password."
-            },
-            "qdrant_url": {
-                "type": "string",
-                "description": "Override Qdrant HTTP endpoint."
             },
             "runtime_url": {
                 "type": "string",
@@ -1525,7 +1493,7 @@ fn node_logs_schema() -> Value {
         "properties": {
             "service": {
                 "type": "string",
-                "description": "Managed service name such as `neo4j`, `qdrant`, or `kafka`."
+                "description": "Managed service name such as `kafka`, `spark`, or `firecrawl`."
             },
             "tail": {
                 "type": "integer",
@@ -1805,10 +1773,6 @@ fn build_query_args(input: &Value, mode: QueryMode) -> Result<Vec<String>> {
                 args.push("--semantic".to_string());
             }
             for (flag, value) in [
-                ("--neo4j-url", optional_string(input, "neo4j_url")),
-                ("--neo4j-user", optional_string(input, "neo4j_user")),
-                ("--neo4j-pass", optional_string(input, "neo4j_pass")),
-                ("--qdrant-url", optional_string(input, "qdrant_url")),
                 ("--llm-url", optional_string(input, "llm_url")),
                 ("--model", optional_string(input, "model")),
                 ("--api-key", optional_string(input, "api_key")),
@@ -2016,10 +1980,6 @@ fn build_ingest_args(input: &Value, watch: bool) -> Result<Vec<String>> {
         ("--model", optional_string(input, "model")),
         ("--llm-url", optional_string(input, "llm_url")),
         ("--api-key", optional_string(input, "api_key")),
-        ("--neo4j-url", optional_string(input, "neo4j_url")),
-        ("--neo4j-user", optional_string(input, "neo4j_user")),
-        ("--neo4j-pass", optional_string(input, "neo4j_pass")),
-        ("--qdrant-url", optional_string(input, "qdrant_url")),
         ("--runtime-url", optional_string(input, "runtime_url")),
     ] {
         if let Some(value) = value {

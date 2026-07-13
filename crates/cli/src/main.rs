@@ -197,18 +197,6 @@ enum Commands {
         /// API key for authenticated LLM providers. Also reads from LLM_API_KEY env var.
         #[arg(long, env = "LLM_API_KEY")]
         api_key: Option<String>,
-        /// Neo4j HTTP endpoint.
-        #[arg(long, default_value = "http://localhost:7474")]
-        neo4j_url: String,
-        /// Neo4j username.
-        #[arg(long, default_value = "neo4j")]
-        neo4j_user: String,
-        /// Neo4j password.
-        #[arg(long, default_value = "prism-local")]
-        neo4j_pass: String,
-        /// Qdrant HTTP endpoint.
-        #[arg(long, default_value = "http://localhost:6333")]
-        qdrant_url: String,
         /// Skip LLM extraction (schema detection only).
         #[arg(long)]
         schema_only: bool,
@@ -244,18 +232,6 @@ enum Commands {
         /// Query all known mesh peers and merge results.
         #[arg(long)]
         federated: bool,
-        /// Neo4j HTTP endpoint.
-        #[arg(long, default_value = "http://localhost:7474")]
-        neo4j_url: String,
-        /// Neo4j username.
-        #[arg(long, default_value = "neo4j")]
-        neo4j_user: String,
-        /// Neo4j password.
-        #[arg(long, default_value = "prism-local")]
-        neo4j_pass: String,
-        /// Qdrant HTTP endpoint.
-        #[arg(long, default_value = "http://localhost:6333")]
-        qdrant_url: String,
         /// Override LLM base URL (otherwise uses prism.toml).
         #[arg(long)]
         llm_url: Option<String>,
@@ -658,15 +634,9 @@ enum NodeCommands {
         /// Dashboard HTTP port (default: 7327).
         #[arg(long, default_value_t = 7327)]
         dashboard_port: u16,
-        /// Skip starting managed services (Neo4j, Qdrant, Kafka).
+        /// Skip starting managed services (Kafka, Spark).
         #[arg(long)]
         no_services: bool,
-        /// Connect to existing Neo4j instead of starting a container.
-        #[arg(long)]
-        external_neo4j: Option<String>,
-        /// Connect to existing Qdrant instead of starting a container.
-        #[arg(long)]
-        external_qdrant: Option<String>,
         /// Also start Kafka (for mesh/pub-sub, off by default in dev).
         #[arg(long)]
         with_kafka: bool,
@@ -688,9 +658,9 @@ enum NodeCommands {
     Status,
     /// Probe local capabilities without connecting.
     Probe,
-    /// Stream logs from a managed service (neo4j, qdrant, kafka).
+    /// Stream logs from a managed service (kafka, spark, firecrawl).
     Logs {
-        /// Service name: neo4j, qdrant, or kafka.
+        /// Service name: e.g. kafka, spark, or firecrawl.
         service: String,
         /// Number of tail lines to show (default: 100).
         #[arg(long, default_value_t = 100)]
@@ -1920,8 +1890,6 @@ async fn main() -> Result<()> {
                 offline,
                 dashboard_port,
                 no_services,
-                external_neo4j,
-                external_qdrant,
                 with_kafka,
                 kafka_brokers,
                 with_spark,
@@ -1995,12 +1963,6 @@ async fn main() -> Result<()> {
                     }
                     if let Some(ref m) = serve {
                         cmd.args(["--serve", m]);
-                    }
-                    if let Some(ref uri) = external_neo4j {
-                        cmd.args(["--external-neo4j", uri]);
-                    }
-                    if let Some(ref uri) = external_qdrant {
-                        cmd.args(["--external-qdrant", uri]);
                     }
 
                     cmd.stdout(log_file.try_clone()?)
@@ -2768,10 +2730,6 @@ async fn main() -> Result<()> {
             model,
             llm_url,
             api_key,
-            neo4j_url,
-            neo4j_user,
-            neo4j_pass,
-            qdrant_url,
             schema_only,
             status,
             watch,
@@ -2791,10 +2749,6 @@ async fn main() -> Result<()> {
                     model.as_deref(),
                     llm_url.as_deref(),
                     api_key.as_deref(),
-                    &neo4j_url,
-                    &neo4j_user,
-                    &neo4j_pass,
-                    &qdrant_url,
                     schema_only,
                     &runtime_url,
                     corpus.as_deref(),
@@ -2812,10 +2766,6 @@ async fn main() -> Result<()> {
                     model.as_deref(),
                     llm_url.as_deref(),
                     api_key.as_deref(),
-                    &neo4j_url,
-                    &neo4j_user,
-                    &neo4j_pass,
-                    &qdrant_url,
                     schema_only,
                     &runtime_url,
                     corpus.as_deref(),
@@ -2831,10 +2781,6 @@ async fn main() -> Result<()> {
             platform,
             json: json_output,
             federated,
-            neo4j_url,
-            neo4j_user,
-            neo4j_pass,
-            qdrant_url,
             llm_url: _,
             model: _,
             api_key: _,
@@ -2847,16 +2793,7 @@ async fn main() -> Result<()> {
             } else if federated {
                 handle_federated_query(&text, &dashboard_url, &paths).await?;
             } else {
-                handle_query(
-                    &text,
-                    semantic,
-                    &neo4j_url,
-                    &neo4j_user,
-                    &neo4j_pass,
-                    &qdrant_url,
-                    limit,
-                )
-                .await?;
+                handle_query(&text, semantic, limit).await?;
             }
         }
         Commands::Agent => {
@@ -4792,21 +4729,15 @@ async fn submit_platform_ingest_chunk(
     Ok(response.json().await?)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_local_ingest_file(
     path: &Path,
     project_root: &Path,
     model: Option<&str>,
     llm_url: Option<&str>,
     api_key: Option<&str>,
-    neo4j_url: &str,
-    neo4j_user: &str,
-    neo4j_pass: &str,
-    qdrant_url: &str,
     schema_only: bool,
     mapping_path: Option<&Path>,
 ) -> Result<serde_json::Value> {
-    use prism_ingest::Neo4jConfig;
     use prism_ingest::pipeline::{IngestPipeline, PipelineConfig};
 
     let mapping = mapping_path
@@ -4816,8 +4747,6 @@ async fn run_local_ingest_file(
     let config = if schema_only {
         PipelineConfig {
             llm: None,
-            neo4j: None,
-            qdrant: None,
             max_sample_rows: 10,
             mapping: None,
             provenance_db: None,
@@ -4826,13 +4755,6 @@ async fn run_local_ingest_file(
         let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
         PipelineConfig {
             llm: Some(llm_cfg),
-            neo4j: Some(Neo4jConfig {
-                base_url: neo4j_url.into(),
-                database: "neo4j".into(),
-                username: neo4j_user.into(),
-                password: neo4j_pass.into(),
-            }),
-            qdrant: None,
             max_sample_rows: 10,
             mapping,
             provenance_db: None,
@@ -5076,7 +4998,7 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     .get("edges_created")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
-                println!("  Graph: {nodes} nodes, {edges} edges written to Neo4j");
+                println!("  Graph: {nodes} nodes, {edges} edges written to the local knowledge graph");
             }
             if let Some(embeddings) = result.get("embeddings") {
                 let count = embeddings
@@ -5345,10 +5267,6 @@ async fn handle_ingest(
     model: Option<&str>,
     llm_url: Option<&str>,
     api_key: Option<&str>,
-    neo4j_url: &str,
-    neo4j_user: &str,
-    neo4j_pass: &str,
-    qdrant_url: &str,
     schema_only: bool,
     runtime_url: &str,
     corpus: Option<&str>,
@@ -5388,10 +5306,6 @@ async fn handle_ingest(
                     model,
                     llm_url,
                     api_key,
-                    neo4j_url,
-                    neo4j_user,
-                    neo4j_pass,
-                    qdrant_url,
                     schema_only,
                     mapping_path,
                 )
@@ -5465,10 +5379,6 @@ async fn handle_ingest_watch(
     model: Option<&str>,
     llm_url: Option<&str>,
     api_key: Option<&str>,
-    neo4j_url: &str,
-    neo4j_user: &str,
-    neo4j_pass: &str,
-    qdrant_url: &str,
     schema_only: bool,
     runtime_url: &str,
     corpus: Option<&str>,
@@ -5508,10 +5418,6 @@ async fn handle_ingest_watch(
             model,
             llm_url,
             api_key,
-            neo4j_url,
-            neo4j_user,
-            neo4j_pass,
-            qdrant_url,
             schema_only,
             runtime_url,
             corpus,
@@ -5562,10 +5468,6 @@ async fn handle_ingest_watch(
                     model,
                     llm_url,
                     api_key,
-                    neo4j_url,
-                    neo4j_user,
-                    neo4j_pass,
-                    qdrant_url,
                     schema_only,
                     runtime_url,
                     corpus,
@@ -7351,7 +7253,7 @@ const LOCAL_ONTOLOGY_TENANT: &str = "local";
 /// Locally-ingested EMMO ontology matches read from the bundled Turso
 /// provenance store (`~/.prism/provenance.db`) — the store `prism ingest`
 /// writes into. This is what makes a local ingest visible to `prism query`
-/// without Neo4j running.
+/// without any external services running.
 struct LocalOntologyResults {
     nodes: Vec<prism_provenance::GraphNode>,
     edges: Vec<prism_provenance::GraphEdge>,
@@ -7361,9 +7263,9 @@ struct LocalOntologyResults {
 /// Query the bundled Turso store for locally-ingested ontology.
 ///
 /// Never errors: any failure (store unopenable, query error) degrades to
-/// `None` so the caller falls back to the existing Neo4j read. `None` is
-/// also returned when the store is fine but nothing matched (fresh
-/// install, unknown term) — same fallback.
+/// `None`, which the caller renders as "no matches". `None` is also
+/// returned when the store is fine but nothing matched (fresh install,
+/// unknown term).
 async fn local_ontology_lookup(
     db_path: &Path,
     text: &str,
@@ -7426,10 +7328,10 @@ async fn local_ontology_lookup(
 /// ingest writes via `embed_entities_best_effort`.
 ///
 /// Never errors: an unopenable store, an empty store, an unavailable
-/// embedding backend, or zero hits all degrade to `None` so the caller
-/// falls back to the existing Qdrant path. The store is checked BEFORE the
+/// embedding backend, or zero hits all degrade to `None`, which the
+/// caller renders as "no results". The store is checked BEFORE the
 /// backend is built, so a fresh install never pays the embedding-model
-/// init just to fall through.
+/// init just to return nothing.
 async fn local_semantic_lookup(
     db_path: &Path,
     text: &str,
@@ -7516,20 +7418,7 @@ fn format_local_ontology(results: &LocalOntologyResults) -> String {
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_query(
-    text: &str,
-    semantic: bool,
-    neo4j_url: &str,
-    neo4j_user: &str,
-    neo4j_pass: &str,
-    qdrant_url: &str,
-    limit: usize,
-) -> Result<()> {
-    // Retired backends (Neo4j/Qdrant) — flags removed with the config
-    // structs in a later step.
-    let _ = (neo4j_url, neo4j_user, neo4j_pass, qdrant_url);
-
+async fn handle_query(text: &str, semantic: bool, limit: usize) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let turso_db = PathBuf::from(home).join(".prism/provenance.db");
 
@@ -9403,7 +9292,7 @@ data: {\"step\":\"complete\",\"total_turns\":2}\n",
             .expect("substring match must be queryable");
         assert!(hit.nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
 
-        // Unknown term → clean miss (caller falls back to Neo4j).
+        // Unknown term → clean miss (caller renders "no matches").
         assert!(
             local_ontology_lookup(&db.path, "no-such-entity-xyz", 10)
                 .await
