@@ -2028,10 +2028,6 @@ async fn main() -> Result<()> {
                 let mut service_handles = None;
                 if !no_services {
                     let mut svc_config = prism_orch::ServiceConfig::default();
-                    // Neo4j/Qdrant are retired — the knowledge graph lives in
-                    // the bundled Turso store. Never launch their containers.
-                    svc_config.neo4j = None;
-                    svc_config.vector_db = None;
                     if with_kafka {
                         svc_config.kafka = Some(prism_orch::services::KafkaConfig::default());
                     }
@@ -2039,9 +2035,7 @@ async fn main() -> Result<()> {
                         svc_config.spark = Some(prism_orch::services::SparkConfig::default());
                     }
 
-                    let wants_managed_services = svc_config.neo4j.is_some()
-                        || svc_config.vector_db.is_some()
-                        || svc_config.kafka.is_some()
+                    let wants_managed_services = svc_config.kafka.is_some()
                         || svc_config.spark.is_some()
                         || svc_config.firecrawl.is_some();
 
@@ -4998,7 +4992,9 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     .get("edges_created")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
-                println!("  Graph: {nodes} nodes, {edges} edges written to the local knowledge graph");
+                println!(
+                    "  Graph: {nodes} nodes, {edges} edges written to the local knowledge graph"
+                );
             }
             if let Some(embeddings) = result.get("embeddings") {
                 let count = embeddings
@@ -5085,7 +5081,8 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                         .get("facts_written")
                         .and_then(|value| value.as_u64())
                         .unwrap_or(0);
-                    let store = value_string(summary, &["store"]).unwrap_or("~/.prism/provenance.db");
+                    let store =
+                        value_string(summary, &["store"]).unwrap_or("~/.prism/provenance.db");
                     println!("  Facts: {facts} written to local store ({store})");
                     if let Some(model) = value_string(summary, &["model"]) {
                         println!("  Model: {model}");
@@ -7380,8 +7377,9 @@ async fn local_semantic_lookup(
     }
 }
 
-/// Render local-ontology matches in the same shape the Neo4j path prints:
-/// one `[type] name` line per entity, plus relationship and fact lines.
+/// Render local-ontology matches in the same shape the retired Neo4j path
+/// printed: one `[type] name` line per entity, plus relationship and fact
+/// lines.
 fn format_local_ontology(results: &LocalOntologyResults) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();

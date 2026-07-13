@@ -20,8 +20,8 @@ use uuid::Uuid;
 
 pub mod emmo;
 pub use emmo::{
-    assertion_id, canonical_key, GraphEdge, GraphNode, LocalAssertion, LocalFact,
-    LocalProvenance, RecalledFact, TraversalResult,
+    GraphEdge, GraphNode, LocalAssertion, LocalFact, LocalProvenance, RecalledFact,
+    TraversalResult, assertion_id, canonical_key,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

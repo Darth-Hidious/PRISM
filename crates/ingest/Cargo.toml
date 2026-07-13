@@ -1,6 +1,6 @@
 [package]
 name = "prism-ingest"
-description = "Data ingestion and ontology pipeline — LLM-driven entity extraction, Neo4j graphs, and Qdrant embeddings."
+description = "Data ingestion and ontology pipeline — LLM-driven entity extraction into the bundled Turso EMMO knowledge graph."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

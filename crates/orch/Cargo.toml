@@ -1,6 +1,6 @@
 [package]
 name = "prism-orch"
-description = "Container orchestration — Docker/Podman lifecycle management for Neo4j, Qdrant, Kafka, and Spark."
+description = "Container orchestration — Docker/Podman lifecycle management for Kafka, Spark, and Firecrawl."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,4 +16,3 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 tokio-util = { workspace = true }
-url = "2"

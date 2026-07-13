@@ -1,8 +1,8 @@
 // Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
 //! Container orchestration for PRISM node services.
 //!
-//! Manages the lifecycle of infrastructure services (Neo4j, Qdrant, Kafka, Spark)
-//! that a PRISM node depends on. Two modes:
+//! Manages the lifecycle of infrastructure services (Kafka, Spark,
+//! Firecrawl) that a PRISM node depends on. Two modes:
 //!
 //! - **Managed** ([`docker`]): PRISM pulls images, starts/stops containers, and monitors health.
 //! - **External** ([`external`]): User provides connection URIs to pre-existing instances.
@@ -82,12 +82,11 @@ mod tests {
     #[test]
     fn default_config_is_sane() {
         let cfg = ServiceConfig::default();
-        assert_eq!(cfg.neo4j.as_ref().unwrap().bolt_port, 7687);
-        assert_eq!(cfg.neo4j.as_ref().unwrap().http_port, 7474);
-        assert_eq!(cfg.vector_db.as_ref().unwrap().port, 6333);
+        // Kafka and Spark are opt-in; Firecrawl is on by default.
         assert!(cfg.kafka.is_none());
-        assert!(cfg.neo4j.as_ref().unwrap().image.contains("neo4j"));
-        assert!(cfg.vector_db.as_ref().unwrap().image.contains("qdrant"));
+        assert!(cfg.spark.is_none());
+        assert_eq!(cfg.firecrawl.as_ref().unwrap().port, 3002);
+        assert!(cfg.firecrawl.as_ref().unwrap().image.contains("firecrawl"));
     }
 
     #[test]
@@ -95,21 +94,21 @@ mod tests {
         let handles = ServiceHandles {
             services: vec![
                 ServiceHandle {
-                    name: "neo4j".into(),
+                    name: "kafka".into(),
                     container_id: Some("abc".into()),
-                    port: 7687,
+                    port: 9092,
                     healthy: true,
                 },
                 ServiceHandle {
-                    name: "qdrant".into(),
+                    name: "spark".into(),
                     container_id: Some("def".into()),
-                    port: 6333,
+                    port: 7077,
                     healthy: true,
                 },
             ],
         };
         assert!(handles.all_healthy());
-        assert!(handles.get("neo4j").is_some());
+        assert!(handles.get("kafka").is_some());
         assert!(handles.get("redis").is_none());
     }
 
@@ -118,15 +117,15 @@ mod tests {
         let handles = ServiceHandles {
             services: vec![
                 ServiceHandle {
-                    name: "neo4j".into(),
+                    name: "kafka".into(),
                     container_id: Some("abc".into()),
-                    port: 7687,
+                    port: 9092,
                     healthy: true,
                 },
                 ServiceHandle {
-                    name: "qdrant".into(),
+                    name: "spark".into(),
                     container_id: Some("def".into()),
-                    port: 6333,
+                    port: 7077,
                     healthy: false,
                 },
             ],
@@ -138,11 +137,11 @@ mod tests {
     fn health_report_summary() {
         let report = HealthReport {
             services: vec![ServiceHealth {
-                name: "neo4j".into(),
+                name: "kafka".into(),
                 status: "healthy".into(),
-                port: 7687,
+                port: 9092,
             }],
         };
-        assert_eq!(report.summary(), "neo4j:7687 (healthy)");
+        assert_eq!(report.summary(), "kafka:9092 (healthy)");
     }
 }

@@ -2979,8 +2979,8 @@ async fn execute_workflow_command(
     Ok(result)
 }
 
-/// Tools that hit the LOCAL graph/vector stores (Neo4j/Qdrant behind the
-/// local node) or the local node dashboard. Offering them while the node is
+/// Tools that hit the LOCAL knowledge graph (the bundled Turso store behind
+/// the local node) or the local node dashboard. Offering them while the node is
 /// down produced dead-end failures for every semantic/graph call, so they
 /// are only listed in the default catalog when the node is reachable. The
 /// specs stay registered — `execute_command_tool` still resolves them — so

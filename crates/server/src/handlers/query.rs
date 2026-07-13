@@ -224,10 +224,10 @@ async fn local_semantic_lookup(
     }
 }
 
-/// Map local Turso graph nodes into the same JSON shape the Neo4j path
-/// returns (`{type, name, properties}`). Local nodes carry no free-form
-/// properties, so `properties` is an empty object — the same shape clients
-/// already see for property-less Neo4j entities.
+/// Map local Turso graph nodes into the same JSON shape the retired Neo4j
+/// path returned (`{type, name, properties}`), keeping the wire format
+/// stable for existing clients. Local nodes carry no free-form properties,
+/// so `properties` is an empty object.
 fn graph_nodes_to_results(nodes: &[prism_provenance::GraphNode]) -> Vec<serde_json::Value> {
     nodes
         .iter()
@@ -241,8 +241,8 @@ fn graph_nodes_to_results(nodes: &[prism_provenance::GraphNode]) -> Vec<serde_js
         .collect()
 }
 
-/// Map local Turso semantic hits into the same JSON shape the Qdrant path
-/// returns (`{id, score}`).
+/// Map local Turso semantic hits into the same JSON shape the retired
+/// Qdrant path returned (`{id, score}`), keeping the wire format stable.
 fn semantic_hits_to_results(hits: &[(String, f32)]) -> Vec<serde_json::Value> {
     hits.iter()
         .map(|(id, score)| {
@@ -413,8 +413,10 @@ mod tests {
 
     impl TempProvenanceDb {
         fn new() -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("prism_server_local_query_{}.db", uuid::Uuid::new_v4()));
+            let path = std::env::temp_dir().join(format!(
+                "prism_server_local_query_{}.db",
+                uuid::Uuid::new_v4()
+            ));
             Self { path }
         }
     }

@@ -33,7 +33,9 @@ pub struct IngestResult {
     /// Counts are upsert attempts, not net-new rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph: Option<GraphUpdate>,
-    /// Populated when Qdrant embedding upsert runs.
+    /// Always `None` since the Qdrant upsert step was removed (entity
+    /// vectors live in the bundled Turso store); kept so the serialized
+    /// result shape stays stable for older consumers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<EmbeddingBatch>,
     /// Step failures. NON-EMPTY means configured pipeline steps did NOT
@@ -211,9 +213,7 @@ impl IngestPipeline {
         // entities exist and validation passed). This replaced the Neo4j
         // upsert (Neo4j retirement, step 1) — the store is bundled, so no
         // backend config gates the write.
-        let graph = if graph_validation_passed
-            && let Some(entity_set) = &entities
-        {
+        let graph = if graph_validation_passed && let Some(entity_set) = &entities {
             match self.write_local_graph(entity_set, &source).await {
                 Ok(update) => {
                     tracing::info!(
@@ -405,7 +405,7 @@ mod tests {
         };
         let (report, blocking_error) = validate_before_graph_write(&entity_set);
         assert!(!report.passed);
-        let msg = blocking_error.expect("orphan relationship must block the Neo4j write");
+        let msg = blocking_error.expect("orphan relationship must block the graph write");
         assert!(msg.contains("graph validation failed"));
         assert!(msg.contains("Fe"));
     }
@@ -443,8 +443,8 @@ mod tests {
         // Process-global, but no other prism-ingest test reads this env.
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
 
-        let db_path = std::env::temp_dir()
-            .join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
+        let db_path =
+            std::env::temp_dir().join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
         let pipeline = IngestPipeline::with_config(PipelineConfig {
             llm: None,
             max_sample_rows: 10,
@@ -505,7 +505,10 @@ mod tests {
             .await
             .unwrap();
         let hits = store.graph_search("Steel", "local", 10).await.unwrap();
-        assert!(hits.iter().any(|n| n.name == "Steel" && n.label == "Matter"));
+        assert!(
+            hits.iter()
+                .any(|n| n.name == "Steel" && n.label == "Matter")
+        );
         let tr = store
             .get_neighbors("Steel", None, "local", 10)
             .await
@@ -558,11 +561,11 @@ mod tests {
         // …but step failures MUST be visible in the JSON (the old shape hid
         // failed steps entirely — audit critical #2).
         let failed = IngestResult {
-            errors: vec!["Neo4j graph upsert failed: connection refused".into()],
+            errors: vec!["local graph write failed: disk full".into()],
             ..result
         };
         let json = serde_json::to_string(&failed).unwrap();
         assert!(json.contains("errors"));
-        assert!(json.contains("connection refused"));
+        assert!(json.contains("disk full"));
     }
 }

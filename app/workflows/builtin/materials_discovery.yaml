@@ -97,7 +97,7 @@ steps:
   - name: ingest_knowledge
     skill: knowledge_ingest
     description: >
-      Ingest the discovered materials into the local Neo4j knowledge graph.
+      Ingest the discovered materials into the local knowledge graph.
       Create entities for each material with all properties.
       Create relationships between materials, elements, and properties.
       Tag with provenance (source database, prediction method, confidence).

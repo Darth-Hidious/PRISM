@@ -27,7 +27,7 @@ class Prism < Formula
 
   def caveats
     <<~EOS
-      PRISM requires Docker for managed services (Neo4j, Qdrant, Kafka).
+      PRISM requires Docker for optional managed services (Kafka, Spark, Firecrawl).
       Install Docker Desktop or Podman before running `prism node up`.
 
       For AI features, you need either:

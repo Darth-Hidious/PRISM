@@ -16,7 +16,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use turso::Value;
 
-use crate::{get_str, ProvenanceStore};
+use crate::{ProvenanceStore, get_str};
 
 // ─────────────────────────────────────────────────────────────────────────
 // Write-side types (mirror core's `ExtractedFact` / `Provenance`)
@@ -412,10 +412,26 @@ impl ProvenanceStore {
                 let obj_key = self
                     .upsert_entity(&fact.object, "Property", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &meas_key, "HAS_MEASUREMENT", &fact.predicate, confidence, tenant, None)
-                    .await?;
-                self.upsert_edge(&meas_key, &obj_key, "OF_PROPERTY", &fact.predicate, confidence, tenant, None)
-                    .await?;
+                self.upsert_edge(
+                    &subj_key,
+                    &meas_key,
+                    "HAS_MEASUREMENT",
+                    &fact.predicate,
+                    confidence,
+                    tenant,
+                    None,
+                )
+                .await?;
+                self.upsert_edge(
+                    &meas_key,
+                    &obj_key,
+                    "OF_PROPERTY",
+                    &fact.predicate,
+                    confidence,
+                    tenant,
+                    None,
+                )
+                .await?;
             }
             Some("phase") => {
                 let subj_key = self
@@ -424,8 +440,16 @@ impl ProvenanceStore {
                 let obj_key = self
                     .upsert_entity(&fact.object, "Phase", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "HAS_PHASE", &fact.predicate, confidence, tenant, None)
-                    .await?;
+                self.upsert_edge(
+                    &subj_key,
+                    &obj_key,
+                    "HAS_PHASE",
+                    &fact.predicate,
+                    confidence,
+                    tenant,
+                    None,
+                )
+                .await?;
             }
             Some("composition") => {
                 let props = serde_json::json!({ "canonical_formula": &fact.object });
@@ -435,8 +459,16 @@ impl ProvenanceStore {
                 let obj_key = self
                     .upsert_entity(&fact.object, "Composition", tenant, Some(props.to_string()))
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "HAS_COMPOSITION", &fact.predicate, confidence, tenant, None)
-                    .await?;
+                self.upsert_edge(
+                    &subj_key,
+                    &obj_key,
+                    "HAS_COMPOSITION",
+                    &fact.predicate,
+                    confidence,
+                    tenant,
+                    None,
+                )
+                .await?;
             }
             // Mirrors core's Element node + CONTAINS_ELEMENT edge; the
             // composition fraction (when `value` carries it) rides on the
@@ -451,8 +483,16 @@ impl ProvenanceStore {
                 let obj_key = self
                     .upsert_entity(&fact.object, "Element", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "CONTAINS_ELEMENT", &fact.predicate, confidence, tenant, props.as_deref())
-                    .await?;
+                self.upsert_edge(
+                    &subj_key,
+                    &obj_key,
+                    "CONTAINS_ELEMENT",
+                    &fact.predicate,
+                    confidence,
+                    tenant,
+                    props.as_deref(),
+                )
+                .await?;
             }
             Some("processing") => {
                 // The step order (when `value` carries it) rides on the edge.
@@ -465,8 +505,16 @@ impl ProvenanceStore {
                 let obj_key = self
                     .upsert_entity(&fact.object, "Manufacturing", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "PROCESSED_BY", &fact.predicate, confidence, tenant, props.as_deref())
-                    .await?;
+                self.upsert_edge(
+                    &subj_key,
+                    &obj_key,
+                    "PROCESSED_BY",
+                    &fact.predicate,
+                    confidence,
+                    tenant,
+                    props.as_deref(),
+                )
+                .await?;
             }
             Some("structure") => {
                 let props = serde_json::json!({ "system": &fact.object });
@@ -474,10 +522,23 @@ impl ProvenanceStore {
                     .upsert_entity(&fact.subject, "Matter", tenant, None)
                     .await?;
                 let obj_key = self
-                    .upsert_entity(&fact.object, "CrystalStructure", tenant, Some(props.to_string()))
+                    .upsert_entity(
+                        &fact.object,
+                        "CrystalStructure",
+                        tenant,
+                        Some(props.to_string()),
+                    )
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "HAS_STRUCTURE", &fact.predicate, confidence, tenant, None)
-                    .await?;
+                self.upsert_edge(
+                    &subj_key,
+                    &obj_key,
+                    "HAS_STRUCTURE",
+                    &fact.predicate,
+                    confidence,
+                    tenant,
+                    None,
+                )
+                .await?;
             }
             Some("application") => {
                 let subj_key = self
@@ -486,8 +547,16 @@ impl ProvenanceStore {
                 let obj_key = self
                     .upsert_entity(&fact.object, "Application", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, "USED_IN", &fact.predicate, confidence, tenant, None)
-                    .await?;
+                self.upsert_edge(
+                    &subj_key,
+                    &obj_key,
+                    "USED_IN",
+                    &fact.predicate,
+                    confidence,
+                    tenant,
+                    None,
+                )
+                .await?;
             }
             // Unknown kind: keep the fact as a generic edge, don't drop it.
             _ => {
@@ -497,8 +566,16 @@ impl ProvenanceStore {
                 let obj_key = self
                     .upsert_entity(&fact.object, "Entity", tenant, None)
                     .await?;
-                self.upsert_edge(&subj_key, &obj_key, &fact.predicate, &fact.predicate, confidence, tenant, None)
-                    .await?;
+                self.upsert_edge(
+                    &subj_key,
+                    &obj_key,
+                    &fact.predicate,
+                    &fact.predicate,
+                    confidence,
+                    tenant,
+                    None,
+                )
+                .await?;
             }
         }
 
@@ -556,11 +633,7 @@ impl ProvenanceStore {
     /// the extractor's confidence and `corroborations = 1`; every re-record
     /// of the same triple (stable SHA-256 id over canonical forms) combines
     /// confidence noisy-OR and increments `corroborations`.
-    pub async fn record_assertion(
-        &self,
-        a: &LocalAssertion,
-        prov: &LocalProvenance,
-    ) -> Result<()> {
+    pub async fn record_assertion(&self, a: &LocalAssertion, prov: &LocalProvenance) -> Result<()> {
         self.record_activity(prov).await?;
 
         let id = assertion_id(&a.subject, &a.predicate, &a.object);
@@ -819,12 +892,7 @@ impl ProvenanceStore {
 
     /// Recall assertions whose subject or object matches the query,
     /// highest-confidence first.
-    pub async fn recall(
-        &self,
-        query: &str,
-        tenant: &str,
-        limit: i64,
-    ) -> Result<Vec<RecalledFact>> {
+    pub async fn recall(&self, query: &str, tenant: &str, limit: i64) -> Result<Vec<RecalledFact>> {
         let pattern = format!("%{query}%");
         let mut rows = self
             .conn
@@ -1065,8 +1133,8 @@ mod tests {
 
     impl TempDb {
         fn new() -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("prism_emmo_test_{}.db", uuid::Uuid::new_v4()));
+            let path =
+                std::env::temp_dir().join(format!("prism_emmo_test_{}.db", uuid::Uuid::new_v4()));
             Self { path }
         }
     }
@@ -1129,13 +1197,49 @@ mod tests {
         let prov = test_prov();
 
         let cases = [
-            ("measurement", "Ti-6Al-4V", "has_measurement", "UTS", "HAS_MEASUREMENT"),
+            (
+                "measurement",
+                "Ti-6Al-4V",
+                "has_measurement",
+                "UTS",
+                "HAS_MEASUREMENT",
+            ),
             ("phase", "Ti-6Al-4V", "has_phase", "alpha-beta", "HAS_PHASE"),
-            ("composition", "Inconel 718", "has_composition", "NiCr19Fe18", "HAS_COMPOSITION"),
-            ("contains", "Inconel 718", "contains", "Ni", "CONTAINS_ELEMENT"),
-            ("processing", "Inconel 718", "processed_by", "LPBF", "PROCESSED_BY"),
-            ("structure", "Ti-6Al-4V", "has_structure", "hexagonal", "HAS_STRUCTURE"),
-            ("application", "Ti-6Al-4V", "used_in", "turbine blades", "USED_IN"),
+            (
+                "composition",
+                "Inconel 718",
+                "has_composition",
+                "NiCr19Fe18",
+                "HAS_COMPOSITION",
+            ),
+            (
+                "contains",
+                "Inconel 718",
+                "contains",
+                "Ni",
+                "CONTAINS_ELEMENT",
+            ),
+            (
+                "processing",
+                "Inconel 718",
+                "processed_by",
+                "LPBF",
+                "PROCESSED_BY",
+            ),
+            (
+                "structure",
+                "Ti-6Al-4V",
+                "has_structure",
+                "hexagonal",
+                "HAS_STRUCTURE",
+            ),
+            (
+                "application",
+                "Ti-6Al-4V",
+                "used_in",
+                "turbine blades",
+                "USED_IN",
+            ),
         ];
         for (kind, s, p, o, rel) in cases {
             let mut f = fact(kind, s, p, o);
@@ -1146,7 +1250,10 @@ mod tests {
             store.write_fact(&f, &prov).await.unwrap();
 
             let hits = store.graph_search(s, "t1", 10).await.unwrap();
-            assert!(hits.iter().any(|n| n.name == s), "graph_search missed subject for {kind}");
+            assert!(
+                hits.iter().any(|n| n.name == s),
+                "graph_search missed subject for {kind}"
+            );
 
             let tr = store.get_neighbors(s, Some(rel), "t1", 10).await.unwrap();
             assert!(
@@ -1167,17 +1274,28 @@ mod tests {
             kind: None,
         };
         store.write_fact(&f, &prov).await.unwrap();
-        let tr = store.get_neighbors("X material", None, "t1", 10).await.unwrap();
+        let tr = store
+            .get_neighbors("X material", None, "t1", 10)
+            .await
+            .unwrap();
         assert!(tr.edges.iter().any(|e| e.rel_type == "related_to"));
 
         // Tenant scoping: nothing leaks into another tenant.
-        assert!(store.graph_search("Ti", "other", 10).await.unwrap().is_empty());
-        assert!(store
-            .get_neighbors("Ti-6Al-4V", None, "other", 10)
-            .await
-            .unwrap()
-            .edges
-            .is_empty());
+        assert!(
+            store
+                .graph_search("Ti", "other", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_neighbors("Ti-6Al-4V", None, "other", 10)
+                .await
+                .unwrap()
+                .edges
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1198,23 +1316,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM emmo_entity WHERE name = 'alpha'").await,
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE name = 'alpha'"
+            )
+            .await,
             2
         );
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Matter:alpha'").await,
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Matter:alpha'"
+            )
+            .await,
             1
         );
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Phase:alpha'").await,
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Phase:alpha'"
+            )
+            .await,
             1
         );
 
         // Traversal from the shared name sees edges of BOTH labels.
         let tr = store.get_neighbors("alpha", None, "t1", 10).await.unwrap();
-        assert_eq!(tr.edges.len(), 2, "expected one edge per label: {:?}", tr.edges);
-        assert!(tr.edges.iter().any(|e| e.source == "Ti-6Al-4V" && e.target == "alpha"));
-        assert!(tr.edges.iter().any(|e| e.source == "alpha" && e.target == "beta"));
+        assert_eq!(
+            tr.edges.len(),
+            2,
+            "expected one edge per label: {:?}",
+            tr.edges
+        );
+        assert!(
+            tr.edges
+                .iter()
+                .any(|e| e.source == "Ti-6Al-4V" && e.target == "alpha")
+        );
+        assert!(
+            tr.edges
+                .iter()
+                .any(|e| e.source == "alpha" && e.target == "beta")
+        );
     }
 
     #[tokio::test]
@@ -1228,7 +1371,11 @@ mod tests {
         store.write_fact(&f, &prov).await.unwrap();
 
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Element:nb'").await,
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Element:nb'"
+            )
+            .await,
             1
         );
         let props = query_str(
@@ -1284,7 +1431,10 @@ mod tests {
         // 1 assertion (corroborated), 1 agent, 1 activity.
         assert_eq!(count(&store, "SELECT COUNT(*) FROM emmo_entity").await, 2);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM emmo_edge").await, 1);
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM prov_assertion").await, 1);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            1
+        );
         assert_eq!(count(&store, "SELECT COUNT(*) FROM prov_agent").await, 1);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM prov_activity").await, 1);
     }
@@ -1304,7 +1454,10 @@ mod tests {
         store.record_assertion(&a, &prov).await.unwrap();
         store.record_assertion(&a, &prov).await.unwrap();
 
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM prov_assertion").await, 1);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            1
+        );
         assert_eq!(
             count(&store, "SELECT corroborations FROM prov_assertion").await,
             2
@@ -1330,15 +1483,27 @@ mod tests {
         assert!(facts[0].confidence >= facts[1].confidence);
 
         // Tenant scoping on recall.
-        assert!(store.recall("alpha-beta", "other", 10).await.unwrap().is_empty());
+        assert!(
+            store
+                .recall("alpha-beta", "other", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn canonical_key_normalizes() {
         assert_eq!(canonical_key("  Ti-6Al-4V  "), "ti-6al-4v");
         assert_eq!(canonical_key("Yield   Strength"), "yield strength");
-        assert_eq!(canonical_key("YIELD\tstrength"), canonical_key("yield STRENGTH "));
-        assert_ne!(canonical_key("yield strength"), canonical_key("tensile strength"));
+        assert_eq!(
+            canonical_key("YIELD\tstrength"),
+            canonical_key("yield STRENGTH ")
+        );
+        assert_ne!(
+            canonical_key("yield strength"),
+            canonical_key("tensile strength")
+        );
     }
 
     #[test]
@@ -1433,11 +1598,13 @@ mod tests {
         assert_eq!(hits.len(), 1);
 
         // Tenant scoping: nothing leaks into another tenant.
-        assert!(store
-            .semantic_search_entities(&[1.0, 0.2, 0.0], "other", 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .semantic_search_entities(&[1.0, 0.2, 0.0], "other", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1460,7 +1627,10 @@ mod tests {
             .embed_and_store_entities(&facts, "t1", &MockEmbed)
             .await
             .unwrap();
-        assert_eq!(stored, 4, "Matter:ti-6al-4v, Phase:alpha, Matter:alpha, Phase:beta");
+        assert_eq!(
+            stored, 4,
+            "Matter:ti-6al-4v, Phase:alpha, Matter:alpha, Phase:beta"
+        );
 
         // … but search reports the display name once.
         let hits = store

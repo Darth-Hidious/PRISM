@@ -127,7 +127,11 @@ mod tests {
         let set = EntitySet {
             entities: vec![
                 entity("Alloy", "Ti-6Al-4V", serde_json::json!({})),
-                entity("Property", "corrosion resistance", serde_json::json!({"value": "high"})),
+                entity(
+                    "Property",
+                    "corrosion resistance",
+                    serde_json::json!({"value": "high"}),
+                ),
             ],
             relationships: vec![rel("Ti-6Al-4V", "HAS_PROPERTY", "corrosion resistance")],
         };

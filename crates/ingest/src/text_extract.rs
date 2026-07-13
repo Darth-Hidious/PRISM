@@ -27,7 +27,9 @@ pub async fn extract_facts_from_text(
     title: &str,
     text: &str,
 ) -> Result<Vec<LocalFact>> {
-    let raw = llm.generate_json(&build_extraction_prompt(title, text)).await?;
+    let raw = llm
+        .generate_json(&build_extraction_prompt(title, text))
+        .await?;
     Ok(parse_extraction(&raw))
 }
 

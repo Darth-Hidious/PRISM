@@ -65,7 +65,7 @@ prism status             # Auth state, paths, endpoints
 prism                    # Interactive chat agent
 prism query --platform "titanium alloys"
 prism query --semantic "creep resistance"
-prism query --cypher "MATCH (a:Alloy) RETURN a"
+prism query "Ti-6Al-4V"                  # Local knowledge-graph lookup
 prism research "novel refractory alloys" --depth 1
 ```
 
@@ -90,7 +90,7 @@ prism job-status <uuid>
 
 ### Mesh & Nodes
 ```
-prism node up            # Start local node (Neo4j + Qdrant)
+prism node up            # Start local node (bundled knowledge graph)
 prism node status
 prism mesh discover      # Find LAN peers via mDNS
 prism mesh publish       # Share dataset to mesh

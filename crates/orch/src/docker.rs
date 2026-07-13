@@ -1,7 +1,8 @@
 //! Docker-based service orchestrator using bollard.
 //!
-//! Manages the lifecycle of PRISM's managed services (Neo4j, Qdrant, Kafka)
-//! as Docker containers with a `prism-` prefix for easy identification.
+//! Manages the lifecycle of PRISM's managed services (Kafka, Spark,
+//! Firecrawl) as Docker containers with a `prism-` prefix for easy
+//! identification.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -166,84 +167,6 @@ impl DockerOrchestrator {
             .await
             .map(|list| !list.is_empty())
             .unwrap_or(false)
-    }
-
-    /// Start Neo4j and return a ServiceHandle.
-    async fn start_neo4j(&self, config: &crate::services::Neo4jConfig) -> Result<ServiceHandle> {
-        self.ensure_image(&config.image).await?;
-
-        let env = vec![
-            "NEO4J_AUTH=neo4j/prism-local".to_string(),
-            "NEO4J_PLUGINS=[\"apoc\"]".to_string(),
-            // Allocate reasonable memory for local dev
-            "NEO4J_server_memory_heap_initial__size=256m".to_string(),
-            "NEO4J_server_memory_heap_max__size=512m".to_string(),
-        ];
-
-        let mut port_bindings = HashMap::new();
-        // Bolt protocol
-        port_bindings.insert(
-            "7687/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some(config.bolt_port.to_string()),
-            }]),
-        );
-        // HTTP browser
-        port_bindings.insert(
-            "7474/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some(config.http_port.to_string()),
-            }]),
-        );
-
-        let container_id = self
-            .run_container("neo4j", &config.image, env, None, port_bindings, None)
-            .await?;
-
-        Ok(ServiceHandle {
-            name: "neo4j".to_string(),
-            container_id: Some(container_id),
-            port: config.bolt_port,
-            healthy: false, // will be checked separately
-        })
-    }
-
-    /// Start Qdrant and return a ServiceHandle.
-    async fn start_qdrant(
-        &self,
-        config: &crate::services::VectorDbConfig,
-    ) -> Result<ServiceHandle> {
-        self.ensure_image(&config.image).await?;
-
-        let mut port_bindings = HashMap::new();
-        port_bindings.insert(
-            "6333/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some(config.port.to_string()),
-            }]),
-        );
-        // gRPC port
-        port_bindings.insert(
-            "6334/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some((config.port + 1).to_string()),
-            }]),
-        );
-
-        let container_id = self
-            .run_container("qdrant", &config.image, vec![], None, port_bindings, None)
-            .await?;
-
-        Ok(ServiceHandle {
-            name: "qdrant".to_string(),
-            container_id: Some(container_id),
-            port: config.port,
-            healthy: false,
-        })
     }
 
     /// Start Kafka (KRaft mode, no Zookeeper) and return a ServiceHandle.
@@ -424,22 +347,6 @@ impl DockerOrchestrator {
 
     // -- Public wrappers for HealthMonitor restart --
 
-    /// Restart Neo4j (public, used by health monitor).
-    pub async fn start_neo4j_public(
-        &self,
-        config: &crate::services::Neo4jConfig,
-    ) -> Result<ServiceHandle> {
-        self.start_neo4j(config).await
-    }
-
-    /// Restart Qdrant (public, used by health monitor).
-    pub async fn start_qdrant_public(
-        &self,
-        config: &crate::services::VectorDbConfig,
-    ) -> Result<ServiceHandle> {
-        self.start_qdrant(config).await
-    }
-
     /// Restart Kafka (public, used by health monitor).
     pub async fn start_kafka_public(
         &self,
@@ -495,18 +402,6 @@ impl DockerOrchestrator {
 impl ServiceOrchestrator for DockerOrchestrator {
     async fn start_all(&self, config: &ServiceConfig) -> Result<ServiceHandles> {
         let mut services = Vec::new();
-
-        if let Some(ref neo4j_cfg) = config.neo4j {
-            info!("Starting Neo4j...");
-            let neo4j = self.start_neo4j(neo4j_cfg).await?;
-            services.push(neo4j);
-        }
-
-        if let Some(ref vector_cfg) = config.vector_db {
-            info!("Starting Qdrant...");
-            let qdrant = self.start_qdrant(vector_cfg).await?;
-            services.push(qdrant);
-        }
 
         // Kafka — optional
         if let Some(ref kafka_cfg) = config.kafka {

@@ -107,7 +107,7 @@ jobs:
           "
 
   ingest-pipeline:
-    name: Ingest Pipeline (with services)
+    name: Ingest Pipeline (bundled Turso store)
     runs-on: [self-hosted, linux, ARM64]
     needs: [rust-tests]
     # Non-blocking. The job spawns a Python worker via `prism ingest`
@@ -117,27 +117,8 @@ jobs:
     # Follow-up: either install scientific compilers via apt OR pin a
     # prism-platform venv in /home/ghrunner/.venvs/ the same way the
     # marc27-core Runtime Sidecar Tests job does its PyMuPDF/fastapi
-    # venv. Until then the qdrant-port-remap validation passes
-    # implicitly (containers came up, healthcheck would have run if
-    # the python worker had spawned), so the underlying CI infra fix
-    # is still validated.
+    # venv.
     continue-on-error: true
-    services:
-      neo4j:
-        image: neo4j:5-community
-        ports:
-          - 7474:7474
-          - 7687:7687
-        env:
-          NEO4J_AUTH: neo4j/prism-local
-      qdrant:
-        image: qdrant/qdrant:v1.12.6
-        ports:
-          # Self-hosted runner co-tenants with a long-running user-owned
-          # qdrant container on host port 6333. Remap to 36333 so the CI
-          # service doesn't collide with the existing host binding.
-          - 36333:6333
-          - 6334:6334
 
     steps:
       - uses: actions/checkout@v4
@@ -145,15 +126,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev protobuf-compiler
       - name: Create dashboard dist placeholder (rust-embed needs it)
         run: mkdir -p dashboard/dist && echo '<html><body>placeholder</body></html>' > dashboard/dist/index.html
-
-      - name: Wait for services to be ready
-        run: |
-          echo "Waiting for Neo4j..."
-          for i in $(seq 1 30); do curl -sf http://localhost:7474 > /dev/null 2>&1 && break || sleep 3; done
-          curl -sf http://localhost:7474 > /dev/null && echo "Neo4j ready" || echo "Neo4j not ready (continuing anyway)"
-          echo "Waiting for Qdrant..."
-          for i in $(seq 1 30); do curl -sf http://localhost:36333/healthz > /dev/null 2>&1 && break || sleep 3; done
-          curl -sf http://localhost:36333/healthz > /dev/null && echo "Qdrant ready" || echo "Qdrant not ready (continuing anyway)"
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -166,31 +138,18 @@ jobs:
       - name: Build CLI binary
         run: cargo build --bin prism
 
-      - name: Create Qdrant collection
-        run: |
-          curl -X PUT http://localhost:36333/collections/prism_embeddings \
-            -H "Content-Type: application/json" \
-            -d '{"vectors": {"size": 768, "distance": "Cosine"}}'
-
       - name: Test schema-only ingest
         run: |
           ./target/debug/prism ingest tests/data/refractory_heas.csv --schema-only 2>&1 | tee /tmp/schema.out
           grep -q "15 columns, 10 rows" /tmp/schema.out
 
-      - name: Test Cypher query
+      - name: Test graph query (bundled Turso store, no services)
         run: |
-          curl -s -u neo4j:prism-local \
-            -H "Content-Type: application/json" \
-            http://localhost:7474/db/neo4j/tx/commit \
-            -d '{"statements": [{"statement": "CREATE (a:Alloy {name: \"TestAlloy\"})-[:CONTAINS {weight: 0.5}]->(e:Element {name: \"Fe\"})"}]}'
-
-          ./target/debug/prism query --cypher "MATCH (a:Alloy) RETURN a.name AS name" 2>&1 | tee /tmp/cypher.out
-          grep -q "TestAlloy" /tmp/cypher.out
-
-      - name: Test graph neighbor query
-        run: |
+          # A fresh store has no entities — the query must still succeed
+          # (exit 0) and report a clean miss, proving the local read path
+          # needs no external graph/vector service.
           ./target/debug/prism query "TestAlloy" 2>&1 | tee /tmp/graph.out
-          grep -q "Fe" /tmp/graph.out
+          grep -q "No direct matches" /tmp/graph.out
 
       - name: Test version flag
         # Read the expected version from the workspace Cargo.toml so this
