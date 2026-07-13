@@ -4604,6 +4604,7 @@ dependencies = [
  "prism-node",
  "prism-orch",
  "prism-proto",
+ "prism-provenance",
  "prism-python-bridge",
  "prism-runtime",
  "prism-server",

@@ -86,6 +86,11 @@ pub struct OntologySection {
     /// Custom ontology mapping rules YAML file path.
     #[serde(default)]
     pub mapping_file: Option<String>,
+    /// Where text-document ingest runs: "auto" | "local" | "cloud".
+    /// auto → local when the resolved LLM endpoint is loopback (an
+    /// on-device model), else cloud.
+    #[serde(default = "default_locality")]
+    pub locality: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +333,9 @@ fn default_engine() -> String {
 fn default_llm_provider() -> String {
     "platform".into()
 }
+fn default_locality() -> String {
+    "auto".into()
+}
 fn default_session_timeout() -> String {
     "24h".into()
 }
@@ -404,6 +412,7 @@ impl Default for OntologySection {
             engine: default_engine(),
             llm_provider: default_llm_provider(),
             mapping_file: None,
+            locality: default_locality(),
         }
     }
 }

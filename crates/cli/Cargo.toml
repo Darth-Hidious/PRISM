@@ -36,6 +36,7 @@ prism-ingest = { path = "../ingest" }
 prism-mesh = { path = "../mesh" }
 prism-node = { path = "../node" }
 prism-orch = { path = "../orch" }
+prism-provenance = { path = "../provenance" }
 prism-ipc = { path = "../ipc" }
 prism-proto = { path = "../proto" }
 prism-agent = { path = "../agent" }

@@ -4635,6 +4635,41 @@ fn ingest_format(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// True when the URL's host is loopback (`localhost`, 127.x.x.x, `::1`) —
+/// i.e. the model runs on this machine.
+fn is_loopback_url(raw: &str) -> bool {
+    match url::Url::parse(raw) {
+        Ok(parsed) => match parsed.host() {
+            Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Resolve where text-document ingest runs: `[ontology] locality` in
+/// prism.toml ("local"/"cloud" honored as-is); "auto" → local iff the LLM
+/// endpoint `build_llm_config` resolves is loopback (an on-device model).
+/// No usable LLM config → cloud, preserving the pre-locality default.
+fn resolve_text_ingest_locality(
+    project_root: &Path,
+    llm_url: Option<&str>,
+    model: Option<&str>,
+    api_key: Option<&str>,
+) -> &'static str {
+    let node_config = prism_core::config::NodeConfig::load(Some(project_root));
+    match node_config.ontology.locality.as_str() {
+        "local" => "local",
+        "cloud" => "cloud",
+        _ => match build_llm_config(project_root, llm_url, model, api_key) {
+            Ok(cfg) if is_loopback_url(&cfg.base_url) => "local",
+            _ => "cloud",
+        },
+    }
+}
+
 fn collect_ingest_paths(root: &Path) -> Result<Vec<PathBuf>> {
     if root.is_file() {
         return Ok(vec![root.to_path_buf()]);
@@ -4937,6 +4972,110 @@ async fn run_platform_ingest_file(
     }))
 }
 
+/// Ingest a text document entirely on-device: extract EMMO facts with the
+/// local LLM and write them (with one PROV-O activity) into the bundled
+/// Turso provenance store. Nothing leaves the machine.
+#[allow(clippy::too_many_arguments)]
+async fn run_local_text_ingest_file(
+    path: &Path,
+    project_root: &Path,
+    model: Option<&str>,
+    llm_url: Option<&str>,
+    api_key: Option<&str>,
+    runtime_url: &str,
+    schema_only: bool,
+    mapping_path: Option<&Path>,
+) -> Result<serde_json::Value> {
+    if mapping_path.is_some() {
+        eprintln!(
+            "Warning: --mapping is only applied to the local tabular ingest pipeline and is ignored for {}.",
+            path.display()
+        );
+    }
+
+    // Local PDF parsing isn't wired yet. Be honest and skip — never quietly
+    // fall back to the cloud against the user's locality choice.
+    if ingest_format(path) == "pdf" {
+        let reason = "local PDF parsing isn't available yet — ingest text/markdown/json locally, or set locality = \"cloud\" for PDFs";
+        eprintln!("  Skipping {}: {reason}", path.display());
+        return Ok(serde_json::json!({
+            "backend": "local_text",
+            "path": path.display().to_string(),
+            "format": "pdf",
+            "skipped": true,
+            "reason": reason,
+        }));
+    }
+
+    // Non-PDF text formats just read the file — the runtime sidecar is
+    // never contacted (the PDF branch is excluded above).
+    let (text, _pages, warning) = extract_platform_ingest_text(path, runtime_url).await?;
+    let chars = text.chars().count();
+    if text.trim().is_empty() {
+        bail!("No ingestable text found in {}", path.display());
+    }
+
+    if schema_only {
+        return Ok(serde_json::json!({
+            "backend": "local_text",
+            "path": path.display().to_string(),
+            "format": ingest_format(path),
+            "schema_only": true,
+            "chars": chars,
+            "warning": warning,
+        }));
+    }
+
+    let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
+    let agent_id = if llm_cfg.model.is_empty() {
+        "prism-ingest".to_string()
+    } else {
+        llm_cfg.model.clone()
+    };
+    let llm = prism_ingest::llm::LlmClient::new(llm_cfg);
+    let title = path
+        .file_stem()
+        .or_else(|| path.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or("untitled");
+
+    let facts = prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let db_path = PathBuf::from(home).join(".prism/provenance.db");
+    let store = prism_provenance::ProvenanceStore::open(&db_path).await?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let prov = prism_provenance::LocalProvenance {
+        activity_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: agent_id.clone(),
+        agent_kind: "SoftwareAgent".into(),
+        source_entity_id: path.display().to_string(),
+        source_kind: "Document".into(),
+        // Local single-user store — no per-run tenancy (yet).
+        tenant: "local".into(),
+        started_at: now.clone(),
+        ended_at: now,
+        locality: "local".into(),
+    };
+    store.record_activity(&prov).await?;
+    for fact in &facts {
+        store.write_fact(fact, &prov).await?;
+    }
+
+    Ok(serde_json::json!({
+        "backend": "local_text",
+        "path": path.display().to_string(),
+        "format": ingest_format(path),
+        "schema_only": false,
+        "chars": chars,
+        "facts_written": facts.len(),
+        "model": agent_id,
+        "store": db_path.display().to_string(),
+        "warning": warning,
+    }))
+}
+
 fn print_ingest_summary(summary: &serde_json::Value) {
     let backend = value_string(summary, &["backend"]).unwrap_or("ingest");
     let path = value_string(summary, &["path"]).unwrap_or("?");
@@ -5058,6 +5197,42 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     let job_id = value_string(job, &["job_id"]).unwrap_or("?");
                     let status = value_string(job, &["status"]).unwrap_or("submitted");
                     println!("  Chunk {chunk_index}: job {job_id} [{status}]");
+                }
+            }
+        }
+        "local_text" => {
+            if summary
+                .get("skipped")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                let reason = value_string(summary, &["reason"]).unwrap_or("skipped");
+                println!("  Skipped: {reason}");
+            } else {
+                let chars = summary
+                    .get("chars")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                println!("  Text: {chars} chars extracted on-device");
+                if let Some(warning) = summary.get("warning").and_then(|value| value.as_str()) {
+                    println!("  Warning: {warning}");
+                }
+                if summary
+                    .get("schema_only")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    println!("  (schema-only mode — text was measured but not extracted)");
+                } else {
+                    let facts = summary
+                        .get("facts_written")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let store = value_string(summary, &["store"]).unwrap_or("~/.prism/provenance.db");
+                    println!("  Facts: {facts} written to local store ({store})");
+                    if let Some(model) = value_string(summary, &["model"]) {
+                        println!("  Model: {model}");
+                    }
                 }
             }
         }
@@ -5250,6 +5425,24 @@ async fn handle_ingest(
         bail!("No ingestable files found under {}", path.display());
     }
 
+    // Resolve text-ingest locality once per run and say where document text
+    // is processed BEFORE anything runs. Banner goes to stderr so `--json`
+    // stdout stays parseable.
+    let text_locality = if ingest_targets
+        .iter()
+        .any(|target| ingest_backend(target) == Some(IngestBackend::PlatformText))
+    {
+        let locality = resolve_text_ingest_locality(project_root, llm_url, model, api_key);
+        if locality == "local" {
+            eprintln!("⚑ LOCAL — extracting on-device, nothing leaves your machine");
+        } else {
+            eprintln!("☁ CLOUD — sent to the platform");
+        }
+        locality
+    } else {
+        "cloud"
+    };
+
     let mut summaries = Vec::new();
     for target in ingest_targets {
         let summary = match ingest_backend(&target) {
@@ -5264,6 +5457,19 @@ async fn handle_ingest(
                     neo4j_user,
                     neo4j_pass,
                     qdrant_url,
+                    schema_only,
+                    mapping_path,
+                )
+                .await?
+            }
+            Some(IngestBackend::PlatformText) if text_locality == "local" => {
+                run_local_text_ingest_file(
+                    &target,
+                    project_root,
+                    model,
+                    llm_url,
+                    api_key,
+                    runtime_url,
                     schema_only,
                     mapping_path,
                 )

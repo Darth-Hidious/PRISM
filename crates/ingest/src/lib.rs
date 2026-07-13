@@ -28,6 +28,7 @@ pub mod nl_query;
 pub mod ontology;
 pub mod pipeline;
 pub mod schema;
+pub mod text_extract;
 pub mod validation;
 
 use anyhow::Result;
