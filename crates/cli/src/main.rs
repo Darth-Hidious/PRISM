@@ -6994,29 +6994,128 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
     Ok(())
 }
 
-/// Parse a Server-Sent-Events stream body into JSON event objects. Each
-/// `data:` line is decoded as one JSON value (our backends emit one compact
-/// JSON object per `data:` line); `[DONE]` sentinels, comments, and non-JSON
-/// keep-alive lines are skipped.
+/// Chunk-safe Server-Sent-Events decoder for the platform discourse
+/// (mirofish) event stream.
+///
+/// Two things make a naive "one JSON object per `data:` line" parser wrong
+/// against the live platform:
+///
+/// 1. **Multi-line events.** Per the SSE spec, an event's `data` field can
+///    span several consecutive `data:` lines — the values are joined with
+///    `\n` and the event only ends at the next *blank* line. Treating every
+///    `data:` line as an independent event breaks as soon as a payload (or
+///    the framing around it) spans more than one line.
+/// 2. **Double `data:` encoding.** The mirofish discourse engine pre-formats
+///    each message as the literal string `"data: {json}\n\n"` *before*
+///    handing it to axum's `Sse` response writer, which then SSE-encodes
+///    that string *again* — splitting it on its embedded newlines and
+///    re-prefixing every resulting line with `data:`. The wire bytes for one
+///    logical event end up looking like:
+///    ```text
+///    data:data: {"step":"started"}
+///    data:
+///    data:
+///
+///    ```
+///    A spec-correct multi-line join (rule 1) reconstructs the original
+///    `"data: {json}\n\n"` string; this decoder then strips the surviving
+///    inner `data:` prefix before parsing JSON.
+///
+/// The decoder is fed via [`SseDecoder::push_chunk`], which may be called
+/// once per network read — a line, or an event's blank-line terminator, may
+/// legally straddle two chunks, and partial state is buffered across calls.
+#[derive(Default)]
+struct SseDecoder {
+    /// Bytes received but not yet resolved into a complete `\n`-terminated line.
+    line_buf: String,
+    /// `data:` field values accumulated for the event currently in progress.
+    data_lines: Vec<String>,
+}
+
+impl SseDecoder {
+    /// Feed one chunk of the response body (as much or as little as one
+    /// network read happened to deliver) and return every event it
+    /// completes. Incomplete lines/events are buffered for the next call.
+    fn push_chunk(&mut self, chunk: &str) -> Vec<serde_json::Value> {
+        self.line_buf.push_str(chunk);
+        let mut out = Vec::new();
+        while let Some(pos) = self.line_buf.find('\n') {
+            let line = self.line_buf[..pos].trim_end_matches('\r').to_string();
+            self.line_buf.drain(..=pos);
+            self.feed_line(&line, &mut out);
+        }
+        out
+    }
+
+    /// Flush any state left after the stream has closed: a final line with
+    /// no trailing newline, and/or an event with no trailing blank line.
+    fn finish(&mut self) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        if !self.line_buf.is_empty() {
+            let line = std::mem::take(&mut self.line_buf);
+            self.feed_line(line.trim_end_matches('\r'), &mut out);
+        }
+        if let Some(value) = self.finish_event() {
+            out.push(value);
+        }
+        out
+    }
+
+    fn feed_line(&mut self, line: &str, out: &mut Vec<serde_json::Value>) {
+        if line.is_empty() {
+            // Blank line: the SSE event boundary.
+            if let Some(value) = self.finish_event() {
+                out.push(value);
+            }
+            return;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            self.data_lines
+                .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        }
+        // Other fields (`event:`, `id:`, `retry:`) and `:`-comment
+        // keep-alives carry no payload we need here — ignored.
+    }
+
+    fn finish_event(&mut self) -> Option<serde_json::Value> {
+        if self.data_lines.is_empty() {
+            return None;
+        }
+        let mut payload = self.data_lines.join("\n");
+        self.data_lines.clear();
+
+        // Undo the double `data:` encoding described above. Bounded so a
+        // malformed payload that merely starts with the literal text
+        // "data:" can never loop.
+        for _ in 0..4 {
+            let Some(rest) = payload.trim().strip_prefix("data:") else {
+                break;
+            };
+            payload = rest.strip_prefix(' ').unwrap_or(rest).to_string();
+        }
+
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return None;
+        }
+        // Malformed/non-JSON keep-alive payloads are skipped rather than
+        // failing the whole stream, matching real SSE keep-alive traffic.
+        serde_json::from_str::<serde_json::Value>(payload).ok()
+    }
+}
+
+/// Parse a Server-Sent-Events stream body into JSON event objects, tolerant
+/// of multi-line events and the mirofish double `data:` encoding bug — see
+/// [`SseDecoder`].
 ///
 /// If the body carries no SSE `data:` events at all, it is treated as a plain
 /// JSON document (array → its elements, object → a single event) so a
 /// non-streamed error/response body still surfaces to the caller instead of
 /// silently vanishing.
 fn parse_sse_json_events(body: &str) -> Result<Vec<serde_json::Value>> {
-    let mut events = Vec::new();
-    for line in body.lines() {
-        let Some(payload) = line.trim_end().strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
-            events.push(value);
-        }
-    }
+    let mut decoder = SseDecoder::default();
+    let mut events = decoder.push_chunk(body);
+    events.extend(decoder.finish());
 
     if events.is_empty() && !body.trim().is_empty() {
         match serde_json::from_str::<serde_json::Value>(body.trim()) {
@@ -9056,11 +9155,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_sse_json_events_accepts_line_delimited_data_events() {
+    fn parse_sse_json_events_accepts_blank_line_delimited_data_events() {
+        // Real SSE framing: one `data:` line per event, each event
+        // terminated by a blank line (this is how axum's `Sse` writer, and
+        // every conformant SSE source, actually separates events on the
+        // wire — see `SseDecoder`'s doc comment).
         let events = parse_sse_json_events(
-            "data: {\"step\":\"started\",\"instance_id\":\"abc\"}\n\
-data: {\"step\":\"agent_turn\",\"agent_id\":\"metallurgist\"}\n\
-data: {\"step\":\"complete\",\"total_turns\":2}\n",
+            "data: {\"step\":\"started\",\"instance_id\":\"abc\"}\n\n\
+data: {\"step\":\"agent_turn\",\"agent_id\":\"metallurgist\"}\n\n\
+data: {\"step\":\"complete\",\"total_turns\":2}\n\n",
         )
         .unwrap();
 
@@ -9068,6 +9171,89 @@ data: {\"step\":\"complete\",\"total_turns\":2}\n",
         assert_eq!(events[0]["step"], "started");
         assert_eq!(events[1]["agent_id"], "metallurgist");
         assert_eq!(events[2]["step"], "complete");
+    }
+
+    #[test]
+    fn parse_sse_json_events_joins_multiline_data_fields() {
+        // Per the SSE spec, several consecutive `data:` lines before a
+        // blank line belong to ONE event and are joined with `\n`.
+        let events = parse_sse_json_events(
+            "data: {\"step\":\"complete\",\n\
+data: \"summary\":\"line one\\nline two\"}\n\n",
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["step"], "complete");
+        assert_eq!(events[0]["summary"], "line one\nline two");
+    }
+
+    /// Reproduces the real, live-observed mirofish/axum double `data:`
+    /// encoding bug: `crates/core/src/mirofish/engine.rs` pre-formats each
+    /// message as `format!("data: {json}\n\n")` and hands that *string* to
+    /// `axum::response::sse::Event::data(msg)` in
+    /// `crates/api/src/routes/discourse.rs`, which SSE-encodes it a second
+    /// time — splitting on the embedded newlines and re-prefixing every
+    /// resulting line with `data:`. This byte stream is what actually
+    /// arrives over the wire for a single logical `{"step":"started",...}`
+    /// event; a naive one-`data:`-line-per-event parser silently drops it
+    /// (payload = the non-JSON string `data: {"step":...}`) and the whole
+    /// discourse run comes back empty.
+    #[test]
+    fn parse_sse_json_events_reconstructs_double_data_prefixed_events() {
+        let raw = "data:data: {\"step\":\"started\",\"instance_id\":\"abc\"}\n\
+data:\n\
+data:\n\
+\n\
+data:data: {\"step\":\"complete\",\"total_turns\":2}\n\
+data:\n\
+data:\n\
+\n";
+
+        let events = parse_sse_json_events(raw).unwrap();
+
+        assert_eq!(events.len(), 2, "events: {events:?}");
+        assert_eq!(events[0]["step"], "started");
+        assert_eq!(events[0]["instance_id"], "abc");
+        assert_eq!(events[1]["step"], "complete");
+        assert_eq!(events[1]["total_turns"], 2);
+    }
+
+    /// Same double-encoded byte stream as above, but delivered as two
+    /// separate network reads with the split landing *inside* the
+    /// double-`data:`-prefixed line of the first event — the case a
+    /// non-chunk-safe parser (one that only ever sees a fully-buffered
+    /// `String`) can't represent at all. Feeding `SseDecoder` chunk by
+    /// chunk directly (rather than through `parse_sse_json_events`, which
+    /// only ever receives one fully-assembled body) proves the buffering
+    /// survives a line — and an event's blank-line terminator — arriving in
+    /// two pieces.
+    #[test]
+    fn sse_decoder_reassembles_event_split_across_two_chunks() {
+        let raw = "data:data: {\"step\":\"started\",\"instance_id\":\"abc\"}\n\
+data:\n\
+data:\n\
+\n\
+data:data: {\"step\":\"complete\",\"total_turns\":2}\n\
+data:\n\
+data:\n\
+\n";
+        // Split mid-line, inside the JSON payload of the first event.
+        let split_at = raw
+            .find("\"instance_id\"")
+            .expect("fixture contains marker");
+        let (chunk_a, chunk_b) = raw.split_at(split_at);
+
+        let mut decoder = SseDecoder::default();
+        let mut events = decoder.push_chunk(chunk_a);
+        events.extend(decoder.push_chunk(chunk_b));
+        events.extend(decoder.finish());
+
+        assert_eq!(events.len(), 2, "events: {events:?}");
+        assert_eq!(events[0]["step"], "started");
+        assert_eq!(events[0]["instance_id"], "abc");
+        assert_eq!(events[1]["step"], "complete");
+        assert_eq!(events[1]["total_turns"], 2);
     }
 
     #[test]
