@@ -269,6 +269,8 @@ impl CampaignState {
             total_cost_usd: 0.0,
             paused: false,
             completed: false,
+            status: GoalStatus::Submitted,
+            gates_hit: Vec::new(),
             completion_reason: String::new(),
             started_at: Utc::now().to_rfc3339(),
             last_checkpoint_at: String::new(),
