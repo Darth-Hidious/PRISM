@@ -1,12 +1,12 @@
 //! Query execution handlers.
 //!
-//! Supports four query modes:
-//! - `nl` — Natural language → LLM translates to Cypher → executes against Neo4j
-//! - `cypher` — Direct Cypher execution (power users)
-//! - `graph` — Entity neighbor traversal by name (bundled Turso store first,
-//!   Neo4j fallback)
-//! - `semantic` — Vector similarity search (bundled Turso store first, Qdrant
-//!   fallback)
+//! Supports three query modes, all served by the bundled Turso store:
+//! - `graph` — Entity neighbor traversal by name
+//! - `semantic` — Vector similarity search over locally-embedded entities
+//! - `federated` — Fan out to mesh peers and merge results
+//!
+//! The `nl` and `cypher` modes were removed with the Neo4j retirement —
+//! they translated to / executed Cypher and have no Turso equivalent.
 
 use axum::Extension;
 use axum::extract::State;
@@ -22,7 +22,7 @@ use crate::middleware::AuthenticatedUser;
 #[derive(Deserialize)]
 pub struct QueryRequest {
     pub query: String,
-    /// "nl" (default), "cypher", "graph", "semantic", or "federated".
+    /// "graph" (default), "semantic", or "federated".
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_limit")]
@@ -33,7 +33,7 @@ pub struct QueryRequest {
 }
 
 fn default_mode() -> String {
-    "nl".into()
+    "graph".into()
 }
 fn default_limit() -> usize {
     10
@@ -44,15 +44,6 @@ pub struct QueryResponse {
     pub results: Vec<serde_json::Value>,
     pub count: u64,
     pub mode: String,
-    /// For "nl" mode: the generated Cypher and explanation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub translation: Option<TranslationInfo>,
-}
-
-#[derive(Serialize)]
-pub struct TranslationInfo {
-    pub cypher: String,
-    pub explanation: String,
 }
 
 #[derive(Serialize)]
@@ -90,8 +81,6 @@ pub async fn execute_query(
         .unwrap_or("anonymous");
 
     let mut result = match body.mode.as_str() {
-        "nl" => handle_nl_query(&state, &body, user_id).await,
-        "cypher" => handle_cypher_query(&state, &body, user_id).await,
         "graph" | "neighbors" => handle_graph_query(&state, &body, user_id).await,
         "semantic" => handle_semantic_query(&state, &body, user_id).await,
         "federated" => handle_federated_query(&state, &body, user_id).await,
@@ -99,7 +88,7 @@ pub async fn execute_query(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: format!(
-                    "Unknown query mode: '{other}'. Use 'nl', 'cypher', 'graph', 'semantic', or 'federated'."
+                    "Unknown query mode: '{other}'. Use 'graph', 'semantic', or 'federated'."
                 ),
             }),
         )),
@@ -115,206 +104,6 @@ pub async fn execute_query(
     }
 
     Ok(result)
-}
-
-/// Natural language query: LLM translates to Cypher, then executes.
-async fn handle_nl_query(
-    state: &NodeState,
-    body: &QueryRequest,
-    user_id: &str,
-) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref neo4j_config) = state.neo4j else {
-        return Err(service_unavailable("Neo4j not configured."));
-    };
-    let Some(ref llm_config) = state.llm else {
-        return Err(service_unavailable(
-            "LLM not configured — cannot translate natural language queries. Use mode='cypher' for direct Cypher.",
-        ));
-    };
-
-    use prism_ingest::graph::Neo4jGraphStore;
-    use prism_ingest::nl_query::NlQueryTranslator;
-
-    let store = Neo4jGraphStore::new(neo4j_config.clone());
-    let translator = NlQueryTranslator::new(llm_config.clone());
-
-    // Get graph schema for the LLM
-    let schema = store.schema().await.map_err(|e| {
-        tracing::error!(error = %e, "failed to fetch graph schema");
-        internal_error("Failed to read graph schema.")
-    })?;
-
-    // Translate NL → Cypher
-    let translation = translator
-        .translate(&body.query, &schema, body.limit)
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, query = %body.query, "NL→Cypher translation failed");
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(ErrorResponse {
-                    error: format!("Could not translate query: {e}"),
-                }),
-            )
-        })?;
-
-    tracing::info!(
-        cypher = %translation.cypher,
-        explanation = %translation.explanation,
-        "NL query translated"
-    );
-
-    // Same write protection as direct cypher mode. The LLM can produce
-    // destructive Cypher accidentally (a user asking "delete my old
-    // experiments" politely), or via prompt injection (an entity name
-    // in the corpus reads `MATCH (n) DETACH DELETE n` and the LLM
-    // echoes it). Bug #48 — NL mode bypassed the cypher-mode blocklist.
-    //
-    // Reject with a clear message; the user can switch to a write-aware
-    // endpoint if they actually want destructive behavior.
-    if let Some(found) = detect_blocked_cypher_keyword(&translation.cypher) {
-        // Audit the LLM-generated denial — distinguishes prompt-injection
-        // attempts from genuine user write requests. See Bug #55.
-        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
-            id: 0,
-            timestamp: chrono::Utc::now(),
-            user_id: user_id.to_string(),
-            action: prism_core::audit::AuditAction::DataQuery,
-            target: "nl".into(),
-            detail: Some(format!(
-                "LLM emitted blocked keyword: {} (cypher={})",
-                found.trim(),
-                translation.cypher
-            )),
-            outcome: prism_core::audit::AuditOutcome::Denied,
-        });
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: format!(
-                    "Generated Cypher contains a write/admin keyword ({}); the query API is \
-                     read-only. Generated: {}",
-                    found.trim(),
-                    translation.cypher
-                ),
-            }),
-        ));
-    }
-
-    // Execute the generated Cypher
-    let results = store
-        .query_cypher(&translation.cypher, None)
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, cypher = %translation.cypher, "generated Cypher failed");
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(ErrorResponse {
-                    error: format!(
-                        "Generated Cypher failed to execute: {e}. Try rephrasing your question."
-                    ),
-                }),
-            )
-        })?;
-
-    let count = results.len() as u64;
-
-    state.audit_and_broadcast(&prism_core::audit::AuditEntry {
-        id: 0,
-        timestamp: chrono::Utc::now(),
-        user_id: user_id.to_string(),
-        action: prism_core::audit::AuditAction::DataQuery,
-        target: "nl".into(),
-        detail: Some(format!("results={count}, cypher={}", translation.cypher)),
-        outcome: prism_core::audit::AuditOutcome::Success,
-    });
-
-    Ok(Json(QueryResponse {
-        results,
-        count,
-        mode: "nl".into(),
-        translation: Some(TranslationInfo {
-            cypher: translation.cypher,
-            explanation: translation.explanation,
-        }),
-    }))
-}
-
-/// Direct Cypher query execution.
-async fn handle_cypher_query(
-    state: &NodeState,
-    body: &QueryRequest,
-    user_id: &str,
-) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref neo4j_config) = state.neo4j else {
-        return Err(service_unavailable("Neo4j not configured."));
-    };
-
-    if let Some(found) = detect_blocked_cypher_keyword(&body.query) {
-        // Audit the denial — failed/blocked operations are at least as
-        // important to log as successes for security review. Without
-        // this, admins reviewing the audit log can't see attack
-        // attempts. See Bug #55.
-        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
-            id: 0,
-            timestamp: chrono::Utc::now(),
-            user_id: user_id.to_string(),
-            action: prism_core::audit::AuditAction::DataQuery,
-            target: "cypher".into(),
-            detail: Some(format!("blocked keyword: {}", found.trim())),
-            outcome: prism_core::audit::AuditOutcome::Denied,
-        });
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                error: format!(
-                    "Write/admin operations not allowed via the query API (matched: {}). \
-                     Use the dedicated ingest / admin endpoints instead.",
-                    found.trim()
-                ),
-            }),
-        ));
-    }
-
-    use prism_ingest::graph::Neo4jGraphStore;
-    let store = Neo4jGraphStore::new(neo4j_config.clone());
-
-    let results = store.query_cypher(&body.query, None).await.map_err(|e| {
-        tracing::error!(error = %e, "Cypher query failed");
-        // Failed query — log as Failure for the audit trail. Surface to
-        // admins reviewing security: a Cypher syntax error from a real
-        // user is benign noise, but the same error from a probe trying
-        // to fingerprint the schema is signal.
-        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
-            id: 0,
-            timestamp: chrono::Utc::now(),
-            user_id: user_id.to_string(),
-            action: prism_core::audit::AuditAction::DataQuery,
-            target: "cypher".into(),
-            detail: Some(format!("execution error: {e}")),
-            outcome: prism_core::audit::AuditOutcome::Failure,
-        });
-        internal_error("Cypher execution failed.")
-    })?;
-
-    let count = results.len() as u64;
-
-    state.audit_and_broadcast(&prism_core::audit::AuditEntry {
-        id: 0,
-        timestamp: chrono::Utc::now(),
-        user_id: user_id.to_string(),
-        action: prism_core::audit::AuditAction::DataQuery,
-        target: "cypher".into(),
-        detail: Some(format!("results={count}")),
-        outcome: prism_core::audit::AuditOutcome::Success,
-    });
-
-    Ok(Json(QueryResponse {
-        results,
-        count,
-        mode: "cypher".into(),
-        translation: None,
-    }))
 }
 
 // ─── Local Turso reads (same pattern as the CLI's local-first query) ────
@@ -334,9 +123,9 @@ fn default_provenance_db_path() -> PathBuf {
 /// Query the bundled Turso store for locally-ingested ontology entities.
 ///
 /// Never errors: any failure (store unopenable, query error) degrades to
-/// `None` so the caller falls back to the existing Neo4j read. `None` is
+/// `None`, which the handler renders as an empty result set. `None` is
 /// also returned when the store is fine but nothing matched (fresh
-/// install, unknown term) — same fallback.
+/// install, unknown term).
 async fn local_graph_lookup(
     db_path: &Path,
     text: &str,
@@ -383,10 +172,10 @@ async fn local_graph_lookup(
 /// ingest writes via `embed_entities_best_effort`.
 ///
 /// Never errors: an unopenable store, an empty store, an unavailable
-/// embedding backend, or zero hits all degrade to `None` so the caller
-/// falls back to the existing Qdrant path. The store is checked BEFORE the
-/// backend is built, so a fresh install never pays the embedding-model
-/// init just to fall through.
+/// embedding backend, or zero hits all degrade to `None`, which the
+/// handler renders as an empty result set. The store is checked BEFORE
+/// the backend is built, so a fresh install never pays the
+/// embedding-model init just to return nothing.
 async fn local_semantic_lookup(
     db_path: &Path,
     text: &str,
@@ -465,66 +254,19 @@ fn semantic_hits_to_results(hits: &[(String, f32)]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Entity neighbor traversal by name.
+/// Entity neighbor traversal by name, served by the bundled Turso store
+/// (~/.prism/provenance.db, tenant "local") — the sole graph backend.
+/// A miss (fresh install, unknown term) is an empty result set, not an
+/// error.
 async fn handle_graph_query(
     state: &NodeState,
     body: &QueryRequest,
     user_id: &str,
 ) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Local-first: `prism ingest` writes ontology entities into the bundled
-    // Turso store (~/.prism/provenance.db, tenant "local"), not Neo4j — so
-    // locally-ingested data must be queryable without any running services.
-    // Read Turso first; an empty/unavailable store falls through to the
-    // existing Neo4j read unchanged.
-    if let Some(nodes) =
-        local_graph_lookup(&default_provenance_db_path(), &body.query, body.limit).await
-    {
-        let results = graph_nodes_to_results(&nodes);
-        let count = results.len() as u64;
-
-        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
-            id: 0,
-            timestamp: chrono::Utc::now(),
-            user_id: user_id.to_string(),
-            action: prism_core::audit::AuditAction::DataQuery,
-            target: "graph".into(),
-            detail: Some(format!("results={count}, source=turso-local")),
-            outcome: prism_core::audit::AuditOutcome::Success,
-        });
-
-        return Ok(Json(QueryResponse {
-            results,
-            count,
-            mode: "graph".into(),
-            translation: None,
-        }));
-    }
-
-    let Some(ref neo4j_config) = state.neo4j else {
-        return Err(service_unavailable(
-            "Neo4j not configured — is the node running with services?",
-        ));
-    };
-
-    use prism_ingest::graph::{GraphStore, Neo4jGraphStore};
-    let store = Neo4jGraphStore::new(neo4j_config.clone());
-    let entity_set = store.neighbors(&body.query, 3).await.map_err(|e| {
-        tracing::error!(error = %e, "Neo4j neighbor query failed");
-        internal_error("Internal server error.")
-    })?;
-
-    let results: Vec<serde_json::Value> = entity_set
-        .entities
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "type": e.entity_type,
-                "name": e.name,
-                "properties": e.properties,
-            })
-        })
-        .collect();
-
+    let nodes = local_graph_lookup(&default_provenance_db_path(), &body.query, body.limit)
+        .await
+        .unwrap_or_default();
+    let results = graph_nodes_to_results(&nodes);
     let count = results.len() as u64;
 
     state.audit_and_broadcast(&prism_core::audit::AuditEntry {
@@ -533,7 +275,7 @@ async fn handle_graph_query(
         user_id: user_id.to_string(),
         action: prism_core::audit::AuditAction::DataQuery,
         target: "graph".into(),
-        detail: Some(format!("results={count}")),
+        detail: Some(format!("results={count}, source=turso-local")),
         outcome: prism_core::audit::AuditOutcome::Success,
     });
 
@@ -541,85 +283,22 @@ async fn handle_graph_query(
         results,
         count,
         mode: "graph".into(),
-        translation: None,
     }))
 }
 
-/// Vector similarity search via Qdrant.
+/// Vector similarity search over the bundled Turso entity vectors written
+/// by local ingest (offline prism-embed query embedding — no services
+/// needed). A miss (empty store, unavailable embedding backend, zero hits)
+/// is an empty result set, not an error.
 async fn handle_semantic_query(
     state: &NodeState,
     body: &QueryRequest,
     user_id: &str,
 ) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Local-first: try the bundled Turso entity vectors written by local
-    // ingest (offline prism-embed query embedding — no services needed).
-    // Hits take the same {id, score} shape as the Qdrant results below; an
-    // empty/unavailable store falls through to the existing Qdrant path
-    // unchanged.
-    if let Some(hits) =
-        local_semantic_lookup(&default_provenance_db_path(), &body.query, body.limit).await
-    {
-        let results = semantic_hits_to_results(&hits);
-        let count = results.len() as u64;
-
-        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
-            id: 0,
-            timestamp: chrono::Utc::now(),
-            user_id: user_id.to_string(),
-            action: prism_core::audit::AuditAction::DataQuery,
-            target: "semantic".into(),
-            detail: Some(format!("results={count}, source=turso-local")),
-            outcome: prism_core::audit::AuditOutcome::Success,
-        });
-
-        return Ok(Json(QueryResponse {
-            results,
-            count,
-            mode: "semantic".into(),
-            translation: None,
-        }));
-    }
-
-    let Some(ref qdrant_config) = state.qdrant else {
-        return Err(service_unavailable(
-            "Qdrant not configured — is the node running with services?",
-        ));
-    };
-    let Some(ref llm_config) = state.llm else {
-        return Err(service_unavailable(
-            "LLM not configured — cannot generate embeddings for semantic search.",
-        ));
-    };
-
-    use prism_ingest::embeddings::{QdrantVectorStore, VectorStore};
-    use prism_ingest::ontology::LlmOntologyConstructor;
-
-    // Generate an embedding for the query text via Ollama
-    let constructor = LlmOntologyConstructor::new(llm_config.clone());
-    let query_embedding = constructor.embed_text(&body.query).await.map_err(|e| {
-        tracing::error!(error = %e, "failed to embed query text");
-        internal_error("Failed to generate query embedding.")
-    })?;
-
-    let store = QdrantVectorStore::new(qdrant_config.clone());
-    let hits = store
-        .query(&query_embedding, body.limit)
+    let hits = local_semantic_lookup(&default_provenance_db_path(), &body.query, body.limit)
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Qdrant search failed");
-            internal_error("Semantic search failed.")
-        })?;
-
-    let results: Vec<serde_json::Value> = hits
-        .iter()
-        .map(|(id, score)| {
-            serde_json::json!({
-                "id": id,
-                "score": score,
-            })
-        })
-        .collect();
-
+        .unwrap_or_default();
+    let results = semantic_hits_to_results(&hits);
     let count = results.len() as u64;
 
     state.audit_and_broadcast(&prism_core::audit::AuditEntry {
@@ -628,7 +307,7 @@ async fn handle_semantic_query(
         user_id: user_id.to_string(),
         action: prism_core::audit::AuditAction::DataQuery,
         target: "semantic".into(),
-        detail: Some(format!("results={count}")),
+        detail: Some(format!("results={count}, source=turso-local")),
         outcome: prism_core::audit::AuditOutcome::Success,
     });
 
@@ -636,7 +315,6 @@ async fn handle_semantic_query(
         results,
         count,
         mode: "semantic".into(),
-        translation: None,
     }))
 }
 
@@ -685,7 +363,6 @@ async fn handle_federated_query(
         results,
         count,
         mode: "federated".into(),
-        translation: None,
     }))
 }
 
@@ -716,33 +393,6 @@ async fn query_mesh_peers(state: &NodeState, query: &str) -> Option<Vec<serde_js
             None
         }
     }
-}
-
-fn service_unavailable(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse { error: msg.into() }),
-    )
-}
-
-/// Substring-based write/admin keyword detection. Imperfect — the
-/// only correct long-term fix is connecting to Neo4j as a READ-ONLY
-/// role — but closes the obvious bypasses for both direct cypher
-/// queries and LLM-generated NL→cypher.
-///
-/// Returns the matched keyword (for the error message) when the
-/// query contains any forbidden verb. Tested via cypher-mode unit
-/// tests; reused by NL mode so the LLM can't accidentally — or via
-/// prompt injection — emit destructive Cypher and have it run.
-fn detect_blocked_cypher_keyword(query: &str) -> Option<&'static str> {
-    let upper = query.to_uppercase();
-    const BLOCKED_KEYWORDS: &[&str] = &[
-        "DELETE", "CREATE", "MERGE", "SET ", "REMOVE ", "DROP ", "LOAD ", "USE ", "CALL ",
-    ];
-    BLOCKED_KEYWORDS
-        .iter()
-        .find(|kw| upper.contains(*kw))
-        .copied()
 }
 
 fn internal_error(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
@@ -810,8 +460,8 @@ mod tests {
     async fn local_lookups_miss_cleanly_on_empty_or_unopenable_store() {
         let db = TempProvenanceDb::new();
 
-        // Fresh (empty) store: clean miss — the handlers fall through to
-        // Neo4j/Qdrant exactly as before.
+        // Fresh (empty) store: clean miss — the handlers render an empty
+        // result set instead of erroring.
         assert!(
             local_graph_lookup(&db.path, "titanium", 10).await.is_none(),
             "empty store must be a clean graph miss"
@@ -889,7 +539,7 @@ mod tests {
             .expect("substring match must be queryable");
         assert!(nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
 
-        // Unknown term → clean miss (caller falls back to Neo4j).
+        // Unknown term → clean miss (handler renders an empty result set).
         assert!(
             local_graph_lookup(&db.path, "no-such-entity-xyz", 10)
                 .await

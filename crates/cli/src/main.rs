@@ -230,11 +230,8 @@ enum Commands {
     },
     /// Query the knowledge graph.
     Query {
-        /// Natural language or Cypher query.
+        /// Entity name or search text.
         text: String,
-        /// Direct Cypher query (skip LLM translation).
-        #[arg(long)]
-        cypher: bool,
         /// Semantic vector search.
         #[arg(long)]
         semantic: bool,
@@ -2872,7 +2869,6 @@ async fn main() -> Result<()> {
         }
         Commands::Query {
             text,
-            cypher,
             semantic,
             platform,
             json: json_output,
@@ -2881,9 +2877,9 @@ async fn main() -> Result<()> {
             neo4j_user,
             neo4j_pass,
             qdrant_url,
-            llm_url,
-            model,
-            api_key,
+            llm_url: _,
+            model: _,
+            api_key: _,
             limit,
             dashboard_url,
         } => {
@@ -2893,27 +2889,13 @@ async fn main() -> Result<()> {
             } else if federated {
                 handle_federated_query(&text, &dashboard_url, &paths).await?;
             } else {
-                // LLM config only needed for the --semantic Qdrant fallback
-                // (query embedding). Best-effort here: the Turso-first
-                // semantic path embeds via prism-embed and needs no LLM, and
-                // handle_query raises its own actionable error when the
-                // Qdrant fallback is reached without one.
-                let llm_cfg = build_llm_config(
-                    &project_root,
-                    llm_url.as_deref(),
-                    model.as_deref(),
-                    api_key.as_deref(),
-                )
-                .ok();
                 handle_query(
                     &text,
-                    cypher,
                     semantic,
                     &neo4j_url,
                     &neo4j_user,
                     &neo4j_pass,
                     &qdrant_url,
-                    llm_cfg.as_ref(),
                     limit,
                 )
                 .await?;
@@ -7579,146 +7561,43 @@ fn format_local_ontology(results: &LocalOntologyResults) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn handle_query(
     text: &str,
-    cypher: bool,
     semantic: bool,
     neo4j_url: &str,
     neo4j_user: &str,
     neo4j_pass: &str,
     qdrant_url: &str,
-    llm_cfg: Option<&prism_ingest::LlmConfig>,
     limit: usize,
 ) -> Result<()> {
-    use prism_ingest::embeddings::{QdrantVectorStore, VectorStore};
-    use prism_ingest::graph::{GraphStore, Neo4jGraphStore};
-    use prism_ingest::{Neo4jConfig, QdrantConfig};
+    // Retired backends (Neo4j/Qdrant) — flags removed with the config
+    // structs in a later step.
+    let _ = (neo4j_url, neo4j_user, neo4j_pass, qdrant_url);
 
-    let neo4j_config = Neo4jConfig {
-        base_url: neo4j_url.into(),
-        database: "neo4j".into(),
-        username: neo4j_user.into(),
-        password: neo4j_pass.into(),
-    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let turso_db = PathBuf::from(home).join(".prism/provenance.db");
 
-    if cypher {
-        // Direct Cypher execution
-        let store = Neo4jGraphStore::new(neo4j_config);
-        println!("Executing Cypher: {text}\n");
-        let results = store.query_cypher(text, None).await?;
-        if results.is_empty() {
-            println!("  (no results)");
-        } else {
-            for (i, row) in results.iter().enumerate() {
-                println!("  {}. {}", i + 1, row);
-            }
-            println!("\n  {} row(s)", results.len());
-        }
-    } else if semantic {
-        // Local-first: try the bundled Turso entity vectors written by local
-        // ingest (offline prism-embed query embedding — no services needed).
-        // Hits are printed in the same shape as the Qdrant results below;
-        // an empty/unavailable store falls through to the Qdrant path.
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let turso_db = PathBuf::from(home).join(".prism/provenance.db");
-        if let Some(results) = local_semantic_lookup(&turso_db, text, limit).await {
-            println!("\nSemantic search results ({} matches):\n", results.len());
-            for (i, (id, score)) in results.iter().enumerate() {
-                println!("  {}. {id}  (score: {score:.4})", i + 1);
-            }
-            return Ok(());
-        }
-
-        // Semantic vector search
-        let qdrant_config = QdrantConfig {
-            base_url: qdrant_url.into(),
-            collection: "prism_embeddings".into(),
-            api_key: None,
-        };
-
-        // Generate embedding for the query text via provider-agnostic LlmClient
-        let llm_cfg = llm_cfg.ok_or_else(|| {
-            anyhow!("--semantic queries require an LLM for embeddings. Run: prism configure --model <name>")
-        })?;
-        println!("Generating query embedding...");
-        let llm_client = prism_ingest::llm::LlmClient::new(llm_cfg.clone());
-        let query_vec = match llm_client.embed_text(text).await {
-            Ok(v) => v,
-            Err(e) => {
-                // Detect the most common misconfiguration: prism.toml's
-                // `[llm].url` points at MARC27's project-scoped LLM proxy
-                // (`/api/v1/projects/{id}/llm`) which doesn't expose
-                // `/v1/embeddings`. Without this hint a real user thinks
-                // the platform is down. Steer them to the working path.
-                let msg = e.to_string();
-                let looks_like_marc27_404 =
-                    msg.contains("404") && msg.contains("/projects/") && msg.contains("/llm/");
-                if looks_like_marc27_404 {
-                    bail!(
-                        "Local --semantic search needs an LLM that exposes \
-                         OpenAI-compatible /v1/embeddings, but the configured \
-                         URL ({}) is the MARC27 project-scoped LLM proxy \
-                         which serves chat-streaming only.\n\n\
-                         For platform knowledge-graph search, use:\n\
-                         \x20 prism query --platform --semantic \"{}\"\n\n\
-                         For local embeddings, run a server like Ollama or \
-                         llama.cpp and point prism at it via:\n\
-                         \x20 prism configure --llm-provider llamacpp\n\n\
-                         Underlying error: {e}",
-                        llm_cfg.base_url,
-                        text
-                    );
-                }
-                return Err(e).context("failed to generate query embedding");
-            }
-        };
-
-        let store = QdrantVectorStore::new(qdrant_config);
-        let results = store.query(&query_vec, limit).await?;
-
+    if semantic {
+        // Bundled Turso entity vectors written by local ingest (offline
+        // prism-embed query embedding — no services needed).
+        let results = local_semantic_lookup(&turso_db, text, limit)
+            .await
+            .unwrap_or_default();
         println!("\nSemantic search results ({} matches):\n", results.len());
         for (i, (id, score)) in results.iter().enumerate() {
             println!("  {}. {id}  (score: {score:.4})", i + 1);
         }
         if results.is_empty() {
-            println!("  (no results — collection may be empty)");
+            println!("  (no results — ingest data first with: prism ingest <path>)");
         }
     } else {
-        // Natural language → graph traversal
+        // Graph traversal over the bundled Turso provenance store
+        // (~/.prism/provenance.db, tenant "local") — the sole graph
+        // backend; no running services required.
         println!("Querying knowledge graph: \"{text}\"\n");
 
-        // Local-first: `prism ingest` writes EMMO facts into the bundled
-        // Turso provenance store (~/.prism/provenance.db, tenant "local"),
-        // not Neo4j — so a locally-ingested ontology must be queryable
-        // without any running services. Read Turso first; fall back to the
-        // existing Neo4j read when it has nothing.
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let turso_db = PathBuf::from(home).join(".prism/provenance.db");
         if let Some(local) = local_ontology_lookup(&turso_db, text, limit).await {
             print!("{}", format_local_ontology(&local));
-            return Ok(());
-        }
-
-        // Find entities whose names match the query text, then traverse neighbors.
-        let store = Neo4jGraphStore::new(neo4j_config);
-        let result = store.neighbors(text, 3).await?;
-        if result.entities.is_empty() {
-            println!("  No direct matches. Try --semantic for vector search.");
         } else {
-            println!("  Found {} connected entities:\n", result.entities.len());
-            for entity in &result.entities {
-                let props_str = if entity.properties.is_object()
-                    && entity.properties.as_object().is_none_or(|o| o.is_empty())
-                {
-                    String::new()
-                } else {
-                    format!("  {}", entity.properties)
-                };
-                println!(
-                    "  [{type}] {name}{props}",
-                    r#type = entity.entity_type,
-                    name = entity.name,
-                    props = props_str,
-                );
-            }
+            println!("  No direct matches. Try --semantic for vector search.");
         }
     }
 
@@ -9213,13 +9092,11 @@ mod tests {
         match cli.command.unwrap() {
             Commands::Query {
                 text,
-                cypher,
                 semantic,
                 limit,
                 ..
             } => {
                 assert_eq!(text, "NbMoTaW alloys");
-                assert!(!cypher);
                 assert!(!semantic);
                 assert_eq!(limit, 10);
             }

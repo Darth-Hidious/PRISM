@@ -140,7 +140,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "query",
         aliases: &[],
         kind: CommandToolKind::QueryLocal,
-        description: "Query the local PRISM graph/vector stores with typed fields instead of manual CLI args. Use `cypher=true` for direct Cypher, `semantic=true` for vector search, or plain text for graph-neighbor lookup.",
+        description: "Query the local PRISM knowledge graph with typed fields instead of manual CLI args. Use `semantic=true` for vector search, or plain text for graph-neighbor lookup.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -878,15 +878,11 @@ fn query_local_schema() -> Value {
         "properties": {
             "text": {
                 "type": "string",
-                "description": "Natural-language query, entity text, or Cypher statement when `cypher=true`."
-            },
-            "cypher": {
-                "type": "boolean",
-                "description": "Run the `text` as a direct Cypher query against local Neo4j."
+                "description": "Entity name or search text."
             },
             "semantic": {
                 "type": "boolean",
-                "description": "Use semantic vector search against local Qdrant instead of graph traversal."
+                "description": "Use semantic vector search over the local entity vectors instead of graph traversal."
             },
             "limit": {
                 "type": "integer",
@@ -1805,9 +1801,6 @@ fn build_query_args(input: &Value, mode: QueryMode) -> Result<Vec<String>> {
 
     match mode {
         QueryMode::Local => {
-            if optional_bool(input, "cypher") {
-                args.push("--cypher".to_string());
-            }
             if optional_bool(input, "semantic") {
                 args.push("--semantic".to_string());
             }

@@ -12,8 +12,8 @@ use crate::ontology::LlmOntologyConstructor;
 use crate::schema::SchemaDetector;
 use crate::validation::{self, ValidationReport};
 use crate::{
-    DataSource, EmbeddingBatch, EntitySet, GraphUpdate, LlmConfig, Neo4jConfig,
-    OntologyConstructor, QdrantConfig, SchemaAnalysis,
+    DataSource, EmbeddingBatch, EntitySet, GraphUpdate, LlmConfig, Neo4jConfig, QdrantConfig,
+    SchemaAnalysis,
 };
 
 /// Result of a complete ingest operation.
