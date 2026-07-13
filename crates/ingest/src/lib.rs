@@ -5,8 +5,8 @@
 //! knowledge through an LLM-driven pipeline:
 //!
 //! ```text
-//! Raw Data → Schema Detection → Entity Extraction → Graph Construction → Embeddings
-//!                                    (Ollama)           (Neo4j)           (Qdrant)
+//! Raw Data → Schema Detection → Entity Extraction → Graph + Embeddings
+//!                                     (LLM)         (bundled Turso store)
 //! ```
 //!
 //! The core trait [`OntologyConstructor`] is pluggable — ships with an LLM-based
@@ -14,8 +14,6 @@
 //! Materials Science) engine can slot in behind the same interface.
 
 pub mod connectors;
-pub mod embeddings;
-pub mod graph;
 pub mod graph_validation;
 /// Re-export LLM client from the standalone `prism-llm` crate.
 /// This keeps backward compatibility — existing code using `prism_ingest::llm::*`
@@ -24,7 +22,6 @@ pub use prism_llm as llm;
 pub use prism_llm::LlmConfig;
 pub mod local_facts;
 pub mod mapping;
-pub mod nl_query;
 pub mod ontology;
 pub mod pipeline;
 pub mod schema;
