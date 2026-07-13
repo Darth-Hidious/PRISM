@@ -381,6 +381,60 @@ enum Commands {
         #[arg(long)]
         keep: bool,
     },
+    /// Deploy any container image or marketplace resource and invoke it,
+    /// one call: create the deployment → poll until `running` (timeout) →
+    /// POST the invoke payload → stop the deployment. The stop is always
+    /// attempted (unless `--keep`), even when the invoke request itself
+    /// fails — no orphaned billable deployment left behind by a failed
+    /// call. Unlike `predict`, this never reuses an already-running
+    /// deployment of the same name; it always creates fresh (general
+    /// image/resource deploys aren't safely reusable the way named
+    /// marketplace slugs are). Prints one JSON document; a failed invoke
+    /// is a real error exit, never a success document.
+    DeployAndInvoke {
+        /// Deployment name shown in the platform UI.
+        #[arg(long)]
+        name: String,
+        /// Container image to deploy directly.
+        #[arg(long)]
+        image: Option<String>,
+        /// Marketplace resource slug to deploy instead of a raw image.
+        #[arg(long)]
+        resource_slug: Option<String>,
+        /// Target deployment backend: `local`, `mesh`, `runpod`, `lambda`.
+        #[arg(long, default_value = "local")]
+        target: String,
+        /// GPU type to request (omit for CPU).
+        #[arg(long)]
+        gpu: Option<String>,
+        /// Optional maximum budget in USD.
+        #[arg(long)]
+        budget: Option<f64>,
+        /// Optional PRISM node pin. Accepts `--node` or `--node-id`.
+        #[arg(long = "node", alias = "node-id")]
+        node_id: Option<String>,
+        /// Environment variables injected into the deployment container.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env_vars: Vec<String>,
+        /// Service port exposed by the deployed container.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Health-check path on the deployed service.
+        #[arg(long, default_value = "/health")]
+        health_path: String,
+        /// Path on the deployment endpoint to POST the invoke payload to.
+        #[arg(long, default_value = "/predict")]
+        invoke_path: String,
+        /// JSON body posted to `invoke_path` (e.g. '{"task": "single_point"}').
+        #[arg(long, default_value = "{}")]
+        input: String,
+        /// Seconds to wait for the deployment to become ready.
+        #[arg(long, default_value_t = 900)]
+        ready_timeout_secs: u64,
+        /// Keep the deployment running after the result (skips auto-stop).
+        #[arg(long)]
+        keep: bool,
+    },
     /// List GPU offers purchasable through the MARC27 compute platform.
     ///
     /// Prints the live catalog (type, VRAM, region, provider, $/hr) as one
@@ -398,6 +452,37 @@ enum Commands {
         #[command(subcommand)]
         command: ComputeCommands,
     },
+    /// Run a compute-broker job to completion, one call: submit → poll
+    /// status → return the real result. A failed/cancelled job is a real
+    /// error exit, never a success document. Price a job for free first
+    /// with `prism compute estimate` before dispatching it with this
+    /// command — `estimate` stays its own cheap, non-billable command.
+    ComputeRun {
+        /// Container image or marketplace slug.
+        #[arg(long)]
+        image: String,
+        /// JSON input payload for the container (default '{}').
+        #[arg(long, default_value = "{}")]
+        inputs: String,
+        /// GPU class, e.g. A100-80GB.
+        #[arg(long)]
+        gpu: Option<String>,
+        /// Hard cost cap in USD; broker refuses dispatch if the estimate exceeds it.
+        #[arg(long)]
+        budget: Option<f64>,
+        /// Routing: cheapest (default), fastest, or a provider name.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Wall-time cap in seconds for the job itself (default 3600).
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Environment variables (repeatable): --env KEY=VALUE.
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// Seconds to wait for the job to reach a terminal state.
+        #[arg(long, default_value_t = 1800)]
+        poll_timeout_secs: u64,
+    },
     /// Knowledge-plane reads + platform ingest (MARC27 knowledge graph).
     ///
     /// entity/paths/corpora are read-only graph/catalog lookups; `ingest`
@@ -407,6 +492,29 @@ enum Commands {
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommands,
+    },
+    /// Submit a knowledge-graph ingest job and wait for it to finish, one
+    /// call: POST the ingest job → poll until done → return the resulting
+    /// graph references. A failed job is a real error exit, never a
+    /// success document.
+    ///
+    /// NOTE: the platform's only wired ingest-job endpoints in this
+    /// codebase are `POST /knowledge/ingest-job` (submit) and
+    /// `GET /knowledge/ingest-jobs` (list ALL jobs) — there is no per-job
+    /// GET, so this polls the list and matches the returned job id.
+    IngestAndWait {
+        /// Source URL to fetch and extract.
+        #[arg(long)]
+        url: Option<String>,
+        /// Free-text query to extract entities/embeddings from.
+        #[arg(long)]
+        query: Option<String>,
+        /// Extraction mode: graph, embed, or full.
+        #[arg(long, default_value = "full")]
+        mode: String,
+        /// Seconds to wait for the ingest job to finish.
+        #[arg(long, default_value_t = 1800)]
+        poll_timeout_secs: u64,
     },
     /// Run multi-agent discourse workflows backed by the MARC27 platform.
     Discourse {
@@ -3219,6 +3327,40 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Commands::DeployAndInvoke {
+            name,
+            image,
+            resource_slug,
+            target,
+            gpu,
+            budget,
+            node_id,
+            env_vars,
+            port,
+            health_path,
+            invoke_path,
+            input,
+            ready_timeout_secs,
+            keep,
+        } => {
+            handle_deploy_and_invoke(
+                &name,
+                image.as_deref(),
+                resource_slug.as_deref(),
+                &target,
+                gpu.as_deref(),
+                budget,
+                node_id.as_deref(),
+                &env_vars,
+                port,
+                &health_path,
+                &invoke_path,
+                &input,
+                ready_timeout_secs,
+                keep,
+            )
+            .await?;
+        }
         Commands::Models { command } => {
             handle_models_command(&paths, command).await?;
         }
@@ -3228,8 +3370,39 @@ async fn main() -> Result<()> {
         Commands::Compute { command } => {
             handle_compute_command(command).await?;
         }
+        Commands::ComputeRun {
+            image,
+            inputs,
+            gpu,
+            budget,
+            provider,
+            timeout,
+            env,
+            poll_timeout_secs,
+        } => {
+            handle_compute_run(
+                &image,
+                &inputs,
+                gpu.as_deref(),
+                budget,
+                provider.as_deref(),
+                timeout,
+                &env,
+                poll_timeout_secs,
+            )
+            .await?;
+        }
         Commands::Knowledge { command } => {
             handle_knowledge_command(command).await?;
+        }
+        Commands::IngestAndWait {
+            url,
+            query,
+            mode,
+            poll_timeout_secs,
+        } => {
+            handle_ingest_and_wait(url.as_deref(), query.as_deref(), &mode, poll_timeout_secs)
+                .await?;
         }
         Commands::Discourse { command } => {
             handle_discourse_command(command).await?;
@@ -6371,6 +6544,240 @@ async fn handle_predict(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_deploy_and_invoke(
+    name: &str,
+    image: Option<&str>,
+    resource_slug: Option<&str>,
+    target: &str,
+    gpu: Option<&str>,
+    budget: Option<f64>,
+    node_id: Option<&str>,
+    env_vars: &[String],
+    port: u16,
+    health_path: &str,
+    invoke_path: &str,
+    input_json: &str,
+    ready_timeout_secs: u64,
+    keep: bool,
+) -> Result<()> {
+    let input: serde_json::Value = serde_json::from_str(input_json)
+        .with_context(|| "--input is not valid JSON".to_string())?;
+
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+
+    let result = run_deploy_and_invoke(
+        &client,
+        &api_base,
+        &auth,
+        name,
+        image,
+        resource_slug,
+        target,
+        gpu,
+        budget,
+        node_id,
+        env_vars,
+        port,
+        health_path,
+        invoke_path,
+        input,
+        ready_timeout_secs,
+        keep,
+        Duration::from_secs(5),
+    )
+    .await?;
+
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+/// Core of `deploy-and-invoke`: create a deployment (always fresh — no
+/// reuse, unlike `predict`'s marketplace-slug shortcut), poll (bounded) for
+/// `running` + an endpoint, POST the invoke payload, then ALWAYS attempt
+/// to stop the deployment (unless `keep`) — even when the invoke itself
+/// failed, so a failed call never leaks a billable deployment. Factored
+/// out of `handle_deploy_and_invoke` so tests can drive it against a
+/// mocked HTTP transport instead of `resolve_agent_auth()`'s real env
+/// vars / on-disk credentials.
+#[allow(clippy::too_many_arguments)]
+async fn run_deploy_and_invoke(
+    client: &reqwest::Client,
+    api_base: &str,
+    auth: &PlatformAuth,
+    name: &str,
+    image: Option<&str>,
+    resource_slug: Option<&str>,
+    target: &str,
+    gpu: Option<&str>,
+    budget: Option<f64>,
+    node_id: Option<&str>,
+    env_vars: &[String],
+    port: u16,
+    health_path: &str,
+    invoke_path: &str,
+    input: serde_json::Value,
+    ready_timeout_secs: u64,
+    keep: bool,
+    poll_interval: Duration,
+) -> Result<serde_json::Value> {
+    let has_image = image.is_some();
+    let has_resource = resource_slug.is_some();
+    if has_image == has_resource {
+        bail!("Specify exactly one of `--image` or `--resource-slug`.");
+    }
+    let normalized_target = normalize_deploy_target(target, node_id)?;
+
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "name".to_string(),
+        serde_json::Value::String(name.to_string()),
+    );
+    body.insert(
+        "target".to_string(),
+        serde_json::Value::String(normalized_target.to_string()),
+    );
+    if let Some(gpu) = gpu {
+        body.insert(
+            "gpu_type".to_string(),
+            serde_json::Value::String(gpu.to_string()),
+        );
+    }
+    body.insert(
+        "deploy_config".to_string(),
+        serde_json::json!({ "port": port, "health_path": health_path }),
+    );
+    if let Some(image) = image {
+        body.insert(
+            "image".to_string(),
+            serde_json::Value::String(image.to_string()),
+        );
+    }
+    if let Some(resource_slug) = resource_slug {
+        body.insert(
+            "resource_slug".to_string(),
+            serde_json::Value::String(resource_slug.to_string()),
+        );
+    }
+    if let Some(budget) = budget {
+        body.insert("budget_max_usd".to_string(), serde_json::json!(budget));
+    }
+    if let Some(node_id) = node_id {
+        body.insert(
+            "node_id".to_string(),
+            serde_json::Value::String(node_id.to_string()),
+        );
+    }
+    if !env_vars.is_empty() {
+        body.insert(
+            "env_vars".to_string(),
+            serde_json::Value::Object(parse_string_map_arg(env_vars, "--env")?),
+        );
+    }
+
+    let created: serde_json::Value = auth
+        .apply(client.post(format!("{api_base}/compute/deployments")))
+        .json(&serde_json::Value::Object(body))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let deployment_id = created["id"]
+        .as_str()
+        .or_else(|| created["deployment_id"].as_str())
+        .context("deployment create response has no id")?
+        .to_string();
+
+    // Poll (bounded) for running + endpoint. Failed/stopped is a terminal
+    // honest error, not a wait-forever — mirrors `predict`'s wait loop.
+    let deadline = std::time::Instant::now() + Duration::from_secs(ready_timeout_secs);
+    let endpoint_url = loop {
+        tokio::time::sleep(poll_interval).await;
+        let status: serde_json::Value = auth
+            .apply(client.get(format!("{api_base}/compute/deployments/{deployment_id}")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let state = status["status"].as_str().unwrap_or("unknown");
+        match state {
+            "running" => {
+                if let Some(url) = status["endpoint_url"].as_str().filter(|u| !u.is_empty()) {
+                    break url.to_string();
+                }
+            }
+            "failed" | "stopped" | "unhealthy" => {
+                bail!(
+                    "deployment {deployment_id} for '{name}' ended in state '{state}' \
+                     before serving — check `prism deploy status {deployment_id}`"
+                );
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() > deadline {
+            bail!(
+                "deployment {deployment_id} for '{name}' not ready after \
+                 {ready_timeout_secs}s (last state '{state}'); it is still \
+                 provisioning — poll `prism deploy status {deployment_id}` or \
+                 re-run with a larger --ready-timeout-secs"
+            );
+        }
+    };
+
+    // Invoke — captured as a Result (not `?`'d away) so a failed call
+    // still reaches the auto-stop step below.
+    let invoke_url = format!("{}{}", endpoint_url.trim_end_matches('/'), invoke_path);
+    let send_result = client
+        .post(&invoke_url)
+        .json(&input)
+        .timeout(Duration::from_secs(600))
+        .send()
+        .await;
+    let invoke_result: Result<serde_json::Value> = match send_result {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .context("invoke response was not valid JSON"),
+            Err(e) => Err(e).context("invoke request returned an error status"),
+        },
+        Err(e) => Err(e).with_context(|| format!("invoke request to {invoke_url} failed")),
+    };
+
+    // Auto-stop what WE created (no silent per-minute billing) unless
+    // --keep — runs REGARDLESS of invoke outcome (HARD requirement: never
+    // leak a billable deployment because the invoke call itself failed).
+    let auto_stopped = if !keep {
+        auth.apply(client.delete(format!("{api_base}/compute/deployments/{deployment_id}")))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    match invoke_result {
+        Ok(result) => Ok(serde_json::json!({
+            "deployment_id": deployment_id,
+            "endpoint_url": endpoint_url,
+            "auto_stopped": auto_stopped,
+            "kept_running": !auto_stopped,
+            "result": result,
+        })),
+        Err(e) => Err(anyhow!(
+            "deploy-and-invoke: invoke failed for deployment {deployment_id} \
+             (auto_stopped={auto_stopped}, kept_running={}): {e}",
+            !auto_stopped
+        )),
+    }
+}
+
 async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
     let (api_base, auth) = resolve_agent_auth()?;
     let client = reqwest::Client::builder()
@@ -6698,6 +7105,152 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_compute_run(
+    image: &str,
+    inputs_json: &str,
+    gpu: Option<&str>,
+    budget: Option<f64>,
+    provider: Option<&str>,
+    timeout: Option<u64>,
+    env: &[String],
+    poll_timeout_secs: u64,
+) -> Result<()> {
+    let inputs: serde_json::Value = serde_json::from_str(inputs_json)
+        .map_err(|e| anyhow!("--inputs must be valid JSON: {e}"))?;
+
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let result = run_compute_job(
+        &client,
+        &api_base,
+        &auth,
+        image,
+        inputs,
+        gpu,
+        budget,
+        provider,
+        timeout,
+        env,
+        poll_timeout_secs,
+        Duration::from_secs(5),
+    )
+    .await?;
+
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+/// Core of `compute-run`: POST `{api_base}/compute/submit`, then poll
+/// `GET {api_base}/compute/{job_id}` (the single wired status endpoint —
+/// see the doc comment on `ComputeCommands::Status`) until it reports a
+/// terminal state, returning the real result embedded in that same
+/// response. A failed/cancelled job is a real `Err`, never a fabricated
+/// success. Factored out of `handle_compute_run` so tests can drive it
+/// against a mocked HTTP transport.
+#[allow(clippy::too_many_arguments)]
+async fn run_compute_job(
+    client: &reqwest::Client,
+    api_base: &str,
+    auth: &PlatformAuth,
+    image: &str,
+    inputs: serde_json::Value,
+    gpu: Option<&str>,
+    budget: Option<f64>,
+    provider: Option<&str>,
+    timeout: Option<u64>,
+    env: &[String],
+    poll_timeout_secs: u64,
+    poll_interval: Duration,
+) -> Result<serde_json::Value> {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "image".to_string(),
+        serde_json::Value::String(image.to_string()),
+    );
+    body.insert("inputs".to_string(), inputs);
+    if let Some(gpu) = gpu {
+        body.insert(
+            "gpu_type".to_string(),
+            serde_json::Value::String(gpu.to_string()),
+        );
+    }
+    if let Some(budget) = budget {
+        body.insert("budget_max_usd".to_string(), serde_json::json!(budget));
+    }
+    if let Some(provider) = provider {
+        body.insert(
+            "provider_preference".to_string(),
+            serde_json::Value::String(provider.to_string()),
+        );
+    }
+    if let Some(timeout) = timeout {
+        body.insert("timeout_seconds".to_string(), serde_json::json!(timeout));
+    }
+    if !env.is_empty() {
+        body.insert(
+            "env_vars".to_string(),
+            serde_json::Value::Object(parse_string_map_arg(env, "--env")?),
+        );
+    }
+
+    let submitted: serde_json::Value = auth
+        .apply(client.post(format!("{api_base}/compute/submit")))
+        .json(&serde_json::Value::Object(body))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let job_id = value_string(&submitted, &["job_id", "id"])
+        .context("compute submit response has no job_id")?
+        .to_string();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(poll_timeout_secs);
+    loop {
+        tokio::time::sleep(poll_interval).await;
+        let status: serde_json::Value = auth
+            .apply(client.get(format!("{api_base}/compute/{job_id}")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let state = value_string(&status, &["status", "state"]).unwrap_or("unknown");
+        match state {
+            "completed" | "succeeded" | "done" => {
+                let result = status
+                    .get("result")
+                    .or_else(|| status.get("output"))
+                    .or_else(|| status.get("results"))
+                    .cloned()
+                    .unwrap_or_else(|| status.clone());
+                return Ok(serde_json::json!({
+                    "job_id": job_id,
+                    "status": state,
+                    "result": result,
+                }));
+            }
+            "failed" | "error" | "cancelled" | "canceled" => {
+                let err = value_string(&status, &["error", "error_message"])
+                    .unwrap_or("(no error detail)");
+                bail!("compute job {job_id} {state}: {err}");
+            }
+            _ => {
+                if std::time::Instant::now() >= deadline {
+                    bail!(
+                        "compute job {job_id} still '{state}' after {poll_timeout_secs}s; \
+                         check later with `prism compute status {job_id}`"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum KnowledgeCommands {
     /// Look up one entity plus its 1-hop neighbors in the knowledge graph.
@@ -6820,6 +7373,128 @@ async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
+}
+
+async fn handle_ingest_and_wait(
+    url: Option<&str>,
+    query: Option<&str>,
+    mode: &str,
+    poll_timeout_secs: u64,
+) -> Result<()> {
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let result = run_ingest_job(
+        &client,
+        &api_base,
+        &auth,
+        url,
+        query,
+        mode,
+        poll_timeout_secs,
+        Duration::from_secs(5),
+    )
+    .await?;
+
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+/// Core of `ingest-and-wait`: POST `{api_base}/knowledge/ingest-job` to
+/// submit, then poll `GET {api_base}/knowledge/ingest-jobs` — the ONLY
+/// wired job-status endpoint in this codebase; there is no per-job GET,
+/// so this matches the submitted job id inside the list response — until
+/// the matching entry reports a terminal state, returning its graph
+/// references. A failed job is a real `Err`, never a fabricated success.
+/// Factored out of `handle_ingest_and_wait` so tests can drive it against
+/// a mocked HTTP transport.
+#[allow(clippy::too_many_arguments)]
+async fn run_ingest_job(
+    client: &reqwest::Client,
+    api_base: &str,
+    auth: &PlatformAuth,
+    url: Option<&str>,
+    query: Option<&str>,
+    mode: &str,
+    poll_timeout_secs: u64,
+    poll_interval: Duration,
+) -> Result<serde_json::Value> {
+    let source = match (url, query) {
+        (Some(url), _) => serde_json::json!({ "type": "url", "url": url }),
+        (None, Some(query)) => serde_json::json!({ "type": "query", "query": query }),
+        (None, None) => bail!("`ingest-and-wait` requires --url or --query"),
+    };
+    let body = serde_json::json!({ "mode": mode, "source": source });
+
+    let submitted: serde_json::Value = auth
+        .apply(client.post(format!("{api_base}/knowledge/ingest-job")))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let job_id = value_string(&submitted, &["job_id", "id"])
+        .context("ingest-job submit response has no job_id")?
+        .to_string();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(poll_timeout_secs);
+    loop {
+        tokio::time::sleep(poll_interval).await;
+        let jobs: serde_json::Value = auth
+            .apply(client.get(format!("{api_base}/knowledge/ingest-jobs")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let job_entry = value_array(&jobs, &["jobs", "items", "data"]).and_then(|list| {
+            list.iter()
+                .find(|j| value_string(j, &["job_id", "id"]) == Some(job_id.as_str()))
+        });
+
+        let Some(job) = job_entry else {
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "ingest job {job_id} not found in `/knowledge/ingest-jobs` after \
+                     {poll_timeout_secs}s; check later with `prism ingest --status`"
+                );
+            }
+            continue;
+        };
+
+        let state = value_string(job, &["status", "state"]).unwrap_or("unknown");
+        match state {
+            "completed" | "succeeded" | "done" => {
+                let graph_refs = job
+                    .get("graph_refs")
+                    .or_else(|| job.get("result"))
+                    .or_else(|| job.get("entities"))
+                    .cloned()
+                    .unwrap_or_else(|| job.clone());
+                return Ok(serde_json::json!({
+                    "job_id": job_id,
+                    "status": state,
+                    "graph_refs": graph_refs,
+                }));
+            }
+            "failed" | "error" | "cancelled" | "canceled" => {
+                let err =
+                    value_string(job, &["error", "error_message"]).unwrap_or("(no error detail)");
+                bail!("ingest job {job_id} {state}: {err}");
+            }
+            _ => {
+                if std::time::Instant::now() >= deadline {
+                    bail!(
+                        "ingest job {job_id} still '{state}' after {poll_timeout_secs}s; \
+                         check later with `prism ingest --status`"
+                    );
+                }
+            }
+        }
+    }
 }
 
 async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> Result<()> {
@@ -9578,6 +10253,416 @@ data:\n\
             }
             _ => panic!("expected Discourse::Run command"),
         }
+    }
+
+    // ── WP4 one-call tool wrappers: CLI parsing ───────────────────────
+
+    #[test]
+    fn cli_parses_deploy_and_invoke_command() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "deploy-and-invoke",
+            "--name",
+            "serve-demo",
+            "--resource-slug",
+            "mace-mh-1",
+            "--input",
+            r#"{"task":"single_point"}"#,
+            "--ready-timeout-secs",
+            "60",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::DeployAndInvoke {
+                name,
+                image,
+                resource_slug,
+                invoke_path,
+                input,
+                ready_timeout_secs,
+                keep,
+                ..
+            } => {
+                assert_eq!(name, "serve-demo");
+                assert!(image.is_none());
+                assert_eq!(resource_slug.as_deref(), Some("mace-mh-1"));
+                assert_eq!(invoke_path, "/predict");
+                assert_eq!(input, r#"{"task":"single_point"}"#);
+                assert_eq!(ready_timeout_secs, 60);
+                assert!(!keep);
+            }
+            _ => panic!("expected DeployAndInvoke command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_compute_run_command() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "compute-run",
+            "--image",
+            "marc27/mace:latest",
+            "--gpu",
+            "A100-80GB",
+            "--poll-timeout-secs",
+            "120",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::ComputeRun {
+                image,
+                gpu,
+                poll_timeout_secs,
+                ..
+            } => {
+                assert_eq!(image, "marc27/mace:latest");
+                assert_eq!(gpu.as_deref(), Some("A100-80GB"));
+                assert_eq!(poll_timeout_secs, 120);
+            }
+            _ => panic!("expected ComputeRun command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_ingest_and_wait_command() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "ingest-and-wait",
+            "--url",
+            "https://example.org/paper.pdf",
+            "--mode",
+            "graph",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::IngestAndWait {
+                url, query, mode, ..
+            } => {
+                assert_eq!(url.as_deref(), Some("https://example.org/paper.pdf"));
+                assert!(query.is_none());
+                assert_eq!(mode, "graph");
+            }
+            _ => panic!("expected IngestAndWait command"),
+        }
+    }
+
+    // ── WP4 one-call tool wrappers: mocked-transport behavior ─────────
+    //
+    // Each wrapper gets a happy path and a failure path. The failure path
+    // is the load-bearing assertion: it proves a failed/errored job never
+    // gets reported as a success, and (for deploy-and-invoke) that cleanup
+    // still runs when the invoke call itself fails.
+
+    #[tokio::test]
+    async fn deploy_and_invoke_happy_path_creates_invokes_and_stops() {
+        let mut server = mockito::Server::new_async().await;
+        let api_base = server.url();
+        let svc_url = format!("{api_base}/svc");
+
+        let create_mock = server
+            .mock("POST", "/compute/deployments")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"dep-abc"}"#)
+            .create_async()
+            .await;
+        let status_mock = server
+            .mock("GET", "/compute/deployments/dep-abc")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"status":"running","endpoint_url":"{svc_url}"}}"#
+            ))
+            .create_async()
+            .await;
+        let invoke_mock = server
+            .mock("POST", "/svc/predict")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"answer":42}"#)
+            .create_async()
+            .await;
+        let stop_mock = server
+            .mock("DELETE", "/compute/deployments/dep-abc")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let auth = PlatformAuth::ApiKey("test-key".to_string());
+        let result = run_deploy_and_invoke(
+            &client,
+            &api_base,
+            &auth,
+            "test-dep",
+            Some("img:latest"),
+            None,
+            "local",
+            None,
+            None,
+            None,
+            &[],
+            8080,
+            "/health",
+            "/predict",
+            serde_json::json!({"task": "single_point"}),
+            30,
+            false,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("happy path must succeed");
+
+        assert_eq!(result["deployment_id"], "dep-abc");
+        assert_eq!(result["auto_stopped"], true);
+        assert_eq!(result["kept_running"], false);
+        assert_eq!(result["result"]["answer"], 42);
+
+        create_mock.assert_async().await;
+        status_mock.assert_async().await;
+        invoke_mock.assert_async().await;
+        stop_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn deploy_and_invoke_failure_path_still_stops_and_surfaces_real_error() {
+        let mut server = mockito::Server::new_async().await;
+        let api_base = server.url();
+        let svc_url = format!("{api_base}/svc2");
+
+        server
+            .mock("POST", "/compute/deployments")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"dep-fail"}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/compute/deployments/dep-fail")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"status":"running","endpoint_url":"{svc_url}"}}"#
+            ))
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/svc2/predict")
+            .with_status(500)
+            .with_body("internal error")
+            .create_async()
+            .await;
+        // The load-bearing mock: cleanup MUST still fire even though the
+        // invoke call above failed.
+        let stop_mock = server
+            .mock("DELETE", "/compute/deployments/dep-fail")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let auth = PlatformAuth::ApiKey("test-key".to_string());
+        let result = run_deploy_and_invoke(
+            &client,
+            &api_base,
+            &auth,
+            "test-dep-fail",
+            Some("img:latest"),
+            None,
+            "local",
+            None,
+            None,
+            None,
+            &[],
+            8080,
+            "/health",
+            "/predict",
+            serde_json::json!({"task": "single_point"}),
+            30,
+            false,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        let err = result.expect_err("a failed invoke must never report success");
+        let msg = err.to_string();
+        assert!(msg.contains("dep-fail"), "got: {msg}");
+        assert!(msg.contains("auto_stopped=true"), "got: {msg}");
+
+        stop_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn compute_run_happy_path_returns_real_result() {
+        let mut server = mockito::Server::new_async().await;
+        let api_base = server.url();
+
+        server
+            .mock("POST", "/compute/submit")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"job_id":"job-1"}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/compute/job-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":"completed","result":{"score":0.9}}"#)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let auth = PlatformAuth::ApiKey("test-key".to_string());
+        let result = run_compute_job(
+            &client,
+            &api_base,
+            &auth,
+            "marc27/mace:latest",
+            serde_json::json!({}),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            30,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("happy path must succeed");
+
+        assert_eq!(result["job_id"], "job-1");
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["result"]["score"], 0.9);
+    }
+
+    #[tokio::test]
+    async fn compute_run_failure_path_surfaces_real_error_not_success() {
+        let mut server = mockito::Server::new_async().await;
+        let api_base = server.url();
+
+        server
+            .mock("POST", "/compute/submit")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"job_id":"job-2"}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/compute/job-2")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":"failed","error":"OOM killed"}"#)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let auth = PlatformAuth::ApiKey("test-key".to_string());
+        let result = run_compute_job(
+            &client,
+            &api_base,
+            &auth,
+            "marc27/mace:latest",
+            serde_json::json!({}),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            30,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        let err = result.expect_err("a failed job must never report success");
+        let msg = err.to_string();
+        assert!(msg.contains("job-2"), "got: {msg}");
+        assert!(msg.contains("failed"), "got: {msg}");
+        assert!(msg.contains("OOM killed"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn ingest_and_wait_happy_path_returns_graph_refs() {
+        let mut server = mockito::Server::new_async().await;
+        let api_base = server.url();
+
+        server
+            .mock("POST", "/knowledge/ingest-job")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"job_id":"ing-1","status":"queued"}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/knowledge/ingest-jobs")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jobs":[{"job_id":"ing-1","status":"completed","graph_refs":["Entity:Ti-6Al-4V"]}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let auth = PlatformAuth::ApiKey("test-key".to_string());
+        let result = run_ingest_job(
+            &client,
+            &api_base,
+            &auth,
+            Some("https://example.org/paper.pdf"),
+            None,
+            "full",
+            30,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("happy path must succeed");
+
+        assert_eq!(result["job_id"], "ing-1");
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["graph_refs"][0], "Entity:Ti-6Al-4V");
+    }
+
+    #[tokio::test]
+    async fn ingest_and_wait_failure_path_surfaces_real_error_not_success() {
+        let mut server = mockito::Server::new_async().await;
+        let api_base = server.url();
+
+        server
+            .mock("POST", "/knowledge/ingest-job")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"job_id":"ing-2","status":"queued"}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/knowledge/ingest-jobs")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jobs":[{"job_id":"ing-2","status":"failed","error":"bad pdf"}]}"#)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let auth = PlatformAuth::ApiKey("test-key".to_string());
+        let result = run_ingest_job(
+            &client,
+            &api_base,
+            &auth,
+            Some("https://example.org/broken.pdf"),
+            None,
+            "full",
+            30,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        let err = result.expect_err("a failed ingest job must never report success");
+        let msg = err.to_string();
+        assert!(msg.contains("ing-2"), "got: {msg}");
+        assert!(msg.contains("failed"), "got: {msg}");
+        assert!(msg.contains("bad pdf"), "got: {msg}");
     }
 
     // ── Local Turso ontology read (query fallback chain) ─────────────

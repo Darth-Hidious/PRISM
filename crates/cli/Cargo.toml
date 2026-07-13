@@ -54,3 +54,4 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+mockito.workspace = true
