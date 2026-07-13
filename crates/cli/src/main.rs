@@ -2591,13 +2591,14 @@ async fn main() -> Result<()> {
                             let our_node_id = mesh_node_id.unwrap_or_else(uuid::Uuid::nil);
                             let subscriptions = server_state.subscriptions.clone();
 
-                            // Build sync config from Neo4j settings if available
-                            let sync_config = server_state.neo4j.as_ref().map(|neo4j| {
-                                prism_mesh::sync::SyncConfig {
-                                    neo4j_url: neo4j.base_url.clone(),
-                                    neo4j_user: neo4j.username.clone(),
-                                    neo4j_pass: neo4j.password.clone(),
-                                }
+                            // Peer-synced facts land in the bundled Turso
+                            // store under tenant "mesh" — always available,
+                            // no external graph service required.
+                            let sync_home =
+                                std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                            let sync_config = Some(prism_mesh::sync::SyncConfig {
+                                provenance_db: std::path::PathBuf::from(sync_home)
+                                    .join(".prism/provenance.db"),
                             });
 
                             // Spawn consumer loop
