@@ -11,6 +11,7 @@ pub mod permissions;
 pub mod prompt_profile;
 pub mod prompts;
 pub mod protocol;
+pub mod provenance_sync;
 pub mod scratchpad;
 pub mod service;
 pub mod session;

@@ -954,6 +954,8 @@ pub async fn run_turn(
                             Err(e) => tracing::warn!("llm-turn provenance write failed: {e}"),
                         }
                     }
+                    // Mirror the LLM turn to the platform (fail-open).
+                    crate::provenance_sync::try_push(&record).await;
                 });
             }
         }
