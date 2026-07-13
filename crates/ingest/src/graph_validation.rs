@@ -1,7 +1,7 @@
 //! Graph quality validation — SHACL-lite checks on extracted EntitySets.
 //!
-//! Validates structural integrity of the knowledge graph before/after
-//! writing to Neo4j. Catches issues the LLM entity extraction might produce:
+//! Validates structural integrity of the knowledge graph before the graph
+//! write. Catches issues the LLM entity extraction might produce:
 //!
 //! - Orphan relationships (reference non-existent entities)
 //! - Missing required properties (e.g. Alloy without name)

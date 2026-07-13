@@ -6382,6 +6382,33 @@ async fn handle_command(
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
+        _ if trimmed.starts_with("/billing topup") => {
+            // Buy credits: list the packs, and with a slug open the hosted
+            // checkout in the browser. Crediting is server-side on payment.
+            // (Previously advertised in the /billing footer but never routed.)
+            let pkg = trimmed["/billing topup".len()..].trim();
+            let mut args = vec![String::from("billing"), String::from("topup")];
+            if !pkg.is_empty() {
+                args.push(pkg.to_string());
+            }
+            let out = run_cli_backed_slash_command(&args, slash_ctx)
+                .await
+                .unwrap_or_else(|e| format!("Top-up unavailable: {e}"));
+            emit_view("billing", "Buy credits", &out, "info");
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        _ if trimmed.starts_with("/billing history") => {
+            let out = run_cli_backed_slash_command(
+                &[String::from("billing"), String::from("history")],
+                slash_ctx,
+            )
+            .await
+            .unwrap_or_else(|e| format!("History unavailable: {e}"));
+            emit_view("billing", "Billing history", &out, "info");
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
         _ if trimmed == "/billing" => {
             let balance = run_cli_backed_slash_command(&[String::from("billing")], slash_ctx)
                 .await

@@ -1,6 +1,6 @@
 [package]
 name = "prism-ingest"
-description = "Data ingestion and ontology pipeline — LLM-driven entity extraction, Neo4j graphs, and Qdrant embeddings."
+description = "Data ingestion and ontology pipeline — LLM-driven entity extraction into the bundled Turso EMMO knowledge graph."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,8 @@ authors.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -19,6 +21,7 @@ serde_yaml = { workspace = true }
 uuid = { workspace = true }
 polars = { workspace = true }
 prism-llm = { path = "../llm" }
+prism-provenance = { path = "../provenance" }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -56,7 +56,7 @@ steps:
 
   - name: store_graph
     skill: knowledge_ingest
-    description: Store extracted entities and relationships in Neo4j
+    description: Store extracted entities and relationships in the local knowledge graph
     inputs:
       entities: "$entities"
       relationships: "$relationships"

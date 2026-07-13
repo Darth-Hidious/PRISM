@@ -198,18 +198,6 @@ enum Commands {
         /// API key for authenticated LLM providers. Also reads from LLM_API_KEY env var.
         #[arg(long, env = "LLM_API_KEY")]
         api_key: Option<String>,
-        /// Neo4j HTTP endpoint.
-        #[arg(long, default_value = "http://localhost:7474")]
-        neo4j_url: String,
-        /// Neo4j username.
-        #[arg(long, default_value = "neo4j")]
-        neo4j_user: String,
-        /// Neo4j password.
-        #[arg(long, default_value = "prism-local")]
-        neo4j_pass: String,
-        /// Qdrant HTTP endpoint.
-        #[arg(long, default_value = "http://localhost:6333")]
-        qdrant_url: String,
         /// Skip LLM extraction (schema detection only).
         #[arg(long)]
         schema_only: bool,
@@ -231,11 +219,8 @@ enum Commands {
     },
     /// Query the knowledge graph.
     Query {
-        /// Natural language or Cypher query.
+        /// Entity name or search text.
         text: String,
-        /// Direct Cypher query (skip LLM translation).
-        #[arg(long)]
-        cypher: bool,
         /// Semantic vector search.
         #[arg(long)]
         semantic: bool,
@@ -248,18 +233,6 @@ enum Commands {
         /// Query all known mesh peers and merge results.
         #[arg(long)]
         federated: bool,
-        /// Neo4j HTTP endpoint.
-        #[arg(long, default_value = "http://localhost:7474")]
-        neo4j_url: String,
-        /// Neo4j username.
-        #[arg(long, default_value = "neo4j")]
-        neo4j_user: String,
-        /// Neo4j password.
-        #[arg(long, default_value = "prism-local")]
-        neo4j_pass: String,
-        /// Qdrant HTTP endpoint.
-        #[arg(long, default_value = "http://localhost:6333")]
-        qdrant_url: String,
         /// Override LLM base URL (otherwise uses prism.toml).
         #[arg(long)]
         llm_url: Option<String>,
@@ -504,11 +477,11 @@ enum BillingCommands {
     History,
     /// Show credit pricing table.
     Prices,
-    /// Buy credits (opens Stripe checkout in browser).
+    /// Buy credits — lists packs; with a slug, opens the checkout in a browser.
     Topup {
-        /// Package slug: starter, standard, pro, enterprise.
-        #[arg(default_value = "starter")]
-        package: String,
+        /// Package slug: starter, standard, pro, enterprise. Omit to just
+        /// list the available packs (no checkout is created).
+        package: Option<String>,
     },
 }
 
@@ -663,15 +636,9 @@ enum NodeCommands {
         /// Dashboard HTTP port (default: 7327).
         #[arg(long, default_value_t = 7327)]
         dashboard_port: u16,
-        /// Skip starting managed services (Neo4j, Qdrant, Kafka).
+        /// Skip starting managed services (Kafka, Spark).
         #[arg(long)]
         no_services: bool,
-        /// Connect to existing Neo4j instead of starting a container.
-        #[arg(long)]
-        external_neo4j: Option<String>,
-        /// Connect to existing Qdrant instead of starting a container.
-        #[arg(long)]
-        external_qdrant: Option<String>,
         /// Also start Kafka (for mesh/pub-sub, off by default in dev).
         #[arg(long)]
         with_kafka: bool,
@@ -693,9 +660,9 @@ enum NodeCommands {
     Status,
     /// Probe local capabilities without connecting.
     Probe,
-    /// Stream logs from a managed service (neo4j, qdrant, kafka).
+    /// Stream logs from a managed service (kafka, spark, firecrawl).
     Logs {
-        /// Service name: neo4j, qdrant, or kafka.
+        /// Service name: e.g. kafka, spark, or firecrawl.
         service: String,
         /// Number of tail lines to show (default: 100).
         #[arg(long, default_value_t = 100)]
@@ -1959,8 +1926,6 @@ async fn main() -> Result<()> {
                 offline,
                 dashboard_port,
                 no_services,
-                external_neo4j,
-                external_qdrant,
                 with_kafka,
                 kafka_brokers,
                 with_spark,
@@ -2035,12 +2000,6 @@ async fn main() -> Result<()> {
                     if let Some(ref m) = serve {
                         cmd.args(["--serve", m]);
                     }
-                    if let Some(ref uri) = external_neo4j {
-                        cmd.args(["--external-neo4j", uri]);
-                    }
-                    if let Some(ref uri) = external_qdrant {
-                        cmd.args(["--external-qdrant", uri]);
-                    }
 
                     cmd.stdout(log_file.try_clone()?)
                         .stderr(log_file)
@@ -2105,12 +2064,6 @@ async fn main() -> Result<()> {
                 let mut service_handles = None;
                 if !no_services {
                     let mut svc_config = prism_orch::ServiceConfig::default();
-                    if external_neo4j.is_some() || node_config.services.neo4j_uri.is_some() {
-                        svc_config.neo4j = None;
-                    }
-                    if external_qdrant.is_some() || node_config.services.qdrant_uri.is_some() {
-                        svc_config.vector_db = None;
-                    }
                     if with_kafka {
                         svc_config.kafka = Some(prism_orch::services::KafkaConfig::default());
                     }
@@ -2118,9 +2071,7 @@ async fn main() -> Result<()> {
                         svc_config.spark = Some(prism_orch::services::SparkConfig::default());
                     }
 
-                    let wants_managed_services = svc_config.neo4j.is_some()
-                        || svc_config.vector_db.is_some()
-                        || svc_config.kafka.is_some()
+                    let wants_managed_services = svc_config.kafka.is_some()
                         || svc_config.spark.is_some()
                         || svc_config.firecrawl.is_some();
 
@@ -2231,46 +2182,6 @@ async fn main() -> Result<()> {
                 }
 
                 // Wire backend configs — CLI flags > prism.toml > defaults
-                let managed_neo4j_running = service_handles.as_ref().is_some_and(|handles| {
-                    handles.services.iter().any(|handle| handle.name == "neo4j")
-                });
-                let managed_qdrant_running = service_handles.as_ref().is_some_and(|handles| {
-                    handles
-                        .services
-                        .iter()
-                        .any(|handle| handle.name == "qdrant")
-                });
-
-                if external_neo4j.is_some()
-                    || node_config.services.neo4j_uri.is_some()
-                    || managed_neo4j_running
-                {
-                    let neo4j_url = external_neo4j
-                        .clone()
-                        .or_else(|| node_config.services.neo4j_uri.clone())
-                        .unwrap_or_else(|| "http://localhost:7474".into());
-                    server_node_state.neo4j = Some(prism_ingest::Neo4jConfig {
-                        base_url: neo4j_url,
-                        database: "neo4j".into(),
-                        username: "neo4j".into(),
-                        password: "prism-local".into(),
-                    });
-                }
-                if external_qdrant.is_some()
-                    || node_config.services.qdrant_uri.is_some()
-                    || managed_qdrant_running
-                {
-                    let qdrant_url = external_qdrant
-                        .clone()
-                        .or_else(|| node_config.services.qdrant_uri.clone())
-                        .unwrap_or_else(|| "http://localhost:6333".into());
-                    server_node_state.qdrant = Some(prism_ingest::QdrantConfig {
-                        base_url: qdrant_url,
-                        collection: "prism_embeddings".into(),
-                        api_key: None,
-                    });
-                }
-
                 // Wire LLM config from config.toml [chat] (prism use local)
                 // falling back to prism.toml [indexer], then defaults.
                 {
@@ -2627,13 +2538,14 @@ async fn main() -> Result<()> {
                             let our_node_id = mesh_node_id.unwrap_or_else(uuid::Uuid::nil);
                             let subscriptions = server_state.subscriptions.clone();
 
-                            // Build sync config from Neo4j settings if available
-                            let sync_config = server_state.neo4j.as_ref().map(|neo4j| {
-                                prism_mesh::sync::SyncConfig {
-                                    neo4j_url: neo4j.base_url.clone(),
-                                    neo4j_user: neo4j.username.clone(),
-                                    neo4j_pass: neo4j.password.clone(),
-                                }
+                            // Peer-synced facts land in the bundled Turso
+                            // store under tenant "mesh" — always available,
+                            // no external graph service required.
+                            let sync_home =
+                                std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                            let sync_config = Some(prism_mesh::sync::SyncConfig {
+                                provenance_db: std::path::PathBuf::from(sync_home)
+                                    .join(".prism/provenance.db"),
                             });
 
                             // Spawn consumer loop
@@ -2856,10 +2768,6 @@ async fn main() -> Result<()> {
             model,
             llm_url,
             api_key,
-            neo4j_url,
-            neo4j_user,
-            neo4j_pass,
-            qdrant_url,
             schema_only,
             status,
             watch,
@@ -2879,10 +2787,6 @@ async fn main() -> Result<()> {
                     model.as_deref(),
                     llm_url.as_deref(),
                     api_key.as_deref(),
-                    &neo4j_url,
-                    &neo4j_user,
-                    &neo4j_pass,
-                    &qdrant_url,
                     schema_only,
                     &runtime_url,
                     corpus.as_deref(),
@@ -2900,10 +2804,6 @@ async fn main() -> Result<()> {
                     model.as_deref(),
                     llm_url.as_deref(),
                     api_key.as_deref(),
-                    &neo4j_url,
-                    &neo4j_user,
-                    &neo4j_pass,
-                    &qdrant_url,
                     schema_only,
                     &runtime_url,
                     corpus.as_deref(),
@@ -2915,18 +2815,13 @@ async fn main() -> Result<()> {
         }
         Commands::Query {
             text,
-            cypher,
             semantic,
             platform,
             json: json_output,
             federated,
-            neo4j_url,
-            neo4j_user,
-            neo4j_pass,
-            qdrant_url,
-            llm_url,
-            model,
-            api_key,
+            llm_url: _,
+            model: _,
+            api_key: _,
             limit,
             dashboard_url,
         } => {
@@ -2936,36 +2831,7 @@ async fn main() -> Result<()> {
             } else if federated {
                 handle_federated_query(&text, &dashboard_url, &paths).await?;
             } else {
-                // LLM config only needed for --semantic (embedding generation).
-                // --cypher and NL neighbor queries hit Neo4j directly.
-                let llm_cfg = if semantic {
-                    Some(build_llm_config(
-                        &project_root,
-                        llm_url.as_deref(),
-                        model.as_deref(),
-                        api_key.as_deref(),
-                    )?)
-                } else {
-                    build_llm_config(
-                        &project_root,
-                        llm_url.as_deref(),
-                        model.as_deref(),
-                        api_key.as_deref(),
-                    )
-                    .ok()
-                };
-                handle_query(
-                    &text,
-                    cypher,
-                    semantic,
-                    &neo4j_url,
-                    &neo4j_user,
-                    &neo4j_pass,
-                    &qdrant_url,
-                    llm_cfg.as_ref(),
-                    limit,
-                )
-                .await?;
+                handle_query(&text, semantic, limit).await?;
             }
         }
         Commands::Agent => {
@@ -3873,7 +3739,7 @@ async fn main() -> Result<()> {
                     println!();
                 }
                 Some(BillingCommands::Topup { package }) => {
-                    // First show packages
+                    // Always show the available packs first.
                     let pkgs: serde_json::Value = client
                         .get(format!("{api_base}/billing/packages"))
                         .send()
@@ -3881,7 +3747,7 @@ async fn main() -> Result<()> {
                         .error_for_status()?
                         .json()
                         .await?;
-                    println!("\nAvailable packages:\n");
+                    println!("\nAvailable credit packs:\n");
                     if let Some(packages) = pkgs["packages"].as_array() {
                         for (i, p) in packages.iter().enumerate() {
                             println!(
@@ -3894,7 +3760,14 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    println!("\nOpening Stripe checkout for '{package}'...");
+                    // No slug: list-only. Never create a checkout the user
+                    // didn't ask for (the old default silently bought starter).
+                    let Some(package) = package else {
+                        println!("\nRun `/billing topup <slug>` (e.g. pro) to open a checkout.");
+                        return Ok(());
+                    };
+
+                    println!("\nOpening checkout for '{package}'...");
                     let resp: serde_json::Value = auth
                         .apply(client.post(format!("{api_base}/billing/topup")))
                         .json(&serde_json::json!({"package": package}))
@@ -4672,6 +4545,41 @@ fn ingest_format(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// True when the URL's host is loopback (`localhost`, 127.x.x.x, `::1`) —
+/// i.e. the model runs on this machine.
+fn is_loopback_url(raw: &str) -> bool {
+    match url::Url::parse(raw) {
+        Ok(parsed) => match parsed.host() {
+            Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Resolve where text-document ingest runs: `[ontology] locality` in
+/// prism.toml ("local"/"cloud" honored as-is); "auto" → local iff the LLM
+/// endpoint `build_llm_config` resolves is loopback (an on-device model).
+/// No usable LLM config → cloud, preserving the pre-locality default.
+fn resolve_text_ingest_locality(
+    project_root: &Path,
+    llm_url: Option<&str>,
+    model: Option<&str>,
+    api_key: Option<&str>,
+) -> &'static str {
+    let node_config = prism_core::config::NodeConfig::load(Some(project_root));
+    match node_config.ontology.locality.as_str() {
+        "local" => "local",
+        "cloud" => "cloud",
+        _ => match build_llm_config(project_root, llm_url, model, api_key) {
+            Ok(cfg) if is_loopback_url(&cfg.base_url) => "local",
+            _ => "cloud",
+        },
+    }
+}
+
 fn collect_ingest_paths(root: &Path) -> Result<Vec<PathBuf>> {
     if root.is_file() {
         return Ok(vec![root.to_path_buf()]);
@@ -4859,22 +4767,16 @@ async fn submit_platform_ingest_chunk(
     Ok(response.json().await?)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_local_ingest_file(
     path: &Path,
     project_root: &Path,
     model: Option<&str>,
     llm_url: Option<&str>,
     api_key: Option<&str>,
-    neo4j_url: &str,
-    neo4j_user: &str,
-    neo4j_pass: &str,
-    qdrant_url: &str,
     schema_only: bool,
     mapping_path: Option<&Path>,
 ) -> Result<serde_json::Value> {
     use prism_ingest::pipeline::{IngestPipeline, PipelineConfig};
-    use prism_ingest::{Neo4jConfig, QdrantConfig};
 
     let mapping = mapping_path
         .map(prism_ingest::mapping::OntologyMapping::from_file)
@@ -4883,28 +4785,17 @@ async fn run_local_ingest_file(
     let config = if schema_only {
         PipelineConfig {
             llm: None,
-            neo4j: None,
-            qdrant: None,
             max_sample_rows: 10,
             mapping: None,
+            provenance_db: None,
         }
     } else {
         let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
         PipelineConfig {
             llm: Some(llm_cfg),
-            neo4j: Some(Neo4jConfig {
-                base_url: neo4j_url.into(),
-                database: "neo4j".into(),
-                username: neo4j_user.into(),
-                password: neo4j_pass.into(),
-            }),
-            qdrant: Some(QdrantConfig {
-                base_url: qdrant_url.into(),
-                collection: "prism_embeddings".into(),
-                api_key: None,
-            }),
             max_sample_rows: 10,
             mapping,
+            provenance_db: None,
         }
     };
 
@@ -4968,6 +4859,114 @@ async fn run_platform_ingest_file(
         "chars": text.chars().count(),
         "chunk_count": chunks.len(),
         "jobs": jobs,
+        "warning": warning,
+    }))
+}
+
+/// Ingest a text document entirely on-device: extract EMMO facts with the
+/// local LLM and write them (with one PROV-O activity) into the bundled
+/// Turso provenance store. Nothing leaves the machine.
+#[allow(clippy::too_many_arguments)]
+async fn run_local_text_ingest_file(
+    path: &Path,
+    project_root: &Path,
+    model: Option<&str>,
+    llm_url: Option<&str>,
+    api_key: Option<&str>,
+    runtime_url: &str,
+    schema_only: bool,
+    mapping_path: Option<&Path>,
+) -> Result<serde_json::Value> {
+    if mapping_path.is_some() {
+        eprintln!(
+            "Warning: --mapping is only applied to the local tabular ingest pipeline and is ignored for {}.",
+            path.display()
+        );
+    }
+
+    // Local PDF parsing isn't wired yet. Be honest and skip — never quietly
+    // fall back to the cloud against the user's locality choice.
+    if ingest_format(path) == "pdf" {
+        let reason = "local PDF parsing isn't available yet — ingest text/markdown/json locally, or set locality = \"cloud\" for PDFs";
+        eprintln!("  Skipping {}: {reason}", path.display());
+        return Ok(serde_json::json!({
+            "backend": "local_text",
+            "path": path.display().to_string(),
+            "format": "pdf",
+            "skipped": true,
+            "reason": reason,
+        }));
+    }
+
+    // Non-PDF text formats just read the file — the runtime sidecar is
+    // never contacted (the PDF branch is excluded above).
+    let (text, _pages, warning) = extract_platform_ingest_text(path, runtime_url).await?;
+    let chars = text.chars().count();
+    if text.trim().is_empty() {
+        bail!("No ingestable text found in {}", path.display());
+    }
+
+    if schema_only {
+        return Ok(serde_json::json!({
+            "backend": "local_text",
+            "path": path.display().to_string(),
+            "format": ingest_format(path),
+            "schema_only": true,
+            "chars": chars,
+            "warning": warning,
+        }));
+    }
+
+    let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
+    let agent_id = if llm_cfg.model.is_empty() {
+        "prism-ingest".to_string()
+    } else {
+        llm_cfg.model.clone()
+    };
+    let llm = prism_ingest::llm::LlmClient::new(llm_cfg);
+    let title = path
+        .file_stem()
+        .or_else(|| path.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or("untitled");
+
+    let facts = prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let db_path = PathBuf::from(home).join(".prism/provenance.db");
+    let store = prism_provenance::ProvenanceStore::open(&db_path).await?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let prov = prism_provenance::LocalProvenance {
+        activity_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: agent_id.clone(),
+        agent_kind: "SoftwareAgent".into(),
+        source_entity_id: path.display().to_string(),
+        source_kind: "Document".into(),
+        // Local single-user store — no per-run tenancy (yet).
+        tenant: "local".into(),
+        started_at: now.clone(),
+        ended_at: now,
+        locality: "local".into(),
+    };
+    store.record_activity(&prov).await?;
+    for fact in &facts {
+        store.write_fact(fact, &prov).await?;
+    }
+    // Best-effort: vectorize the freshly written entity names into the same
+    // Turso store so `prism query --semantic` works without Qdrant.
+    // Failures are logged inside and never fail the ingest.
+    store.embed_entities_best_effort(&facts, &prov.tenant).await;
+
+    Ok(serde_json::json!({
+        "backend": "local_text",
+        "path": path.display().to_string(),
+        "format": ingest_format(path),
+        "schema_only": false,
+        "chars": chars,
+        "facts_written": facts.len(),
+        "model": agent_id,
+        "store": db_path.display().to_string(),
         "warning": warning,
     }))
 }
@@ -5037,7 +5036,9 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     .get("edges_created")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
-                println!("  Graph: {nodes} nodes, {edges} edges written to Neo4j");
+                println!(
+                    "  Graph: {nodes} nodes, {edges} edges written to the local knowledge graph"
+                );
             }
             if let Some(embeddings) = result.get("embeddings") {
                 let count = embeddings
@@ -5093,6 +5094,43 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     let job_id = value_string(job, &["job_id"]).unwrap_or("?");
                     let status = value_string(job, &["status"]).unwrap_or("submitted");
                     println!("  Chunk {chunk_index}: job {job_id} [{status}]");
+                }
+            }
+        }
+        "local_text" => {
+            if summary
+                .get("skipped")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                let reason = value_string(summary, &["reason"]).unwrap_or("skipped");
+                println!("  Skipped: {reason}");
+            } else {
+                let chars = summary
+                    .get("chars")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                println!("  Text: {chars} chars extracted on-device");
+                if let Some(warning) = summary.get("warning").and_then(|value| value.as_str()) {
+                    println!("  Warning: {warning}");
+                }
+                if summary
+                    .get("schema_only")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    println!("  (schema-only mode — text was measured but not extracted)");
+                } else {
+                    let facts = summary
+                        .get("facts_written")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let store =
+                        value_string(summary, &["store"]).unwrap_or("~/.prism/provenance.db");
+                    println!("  Facts: {facts} written to local store ({store})");
+                    if let Some(model) = value_string(summary, &["model"]) {
+                        println!("  Model: {model}");
+                    }
                 }
             }
         }
@@ -5270,10 +5308,6 @@ async fn handle_ingest(
     model: Option<&str>,
     llm_url: Option<&str>,
     api_key: Option<&str>,
-    neo4j_url: &str,
-    neo4j_user: &str,
-    neo4j_pass: &str,
-    qdrant_url: &str,
     schema_only: bool,
     runtime_url: &str,
     corpus: Option<&str>,
@@ -5285,6 +5319,24 @@ async fn handle_ingest(
         bail!("No ingestable files found under {}", path.display());
     }
 
+    // Resolve text-ingest locality once per run and say where document text
+    // is processed BEFORE anything runs. Banner goes to stderr so `--json`
+    // stdout stays parseable.
+    let text_locality = if ingest_targets
+        .iter()
+        .any(|target| ingest_backend(target) == Some(IngestBackend::PlatformText))
+    {
+        let locality = resolve_text_ingest_locality(project_root, llm_url, model, api_key);
+        if locality == "local" {
+            eprintln!("⚑ LOCAL — extracting on-device, nothing leaves your machine");
+        } else {
+            eprintln!("☁ CLOUD — sent to the platform");
+        }
+        locality
+    } else {
+        "cloud"
+    };
+
     let mut summaries = Vec::new();
     for target in ingest_targets {
         let summary = match ingest_backend(&target) {
@@ -5295,10 +5347,19 @@ async fn handle_ingest(
                     model,
                     llm_url,
                     api_key,
-                    neo4j_url,
-                    neo4j_user,
-                    neo4j_pass,
-                    qdrant_url,
+                    schema_only,
+                    mapping_path,
+                )
+                .await?
+            }
+            Some(IngestBackend::PlatformText) if text_locality == "local" => {
+                run_local_text_ingest_file(
+                    &target,
+                    project_root,
+                    model,
+                    llm_url,
+                    api_key,
+                    runtime_url,
                     schema_only,
                     mapping_path,
                 )
@@ -5359,10 +5420,6 @@ async fn handle_ingest_watch(
     model: Option<&str>,
     llm_url: Option<&str>,
     api_key: Option<&str>,
-    neo4j_url: &str,
-    neo4j_user: &str,
-    neo4j_pass: &str,
-    qdrant_url: &str,
     schema_only: bool,
     runtime_url: &str,
     corpus: Option<&str>,
@@ -5402,10 +5459,6 @@ async fn handle_ingest_watch(
             model,
             llm_url,
             api_key,
-            neo4j_url,
-            neo4j_user,
-            neo4j_pass,
-            qdrant_url,
             schema_only,
             runtime_url,
             corpus,
@@ -5456,10 +5509,6 @@ async fn handle_ingest_watch(
                     model,
                     llm_url,
                     api_key,
-                    neo4j_url,
-                    neo4j_user,
-                    neo4j_pass,
-                    qdrant_url,
                     schema_only,
                     runtime_url,
                     corpus,
@@ -7346,123 +7395,206 @@ async fn handle_platform_query(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_query(
-    text: &str,
-    cypher: bool,
-    semantic: bool,
-    neo4j_url: &str,
-    neo4j_user: &str,
-    neo4j_pass: &str,
-    qdrant_url: &str,
-    llm_cfg: Option<&prism_ingest::LlmConfig>,
-    limit: usize,
-) -> Result<()> {
-    use prism_ingest::embeddings::{QdrantVectorStore, VectorStore};
-    use prism_ingest::graph::{GraphStore, Neo4jGraphStore};
-    use prism_ingest::{Neo4jConfig, QdrantConfig};
+/// Tenant every local single-user write uses (see the ingest pipeline's
+/// `write_local_graph` and `handle_text_ingest` — both stamp `"local"`).
+const LOCAL_ONTOLOGY_TENANT: &str = "local";
 
-    let neo4j_config = Neo4jConfig {
-        base_url: neo4j_url.into(),
-        database: "neo4j".into(),
-        username: neo4j_user.into(),
-        password: neo4j_pass.into(),
+/// Locally-ingested EMMO ontology matches read from the bundled Turso
+/// provenance store (`~/.prism/provenance.db`) — the store `prism ingest`
+/// writes into. This is what makes a local ingest visible to `prism query`
+/// without any external services running.
+struct LocalOntologyResults {
+    nodes: Vec<prism_provenance::GraphNode>,
+    edges: Vec<prism_provenance::GraphEdge>,
+    facts: Vec<prism_provenance::RecalledFact>,
+}
+
+/// Query the bundled Turso store for locally-ingested ontology.
+///
+/// Never errors: any failure (store unopenable, query error) degrades to
+/// `None`, which the caller renders as "no matches". `None` is also
+/// returned when the store is fine but nothing matched (fresh install,
+/// unknown term).
+async fn local_ontology_lookup(
+    db_path: &Path,
+    text: &str,
+    limit: usize,
+) -> Option<LocalOntologyResults> {
+    let store = match prism_provenance::ProvenanceStore::open(db_path).await {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::debug!("local ontology store open failed: {e:#}");
+            return None;
+        }
+    };
+    let limit = limit.max(1) as i64;
+
+    // Exact/canonical entity name → 1-hop neighborhood (the Turso
+    // counterpart of Neo4j `neighbors`).
+    let (mut nodes, edges) = match store
+        .get_neighbors(text, None, LOCAL_ONTOLOGY_TENANT, limit)
+        .await
+    {
+        Ok(traversal) => (traversal.nodes, traversal.edges),
+        Err(e) => {
+            tracing::debug!("local ontology neighbor read failed: {e:#}");
+            (Vec::new(), Vec::new())
+        }
     };
 
-    if cypher {
-        // Direct Cypher execution
-        let store = Neo4jGraphStore::new(neo4j_config);
-        println!("Executing Cypher: {text}\n");
-        let results = store.query_cypher(text, None).await?;
-        if results.is_empty() {
-            println!("  (no results)");
-        } else {
-            for (i, row) in results.iter().enumerate() {
-                println!("  {}. {}", i + 1, row);
-            }
-            println!("\n  {} row(s)", results.len());
-        }
-    } else if semantic {
-        // Semantic vector search
-        let qdrant_config = QdrantConfig {
-            base_url: qdrant_url.into(),
-            collection: "prism_embeddings".into(),
-            api_key: None,
-        };
-
-        // Generate embedding for the query text via provider-agnostic LlmClient
-        let llm_cfg = llm_cfg.ok_or_else(|| {
-            anyhow!("--semantic queries require an LLM for embeddings. Run: prism configure --model <name>")
-        })?;
-        println!("Generating query embedding...");
-        let llm_client = prism_ingest::llm::LlmClient::new(llm_cfg.clone());
-        let query_vec = match llm_client.embed_text(text).await {
-            Ok(v) => v,
+    // No exact center → substring search over entity names.
+    if nodes.is_empty() {
+        nodes = match store.graph_search(text, LOCAL_ONTOLOGY_TENANT, limit).await {
+            Ok(nodes) => nodes,
             Err(e) => {
-                // Detect the most common misconfiguration: prism.toml's
-                // `[llm].url` points at MARC27's project-scoped LLM proxy
-                // (`/api/v1/projects/{id}/llm`) which doesn't expose
-                // `/v1/embeddings`. Without this hint a real user thinks
-                // the platform is down. Steer them to the working path.
-                let msg = e.to_string();
-                let looks_like_marc27_404 =
-                    msg.contains("404") && msg.contains("/projects/") && msg.contains("/llm/");
-                if looks_like_marc27_404 {
-                    bail!(
-                        "Local --semantic search needs an LLM that exposes \
-                         OpenAI-compatible /v1/embeddings, but the configured \
-                         URL ({}) is the MARC27 project-scoped LLM proxy \
-                         which serves chat-streaming only.\n\n\
-                         For platform knowledge-graph search, use:\n\
-                         \x20 prism query --platform --semantic \"{}\"\n\n\
-                         For local embeddings, run a server like Ollama or \
-                         llama.cpp and point prism at it via:\n\
-                         \x20 prism configure --llm-provider llamacpp\n\n\
-                         Underlying error: {e}",
-                        llm_cfg.base_url,
-                        text
-                    );
-                }
-                return Err(e).context("failed to generate query embedding");
+                tracing::debug!("local ontology graph search failed: {e:#}");
+                Vec::new()
             }
         };
+    }
 
-        let store = QdrantVectorStore::new(qdrant_config);
-        let results = store.query(&query_vec, limit).await?;
+    // Provenance-backed assertions mentioning the query term.
+    let facts = match store.recall(text, LOCAL_ONTOLOGY_TENANT, limit).await {
+        Ok(facts) => facts,
+        Err(e) => {
+            tracing::debug!("local ontology recall failed: {e:#}");
+            Vec::new()
+        }
+    };
 
+    if nodes.is_empty() && edges.is_empty() && facts.is_empty() {
+        return None;
+    }
+    Some(LocalOntologyResults {
+        nodes,
+        edges,
+        facts,
+    })
+}
+
+/// Semantic entity search over the bundled Turso store using the offline
+/// `prism-embed` backend (no Qdrant, no cloud) — the vectors that local
+/// ingest writes via `embed_entities_best_effort`.
+///
+/// Never errors: an unopenable store, an empty store, an unavailable
+/// embedding backend, or zero hits all degrade to `None`, which the
+/// caller renders as "no results". The store is checked BEFORE the
+/// backend is built, so a fresh install never pays the embedding-model
+/// init just to return nothing.
+async fn local_semantic_lookup(
+    db_path: &Path,
+    text: &str,
+    limit: usize,
+) -> Option<Vec<(String, f32)>> {
+    let store = match prism_provenance::ProvenanceStore::open(db_path).await {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::debug!("local semantic store open failed: {e:#}");
+            return None;
+        }
+    };
+    match store.entity_embedding_count(LOCAL_ONTOLOGY_TENANT).await {
+        Ok(0) => return None,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!("local semantic embedding count failed: {e:#}");
+            return None;
+        }
+    }
+
+    // First ever native init may download the model — blocking pool.
+    let backend = tokio::task::spawn_blocking(prism_embed::from_config)
+        .await
+        .ok()
+        .flatten()?;
+    let query_vec = match backend.embed(std::slice::from_ref(&text.to_string())).await {
+        Ok(mut vecs) if !vecs.is_empty() => vecs.remove(0),
+        Ok(_) => return None,
+        Err(e) => {
+            tracing::debug!("local semantic query embedding failed: {e:#}");
+            return None;
+        }
+    };
+
+    match store
+        .semantic_search_entities(&query_vec, LOCAL_ONTOLOGY_TENANT, limit)
+        .await
+    {
+        Ok(hits) if !hits.is_empty() => Some(hits),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::debug!("local semantic search failed: {e:#}");
+            None
+        }
+    }
+}
+
+/// Render local-ontology matches in the same shape the retired Neo4j path
+/// printed: one `[type] name` line per entity, plus relationship and fact
+/// lines.
+fn format_local_ontology(results: &LocalOntologyResults) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if !results.nodes.is_empty() {
+        let _ = writeln!(
+            out,
+            "  Found {} matching entities (local ontology):\n",
+            results.nodes.len()
+        );
+        for node in &results.nodes {
+            let _ = writeln!(out, "  [{}] {}", node.entity_type, node.name);
+        }
+    }
+    if !results.edges.is_empty() {
+        let _ = writeln!(out, "\n  {} relationship(s):\n", results.edges.len());
+        for edge in &results.edges {
+            let _ = writeln!(
+                out,
+                "  {} -[{}]-> {}",
+                edge.source, edge.rel_type, edge.target
+            );
+        }
+    }
+    if !results.facts.is_empty() {
+        let _ = writeln!(out, "\n  {} recalled fact(s):\n", results.facts.len());
+        for fact in &results.facts {
+            let _ = writeln!(
+                out,
+                "  {} -[{}]-> {}  (confidence {:.2}, source {})",
+                fact.subject, fact.predicate, fact.object, fact.confidence, fact.source
+            );
+        }
+    }
+    out
+}
+
+async fn handle_query(text: &str, semantic: bool, limit: usize) -> Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let turso_db = PathBuf::from(home).join(".prism/provenance.db");
+
+    if semantic {
+        // Bundled Turso entity vectors written by local ingest (offline
+        // prism-embed query embedding — no services needed).
+        let results = local_semantic_lookup(&turso_db, text, limit)
+            .await
+            .unwrap_or_default();
         println!("\nSemantic search results ({} matches):\n", results.len());
         for (i, (id, score)) in results.iter().enumerate() {
             println!("  {}. {id}  (score: {score:.4})", i + 1);
         }
         if results.is_empty() {
-            println!("  (no results — collection may be empty)");
+            println!("  (no results — ingest data first with: prism ingest <path>)");
         }
     } else {
-        // Natural language → graph traversal
-        // Find entities whose names match the query text, then traverse neighbors.
-        let store = Neo4jGraphStore::new(neo4j_config);
+        // Graph traversal over the bundled Turso provenance store
+        // (~/.prism/provenance.db, tenant "local") — the sole graph
+        // backend; no running services required.
         println!("Querying knowledge graph: \"{text}\"\n");
 
-        let result = store.neighbors(text, 3).await?;
-        if result.entities.is_empty() {
-            println!("  No direct matches. Try --semantic for vector search.");
+        if let Some(local) = local_ontology_lookup(&turso_db, text, limit).await {
+            print!("{}", format_local_ontology(&local));
         } else {
-            println!("  Found {} connected entities:\n", result.entities.len());
-            for entity in &result.entities {
-                let props_str = if entity.properties.is_object()
-                    && entity.properties.as_object().is_none_or(|o| o.is_empty())
-                {
-                    String::new()
-                } else {
-                    format!("  {}", entity.properties)
-                };
-                println!(
-                    "  [{type}] {name}{props}",
-                    r#type = entity.entity_type,
-                    name = entity.name,
-                    props = props_str,
-                );
-            }
+            println!("  No direct matches. Try --semantic for vector search.");
         }
     }
 
@@ -9036,13 +9168,11 @@ mod tests {
         match cli.command.unwrap() {
             Commands::Query {
                 text,
-                cypher,
                 semantic,
                 limit,
                 ..
             } => {
                 assert_eq!(text, "NbMoTaW alloys");
-                assert!(!cypher);
                 assert!(!semantic);
                 assert_eq!(limit, 10);
             }
@@ -9262,5 +9392,148 @@ data: {\"step\":\"complete\",\"total_turns\":2}\n",
             }
             _ => panic!("expected Discourse::Run command"),
         }
+    }
+
+    // ── Local Turso ontology read (query fallback chain) ─────────────
+
+    /// Tempfile-backed Turso DB, removed (with WAL sidecars) on drop.
+    struct TempProvenanceDb {
+        path: PathBuf,
+    }
+
+    impl TempProvenanceDb {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("prism_cli_local_query_{}.db", uuid::Uuid::new_v4()));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempProvenanceDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.path.clone().into_os_string();
+                p.push(suffix);
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    #[test]
+    fn local_ontology_formatting_matches_neo4j_shape() {
+        let results = LocalOntologyResults {
+            nodes: vec![prism_provenance::GraphNode {
+                name: "Ti-6Al-4V".into(),
+                entity_type: "Matter".into(),
+                label: "Matter".into(),
+                tenant: "local".into(),
+            }],
+            edges: vec![prism_provenance::GraphEdge {
+                source: "Ti-6Al-4V".into(),
+                target: "alpha phase".into(),
+                rel_type: "hasPart".into(),
+                count: 1,
+            }],
+            facts: vec![prism_provenance::RecalledFact {
+                subject: "Ti-6Al-4V".into(),
+                predicate: "hasProperty".into(),
+                object: "tensile strength".into(),
+                confidence: 0.9,
+                source: "doc:test".into(),
+                agent: "prism-ingest".into(),
+            }],
+        };
+        let out = format_local_ontology(&results);
+        // Entity lines keep the Neo4j path's `[type] name` shape.
+        assert!(out.contains("  [Matter] Ti-6Al-4V"), "got: {out}");
+        assert!(
+            out.contains("Ti-6Al-4V -[hasPart]-> alpha phase"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains(
+                "Ti-6Al-4V -[hasProperty]-> tensile strength  (confidence 0.90, source doc:test)"
+            ),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_ontology_lookup_reads_ingested_facts_and_is_empty_safe() {
+        let db = TempProvenanceDb::new();
+
+        // Fresh (empty) store: clean miss, never an error.
+        assert!(
+            local_ontology_lookup(&db.path, "titanium", 10)
+                .await
+                .is_none(),
+            "empty store must be a clean miss"
+        );
+
+        // Write one EMMO fact the way `prism ingest` does (tenant "local").
+        let store = prism_provenance::ProvenanceStore::open(&db.path)
+            .await
+            .expect("open temp store");
+        let now = chrono::Utc::now().to_rfc3339();
+        let prov = prism_provenance::LocalProvenance {
+            activity_id: "act_test".into(),
+            agent_id: "prism-ingest".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: "doc:test".into(),
+            source_kind: "Document".into(),
+            tenant: LOCAL_ONTOLOGY_TENANT.into(),
+            started_at: now.clone(),
+            ended_at: now,
+            locality: "local".into(),
+        };
+        store.record_activity(&prov).await.expect("record activity");
+        store
+            .write_fact(
+                &prism_provenance::LocalFact {
+                    subject: "Ti-6Al-4V".into(),
+                    predicate: "hasPart".into(),
+                    object: "alpha phase".into(),
+                    value: None,
+                    unit: None,
+                    confidence: Some(0.9),
+                    kind: Some("contains".into()),
+                },
+                &prov,
+            )
+            .await
+            .expect("write fact");
+
+        // Exact name → neighbor traversal (nodes + edge). A "contains"
+        // fact is written as a CONTAINS_ELEMENT edge (see emmo write_fact).
+        let hit = local_ontology_lookup(&db.path, "Ti-6Al-4V", 10)
+            .await
+            .expect("ingested entity must be queryable");
+        assert!(hit.nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
+        assert!(
+            hit.edges
+                .iter()
+                .any(|e| e.rel_type == "CONTAINS_ELEMENT" && e.target == "alpha phase")
+        );
+
+        // Substring → graph_search fallback still finds the node.
+        let hit = local_ontology_lookup(&db.path, "6Al", 10)
+            .await
+            .expect("substring match must be queryable");
+        assert!(hit.nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
+
+        // Unknown term → clean miss (caller renders "no matches").
+        assert!(
+            local_ontology_lookup(&db.path, "no-such-entity-xyz", 10)
+                .await
+                .is_none()
+        );
+
+        // Unopenable path (directory) → clean miss, never an error.
+        assert!(
+            local_ontology_lookup(&std::env::temp_dir(), "titanium", 10)
+                .await
+                .is_none(),
+            "store open failure must degrade to a miss"
+        );
     }
 }

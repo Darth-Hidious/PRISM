@@ -2,7 +2,7 @@
 //!
 //! Sends schema + sample rows to any LLM backend (Ollama, OpenAI, MARC27, vLLM),
 //! parses the structured JSON entity/relationship output, and returns typed results
-//! ready for Neo4j graph construction and Qdrant embedding storage.
+//! ready for the local EMMO graph write (bundled Turso store).
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;

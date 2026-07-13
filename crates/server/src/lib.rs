@@ -65,10 +65,6 @@ pub struct NodeState {
     pub node_name: String,
     pub started_at: Instant,
     pub services: Mutex<Vec<ServiceEntry>>,
-    /// Neo4j config — set when managed services are running.
-    pub neo4j: Option<prism_ingest::Neo4jConfig>,
-    /// Qdrant config — set when managed services are running.
-    pub qdrant: Option<prism_ingest::QdrantConfig>,
     /// Path to the audit log SQLite database.
     pub audit_db_path: Option<PathBuf>,
     /// Path to the RBAC SQLite database.
@@ -81,7 +77,7 @@ pub struct NodeState {
     pub mesh: RwLock<prism_mesh::MeshHandle>,
     /// Subscription manager for pub/sub.
     pub subscriptions: Arc<RwLock<prism_mesh::subscription::SubscriptionManager>>,
-    /// LLM config for NL→Cypher query translation (Ollama or compatible).
+    /// LLM config for the embedded chat/agent service (Ollama or compatible).
     pub llm: Option<prism_ingest::LlmConfig>,
     /// Platform API client (set when node is registered with MARC27 platform).
     pub platform_client: Option<prism_client::PlatformClient>,
@@ -121,8 +117,6 @@ impl NodeState {
             node_name,
             started_at: Instant::now(),
             services: Mutex::new(Vec::new()),
-            neo4j: None,
-            qdrant: None,
             audit_db_path: None,
             rbac_db_path: None,
             session_db_path: None,
@@ -237,26 +231,10 @@ mod tests {
         let state = NodeState::new("test-node".into());
         assert!(state.services.lock().unwrap().is_empty());
         state.update_services(vec![ServiceEntry {
-            name: "neo4j".into(),
-            port: 7687,
+            name: "kafka".into(),
+            port: 9092,
             healthy: true,
         }]);
         assert_eq!(state.services.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn node_state_default_has_no_backends() {
-        let state = NodeState::new("test".into());
-        assert!(state.neo4j.is_none());
-        assert!(state.qdrant.is_none());
-    }
-
-    #[test]
-    fn node_state_with_backends() {
-        let mut state = NodeState::new("test".into());
-        state.neo4j = Some(prism_ingest::Neo4jConfig::default());
-        state.qdrant = Some(prism_ingest::QdrantConfig::default());
-        assert!(state.neo4j.is_some());
-        assert!(state.qdrant.is_some());
     }
 }

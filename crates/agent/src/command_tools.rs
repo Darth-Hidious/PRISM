@@ -148,7 +148,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "query",
         aliases: &[],
         kind: CommandToolKind::QueryLocal,
-        description: "Query the local PRISM graph/vector stores with typed fields instead of manual CLI args. Use `cypher=true` for direct Cypher, `semantic=true` for vector search, or plain text for graph-neighbor lookup.",
+        description: "Query the local PRISM knowledge graph with typed fields instead of manual CLI args. Use `semantic=true` for vector search, or plain text for graph-neighbor lookup.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -414,7 +414,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "node",
         aliases: &[],
         kind: CommandToolKind::NodeLogs,
-        description: "Tail logs from a managed node service such as neo4j, qdrant, or kafka.",
+        description: "Tail logs from a managed node service such as kafka, spark, or firecrawl.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -932,36 +932,16 @@ fn query_local_schema() -> Value {
         "properties": {
             "text": {
                 "type": "string",
-                "description": "Natural-language query, entity text, or Cypher statement when `cypher=true`."
-            },
-            "cypher": {
-                "type": "boolean",
-                "description": "Run the `text` as a direct Cypher query against local Neo4j."
+                "description": "Entity name or search text."
             },
             "semantic": {
                 "type": "boolean",
-                "description": "Use semantic vector search against local Qdrant instead of graph traversal."
+                "description": "Use semantic vector search over the local entity vectors instead of graph traversal."
             },
             "limit": {
                 "type": "integer",
                 "description": "Max number of results to return for semantic search.",
                 "minimum": 1
-            },
-            "neo4j_url": {
-                "type": "string",
-                "description": "Override the local Neo4j HTTP endpoint."
-            },
-            "neo4j_user": {
-                "type": "string",
-                "description": "Override the local Neo4j username."
-            },
-            "neo4j_pass": {
-                "type": "string",
-                "description": "Override the local Neo4j password."
-            },
-            "qdrant_url": {
-                "type": "string",
-                "description": "Override the local Qdrant HTTP endpoint."
             },
             "llm_url": {
                 "type": "string",
@@ -1132,22 +1112,6 @@ fn ingest_schema(path_description: &str) -> Value {
             "api_key": {
                 "type": "string",
                 "description": "Optional API key for authenticated LLM providers."
-            },
-            "neo4j_url": {
-                "type": "string",
-                "description": "Override Neo4j HTTP endpoint."
-            },
-            "neo4j_user": {
-                "type": "string",
-                "description": "Override Neo4j username."
-            },
-            "neo4j_pass": {
-                "type": "string",
-                "description": "Override Neo4j password."
-            },
-            "qdrant_url": {
-                "type": "string",
-                "description": "Override Qdrant HTTP endpoint."
             },
             "runtime_url": {
                 "type": "string",
@@ -1583,7 +1547,7 @@ fn node_logs_schema() -> Value {
         "properties": {
             "service": {
                 "type": "string",
-                "description": "Managed service name such as `neo4j`, `qdrant`, or `kafka`."
+                "description": "Managed service name such as `kafka`, `spark`, or `firecrawl`."
             },
             "tail": {
                 "type": "integer",
@@ -1862,17 +1826,10 @@ fn build_query_args(input: &Value, mode: QueryMode) -> Result<Vec<String>> {
 
     match mode {
         QueryMode::Local => {
-            if optional_bool(input, "cypher") {
-                args.push("--cypher".to_string());
-            }
             if optional_bool(input, "semantic") {
                 args.push("--semantic".to_string());
             }
             for (flag, value) in [
-                ("--neo4j-url", optional_string(input, "neo4j_url")),
-                ("--neo4j-user", optional_string(input, "neo4j_user")),
-                ("--neo4j-pass", optional_string(input, "neo4j_pass")),
-                ("--qdrant-url", optional_string(input, "qdrant_url")),
                 ("--llm-url", optional_string(input, "llm_url")),
                 ("--model", optional_string(input, "model")),
                 ("--api-key", optional_string(input, "api_key")),
@@ -2080,10 +2037,6 @@ fn build_ingest_args(input: &Value, watch: bool) -> Result<Vec<String>> {
         ("--model", optional_string(input, "model")),
         ("--llm-url", optional_string(input, "llm_url")),
         ("--api-key", optional_string(input, "api_key")),
-        ("--neo4j-url", optional_string(input, "neo4j_url")),
-        ("--neo4j-user", optional_string(input, "neo4j_user")),
-        ("--neo4j-pass", optional_string(input, "neo4j_pass")),
-        ("--qdrant-url", optional_string(input, "qdrant_url")),
         ("--runtime-url", optional_string(input, "runtime_url")),
     ] {
         if let Some(value) = value {
@@ -3102,8 +3055,8 @@ async fn execute_workflow_command(
     Ok(result)
 }
 
-/// Tools that hit the LOCAL graph/vector stores (Neo4j/Qdrant behind the
-/// local node) or the local node dashboard. Offering them while the node is
+/// Tools that hit the LOCAL knowledge graph (the bundled Turso store behind
+/// the local node) or the local node dashboard. Offering them while the node is
 /// down produced dead-end failures for every semantic/graph call, so they
 /// are only listed in the default catalog when the node is reachable. The
 /// specs stay registered — `execute_command_tool` still resolves them — so

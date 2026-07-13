@@ -2,49 +2,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
-    pub neo4j: Option<Neo4jConfig>,
-    pub vector_db: Option<VectorDbConfig>,
     pub kafka: Option<KafkaConfig>,
     pub spark: Option<SparkConfig>,
     pub firecrawl: Option<FirecrawlConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Neo4jConfig {
-    pub image: String,
-    pub bolt_port: u16,
-    pub http_port: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VectorDbConfig {
-    pub image: String,
-    pub port: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaConfig {
     pub image: String,
     pub port: u16,
-}
-
-impl Default for Neo4jConfig {
-    fn default() -> Self {
-        Self {
-            image: "neo4j:5-community".to_string(),
-            bolt_port: 7687,
-            http_port: 7474,
-        }
-    }
-}
-
-impl Default for VectorDbConfig {
-    fn default() -> Self {
-        Self {
-            image: "qdrant/qdrant:v1.12.6".to_string(),
-            port: 6333,
-        }
-    }
 }
 
 impl Default for KafkaConfig {
@@ -95,8 +61,6 @@ impl Default for FirecrawlConfig {
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
-            neo4j: Some(Neo4jConfig::default()),
-            vector_db: Some(VectorDbConfig::default()),
             kafka: None,
             spark: None,
             firecrawl: Some(FirecrawlConfig::default()),

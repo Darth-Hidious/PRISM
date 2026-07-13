@@ -28,22 +28,11 @@ pub struct IngestResponse {
 }
 
 /// GET /api/data/sources — list available data sources.
-pub async fn list_sources(State(state): State<Arc<NodeState>>) -> Json<Vec<DataSource>> {
-    // Report graph stats if Neo4j is available.
-    if let Some(ref neo4j_config) = state.neo4j {
-        use prism_ingest::graph::{GraphStore, Neo4jGraphStore};
-        let store = Neo4jGraphStore::new(neo4j_config.clone());
-        if let Ok(stats) = store.stats().await {
-            return Json(vec![DataSource {
-                id: "neo4j".into(),
-                name: format!(
-                    "Knowledge Graph ({} nodes, {} rels)",
-                    stats.node_count, stats.relationship_count
-                ),
-                kind: "graph".into(),
-            }]);
-        }
-    }
+///
+/// Always empty for now: the old implementation reported Neo4j graph
+/// stats, and Neo4j is retired. Knowledge lives in the bundled Turso
+/// store; surfacing its counts here is future work.
+pub async fn list_sources(State(_state): State<Arc<NodeState>>) -> Json<Vec<DataSource>> {
     Json(vec![])
 }
 

@@ -1,8 +1,8 @@
 //! External service connector — connects to user-provided service URIs
 //! instead of managing Docker containers.
 //!
-//! Used when the user already has Neo4j, Qdrant, or Kafka running and wants
-//! PRISM to connect to them: `prism node up --external-neo4j bolt://...`
+//! Used when the user already has Kafka running and wants PRISM to
+//! connect to it instead of starting a container.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,10 +15,6 @@ use crate::{HealthReport, ServiceHandle, ServiceHandles, ServiceHealth, ServiceO
 /// External URIs provided by the user for pre-existing services.
 #[derive(Debug, Clone, Default)]
 pub struct ExternalServices {
-    /// `bolt://host:port` or just `host:port` for Neo4j.
-    pub neo4j_uri: Option<String>,
-    /// `http://host:port` for Qdrant.
-    pub qdrant_uri: Option<String>,
     /// `host:port` for Kafka broker.
     pub kafka_uri: Option<String>,
 }
@@ -34,7 +30,7 @@ impl ExternalConnector {
     }
 
     fn parse_port(uri: &str, default_port: u16) -> u16 {
-        // Try to extract port from URI like "bolt://host:7687" or "host:7687"
+        // Try to extract port from URI like "kafka://host:9092" or "host:9092"
         uri.rsplit(':')
             .next()
             .and_then(|p| p.trim_end_matches('/').parse().ok())
@@ -48,36 +44,6 @@ impl ServiceOrchestrator for ExternalConnector {
         let checker = HealthChecker::new();
         let mut services = Vec::new();
 
-        if let Some(ref uri) = self.external.neo4j_uri {
-            let port = Self::parse_port(uri, 7687);
-            let healthy = checker.check_port(port).await;
-            info!(uri, port, healthy, "external Neo4j");
-            if !healthy {
-                anyhow::bail!("Cannot connect to external Neo4j at {uri}");
-            }
-            services.push(ServiceHandle {
-                name: "neo4j".to_string(),
-                container_id: None, // external — no container
-                port,
-                healthy,
-            });
-        }
-
-        if let Some(ref uri) = self.external.qdrant_uri {
-            let port = Self::parse_port(uri, 6333);
-            let healthy = checker.check_port(port).await;
-            info!(uri, port, healthy, "external Qdrant");
-            if !healthy {
-                anyhow::bail!("Cannot connect to external Qdrant at {uri}");
-            }
-            services.push(ServiceHandle {
-                name: "qdrant".to_string(),
-                container_id: None,
-                port,
-                healthy,
-            });
-        }
-
         if let Some(ref uri) = self.external.kafka_uri {
             let port = Self::parse_port(uri, 9092);
             let healthy = checker.check_port(port).await;
@@ -87,7 +53,7 @@ impl ServiceOrchestrator for ExternalConnector {
             }
             services.push(ServiceHandle {
                 name: "kafka".to_string(),
-                container_id: None,
+                container_id: None, // external — no container
                 port,
                 healthy,
             });
@@ -122,26 +88,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_port_from_bolt_uri() {
+    fn parse_port_from_scheme_uri() {
         assert_eq!(
-            ExternalConnector::parse_port("bolt://localhost:7687", 7687),
-            7687
+            ExternalConnector::parse_port("kafka://localhost:9092", 9092),
+            9092
         );
         assert_eq!(
-            ExternalConnector::parse_port("bolt://db.internal:7700", 7687),
-            7700
+            ExternalConnector::parse_port("kafka://broker.internal:9100", 9092),
+            9100
         );
     }
 
     #[test]
     fn parse_port_from_http_uri() {
         assert_eq!(
-            ExternalConnector::parse_port("http://10.0.0.5:6333", 6333),
-            6333
+            ExternalConnector::parse_port("http://10.0.0.5:3002", 3002),
+            3002
         );
         assert_eq!(
-            ExternalConnector::parse_port("http://qdrant:6400/", 6333),
-            6400
+            ExternalConnector::parse_port("http://scraper:3010/", 3002),
+            3010
         );
     }
 
@@ -155,6 +121,6 @@ mod tests {
 
     #[test]
     fn parse_port_falls_back_to_default() {
-        assert_eq!(ExternalConnector::parse_port("just-a-hostname", 7687), 7687);
+        assert_eq!(ExternalConnector::parse_port("just-a-hostname", 9092), 9092);
     }
 }

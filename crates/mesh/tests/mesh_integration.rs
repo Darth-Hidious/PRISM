@@ -259,7 +259,7 @@ async fn sync_handler_ignores_unsubscribed_data_publish() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Should not crash, should not attempt to sync (no Neo4j configured)
+    // Should not crash, should not attempt to sync (no provenance store configured)
     // This test verifies the handler gracefully skips unsubscribed datasets
 
     drop(tx);

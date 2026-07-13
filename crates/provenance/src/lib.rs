@@ -19,6 +19,12 @@ use std::path::Path;
 use turso::Value;
 use uuid::Uuid;
 
+pub mod emmo;
+pub use emmo::{
+    GraphEdge, GraphNode, LocalAssertion, LocalFact, LocalProvenance, RecalledFact,
+    TraversalResult, assertion_id, canonical_key,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceRecord {
     pub id: String,
@@ -169,6 +175,9 @@ impl ProvenanceStore {
             (),
         )
         .await?;
+
+        // EMMO materials ontology + PROV-O assertion tables (same store).
+        emmo::init_schema(conn).await?;
 
         Ok(())
     }

@@ -23,7 +23,7 @@ expression: rendered
                │      display ▸ Switch theme            Pick a color theme  palette │
                │      session ▸ Compact conversation    Compact older con… /compact │
                │      science ▸ Knowledge               Search & ingest — … palette │
-               │  … 20 more — ↓ to scroll or type to filter                         │
+               │  … 21 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│

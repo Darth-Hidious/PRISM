@@ -134,7 +134,7 @@ PLANS: dict[str, Plan] = {
     "query":                Plan(None, False, "CLI passthrough — query_local/platform are typed"),
     "ingest_file_pipeline": Plan(None, False, "writes to graph"),
     "ingest_watch_pipeline":Plan(None, False, "writes to graph"),
-    "node_logs":            Plan({"service": "neo4j", "tail": 5}, True, "may fail if no node up"),
+    "node_logs":            Plan({"service": "kafka", "tail": 5}, True, "may fail if no node up"),
     "job-status":           Plan(None, False, "CLI passthrough"),
     "workflow_show":        Plan({"name": "forge"}, True, "may 404"),
     "query_federated":      Plan(None, False, "needs running node"),

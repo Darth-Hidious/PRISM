@@ -5,8 +5,8 @@
 //! knowledge through an LLM-driven pipeline:
 //!
 //! ```text
-//! Raw Data → Schema Detection → Entity Extraction → Graph Construction → Embeddings
-//!                                    (Ollama)           (Neo4j)           (Qdrant)
+//! Raw Data → Schema Detection → Entity Extraction → Graph + Embeddings
+//!                                     (LLM)         (bundled Turso store)
 //! ```
 //!
 //! The core trait [`OntologyConstructor`] is pluggable — ships with an LLM-based
@@ -14,19 +14,18 @@
 //! Materials Science) engine can slot in behind the same interface.
 
 pub mod connectors;
-pub mod embeddings;
-pub mod graph;
 pub mod graph_validation;
 /// Re-export LLM client from the standalone `prism-llm` crate.
 /// This keeps backward compatibility — existing code using `prism_ingest::llm::*`
 /// and `prism_ingest::LlmConfig` continues to work.
 pub use prism_llm as llm;
 pub use prism_llm::LlmConfig;
+pub mod local_facts;
 pub mod mapping;
-pub mod nl_query;
 pub mod ontology;
 pub mod pipeline;
 pub mod schema;
+pub mod text_extract;
 pub mod validation;
 
 use anyhow::Result;
@@ -96,62 +95,6 @@ pub struct EmbeddingBatch {
     pub dimension: Option<usize>,
 }
 
-/// Configuration for connecting to Neo4j.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Neo4jConfig {
-    /// HTTP transaction API endpoint (e.g. "http://localhost:7474").
-    pub base_url: String,
-    /// Database name (default: "neo4j").
-    #[serde(default = "default_neo4j_db")]
-    pub database: String,
-    /// Basic auth username.
-    pub username: String,
-    /// Basic auth password.
-    pub password: String,
-}
-
-fn default_neo4j_db() -> String {
-    "neo4j".into()
-}
-
-impl Default for Neo4jConfig {
-    fn default() -> Self {
-        Self {
-            base_url: "http://localhost:7474".into(),
-            database: "neo4j".into(),
-            username: "neo4j".into(),
-            password: "neo4j".into(),
-        }
-    }
-}
-
-/// Configuration for connecting to Qdrant.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QdrantConfig {
-    /// Qdrant HTTP API endpoint (e.g. "http://localhost:6333").
-    pub base_url: String,
-    /// Collection name for PRISM embeddings.
-    #[serde(default = "default_qdrant_collection")]
-    pub collection: String,
-    /// Optional API key.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-}
-
-fn default_qdrant_collection() -> String {
-    "prism_embeddings".into()
-}
-
-impl Default for QdrantConfig {
-    fn default() -> Self {
-        Self {
-            base_url: "http://localhost:6333".into(),
-            collection: "prism_embeddings".into(),
-            api_key: None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,53 +159,6 @@ mod tests {
         let cfg: LlmConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.max_sample_rows, 10);
         assert_eq!(cfg.timeout_secs, 300);
-    }
-
-    // --- Neo4jConfig serde ---
-
-    #[test]
-    fn neo4j_config_roundtrip() {
-        let cfg = Neo4jConfig {
-            base_url: "http://neo4j.example.com:7474".into(),
-            database: "materials".into(),
-            username: "admin".into(),
-            password: "secret".into(),
-        };
-        let json = serde_json::to_string(&cfg).unwrap();
-        let parsed: Neo4jConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.base_url, cfg.base_url);
-        assert_eq!(parsed.database, "materials");
-        assert_eq!(parsed.username, "admin");
-    }
-
-    #[test]
-    fn neo4j_config_minimal_json_fills_default_database() {
-        let json = r#"{"base_url":"http://localhost:7474","username":"neo4j","password":"neo4j"}"#;
-        let cfg: Neo4jConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.database, "neo4j");
-    }
-
-    // --- QdrantConfig serde ---
-
-    #[test]
-    fn qdrant_config_roundtrip() {
-        let cfg = QdrantConfig {
-            base_url: "http://qdrant.example.com:6333".into(),
-            collection: "my_embeddings".into(),
-            api_key: Some("tok-abc123".into()),
-        };
-        let json = serde_json::to_string(&cfg).unwrap();
-        let parsed: QdrantConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.collection, "my_embeddings");
-        assert_eq!(parsed.api_key, Some("tok-abc123".into()));
-    }
-
-    #[test]
-    fn qdrant_config_minimal_json_fills_default_collection() {
-        let json = r#"{"base_url":"http://localhost:6333"}"#;
-        let cfg: QdrantConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.collection, "prism_embeddings");
-        assert!(cfg.api_key.is_none());
     }
 
     // --- EntitySet edge cases ---

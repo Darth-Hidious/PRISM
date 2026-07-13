@@ -52,12 +52,6 @@ pub struct ServicesSection {
     /// "managed" (Docker) or "external" (user-provided URIs)
     #[serde(default = "default_managed")]
     pub mode: String,
-    /// External Neo4j URI (bolt://host:port) when mode=external
-    #[serde(default)]
-    pub neo4j_uri: Option<String>,
-    /// External Qdrant URI (http://host:port) when mode=external
-    #[serde(default)]
-    pub qdrant_uri: Option<String>,
     /// External Kafka URI when mode=external
     #[serde(default)]
     pub kafka_uri: Option<String>,
@@ -86,6 +80,11 @@ pub struct OntologySection {
     /// Custom ontology mapping rules YAML file path.
     #[serde(default)]
     pub mapping_file: Option<String>,
+    /// Where text-document ingest runs: "auto" | "local" | "cloud".
+    /// auto → local when the resolved LLM endpoint is loopback (an
+    /// on-device model), else cloud.
+    #[serde(default = "default_locality")]
+    pub locality: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +348,9 @@ fn default_engine() -> String {
 fn default_llm_provider() -> String {
     "platform".into()
 }
+fn default_locality() -> String {
+    "auto".into()
+}
 fn default_session_timeout() -> String {
     "24h".into()
 }
@@ -395,8 +397,6 @@ impl Default for ServicesSection {
     fn default() -> Self {
         Self {
             mode: default_managed(),
-            neo4j_uri: None,
-            qdrant_uri: None,
             kafka_uri: None,
         }
     }
@@ -425,6 +425,7 @@ impl Default for OntologySection {
             engine: default_engine(),
             llm_provider: default_llm_provider(),
             mapping_file: None,
+            locality: default_locality(),
         }
     }
 }
@@ -596,8 +597,7 @@ data_dir = "/data/prism"
 
 [services]
 mode = "external"
-neo4j_uri = "bolt://db.internal:7687"
-qdrant_uri = "http://vectors.internal:6333"
+kafka_uri = "kafka://broker.internal:9092"
 
 [platform]
 url = "https://platform.marc27.com"
@@ -632,8 +632,8 @@ api_key_env = "ANTHROPIC_API_KEY"
         let config: NodeConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.services.mode, "external");
         assert_eq!(
-            config.services.neo4j_uri.as_deref(),
-            Some("bolt://db.internal:7687")
+            config.services.kafka_uri.as_deref(),
+            Some("kafka://broker.internal:9092")
         );
         assert_eq!(
             config.indexer.model.as_deref(),

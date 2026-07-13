@@ -2,13 +2,13 @@
 # End-to-end mesh test: spin up 2 PRISM nodes and verify data sharing.
 #
 # Prerequisites:
-#   - Docker running (for Neo4j, Qdrant, Kafka)
+#   - Docker running (for Kafka)
 #   - prism binary built: cargo build --release
 #   - curl installed
 #
 # What this tests:
-#   1. Node A starts with Kafka and Neo4j
-#   2. Node B starts with Kafka and Neo4j (different ports)
+#   1. Node A starts with Kafka
+#   2. Node B starts with Kafka (different ports)
 #   3. Both nodes discover each other via Kafka
 #   4. Node A publishes a dataset
 #   5. Node B subscribes to it

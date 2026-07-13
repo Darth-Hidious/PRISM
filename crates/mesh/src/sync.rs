@@ -4,8 +4,12 @@
 //! This is the "data plane" of the mesh: when a remote node publishes a
 //! dataset update, the consumer receives a `DataPublish` message. This
 //! module reacts to those messages by fetching the actual graph data from
-//! the publishing node's REST API and upserting it into the local Neo4j.
+//! the publishing node's REST API and writing it as EMMO facts into the
+//! bundled Turso provenance store under the dedicated tenant
+//! [`MESH_TENANT`], so peer-synced data never blends with locally
+//! ingested data.
 
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -17,13 +21,17 @@ use crate::PeerNode;
 use crate::protocol::MeshMessage;
 use crate::subscription::SubscriptionManager;
 
+/// Tenant under which peer-synced facts land in the bundled Turso store.
+/// Kept distinct from the local-ingest tenant ("local") so synced data is
+/// attributable and separable.
+pub const MESH_TENANT: &str = "mesh";
+
 /// Configuration for the sync handler.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
-    /// Local Neo4j HTTP endpoint for writing synced data.
-    pub neo4j_url: String,
-    pub neo4j_user: String,
-    pub neo4j_pass: String,
+    /// Path to the bundled Turso provenance store where peer-synced facts
+    /// are written (tenant [`MESH_TENANT`]).
+    pub provenance_db: PathBuf,
 }
 
 /// Processes incoming mesh messages and performs data synchronisation.
@@ -292,7 +300,8 @@ pub async fn run_sync_handler(
     info!("mesh sync handler stopped");
 }
 
-/// Fetch graph data from a peer's query API and write to local Neo4j.
+/// Fetch graph data from a peer's query API and write it as EMMO facts
+/// into the bundled Turso store (tenant [`MESH_TENANT`]).
 async fn sync_dataset_from_peer(
     client: &reqwest::Client,
     peer_url: &str,
@@ -300,8 +309,8 @@ async fn sync_dataset_from_peer(
     sync_config: &Option<SyncConfig>,
 ) -> Result<()> {
     // Reject malformed dataset names up front — defense-in-depth before
-    // we hand the value to a Cypher parameter binder that *should* be
-    // safe but isn't worth trusting blindly. Marketplace and platform
+    // we hand the value to the parameterized Turso writer, which *should*
+    // be safe but isn't worth trusting blindly. Marketplace and platform
     // dataset names are simple identifiers in practice; if a peer
     // publishes something exotic, refuse to sync rather than send it
     // through the query pipeline.
@@ -317,16 +326,17 @@ async fn sync_dataset_from_peer(
         );
     }
 
-    // Query the peer's graph for all entities in the dataset.
-    // Use a parameterized Cypher query — earlier code interpolated
-    // `dataset_name` straight into the query string, which let a
-    // malicious peer (or a peer with a buggy publish call) inject
-    // Cypher via the dataset name they publish. See Bug #45.
+    // Query the peer's graph for entities related to the dataset. The
+    // "cypher" mode this used to send was removed with the Neo4j
+    // retirement; "graph" mode is a name/substring lookup over the peer's
+    // knowledge graph and returns the same {type, name, properties} rows.
+    // The dataset name travels as plain JSON data, never spliced into a
+    // query language string (Bug #45 stays fixed by construction).
     let query_url = format!("{peer_url}/api/query");
     let body = serde_json::json!({
-        "query": "MATCH (n) WHERE n.dataset = $dataset RETURN n LIMIT 1000",
-        "params": { "dataset": dataset_name },
-        "mode": "cypher",
+        "query": dataset_name,
+        "mode": "graph",
+        "limit": 1000,
     });
 
     let resp = client.post(&query_url).json(&body).send().await?;
@@ -370,67 +380,67 @@ async fn sync_dataset_from_peer(
         return Ok(());
     }
 
-    // Write to local Neo4j if configured
+    // Write into the bundled Turso store if configured. Every value —
+    // entity names, the dataset name, properties — is bound through
+    // `write_fact`'s parameterized SQL, never spliced into a statement
+    // string, so a malicious peer cannot inject via the data it serves
+    // (the same property the old parameterized Cypher write preserved;
+    // see Bug #45).
     if let Some(cfg) = sync_config {
-        let neo4j_url = format!("{}/db/neo4j/tx/commit", cfg.neo4j_url);
         let Some(results) = data["results"].as_array() else {
             return Ok(());
         };
 
-        // Batch-create nodes from peer data using UNWIND.
-        //
-        // Both `$rows` AND `$source` are passed as parameters — the
-        // earlier version interpolated `dataset_name` into the
-        // statement string, which would have let a malicious peer
-        // execute arbitrary Cypher against our LOCAL Neo4j (e.g. a
-        // dataset named `x' DETACH DELETE n RETURN '` would wipe the
-        // local graph). See Bug #45.
-        let cypher = "UNWIND $rows AS row \
-             MERGE (n:SyncedEntity {name: row.name, source_dataset: $source}) \
-             SET n += row.properties";
+        let store = prism_provenance::ProvenanceStore::open(&cfg.provenance_db).await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let prov = prism_provenance::LocalProvenance {
+            activity_id: Uuid::new_v4().to_string(),
+            agent_id: "prism-mesh-sync".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: format!("{peer_url}#{dataset_name}"),
+            source_kind: "Dataset".into(),
+            tenant: MESH_TENANT.into(),
+            started_at: now.clone(),
+            ended_at: now,
+            locality: "mesh".into(),
+        };
+        store.record_activity(&prov).await?;
 
-        let rows: Vec<serde_json::Value> = results
-            .iter()
-            .filter_map(|r| {
-                Some(serde_json::json!({
-                    "name": r.get("name")?.as_str()?,
-                    "properties": r,
-                }))
-            })
-            .collect();
-
-        let neo4j_body = serde_json::json!({
-            "statements": [{
-                "statement": cypher,
-                "parameters": { "rows": rows, "source": dataset_name },
-            }]
-        });
-
-        let neo4j_resp = client
-            .post(&neo4j_url)
-            .basic_auth(&cfg.neo4j_user, Some(&cfg.neo4j_pass))
-            .json(&neo4j_body)
-            .send()
-            .await?;
-
-        if neo4j_resp.status().is_success() {
-            info!(
-                dataset = %dataset_name,
-                synced = rows.len(),
-                "dataset synced to local Neo4j"
-            );
-        } else {
-            warn!(
-                dataset = %dataset_name,
-                status = %neo4j_resp.status(),
-                "Neo4j sync write returned error"
-            );
+        // Same `LocalFact` shape as ingest's `to_local_facts`: each peer
+        // entity becomes a generic edge (kind None) linking the entity to
+        // its source dataset, so the node exists in the local graph and
+        // stays attributable to where it was synced from — the Turso
+        // counterpart of the old `SyncedEntity {name, source_dataset}`
+        // node.
+        let mut synced = 0usize;
+        for row in results {
+            let Some(name) = row.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let fact = prism_provenance::LocalFact {
+                subject: name.to_string(),
+                predicate: "SYNCED_FROM".into(),
+                object: dataset_name.to_string(),
+                value: None,
+                unit: None,
+                confidence: None,
+                kind: None,
+            };
+            store.write_fact(&fact, &prov).await?;
+            synced += 1;
         }
+
+        info!(
+            dataset = %dataset_name,
+            synced,
+            tenant = MESH_TENANT,
+            "dataset synced to local Turso store"
+        );
     } else {
         info!(
             dataset = %dataset_name,
             results = result_count,
-            "dataset fetched from peer (no local Neo4j configured)"
+            "dataset fetched from peer (no local provenance store configured)"
         );
     }
 

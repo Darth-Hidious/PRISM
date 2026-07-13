@@ -28,6 +28,7 @@ uuid = { workspace = true }
 
 prism-client = { path = "../client" }
 prism-proto = { path = "../proto" }
+prism-provenance = { path = "../provenance" }
 
 [dev-dependencies]
 prism-audit = { path = "../audit" }
