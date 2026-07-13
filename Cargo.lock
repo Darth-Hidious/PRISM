@@ -4570,6 +4570,7 @@ name = "prism-campaign"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "prism-llm",
  "prism-provenance",
@@ -4578,6 +4579,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

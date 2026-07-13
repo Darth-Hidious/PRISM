@@ -35,10 +35,7 @@
 //!     budget_usd: Some(50.0),
 //!     checkpoint_every: 10,
 //!     approval_gate_at: vec![50],
-//!     checkpoint_dir: None,
-//!     llm_model: String::new(),
-//!     llm_temperature: 0.7,
-//!     reward_weights: std::collections::BTreeMap::new(),
+//!     ..Default::default()
 //! };
 //! let mut campaign = Campaign::new(goal, config, "campaign-001".into());
 //! let result = campaign.run().await;
@@ -112,6 +109,14 @@ pub struct CampaignConfig {
     /// Negative = minimize, positive = maximize.
     #[serde(default)]
     pub reward_weights: BTreeMap<String, f64>,
+    /// Base URL override for the proposal LLM. None = `$LLM_BASE_URL` /
+    /// `$LLM_API_BASE`, then `http://127.0.0.1:8081/v1`.
+    #[serde(default)]
+    pub llm_base_url: Option<String>,
+    /// Base URL override for the PRISM node that runs the evaluation tool.
+    /// None = `http://127.0.0.1:$PRISM_NODE_PORT` (default port 7327).
+    #[serde(default)]
+    pub node_base_url: Option<String>,
 }
 
 fn default_checkpoint_every() -> usize {
@@ -134,11 +139,48 @@ impl Default for CampaignConfig {
             llm_model: String::new(),
             llm_temperature: 0.7,
             reward_weights: BTreeMap::new(),
+            llm_base_url: None,
+            node_base_url: None,
         }
     }
 }
 
 // ── Campaign State ──────────────────────────────────────────────────
+
+/// Lifecycle status of a goal (campaign). Every change of status goes
+/// through [`Campaign::transition`], which persists one provenance record
+/// per transition AND rewrites the checkpoint — the store holds the audit
+/// trail, the checkpoint holds the resumable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    /// Created and checkpointed, loop not started yet.
+    #[default]
+    Submitted,
+    /// The propose → evaluate → rank loop is executing.
+    Running,
+    /// Stopped at an approval gate; resumable via `resume`.
+    Paused,
+    /// Terminal success — the loop finished AND at least one candidate was
+    /// really evaluated. A goal can never be `Completed` otherwise.
+    Completed,
+    /// Terminal failure — a step could not run (LLM/evaluator unreachable)
+    /// or the loop ended without a single evaluated candidate. Retryable
+    /// with `campaign continue` once the cause is fixed.
+    Failed,
+}
+
+impl GoalStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
 
 /// A single evaluated candidate material.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,10 +214,22 @@ pub struct CampaignState {
     /// Cumulative compute cost in USD.
     pub total_cost_usd: f64,
     /// Whether the campaign is paused at an approval gate.
+    /// Kept in sync with `status` for older checkpoint readers.
     pub paused: bool,
-    /// Whether the campaign has completed (success, budget, or iteration cap).
+    /// Whether the campaign completed successfully (iteration or budget cap
+    /// with real evaluations). Kept in sync with `status`.
     pub completed: bool,
-    /// Why the campaign completed (if it did).
+    /// Lifecycle status. Checkpoints written before this field existed
+    /// deserialize as `Submitted` and are fixed up from the legacy flags
+    /// in [`Campaign::from_checkpoint`].
+    #[serde(default)]
+    pub status: GoalStatus,
+    /// Approval gates that already fired (iteration numbers). A gate pauses
+    /// the loop exactly once — without this, `resume` would re-pause at the
+    /// same gate forever.
+    #[serde(default)]
+    pub gates_hit: Vec<usize>,
+    /// Why the campaign reached a terminal status (reason or error).
     #[serde(default)]
     pub completion_reason: String,
     /// ISO-8601 timestamp of when the campaign started.
@@ -196,6 +250,8 @@ impl CampaignState {
             total_cost_usd: 0.0,
             paused: false,
             completed: false,
+            status: GoalStatus::Submitted,
+            gates_hit: Vec::new(),
             completion_reason: String::new(),
             started_at: Utc::now().to_rfc3339(),
             last_checkpoint_at: String::new(),
@@ -225,6 +281,51 @@ impl CampaignState {
         }
         let sum: f64 = self.candidates.iter().map(|c| c.reward).sum();
         sum / self.candidates.len() as f64
+    }
+
+    /// Build a human-readable summary of the campaign results.
+    pub fn summary(&self, winners: &[Candidate]) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("Campaign: {}\n", self.campaign_id));
+        s.push_str(&format!("Goal: {}\n", self.goal.description));
+        let status_line = match self.status {
+            GoalStatus::Completed => format!("completed ({})", self.completion_reason),
+            // completion_reason is already "failed: <error>" here.
+            GoalStatus::Failed => self.completion_reason.clone(),
+            GoalStatus::Paused => "paused (approval gate)".to_string(),
+            GoalStatus::Running => "running".to_string(),
+            GoalStatus::Submitted => "submitted".to_string(),
+        };
+        s.push_str(&format!("Status: {status_line}\n"));
+        s.push_str(&format!(
+            "Iterations: {} / {}\n",
+            self.current_iteration, self.config.max_iterations
+        ));
+        s.push_str(&format!(
+            "Candidates evaluated: {}\n",
+            self.total_evaluated()
+        ));
+        s.push_str(&format!("Avg reward: {:.4}\n", self.avg_reward()));
+        if let Some(best) = self.best() {
+            s.push_str(&format!(
+                "Best: {} (reward={:.4})\n",
+                best.composition, best.reward
+            ));
+        }
+        if !winners.is_empty() {
+            s.push_str("\nTop candidates:\n");
+            for (i, c) in winners.iter().enumerate() {
+                s.push_str(&format!(
+                    "  {}. {} — reward={:.4} (iter {}, {})\n",
+                    i + 1,
+                    c.composition,
+                    c.reward,
+                    c.iteration,
+                    c.source
+                ));
+            }
+        }
+        s
     }
 }
 
@@ -273,8 +374,19 @@ impl Campaign {
     pub fn from_checkpoint(path: &std::path::Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read campaign checkpoint: {}", path.display()))?;
-        let state: CampaignState = serde_json::from_str(&text)
+        let mut state: CampaignState = serde_json::from_str(&text)
             .context("failed to parse campaign checkpoint (version mismatch?)")?;
+        // Back-compat: checkpoints written before `status` existed carry
+        // only the legacy flags — derive the status from them.
+        if state.status == GoalStatus::Submitted {
+            if state.completed {
+                state.status = GoalStatus::Completed;
+            } else if state.paused {
+                state.status = GoalStatus::Paused;
+            } else if state.current_iteration > 0 {
+                state.status = GoalStatus::Running;
+            }
+        }
         let checkpoint_path = path.to_path_buf();
         Ok(Self {
             state,
@@ -305,6 +417,16 @@ impl Campaign {
     /// 5. Checkpoint
     /// 6. Record provenance
     pub async fn run(&mut self) -> Result<CampaignResult> {
+        // Completed is final; Failed stays re-runnable (retry after the
+        // cause — evaluator down, LLM unreachable — is fixed).
+        if self.state.status == GoalStatus::Completed {
+            bail!(
+                "campaign '{}' already completed ({}) — nothing to run",
+                self.state.campaign_id,
+                self.state.completion_reason
+            );
+        }
+
         info!(
             campaign = %self.state.campaign_id,
             goal = %self.state.goal.description,
@@ -312,84 +434,42 @@ impl Campaign {
             "campaign started"
         );
 
-        self.record_event(
-            "campaign.start",
-            serde_json::json!({
-                "goal": self.state.goal,
-                "config": self.state.config,
-            }),
-        )
-        .await;
-
-        while !self.state.completed && !self.state.paused {
-            // Check iteration cap
-            if self.state.current_iteration >= self.state.config.max_iterations {
-                self.state.completed = true;
-                self.state.completion_reason = "iteration_limit".into();
-                info!(campaign = %self.state.campaign_id, "campaign hit iteration limit");
-                break;
-            }
-
-            // Check budget
-            if let Some(budget) = self.state.config.budget_usd
-                && self.state.total_cost_usd >= budget
-            {
-                self.state.completed = true;
-                self.state.completion_reason = "budget_exhausted".into();
-                info!(
-                    campaign = %self.state.campaign_id,
-                    spent = self.state.total_cost_usd,
-                    budget,
-                    "campaign hit budget limit"
-                );
-                break;
-            }
-
-            // Check approval gate
-            let iter = self.state.current_iteration;
-            if self.state.config.approval_gate_at.contains(&iter) && iter > 0 {
-                self.state.paused = true;
-                info!(
-                    campaign = %self.state.campaign_id,
-                    iteration = iter,
-                    "campaign paused at approval gate"
-                );
-                self.checkpoint()?;
-                break;
-            }
-
-            // Run one iteration
-            self.run_iteration().await?;
-
-            // Checkpoint
-            if self.state.config.checkpoint_every > 0
-                && iter > 0
-                && iter.is_multiple_of(self.state.config.checkpoint_every)
-            {
-                self.checkpoint()?;
-            }
-        }
-
-        if self.state.completed {
+        if self.state.status == GoalStatus::Submitted {
+            // First run of this goal: record the durable submission before
+            // any step executes.
             self.record_event(
-                "campaign.complete",
+                "campaign.submitted",
                 serde_json::json!({
-                    "reason": self.state.completion_reason,
-                    "iterations": self.state.current_iteration,
-                    "candidates": self.state.total_evaluated(),
-                    "best_reward": self.state.best().map(|c| c.reward).unwrap_or(0.0),
+                    "goal": self.state.goal,
+                    "config": self.state.config,
                 }),
             )
             .await;
         }
+        self.transition(GoalStatus::Running, |_| serde_json::json!({}))
+            .await?;
 
-        // Final checkpoint
-        self.checkpoint()?;
+        if let Err(e) = self.drive().await {
+            // A goal must never look alive (or worse, completed) when its
+            // steps didn't run: persist the failure as a real terminal
+            // transition, then propagate the error to the caller.
+            self.state.completion_reason = format!("failed: {e:#}");
+            if let Err(persist) = self
+                .transition(
+                    GoalStatus::Failed,
+                    |_| serde_json::json!({ "error": format!("{e:#}") }),
+                )
+                .await
+            {
+                warn!(error = %persist, "failed to persist Failed transition");
+            }
+            return Err(e);
+        }
 
-        // Build result
+        // Build result (state is now Completed or Paused).
         let winners: Vec<Candidate> = self.state.top_n(10).to_vec();
 
-        let summary = self.build_summary(&winners);
+        let summary = self.state.summary(&winners);
 
         let provenance = if let Some(ref prov) = self.provenance {
             prov.query_by_session(&self.state.campaign_id)
@@ -409,12 +489,115 @@ impl Campaign {
         })
     }
 
+    /// The core loop. Extracted from `run` so any error becomes a persisted
+    /// `Failed` transition there — a dying worker must never leave a goal
+    /// with a stale non-terminal status.
+    async fn drive(&mut self) -> Result<()> {
+        loop {
+            // Check iteration cap
+            if self.state.current_iteration >= self.state.config.max_iterations {
+                info!(campaign = %self.state.campaign_id, "campaign hit iteration limit");
+                return self.finish("iteration_limit").await;
+            }
+
+            // Check budget
+            if let Some(budget) = self.state.config.budget_usd
+                && self.state.total_cost_usd >= budget
+            {
+                info!(
+                    campaign = %self.state.campaign_id,
+                    spent = self.state.total_cost_usd,
+                    budget,
+                    "campaign hit budget limit"
+                );
+                return self.finish("budget_exhausted").await;
+            }
+
+            // Check approval gate — each gate fires exactly once.
+            let iter = self.state.current_iteration;
+            if self.state.config.approval_gate_at.contains(&iter)
+                && iter > 0
+                && !self.state.gates_hit.contains(&iter)
+            {
+                self.state.gates_hit.push(iter);
+                info!(
+                    campaign = %self.state.campaign_id,
+                    iteration = iter,
+                    "campaign paused at approval gate"
+                );
+                self.transition(GoalStatus::Paused, |_| serde_json::json!({ "gate": iter }))
+                    .await?;
+                return Ok(());
+            }
+
+            // Run one iteration
+            self.run_iteration().await?;
+
+            // Cadence checkpoint between transitions.
+            if self.state.config.checkpoint_every > 0
+                && iter > 0
+                && iter.is_multiple_of(self.state.config.checkpoint_every)
+            {
+                self.checkpoint()?;
+            }
+        }
+    }
+
+    /// Terminal transition for a loop that ended on its own (iteration or
+    /// budget cap). Honesty gate: a goal that never evaluated a single
+    /// candidate did NOT do its work — that is a failure, not a completion,
+    /// no matter which cap tripped.
+    async fn finish(&mut self, reason: &str) -> Result<()> {
+        if self.state.total_evaluated() == 0 {
+            bail!("{reason} reached with zero candidates evaluated — steps never ran");
+        }
+        self.state.completion_reason = reason.to_string();
+        self.transition(GoalStatus::Completed, |state| {
+            let winners: Vec<Candidate> = state.top_n(10).to_vec();
+            serde_json::json!({
+                "reason": state.completion_reason,
+                "iterations": state.current_iteration,
+                "candidates": state.total_evaluated(),
+                "best_reward": state.best().map(|c| c.reward).unwrap_or(0.0),
+                "summary": state.summary(&winners),
+                "winners": winners,
+            })
+        })
+        .await
+    }
+
+    /// Move the goal to `status`, write the transition to the provenance
+    /// store (if attached), and rewrite the checkpoint. The legacy
+    /// `paused`/`completed` flags stay in sync for older readers. `build`
+    /// produces the event payload AFTER the status is applied, so payloads
+    /// (e.g. the terminal summary) see the final state.
+    async fn transition(
+        &mut self,
+        status: GoalStatus,
+        build: impl FnOnce(&CampaignState) -> serde_json::Value,
+    ) -> Result<()> {
+        let from = self.state.status;
+        self.state.status = status;
+        self.state.paused = status == GoalStatus::Paused;
+        self.state.completed = status == GoalStatus::Completed;
+        let mut data = build(&self.state);
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("from".into(), serde_json::json!(from.as_str()));
+            obj.insert(
+                "iteration".into(),
+                serde_json::json!(self.state.current_iteration),
+            );
+        }
+        self.record_event(&format!("campaign.status.{}", status.as_str()), data)
+            .await;
+        self.checkpoint()
+    }
+
     /// Resume a paused campaign (after human approval at a gate).
     pub async fn resume(&mut self) -> Result<CampaignResult> {
-        if !self.state.paused {
+        if self.state.status != GoalStatus::Paused {
             bail!("campaign is not paused — nothing to resume");
         }
-        self.state.paused = false;
         info!(
             campaign = %self.state.campaign_id,
             iteration = self.state.current_iteration,
@@ -437,6 +620,7 @@ impl Campaign {
 
         // ── 2. Evaluate each candidate ───────────────────────────────
         let mut evaluated: Vec<Candidate> = Vec::new();
+        let mut last_err: Option<anyhow::Error> = None;
         for comp in &proposals {
             match self.evaluate_candidate(comp, iter).await {
                 Ok(candidate) => evaluated.push(candidate),
@@ -447,9 +631,24 @@ impl Campaign {
                         error = %e,
                         "evaluation failed for candidate"
                     );
+                    last_err = Some(e);
                 }
             }
         }
+
+        // An iteration where every single evaluation failed is not
+        // progress — it is the evaluator being down. Fail the goal instead
+        // of spinning to the iteration cap and "completing" with nothing.
+        if evaluated.is_empty() && !proposals.is_empty() {
+            let detail = last_err
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| "unknown error".into());
+            bail!(
+                "iteration {iter}: all {} candidate evaluations failed — {detail}",
+                proposals.len()
+            );
+        }
+        let n_evaluated = evaluated.len();
 
         // ── 3. Rank by reward (descending) ───────────────────────────
         evaluated.sort_by(|a, b| {
@@ -470,6 +669,21 @@ impl Campaign {
         }
 
         self.state.current_iteration = iter + 1;
+
+        // Persist the per-iteration progress transition — the durable trail
+        // must show every step, not only the terminal status.
+        self.record_event(
+            "campaign.iteration",
+            serde_json::json!({
+                "iteration": iter,
+                "proposed": proposals.len(),
+                "evaluated": n_evaluated,
+                "total_evaluated": self.state.total_evaluated(),
+                "best_reward": self.state.best().map(|c| c.reward),
+                "best": self.state.best().map(|c| c.composition.clone()),
+            }),
+        )
+        .await;
 
         if let Some(best) = self.state.best() {
             info!(
@@ -504,9 +718,11 @@ impl Campaign {
         let prompt = self.build_proposal_prompt(batch);
 
         // Use the LLM to propose candidates.
-        let base_url = std::env::var("LLM_BASE_URL")
-            .or_else(|_| std::env::var("LLM_API_BASE"))
-            .unwrap_or_else(|_| "http://127.0.0.1:8081/v1".to_string());
+        let base_url = self.state.config.llm_base_url.clone().unwrap_or_else(|| {
+            std::env::var("LLM_BASE_URL")
+                .or_else(|_| std::env::var("LLM_API_BASE"))
+                .unwrap_or_else(|_| "http://127.0.0.1:8081/v1".to_string())
+        });
         let api_key = std::env::var("LLM_API_KEY")
             .or_else(|_| std::env::var("MARC27_TOKEN"))
             .ok();
@@ -679,9 +895,15 @@ impl Campaign {
     /// via the local PRISM node API and computes a scalarized reward from
     /// the returned physics descriptors.
     async fn evaluate_candidate(&self, composition: &str, iteration: usize) -> Result<Candidate> {
-        // Call the local PRISM node's evaluate_material tool.
-        let port = std::env::var("PRISM_NODE_PORT").unwrap_or_else(|_| "7327".to_string());
-        let url = format!("http://127.0.0.1:{port}/api/tools/evaluate_material/run");
+        // Call the PRISM node's evaluate_material tool.
+        let base = self.state.config.node_base_url.clone().unwrap_or_else(|| {
+            let port = std::env::var("PRISM_NODE_PORT").unwrap_or_else(|_| "7327".to_string());
+            format!("http://127.0.0.1:{port}")
+        });
+        let url = format!(
+            "{}/api/tools/evaluate_material/run",
+            base.trim_end_matches('/')
+        );
         let body = serde_json::json!({
             "inputs": { "composition": composition },
         });
@@ -797,53 +1019,6 @@ impl Campaign {
                 warn!(error = %e, "failed to record campaign provenance");
             }
         }
-    }
-
-    /// Build a human-readable summary of the campaign results.
-    fn build_summary(&self, winners: &[Candidate]) -> String {
-        let mut s = String::new();
-        s.push_str(&format!("Campaign: {}\n", self.state.campaign_id));
-        s.push_str(&format!("Goal: {}\n", self.state.goal.description));
-        s.push_str(&format!(
-            "Status: {}",
-            if self.state.completed {
-                &self.state.completion_reason
-            } else if self.state.paused {
-                "paused (approval gate)"
-            } else {
-                "running"
-            }
-        ));
-        s.push('\n');
-        s.push_str(&format!(
-            "Iterations: {} / {}\n",
-            self.state.current_iteration, self.state.config.max_iterations
-        ));
-        s.push_str(&format!(
-            "Candidates evaluated: {}\n",
-            self.state.total_evaluated()
-        ));
-        s.push_str(&format!("Avg reward: {:.4}\n", self.state.avg_reward()));
-        if let Some(best) = self.state.best() {
-            s.push_str(&format!(
-                "Best: {} (reward={:.4})\n",
-                best.composition, best.reward
-            ));
-        }
-        if !winners.is_empty() {
-            s.push_str("\nTop candidates:\n");
-            for (i, c) in winners.iter().enumerate() {
-                s.push_str(&format!(
-                    "  {}. {} — reward={:.4} (iter {}, {})\n",
-                    i + 1,
-                    c.composition,
-                    c.reward,
-                    c.iteration,
-                    c.source
-                ));
-            }
-        }
-        s
     }
 }
 
@@ -1047,6 +1222,7 @@ mod tests {
     fn build_summary_contains_key_info() {
         let mut state = CampaignState::new("c1".into(), test_goal(), CampaignConfig::default());
         state.completed = true;
+        state.status = GoalStatus::Completed;
         state.completion_reason = "iteration_limit".into();
         state.current_iteration = 50;
         state.candidates.push(Candidate {
@@ -1056,15 +1232,10 @@ mod tests {
             iteration: 45,
             source: "llm".into(),
         });
-        let campaign = Campaign {
-            state,
-            provenance: None,
-            checkpoint_path: std::env::temp_dir().join("prism_campaign_test/c1.json"),
-        };
-        let winners = campaign.state.top_n(10).to_vec();
-        let summary = campaign.build_summary(&winners);
+        let winners = state.top_n(10).to_vec();
+        let summary = state.summary(&winners);
         assert!(summary.contains("c1"));
-        assert!(summary.contains("iteration_limit"));
+        assert!(summary.contains("completed (iteration_limit)"));
         assert!(summary.contains("Ti0.8 Al0.2"));
         assert!(summary.contains("50"));
     }

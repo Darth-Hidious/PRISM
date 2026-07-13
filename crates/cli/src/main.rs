@@ -1365,7 +1365,7 @@ async fn main() -> Result<()> {
             handle_workflow_command(command, &project_root, &paths).await?;
         }
         Commands::Campaign { command } => {
-            use prism_campaign::{Campaign, CampaignConfig, CampaignGoal};
+            use prism_campaign::{Campaign, CampaignConfig, CampaignGoal, GoalStatus};
 
             match command {
                 CampaignCommands::Start {
@@ -1437,12 +1437,17 @@ async fn main() -> Result<()> {
                         // a background worker owns the loop. The caller —
                         // agent tool, HTTP endpoint, or a human — polls
                         // `campaign status` instead of blocking for hours.
+                        // The worker (`campaign continue`) attaches the
+                        // provenance store and records the full trail.
                         campaign.checkpoint()?;
                         spawn_campaign_worker(&campaign_id)?;
                         println!("Detached: {campaign_id}");
                         println!("Checkpoint: ~/.prism/campaigns/{campaign_id}.json");
                         println!("Poll: prism campaign status {campaign_id}");
                     } else {
+                        if let Some(store) = open_campaign_provenance().await {
+                            campaign = campaign.with_provenance(store);
+                        }
                         let result = campaign.run().await?;
                         println!("\n{}", result.summary);
                         println!("\nCheckpoint: ~/.prism/campaigns/{campaign_id}.json");
@@ -1458,7 +1463,7 @@ async fn main() -> Result<()> {
                     if detach {
                         // Validate resumability BEFORE detaching so the
                         // caller gets the honest error, not a dead worker.
-                        if campaign.state().completed {
+                        if campaign.state().status == GoalStatus::Completed {
                             anyhow::bail!(
                                 "campaign '{id}' is completed ({}) — nothing to resume",
                                 campaign.state().completion_reason
@@ -1468,6 +1473,9 @@ async fn main() -> Result<()> {
                         println!("Detached: {id}");
                         println!("Poll: prism campaign status {id}");
                     } else {
+                        if let Some(store) = open_campaign_provenance().await {
+                            campaign = campaign.with_provenance(store);
+                        }
                         println!("Resuming campaign: {id}");
                         let result = campaign.resume().await?;
                         println!("\n{}", result.summary);
@@ -1480,16 +1488,22 @@ async fn main() -> Result<()> {
                         .join("campaigns")
                         .join(format!("{id}.json"));
                     let mut campaign = Campaign::from_checkpoint(&path)?;
-                    if campaign.state().completed {
+                    if campaign.state().status == GoalStatus::Completed {
                         println!(
                             "Campaign '{id}' already completed: {}",
                             campaign.state().completion_reason
                         );
-                    } else if campaign.state().paused {
-                        let result = campaign.resume().await?;
-                        println!("\n{}", result.summary);
                     } else {
-                        let result = campaign.run().await?;
+                        if let Some(store) = open_campaign_provenance().await {
+                            campaign = campaign.with_provenance(store);
+                        }
+                        let result = if campaign.state().status == GoalStatus::Paused {
+                            campaign.resume().await?
+                        } else {
+                            // Submitted, Running (stale after a crash), or
+                            // Failed (retry) — all re-enter the loop.
+                            campaign.run().await?
+                        };
                         println!("\n{}", result.summary);
                     }
                 }
@@ -1503,16 +1517,10 @@ async fn main() -> Result<()> {
                     let state = campaign.state();
                     println!("Campaign: {}", state.campaign_id);
                     println!("Goal: {}", state.goal.description);
-                    println!(
-                        "Status: {}",
-                        if state.completed {
-                            &state.completion_reason
-                        } else if state.paused {
-                            "paused (approval gate)"
-                        } else {
-                            "incomplete"
-                        }
-                    );
+                    println!("Status: {}", state.status.as_str());
+                    if !state.completion_reason.is_empty() {
+                        println!("Reason: {}", state.completion_reason);
+                    }
                     println!(
                         "Iterations: {} / {}",
                         state.current_iteration, state.config.max_iterations
@@ -1540,12 +1548,10 @@ async fn main() -> Result<()> {
                         match Campaign::from_checkpoint(&path) {
                             Ok(c) => {
                                 let s = c.state();
-                                let status = if s.completed {
-                                    &s.completion_reason
-                                } else if s.paused {
-                                    "paused"
+                                let status = if s.completion_reason.is_empty() {
+                                    s.status.as_str().to_string()
                                 } else {
-                                    "incomplete"
+                                    format!("{} ({})", s.status.as_str(), s.completion_reason)
                                 };
                                 println!(
                                     "  {} — {} — iter {}/{} — {} candidates — {}",
@@ -7115,11 +7121,35 @@ async fn create_dashboard_session_for_user(
     Ok(session.session_id)
 }
 
+/// Open the shared provenance store (`~/.prism/provenance.db`) so a campaign
+/// loop persists every progress transition to Turso. Failure degrades to
+/// checkpoint-only persistence with a loud warning — a locked or corrupt
+/// store must not brick a discovery run.
+async fn open_campaign_provenance() -> Option<prism_provenance::ProvenanceStore> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let db_path = PathBuf::from(home).join(".prism").join("provenance.db");
+    if let Some(parent) = db_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match prism_provenance::ProvenanceStore::open(&db_path).await {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                db = %db_path.display(),
+                "campaign provenance store unavailable — transitions will only land in the checkpoint"
+            );
+            None
+        }
+    }
+}
+
 /// Spawn the detached background worker that owns a campaign loop:
 /// `prism campaign continue <id>` with stdio detached, in its own process
 /// group so it survives the parent CLI (or an agent tool call) exiting. The
-/// checkpoint file is the only communication channel — the worker updates
-/// it, everyone else polls it.
+/// checkpoint file is the polling channel — the worker updates it, everyone
+/// else polls it — and the worker also records every progress transition to
+/// the provenance store.
 fn spawn_campaign_worker(campaign_id: &str) -> Result<()> {
     let exe = std::env::current_exe().context("failed to locate current prism executable")?;
     let mut cmd = std::process::Command::new(exe);
