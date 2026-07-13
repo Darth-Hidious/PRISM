@@ -32,6 +32,7 @@ prism-audit = { path = "../audit" }
 prism-client = { path = "../client" }
 prism-compute = { path = "../compute" }
 prism-core = { path = "../core" }
+prism-embed = { path = "../embed" }
 prism-ingest = { path = "../ingest" }
 prism-mesh = { path = "../mesh" }
 prism-node = { path = "../node" }

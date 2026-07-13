@@ -265,6 +265,27 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     )
     .await?;
 
+    // Entity vectors for local semantic search: one little-endian f32 blob
+    // per emmo_entity key (same encoding as `provenance_embeddings`),
+    // written lazily by `embed_and_store_entities` — never on the
+    // `write_fact` path. Turso-side counterpart of the Qdrant collection so
+    // a local ingest is semantically searchable without any services.
+    conn.execute(
+        r#"CREATE TABLE IF NOT EXISTS emmo_embedding (
+            key TEXT PRIMARY KEY,
+            tenant TEXT,
+            dim INTEGER,
+            vector BLOB
+        )"#,
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_emmo_embedding_tenant ON emmo_embedding(tenant)",
+        (),
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -837,6 +858,188 @@ impl ProvenanceStore {
         }
         Ok(facts)
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Entity vectors — local semantic search without Qdrant
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// UPSERT one vector for a label-qualified entity key (little-endian
+    /// f32 blob, same encoding as `provenance_embeddings`).
+    pub async fn store_entity_embedding(
+        &self,
+        key: &str,
+        tenant: &str,
+        vector: &[f32],
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                r#"INSERT OR REPLACE INTO emmo_embedding
+                   (key, tenant, dim, vector) VALUES (?1, ?2, ?3, ?4)"#,
+                [
+                    Value::Text(key.to_string()),
+                    Value::Text(tenant.to_string()),
+                    Value::Integer(vector.len() as i64),
+                    Value::Blob(prism_embed::vec_to_le_bytes(vector)),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Embed the distinct subject/object names of `facts` with `backend`
+    /// and store one vector per matching `emmo_entity` row. Names are
+    /// resolved to their label-qualified keys via the entity table itself
+    /// (no duplicate of `write_fact`'s kind→label routing), so names that
+    /// never landed there (e.g. value-less measurements dropped by
+    /// `write_fact`) are skipped. Returns the number of vectors stored.
+    ///
+    /// Like `embed_and_store`, deliberately NOT part of `write_fact`:
+    /// graph writes must never wait on (or fail because of) an embedding
+    /// model. Callers run this after the fact writes succeed.
+    pub async fn embed_and_store_entities(
+        &self,
+        facts: &[LocalFact],
+        tenant: &str,
+        backend: &dyn prism_embed::EmbedBackend,
+    ) -> Result<usize> {
+        // Distinct display names, first-seen order.
+        let mut seen = std::collections::HashSet::new();
+        let mut names: Vec<String> = Vec::new();
+        for fact in facts {
+            for name in [&fact.subject, &fact.object] {
+                if seen.insert(canonical_key(name)) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        if names.is_empty() {
+            return Ok(0);
+        }
+        let vectors = backend.embed(&names).await?;
+
+        let mut stored = 0usize;
+        for (name, vector) in names.iter().zip(&vectors) {
+            // The read cursor is fully drained BEFORE the writes below
+            // (turso pre-release mishandles interleaved open statements —
+            // see `record_assertion`).
+            let keys = {
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT key FROM emmo_entity WHERE tenant = ?1 AND name = ?2",
+                        [Value::Text(tenant.to_string()), Value::Text(name.clone())],
+                    )
+                    .await?;
+                let mut keys = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    keys.push(get_str(&row, 0)?);
+                }
+                keys
+            };
+            for key in keys {
+                self.store_entity_embedding(&key, tenant, vector).await?;
+                stored += 1;
+            }
+        }
+        Ok(stored)
+    }
+
+    /// Best-effort entity embedding for freshly written facts: builds the
+    /// configured `prism-embed` backend (on the blocking pool — the first
+    /// ever native init downloads the model) and stores one vector per
+    /// entity. Failures are logged and swallowed — an ingest must never
+    /// fail because of the embedding model.
+    pub async fn embed_entities_best_effort(&self, facts: &[LocalFact], tenant: &str) {
+        if facts.is_empty() {
+            return;
+        }
+        let backend = match tokio::task::spawn_blocking(prism_embed::from_config).await {
+            Ok(Some(backend)) => backend,
+            Ok(None) => {
+                tracing::debug!("embedding backend unavailable — entity vectors skipped");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("embedding backend init failed: {e} — entity vectors skipped");
+                return;
+            }
+        };
+        match self
+            .embed_and_store_entities(facts, tenant, backend.as_ref())
+            .await
+        {
+            Ok(stored) => tracing::debug!(stored, tenant, "entity vectors stored in Turso"),
+            Err(e) => tracing::warn!("entity embedding failed: {e:#} — graph write unaffected"),
+        }
+    }
+
+    /// Number of stored entity vectors for `tenant` — cheap existence
+    /// check so query paths can skip embedding-model init (and fall back
+    /// to other stores) when there is nothing to search.
+    pub async fn entity_embedding_count(&self, tenant: &str) -> Result<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM emmo_embedding WHERE tenant = ?1",
+                [Value::Text(tenant.to_string())],
+            )
+            .await?;
+        Ok(match rows.next().await? {
+            Some(row) => row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0),
+            None => 0,
+        })
+    }
+
+    /// Brute-force cosine search over stored entity vectors (fine at
+    /// local-ingest scale — same pattern as `semantic_search` over
+    /// `provenance_embeddings`). Returns up to `limit` distinct
+    /// `(display name, score)` pairs, best first, scores in `[-1, 1]`.
+    /// Vectors whose dimensionality differs from the query (mixed models)
+    /// are skipped; the same name under two labels is reported once.
+    pub async fn semantic_search_entities(
+        &self,
+        query_vec: &[f32],
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT n.name, e.vector FROM emmo_embedding e \
+                 JOIN emmo_entity n ON n.key = e.key \
+                 WHERE e.tenant = ?1",
+                [Value::Text(tenant.to_string())],
+            )
+            .await?;
+        let mut scored: Vec<(String, f32)> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let name = get_str(&row, 0)?;
+            let vector = match row.get_value(1)? {
+                Value::Blob(bytes) => prism_embed::le_bytes_to_vec(&bytes),
+                _ => continue,
+            };
+            if vector.len() != query_vec.len() {
+                continue; // different embedding model — not comparable
+            }
+            scored.push((name, prism_embed::cosine_similarity(query_vec, &vector)));
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (name, score) in scored {
+            if seen.insert(name.clone()) {
+                out.push((name, score));
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Read a `GraphNode` from four consecutive columns starting at `offset`
@@ -1146,5 +1349,160 @@ mod tests {
         assert_eq!(a, b, "spelling variants must corroborate one assertion");
         assert_ne!(a, c, "direction matters");
         assert_eq!(a.len(), 64);
+    }
+
+    // ── Entity vectors ───────────────────────────────────────────────────
+
+    /// Deterministic 3-dim stand-in for the real ONNX backend.
+    struct MockEmbed;
+
+    fn mock_vec(text: &str) -> Vec<f32> {
+        match text {
+            "Ti-6Al-4V" => vec![1.0, 0.0, 0.0],
+            "alpha" => vec![0.0, 1.0, 0.0],
+            "Inconel 718" => vec![0.0, 0.0, 1.0],
+            _ => vec![0.6, 0.6, 0.6],
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl prism_embed::EmbedBackend for MockEmbed {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|t| mock_vec(t)).collect())
+        }
+        fn dimensions(&self) -> usize {
+            3
+        }
+        fn id(&self) -> &str {
+            "test:mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_search_entities_empty_store_is_empty() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_eq!(store.entity_embedding_count("t1").await.unwrap(), 0);
+        let hits = store
+            .semantic_search_entities(&[1.0, 0.0, 0.0], "t1", 5)
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn entity_vectors_store_and_search_ranked() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        let facts = vec![
+            fact("phase", "Ti-6Al-4V", "has_phase", "alpha"),
+            fact("processing", "Inconel 718", "processed_by", "LPBF"),
+        ];
+        for f in &facts {
+            store.write_fact(f, &prov).await.unwrap();
+        }
+
+        // 4 distinct names, each resolving to exactly one entity key.
+        let stored = store
+            .embed_and_store_entities(&facts, "t1", &MockEmbed)
+            .await
+            .unwrap();
+        assert_eq!(stored, 4);
+        assert_eq!(store.entity_embedding_count("t1").await.unwrap(), 4);
+
+        // Query near the Ti-6Al-4V axis → ranked best-first.
+        let hits = store
+            .semantic_search_entities(&[1.0, 0.2, 0.0], "t1", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].0, "Ti-6Al-4V");
+        assert!(hits[0].1 > 0.9);
+        assert!(
+            hits.windows(2).all(|w| w[0].1 >= w[1].1),
+            "scores must be descending: {hits:?}"
+        );
+
+        // Limit is respected.
+        let hits = store
+            .semantic_search_entities(&[1.0, 0.2, 0.0], "t1", 1)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Tenant scoping: nothing leaks into another tenant.
+        assert!(store
+            .semantic_search_entities(&[1.0, 0.2, 0.0], "other", 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_name_under_two_labels_searches_once() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        // "alpha" exists as both Phase (object) and Matter (subject).
+        let facts = vec![
+            fact("phase", "Ti-6Al-4V", "has_phase", "alpha"),
+            fact("phase", "alpha", "has_phase", "beta"),
+        ];
+        for f in &facts {
+            store.write_fact(f, &prov).await.unwrap();
+        }
+
+        // One vector per entity ROW (both labels of "alpha" get one) …
+        let stored = store
+            .embed_and_store_entities(&facts, "t1", &MockEmbed)
+            .await
+            .unwrap();
+        assert_eq!(stored, 4, "Matter:ti-6al-4v, Phase:alpha, Matter:alpha, Phase:beta");
+
+        // … but search reports the display name once.
+        let hits = store
+            .semantic_search_entities(&[0.0, 1.0, 0.0], "t1", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits[0].0, "alpha");
+        assert_eq!(
+            hits.iter().filter(|(name, _)| name == "alpha").count(),
+            1,
+            "same name under two labels must be deduped: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_search_entities_skips_mismatched_dims() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+        store
+            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "alpha"), &prov)
+            .await
+            .unwrap();
+
+        store
+            .store_entity_embedding(&entity_key("Matter", "Ti-6Al-4V"), "t1", &[1.0, 0.0, 0.0])
+            .await
+            .unwrap();
+
+        // 4-dim query cannot compare against the 3-dim vector.
+        let hits = store
+            .semantic_search_entities(&[1.0, 0.0, 0.0, 0.0], "t1", 10)
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+
+        // Matching dimensionality finds it.
+        let hits = store
+            .semantic_search_entities(&[1.0, 0.0, 0.0], "t1", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "Ti-6Al-4V");
     }
 }

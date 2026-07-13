@@ -331,6 +331,10 @@ impl IngestPipeline {
         for fact in &facts {
             store.write_fact(fact, &prov).await?;
         }
+        // Best-effort: vectorize the freshly written entity names into the
+        // same Turso store so `prism query --semantic` works without Qdrant.
+        // Failures are logged inside and never fail the ingest.
+        store.embed_entities_best_effort(&facts, &prov.tenant).await;
         Ok(GraphUpdate {
             nodes_created: entity_set.entities.len(),
             edges_created: facts.len(),
@@ -476,6 +480,11 @@ mod tests {
     #[tokio::test]
     async fn write_local_graph_lands_facts_in_turso_store() {
         use crate::{Entity, Relationship};
+
+        // Keep the best-effort entity-embedding step inert: a unit test
+        // must never init (or first-run download) the native ONNX model.
+        // Process-global, but no other prism-ingest test reads this env.
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
 
         let db_path = std::env::temp_dir()
             .join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));

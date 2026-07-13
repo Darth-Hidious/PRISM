@@ -2892,24 +2892,18 @@ async fn main() -> Result<()> {
             } else if federated {
                 handle_federated_query(&text, &dashboard_url, &paths).await?;
             } else {
-                // LLM config only needed for --semantic (embedding generation).
-                // --cypher and NL neighbor queries hit Neo4j directly.
-                let llm_cfg = if semantic {
-                    Some(build_llm_config(
-                        &project_root,
-                        llm_url.as_deref(),
-                        model.as_deref(),
-                        api_key.as_deref(),
-                    )?)
-                } else {
-                    build_llm_config(
-                        &project_root,
-                        llm_url.as_deref(),
-                        model.as_deref(),
-                        api_key.as_deref(),
-                    )
-                    .ok()
-                };
+                // LLM config only needed for the --semantic Qdrant fallback
+                // (query embedding). Best-effort here: the Turso-first
+                // semantic path embeds via prism-embed and needs no LLM, and
+                // handle_query raises its own actionable error when the
+                // Qdrant fallback is reached without one.
+                let llm_cfg = build_llm_config(
+                    &project_root,
+                    llm_url.as_deref(),
+                    model.as_deref(),
+                    api_key.as_deref(),
+                )
+                .ok();
                 handle_query(
                     &text,
                     cypher,
@@ -5062,6 +5056,10 @@ async fn run_local_text_ingest_file(
     for fact in &facts {
         store.write_fact(fact, &prov).await?;
     }
+    // Best-effort: vectorize the freshly written entity names into the same
+    // Turso store so `prism query --semantic` works without Qdrant.
+    // Failures are logged inside and never fail the ingest.
+    store.embed_entities_best_effort(&facts, &prov.tenant).await;
 
     Ok(serde_json::json!({
         "backend": "local_text",
@@ -7486,6 +7484,63 @@ async fn local_ontology_lookup(
     })
 }
 
+/// Semantic entity search over the bundled Turso store using the offline
+/// `prism-embed` backend (no Qdrant, no cloud) — the vectors that local
+/// ingest writes via `embed_entities_best_effort`.
+///
+/// Never errors: an unopenable store, an empty store, an unavailable
+/// embedding backend, or zero hits all degrade to `None` so the caller
+/// falls back to the existing Qdrant path. The store is checked BEFORE the
+/// backend is built, so a fresh install never pays the embedding-model
+/// init just to fall through.
+async fn local_semantic_lookup(
+    db_path: &Path,
+    text: &str,
+    limit: usize,
+) -> Option<Vec<(String, f32)>> {
+    let store = match prism_provenance::ProvenanceStore::open(db_path).await {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::debug!("local semantic store open failed: {e:#}");
+            return None;
+        }
+    };
+    match store.entity_embedding_count(LOCAL_ONTOLOGY_TENANT).await {
+        Ok(0) => return None,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!("local semantic embedding count failed: {e:#}");
+            return None;
+        }
+    }
+
+    // First ever native init may download the model — blocking pool.
+    let backend = tokio::task::spawn_blocking(prism_embed::from_config)
+        .await
+        .ok()
+        .flatten()?;
+    let query_vec = match backend.embed(std::slice::from_ref(&text.to_string())).await {
+        Ok(mut vecs) if !vecs.is_empty() => vecs.remove(0),
+        Ok(_) => return None,
+        Err(e) => {
+            tracing::debug!("local semantic query embedding failed: {e:#}");
+            return None;
+        }
+    };
+
+    match store
+        .semantic_search_entities(&query_vec, LOCAL_ONTOLOGY_TENANT, limit)
+        .await
+    {
+        Ok(hits) if !hits.is_empty() => Some(hits),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::debug!("local semantic search failed: {e:#}");
+            None
+        }
+    }
+}
+
 /// Render local-ontology matches in the same shape the Neo4j path prints:
 /// one `[type] name` line per entity, plus relationship and fact lines.
 fn format_local_ontology(results: &LocalOntologyResults) -> String {
@@ -7561,6 +7616,20 @@ async fn handle_query(
             println!("\n  {} row(s)", results.len());
         }
     } else if semantic {
+        // Local-first: try the bundled Turso entity vectors written by local
+        // ingest (offline prism-embed query embedding — no services needed).
+        // Hits are printed in the same shape as the Qdrant results below;
+        // an empty/unavailable store falls through to the Qdrant path.
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let turso_db = PathBuf::from(home).join(".prism/provenance.db");
+        if let Some(results) = local_semantic_lookup(&turso_db, text, limit).await {
+            println!("\nSemantic search results ({} matches):\n", results.len());
+            for (i, (id, score)) in results.iter().enumerate() {
+                println!("  {}. {id}  (score: {score:.4})", i + 1);
+            }
+            return Ok(());
+        }
+
         // Semantic vector search
         let qdrant_config = QdrantConfig {
             base_url: qdrant_url.into(),
