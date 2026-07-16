@@ -134,6 +134,12 @@ pub struct AgentConfig {
     /// model has pinned via discovery. Default false = today's full top-K.
     #[serde(default)]
     pub core_tools_only: bool,
+    /// Nesting depth of THIS agent in a `spawn_subagent` chain: 0 = the
+    /// top-level agent, 1 = a subagent it spawned, and so on. Threaded through
+    /// the nested config so the recursion cap can be enforced (see
+    /// `subagent::MAX_SUBAGENT_DEPTH`).
+    #[serde(default)]
+    pub subagent_depth: usize,
 }
 
 impl Default for AgentConfig {
@@ -144,6 +150,7 @@ impl Default for AgentConfig {
             auto_approve: false,
             model: "claude-sonnet-4-6".to_string(),
             core_tools_only: false,
+            subagent_depth: 0,
         }
     }
 }

@@ -27,6 +27,7 @@ const META_TOOLS: &[&str] = &[
     "write_skill",
     "run_skill",
     "list_skills",
+    "spawn_subagent",
 ];
 
 /// How many matches `recall(query)` returns by default.
@@ -195,6 +196,7 @@ pub fn definitions() -> Vec<LoadedTool> {
             source: Some("builtin".to_string()),
             source_detail: Some("self-authoring".to_string()),
         },
+        crate::subagent::definition(),
     ]
 }
 
@@ -213,6 +215,14 @@ pub async fn execute_meta_tool(
         "write_skill" => write_skill(args).await,
         "run_skill" => run_skill(args).await,
         "list_skills" => Ok(list_skills()),
+        // Needs the live turn machinery (LLM client, tool server, approval
+        // channel), which this signature cannot carry — the agent loop
+        // intercepts it BEFORE this dispatcher (see agent_loop.rs). Reaching
+        // this arm means a caller (e.g. the single-tool executor) tried to
+        // run it out of context.
+        "spawn_subagent" => anyhow::bail!(
+            "spawn_subagent runs a nested agent turn and is dispatched inside the agent loop only"
+        ),
         other => anyhow::bail!("unknown meta-tool '{other}'"),
     }
 }
@@ -571,6 +581,7 @@ mod tests {
     fn is_meta_tool_recognizes_native_tools() {
         assert!(is_meta_tool("recall"));
         assert!(is_meta_tool("find_tools"));
+        assert!(is_meta_tool("spawn_subagent"));
         assert!(!is_meta_tool("file"));
         assert!(!is_meta_tool("peek_result"));
     }
@@ -620,8 +631,9 @@ mod tests {
             assert_eq!(t.permission_mode, PermissionMode::ReadOnly, "{name}");
             assert!(!t.requires_approval, "{name} must not need approval");
         }
-        // Code-executing self-authoring tools are workspace-write + gated.
-        for name in ["write_skill", "run_skill"] {
+        // Code-executing self-authoring tools — and delegation, which spends
+        // tokens and drives tools — are workspace-write + gated.
+        for name in ["write_skill", "run_skill", "spawn_subagent"] {
             let t = by(name);
             assert_eq!(t.permission_mode, PermissionMode::WorkspaceWrite, "{name}");
             assert!(

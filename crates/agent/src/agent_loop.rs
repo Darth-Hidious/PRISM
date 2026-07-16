@@ -260,6 +260,12 @@ fn tool_preview(tool_name: &str, args: &Value) -> Option<String> {
             .get("query")
             .and_then(|value| value.as_str())
             .map(|query| format!("find tools for \"{query}\"")),
+        "spawn_subagent" => args
+            .get("task")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|task| format!("subagent: {}", task.lines().next().unwrap_or(task))),
         "read_file" => args
             .get("path")
             .and_then(|value| value.as_str())
@@ -1205,7 +1211,36 @@ pub async fn run_turn(
 
             // ── h5. Execute tool ──────────────────────────────────
             let start = Instant::now();
-            let result: Result<Value> = if crate::meta_tools::is_meta_tool(tool_name) {
+            let result: Result<Value> = if tool_name == crate::subagent::SPAWN_SUBAGENT_TOOL {
+                // spawn_subagent is a meta-tool by name, but unlike
+                // recall/find_tools it needs the LIVE turn machinery (LLM
+                // client, tool server, approval channel, policy engine) that
+                // execute_meta_tool cannot carry — so it is intercepted here,
+                // before the generic meta-tool dispatch. It runs one nested
+                // run_turn under the parent's permission/approval gating.
+                let sub_result = crate::subagent::execute_spawn_subagent(
+                    llm,
+                    tool_server,
+                    command_tool_runtime,
+                    tool_catalog,
+                    config,
+                    &args,
+                    hooks,
+                    permissions,
+                    live_permission_overrides.clone(),
+                    emit,
+                    approval_rx.clone(),
+                    policy.as_deref_mut(),
+                )
+                .await;
+                // The subagent's spend counts against the PARENT's cumulative
+                // budget too — delegation must not be a budget escape hatch.
+                if let Ok(value) = &sub_result {
+                    let (sub_in, sub_out) = crate::subagent::usage_from_result(value);
+                    transcript.record_cost("subagent", sub_in, sub_out);
+                }
+                sub_result.map(|value| serde_json::json!({ "result": value }))
+            } else if crate::meta_tools::is_meta_tool(tool_name) {
                 // Native meta-tools (recall / find_tools) operate on the agent's
                 // own state — durable memory + the tool catalog — so intercept
                 // them before command-tool / Python dispatch. Open the same

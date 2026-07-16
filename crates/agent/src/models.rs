@@ -57,6 +57,28 @@ fn registry() -> &'static HashMap<&'static str, ModelConfig> {
 
         // --- Anthropic ---
         reg!(
+            "claude-fable-5",
+            "anthropic",
+            1_000_000,
+            128_000,
+            32_768,
+            10.00,
+            50.00,
+            cache = true,
+            think = true
+        );
+        reg!(
+            "claude-opus-4-8",
+            "anthropic",
+            1_000_000,
+            128_000,
+            32_768,
+            5.00,
+            25.00,
+            cache = true,
+            think = true
+        );
+        reg!(
             "claude-opus-4-6",
             "anthropic",
             200_000,
@@ -64,6 +86,17 @@ fn registry() -> &'static HashMap<&'static str, ModelConfig> {
             32_768,
             5.00,
             25.00,
+            cache = true,
+            think = true
+        );
+        reg!(
+            "claude-sonnet-5",
+            "anthropic",
+            1_000_000,
+            128_000,
+            16_384,
+            3.00,
+            15.00,
             cache = true,
             think = true
         );
@@ -99,6 +132,16 @@ fn registry() -> &'static HashMap<&'static str, ModelConfig> {
             15.00,
             cache = true,
             think = true
+        );
+        reg!(
+            "claude-haiku-4-5",
+            "anthropic",
+            200_000,
+            64_000,
+            8_192,
+            1.00,
+            5.00,
+            cache = true
         );
         reg!(
             "claude-haiku-4-5-20251001",
@@ -301,6 +344,41 @@ mod tests {
     fn openrouter_prefix_strip() {
         let cfg = get_model_config("anthropic/claude-sonnet-4-6");
         assert_eq!(cfg.id, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn fable_is_first_class_not_unknown_fallback() {
+        // The subagent default model must have REAL budget/context accounting
+        // (it previously fell through to UNKNOWN_MODEL_CONFIG: 128K ctx, $0).
+        let cfg = get_model_config("claude-fable-5");
+        assert_eq!(cfg.id, "claude-fable-5");
+        assert_eq!(cfg.provider, "anthropic");
+        assert_eq!(cfg.context_window, 1_000_000);
+        assert_eq!(cfg.max_output_tokens, 128_000);
+        assert!((cfg.input_price_per_mtok - 10.0).abs() < f64::EPSILON);
+        assert!((cfg.output_price_per_mtok - 50.0).abs() < f64::EPSILON);
+        assert!(cfg.supports_caching);
+        assert!(cfg.supports_thinking);
+        assert!(cfg.supports_tools);
+        // The TUI picker's platform-prefixed spelling resolves to the same entry.
+        assert_eq!(
+            get_model_config("anthropic/claude-fable-5").id,
+            "claude-fable-5"
+        );
+    }
+
+    #[test]
+    fn curated_picker_ids_resolve_exactly() {
+        for (id, ctx) in [
+            ("claude-opus-4-8", 1_000_000),
+            ("claude-sonnet-5", 1_000_000),
+            ("claude-haiku-4-5", 200_000),
+        ] {
+            let cfg = get_model_config(id);
+            assert_eq!(cfg.id, id, "exact registry entry expected for {id}");
+            assert_eq!(cfg.context_window, ctx, "{id}");
+            assert_eq!(cfg.provider, "anthropic", "{id}");
+        }
     }
 
     #[test]

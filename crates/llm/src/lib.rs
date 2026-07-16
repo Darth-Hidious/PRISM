@@ -209,6 +209,14 @@ impl LlmClient {
         Self { client, config }
     }
 
+    /// The configuration this client was built with. Lets callers derive a
+    /// sibling client (same endpoint/credentials, different model) — e.g. the
+    /// agent's `spawn_subagent`, which runs a nested turn on another model.
+    #[must_use]
+    pub fn config(&self) -> &LlmConfig {
+        &self.config
+    }
+
     /// Generate text from a prompt.
     pub async fn generate(&self, prompt: &str) -> Result<String> {
         self.chat("You are a helpful assistant.", prompt).await
