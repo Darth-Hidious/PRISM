@@ -40,8 +40,37 @@ import ast
 import base64
 import io
 import json
+import os
 import sys
 import traceback
+
+# Caps applied to every response BEFORE json.dumps, so one verbose cell can
+# never emit a multi-GB line that OOMs the Rust backend reading it. The Rust
+# side has its own hard line cap as a second line of defense.
+MAX_TEXT = 1_000_000  # ~1 MB per stdout/stderr/result stream
+MAX_IMAGES = 10  # keep at most this many figures per cell
+MAX_IMAGE_BYTES_TOTAL = 8_000_000  # ~8 MB of base64 image data per cell
+
+
+def _cap_text(value):
+    """Truncate an over-long captured string, noting how much was dropped."""
+    if value is None or len(value) <= MAX_TEXT:
+        return value
+    dropped = len(value) - MAX_TEXT
+    return value[:MAX_TEXT] + f"\n...[truncated {dropped} characters]"
+
+
+def _cap_images(images):
+    """Bound both the count and the total base64 size of returned images."""
+    capped = []
+    total = 0
+    for image in images[:MAX_IMAGES]:
+        size = len(image.get("b64", ""))
+        if total + size > MAX_IMAGE_BYTES_TOTAL:
+            break
+        total += size
+        capped.append(image)
+    return capped
 
 
 def _emit(obj):
@@ -71,6 +100,7 @@ class JupyterKernel:
         result_repr = None
         error = None
         execution_count = None
+        kernel_dead = False
         deadline_timeout = timeout if timeout and timeout > 0 else None
 
         # Drain iopub until the kernel returns to idle for OUR request.
@@ -78,8 +108,11 @@ class JupyterKernel:
             try:
                 msg = client.get_iopub_msg(timeout=deadline_timeout)
             except Exception:
-                # Soft timeout (or a dead channel): interrupt and report
-                # honestly rather than hanging the whole sidecar.
+                # Soft timeout (or a dead channel): interrupt, then confirm the
+                # kernel actually came back to idle before we let it be reused.
+                # A GIL-bound loop ignores SIGINT — if it never idles, the
+                # kernel is wedged, so mark it dead and let Rust restart it (so
+                # "variables intact" is never a lie).
                 try:
                     self.manager.interrupt_kernel()
                 except Exception:
@@ -89,6 +122,7 @@ class JupyterKernel:
                     "evalue": f"cell exceeded {timeout}s and was interrupted",
                     "traceback": [f"TimeoutError: cell exceeded {timeout}s"],
                 }
+                kernel_dead = not self._drain_to_idle(msg_id, grace=5)
                 break
 
             parent = msg.get("parent_header", {}).get("msg_id")
@@ -135,7 +169,28 @@ class JupyterKernel:
             "images": images,
             "error": error,
             "execution_count": execution_count,
+            "kernel_dead": kernel_dead,
         }
+
+    def _drain_to_idle(self, msg_id, grace):
+        """After an interrupt, wait up to ``grace`` seconds for OUR request to
+        reach idle. Returns True if the kernel recovered, False if wedged."""
+        import time
+
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                msg = self.client.get_iopub_msg(timeout=deadline - time.monotonic())
+            except Exception:
+                return False
+            if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                continue
+            if (
+                msg["header"]["msg_type"] == "status"
+                and msg["content"].get("execution_state") == "idle"
+            ):
+                return True
+        return False
 
     def shutdown(self):
         try:
@@ -163,6 +218,13 @@ class BuiltinKernel:
     """
 
     def __init__(self):
+        # Force a non-interactive matplotlib backend BEFORE any user code can
+        # import pyplot. Without this, macOS defaults to the `macosx` GUI
+        # backend, where `plt.show()` BLOCKS the sidecar until the Rust
+        # hard-timeout kills+restarts it — wiping the shared session. (Only the
+        # stdlib fallback does this; the Jupyter backend keeps its inline
+        # backend so plots are still captured as images.)
+        os.environ.setdefault("MPLBACKEND", "Agg")
         self.globals = {"__name__": "__main__", "__builtins__": __builtins__}
         self.count = 0
 
@@ -200,6 +262,7 @@ class BuiltinKernel:
             "images": self._harvest_matplotlib(),
             "error": error,
             "execution_count": self.count,
+            "kernel_dead": False,
         }
 
     @staticmethod
@@ -258,6 +321,14 @@ class BuiltinKernel:
 
 def _make_kernel():
     """Prefer the real Jupyter kernel; fall back to the stdlib kernel."""
+    # Test/diagnostic hook: force the stdlib fallback even where Jupyter is
+    # importable, so the fallback path can be exercised deterministically.
+    if os.environ.get("PRISM_NOTEBOOK_FORCE_BUILTIN") == "1":
+        return (
+            BuiltinKernel(),
+            "builtin",
+            "stdlib kernel (forced via PRISM_NOTEBOOK_FORCE_BUILTIN)",
+        )
     try:
         import ipykernel  # noqa: F401
         import jupyter_client  # noqa: F401
@@ -339,12 +410,13 @@ def main():
                 "event": "result",
                 "id": req_id,
                 "status": "error" if out["error"] else "ok",
-                "stdout": out["stdout"],
-                "stderr": out["stderr"],
-                "result": out["result"],
-                "images": out["images"],
+                "stdout": _cap_text(out["stdout"]),
+                "stderr": _cap_text(out["stderr"]),
+                "result": _cap_text(out["result"]),
+                "images": _cap_images(out["images"]),
                 "error": out["error"],
                 "execution_count": out["execution_count"],
+                "kernel_dead": out.get("kernel_dead", False),
             }
         )
 

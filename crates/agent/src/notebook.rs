@@ -54,6 +54,12 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
 /// How long to wait for the sidecar's `hello` line before declaring it dead.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on ONE response line from the sidecar. The sidecar already
+/// truncates its own captured output, so this is defense-in-depth against a
+/// pathological unbounded line (e.g. a cell writing raw bytes to fd 1) that
+/// would otherwise let `read_line` buffer until the backend runs out of
+/// memory and takes the whole TUI down with it.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// One executed cell — the shared record both the agent tool and the TUI
 /// pane read. Serialized straight onto the `ui.notebook.*` wire and into the
@@ -94,6 +100,12 @@ struct NotebookState {
     workdir: PathBuf,
     cells: Vec<Cell>,
     exec_count: u64,
+    /// A cell is executing right now. The kernel is checked out of `kernel`
+    /// (moved to None) across the await, so a second overlapping caller would
+    /// otherwise see None and spawn a rival kernel; this flag makes it error
+    /// "kernel busy" instead. Unreachable via today's serialized transports —
+    /// cheap latent-race defense.
+    busy: bool,
 }
 
 static STATE: Mutex<Option<NotebookState>> = Mutex::new(None);
@@ -135,6 +147,7 @@ pub fn configure(python_bin: PathBuf, workdir: PathBuf) {
                 workdir,
                 cells: Vec::new(),
                 exec_count: 0,
+                busy: false,
             });
         }
     }
@@ -152,6 +165,7 @@ fn ensure_state(guard: &mut Option<NotebookState>) -> Result<&mut NotebookState>
             workdir,
             cells: Vec::new(),
             exec_count: 0,
+            busy: false,
         });
     }
     Ok(guard.as_mut().expect("state initialized above"))
@@ -194,6 +208,11 @@ impl Kernel {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // Own process group: the sidecar becomes a group leader (pgid == its
+        // pid), so a hard-timeout kill can reap the WHOLE group — any
+        // subprocess a cell spawned dies with it instead of surviving.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -215,25 +234,28 @@ impl Kernel {
         let stdout = child.stdout.take().context("kernel stdout was piped")?;
         let mut stdout = BufReader::new(stdout);
 
-        // Read the hello line (bounded) — proves the interpreter actually ran.
-        let mut hello_line = String::new();
-        let read = timeout(HELLO_TIMEOUT, stdout.read_line(&mut hello_line)).await;
-        let hello: Value = match read {
-            Ok(Ok(n)) if n > 0 => serde_json::from_str(hello_line.trim())
-                .context("notebook kernel sent a malformed hello line")?,
-            Ok(Ok(_)) => {
-                bail!(
-                    "notebook kernel exited before starting — is `{}` a working \
+        // Read the hello line (size- and time-bounded) — proves the
+        // interpreter actually ran.
+        let hello: Value =
+            match timeout(HELLO_TIMEOUT, read_capped_line(&mut stdout, MAX_LINE_BYTES)).await {
+                Ok(Ok(LineRead::Line(line))) => serde_json::from_str(line.trim())
+                    .context("notebook kernel sent a malformed hello line")?,
+                Ok(Ok(LineRead::Eof)) => {
+                    bail!(
+                        "notebook kernel exited before starting — is `{}` a working \
                      Python 3 interpreter?",
-                    python_bin.display()
-                );
-            }
-            Ok(Err(e)) => bail!("failed to read from notebook kernel: {e}"),
-            Err(_) => bail!(
-                "notebook kernel did not start within {}s",
-                HELLO_TIMEOUT.as_secs()
-            ),
-        };
+                        python_bin.display()
+                    );
+                }
+                Ok(Ok(LineRead::TooLarge)) => {
+                    bail!("notebook kernel emitted an oversized hello line")
+                }
+                Ok(Err(e)) => bail!("failed to read from notebook kernel: {e}"),
+                Err(_) => bail!(
+                    "notebook kernel did not start within {}s",
+                    HELLO_TIMEOUT.as_secs()
+                ),
+            };
 
         Ok(Self {
             child,
@@ -258,7 +280,13 @@ impl Kernel {
         })
     }
 
-    /// Send one `execute` request and read its single `result` line.
+    /// Send one `execute` request and read back the matching `result` line.
+    ///
+    /// The response is correlated by `id`: a stray line on the sidecar's stdout
+    /// (a C-extension print, `os.write(1, …)`, an inheriting subprocess) is
+    /// SKIPPED rather than mis-attributed as this cell's output. Malformed
+    /// lines are skipped too. A bounded skip budget guards against an endless
+    /// desync (→ the caller kills+restarts).
     async fn request(&mut self, code: &str, timeout_secs: u64) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
@@ -272,22 +300,106 @@ impl Kernel {
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.flush().await?;
 
-        let mut response = String::new();
-        let n = self.stdout.read_line(&mut response).await?;
-        if n == 0 {
-            bail!("notebook kernel closed its output stream");
+        for _ in 0..64 {
+            match read_capped_line(&mut self.stdout, MAX_LINE_BYTES).await? {
+                LineRead::Line(text) => {
+                    let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+                        continue; // stray non-JSON line — skip and keep looking.
+                    };
+                    if value.get("id").and_then(Value::as_u64) == Some(id) {
+                        return Ok(value);
+                    }
+                    // A line for a different id (or an event) — skip.
+                }
+                LineRead::Eof => bail!("notebook kernel closed its output stream"),
+                LineRead::TooLarge => bail!(
+                    "notebook cell emitted more than {} MiB on a single output line",
+                    MAX_LINE_BYTES / (1024 * 1024)
+                ),
+            }
         }
-        serde_json::from_str(response.trim()).context("kernel sent malformed result JSON")
+        bail!("notebook kernel desynchronized — no response for cell {id}")
     }
 
     async fn shutdown(&mut self) {
         let _ = self.stdin.write_all(b"{\"op\":\"shutdown\"}\n").await;
         let _ = self.stdin.flush().await;
-        // Give it a moment to tear the IPython kernel down cleanly, then reap.
-        let _ = timeout(Duration::from_secs(5), self.child.wait()).await;
-        let _ = self.child.start_kill();
+        // Give it a moment to tear the IPython kernel down cleanly, then reap
+        // the whole process group so no cell-spawned child is orphaned.
+        if timeout(Duration::from_secs(5), self.child.wait())
+            .await
+            .is_err()
+        {
+            if let Some(pid) = self.child.id() {
+                kill_process_group(pid);
+            }
+            let _ = self.child.start_kill();
+        }
     }
 }
+
+/// The outcome of one bounded line read.
+enum LineRead {
+    Line(String),
+    /// Clean end of stream.
+    Eof,
+    /// A single line exceeded the byte cap; the stream was drained to the next
+    /// newline so the reader stays in sync, but the content is discarded.
+    TooLarge,
+}
+
+/// Read one `\n`-terminated line from `reader`, never buffering more than
+/// `cap` bytes. On overflow it keeps consuming (discarding) until the newline
+/// so the protocol stays framed, then reports [`LineRead::TooLarge`]. This is
+/// what stops a giant cell output from OOM-ing the backend.
+async fn read_capped_line(reader: &mut BufReader<ChildStdout>, cap: usize) -> Result<LineRead> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if overflowed {
+                LineRead::TooLarge
+            } else if out.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line(String::from_utf8_lossy(&out).into_owned())
+            });
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if !overflowed {
+                out.extend_from_slice(&available[..pos]);
+            }
+            reader.consume(pos + 1);
+            return Ok(if overflowed {
+                LineRead::TooLarge
+            } else {
+                LineRead::Line(String::from_utf8_lossy(&out).into_owned())
+            });
+        }
+        let len = available.len();
+        if !overflowed {
+            out.extend_from_slice(available);
+            if out.len() > cap {
+                overflowed = true;
+                out = Vec::new(); // release the buffer; keep draining to resync.
+            }
+        }
+        reader.consume(len);
+    }
+}
+
+/// SIGKILL an entire process group by its leader pid (we spawn the sidecar as
+/// a group leader, so `pgid == pid`). No-op on non-unix.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    // SAFETY: killpg is a simple libc call; an invalid pgid just returns ESRCH.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 /// Persist any base64 images a cell produced to PNG files under the state dir,
 /// returning their paths. Keeps huge blobs out of the agent's context: the
@@ -353,10 +465,15 @@ pub async fn execute(code: &str, timeout_secs: Option<u64>, origin: &str) -> Res
 
     // Take the kernel out of the shared state for the duration of the call so
     // the lock isn't held across await points. One cell at a time — a running
-    // cell occupies the loop, same as the other slash handlers.
+    // cell occupies the loop, same as the other slash handlers. `busy` rejects
+    // an overlapping caller instead of letting it spawn a rival kernel.
     let (mut kernel, python_bin, workdir, exec_count) = {
         let mut guard = lock();
         let state = ensure_state(&mut guard)?;
+        if state.busy {
+            bail!("notebook kernel is busy running another cell — try again once it finishes");
+        }
+        state.busy = true;
         state.exec_count += 1;
         (
             state.kernel.take(),
@@ -365,6 +482,9 @@ pub async fn execute(code: &str, timeout_secs: Option<u64>, origin: &str) -> Res
             state.exec_count,
         )
     };
+    // Clear `busy` on every exit path (including `?`/panic), so one failure
+    // can't wedge the notebook shut.
+    let _busy = BusyGuard;
 
     if kernel.is_none() {
         kernel = Some(Kernel::spawn(&python_bin, &workdir).await?);
@@ -380,13 +500,20 @@ pub async fn execute(code: &str, timeout_secs: Option<u64>, origin: &str) -> Res
         .await
     {
         Ok(Ok(value)) => {
+            // The sidecar sets kernel_dead when a soft-timeout interrupt left
+            // the kernel wedged (not back to idle) — reusing it would be a lie
+            // about "variables intact", so treat it as a failed kernel below.
+            let kernel_dead = value
+                .get("kernel_dead")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let error = format_error(value.get("error").unwrap_or(&Value::Null));
             let image_paths = save_images(exec_count, value.get("images").unwrap_or(&Value::Null));
             let cell = Cell {
-                execution_count: value
-                    .get("execution_count")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(exec_count),
+                // Always the Rust-monotonic count — the kernel's own count
+                // resets to 1 after a restart, which would collide with the
+                // earliest pane cells (see apply_cell replace-by-count).
+                execution_count: exec_count,
                 origin: origin.to_string(),
                 code: code.to_string(),
                 stdout: value
@@ -407,6 +534,18 @@ pub async fn execute(code: &str, timeout_secs: Option<u64>, origin: &str) -> Res
                 success: error.is_none(),
                 error,
             };
+            if kernel_dead {
+                // Fall through to the failure path to reap the wedged kernel,
+                // but keep the cell we already built (it carries the timeout
+                // error the sidecar reported).
+                reap_kernel(&mut kernel).await;
+                let mut guard = lock();
+                if let Some(state) = guard.as_mut() {
+                    state.kernel = None;
+                    state.cells.push(cell.clone());
+                }
+                return Ok(cell);
+            }
             // Healthy kernel — put it back for the next cell.
             let mut guard = lock();
             if let Some(state) = guard.as_mut() {
@@ -422,9 +561,9 @@ pub async fn execute(code: &str, timeout_secs: Option<u64>, origin: &str) -> Res
         )),
     };
 
-    // Failure path: reap the suspect kernel and force a fresh spawn next time.
-    kernel.child.start_kill().ok();
-    let _ = kernel.child.wait().await;
+    // Failure path: reap the suspect kernel (whole process group) and force a
+    // fresh spawn next time.
+    reap_kernel(&mut kernel).await;
     let cell = Cell {
         execution_count: exec_count,
         origin: origin.to_string(),
@@ -442,6 +581,25 @@ pub async fn execute(code: &str, timeout_secs: Option<u64>, origin: &str) -> Res
         state.cells.push(cell.clone());
     }
     Ok(cell)
+}
+
+/// Kill a suspect kernel and its whole process group, then reap the child.
+async fn reap_kernel(kernel: &mut Kernel) {
+    if let Some(pid) = kernel.child.id() {
+        kill_process_group(pid);
+    }
+    kernel.child.start_kill().ok();
+    let _ = kernel.child.wait().await;
+}
+
+/// Clears the shared `busy` flag on drop — panic- and early-return-safe.
+struct BusyGuard;
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        if let Some(state) = lock().as_mut() {
+            state.busy = false;
+        }
+    }
 }
 
 /// Current kernel status (does not spawn a kernel).
@@ -609,6 +767,79 @@ mod tests {
             msg.contains("Install") || msg.contains("not found"),
             "message should be actionable: {msg}"
         );
+        reset_global();
+    }
+
+    /// Does `python` have `module` importable?
+    fn python_has_module(py: &Path, module: &str) -> bool {
+        std::process::Command::new(py)
+            .args(["-c", &format!("import {module}")])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn forces_builtin_backend_via_env() {
+        let _serial = test_serial().lock().await;
+        let Some(py) = test_python() else {
+            return;
+        };
+        reset_global();
+        // SAFETY: single-threaded critical section (tests are serialized) and
+        // the var is removed before any assertion can unwind.
+        unsafe { std::env::set_var("PRISM_NOTEBOOK_FORCE_BUILTIN", "1") };
+        configure(py, std::env::temp_dir());
+
+        let cell = execute("21 * 2", Some(30), "user").await;
+        let backend = status().backend;
+        unsafe { std::env::remove_var("PRISM_NOTEBOOK_FORCE_BUILTIN") };
+
+        let cell = cell.expect("execute should succeed on the stdlib fallback");
+        assert_eq!(cell.result.as_deref(), Some("42"));
+        assert_eq!(
+            backend.as_deref(),
+            Some("builtin"),
+            "the env var must force the stdlib backend even where Jupyter is present"
+        );
+
+        reset().await.unwrap();
+        reset_global();
+    }
+
+    #[tokio::test]
+    async fn captures_matplotlib_image_on_builtin_backend() {
+        let _serial = test_serial().lock().await;
+        let Some(py) = test_python() else {
+            return;
+        };
+        if !python_has_module(&py, "matplotlib") {
+            eprintln!("skipping: matplotlib not installed");
+            return;
+        }
+        reset_global();
+        // Force the builtin backend so the figure harvester (not the Jupyter
+        // inline path) is exercised deterministically.
+        unsafe { std::env::set_var("PRISM_NOTEBOOK_FORCE_BUILTIN", "1") };
+        configure(py, std::env::temp_dir());
+
+        let cell = execute(
+            "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3], [1, 4, 9])\n1",
+            Some(60),
+            "agent",
+        )
+        .await;
+        unsafe { std::env::remove_var("PRISM_NOTEBOOK_FORCE_BUILTIN") };
+
+        let cell = cell.expect("execute should succeed");
+        assert!(cell.success, "error: {:?}", cell.error);
+        assert_eq!(cell.image_paths.len(), 1, "one figure should be captured");
+        let bytes = std::fs::read(&cell.image_paths[0]).expect("saved PNG exists");
+        assert!(!bytes.is_empty(), "the saved plot must have bytes");
+        // PNG magic number.
+        assert_eq!(&bytes[..4], b"\x89PNG", "the saved file must be a PNG");
+
+        reset().await.unwrap();
         reset_global();
     }
 }

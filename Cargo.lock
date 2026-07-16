@@ -4576,6 +4576,7 @@ dependencies = [
  "chrono",
  "directories",
  "dirs",
+ "libc",
  "prism-campaign",
  "prism-client",
  "prism-embed",

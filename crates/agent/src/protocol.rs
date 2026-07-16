@@ -3926,10 +3926,15 @@ async fn handle_notebook_slash_command(
             }
             match crate::notebook::execute(&code, timeout, "user").await {
                 Ok(cell) => emit_notebook_cell(&cell),
-                Err(error) => emit_notification(
-                    "ui.text.delta",
-                    serde_json::json!({ "text": format!("Notebook error: {error:#}") }),
-                ),
+                Err(error) => {
+                    emit_notification(
+                        "ui.text.delta",
+                        serde_json::json!({ "text": format!("Notebook error: {error:#}") }),
+                    );
+                    // A spawn failure produced no cell, so the pane would stay
+                    // stuck at "running…". Push state to clear the flag.
+                    emit_notebook_state();
+                }
             }
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)

@@ -853,9 +853,9 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "notebook",
         aliases: &["notebook_restart"],
         kind: CommandToolKind::NotebookReset,
-        description: "Restart the in-app notebook kernel and clear all cell state — a clean slate. Use this when the session's variables are wrong or a cell hung. Everything defined so far is lost.",
+        description: "Restart the in-app notebook kernel and clear all cell state — a clean slate. Use this when the session's variables are wrong or a cell hung. Everything defined so far is lost. Approval-gated because the kernel is SHARED with the human's notebook pane — a reset wipes their session too.",
         permission_mode: PermissionMode::WorkspaceWrite,
-        requires_approval: false,
+        requires_approval: true,
     },
 ];
 
@@ -2003,9 +2003,10 @@ fn format_execution_invocation(execution: &CommandExecution) -> String {
             "workflow",
             &workflow_run_display_args(name, values, *execute),
         ),
-        CommandExecution::NotebookExec { code, .. } => {
+        CommandExecution::NotebookExec { code, reset, .. } => {
             // Preview the first code line only — the full blob would flood the
-            // approval prompt / transcript.
+            // approval prompt / transcript. `reset` MUST be surfaced: it wipes
+            // the shared kernel, so the human sees it before approving.
             let first_line = code.lines().next().unwrap_or("").trim();
             let head: String = first_line.chars().take(60).collect();
             let ellipsis = if first_line.chars().count() > 60 || code.lines().count() > 1 {
@@ -2013,8 +2014,9 @@ fn format_execution_invocation(execution: &CommandExecution) -> String {
             } else {
                 ""
             };
+            let reset_note = if *reset { " [resets kernel first]" } else { "" };
             format!(
-                "notebook exec: {head}{ellipsis} ({} chars)",
+                "notebook exec: {head}{ellipsis} ({} chars){reset_note}",
                 code.chars().count()
             )
         }
@@ -3485,12 +3487,14 @@ mod tests {
         assert!(is_command_tool("notebook_reset"));
 
         // Exec runs arbitrary code, so it is approval-gated at FullAccess;
-        // status is read-only and ungated.
+        // status is read-only and ungated; reset is gated too because it wipes
+        // the kernel the human shares.
         assert_eq!(command_tool_requires_approval("notebook_exec"), Some(true));
         assert_eq!(
             command_tool_requires_approval("notebook_status"),
             Some(false)
         );
+        assert_eq!(command_tool_requires_approval("notebook_reset"), Some(true));
 
         let tools = command_tools_filtered(true);
         let exec = tools
@@ -3515,6 +3519,12 @@ mod tests {
         assert!(preview.starts_with("notebook exec:"), "{preview}");
         assert!(preview.contains("200 chars"), "{preview}");
         assert!(preview.len() < 120, "preview stays short: {preview}");
+
+        // reset:true is surfaced so the human sees it before approving.
+        let with_reset =
+            command_tool_preview("notebook_exec", &json!({ "code": "1", "reset": true }))
+                .expect("preview renders");
+        assert!(with_reset.contains("resets kernel"), "{with_reset}");
     }
 
     #[test]
