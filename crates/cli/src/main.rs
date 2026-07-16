@@ -1073,6 +1073,37 @@ enum ModelsCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Register a custom or self-hosted model in ~/.prism/models.toml
+    /// (e.g. z.ai GLM, vLLM, Ollama). No network or login required. The
+    /// entry overrides the platform catalog for cost/context accounting.
+    Register {
+        /// Model ID as the endpoint expects it, e.g. `glm-5.2`.
+        model_id: String,
+        /// Provider label, e.g. `zhipu`, `local`, `openai`.
+        #[arg(long)]
+        provider: String,
+        /// Custom endpoint base URL (self-hosted / direct vendor).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Name of the env var holding the API key (never the key itself).
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// USD per 1M input tokens (0 for free/local models).
+        #[arg(long)]
+        input_price: f64,
+        /// USD per 1M output tokens (0 for free/local models).
+        #[arg(long)]
+        output_price: f64,
+        /// Context window in tokens.
+        #[arg(long)]
+        context_window: usize,
+        /// Max output tokens per response (default 16384).
+        #[arg(long)]
+        max_output_tokens: Option<usize>,
+        /// Output raw JSON instead of a concise summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -7522,7 +7553,9 @@ async fn run_ingest_job(
     }
 }
 
-async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> Result<()> {
+/// Fetch the live platform catalog and persist it to the local cache
+/// (`~/.prism/model-catalog.json`) so lookups keep working offline.
+async fn fetch_platform_catalog_live(paths: &PrismPaths) -> Result<Vec<serde_json::Value>> {
     let (api_base, auth) = resolve_agent_auth()?;
     let project_id = resolve_active_project_id(paths)?;
     let client = reqwest::Client::builder()
@@ -7537,9 +7570,115 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
         .json()
         .await?;
 
-    let mut models = value_array(&response, &["models", "items", "data"])
+    let models = value_array(&response, &["models", "items", "data"])
         .cloned()
         .unwrap_or_default();
+    if let Err(err) = prism_agent::models::save_catalog_cache(&models) {
+        eprintln!("[prism] warning: could not write model catalog cache: {err:#}");
+    }
+    Ok(models)
+}
+
+/// User-registered models first (they override the catalog), then the
+/// platform catalog, deduped by id, ranked newest-first.
+fn merge_and_rank_models(catalog: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut models = prism_agent::models::user_models_as_catalog_json();
+    models.extend(catalog);
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|m| match value_string(m, &["model_id", "id"]) {
+        Some(id) => seen.insert(id.to_string()),
+        None => false,
+    });
+    models.sort_by(|a, b| {
+        let key = |m: &serde_json::Value| {
+            prism_agent::models::recency_key(value_string(m, &["model_id", "id"]).unwrap_or(""))
+        };
+        key(b).cmp(&key(a)).then_with(|| {
+            value_string(a, &["model_id", "id"]).cmp(&value_string(b, &["model_id", "id"]))
+        })
+    });
+    models
+}
+
+async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> Result<()> {
+    // Register is purely local: no auth, no network.
+    let command = match command {
+        ModelsCommands::Register {
+            model_id,
+            provider,
+            base_url,
+            api_key_env,
+            input_price,
+            output_price,
+            context_window,
+            max_output_tokens,
+            json,
+        } => {
+            let entry = prism_agent::models::UserModel {
+                provider,
+                base_url,
+                api_key_env,
+                input_price,
+                output_price,
+                context_window,
+                max_output_tokens,
+                supports_tools: None,
+                supports_thinking: None,
+                supports_caching: None,
+            };
+            let path = prism_agent::models::register_user_model(&model_id, entry.clone())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "registered": model_id,
+                        "path": path,
+                        "model": entry,
+                    }))?
+                );
+            } else {
+                println!("Registered model: {model_id} [{}]", entry.provider);
+                println!(
+                    "  ctx={}  in=${:.2}/M  out=${:.2}/M",
+                    entry.context_window, entry.input_price, entry.output_price
+                );
+                if let Some(url) = &entry.base_url {
+                    println!("  endpoint: {url}");
+                }
+                if let Some(env) = &entry.api_key_env {
+                    println!("  api key env: {env}");
+                }
+                println!("  saved to {}", path.display());
+                println!("  Switch with `/model {model_id}` in the TUI.");
+            }
+            return Ok(());
+        }
+        other => other,
+    };
+
+    // Live catalog first; if the platform is unreachable, fall back to the
+    // local cache so `prism models` keeps working offline.
+    let catalog = match fetch_platform_catalog_live(paths).await {
+        Ok(models) => models,
+        Err(err) => match prism_agent::models::load_catalog_cache() {
+            Some(cache) => {
+                eprintln!(
+                    "[prism] platform catalog unreachable ({err:#}); using cached catalog \
+                     ({} models, {}m old)",
+                    cache.models.len(),
+                    cache.age().as_secs() / 60
+                );
+                cache.models
+            }
+            None => {
+                return Err(err.context(
+                    "platform catalog unreachable and no local cache yet — run once while \
+                     online, or add models with `prism models register`",
+                ));
+            }
+        },
+    };
+    let mut models = merge_and_rank_models(catalog);
 
     match command {
         ModelsCommands::List { provider, json } => {
@@ -7591,6 +7730,8 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
 
             println!("{}", serde_json::to_string_pretty(&model)?)
         }
+        // Handled by the early-return above; the rebind can't carry it here.
+        ModelsCommands::Register { .. } => unreachable!("register returns early"),
     }
 
     Ok(())
@@ -9604,39 +9745,62 @@ fn marc27_llm_url_for_project(api_base: &str, project_id: &str) -> String {
 /// Bounded by a short timeout so backend startup is never held hostage.
 /// Fetch the platform model catalog once (`GET /projects/{id}/llm/models`,
 /// same endpoint as `prism models list`). Fail-open on every path —
-/// offline, no auth, network error → empty Vec. One fetch serves BOTH
-/// model resolution (`resolve_catalog_model`) and limits (`model_limits`).
+/// offline, no auth, network error → the local catalog cache at any age,
+/// else empty. A fresh cache (within `CATALOG_TTL`) skips the network
+/// entirely; a live fetch refreshes the cache. User-registered models
+/// (`~/.prism/models.toml`) are always merged in FIRST so they override
+/// catalog entries for resolution and limits. One fetch serves BOTH model
+/// resolution (`resolve_catalog_model`) and limits (`model_limits`).
 async fn fetch_model_catalog(paths: &PrismPaths) -> Vec<serde_json::Value> {
-    if std::env::var("PRISM_OFFLINE").as_deref() == Ok("1") {
-        return Vec::new();
+    let mut models = prism_agent::models::user_models_as_catalog_json();
+
+    let cache = prism_agent::models::load_catalog_cache();
+    let cache_is_fresh = cache
+        .as_ref()
+        .is_some_and(prism_agent::models::CatalogCache::is_fresh);
+    let offline = std::env::var("PRISM_OFFLINE").as_deref() == Ok("1");
+    if offline || cache_is_fresh {
+        models.extend(cache.map(|c| c.models).unwrap_or_default());
+        return models;
     }
-    let Ok((api_base, auth)) = resolve_agent_auth() else {
-        return Vec::new();
-    };
-    let Ok(project_id) = resolve_active_project_id(paths) else {
-        return Vec::new();
-    };
-    let Ok(client) = reqwest::Client::builder()
+
+    let fetched = fetch_platform_catalog_live_short_timeout(paths).await;
+    match fetched {
+        Some(live) => models.extend(live),
+        // Live fetch failed → serve the stale cache rather than nothing.
+        None => models.extend(cache.map(|c| c.models).unwrap_or_default()),
+    }
+    models
+}
+
+/// The startup-path live fetch: bounded by a short timeout so backend
+/// startup is never held hostage, and every failure is `None` (fail-open).
+/// On success the local cache is refreshed.
+async fn fetch_platform_catalog_live_short_timeout(
+    paths: &PrismPaths,
+) -> Option<Vec<serde_json::Value>> {
+    let (api_base, auth) = resolve_agent_auth().ok()?;
+    let project_id = resolve_active_project_id(paths).ok()?;
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
-    else {
-        return Vec::new();
-    };
-    let response: serde_json::Value = match auth
+        .ok()?;
+    let response: serde_json::Value = auth
         .apply(client.get(format!("{api_base}/projects/{project_id}/llm/models")))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-    {
-        Ok(resp) => match resp.json().await {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
-        },
-        Err(_) => return Vec::new(),
-    };
-    value_array(&response, &["models", "items", "data"])
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let models = value_array(&response, &["models", "items", "data"])
         .cloned()
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Err(err) = prism_agent::models::save_catalog_cache(&models) {
+        tracing::debug!("could not write model catalog cache: {err:#}");
+    }
+    Some(models)
 }
 
 /// The model's context/output limits from an already-fetched catalog.

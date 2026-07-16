@@ -3620,6 +3620,37 @@ async fn handle_models_slash_command(
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
+        // `/models register <id> --provider <p> --input-price <usd/mtok>
+        // --output-price <usd/mtok> --context-window <tokens> [--base-url
+        // <url>] [--api-key-env <ENV>] [--max-output-tokens <n>]` — write the
+        // model to ~/.prism/models.toml via the CLI, then reload the
+        // in-process registry so it resolves immediately (no restart, no
+        // exit-to-CLI).
+        "register" => {
+            let json_args = ensure_json_flag(args);
+            let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
+            crate::models::reload();
+            let id = value_string(&value, &["registered"])
+                .unwrap_or("?")
+                .to_string();
+            let cfg = crate::models::get_model_config(&id);
+            let body = format!(
+                "Registered: {id} [{}]\n  context window: {}\n  pricing: ${:.2}/M in, ${:.2}/M out{}{}\n\nSwitch with /model {id}",
+                cfg.provider,
+                cfg.context_window,
+                cfg.input_price_per_mtok,
+                cfg.output_price_per_mtok,
+                cfg.base_url
+                    .map(|u| format!("\n  endpoint: {u}"))
+                    .unwrap_or_default(),
+                cfg.api_key_env
+                    .map(|e| format!("\n  api key env: {e}"))
+                    .unwrap_or_default(),
+            );
+            emit_view("models", "Model Registered", &body, "info");
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }

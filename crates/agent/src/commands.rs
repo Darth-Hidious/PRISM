@@ -221,6 +221,11 @@ const BUILTIN_COMMANDS: &[SlashCommandSpec] = &[
         category: "Settings",
     },
     SlashCommandSpec {
+        usage: "/models register <id> --provider <p> --input-price <usd/mtok> --output-price <usd/mtok> --context-window <tokens>",
+        description: "Register a custom/self-hosted model (z.ai, vLLM, Ollama) in ~/.prism/models.toml; optional --base-url, --api-key-env, --max-output-tokens",
+        category: "Settings",
+    },
+    SlashCommandSpec {
         usage: "/deploy list",
         description: "List persistent deployments visible to the current auth context",
         category: "Settings",
