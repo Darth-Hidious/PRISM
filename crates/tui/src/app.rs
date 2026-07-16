@@ -351,6 +351,13 @@ pub enum FormTarget {
     MarketplaceFind,
     /// Install a marketplace item (palette `marketplace.install`).
     MarketplaceInstall,
+    /// Run a saved skill by name (palette `skills.run`).
+    SkillRun,
+    /// Author + verify a new skill (palette `skills.create`). Submit
+    /// dispatches `/skills create ...`, which the backend runs through the
+    /// same verify-then-store path (`write_skill`) the agent uses — the
+    /// skill is executed once and only saved if it exits cleanly.
+    SkillCreate,
 }
 
 /// An open form pane: the widget plus what submit dispatches to.
@@ -1318,6 +1325,25 @@ impl App {
                     self.form = Some(pane);
                 }
             },
+            FormTarget::SkillRun => match skill_run_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
+            FormTarget::SkillCreate => match skill_create_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                    self.toast("verifying — it runs once before saving", ToastKind::Info);
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
         }
     }
 
@@ -1461,6 +1487,39 @@ impl App {
             ],
         );
         self.open_form(form, FormTarget::MarketplaceInstall);
+    }
+
+    /// Palette `skills.run` — one field: which saved skill to execute. The
+    /// backend re-runs the stored code and reports its output (mirrors the
+    /// agent's `run_skill`).
+    pub fn open_skill_run_form(&mut self) {
+        let form = Form::new(
+            "Run skill",
+            "run",
+            vec![FormField::text("name", "Skill name", "").with_note("from Skills")],
+        );
+        self.open_form(form, FormTarget::SkillRun);
+    }
+
+    /// Palette `skills.create` — author a reusable skill. Submit dispatches
+    /// `/skills create ...`, which the backend runs through the SAME
+    /// verify-then-store path (`write_skill`) the agent uses: the code is
+    /// executed once and the skill is saved only if it exits cleanly. The
+    /// code field is single-line (the shared form submits on Enter) — good
+    /// for shell one-liners / short python.
+    pub fn open_skill_create_form(&mut self) {
+        let form = Form::new(
+            "Create skill — verified before it's saved",
+            "verify & save",
+            vec![
+                FormField::text("name", "Name", "").with_note("1-64 of [A-Za-z0-9_-]"),
+                FormField::text("description", "Description", "")
+                    .with_note("one line, for retrieval"),
+                FormField::toggle("python", "Python", false).with_note("off = shell"),
+                FormField::text("code", "Code", "").with_note("runs once to verify"),
+            ],
+        );
+        self.open_form(form, FormTarget::SkillCreate);
     }
 
     // ── Knowledge pane (Search | Ingest) ─────────────────────────────
@@ -2753,6 +2812,11 @@ impl App {
             "marketplace.search" => self.open_marketplace_search_form(),
             "marketplace.find" => self.open_marketplace_find_form(),
             "marketplace.install" => self.open_marketplace_install_form(),
+            "skills.list" => {
+                let _ = self.backend.send_command("/skills list");
+            }
+            "skills.run" => self.open_skill_run_form(),
+            "skills.create" => self.open_skill_create_form(),
             "use.show" => {
                 let _ = self.backend.send_command("/use show");
             }
@@ -3652,6 +3716,56 @@ fn marketplace_install_command(form: &crate::form::Form) -> Result<String, &'sta
     Ok(build_slash_command(&args))
 }
 
+/// Build `/skills run <name>` from the `skills.run` form.
+fn skill_run_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let name = form.text_value("name").trim().to_string();
+    if name.is_empty() {
+        return Err("enter a skill name first");
+    }
+    Ok(build_slash_command(&[
+        "skills".to_string(),
+        "run".to_string(),
+        name,
+    ]))
+}
+
+/// Build `/skills create --name .. --language .. --description .. --code ..`
+/// from the `skills.create` form. Every field is quoted by
+/// [`build_slash_command`], so multi-word descriptions and code with quotes
+/// survive the round trip; the backend runs the code once and only stores it
+/// if it verifies (exits cleanly).
+fn skill_create_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let name = form.text_value("name").trim().to_string();
+    if name.is_empty() {
+        return Err("enter a skill name first");
+    }
+    let description = form.text_value("description").trim().to_string();
+    if description.is_empty() {
+        return Err("enter a one-line description first");
+    }
+    let code = form.text_value("code").trim().to_string();
+    if code.is_empty() {
+        return Err("enter the skill code first");
+    }
+    let language = if form.toggle_value("python") {
+        "python"
+    } else {
+        "shell"
+    };
+    Ok(build_slash_command(&[
+        "skills".to_string(),
+        "create".to_string(),
+        "--name".to_string(),
+        name,
+        "--language".to_string(),
+        language.to_string(),
+        "--description".to_string(),
+        description,
+        "--code".to_string(),
+        code,
+    ]))
+}
+
 /// Compose the exact chat instruction the research form launches.
 ///
 /// The engine contract is `{question, depth}` (app/tools/agent_runs.py),
@@ -4434,6 +4548,108 @@ mod tests {
             marketplace_install_command(&form),
             Err("enter a marketplace item name first")
         );
+    }
+
+    // ── Skills palette ───────────────────────────────────────────────────
+
+    #[test]
+    fn skills_run_dispatch_opens_form() {
+        let mut app = fresh();
+        app.dispatch_command("skills.run");
+        let pane = app.form.as_ref().expect("skills.run must open a form");
+        assert_eq!(pane.target, FormTarget::SkillRun);
+        let names: Vec<&str> = pane.form.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["name"]);
+    }
+
+    #[test]
+    fn skills_create_dispatch_opens_form_with_fields() {
+        let mut app = fresh();
+        app.dispatch_command("skills.create");
+        let pane = app.form.as_ref().expect("skills.create must open a form");
+        assert_eq!(pane.target, FormTarget::SkillCreate);
+        let names: Vec<&str> = pane.form.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["name", "description", "python", "code"]);
+    }
+
+    #[test]
+    fn skill_run_requires_name() {
+        let form = Form::new("t", "go", vec![FormField::text("name", "Skill name", "")]);
+        assert_eq!(skill_run_command(&form), Err("enter a skill name first"));
+    }
+
+    #[test]
+    fn skill_run_builds_invocation() {
+        let form = Form::new(
+            "t",
+            "go",
+            vec![FormField::text("name", "Skill name", "density_calc")],
+        );
+        assert_eq!(
+            skill_run_command(&form).unwrap(),
+            "/skills run density_calc"
+        );
+    }
+
+    #[test]
+    fn skill_create_requires_name_description_and_code() {
+        let base = |name: &str, desc: &str, code: &str| {
+            Form::new(
+                "t",
+                "go",
+                vec![
+                    FormField::text("name", "Name", name),
+                    FormField::text("description", "Description", desc),
+                    FormField::toggle("python", "Python", false),
+                    FormField::text("code", "Code", code),
+                ],
+            )
+        };
+        assert_eq!(
+            skill_create_command(&base("", "d", "echo hi")),
+            Err("enter a skill name first")
+        );
+        assert_eq!(
+            skill_create_command(&base("greet", "", "echo hi")),
+            Err("enter a one-line description first")
+        );
+        assert_eq!(
+            skill_create_command(&base("greet", "say hi", "")),
+            Err("enter the skill code first")
+        );
+    }
+
+    #[test]
+    fn skill_create_builds_verified_invocation() {
+        // Free-text description + code with a space are single-quoted so they
+        // survive the backend's shlex re-split; the toggle selects python.
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("name", "Name", "greet"),
+                FormField::text("description", "Description", "print a greeting"),
+                FormField::toggle("python", "Python", true),
+                FormField::text("code", "Code", "print('hi')"),
+            ],
+        );
+        assert_eq!(
+            skill_create_command(&form).unwrap(),
+            "/skills create --name greet --language python \
+             --description 'print a greeting' --code 'print('\"'\"'hi'\"'\"')'"
+        );
+    }
+
+    #[test]
+    fn skills_commands_are_palette_reachable() {
+        for (query, id) in [
+            ("skills", "skills.list"),
+            ("run skill", "skills.run"),
+            ("create skill", "skills.create"),
+        ] {
+            let ids: Vec<&str> = command::fuzzy_sorted(query).iter().map(|c| c.id).collect();
+            assert!(ids.contains(&id), "{query} → {id}, got: {ids:?}");
+        }
     }
 
     // ── Billing & use show (direct-dispatch palette entries) ────────────

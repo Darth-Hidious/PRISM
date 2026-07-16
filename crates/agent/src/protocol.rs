@@ -3723,6 +3723,194 @@ async fn handle_nodes_slash_command(args: &[String]) -> Result<bool> {
     Ok(true)
 }
 
+/// The four fields a `/skills create` invocation carries, parsed from the
+/// `--name / --language / --description / --code` flags the TUI form builds.
+struct SkillCreateFields {
+    name: String,
+    description: String,
+    language: String,
+    code: String,
+}
+
+/// Read the `--name / --language / --description / --code` flags out of the
+/// `create` argv tail. Each flag's value is the very next token (already
+/// shlex-unquoted), so a value that itself looks like a flag is still taken
+/// verbatim — the code body can contain anything.
+fn parse_skill_create_args(rest: &[String]) -> SkillCreateFields {
+    let mut fields = SkillCreateFields {
+        name: String::new(),
+        description: String::new(),
+        language: "shell".to_string(),
+        code: String::new(),
+    };
+    let mut i = 0;
+    while i < rest.len() {
+        let value = rest.get(i + 1).cloned().unwrap_or_default();
+        match rest[i].as_str() {
+            "--name" => fields.name = value,
+            "--description" => fields.description = value,
+            "--language" => fields.language = value,
+            "--code" => fields.code = value,
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        i += 2;
+    }
+    fields
+}
+
+/// Render `list_skills` output as a readable panel body.
+fn format_skills_list(result: &Value) -> String {
+    match result.get("skills").and_then(Value::as_array) {
+        Some(items) if !items.is_empty() => {
+            let mut lines = vec![format!("Your skills ({}):", items.len())];
+            for s in items {
+                let name = s.get("name").and_then(Value::as_str).unwrap_or("?");
+                let desc = s.get("description").and_then(Value::as_str).unwrap_or("");
+                let lang = s.get("language").and_then(Value::as_str).unwrap_or("shell");
+                let verified = s.get("verified").and_then(Value::as_bool).unwrap_or(false);
+                let mark = if verified { "" } else { " (unverified)" };
+                lines.push(format!("  • {name} [{lang}]{mark} — {desc}"));
+            }
+            lines.push(String::new());
+            lines.push("Run one from the palette (Run skill) or `/skills run <name>`.".to_string());
+            lines.join("\n")
+        }
+        _ => "No skills yet. Author one from the palette (Create skill) or `/skills create`."
+            .to_string(),
+    }
+}
+
+/// Render `run_skill` output honestly — exit status plus any captured streams.
+fn format_skill_run(name: &str, result: &Value) -> String {
+    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
+    let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
+    let mut body = if ok {
+        format!("Ran skill '{name}' — exited cleanly.")
+    } else {
+        let code = result
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .map(|c| format!("exit {c}"))
+            .unwrap_or_else(|| "killed by signal".to_string());
+        format!("Ran skill '{name}' — FAILED ({code}).")
+    };
+    if !stdout.trim().is_empty() {
+        body.push_str(&format!("\n\nstdout:\n{}", stdout.trim_end()));
+    }
+    if !stderr.trim().is_empty() {
+        body.push_str(&format!("\n\nstderr:\n{}", stderr.trim_end()));
+    }
+    body
+}
+
+/// Render `write_skill` output honestly: whether the skill was verified (ran
+/// once, exit 0) and therefore stored, or rejected — and why, so a failed
+/// verification never looks like a save.
+fn format_skill_create(name: &str, result: &Value) -> String {
+    let stored = result
+        .get("stored")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if stored {
+        let mut body = format!(
+            "Skill '{name}' verified and saved.\nIt ran once cleanly (that is the verification), \
+             so it is now in your skills — run it anytime from the palette (Run skill)."
+        );
+        let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
+        if !stdout.trim().is_empty() {
+            body.push_str(&format!("\n\nverification stdout:\n{}", stdout.trim_end()));
+        }
+        body
+    } else {
+        let err = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("verification failed");
+        let mut body = format!("Skill '{name}' was NOT saved — {err}");
+        let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
+        if !stderr.trim().is_empty() {
+            body.push_str(&format!("\n\nstderr:\n{}", stderr.trim_end()));
+        }
+        body
+    }
+}
+
+/// `/skills` — the human's window onto the agent's self-authored skills store,
+/// surfaced so a person can list / run / create skills entirely in-app (no
+/// shell, no `prism` CLI). It reuses the SAME store and verify-then-store logic
+/// the agent's `list_skills` / `run_skill` / `write_skill` meta-tools use, via
+/// [`crate::meta_tools::execute_meta_tool`] — skill semantics are not duplicated
+/// here. `create` runs the code once to verify it and only stores on a clean
+/// exit; a failure is reported and nothing is saved. Returns `Ok(false)` when
+/// the root isn't `skills`.
+async fn handle_skills_slash_command(args: &[String], tools: &ToolCatalog) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("skills") {
+        return Ok(false);
+    }
+    let sub = args.get(1).map(String::as_str).unwrap_or("list");
+    let body = match sub {
+        "list" => {
+            let result = crate::meta_tools::execute_meta_tool(
+                "list_skills",
+                &serde_json::json!({}),
+                None,
+                "",
+                tools,
+            )
+            .await?;
+            format_skills_list(&result)
+        }
+        "run" => {
+            let name = args.get(2).map(String::as_str).unwrap_or("").trim();
+            if name.is_empty() {
+                "Give a skill name to run: `/skills run <name>`.".to_string()
+            } else {
+                match crate::meta_tools::execute_meta_tool(
+                    "run_skill",
+                    &serde_json::json!({ "name": name }),
+                    None,
+                    "",
+                    tools,
+                )
+                .await
+                {
+                    Ok(result) => format_skill_run(name, &result),
+                    Err(error) => format!("Skill '{name}' could not run — {error}"),
+                }
+            }
+        }
+        "create" => {
+            let fields = parse_skill_create_args(&args[2..]);
+            let name = fields.name.clone();
+            match crate::meta_tools::execute_meta_tool(
+                "write_skill",
+                &serde_json::json!({
+                    "name": fields.name,
+                    "description": fields.description,
+                    "language": fields.language,
+                    "code": fields.code,
+                }),
+                None,
+                "",
+                tools,
+            )
+            .await
+            {
+                Ok(result) => format_skill_create(&name, &result),
+                Err(error) => format!("Skill '{name}' was NOT saved — {error}"),
+            }
+        }
+        other => format!("Unknown `/skills` action '{other}'. Try: list, run <name>, create."),
+    };
+    emit_notification("ui.text.delta", serde_json::json!({ "text": body }));
+    emit_notification("ui.turn.complete", serde_json::json!({}));
+    Ok(true)
+}
+
 /// `/gh` — GitHub inside the TUI. Backs the Issues / PRs / Status / Bug panel.
 /// Shells to the authenticated `gh` CLI and emits a single structured
 /// `ui.gh.data` notification the TUI renders. The repo is auto-detected from
@@ -6513,6 +6701,9 @@ async fn handle_command(
             if handle_nodes_slash_command(&args).await? {
                 return Ok(true);
             }
+            if handle_skills_slash_command(&args, tools).await? {
+                return Ok(true);
+            }
             if handle_gh_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
@@ -7194,12 +7385,13 @@ mod tests {
     use super::{
         BashSlashAction, DiffSlashAction, EditSlashAction, PythonSlashAction, SessionMode,
         SlashCommandContext, WriteSlashAction, build_effective_permission_context,
-        build_tool_card_payload, humanize_tool_verb, inline_list, load_plan_snapshot,
+        build_tool_card_payload, format_skill_create, format_skill_run, format_skills_list,
+        handle_skills_slash_command, humanize_tool_verb, inline_list, load_plan_snapshot,
         parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
         parse_edit_slash_action, parse_python_slash_action, parse_read_slash_path,
-        parse_slash_command, parse_write_slash_action, persist_plan_snapshot, pick_organization,
-        pick_project, plan_snapshot_path, project_api_history, shell_command_join,
-        summarize_api_view, truncate_for_ui,
+        parse_skill_create_args, parse_slash_command, parse_write_slash_action,
+        persist_plan_snapshot, pick_organization, pick_project, plan_snapshot_path,
+        project_api_history, shell_command_join, summarize_api_view, truncate_for_ui,
     };
     use crate::commands::is_cli_backed_slash_root;
     use crate::permissions::PermissionOverrides;
@@ -7817,5 +8009,124 @@ mod tests {
         assert_eq!(data["path"], "/tmp/demo/src/main.rs");
         assert_eq!(data["replacements"], 1);
         assert_eq!(data["success"], true);
+    }
+
+    #[test]
+    fn parse_skill_create_args_reads_flags_verbatim() {
+        // The code body must be taken exactly, even if it looks like a flag.
+        let args = vec![
+            "--name".to_string(),
+            "greet".to_string(),
+            "--language".to_string(),
+            "python".to_string(),
+            "--description".to_string(),
+            "say hi".to_string(),
+            "--code".to_string(),
+            "print('--not-a-flag')".to_string(),
+        ];
+        let fields = parse_skill_create_args(&args);
+        assert_eq!(fields.name, "greet");
+        assert_eq!(fields.language, "python");
+        assert_eq!(fields.description, "say hi");
+        assert_eq!(fields.code, "print('--not-a-flag')");
+    }
+
+    #[test]
+    fn parse_skill_create_args_defaults_language_to_shell() {
+        let args = vec!["--name".to_string(), "x".to_string()];
+        let fields = parse_skill_create_args(&args);
+        assert_eq!(fields.language, "shell");
+        assert!(fields.code.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_skills_slash_command_ignores_other_roots() {
+        let catalog = ToolCatalog::from_tool_server_json(&serde_json::json!({ "tools": [] }));
+        let handled = handle_skills_slash_command(&["nodes".to_string()], &catalog)
+            .await
+            .unwrap();
+        assert!(!handled, "a non-skills root must fall through");
+    }
+
+    /// End to end through the REUSED skills store: `/skills create` verifies by
+    /// running the code once, stores only on a clean exit, `/skills list` shows
+    /// the verified one (not the rejected one), and `/skills run` re-executes
+    /// it — asserted on the exact panel bodies the TUI renders.
+    // The env guard is held across `.await` only to serialize `PRISM_SKILLS_DIR`;
+    // `#[tokio::test]` is single-threaded so this can't deadlock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn skills_create_verify_then_store_list_and_run() {
+        let (_g, _dir) = crate::skills::test_env_guard("protocol-skills");
+        let catalog = ToolCatalog::from_tool_server_json(&serde_json::json!({ "tools": [] }));
+
+        // A valid shell skill: verified by running once, then stored.
+        let created = crate::meta_tools::execute_meta_tool(
+            "write_skill",
+            &serde_json::json!({
+                "name": "hello_skill",
+                "description": "print a greeting",
+                "language": "shell",
+                "code": "echo hi-from-tui",
+            }),
+            None,
+            "",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(created["stored"], serde_json::json!(true));
+        let body = format_skill_create("hello_skill", &created);
+        assert!(body.contains("verified and saved"), "got: {body}");
+
+        // A skill that exits non-zero is rejected — NOT saved — and says why.
+        let failed = crate::meta_tools::execute_meta_tool(
+            "write_skill",
+            &serde_json::json!({
+                "name": "broken_skill",
+                "description": "exits non-zero",
+                "language": "shell",
+                "code": "exit 5",
+            }),
+            None,
+            "",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed["stored"], serde_json::json!(false));
+        let body = format_skill_create("broken_skill", &failed);
+        assert!(body.contains("NOT saved"), "got: {body}");
+
+        // List shows only the verified skill.
+        let listed = crate::meta_tools::execute_meta_tool(
+            "list_skills",
+            &serde_json::json!({}),
+            None,
+            "",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        let body = format_skills_list(&listed);
+        assert!(body.contains("hello_skill"), "got: {body}");
+        assert!(
+            !body.contains("broken_skill"),
+            "rejected skill must not list: {body}"
+        );
+
+        // Run re-executes the stored skill and echoes its output.
+        let ran = crate::meta_tools::execute_meta_tool(
+            "run_skill",
+            &serde_json::json!({ "name": "hello_skill" }),
+            None,
+            "",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        let body = format_skill_run("hello_skill", &ran);
+        assert!(body.contains("exited cleanly"), "got: {body}");
+        assert!(body.contains("hi-from-tui"), "got: {body}");
     }
 }

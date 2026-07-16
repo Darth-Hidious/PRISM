@@ -204,6 +204,31 @@ pub static CATALOG: &[Command] = &[
         keybind: "palette",
         suggested: false,
     },
+    // ── Skills (self-authored reusable snippets) ──────────────────────
+    Command {
+        id: "skills.list",
+        title: "Skills",
+        description: "Your saved reusable shell/python skills",
+        category: "Skills",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "skills.run",
+        title: "Run skill",
+        description: "Execute a saved skill by name",
+        category: "Skills",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "skills.create",
+        title: "Create skill",
+        description: "Author & verify a reusable shell/python skill",
+        category: "Skills",
+        keybind: "palette",
+        suggested: false,
+    },
     Command {
         id: "help.show",
         title: "Help",
