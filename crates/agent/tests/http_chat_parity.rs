@@ -265,9 +265,12 @@ async fn http_chat_service_and_backend_share_loop_and_catalog() {
     // ── Transport 2: the backend path (what the TUI uses) ─────────
     // Same seed builder, same run_turn — this is spawn_agent_turn's
     // dispatch without the stdio framing.
-    let seed = build_agent_seed(&tool_server_config(project.path(), &python))
-        .await
-        .expect("backend seed");
+    let seed = build_agent_seed(
+        &tool_server_config(project.path(), &python),
+        &llm_config(base_url.clone()),
+    )
+    .await
+    .expect("backend seed");
 
     // Catalog parity: identical tool names on both transports.
     let mut service_tools = service.tool_names();

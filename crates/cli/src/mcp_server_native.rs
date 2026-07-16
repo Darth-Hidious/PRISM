@@ -28,6 +28,8 @@ pub async fn run(project_root: PathBuf, python_bin: PathBuf) -> Result<()> {
         current_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("prism")),
         project_root,
         python_bin,
+        // Workflow `llm_*` steps here fall back to their own env resolution.
+        ..Default::default()
     };
 
     let stdin = tokio::io::stdin();

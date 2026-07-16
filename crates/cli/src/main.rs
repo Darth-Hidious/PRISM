@@ -4046,6 +4046,8 @@ async fn handle_workflow_command(
             if execute && let Some(token) = mint_workflow_node_token(paths).await {
                 values.insert("_node_token".to_string(), token);
             }
+            // Point `llm_*` steps at the resolved chat endpoint.
+            inject_workflow_llm_endpoint(&mut values, project_root);
             let result = execute_workflow(spec, &values, execute).await?;
             render_workflow_result(spec, &result);
         }
@@ -4073,6 +4075,8 @@ async fn try_run_workflow_alias(
     {
         values.insert("_node_token".to_string(), token);
     }
+    // Point `llm_*` steps at the resolved chat endpoint.
+    inject_workflow_llm_endpoint(&mut values, project_root);
     let result = execute_workflow(spec, &values, request.execute).await?;
     render_workflow_result(spec, &result);
     Ok(true)
@@ -4710,6 +4714,26 @@ fn build_llm_config(
         timeout_secs: llm.timeout_secs,
         ..Default::default()
     })
+}
+
+/// Inject the resolved chat LLM endpoint into a workflow's `values` so its
+/// `llm_*` steps reach the real model instead of the engine's built-in
+/// localhost default. Uses the SAME `build_llm_config` resolution the chat
+/// path uses (chat target + prism.toml + signed-in project's MARC27 endpoint).
+/// A `--set` override always wins (`or_insert`). Resolution failure is
+/// non-fatal — the workflow falls back to its own env resolution.
+fn inject_workflow_llm_endpoint(values: &mut BTreeMap<String, String>, project_root: &Path) {
+    let Ok(cfg) = build_llm_config(project_root, None, None, None) else {
+        return;
+    };
+    if !cfg.base_url.is_empty() {
+        values
+            .entry("llm_base_url".to_string())
+            .or_insert(cfg.base_url);
+    }
+    if !cfg.model.is_empty() {
+        values.entry("llm_model".to_string()).or_insert(cfg.model);
+    }
 }
 
 // ── prism ingest ────────────────────────────────────────────────────────

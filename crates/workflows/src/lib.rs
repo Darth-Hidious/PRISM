@@ -1182,10 +1182,19 @@ async fn run_llm_step(
     let api_key = env::var("LLM_API_KEY")
         .or_else(|_| env::var("MARC27_TOKEN"))
         .ok();
-    let model = if model.is_empty() {
-        env::var("LLM_MODEL").unwrap_or_else(|_| "gemma-4-12b".to_string())
-    } else {
+    // Model resolves with the same precedence as base_url: step config →
+    // context (`llm_model`, injected by the agent/CLI from the resolved chat
+    // config) → env → built-in default.
+    let model = if !model.is_empty() {
         model.to_string()
+    } else if let Some(ctx_model) = context
+        .get("llm_model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        ctx_model.to_string()
+    } else {
+        env::var("LLM_MODEL").unwrap_or_else(|_| "gemma-4-12b".to_string())
     };
 
     let config = prism_llm::LlmConfig {
