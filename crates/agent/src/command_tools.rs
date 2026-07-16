@@ -93,6 +93,10 @@ enum CommandToolKind {
     BillingUsage,
     BillingHistory,
     BillingPrices,
+    // ── In-app notebook kernel (crate::notebook) ──────────────────────
+    NotebookExec,
+    NotebookStatus,
+    NotebookReset,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -822,6 +826,37 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
+    // ── In-app notebook kernel ────────────────────────────────────────
+    // A persistent Python kernel shared with the human's TUI notebook pane
+    // (crate::notebook). Lets the agent write AND run code, then read the
+    // outputs, building an analysis up cell by cell.
+    CommandToolSpec {
+        name: "notebook_exec",
+        root: "notebook",
+        aliases: &["notebook_run", "run_python_notebook"],
+        kind: CommandToolKind::NotebookExec,
+        description: "Execute Python in PRISM's persistent in-app notebook kernel and read the outputs (stdout, stderr, the last expression's value, and any plots). The kernel is SHARED with the human's notebook pane and KEEPS STATE across calls — variables, imports, and loaded data persist between cells, so build an analysis up incrementally instead of re-running everything each time. Plots/figures are saved to PNG files whose paths are returned; pass include_images_base64=true only when you actually need the raw bytes. This runs real, un-sandboxed Python on the local machine (exactly like a Jupyter cell), so it is approval-gated.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "notebook_status",
+        root: "notebook",
+        aliases: &[],
+        kind: CommandToolKind::NotebookStatus,
+        description: "Report the in-app notebook kernel status: whether it is running, which backend it uses (a real Jupyter/IPython kernel or the zero-setup stdlib fallback), the Python version, and how many cells have run this session.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "notebook_reset",
+        root: "notebook",
+        aliases: &["notebook_restart"],
+        kind: CommandToolKind::NotebookReset,
+        description: "Restart the in-app notebook kernel and clear all cell state — a clean slate. Use this when the session's variables are wrong or a cell hung. Everything defined so far is lost.",
+        permission_mode: PermissionMode::WorkspaceWrite,
+        requires_approval: false,
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -839,12 +874,50 @@ enum CommandExecution {
         values: BTreeMap<String, String>,
         execute: bool,
     },
+    NotebookExec {
+        code: String,
+        timeout: Option<u64>,
+        reset: bool,
+        include_images_base64: bool,
+    },
+    NotebookStatus,
+    NotebookReset,
 }
 
 fn empty_schema() -> Value {
     json!({
         "type": "object",
         "properties": {},
+        "additionalProperties": false
+    })
+}
+
+fn notebook_exec_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Python source to run as one notebook cell. Multi-line is fine; the last bare expression's value is echoed like a Jupyter cell."
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Per-cell wall-clock limit in seconds (default 120, max 600). On timeout the kernel restarts and its variables are lost.",
+                "minimum": 1,
+                "maximum": 600
+            },
+            "reset": {
+                "type": "boolean",
+                "description": "Restart the kernel (clearing all prior variables) BEFORE running this cell.",
+                "default": false
+            },
+            "include_images_base64": {
+                "type": "boolean",
+                "description": "Also return each produced plot as base64 bytes, not just its saved file path. Off by default to keep results small.",
+                "default": false
+            }
+        },
+        "required": ["code"],
         "additionalProperties": false
     })
 }
@@ -1720,6 +1793,8 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         | CommandToolKind::BillingUsage
         | CommandToolKind::BillingHistory
         | CommandToolKind::BillingPrices => empty_schema(),
+        CommandToolKind::NotebookExec => notebook_exec_schema(),
+        CommandToolKind::NotebookStatus | CommandToolKind::NotebookReset => empty_schema(),
         CommandToolKind::NodeProbe | CommandToolKind::NodeStatus => empty_schema(),
         CommandToolKind::NodeLogs => node_logs_schema(),
         CommandToolKind::MeshDiscover => mesh_discover_schema(),
@@ -1928,6 +2003,23 @@ fn format_execution_invocation(execution: &CommandExecution) -> String {
             "workflow",
             &workflow_run_display_args(name, values, *execute),
         ),
+        CommandExecution::NotebookExec { code, .. } => {
+            // Preview the first code line only — the full blob would flood the
+            // approval prompt / transcript.
+            let first_line = code.lines().next().unwrap_or("").trim();
+            let head: String = first_line.chars().take(60).collect();
+            let ellipsis = if first_line.chars().count() > 60 || code.lines().count() > 1 {
+                "…"
+            } else {
+                ""
+            };
+            format!(
+                "notebook exec: {head}{ellipsis} ({} chars)",
+                code.chars().count()
+            )
+        }
+        CommandExecution::NotebookStatus => "notebook status".to_string(),
+        CommandExecution::NotebookReset => "notebook reset".to_string(),
     }
 }
 
@@ -2802,6 +2894,14 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args,
             })
         }
+        CommandToolKind::NotebookExec => Ok(CommandExecution::NotebookExec {
+            code: required_string(input, "code")?,
+            timeout: optional_usize(input, "timeout").map(|value| value as u64),
+            reset: optional_bool(input, "reset"),
+            include_images_base64: optional_bool(input, "include_images_base64"),
+        }),
+        CommandToolKind::NotebookStatus => Ok(CommandExecution::NotebookStatus),
+        CommandToolKind::NotebookReset => Ok(CommandExecution::NotebookReset),
     }
 }
 
@@ -3047,7 +3147,10 @@ async fn execute_workflow_command(
                 ),
             }
         }
-        CommandExecution::Cli { .. } => {
+        CommandExecution::Cli { .. }
+        | CommandExecution::NotebookExec { .. }
+        | CommandExecution::NotebookStatus
+        | CommandExecution::NotebookReset => {
             unreachable!("workflow executor only handles workflow commands")
         }
     };
@@ -3141,7 +3244,163 @@ pub async fn execute_command_tool(
         | CommandExecution::WorkflowRun { .. } => {
             execute_workflow_command(runtime, &execution, &invocation, policy).await
         }
+        CommandExecution::NotebookExec {
+            code,
+            timeout,
+            reset,
+            include_images_base64,
+        } => {
+            execute_notebook(
+                runtime,
+                code,
+                *timeout,
+                *reset,
+                *include_images_base64,
+                &invocation,
+            )
+            .await
+        }
+        CommandExecution::NotebookStatus => Ok(notebook_status_result(&invocation)),
+        CommandExecution::NotebookReset => Ok(notebook_reset_result(&invocation).await),
     }
+}
+
+/// Run one notebook cell through the shared in-app kernel
+/// ([`crate::notebook`]) — the same kernel the human's TUI notebook pane
+/// drives, so agent and user share variables and history. Returns the
+/// standard command-tool result shape plus structured notebook extras
+/// (`result`, `images`, `execution_count`, `kernel_backend`).
+async fn execute_notebook(
+    runtime: &CommandToolRuntime,
+    code: &str,
+    timeout: Option<u64>,
+    reset: bool,
+    include_images_base64: bool,
+    invocation: &str,
+) -> Result<Value> {
+    // Point the kernel at PRISM's managed interpreter + the project root, the
+    // same environment the Python tool server runs in.
+    crate::notebook::configure(runtime.python_bin.clone(), runtime.project_root.clone());
+    if reset {
+        let _ = crate::notebook::reset().await;
+    }
+
+    let cell = match crate::notebook::execute(code, timeout, "agent").await {
+        Ok(cell) => cell,
+        // A spawn failure (e.g. Python missing) — surface the actionable
+        // message as an honest failure, not a crash.
+        Err(error) => {
+            return Ok(json!({
+                "root": "notebook",
+                "invocation": invocation,
+                "success": false,
+                "timed_out": false,
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": truncate_for_ui(&format!("{error:#}"), 30_000),
+            }));
+        }
+    };
+
+    // Compose the readable cell output the model sees in `stdout`.
+    let mut display = String::new();
+    if !cell.stdout.is_empty() {
+        display.push_str(&cell.stdout);
+    }
+    if let Some(result) = &cell.result {
+        if !display.is_empty() && !display.ends_with('\n') {
+            display.push('\n');
+        }
+        display.push_str(&format!("=> {result}"));
+    }
+    for path in &cell.image_paths {
+        if !display.is_empty() && !display.ends_with('\n') {
+            display.push('\n');
+        }
+        display.push_str(&format!("[plot saved: {path}]"));
+    }
+    if let Some(error) = &cell.error {
+        if !display.is_empty() && !display.ends_with('\n') {
+            display.push('\n');
+        }
+        display.push_str(error);
+    }
+
+    let images: Vec<Value> = cell
+        .image_paths
+        .iter()
+        .map(|path| {
+            let mut entry = json!({ "path": path });
+            if include_images_base64 && let Ok(bytes) = std::fs::read(path) {
+                use base64::Engine as _;
+                entry["base64"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+            }
+            entry
+        })
+        .collect();
+
+    Ok(json!({
+        "root": "notebook",
+        "invocation": invocation,
+        "success": cell.success,
+        "timed_out": false,
+        "exit_code": if cell.success { 0 } else { 1 },
+        "stdout": truncate_for_ui(&display, 30_000),
+        "stderr": truncate_for_ui(&cell.stderr, 30_000),
+        "execution_count": cell.execution_count,
+        "result": cell.result,
+        "error": cell.error,
+        "images": images,
+        "kernel_backend": crate::notebook::status().backend,
+    }))
+}
+
+fn notebook_status_result(invocation: &str) -> Value {
+    let status = crate::notebook::status();
+    let summary = if status.running {
+        format!(
+            "Kernel running — backend {}, Python {}, {} cell(s) this session.\n{}",
+            status.backend.as_deref().unwrap_or("?"),
+            status.python.as_deref().unwrap_or("?"),
+            status.cell_count,
+            status.detail.as_deref().unwrap_or(""),
+        )
+    } else {
+        format!(
+            "Kernel not running — it starts on the first notebook_exec. {} cell(s) recorded.",
+            status.cell_count
+        )
+    };
+    json!({
+        "root": "notebook",
+        "invocation": invocation,
+        "success": true,
+        "timed_out": false,
+        "exit_code": 0,
+        "stdout": summary.trim(),
+        "stderr": "",
+        "running": status.running,
+        "backend": status.backend,
+        "python": status.python,
+        "cell_count": status.cell_count,
+    })
+}
+
+async fn notebook_reset_result(invocation: &str) -> Value {
+    let outcome = crate::notebook::reset().await;
+    let (success, message) = match outcome {
+        Ok(()) => (true, "Notebook kernel reset — all cell state cleared."),
+        Err(_) => (false, "Notebook kernel reset encountered an error."),
+    };
+    json!({
+        "root": "notebook",
+        "invocation": invocation,
+        "success": success,
+        "timed_out": false,
+        "exit_code": if success { 0 } else { 1 },
+        "stdout": message,
+        "stderr": "",
+    })
 }
 
 /// `node up` / `node down` need supervision, not a fire-and-forget subprocess:
@@ -3215,6 +3474,47 @@ mod tests {
             workflow_run.input_schema["properties"]["values"]["type"],
             serde_json::json!("object")
         );
+    }
+
+    #[test]
+    fn notebook_tools_registered_with_correct_gating_and_schema() {
+        // The three notebook tools exist and resolve by name + alias.
+        assert!(is_command_tool("notebook_exec"));
+        assert!(is_command_tool("notebook_run"), "alias resolves");
+        assert!(is_command_tool("notebook_status"));
+        assert!(is_command_tool("notebook_reset"));
+
+        // Exec runs arbitrary code, so it is approval-gated at FullAccess;
+        // status is read-only and ungated.
+        assert_eq!(command_tool_requires_approval("notebook_exec"), Some(true));
+        assert_eq!(
+            command_tool_requires_approval("notebook_status"),
+            Some(false)
+        );
+
+        let tools = command_tools_filtered(true);
+        let exec = tools
+            .iter()
+            .find(|tool| tool.name == "notebook_exec")
+            .expect("notebook_exec offered");
+        assert_eq!(exec.permission_mode, PermissionMode::FullAccess);
+        // `code` is a required string; the schema forbids extra keys.
+        assert_eq!(exec.input_schema["required"], serde_json::json!(["code"]));
+        assert_eq!(
+            exec.input_schema["properties"]["code"]["type"],
+            serde_json::json!("string")
+        );
+    }
+
+    #[test]
+    fn notebook_exec_preview_truncates_code_blob() {
+        let long = "x".repeat(200);
+        let preview = command_tool_preview("notebook_exec", &json!({ "code": long }))
+            .expect("preview renders");
+        // Shows a bounded head + the total char count, never the whole blob.
+        assert!(preview.starts_with("notebook exec:"), "{preview}");
+        assert!(preview.contains("200 chars"), "{preview}");
+        assert!(preview.len() < 120, "preview stays short: {preview}");
     }
 
     #[test]
