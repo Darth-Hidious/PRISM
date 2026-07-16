@@ -7,6 +7,7 @@ use crate::gh::{self, GhPanel, GhTab};
 use crate::keymap;
 use crate::knowledge::{self, IngestPhase, KnowledgePane, KnowledgeTab};
 use crate::msg::{AgentMsg, parse_notification};
+use crate::notebook::{self, NotebookCell, NotebookPane};
 use crate::sanitize::sanitize_for_render;
 use crate::theme;
 use crate::toast::{self, ToastKind};
@@ -487,6 +488,8 @@ pub struct App {
     pub form: Option<FormPane>,
     /// Knowledge pane (Search | Ingest tabs + file browser).
     pub knowledge: KnowledgePane,
+    /// Notebook pane — the in-app Python notebook (kernel shared with agent).
+    pub notebook: NotebookPane,
 }
 
 impl App {
@@ -555,6 +558,7 @@ impl App {
             link_picker: LinkPicker::default(),
             form: None,
             knowledge: KnowledgePane::default(),
+            notebook: NotebookPane::default(),
         }
     }
 
@@ -579,6 +583,12 @@ impl App {
         // The Knowledge pane intercepts keys while open.
         if self.knowledge.open {
             self.handle_knowledge_key(key);
+            return;
+        }
+
+        // The Notebook pane intercepts keys while open.
+        if self.notebook.open {
+            self.handle_notebook_key(key);
             return;
         }
 
@@ -1658,6 +1668,77 @@ impl App {
         self.input.insert_str(prompt);
         self.focus = Focus::Input;
         self.toast("review the prompt, then Enter", ToastKind::Info);
+    }
+
+    // ── Notebook pane ────────────────────────────────────────────────
+
+    /// Open the notebook pane and ask the backend for the current kernel
+    /// state + cell log (so re-opening shows prior cells, not a blank pane).
+    pub fn open_notebook_pane(&mut self) {
+        self.notebook = NotebookPane::opened();
+        let _ = self.backend.send_command("/notebook open");
+    }
+
+    /// Keys while the Notebook pane is open. The code editor takes typed
+    /// input (Enter inserts a newline — cells are multi-line); Ctrl-R runs the
+    /// current cell (dispatching `/notebook run`); PgUp/PgDn scroll the cell
+    /// history; Esc / Ctrl-C close the pane. Editor keys are driven manually
+    /// (same reason as [`Self::handle_textarea_key`]: ratatui-crossterm mismatch).
+    fn handle_notebook_key(&mut self, key: KeyEvent) {
+        use ratatui_textarea::CursorMove;
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => self.notebook.open = false,
+                KeyCode::Char('r') => self.run_notebook_cell(),
+                KeyCode::Char('a') => self.notebook.input.move_cursor(CursorMove::Head),
+                KeyCode::Char('e') => self.notebook.input.move_cursor(CursorMove::End),
+                KeyCode::Char('u') => {
+                    self.notebook.input.delete_line_by_head();
+                }
+                KeyCode::Char('k') => {
+                    self.notebook.input.delete_line_by_end();
+                }
+                KeyCode::Char('w') => {
+                    self.notebook.input.delete_word();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.notebook.open = false,
+            KeyCode::Enter => self.notebook.input.insert_newline(),
+            KeyCode::Char(c) => self.notebook.input.insert_char(c),
+            KeyCode::Backspace => {
+                self.notebook.input.delete_char();
+            }
+            KeyCode::Delete => {
+                self.notebook.input.delete_next_char();
+            }
+            KeyCode::Left => self.notebook.input.move_cursor(CursorMove::Back),
+            KeyCode::Right => self.notebook.input.move_cursor(CursorMove::Forward),
+            KeyCode::Up => self.notebook.input.move_cursor(CursorMove::Up),
+            KeyCode::Down => self.notebook.input.move_cursor(CursorMove::Down),
+            KeyCode::Home => self.notebook.input.move_cursor(CursorMove::Head),
+            KeyCode::End => self.notebook.input.move_cursor(CursorMove::End),
+            KeyCode::PageUp => self.notebook.scroll = self.notebook.scroll.saturating_sub(5),
+            KeyCode::PageDown => self.notebook.scroll = self.notebook.scroll.saturating_add(5),
+            _ => {}
+        }
+    }
+
+    /// Run the notebook editor's current contents as one cell.
+    fn run_notebook_cell(&mut self) {
+        match notebook::run_command(&self.notebook.code()) {
+            Some(cmd) => {
+                self.notebook.running = true;
+                self.notebook.clear_input();
+                let _ = self.backend.send_command(&cmd);
+            }
+            None => self.toast("write some Python first", ToastKind::Warn),
+        }
     }
 
     // ── Which-key panel (`?`) ────────────────────────────────────────
@@ -2817,12 +2898,7 @@ impl App {
             // aliases that land on the right tab (muscle memory).
             "knowledge.open" | "sci.search" => self.open_knowledge_pane(KnowledgeTab::Search),
             "sci.ingest" => self.open_knowledge_pane(KnowledgeTab::Ingest),
-            "sci.notebook" => {
-                self.toast(
-                    "In-app notebooks are coming — agent-watched + editable (not wired yet).",
-                    ToastKind::Info,
-                );
-            }
+            "sci.notebook" => self.open_notebook_pane(),
             "help.show" => self.modal = Some(Modal::Help),
             "which_key.show" => self.open_which_key(),
             "theme.list" => self.open_theme_picker(),
@@ -3339,6 +3415,62 @@ impl App {
             AgentMsg::Error(e) => {
                 self.push_error(&e);
                 self.reset_stream_metrics();
+            }
+            AgentMsg::NotebookState {
+                running,
+                backend,
+                python,
+                cells,
+            } => {
+                let header =
+                    notebook::kernel_header(running, backend.as_deref(), python.as_deref());
+                let cells = cells.iter().map(NotebookCell::from_value).collect();
+                // A state push implies the notebook is in play — open the pane
+                // if it isn't already (e.g. the agent started using the kernel).
+                if !self.notebook.open {
+                    self.notebook = NotebookPane::opened();
+                }
+                self.notebook.apply_state(running, header, cells);
+            }
+            AgentMsg::NotebookCell {
+                cell,
+                running,
+                backend,
+                python,
+            } => {
+                let header =
+                    notebook::kernel_header(running, backend.as_deref(), python.as_deref());
+                let parsed = NotebookCell::from_value(&cell);
+                if self.notebook.open {
+                    self.notebook.apply_cell(parsed, Some(header));
+                } else {
+                    // Pane closed (e.g. the agent ran a cell mid-chat): surface
+                    // it as a compact chat line so the human still sees it.
+                    let origin = if parsed.origin == "agent" {
+                        "agent"
+                    } else {
+                        "notebook"
+                    };
+                    let body = if parsed.success {
+                        parsed
+                            .result
+                            .clone()
+                            .or_else(|| {
+                                (!parsed.stdout.trim().is_empty())
+                                    .then(|| parsed.stdout.trim().to_string())
+                            })
+                            .unwrap_or_else(|| "(ok)".to_string())
+                    } else {
+                        parsed
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "(error)".to_string())
+                    };
+                    self.push_system(&format!(
+                        "[{origin} notebook In[{}]] {body}",
+                        parsed.execution_count
+                    ));
+                }
             }
             AgentMsg::Unknown(_) => {}
         }

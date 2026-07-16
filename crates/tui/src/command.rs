@@ -140,10 +140,10 @@ pub static CATALOG: &[Command] = &[
     Command {
         id: "sci.notebook",
         title: "Notebook",
-        description: "Notebook session — coming in-app (agent-watched, editable)",
+        description: "Python notebook — persistent kernel shared with the agent",
         category: "Science",
-        keybind: "soon",
-        suggested: false,
+        keybind: "palette",
+        suggested: true,
     },
     // ── Goals (long-running discovery campaigns) ──────────────────────
     Command {
