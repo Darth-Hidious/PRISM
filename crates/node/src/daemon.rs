@@ -1092,6 +1092,73 @@ async fn handle_platform_message(
                 .await;
             });
         }
+        PlatformMessage::InvokeDeployment {
+            invocation_id,
+            deployment_id,
+            method,
+            path,
+            headers,
+            body,
+        } => {
+            tracing::info!(
+                %invocation_id, %deployment_id, %method, %path,
+                "deployment inference relayed from platform"
+            );
+
+            // Resolve the deployment's LOCAL endpoint from persisted state —
+            // the source of truth that survives platform reconnects (the
+            // in-session running map does not), the same fallback
+            // StopDeployment uses. No record → this node isn't serving it, so
+            // fail honestly instead of relaying into the void.
+            let Some(local_base) = resolve_local_deployment_base(&paths.state_dir, deployment_id)
+            else {
+                send_msg(
+                    outgoing_tx,
+                    &NodeMessage::DeploymentInvokeResult {
+                        invocation_id,
+                        status: 0,
+                        headers: std::collections::BTreeMap::new(),
+                        body: None,
+                        error: Some(format!(
+                            "deployment {deployment_id} is not running on this node"
+                        )),
+                    },
+                )
+                .await;
+                return;
+            };
+
+            // Relay in a task so heartbeats and other platform messages keep
+            // flowing while inference runs (same pattern as jobs / InvokeTool).
+            let tx = outgoing_tx.clone();
+            tokio::spawn(async move {
+                let msg = match relay_deployment_invoke(
+                    &local_base,
+                    &method,
+                    &path,
+                    &headers,
+                    body.as_ref(),
+                )
+                .await
+                {
+                    Ok((status, headers, body)) => NodeMessage::DeploymentInvokeResult {
+                        invocation_id,
+                        status,
+                        headers,
+                        body,
+                        error: None,
+                    },
+                    Err(error) => NodeMessage::DeploymentInvokeResult {
+                        invocation_id,
+                        status: 0,
+                        headers: std::collections::BTreeMap::new(),
+                        body: None,
+                        error: Some(error),
+                    },
+                };
+                send_msg(&tx, &msg).await;
+            });
+        }
     }
 }
 
@@ -1099,6 +1166,108 @@ async fn send_msg(tx: &mpsc::Sender<String>, msg: &NodeMessage) {
     if let Ok(json) = serde_json::to_string(msg) {
         tx.send(json).await.ok();
     }
+}
+
+/// Node-side HTTP timeout for a relayed inference request. Sits under the
+/// platform's own invoke budget (`deployments.rs` INVOKE_TIMEOUT_SECS = 120)
+/// plus the registry's +10s grace, so the node's honest response/error wins the
+/// race rather than the platform timing the invocation out first.
+const INVOKE_RELAY_TIMEOUT_SECS: u64 = 120;
+
+/// Local base URL (`{scheme}://{host}:{port}`, no path) for a deployment this
+/// node is currently serving, or `None` if it is not serving it. Derived from
+/// the persisted `ActiveDeploymentRecord::local_health_url` (the only stored
+/// local address) by dropping the health path.
+fn resolve_local_deployment_base(state_dir: &Path, deployment_id: Uuid) -> Option<String> {
+    let record = state::find_active_deployment(state_dir, deployment_id)
+        .ok()
+        .flatten()?;
+    let url = reqwest::Url::parse(&record.local_health_url).ok()?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    })
+}
+
+/// Relay one buffered HTTP request to a deployment's LOCAL endpoint and collect
+/// the response as the inference relay's `(status, headers, body)`. Failures
+/// (unsupported method, unreachable endpoint, unreadable body) surface as the
+/// `Err` string the caller puts in `DeploymentInvokeResult::error` — never a
+/// panic, never a fabricated status. Bodies are carried as JSON (the relay's
+/// documented shape); a non-JSON response body is dropped (status still
+/// forwarded) rather than corrupted.
+async fn relay_deployment_invoke(
+    local_base: &str,
+    method: &str,
+    path: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    body: Option<&serde_json::Value>,
+) -> std::result::Result<
+    (
+        u16,
+        std::collections::BTreeMap<String, String>,
+        Option<serde_json::Value>,
+    ),
+    String,
+> {
+    let http_method = reqwest::Method::from_bytes(method.as_bytes())
+        .map_err(|_| format!("unsupported HTTP method: {method}"))?;
+    let url = format!("{}{}", local_base.trim_end_matches('/'), path);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(INVOKE_RELAY_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+    let mut request = client.request(http_method, &url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    if let Some(body) = body {
+        let bytes = serde_json::to_vec(body)
+            .map_err(|e| format!("failed to serialize request body: {e}"))?;
+        request = request.body(bytes);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("could not reach the deployment endpoint at {url}: {e}"))?;
+
+    let status = response.status().as_u16();
+    let resp_headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("failed reading deployment response body: {e}"))?;
+
+    let body = if bytes.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                tracing::warn!(
+                    %url,
+                    "deployment response body was not JSON — the inference relay carries \
+                     JSON bodies only; forwarding status without body"
+                );
+                None
+            }
+        }
+    };
+
+    Ok((status, resp_headers, body))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2417,5 +2586,240 @@ mod tests {
             other => panic!("expected Denied, got {other:?}"),
         }
         envelopes[1].verify_signature().unwrap();
+    }
+
+    /// Deployment inference relay happy path: an `InvokeDeployment` for a
+    /// deployment this node is serving is forwarded to the deployment's LOCAL
+    /// endpoint (correct method + path), and the endpoint's response comes back
+    /// as a well-formed `DeploymentInvokeResult`. The stub returns a
+    /// distinctive body so a canned/echoed reply could not pass by accident.
+    #[tokio::test]
+    async fn invoke_deployment_relays_to_local_endpoint() {
+        let (endpoint_base, server) = spawn_stub_http_server(
+            1,
+            Arc::new(|request| {
+                assert!(
+                    request.starts_with("POST /v1/chat/completions "),
+                    "relay must hit the request path on the local endpoint, got: {}",
+                    request.lines().next().unwrap_or_default()
+                );
+                (
+                    200,
+                    serde_json::json!({"choices": [{"text": "relayed-ok"}]}).to_string(),
+                    "application/json",
+                )
+            }),
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let active_jobs = Arc::new(AtomicU32::new(0));
+        let running_jobs: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        let running_deployments: RunningDeployments = Arc::new(Mutex::new(HashMap::new()));
+
+        // The node must already be serving this deployment — its persisted
+        // record points at the stub as the LOCAL endpoint.
+        let deployment_id = Uuid::new_v4();
+        state::register_active_deployment(
+            &paths.state_dir,
+            state::ActiveDeploymentRecord {
+                deployment_id,
+                backend: "runtime".to_string(),
+                handle: deployment_id.to_string(),
+                runtime_url: None,
+                endpoint_url: "http://node.example.com:9001".to_string(),
+                local_health_url: format!("{endpoint_base}/health"),
+                started_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let invocation_id = Uuid::new_v4();
+        let msg = PlatformMessage::InvokeDeployment {
+            invocation_id,
+            deployment_id,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            headers: std::collections::BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            body: Some(serde_json::json!({"model": "m", "messages": []})),
+        };
+        let text = serde_json::to_string(&msg).unwrap();
+
+        handle_platform_message(
+            &paths,
+            &text,
+            &tx,
+            &active_jobs,
+            &running_jobs,
+            &running_deployments,
+            None,
+            None,
+        )
+        .await;
+
+        let reply: NodeMessage =
+            serde_json::from_str(&rx.recv().await.expect("a reply must be sent")).unwrap();
+        match reply {
+            NodeMessage::DeploymentInvokeResult {
+                invocation_id: id,
+                status,
+                body,
+                error,
+                ..
+            } => {
+                assert_eq!(id, invocation_id);
+                assert_eq!(status, 200);
+                assert!(
+                    error.is_none(),
+                    "reachable endpoint → no error, got {error:?}"
+                );
+                assert_eq!(
+                    body.as_ref().and_then(|b| b["choices"][0]["text"].as_str()),
+                    Some("relayed-ok")
+                );
+            }
+            other => panic!("expected DeploymentInvokeResult, got {other:?}"),
+        }
+
+        server.join().unwrap();
+    }
+
+    /// Error path: the deployment is registered but its LOCAL endpoint is down.
+    /// The relay must answer with `error` set (honest unreachability) and a
+    /// zeroed status — never a fabricated response, never a panic.
+    #[tokio::test]
+    async fn invoke_deployment_reports_error_when_endpoint_down() {
+        // Reserve an ephemeral port, then drop the listener so nothing accepts.
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let active_jobs = Arc::new(AtomicU32::new(0));
+        let running_jobs: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        let running_deployments: RunningDeployments = Arc::new(Mutex::new(HashMap::new()));
+
+        let deployment_id = Uuid::new_v4();
+        state::register_active_deployment(
+            &paths.state_dir,
+            state::ActiveDeploymentRecord {
+                deployment_id,
+                backend: "runtime".to_string(),
+                handle: deployment_id.to_string(),
+                runtime_url: None,
+                endpoint_url: "http://node.example.com:9001".to_string(),
+                local_health_url: format!("http://127.0.0.1:{dead_port}/health"),
+                started_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let invocation_id = Uuid::new_v4();
+        let msg = PlatformMessage::InvokeDeployment {
+            invocation_id,
+            deployment_id,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            headers: std::collections::BTreeMap::new(),
+            body: Some(serde_json::json!({"model": "m"})),
+        };
+        let text = serde_json::to_string(&msg).unwrap();
+
+        handle_platform_message(
+            &paths,
+            &text,
+            &tx,
+            &active_jobs,
+            &running_jobs,
+            &running_deployments,
+            None,
+            None,
+        )
+        .await;
+
+        let reply: NodeMessage =
+            serde_json::from_str(&rx.recv().await.expect("a reply must be sent")).unwrap();
+        match reply {
+            NodeMessage::DeploymentInvokeResult {
+                invocation_id: id,
+                status,
+                body,
+                error,
+                ..
+            } => {
+                assert_eq!(id, invocation_id);
+                assert_eq!(status, 0);
+                assert!(body.is_none());
+                assert!(
+                    error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("could not reach the deployment endpoint")),
+                    "must honestly report unreachability, got {error:?}"
+                );
+            }
+            other => panic!("expected DeploymentInvokeResult, got {other:?}"),
+        }
+    }
+
+    /// A deployment this node is NOT serving must fail honestly (no relay
+    /// attempt at all), naming the missing deployment.
+    #[tokio::test]
+    async fn invoke_deployment_unknown_deployment_fails_honestly() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let active_jobs = Arc::new(AtomicU32::new(0));
+        let running_jobs: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        let running_deployments: RunningDeployments = Arc::new(Mutex::new(HashMap::new()));
+
+        let invocation_id = Uuid::new_v4();
+        let msg = PlatformMessage::InvokeDeployment {
+            invocation_id,
+            deployment_id: Uuid::new_v4(),
+            method: "GET".into(),
+            path: "/health".into(),
+            headers: std::collections::BTreeMap::new(),
+            body: None,
+        };
+        let text = serde_json::to_string(&msg).unwrap();
+
+        handle_platform_message(
+            &paths,
+            &text,
+            &tx,
+            &active_jobs,
+            &running_jobs,
+            &running_deployments,
+            None,
+            None,
+        )
+        .await;
+
+        let reply: NodeMessage =
+            serde_json::from_str(&rx.recv().await.expect("a reply must be sent")).unwrap();
+        match reply {
+            NodeMessage::DeploymentInvokeResult {
+                invocation_id: id,
+                status,
+                error,
+                ..
+            } => {
+                assert_eq!(id, invocation_id);
+                assert_eq!(status, 0);
+                assert!(
+                    error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("not running on this node")),
+                    "got {error:?}"
+                );
+            }
+            other => panic!("expected DeploymentInvokeResult, got {other:?}"),
+        }
     }
 }

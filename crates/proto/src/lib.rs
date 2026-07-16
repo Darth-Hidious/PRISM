@@ -196,6 +196,25 @@ pub enum NodeMessage {
         ok: bool,
         result: serde_json::Value,
     },
+    /// Result of a relayed deployment inference request
+    /// ([`PlatformMessage::InvokeDeployment`]) — the tool-relay pattern applied
+    /// to HTTP, with an HTTP-faithful payload. Mirrors the platform's
+    /// `NodeMessage::DeploymentInvokeResult` (marc27-core
+    /// `crates/protocol/src/messages.rs`) byte-for-byte: `body`/`error` carry no
+    /// `skip_serializing_if`, so a `None` serializes as explicit `null` exactly
+    /// as the platform emits and expects.
+    DeploymentInvokeResult {
+        invocation_id: Uuid,
+        /// HTTP status the local endpoint answered with.
+        status: u16,
+        /// Response headers, forwarded verbatim.
+        headers: BTreeMap<String, String>,
+        /// Response body (bytes-as-JSON for now; streaming is a follow-up).
+        body: Option<serde_json::Value>,
+        /// Set when the node could not reach the local endpoint at all —
+        /// `status`/`body` are then meaningless and must not be trusted.
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -239,6 +258,30 @@ pub enum PlatformMessage {
         args: serde_json::Value,
         caller_user_id: Uuid,
         timeout_secs: u64,
+    },
+    /// Relay an HTTP inference request to a deployment served on this node (the
+    /// deployment inference relay — [`InvokeTool`]'s pattern applied to HTTP).
+    /// The node resolves `deployment_id` to the deployment's LOCAL endpoint
+    /// (LAN/127.0.0.1 — reachable FROM the node, not the platform), performs
+    /// `{method} {endpoint}{path}` and answers with
+    /// [`NodeMessage::DeploymentInvokeResult`] carrying the same
+    /// `invocation_id`. One buffered response; SSE/streaming is a follow-up.
+    /// Mirrors the platform's `PlatformMessage::InvokeDeployment` (marc27-core
+    /// `crates/protocol/src/messages.rs`).
+    ///
+    /// [`InvokeTool`]: PlatformMessage::InvokeTool
+    InvokeDeployment {
+        invocation_id: Uuid,
+        deployment_id: Uuid,
+        /// HTTP method (GET | POST | …).
+        method: String,
+        /// Path appended to the local endpoint (e.g. "/v1/chat/completions").
+        path: String,
+        /// Request headers, forwarded verbatim.
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+        /// Request body (bytes-as-JSON for now).
+        body: Option<serde_json::Value>,
     },
     Ping,
     Error {
@@ -586,6 +629,115 @@ mod tests {
         } else {
             panic!("expected InvokeTool");
         }
+    }
+
+    // ── Deployment inference relay: cross-compat with the platform ──────
+    //
+    // The platform (marc27-core `crates/protocol/src/messages.rs`) is the
+    // source of truth for these two frames. These tests pin the PRISM frames
+    // to the platform's exact wire shape (snake_case tag, field names, field
+    // order, null-for-None on body/error) and prove PRISM parses the literal
+    // JSON the platform emits — a mismatched frame would make a deployed model
+    // uninvokable.
+
+    #[test]
+    fn invoke_deployment_matches_platform_wire() {
+        // Same values as marc27-core's `serialize_invoke_deployment` vector.
+        let msg = PlatformMessage::InvokeDeployment {
+            invocation_id: Uuid::nil(),
+            deployment_id: Uuid::nil(),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: Some(serde_json::json!({"model": "llama", "messages": []})),
+        };
+
+        // Shape parity: tag + every field name/value the platform emits.
+        let value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(value["type"], "invoke_deployment");
+        assert_eq!(value["invocation_id"], Uuid::nil().to_string());
+        assert_eq!(value["deployment_id"], Uuid::nil().to_string());
+        assert_eq!(value["method"], "POST");
+        assert_eq!(value["path"], "/v1/chat/completions");
+        assert_eq!(value["headers"]["content-type"], "application/json");
+        assert_eq!(value["body"]["model"], "llama");
+
+        // The exact JSON the platform emits must parse back into the PRISM
+        // frame (proves snake_case tag + field names are byte-compatible).
+        let platform_wire = r#"{"type":"invoke_deployment","invocation_id":"00000000-0000-0000-0000-000000000000","deployment_id":"00000000-0000-0000-0000-000000000000","method":"POST","path":"/v1/chat/completions","headers":{"content-type":"application/json"},"body":{"model":"llama","messages":[]}}"#;
+        let parsed: PlatformMessage = serde_json::from_str(platform_wire).unwrap();
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn invoke_deployment_tolerates_omitted_headers_and_body() {
+        // The platform's health probe sends no body; `headers` is `#[serde(
+        // default)]` and `body` is `Option`, so both may be absent on the wire.
+        let wire = r#"{"type":"invoke_deployment","invocation_id":"00000000-0000-0000-0000-000000000000","deployment_id":"00000000-0000-0000-0000-000000000000","method":"GET","path":"/health"}"#;
+        let parsed: PlatformMessage = serde_json::from_str(wire).unwrap();
+        match parsed {
+            PlatformMessage::InvokeDeployment {
+                method,
+                path,
+                headers,
+                body,
+                ..
+            } => {
+                assert_eq!(method, "GET");
+                assert_eq!(path, "/health");
+                assert!(headers.is_empty());
+                assert!(body.is_none());
+            }
+            other => panic!("expected InvokeDeployment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deployment_invoke_result_matches_platform_wire() {
+        // Same values as marc27-core's `serialize_deployment_invoke_result`.
+        let msg = NodeMessage::DeploymentInvokeResult {
+            invocation_id: Uuid::nil(),
+            status: 200,
+            headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: Some(serde_json::json!({"choices": []})),
+            error: None,
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"deployment_invoke_result\""));
+        assert!(json.contains("\"status\":200"));
+
+        // `error: None` MUST serialize as explicit `null` (no
+        // skip_serializing_if) — this is how the platform emits it and how its
+        // `NodeMessage::DeploymentInvokeResult` reads it back.
+        let value = serde_json::to_value(&msg).unwrap();
+        assert!(value.get("error").is_some());
+        assert!(value["error"].is_null());
+        assert!(value.get("body").is_some());
+
+        let back: NodeMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn deployment_invoke_result_error_matches_platform_wire() {
+        // The honest-failure shape (node could not reach the local endpoint) —
+        // marc27-core's `serialize_deployment_invoke_result_error` vector.
+        let msg = NodeMessage::DeploymentInvokeResult {
+            invocation_id: Uuid::nil(),
+            status: 0,
+            headers: BTreeMap::new(),
+            body: None,
+            error: Some("connection refused (is the container running?)".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: NodeMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+
+        // The platform reads exactly this wire shape off the node socket.
+        let platform_wire = r#"{"type":"deployment_invoke_result","invocation_id":"00000000-0000-0000-0000-000000000000","status":0,"headers":{},"body":null,"error":"connection refused (is the container running?)"}"#;
+        let parsed: NodeMessage = serde_json::from_str(platform_wire).unwrap();
+        assert_eq!(parsed, msg);
     }
 
     #[test]

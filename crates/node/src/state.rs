@@ -125,6 +125,19 @@ pub fn active_deployments(state_dir: &Path) -> Result<Vec<ActiveDeploymentRecord
         .collect())
 }
 
+/// The persisted record for a single deployment, or `None` if this node is not
+/// serving it. The record survives platform reconnects (unlike the in-session
+/// running map), so it is the source of truth for resolving a deployment's
+/// local endpoint when relaying an inference request.
+pub fn find_active_deployment(
+    state_dir: &Path,
+    deployment_id: Uuid,
+) -> Result<Option<ActiveDeploymentRecord>> {
+    Ok(load_active_deployments(state_dir)?
+        .deployments
+        .remove(&deployment_id))
+}
+
 pub fn write_shutdown_request(state_dir: &Path) -> Result<()> {
     fs::create_dir_all(state_dir)?;
     fs::write(shutdown_file_path(state_dir), b"shutdown\n")
