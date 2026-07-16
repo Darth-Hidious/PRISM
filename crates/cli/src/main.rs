@@ -3253,9 +3253,22 @@ async fn main() -> Result<()> {
                     .error_for_status()?
                     .json()
                     .await?;
-                let state = run.get("state").and_then(|s| s.as_str()).unwrap_or("");
+                // Read the terminal state from `state` (primary) or `status`
+                // (fallback), and accept the full success/failure vocabulary the
+                // platform uses. This mirrors the sibling `run_ingest_job` poll
+                // loop and the verified Python client (`app/tools/agent_runs.py`,
+                // shape verified 2026-07-02): the `/agent-runs` orchestrator may
+                // report success as "succeeded"/"done" (not only "completed"),
+                // and cancel as "cancelled". Matching only "completed" here would
+                // hang the research leg until the 10-min deadline on a run that
+                // actually finished.
+                let state = run
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .or_else(|| run.get("status").and_then(|s| s.as_str()))
+                    .unwrap_or("");
                 match state {
-                    "completed" => {
+                    "completed" | "succeeded" | "done" => {
                         break serde_json::json!({
                             "run_id": run_id,
                             "answer": run.get("answer").cloned().unwrap_or(serde_json::Value::Null),
@@ -3263,7 +3276,7 @@ async fn main() -> Result<()> {
                                 .unwrap_or_else(|| serde_json::json!([])),
                         });
                     }
-                    "failed" | "canceled" => {
+                    "failed" | "canceled" | "cancelled" => {
                         let err = run
                             .get("error")
                             .and_then(|e| e.as_str())
