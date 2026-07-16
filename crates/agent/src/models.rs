@@ -199,6 +199,23 @@ const SEED: &[ModelConfig] = &[
         false,
     ),
     // --- OpenAI ---
+    // Legacy GPT-4 at its real list prices ($30/$60, 8k ctx; turbo $10/$30,
+    // 128k). Seeded so bare `gpt-4` resolves EXACTLY instead of
+    // family-aliasing to the ~15x-cheaper gpt-4.1.
+    seed(
+        "gpt-4", "openai", 8_192, 8_192, 4_096, 30.00, 60.00, false, false,
+    ),
+    seed(
+        "gpt-4-turbo",
+        "openai",
+        128_000,
+        4_096,
+        4_096,
+        10.00,
+        30.00,
+        false,
+        false,
+    ),
     seed(
         "gpt-4o", "openai", 128_000, 16_384, 8_192, 2.50, 10.00, false, false,
     ),
@@ -583,6 +600,11 @@ pub fn save_catalog_cache(models: &[serde_json::Value]) -> Result<PathBuf> {
 
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 16_384;
 
+/// Upper bound on token limits accepted from the catalog/cache. The largest
+/// real context window today is ~10M tokens; 100M leaves headroom while
+/// keeping a poisoned cache's `u64::MAX` out of live budget math.
+const MAX_SANE_TOKEN_LIMIT: u64 = 100_000_000;
+
 /// Intern a dynamic string. The registry is built at most once per
 /// (re)load, so the leak is bounded: a few hundred bytes per model id,
 /// re-leaked only on explicit `reload()` (i.e. after registering a model
@@ -616,11 +638,12 @@ fn catalog_entry_to_config(v: &serde_json::Value) -> Option<ModelConfig> {
         .get("model_id")
         .or_else(|| v.get("id"))
         .and_then(|x| x.as_str())?;
-    // A positive u64; 0 or absurd → treat as absent (use the default).
+    // A u64 within sane bounds; 0 or absurd (> [`MAX_SANE_TOKEN_LIMIT`],
+    // e.g. a poisoned cache's u64::MAX) → treat as absent (use the default).
     let get_usize = |keys: &[&str]| {
         keys.iter()
             .find_map(|k| v.get(*k).and_then(|x| x.as_u64()))
-            .filter(|x| *x > 0)
+            .filter(|x| (1..=MAX_SANE_TOKEN_LIMIT).contains(x))
             .map(|x| x as usize)
     };
     let get_bool = |k: &str| v.get(k).and_then(serde_json::Value::as_bool);
@@ -734,11 +757,12 @@ pub fn estimate_cost(usage: &UsageInfo, config: &ModelConfig) -> f64 {
 // get_model_config — lookup with fallback chain
 // ---------------------------------------------------------------------------
 
-/// Minimum query length before the fuzzy (suffix/prefix) steps engage.
-/// Shorter queries (`""`, `"g"`, `"o3"`) are too ambiguous to resolve
-/// safely — they fall through to UNKNOWN rather than silently matching
-/// whatever ranks top. (Every real short id like `o3` is in the seed and
-/// hits the exact-match step long before this.)
+/// Minimum query length before the prefix step (step 4) engages. Shorter
+/// queries (`""`, `"g"`, `"o3"`) are too ambiguous to family-alias safely —
+/// they fall through to UNKNOWN rather than silently matching whatever
+/// ranks top. The exact-tail suffix step (step 3) is exempt: it matches the
+/// bare name EXACTLY, so a real short id present only router-style in the
+/// catalog (`openai/o1`) still resolves.
 const MIN_FUZZY_LEN: usize = 3;
 
 /// Look up model configuration by ID.
@@ -751,7 +775,8 @@ const MIN_FUZZY_LEN: usize = 3;
 /// 4. Prefix match — but only up to a token boundary (`-`/`.`/`/`), so
 ///    `o3` never grabs `o3-mini`; newest + most-canonical provider wins.
 ///
-/// Steps 3–4 require a query of at least [`MIN_FUZZY_LEN`] chars and
+/// Step 4 requires a query of at least [`MIN_FUZZY_LEN`] chars (step 3 is
+/// an exact-tail match, so real short ids like `o1` still resolve). Both
 /// `tracing::debug` the resolved id so fuzzy hits are observable, not
 /// silent. No match → honest UNKNOWN, logged once per id.
 ///
@@ -815,12 +840,13 @@ fn lookup(reg: &HashMap<String, ModelConfig>, model_id: &str) -> Option<ModelCon
     {
         return Some(*cfg);
     }
-    // Fuzzy steps only for queries long enough to be unambiguous.
-    if model_id.len() < MIN_FUZZY_LEN {
-        return None;
-    }
-    // 3. Bare-name suffix: `glm-5.2` → catalog id `z-ai/glm-5.2` (exact tail).
-    if !model_id.contains('/')
+    // 3. Bare-name suffix: `glm-5.2` → catalog id `z-ai/glm-5.2`. This is
+    //    an EXACT-tail match, so it takes no length gate — its only
+    //    ambiguity (cross-provider) is resolved by `best_fuzzy`'s
+    //    provider_rank, and a real short id present only router-style
+    //    (`openai/o1`) must still resolve.
+    if !model_id.is_empty()
+        && !model_id.contains('/')
         && let Some((id, cfg)) = best_fuzzy(
             reg.iter()
                 .filter(|(key, _)| key.split_once('/').map(|(_, tail)| tail) == Some(model_id)),
@@ -832,6 +858,10 @@ fn lookup(reg: &HashMap<String, ModelConfig>, model_id: &str) -> Option<ModelCon
             "model resolved by suffix match"
         );
         return Some(cfg);
+    }
+    // Prefix matching only for queries long enough to be unambiguous.
+    if model_id.len() < MIN_FUZZY_LEN {
+        return None;
     }
     // 4. Prefix match — bounded at a token boundary, newest/canonical wins.
     if let Some((id, cfg)) = best_fuzzy(
@@ -899,14 +929,17 @@ const UNKNOWN_MODEL_CONFIG: ModelConfig = ModelConfig {
 ///
 /// Two kinds of digit run are *ignored* so they can't masquerade as a
 /// higher version:
-///  - date stamps (≥ 6 digits, e.g. `-20250514`) — a dated snapshot must
-///    not outrank the clean `-4-6`;
+///  - date stamps — compact (≥ 6 digits, e.g. `-20250514`) or dashed
+///    `YYYY-MM-DD` (e.g. `-2025-01-31`) — a dated snapshot must not
+///    outrank the clean `-4-6` or the family's `-pro`;
 ///  - param-count / size tokens (a run followed by `b`/`m`/`k`, e.g. `34b`,
 ///    `72b`) — `yi-34b` must not outrank `claude-…-5` on "34 > 5".
 #[must_use]
 pub fn recency_key(id: &str) -> Vec<u64> {
     let bytes = id.as_bytes();
-    let mut out = Vec::new();
+    // Pass 1: collect digit runs as byte ranges so pass 2 can inspect the
+    // separators between them.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if !bytes[i].is_ascii_digit() {
@@ -917,14 +950,49 @@ pub fn recency_key(id: &str) -> Vec<u64> {
         while i < bytes.len() && bytes[i].is_ascii_digit() {
             i += 1;
         }
-        let digits = &id[start..i];
-        let followed_by_size =
-            matches!(bytes.get(i), Some(b'b' | b'B' | b'm' | b'M' | b'k' | b'K'));
-        if digits.len() < 6 && !followed_by_size {
-            out.push(digits.parse().unwrap_or(0));
+        runs.push((start, i));
+    }
+    // Pass 2: mark non-version runs. Compact dates and size tokens first…
+    let mut skip = vec![false; runs.len()];
+    for (idx, &(start, end)) in runs.iter().enumerate() {
+        let followed_by_size = matches!(
+            bytes.get(end),
+            Some(b'b' | b'B' | b'm' | b'M' | b'k' | b'K')
+        );
+        if end - start >= 6 || followed_by_size {
+            skip[idx] = true;
         }
     }
-    out
+    // …then dashed date stamps: a plausible-`YYYY-MM-DD` triple of
+    // consecutive '-'-joined runs is one date, not three version parts.
+    let joined_by_dash =
+        |prev_end: usize, next_start: usize| next_start == prev_end + 1 && bytes[prev_end] == b'-';
+    let in_range = |range: std::ops::RangeInclusive<u64>, start: usize, end: usize| {
+        id[start..end]
+            .parse::<u64>()
+            .is_ok_and(|n| range.contains(&n))
+    };
+    for (idx, w) in runs.windows(3).enumerate() {
+        let ((ys, ye), (ms, me), (ds, de)) = (w[0], w[1], w[2]);
+        if ye - ys == 4
+            && me - ms <= 2
+            && de - ds <= 2
+            && joined_by_dash(ye, ms)
+            && joined_by_dash(me, ds)
+            && in_range(1900..=2099, ys, ye)
+            && in_range(1..=12, ms, me)
+            && in_range(1..=31, ds, de)
+        {
+            skip[idx] = true;
+            skip[idx + 1] = true;
+            skip[idx + 2] = true;
+        }
+    }
+    runs.iter()
+        .zip(skip.iter())
+        .filter(|&(_, &skipped)| !skipped)
+        .map(|(&(start, end), _)| id[start..end].parse().unwrap_or(0))
+        .collect()
 }
 
 /// All registered models (user config + catalog cache + seed), newest
@@ -1157,6 +1225,27 @@ supports_thinking = true
             sane_price(&serde_json::json!({ "p": f64::INFINITY }), "p"),
             0.0
         );
+        // R2 hardening: absurdly large limits (a poisoned cache's u64::MAX)
+        // fall back to the defaults too — "0 or absurd" means it.
+        let v = serde_json::json!({
+            "model_id": "junk-2",
+            "provider": "acme",
+            "context_window": u64::MAX,
+            "max_output_tokens": u64::MAX,
+        });
+        let cfg = catalog_entry_to_config(&v).unwrap();
+        assert_eq!(cfg.context_window, 128_000);
+        assert_eq!(cfg.max_output_tokens, 16_384);
+        assert_eq!(cfg.default_max_tokens, 16_384);
+        // The bound is inclusive: a real 100M-token window would survive.
+        let v = serde_json::json!({
+            "model_id": "big-1", "provider": "acme",
+            "context_window": MAX_SANE_TOKEN_LIMIT,
+        });
+        assert_eq!(
+            catalog_entry_to_config(&v).unwrap().context_window,
+            100_000_000
+        );
     }
 
     #[test]
@@ -1241,16 +1330,60 @@ supports_thinking = true
         // `gpt-4` must not grab `gpt-4o`, `o3-min` must not grab `o3-mini`.
         assert_ne!(lookup(&reg, "gpt-4").map(|c| c.id), Some("gpt-4o"));
         assert!(lookup(&reg, "o3-min").is_none(), "mid-token, no boundary");
-        // Too-short queries never fuzzy-match (→ UNKNOWN).
+        // Too-short queries never prefix-match (→ UNKNOWN).
         assert!(lookup(&reg, "o").is_none());
         assert!(lookup(&reg, "").is_none());
         // A real family prefix ending on a boundary still resolves.
         assert_eq!(lookup(&reg, "claude-sonnet").unwrap().provider, "anthropic");
-        assert_eq!(
-            lookup(&reg, "gpt-4").unwrap().id,
-            "gpt-4.1",
-            "newest gpt-4.x"
-        );
+        // `gpt-4` is seeded (real legacy GPT-4), so the exact match wins —
+        // it never family-aliases to the much cheaper gpt-4.1.
+        assert_eq!(lookup(&reg, "gpt-4").unwrap().id, "gpt-4");
+    }
+
+    #[test]
+    fn bare_gpt4_resolves_to_seeded_real_gpt4_not_family_alias() {
+        // R2 honesty fix: a user pointing at REAL OpenAI gpt-4 must get its
+        // real 8k/$30/$60 config, not gpt-4.1's ~15x-lower pricing.
+        let reg = build_registry_from(&[], &[]);
+        let cfg = lookup(&reg, "gpt-4").expect("gpt-4 in seed");
+        assert_eq!(cfg.id, "gpt-4");
+        assert_eq!(cfg.provider, "openai");
+        assert_eq!(cfg.context_window, 8_192);
+        assert!((cfg.input_price_per_mtok - 30.0).abs() < f64::EPSILON);
+        assert!((cfg.output_price_per_mtok - 60.0).abs() < f64::EPSILON);
+        let turbo = lookup(&reg, "gpt-4-turbo").expect("gpt-4-turbo in seed");
+        assert_eq!(turbo.id, "gpt-4-turbo");
+        assert_eq!(turbo.context_window, 128_000);
+        assert!((turbo.input_price_per_mtok - 10.0).abs() < f64::EPSILON);
+        assert!((turbo.output_price_per_mtok - 30.0).abs() < f64::EPSILON);
+        // Family-prefix aliasing still works for genuinely-absent ids.
+        assert_eq!(lookup(&reg, "gpt-4.1").unwrap().id, "gpt-4.1");
+        assert_eq!(lookup(&reg, "claude-opus").unwrap().id, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn short_bare_id_resolves_via_exact_tail_suffix() {
+        // R2 regression fix: a real short id present ONLY router-style in
+        // the catalog (`openai/o1`) + bare query `o1` must resolve with its
+        // real cost — the MIN_FUZZY_LEN gate applies to the prefix step
+        // only, not the exact-tail suffix step.
+        let catalog = vec![
+            serde_json::json!({ "model_id": "openai/o1", "provider": "openai",
+                "context_window": 200_000, "input_price": 15.0, "output_price": 60.0 }),
+            serde_json::json!({ "model_id": "openai/o1-mini", "provider": "openai",
+                "context_window": 128_000, "input_price": 1.10, "output_price": 4.40 }),
+        ];
+        let reg = build_registry_from(&[], &catalog);
+        let cfg = lookup(&reg, "o1").expect("short bare id via exact-tail suffix");
+        assert_eq!(cfg.id, "openai/o1", "exact tail — never grabs o1-mini");
+        assert!((cfg.input_price_per_mtok - 15.0).abs() < f64::EPSILON);
+        assert!((cfg.output_price_per_mtok - 60.0).abs() < f64::EPSILON);
+        // With only the neighbour present, `o1` stays unresolved (no tail
+        // equals it, and it is too short to prefix-match).
+        let reg = build_registry_from(&[], &catalog[1..]);
+        assert!(lookup(&reg, "o1").is_none());
+        // Degenerate empty query never suffix-matches.
+        assert!(lookup(&reg, "").is_none());
     }
 
     #[test]
@@ -1281,6 +1414,23 @@ supports_thinking = true
         // Genuine versions still compare correctly.
         assert!(recency_key("glm-5.2") > recency_key("glm-5"));
         assert_eq!(recency_key("gpt-4o"), vec![4]);
+    }
+
+    #[test]
+    fn recency_key_ignores_dashed_date_stamps() {
+        // R2: OpenAI's real snapshot format is dashed — the date must not
+        // masquerade as a higher version within the family.
+        assert_eq!(recency_key("o3-mini-2025-01-31"), vec![3]);
+        assert!(recency_key("o3-mini-2025-01-31") <= recency_key("o3-pro"));
+        assert!(recency_key("gpt-4.1") > recency_key("gpt-4-2025-11-20"));
+        assert_eq!(recency_key("claude-3-5-sonnet-2024-10-22"), vec![3, 5]);
+        // Near-misses stay version components: implausible month, and
+        // non-dash separators.
+        assert_eq!(recency_key("foo-2025-13-01"), vec![2025, 13, 1]);
+        assert_eq!(recency_key("bar-2024.1"), vec![2024, 1]);
+        // Compact stamps and plain versions are unchanged.
+        assert_eq!(recency_key("claude-sonnet-4-20250514"), vec![4]);
+        assert_eq!(recency_key("claude-sonnet-4-6"), vec![4, 6]);
     }
 
     #[test]
