@@ -4388,9 +4388,10 @@ async fn handle_publish_slash_command(
     Ok(true)
 }
 
-/// Assemble the `values` map for a slash-command workflow run, threading the
-/// two pieces of runtime context the interactive slash path historically
-/// dropped (the CLI and agent-tool paths already thread both):
+/// Assemble the `values` map for a workflow run, threading the two pieces of
+/// runtime context a launcher must supply for hands-off execution. Shared by
+/// every launch surface that holds a resolved [`LlmConfig`] — the interactive
+/// slash path and the node's HTTP `run_workflow` handler:
 ///
 ///  * **`_node_token`** (execute mode only) — a workflow's `tool` steps call
 ///    the auth-gated node (`POST /api/tools/{name}/run`); without this
@@ -4400,12 +4401,12 @@ async fn handle_publish_slash_command(
 ///    silently succeeding.
 ///  * **`llm_base_url` / `llm_model`** — a workflow's `llm_*` steps otherwise
 ///    resolve to the engine's built-in localhost default; injecting the
-///    agent's resolved chat endpoint (the SAME `LlmConfig` the chat path uses)
-///    points them at the real model.
+///    resolved chat endpoint (the SAME `LlmConfig` the chat path uses) points
+///    them at the real model.
 ///
 /// A caller-supplied value (via `--set`) always wins — `or_insert` never
 /// clobbers it.
-fn assemble_workflow_run_values(
+pub fn assemble_workflow_run_values(
     mut values: BTreeMap<String, String>,
     execute: bool,
     node_token: Option<String>,

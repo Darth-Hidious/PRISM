@@ -179,9 +179,11 @@ tool_is_destructive if {
 }
 
 # Workflows the agent can run without human approval.
-# NOTE: `workflow.execute` only clears the workflow for launch — every `tool`
-# step inside it is still policy-checked individually (destructive tools stay
-# admin-gated), so allowlisting a workflow does not loosen tool policy.
+# NOTE: allowlisting here only clears the workflow to LAUNCH. It grants no tool
+# permission: each `tool` step is still evaluated on its own `tool.call` rule.
+# The workflows below happen to use only non-destructive tools, so those steps
+# are permitted anyway — but a step that DID invoke a destructive tool would
+# still be admin-gated regardless of this list. So this never loosens tool policy.
 agent_approved_workflows := {
     "train-indexer",
     "forge",

@@ -3019,8 +3019,10 @@ async fn execute_workflow_command(
             // Authenticate the workflow's `tool` steps to the local node.
             // Execute mode only — dry runs plan without calling tools.
             let mut values = values.clone();
+            // `or_insert`: an explicit workflow `_node_token` value wins over
+            // the minted one (consistent with the slash/CLI paths).
             if *execute && let Some(token) = mint_agent_node_token().await {
-                values.insert("_node_token".to_string(), token);
+                values.entry("_node_token".to_string()).or_insert(token);
             }
             // Point `llm_*` steps at the resolved chat endpoint (the SAME
             // config the agent's chat path uses). `or_insert` lets an explicit

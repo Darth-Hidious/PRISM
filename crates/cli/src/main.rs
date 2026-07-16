@@ -4043,11 +4043,13 @@ async fn handle_workflow_command(
             };
             let mut values = parse_set_pairs(&pairs)?;
             // Only execute-mode runs actually call tools (dry runs plan only).
+            // `or_insert`: an explicit `--set _node_token=…` wins over the
+            // minted one (consistent with the slash/agent paths).
             if execute && let Some(token) = mint_workflow_node_token(paths).await {
-                values.insert("_node_token".to_string(), token);
+                values.entry("_node_token".to_string()).or_insert(token);
             }
             // Point `llm_*` steps at the resolved chat endpoint.
-            inject_workflow_llm_endpoint(&mut values, project_root);
+            inject_workflow_llm_endpoint(&mut values, project_root, paths);
             let result = execute_workflow(spec, &values, execute).await?;
             render_workflow_result(spec, &result);
         }
@@ -4070,13 +4072,14 @@ async fn try_run_workflow_alias(
     };
     let mut values = request.values;
     // Only execute-mode runs actually call tools (dry runs plan only).
+    // `or_insert`: an explicit `--set _node_token=…` wins over the minted one.
     if request.execute
         && let Some(token) = mint_workflow_node_token(paths).await
     {
-        values.insert("_node_token".to_string(), token);
+        values.entry("_node_token".to_string()).or_insert(token);
     }
     // Point `llm_*` steps at the resolved chat endpoint.
-    inject_workflow_llm_endpoint(&mut values, project_root);
+    inject_workflow_llm_endpoint(&mut values, project_root, paths);
     let result = execute_workflow(spec, &values, request.execute).await?;
     render_workflow_result(spec, &result);
     Ok(true)
@@ -4716,23 +4719,96 @@ fn build_llm_config(
     })
 }
 
-/// Inject the resolved chat LLM endpoint into a workflow's `values` so its
-/// `llm_*` steps reach the real model instead of the engine's built-in
-/// localhost default. Uses the SAME `build_llm_config` resolution the chat
-/// path uses (chat target + prism.toml + signed-in project's MARC27 endpoint).
-/// A `--set` override always wins (`or_insert`). Resolution failure is
-/// non-fatal — the workflow falls back to its own env resolution.
-fn inject_workflow_llm_endpoint(values: &mut BTreeMap<String, String>, project_root: &Path) {
-    let Ok(cfg) = build_llm_config(project_root, None, None, None) else {
+/// Decide the `(llm_base_url, llm_model)` a workflow run should inject into its
+/// context so `llm_*` steps reach the real model, mirroring the
+/// `Commands::Backend` chat resolution per configured target. `None` ⇒ inject
+/// nothing (the workflow falls back to its own env resolution).
+///
+/// This deliberately does NOT reuse `build_llm_config`, whose Marc27 arm
+/// resolves the raw `[llm].url` (whose default is the localhost llama.cpp
+/// endpoint) and errors when no `[llm].model` is set — both wrong for a
+/// signed-in cloud user and a re-open of the #132 silent-localhost class.
+///
+/// For the Marc27 cloud target the base URL is the outcome of the shared
+/// `marc27_llm_base_url` resolver (LLM_BASE_URL env → signed-in project `/llm`
+/// endpoint → explicit `[llm].url`, refusing the localhost default); `None`
+/// there ⇒ skip, so an unauthenticated user with no explicit endpoint never
+/// gets the dead localhost default and a stray localhost-ingest `[llm].url`
+/// never shadows a working env override. The model honors `LLM_MODEL` (env) →
+/// `/use marc27 --model` → `[llm].model`, else the platform's `default` alias.
+fn resolve_workflow_llm_endpoint(
+    chat_target: &crate::chat_config::ChatTarget,
+    cfg_model: Option<&str>,
+    env_model: Option<String>,
+    marc27_base_url: Option<String>,
+) -> Option<(String, String)> {
+    use crate::chat_config::ChatTarget;
+    match chat_target {
+        ChatTarget::Local { url, model, .. } => {
+            (!url.is_empty()).then(|| (url.clone(), model.clone()))
+        }
+        ChatTarget::Provider {
+            provider, model, ..
+        } => Some((
+            format!(
+                "https://api.{provider}.com/v1",
+                provider = provider.to_ascii_lowercase()
+            ),
+            model.clone(),
+        )),
+        ChatTarget::Marc27 {
+            model: target_model,
+        } => {
+            let base_url = marc27_base_url?;
+            let model = resolve_marc27_model(env_model, target_model.as_deref(), cfg_model)
+                .unwrap_or_else(|| "default".to_string());
+            Some((base_url, model))
+        }
+    }
+}
+
+/// Gather the (global) config the workflow LLM endpoint resolves from and hand
+/// it to the pure [`resolve_workflow_llm_endpoint`]. Shared by the CLI
+/// `prism workflow run` paths and the native MCP server so every headless
+/// launch surface points `llm_*` steps at the same endpoint the chat path uses.
+fn resolve_workflow_llm_pair(project_root: &Path, paths: &PrismPaths) -> Option<(String, String)> {
+    let node_config = prism_core::config::NodeConfig::load(Some(project_root));
+    let cfg_llm = &node_config.llm;
+    let chat_target = crate::chat_config::load().unwrap_or_default().chat;
+
+    // Marc27 base URL via the SAME resolver the chat backend uses; `.ok()`
+    // turns the honest #132 error (unauthenticated + no explicit endpoint)
+    // into "skip injection" rather than a dead localhost default.
+    let marc27_base_url = if matches!(chat_target, crate::chat_config::ChatTarget::Marc27 { .. }) {
+        let endpoints = PlatformEndpoints::from_env();
+        marc27_llm_base_url(paths, &endpoints.api_base, &cfg_llm.url).ok()
+    } else {
+        None
+    };
+
+    resolve_workflow_llm_endpoint(
+        &chat_target,
+        cfg_llm.model.as_deref(),
+        std::env::var("LLM_MODEL").ok(),
+        marc27_base_url,
+    )
+}
+
+/// Inject the resolved chat LLM endpoint into a workflow's `values`. A `--set`
+/// override always wins (`or_insert`); an unresolved endpoint injects nothing.
+fn inject_workflow_llm_endpoint(
+    values: &mut BTreeMap<String, String>,
+    project_root: &Path,
+    paths: &PrismPaths,
+) {
+    let Some((base_url, model)) = resolve_workflow_llm_pair(project_root, paths) else {
         return;
     };
-    if !cfg.base_url.is_empty() {
-        values
-            .entry("llm_base_url".to_string())
-            .or_insert(cfg.base_url);
+    if !base_url.is_empty() {
+        values.entry("llm_base_url".to_string()).or_insert(base_url);
     }
-    if !cfg.model.is_empty() {
-        values.entry("llm_model".to_string()).or_insert(cfg.model);
+    if !model.is_empty() {
+        values.entry("llm_model".to_string()).or_insert(model);
     }
 }
 
@@ -9755,6 +9831,112 @@ mod tests {
             resolve_unauth_llm_url(explicit).unwrap(),
             explicit,
             "an explicitly-set [llm].url is a deliberate local-mode choice"
+        );
+    }
+
+    // ── workflow llm-endpoint injection (bug c, CLI path) ──────────────
+    // The Marc27 base URL is the outcome of the shared `marc27_llm_base_url`
+    // resolver (tested above); these pin how the workflow injector consumes it.
+
+    #[test]
+    fn workflow_llm_marc27_signed_in_injects_project_endpoint() {
+        // Signed-in cloud user, no [llm].model: must inject the resolved
+        // project /llm endpoint and fall back to the platform `default` alias
+        // — NOT error out (build_llm_config's Marc27 arm would) and NOT the
+        // dead localhost default.
+        let target = crate::chat_config::ChatTarget::Marc27 { model: None };
+        let resolved = resolve_workflow_llm_endpoint(
+            &target,
+            None,
+            None,
+            Some("https://api.marc27.com/projects/p1/llm".to_string()),
+        );
+        assert_eq!(
+            resolved,
+            Some((
+                "https://api.marc27.com/projects/p1/llm".to_string(),
+                "default".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn workflow_llm_marc27_honors_env_and_cfg_model() {
+        let target = crate::chat_config::ChatTarget::Marc27 { model: None };
+        // env LLM_MODEL wins.
+        let with_env = resolve_workflow_llm_endpoint(
+            &target,
+            Some("cfg-model"),
+            Some("env-model".to_string()),
+            Some("https://x/llm".to_string()),
+        );
+        assert_eq!(with_env.unwrap().1, "env-model");
+        // No env ⇒ [llm].model is used.
+        let with_cfg = resolve_workflow_llm_endpoint(
+            &target,
+            Some("cfg-model"),
+            None,
+            Some("https://x/llm".to_string()),
+        );
+        assert_eq!(with_cfg.unwrap().1, "cfg-model");
+    }
+
+    #[test]
+    fn workflow_llm_marc27_unresolved_base_injects_nothing() {
+        // The anti-regression: when the Marc27 resolver refuses (unauthenticated
+        // + no explicit endpoint → #132 error → None here), inject NOTHING so
+        // the workflow falls back to its own env resolution instead of the dead
+        // localhost default. Also proves a stray localhost `[llm].url` can't be
+        // smuggled in via this path.
+        let target = crate::chat_config::ChatTarget::Marc27 { model: None };
+        assert_eq!(
+            resolve_workflow_llm_endpoint(&target, None, Some("m".to_string()), None),
+            None
+        );
+    }
+
+    #[test]
+    fn workflow_llm_local_uses_configured_url_and_model() {
+        let target = crate::chat_config::ChatTarget::Local {
+            url: "http://127.0.0.1:11434/v1".to_string(),
+            model: "llama3".to_string(),
+            api_key: None,
+        };
+        assert_eq!(
+            resolve_workflow_llm_endpoint(&target, None, None, None),
+            Some((
+                "http://127.0.0.1:11434/v1".to_string(),
+                "llama3".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn workflow_llm_local_empty_url_injects_nothing() {
+        let target = crate::chat_config::ChatTarget::Local {
+            url: String::new(),
+            model: "llama3".to_string(),
+            api_key: None,
+        };
+        assert_eq!(
+            resolve_workflow_llm_endpoint(&target, None, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn workflow_llm_provider_builds_openai_base() {
+        let target = crate::chat_config::ChatTarget::Provider {
+            provider: "Anthropic".to_string(),
+            model: "claude-sonnet-5".to_string(),
+            api_key_env: None,
+        };
+        assert_eq!(
+            resolve_workflow_llm_endpoint(&target, None, None, None),
+            Some((
+                "https://api.anthropic.com/v1".to_string(),
+                "claude-sonnet-5".to_string()
+            ))
         );
     }
 

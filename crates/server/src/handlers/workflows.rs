@@ -90,7 +90,7 @@ fn default_true() -> bool {
 /// but the workflow engine additionally enforces per-step tool policy using
 /// the caller's authenticated role.
 pub async fn run_workflow(
-    State(_state): State<Arc<NodeState>>,
+    State(state): State<Arc<NodeState>>,
     Path(name): Path<String>,
     role_ext: Option<Extension<UserRole>>,
     user_ext: Option<Extension<AuthenticatedUser>>,
@@ -118,13 +118,38 @@ pub async fn run_workflow(
     let role = role_ext
         .map(|Extension(UserRole(r))| policy_role(r))
         .unwrap_or("viewer");
-    let principal = user_ext
-        .map(|Extension(u)| u.user_id)
-        .unwrap_or_else(|| "unknown".to_string());
+    let authed_user = user_ext.map(|Extension(u)| u.user_id);
+    let principal = authed_user.clone().unwrap_or_else(|| "unknown".to_string());
+
+    // Thread the same runtime context the CLI/slash launchers do so this
+    // dashboard-launched run is hands-off:
+    //   * `_node_token` — a loopback session for the authenticated user so the
+    //     workflow's `tool` steps authenticate to THIS node's auth-gated
+    //     `/api/tools/{name}/run` (execute mode only). Minted against the
+    //     node's conventional loopback port; `None` ⇒ an online tool step
+    //     fails honestly with 401 rather than silently succeeding.
+    //   * `llm_base_url` / `llm_model` — the node's resolved LLM endpoint so
+    //     `llm_*` steps reach the real model, not the engine's localhost
+    //     default.
+    let node_token = match (req.execute, authed_user.as_deref()) {
+        (true, Some(user_id)) => {
+            prism_client::node_session::mint_local_session("http://127.0.0.1:7327", user_id, None)
+                .await
+                .ok()
+        }
+        _ => None,
+    };
+    let llm_config = state.llm.clone().unwrap_or_default();
+    let values = prism_agent::protocol::assemble_workflow_run_values(
+        req.values,
+        req.execute,
+        node_token,
+        &llm_config,
+    );
 
     let result = prism_workflows::execute_workflow_with_policy(
         spec,
-        &req.values,
+        &values,
         req.execute,
         Some(&mut policy),
         Some(principal.as_str()),
