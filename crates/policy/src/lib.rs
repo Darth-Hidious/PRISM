@@ -566,6 +566,49 @@ mod tests {
     }
 
     #[test]
+    fn agent_allowed_shipped_builtin_workflows() {
+        // The agent-driven path runs with role=agent; `execute_workflow_with_policy`
+        // checks `workflow.execute` against `resource = spec.name`. The shipped
+        // builtins the agent actually runs — `ingest` and `materials_discovery`
+        // (the flagship e2e workflow: node tool steps + llm_* steps) — must be on
+        // the allowlist, or every agent-initiated run is denied before step one.
+        for workflow in ["ingest", "materials_discovery", "forge"] {
+            let mut engine = PolicyEngine::new().unwrap();
+            let input = PolicyInput {
+                action: "workflow.execute".into(),
+                principal: "agent".into(),
+                role: "agent".into(),
+                resource: workflow.into(),
+                context: serde_json::json!({}),
+            };
+            let decision = engine.evaluate(&input).unwrap();
+            assert!(
+                decision.allowed,
+                "agent must be allowed to run builtin '{workflow}': {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_still_denied_unlisted_workflow() {
+        // The allowlist stays an allowlist: a workflow that isn't on it is still
+        // denied to the agent (no allow-all loosening).
+        let mut engine = PolicyEngine::new().unwrap();
+        let input = PolicyInput {
+            action: "workflow.execute".into(),
+            principal: "agent".into(),
+            role: "agent".into(),
+            resource: "deploy-everything".into(),
+            context: serde_json::json!({}),
+        };
+        let decision = engine.evaluate(&input).unwrap();
+        assert!(
+            !decision.allowed,
+            "agent must NOT run an unlisted workflow: {decision:?}"
+        );
+    }
+
+    #[test]
     fn operator_allowed_workflow_with_audit_obligation() {
         let mut engine = PolicyEngine::new().unwrap();
         let input = PolicyInput {
