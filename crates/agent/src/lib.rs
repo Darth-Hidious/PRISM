@@ -5,6 +5,7 @@ pub mod command_tools;
 pub mod commands;
 pub mod embeddings;
 pub mod hooks;
+pub mod mcp;
 pub mod meta_tools;
 pub mod models;
 pub mod permissions;

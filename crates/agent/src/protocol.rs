@@ -5284,6 +5284,8 @@ async fn handle_command(
                         "name": t.name,
                         "description": t.description,
                         "approval": t.requires_approval,
+                        "source": t.source,
+                        "source_detail": t.source_detail,
                     })
                 })
                 .collect();
@@ -6776,6 +6778,26 @@ pub async fn build_agent_seed(tool_server_config: &ToolServer) -> Result<AgentSe
         .context("failed to list tools")?;
     let mut tool_catalog = ToolCatalog::from_tool_server_json(&tools_json);
     tool_catalog.extend(command_tools::command_tools());
+
+    // External MCP servers (~/.prism/mcp.json): connect, list their tools, and
+    // fold them into the catalog as UNTRUSTED (namespaced mcp__<server>__<tool>,
+    // anti-spoof gated by extend_untrusted). Missing config = zero servers.
+    let mcp_manager = crate::mcp::McpManager::connect_from_default_config().await;
+    if !mcp_manager.is_empty() {
+        let rejected = tool_catalog.extend_untrusted(mcp_manager.loaded_tools());
+        for name in rejected {
+            tracing::warn!(
+                tool = %name,
+                "rejected MCP tool: name collides with an existing tool — rename the server",
+            );
+        }
+        tracing::info!(
+            servers = mcp_manager.server_count(),
+            "connected external MCP servers"
+        );
+    }
+    crate::mcp::init_global(mcp_manager);
+
     let tools = Arc::new(tool_catalog);
     tracing::info!(tool_count = tools.len(), "loaded tool catalog");
 
@@ -7084,6 +7106,8 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                             "name": t.name,
                             "description": t.description,
                             "approval": t.requires_approval,
+                            "source": t.source,
+                            "source_detail": t.source_detail,
                         })
                     })
                     .collect();

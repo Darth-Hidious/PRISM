@@ -1270,6 +1270,16 @@ pub async fn run_turn(
                 )
                 .await
                 .map(|value| serde_json::json!({ "result": value }))
+            } else if tool_catalog
+                .find(tool_name)
+                .is_some_and(|tool| tool.source.as_deref() == Some("mcp"))
+            {
+                // External MCP tool (namespaced `mcp__<server>__<tool>`,
+                // admitted via extend_untrusted): route to the connected MCP
+                // server session instead of the Python tool server. The
+                // approval gate above already ran — MCP tools are untrusted,
+                // always requires_approval, never in the auto-approve set.
+                crate::mcp::call_global_tool(tool_name, &args).await
             } else {
                 tool_server
                     .call_tool(tool_name, args.clone())

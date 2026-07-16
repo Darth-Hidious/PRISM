@@ -946,9 +946,54 @@ fn help_lines(t: Theme) -> Vec<Line<'static>> {
 }
 
 fn tools_lines(t: Theme, app: &App) -> Vec<Line<'static>> {
-    vec![
+    let mut lines = vec![
         Line::raw(""),
         kv_row(t, "Tools loaded", &format!("{}", app.tool_count)),
+        Line::raw(""),
+        section(t, "MCP servers (~/.prism/mcp.json)"),
+    ];
+    // Group MCP-sourced catalog entries by their server (source_detail).
+    let mut by_server: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for tool in &app.tool_catalog {
+        if tool.get("source").and_then(|s| s.as_str()) == Some("mcp") {
+            let server = tool
+                .get("source_detail")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let name = tool
+                .get("name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?")
+                .to_string();
+            by_server.entry(server).or_default().push(name);
+        }
+    }
+    if by_server.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  none connected — add servers to ~/.prism/mcp.json",
+            Style::default().fg(t.dim),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  and relaunch (stdio transport: command + args)",
+            Style::default().fg(t.dim),
+        )));
+    } else {
+        for (server, tools) in &by_server {
+            lines.push(Line::from(Span::styled(
+                format!("  {server} — {} tools", tools.len()),
+                Style::default().fg(t.dim),
+            )));
+            for tool in tools {
+                lines.push(Line::from(Span::styled(
+                    format!("    {tool}"),
+                    Style::default().fg(t.muted),
+                )));
+            }
+        }
+    }
+    lines.extend([
         Line::raw(""),
         section(t, "How tools load"),
         Line::from(Span::styled(
@@ -956,11 +1001,7 @@ fn tools_lines(t: Theme, app: &App) -> Vec<Line<'static>> {
             Style::default().fg(t.dim),
         )),
         Line::from(Span::styled(
-            "  registry; MCP servers from .mcp.json.",
-            Style::default().fg(t.dim),
-        )),
-        Line::from(Span::styled(
-            "  Edit .mcp.json and relaunch to add/remove MCP.",
+            "  registry; MCP tools from ~/.prism/mcp.json.",
             Style::default().fg(t.dim),
         )),
         Line::raw(""),
@@ -974,7 +1015,8 @@ fn tools_lines(t: Theme, app: &App) -> Vec<Line<'static>> {
             "  press any key to close",
             Style::default().fg(t.muted),
         )),
-    ]
+    ]);
+    lines
 }
 
 fn model_lines(app: &App, t: Theme) -> Vec<Line<'static>> {

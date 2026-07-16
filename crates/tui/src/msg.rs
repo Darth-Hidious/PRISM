@@ -82,7 +82,8 @@ pub enum AgentMsg {
     },
 
     /// `ui.tools.catalog` — the live tool catalog (pushed by `/tools`), shown in
-    /// the Workspace sidebar Tools tab. Each item is `{name,description,approval}`.
+    /// the Workspace sidebar Tools tab. Each item is
+    /// `{name,description,approval,source,source_detail}`.
     ToolsCatalog { tools: Vec<Value> },
 
     // ── Status / mode ────────────────────────────────────────────────

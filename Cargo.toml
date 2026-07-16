@@ -173,7 +173,7 @@ pretty_assertions = "1.4.1"
 # AI / Agent
 async-openai = { version = "0.34.0", default-features = false, features = ["response-types"] }
 eserde = "0.1.7"
-rmcp = { version = "0.10.0", features = ["client", "transport-sse-client-reqwest", "transport-child-process", "transport-streamable-http-client-reqwest", "auth"] }
+rmcp = { version = "2.2.0", default-features = false, features = ["client", "transport-child-process"] }
 
 # PRISM-exclusive deps
 axum = "0.8"
