@@ -18,12 +18,12 @@ expression: rendered
                │   navigation ▸ Workspace: Tools        Switch sidebar to Tools ←/→ │
                │  marketplace ▸ Marketplace search      Search downloadabl… palette │
                │      display ▸ Mission Control         The launch dashboa… palette │
+               │      science ▸ Node stop               Stop the local nod… palette │
                │      session ▸ Set goal                Standing goal… /goal <text> │
                │   automation ▸ Show workflow           Inspect one workfl… palette │
+               │      science ▸ Node status             Local daemon + pla… palette │
                │      display ▸ Switch theme            Pick a color theme  palette │
-               │      session ▸ Compact conversation    Compact older con… /compact │
-               │      science ▸ Knowledge               Search & ingest — … palette │
-               │  … 22 more — ↓ to scroll or type to filter                         │
+               │  … 24 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│

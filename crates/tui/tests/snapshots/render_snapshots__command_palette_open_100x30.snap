@@ -21,9 +21,9 @@ expression: rendered
                │    Run simulation          Relax/MD via MACE + pyiron      palette │
                │    Goal status             Check a discovery campaign's p… palette │
                │    List goals              Discovery campaigns on this no… palette │
-               │    Notebook                Notebook session — coming in-app … soon │
-               │    Resume goal             Continue a paused discovery ca… palette │
-               │  … 49 more — ↓ to scroll or type to filter                         │
+               │    Node status             Local daemon + platform regist… palette │
+               │    Node stop               Stop the local node daemon      palette │
+               │  … 52 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│

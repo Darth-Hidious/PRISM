@@ -2304,7 +2304,7 @@ fn draw_node_picker(f: &mut Frame, app: &App) {
         )));
     } else if total == 0 {
         lines.push(Line::from(Span::styled(
-            "  No nodes yet — run `node up` on a machine to connect it",
+            "  No nodes yet — \"Node up\" in the palette connects this machine",
             Style::default().fg(t.muted),
         )));
     } else {
@@ -2379,7 +2379,7 @@ fn draw_node_picker(f: &mut Frame, app: &App) {
 
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  ↑↓ · Esc",
+        "  ↑↓ · ⏎ detail · Esc",
         Style::default().fg(t.muted),
     )));
 

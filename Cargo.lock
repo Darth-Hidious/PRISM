@@ -4580,6 +4580,7 @@ dependencies = [
  "prism-embed",
  "prism-ingest",
  "prism-llm",
+ "prism-node",
  "prism-policy",
  "prism-provenance",
  "prism-python-bridge",

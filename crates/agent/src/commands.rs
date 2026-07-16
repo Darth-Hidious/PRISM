@@ -337,6 +337,7 @@ pub fn builtin_help_text() -> String {
     lines.push("  /campaign start --goal \"...\" [--budget 5]".to_string());
     lines.push("  /campaign status <id>".to_string());
     lines.push("  /skills list".to_string());
+    lines.push("  /node up [--name x] | stop | status  (supervised in-app)".to_string());
 
     lines.join("\n")
 }

@@ -3684,6 +3684,26 @@ async fn handle_nodes_slash_command(args: &[String]) -> Result<bool> {
         .and_then(|paths| paths.load_cli_state().ok())
         .and_then(|state| state.credentials);
 
+    // `/nodes <id>` — one node's detail (the Nodes view's Enter action).
+    if let Some(node_id) = args.get(1) {
+        let body = match &creds {
+            None => "Not signed in — log in from the account view to inspect nodes.".to_string(),
+            Some(creds) => {
+                let endpoints = PlatformEndpoints::from_env();
+                let platform =
+                    PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
+                let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
+                match registry.get_node(node_id).await {
+                    Ok(node) => node_detail_body(&node),
+                    Err(error) => format!("Node lookup failed: {error:#}"),
+                }
+            }
+        };
+        emit_view("node", "Node detail", &body, "info");
+        emit_notification("ui.turn.complete", serde_json::json!({}));
+        return Ok(true);
+    }
+
     let (nodes, error) = match creds {
         None => (
             Vec::new(),
@@ -3721,6 +3741,151 @@ async fn handle_nodes_slash_command(args: &[String]) -> Result<bool> {
     );
     emit_notification("ui.turn.complete", serde_json::json!({}));
     Ok(true)
+}
+
+/// Human-readable body for a single platform node record.
+fn node_detail_body(node: &prism_client::node_registry::NodeDetail) -> String {
+    let mut lines = vec![
+        format!("{} — {}", node.name, node.status),
+        format!("  node_id:    {}", node.node_id),
+    ];
+    if let Some(visibility) = &node.visibility {
+        lines.push(format!("  visibility: {visibility}"));
+    }
+    if let Some(seen) = &node.last_seen {
+        lines.push(format!("  last seen:  {seen}"));
+    }
+    if let Some(price) = node.price_per_hour_usd {
+        lines.push(format!("  price:      ${price:.2}/h"));
+    }
+    if let Some(created) = &node.created_at {
+        lines.push(format!("  created:    {created}"));
+    }
+    if !node.profile.is_null() {
+        lines.push("  profile:".to_string());
+        let profile =
+            serde_json::to_string_pretty(&node.profile).unwrap_or_else(|_| "{}".to_string());
+        for line in profile.lines() {
+            lines.push(format!("    {line}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// `/node up|stop|down|status` — the in-app node lifecycle.
+///
+/// `up` spawns the daemon as a supervised child through
+/// [`crate::node_supervisor`] (no shell, no detached `prism node up`);
+/// `stop`/`down` stop it gracefully (platform deregistration included);
+/// `status` combines local supervision state with the platform registry
+/// record. Other `node` verbs (`probe`, `logs`, `key`, `token`) keep flowing
+/// through the generic CLI-backed path. Failures are emitted as text — an
+/// honest failure, never a crash.
+async fn handle_node_slash_command(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("node") {
+        return Ok(false);
+    }
+    match args.get(1).map(String::as_str) {
+        Some("up") => {
+            let runtime = CommandToolRuntime {
+                current_exe: slash_ctx.current_exe.clone(),
+                project_root: slash_ctx.project_root.clone(),
+                python_bin: slash_ctx.python_bin.clone(),
+            };
+            let report = match crate::node_supervisor::node_up(&runtime, &args[2..]).await {
+                Ok(report) => report,
+                Err(error) => format!("Node start failed: {error:#}"),
+            };
+            emit_notification("ui.text.delta", serde_json::json!({ "text": report }));
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        Some("stop") | Some("down") => {
+            let report = match crate::node_supervisor::node_stop().await {
+                Ok(report) => report,
+                Err(error) => format!("Node stop failed: {error:#}"),
+            };
+            emit_notification("ui.text.delta", serde_json::json!({ "text": report }));
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        Some("status") => {
+            let body = node_status_body().await;
+            emit_view("node", "Node status", &body, "info");
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Body for the `/node status` view: local daemon supervision state plus the
+/// platform registry's record (registration + last heartbeat).
+async fn node_status_body() -> String {
+    let mut lines = vec!["Local daemon".to_string()];
+    let snapshot = crate::node_supervisor::supervised_snapshot();
+    match &snapshot {
+        Some(snap) => {
+            let node_id = snap
+                .node_id
+                .as_deref()
+                .map(|id| format!(", node_id {id}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  Supervised by this session — pid {}, up {}m{node_id}",
+                snap.pid,
+                snap.uptime.as_secs() / 60,
+            ));
+            lines.push(format!("  Log: {}", snap.log_path.display()));
+        }
+        None => match crate::node_supervisor::machine_daemon_pid() {
+            Some(pid) => lines.push(format!(
+                "  Running on this machine (pid {pid}) — started outside this session; \
+                 node.stop still stops it"
+            )),
+            None => lines.push("  Not running — bring one up with node.up".to_string()),
+        },
+    }
+
+    lines.push(String::new());
+    lines.push("Platform registration".to_string());
+    let creds = PrismPaths::discover()
+        .ok()
+        .and_then(|paths| paths.load_cli_state().ok())
+        .and_then(|state| state.credentials);
+    let Some(creds) = creds else {
+        lines.push("  Not signed in — log in from the account view.".to_string());
+        return lines.join("\n");
+    };
+    let endpoints = PlatformEndpoints::from_env();
+    let platform = PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
+    let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
+    match snapshot.and_then(|snap| snap.node_id) {
+        Some(node_id) => match registry.get_node(&node_id).await {
+            Ok(node) => {
+                lines.push(format!("  {} — {}", node.name, node.status));
+                if let Some(seen) = &node.last_seen {
+                    lines.push(format!("  Last heartbeat: {seen}"));
+                }
+            }
+            Err(error) => lines.push(format!("  Lookup failed: {error:#}")),
+        },
+        None => match registry.list_nodes(None).await {
+            Ok(nodes) if nodes.is_empty() => lines.push("  No nodes registered.".to_string()),
+            Ok(nodes) => {
+                let online = nodes.iter().filter(|n| n.status == "online").count();
+                lines.push(format!(
+                    "  {} registered ({online} online) — open Nodes for the list",
+                    nodes.len()
+                ));
+            }
+            Err(error) => lines.push(format!("  List failed: {error:#}")),
+        },
+    }
+    lines.join("\n")
 }
 
 /// The four fields a `/skills create` invocation carries, parsed from the
@@ -6701,6 +6866,9 @@ async fn handle_command(
                 return Ok(true);
             }
             if handle_nodes_slash_command(&args).await? {
+                return Ok(true);
+            }
+            if handle_node_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
             if handle_skills_slash_command(&args, tools).await? {

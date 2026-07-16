@@ -387,7 +387,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         kind: CommandToolKind::RootSubcommand {
             subcommands: &["up", "down", "status", "probe", "logs", "key"],
         },
-        description: "Run `prism node <subcommand>` for PRISM node fabric operations. Prefer the typed siblings node_probe / node_status / node_logs for those verbs; this umbrella covers `up`/`down` (start/stop the local node daemon) and `key` (node key management), which have no typed tool. `up`/`down` change node state and are approval-gated; `status`/`probe`/`logs` are read-only.",
+        description: "Run `prism node <subcommand>` for PRISM node fabric operations. Prefer the typed siblings node_probe / node_status / node_logs for those verbs; this umbrella covers `up`/`down` (start/stop the local node daemon) and `key` (node key management), which have no typed tool. `up` starts the daemon as a supervised background child of this app (returns pid + platform node_id, no shell needed); `down` stops it gracefully (platform deregistration included). `up`/`down` change node state and are approval-gated; `status`/`probe`/`logs` are read-only.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -3128,6 +3128,11 @@ pub async fn execute_command_tool(
     let invocation = format_execution_invocation(&execution);
 
     match &execution {
+        CommandExecution::Cli { root, args }
+            if *root == "node" && is_node_lifecycle_subcommand(args) =>
+        {
+            execute_node_lifecycle(runtime, args, &invocation).await
+        }
         CommandExecution::Cli { root, args } => {
             execute_cli_command(runtime, root, args, &invocation).await
         }
@@ -3137,6 +3142,47 @@ pub async fn execute_command_tool(
             execute_workflow_command(runtime, &execution, &invocation, policy).await
         }
     }
+}
+
+/// `node up` / `node down` need supervision, not a fire-and-forget subprocess:
+/// `up` is a long-running daemon (the plain CLI path would block until the
+/// 60s timeout and then kill it) and `down` should reap the child that `up`
+/// left behind. Both route through [`crate::node_supervisor`] — the same
+/// machinery behind the TUI's `/node up|stop|status` slash commands, so agent
+/// and user drive one implementation.
+fn is_node_lifecycle_subcommand(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("up") | Some("down") | Some("stop")
+    )
+}
+
+async fn execute_node_lifecycle(
+    runtime: &CommandToolRuntime,
+    args: &[String],
+    invocation: &str,
+) -> Result<Value> {
+    let result = match args[0].as_str() {
+        "up" => crate::node_supervisor::node_up(runtime, &args[1..]).await,
+        // "down" (the CLI verb) and "stop" (the palette verb) are synonyms.
+        _ => crate::node_supervisor::node_stop().await,
+    };
+    // Same output contract as execute_cli_command so tool consumers see one
+    // shape regardless of how a node verb executes.
+    let (success, stdout, stderr) = match result {
+        Ok(report) => (true, report, String::new()),
+        Err(error) => (false, String::new(), format!("{error:#}")),
+    };
+    Ok(json!({
+        "root": "node",
+        "args": args,
+        "invocation": invocation,
+        "success": success,
+        "timed_out": false,
+        "exit_code": if success { 0 } else { 1 },
+        "stdout": truncate_for_ui(&stdout, 30_000),
+        "stderr": truncate_for_ui(&stderr, 30_000),
+    }))
 }
 
 pub fn to_definitions() -> Vec<ToolDefinition> {

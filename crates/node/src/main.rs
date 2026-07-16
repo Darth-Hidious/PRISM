@@ -84,7 +84,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Down => {
             let paths = prism_runtime::PrismPaths::discover()?;
-            prism_node::daemon::stop_daemon(&paths)?;
+            let outcome = prism_node::daemon::stop_daemon(&paths)?;
+            println!("{outcome}");
         }
         Command::Probe => {
             let capabilities = prism_node::detect::probe_local_capabilities_async().await;

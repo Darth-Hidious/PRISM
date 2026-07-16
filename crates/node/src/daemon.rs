@@ -312,7 +312,17 @@ pub async fn run_daemon(
 }
 
 /// Stop a running node daemon in a cross-platform way.
-pub fn stop_daemon(paths: &PrismPaths) -> Result<()> {
+///
+/// Graceful first: write the shutdown-request file and give the daemon's
+/// 1-second shutdown poll time to notice, stop jobs, deregister from the
+/// platform, and remove its own pid file. Only if that window elapses is
+/// SIGTERM sent as an escalation. (The old order — SIGTERM immediately after
+/// the shutdown request — killed the process before the poll ever ran, so
+/// clean deregistration never happened and the pid file went stale.)
+///
+/// Returns the human-readable outcome; callers decide where it prints (the
+/// CLI writes it to stdout, the in-app backend relays it as a notification).
+pub fn stop_daemon(paths: &PrismPaths) -> Result<String> {
     let pid_path = pid_file_path(paths);
     if !pid_path.exists() {
         bail!(
@@ -320,8 +330,22 @@ pub fn stop_daemon(paths: &PrismPaths) -> Result<()> {
             pid_path.display()
         );
     }
+    if running_daemon_pid(paths).is_none() {
+        // Pid file left behind by a hard kill — nothing to stop.
+        let _ = std::fs::remove_file(&pid_path);
+        state::clear_shutdown_request(&paths.state_dir);
+        return Ok("No running node (removed stale pid file).".to_string());
+    }
 
     state::write_shutdown_request(&paths.state_dir)?;
+
+    let graceful_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < graceful_deadline {
+        if !pid_path.exists() {
+            return Ok("Node stopped.".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 
     #[cfg(unix)]
     {
@@ -332,17 +356,39 @@ pub fn stop_daemon(paths: &PrismPaths) -> Result<()> {
         }
     }
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if !pid_path.exists() {
-            println!("Node stopped.");
-            return Ok(());
+    let kill_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < kill_deadline {
+        if !pid_path.exists() || running_daemon_pid(paths).is_none() {
+            // A terminated (vs. graceful) exit never drops the pid guard.
+            let _ = std::fs::remove_file(&pid_path);
+            return Ok("Node stopped (terminated after graceful-shutdown timeout).".to_string());
         }
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    println!("Shutdown requested. Node is still draining or shutting down.");
-    Ok(())
+    Ok("Shutdown requested. Node is still draining or shutting down.".to_string())
+}
+
+/// The pid of a live node daemon on this machine, if one is running.
+///
+/// Reads the pid file and (on unix) probes the process with signal 0, so a
+/// stale file left behind by a hard kill is not reported as a running node.
+pub fn running_daemon_pid(paths: &PrismPaths) -> Option<u32> {
+    let pid_str = std::fs::read_to_string(pid_file_path(paths)).ok()?;
+    let pid: u32 = pid_str.trim().parse().ok()?;
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) delivers no signal; it only reports whether the pid
+        // exists (EPERM still means "exists", which is fine for our purpose:
+        // any daemon we can't signal isn't ours to supervise anyway).
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        alive.then_some(pid)
+    }
+    #[cfg(not(unix))]
+    {
+        // No cheap liveness probe — trust the pid file.
+        Some(pid)
+    }
 }
 
 enum ShutdownReason {

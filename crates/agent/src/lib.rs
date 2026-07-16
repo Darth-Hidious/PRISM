@@ -8,6 +8,7 @@ pub mod hooks;
 pub mod mcp;
 pub mod meta_tools;
 pub mod models;
+pub mod node_supervisor;
 pub mod permissions;
 pub mod prompt_profile;
 pub mod prompts;

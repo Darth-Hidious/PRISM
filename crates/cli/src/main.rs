@@ -2394,6 +2394,11 @@ async fn main() -> Result<()> {
                         });
                         match registry.register_node(&node_name, &caps).await {
                             Ok(reg) => {
+                                // NOTE: the in-app node supervisor
+                                // (prism_agent::node_supervisor) parses this
+                                // line out of the daemon log to learn the
+                                // platform node id — keep the
+                                // "(node_id: …)" shape if rewording.
                                 println!(
                                     "  \u{2713} Registered with platform (node_id: {})",
                                     reg.node_id
@@ -2758,7 +2763,8 @@ async fn main() -> Result<()> {
                 result?;
             }
             NodeCommands::Down => {
-                prism_node::daemon::stop_daemon(&paths)?;
+                let outcome = prism_node::daemon::stop_daemon(&paths)?;
+                println!("{outcome}");
             }
             NodeCommands::Status => {
                 let caps = prism_node::detect::probe_local_capabilities_async().await;

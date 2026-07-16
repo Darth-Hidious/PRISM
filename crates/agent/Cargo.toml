@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 prism-ingest = { path = "../ingest" }
 prism-llm = { path = "../llm" }
+prism-node = { path = "../node" }
 prism-policy = { path = "../policy" }
 prism-python-bridge = { path = "../python-bridge" }
 prism-client = { path = "../client" }

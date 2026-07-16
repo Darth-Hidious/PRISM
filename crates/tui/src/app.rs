@@ -159,9 +159,9 @@ pub struct GpuPicker {
 }
 
 /// Nodes view state — the user's connected platform nodes (palette entry
-/// `nodes.show`). Populated from the `ui.nodes.list` notification; this is a
-/// read-only viewer (no Enter action). The visible window follows `selected`
-/// (model-picker style scrolling).
+/// `nodes.show`). Populated from the `ui.nodes.list` notification; Enter
+/// fetches the selected node's platform detail (`/nodes <id>`). The visible
+/// window follows `selected` (model-picker style scrolling).
 #[derive(Debug, Clone, Default)]
 pub struct NodePicker {
     pub open: bool,
@@ -351,6 +351,10 @@ pub enum FormTarget {
     MarketplaceFind,
     /// Install a marketplace item (palette `marketplace.install`).
     MarketplaceInstall,
+    /// Bring this machine online as a node (palette `node.up`). Submit
+    /// dispatches `/node up ...`; the backend supervises the daemon as a
+    /// managed child, so `node.stop` can stop it later — no CLI required.
+    NodeUp,
     /// Run a saved skill by name (palette `skills.run`).
     SkillRun,
     /// Author + verify a new skill (palette `skills.create`). Submit
@@ -1325,6 +1329,14 @@ impl App {
                     self.form = Some(pane);
                 }
             },
+            FormTarget::NodeUp => {
+                let cmd = node_up_command(&pane.form);
+                let _ = self.backend.send_command(&cmd);
+                self.toast(
+                    "bringing the node up — takes a few seconds",
+                    ToastKind::Info,
+                );
+            }
             FormTarget::SkillRun => match skill_run_command(&pane.form) {
                 Ok(cmd) => {
                     let _ = self.backend.send_command(&cmd);
@@ -1487,6 +1499,22 @@ impl App {
             ],
         );
         self.open_form(form, FormTarget::MarketplaceInstall);
+    }
+
+    /// Palette `node.up` — bring this machine online as a compute node.
+    /// Submit dispatches `/node up ...`; the backend spawns and supervises
+    /// the daemon in-process (tracked child, stoppable via `node.stop`).
+    pub fn open_node_up_form(&mut self) {
+        let form = Form::new(
+            "Node up — connect this machine",
+            "start",
+            vec![
+                FormField::text("name", "Node name", "").with_note("empty uses the hostname"),
+                FormField::toggle("broadcast", "Broadcast", false)
+                    .with_note("advertise on the local network + platform discovery"),
+            ],
+        );
+        self.open_form(form, FormTarget::NodeUp);
     }
 
     /// Palette `skills.run` — one field: which saved skill to execute. The
@@ -2048,6 +2076,22 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.node_picker.selected = self.node_picker.selected.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                let Some(node) = self.node_picker.nodes.get(self.node_picker.selected) else {
+                    return;
+                };
+                let id = node
+                    .get("node_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    self.toast("node has no id to inspect", ToastKind::Warn);
+                    return;
+                }
+                self.node_picker.open = false;
+                let _ = self.backend.send_command(&format!("/nodes {id}"));
             }
             _ => {}
         }
@@ -2796,6 +2840,14 @@ impl App {
             "model.show" => self.open_model_picker(),
             "compute.gpus" => self.open_gpu_picker(),
             "nodes.show" => self.open_node_picker(),
+            "node.up" => self.open_node_up_form(),
+            "node.stop" => {
+                let _ = self.backend.send_command("/node stop");
+                self.toast("stopping the node…", ToastKind::Info);
+            }
+            "node.status" => {
+                let _ = self.backend.send_command("/node status");
+            }
             "mcp.show" => self.modal = Some(Modal::Tools),
             "goal.set" => self.open_goal_form(),
             "campaign.start" => self.open_campaign_start_form(),
@@ -3716,6 +3768,22 @@ fn marketplace_install_command(form: &crate::form::Form) -> Result<String, &'sta
     Ok(build_slash_command(&args))
 }
 
+/// Build `/node up [--name <name>] [--broadcast]` from the `node.up` form.
+/// An empty name is fine — the daemon falls back to the hostname — so this
+/// never fails validation.
+fn node_up_command(form: &crate::form::Form) -> String {
+    let mut args = vec!["node".to_string(), "up".to_string()];
+    let name = form.text_value("name").trim().to_string();
+    if !name.is_empty() {
+        args.push("--name".to_string());
+        args.push(name);
+    }
+    if form.toggle_value("broadcast") {
+        args.push("--broadcast".to_string());
+    }
+    build_slash_command(&args)
+}
+
 /// Build `/skills run <name>` from the `skills.run` form.
 fn skill_run_command(form: &crate::form::Form) -> Result<String, &'static str> {
     let name = form.text_value("name").trim().to_string();
@@ -4437,6 +4505,81 @@ mod tests {
         let mut app = fresh();
         app.dispatch_command("campaign.list");
         assert!(app.form.is_none(), "list is read-only — no form needed");
+    }
+
+    // ── Node lifecycle palette ───────────────────────────────────────────
+
+    #[test]
+    fn node_up_dispatch_opens_form_with_defaults() {
+        let mut app = fresh();
+        app.dispatch_command("node.up");
+        let pane = app.form.as_ref().expect("node.up must open a form");
+        assert_eq!(pane.target, FormTarget::NodeUp);
+        let names: Vec<&str> = pane.form.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["name", "broadcast"]);
+        assert!(!pane.form.toggle_value("broadcast"), "broadcast is opt-in");
+    }
+
+    #[test]
+    fn node_up_command_includes_flags_only_when_set() {
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("name", "Node name", ""),
+                FormField::toggle("broadcast", "Broadcast", false),
+            ],
+        );
+        assert_eq!(node_up_command(&form), "/node up");
+
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("name", "Node name", "studio mac"),
+                FormField::toggle("broadcast", "Broadcast", true),
+            ],
+        );
+        assert_eq!(
+            node_up_command(&form),
+            "/node up --name 'studio mac' --broadcast"
+        );
+    }
+
+    #[test]
+    fn node_stop_and_status_dispatch_directly_without_a_form() {
+        let mut app = fresh();
+        app.dispatch_command("node.stop");
+        assert!(app.form.is_none(), "stop needs no form");
+        app.dispatch_command("node.status");
+        assert!(app.form.is_none(), "status needs no form");
+    }
+
+    #[test]
+    fn node_picker_enter_fetches_detail_and_closes() {
+        let mut app = fresh();
+        app.node_picker.open = true;
+        app.node_picker.nodes = vec![serde_json::json!({
+            "node_id": "0f8c2a44-1111-4222-b333-abcdefabcdef",
+            "name": "studio-mac",
+            "status": "online",
+        })];
+        app.node_picker.selected = 0;
+        app.handle_node_picker_key(key(KeyCode::Enter));
+        assert!(
+            !app.node_picker.open,
+            "Enter must close the picker and request the node detail"
+        );
+    }
+
+    #[test]
+    fn node_picker_enter_without_id_warns_and_stays_open() {
+        let mut app = fresh();
+        app.node_picker.open = true;
+        app.node_picker.nodes = vec![serde_json::json!({"name": "x", "status": "online"})];
+        app.node_picker.selected = 0;
+        app.handle_node_picker_key(key(KeyCode::Enter));
+        assert!(app.node_picker.open, "no id — nothing to fetch, stay open");
     }
 
     // ── Workflows palette ────────────────────────────────────────────────
