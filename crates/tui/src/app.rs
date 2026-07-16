@@ -564,6 +564,21 @@ impl App {
 
     /// Handle a crossterm key event.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // An approval prompt is drawn OVER every pane (see render.rs — it is
+        // the highest-priority overlay), so it must intercept keys before any
+        // pane does. Otherwise, with a pane open (notably the notebook pane,
+        // whose whole flow is "agent calls notebook_exec → approval"), the
+        // human's `y`/`n` would be typed into an invisible editor and `Esc`
+        // would silently close the pane. Ctrl-C still quits (emergency exit).
+        if self.approval_pending.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+            } else {
+                self.handle_approval_key(key);
+            }
+            return;
+        }
+
         // The command palette (Ctrl-P) intercepts all keys while open,
         // mirroring opencode's DialogSelect. Inside the palette, Ctrl-C
         // and Esc *cancel the palette* — they do not quit the app. Only
@@ -697,11 +712,8 @@ impl App {
             return;
         }
 
-        // If approval is pending, handle approval keys
-        if self.approval_pending.is_some() {
-            self.handle_approval_key(key);
-            return;
-        }
+        // (Approval is handled at the very top of this function — it outranks
+        // every pane/overlay, matching the render priority.)
 
         // Global: Ctrl-P opens the command palette (opencode primitive).
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
@@ -1674,8 +1686,16 @@ impl App {
 
     /// Open the notebook pane and ask the backend for the current kernel
     /// state + cell log (so re-opening shows prior cells, not a blank pane).
+    ///
+    /// A fresh pane is created only on the FIRST open; reopening keeps any
+    /// in-progress draft and the local cell list (the `/notebook open` refresh
+    /// below re-syncs cells from the backend anyway).
     pub fn open_notebook_pane(&mut self) {
-        self.notebook = NotebookPane::opened();
+        if self.notebook.cells.is_empty() && self.notebook.code().trim().is_empty() {
+            self.notebook = NotebookPane::opened();
+        } else {
+            self.notebook.open = true;
+        }
         let _ = self.backend.send_command("/notebook open");
     }
 
@@ -4186,6 +4206,44 @@ mod tests {
         assert!(
             !app.palette.open,
             "palette must not open while an approval is pending"
+        );
+    }
+
+    #[test]
+    fn approval_is_answerable_while_notebook_pane_open() {
+        // The notebook's whole flow is: agent calls notebook_exec → approval
+        // popup (drawn OVER the pane). The human's `y` must approve, not get
+        // typed into the invisible cell editor.
+        let mut app = fresh();
+        app.open_notebook_pane();
+        assert!(app.notebook.open);
+        app.approval_pending = Some(("notebook_exec".into(), "Allow?".into()));
+
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(
+            app.approval_pending.is_none(),
+            "`y` must resolve the approval, not land in the editor"
+        );
+        assert!(
+            app.notebook.code().trim().is_empty(),
+            "the approval keystroke must not be typed into the cell"
+        );
+        assert!(app.notebook.open, "approving must not close the pane");
+    }
+
+    #[test]
+    fn reopening_notebook_preserves_in_progress_draft() {
+        let mut app = fresh();
+        app.open_notebook_pane();
+        app.notebook.input.insert_str("x = 41");
+        app.notebook.open = false; // user pressed Esc
+
+        app.open_notebook_pane(); // reopen from the palette
+        assert!(app.notebook.open);
+        assert_eq!(
+            app.notebook.code(),
+            "x = 41",
+            "an in-progress draft must survive close/reopen"
         );
     }
 
