@@ -3283,8 +3283,18 @@ async fn execute_notebook(
     // Point the kernel at PRISM's managed interpreter + the project root, the
     // same environment the Python tool server runs in.
     crate::notebook::configure(runtime.python_bin.clone(), runtime.project_root.clone());
-    if reset {
-        let _ = crate::notebook::reset().await;
+    if reset && let Err(error) = crate::notebook::reset().await {
+        // The caller asked for a clean slate — running the cell anyway on the
+        // old state would silently betray that, so fail honestly instead.
+        return Ok(json!({
+            "root": "notebook",
+            "invocation": invocation,
+            "success": false,
+            "timed_out": false,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": truncate_for_ui(&format!("reset failed: {error:#}"), 30_000),
+        }));
     }
 
     let cell = match crate::notebook::execute(code, timeout, "agent").await {
@@ -3389,10 +3399,19 @@ fn notebook_status_result(invocation: &str) -> Value {
 }
 
 async fn notebook_reset_result(invocation: &str) -> Value {
-    let outcome = crate::notebook::reset().await;
-    let (success, message) = match outcome {
-        Ok(()) => (true, "Notebook kernel reset — all cell state cleared."),
-        Err(_) => (false, "Notebook kernel reset encountered an error."),
+    // Surface the real reason on failure (e.g. "kernel is busy running a
+    // cell") — a generic "encountered an error" would hide the fix.
+    let (success, stdout, stderr) = match crate::notebook::reset().await {
+        Ok(()) => (
+            true,
+            "Notebook kernel reset — all cell state cleared.".to_string(),
+            String::new(),
+        ),
+        Err(error) => (
+            false,
+            String::new(),
+            format!("Notebook kernel reset failed: {error:#}"),
+        ),
     };
     json!({
         "root": "notebook",
@@ -3400,8 +3419,8 @@ async fn notebook_reset_result(invocation: &str) -> Value {
         "success": success,
         "timed_out": false,
         "exit_code": if success { 0 } else { 1 },
-        "stdout": message,
-        "stderr": "",
+        "stdout": stdout,
+        "stderr": stderr,
     })
 }
 

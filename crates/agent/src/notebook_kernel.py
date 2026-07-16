@@ -60,8 +60,48 @@ def _cap_text(value):
     return value[:MAX_TEXT] + f"\n...[truncated {dropped} characters]"
 
 
+def _cap_error(error):
+    """Bound every field of an error payload before it is serialized.
+
+    A recoverable exception with a huge message (e.g.
+    ``raise ValueError('x' * 20_000_000)``) would otherwise produce a
+    response line far beyond the Rust reader's per-line cap — which reaps
+    and restarts the kernel, destroying the whole shared session over a
+    perfectly normal exception. Caps ename/evalue individually and bounds
+    the traceback to ~MAX_TEXT total, keeping the HEAD of an oversized
+    frame (the exception line lives there) and reporting anything dropped.
+    """
+    if not error:
+        return error
+    frames = []
+    kept = 0
+    dropped = 0
+    for frame in error.get("traceback") or []:
+        frame = str(frame)
+        room = MAX_TEXT - kept
+        if room <= 0:
+            dropped += 1
+            continue
+        if len(frame) > room:
+            omitted = len(frame) - room
+            frame = frame[:room] + f"\n...[truncated {omitted} characters]"
+        kept += len(frame)
+        frames.append(frame)
+    if dropped:
+        frames.append(f"...[{dropped} traceback frame(s) dropped]")
+    return {
+        "ename": _cap_text(str(error.get("ename", "Error"))),
+        "evalue": _cap_text(str(error.get("evalue", ""))),
+        "traceback": frames,
+    }
+
+
 def _cap_images(images):
-    """Bound both the count and the total base64 size of returned images."""
+    """Bound both the count and the total base64 size of returned images.
+
+    Returns ``(kept, note)`` — figures past the budget are REPORTED via the
+    note (surfaced on stderr), never silently discarded.
+    """
     capped = []
     total = 0
     for image in images[:MAX_IMAGES]:
@@ -70,7 +110,52 @@ def _cap_images(images):
             break
         total += size
         capped.append(image)
-    return capped
+    dropped = len(images) - len(capped)
+    note = f"[{dropped} plot(s) dropped: over the per-cell image budget]" if dropped else None
+    return capped, note
+
+
+class _CappedBuffer(io.TextIOBase):
+    """Append-only text sink that stops STORING past ~MAX_TEXT.
+
+    Overflow is counted, not kept, so a print-flood inside a cell cannot
+    balloon the sidecar's memory while the cell runs (the old ``StringIO``
+    grew by GBs before the end-of-cell cap). ``value()`` stays within
+    MAX_TEXT including its truncation marker, so the final ``_cap_text``
+    pass never mangles the marker. Duck-types as a ``write()``-able stream
+    for the builtin backend's stdout/stderr redirection.
+    """
+
+    _ROOM = 100  # reserved for the truncation marker
+
+    def __init__(self):
+        super().__init__()
+        self._parts = []
+        self._length = 0
+        self._dropped = 0
+
+    def writable(self):
+        return True
+
+    def write(self, text):
+        text = str(text)
+        room = (MAX_TEXT - self._ROOM) - self._length
+        if room > 0:
+            kept = text[:room]
+            self._parts.append(kept)
+            self._length += len(kept)
+            self._dropped += len(text) - len(kept)
+        else:
+            self._dropped += len(text)
+        return len(text)
+
+    def value(self):
+        out = "".join(self._parts)
+        if self._dropped:
+            out += f"\n...[truncated {self._dropped} characters]"
+        return out
+
+    getvalue = value
 
 
 def _emit(obj):
@@ -95,7 +180,9 @@ class JupyterKernel:
         client = self.client
         msg_id = client.execute(code)
 
-        stdout, stderr = [], []
+        # Capped at append time — a print-flood over iopub must not balloon
+        # the sidecar while the cell runs.
+        stdout, stderr = _CappedBuffer(), _CappedBuffer()
         images = []
         result_repr = None
         error = None
@@ -117,12 +204,24 @@ class JupyterKernel:
                     self.manager.interrupt_kernel()
                 except Exception:
                     pass
+                kernel_dead = not self._drain_to_idle(msg_id, grace=5)
+                if kernel_dead:
+                    # Rust reaps a wedged kernel and starts fresh — say so,
+                    # honestly: "interrupted" alone would imply the session
+                    # (its variables) survived, and it did not.
+                    detail = (
+                        f"cell exceeded {timeout}s and the kernel ignored the "
+                        "interrupt — the kernel was restarted, so variables "
+                        "from this session were lost. Re-run setup cells, or "
+                        "raise the timeout."
+                    )
+                else:
+                    detail = f"cell exceeded {timeout}s and was interrupted"
                 error = {
                     "ename": "TimeoutError",
-                    "evalue": f"cell exceeded {timeout}s and was interrupted",
-                    "traceback": [f"TimeoutError: cell exceeded {timeout}s"],
+                    "evalue": detail,
+                    "traceback": [f"TimeoutError: {detail}"],
                 }
-                kernel_dead = not self._drain_to_idle(msg_id, grace=5)
                 break
 
             parent = msg.get("parent_header", {}).get("msg_id")
@@ -136,7 +235,7 @@ class JupyterKernel:
                 if content.get("execution_state") == "idle":
                     break
             elif mtype == "stream":
-                (stdout if content.get("name") == "stdout" else stderr).append(
+                (stdout if content.get("name") == "stdout" else stderr).write(
                     content.get("text", "")
                 )
             elif mtype in ("execute_result", "display_data"):
@@ -163,8 +262,8 @@ class JupyterKernel:
             pass
 
         return {
-            "stdout": "".join(stdout),
-            "stderr": "".join(stderr),
+            "stdout": stdout.value(),
+            "stderr": stderr.value(),
             "result": result_repr,
             "images": images,
             "error": error,
@@ -230,8 +329,10 @@ class BuiltinKernel:
 
     def execute(self, code, timeout):  # timeout enforced by Rust (process kill)
         self.count += 1
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        # Capped at write time — a print-flood must not balloon this process
+        # by GBs before the end-of-cell truncation gets a chance to run.
+        stdout = _CappedBuffer()
+        stderr = _CappedBuffer()
         result_repr = None
         error = None
 
@@ -255,11 +356,16 @@ class BuiltinKernel:
         finally:
             sys.stdout, sys.stderr = old_out, old_err
 
+        images, image_note = self._harvest_matplotlib()
+        stderr_text = stderr.value()
+        if image_note:
+            stderr_text = f"{stderr_text}\n{image_note}" if stderr_text else image_note
+
         return {
-            "stdout": stdout.getvalue(),
-            "stderr": stderr.getvalue(),
+            "stdout": stdout.value(),
+            "stderr": stderr_text,
             "result": result_repr,
-            "images": self._harvest_matplotlib(),
+            "images": images,
             "error": error,
             "execution_count": self.count,
             "kernel_dead": False,
@@ -290,27 +396,37 @@ class BuiltinKernel:
 
     @staticmethod
     def _harvest_matplotlib():
-        """Snapshot any open matplotlib figures to PNG, then close them."""
+        """Snapshot any open matplotlib figures to PNG, then close them.
+
+        Returns ``(images, note)`` — a figure that fails to render is COUNTED
+        and reported via the note (surfaced on stderr), never silently
+        dropped, and one bad figure doesn't stop the rest from capturing.
+        """
         if "matplotlib" not in sys.modules:
-            return []
+            return [], None
         images = []
+        failed = 0
         try:
             import matplotlib.pyplot as plt
 
             for num in plt.get_fignums():
-                fig = plt.figure(num)
-                buf = io.BytesIO()
-                fig.savefig(buf, format="png", bbox_inches="tight")
-                images.append(
-                    {
-                        "mime": "image/png",
-                        "b64": base64.b64encode(buf.getvalue()).decode("ascii"),
-                    }
-                )
+                try:
+                    fig = plt.figure(num)
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format="png", bbox_inches="tight")
+                    images.append(
+                        {
+                            "mime": "image/png",
+                            "b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+                        }
+                    )
+                except Exception:
+                    failed += 1
             plt.close("all")
         except Exception:
-            return images
-        return images
+            failed += 1
+        note = f"[{failed} plot(s) failed to capture]" if failed else None
+        return images, note
 
     def shutdown(self):
         self.globals.clear()
@@ -395,26 +511,34 @@ def main():
                     "stderr": "",
                     "result": None,
                     "images": [],
-                    "error": {
-                        "ename": type(exc).__name__,
-                        "evalue": str(exc),
-                        "traceback": traceback.format_exc().splitlines(),
-                    },
+                    # Capped like every error: a fault carrying a huge message
+                    # must not exceed the Rust line cap and kill the session.
+                    "error": _cap_error(
+                        {
+                            "ename": type(exc).__name__,
+                            "evalue": str(exc),
+                            "traceback": traceback.format_exc().splitlines(),
+                        }
+                    ),
                     "execution_count": None,
                 }
             )
             continue
 
+        images, image_note = _cap_images(out["images"])
+        stderr = _cap_text(out["stderr"]) or ""
+        if image_note:
+            stderr = f"{stderr}\n{image_note}" if stderr else image_note
         _emit(
             {
                 "event": "result",
                 "id": req_id,
                 "status": "error" if out["error"] else "ok",
                 "stdout": _cap_text(out["stdout"]),
-                "stderr": _cap_text(out["stderr"]),
+                "stderr": stderr,
                 "result": _cap_text(out["result"]),
-                "images": _cap_images(out["images"]),
-                "error": out["error"],
+                "images": images,
+                "error": _cap_error(out["error"]),
                 "execution_count": out["execution_count"],
                 "kernel_dead": out.get("kernel_dead", False),
             }

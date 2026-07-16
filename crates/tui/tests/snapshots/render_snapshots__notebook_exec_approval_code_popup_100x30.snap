@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+                                                                   │
+❯ You                                                              │  1. prompt "analyze the data" •
+▌ analyze the data                                                 │
+              ┌──────────────────────────────────────────────────────────────────────┐
+· notebook_exe│  ⚠ APPROVAL REQUIRED                                                 │
+              │                                                                      │
+              │  Tool: notebook_exec  —  Allow notebook_exec?                        │
+              │┌ Cell code — review before answering ───────────────────────────────┐│
+              ││import os                                                           ││
+              ││secrets = {k: v for k, v in os.environ.items()}                     ││
+              ││print(secrets)                                                      ││
+              ││                                                                    ││
+              ││                                                                    ││
+              ││                                                                    ││
+              ││                                                                    ││
+              ││                                                                    ││
+              ││                                                                    ││
+              ││                                                                    ││
+              ││                                                                    ││
+              ││                                                                    ││
+              ││                                                                    ││
+              │└────────────────────────────────────────────────────────────────────┘│
+┌ Prompt ─────│  [y] Allow   [a] Allow all   [n] Deny                                │
+│tool approval└──────────────────────────────────────────────────────────────────────┘
+│                                                                 ││
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [APPROVAL]    Ctrl-C quit           │

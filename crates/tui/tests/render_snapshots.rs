@@ -326,6 +326,49 @@ fn snapshot_approval_required_popup_100x30() {
     insta::assert_snapshot!("approval_required_popup_100x30", rendered);
 }
 
+/// Snapshot: `notebook_exec` approval popup shows the FULL cell code — the
+/// kernel is shared with the human, so consent must be informed (a 60-char
+/// first-line preview could hide `print(api_key)` on line two).
+#[test]
+fn snapshot_notebook_exec_approval_code_popup_100x30() {
+    let mut app = fake_app();
+    app.apply_agent_msg(AgentMsg::Welcome {
+        version: "2.7.1-fake".into(),
+        tool_count: 99,
+    });
+    app.apply_agent_msg(AgentMsg::Status {
+        model: "fake-backend".into(),
+        mode: "chat".into(),
+        message_count: 1,
+    });
+    app.push_user("analyze the data");
+    app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+        tool_name: "notebook_exec".into(),
+        call_id: Some("call-7".into()),
+        message: "Allow notebook_exec?".into(),
+        tool_args: Some(serde_json::json!({
+            "code": "import os\nsecrets = {k: v for k, v in os.environ.items()}\nprint(secrets)",
+            "reset": false,
+        })),
+        tool_description: Some("Execute Python in the shared notebook kernel".into()),
+        requires_approval: Some(true),
+        permission_mode: Some("full_access".into()),
+        choices: vec!["y".into(), "n".into(), "a".into()],
+        prompt_type: Some("approval".into()),
+    });
+    app.tokens_per_sec = 0.0;
+    app.first_token_time = None;
+    app.last_token_time = None;
+    app.tokens_received = 0;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    // Every line of the cell must be visible, not just a truncated head.
+    assert!(rendered.contains("import os"));
+    assert!(rendered.contains("secrets = {k: v for k, v in os.environ.items()}"));
+    assert!(rendered.contains("print(secrets)"));
+    insta::assert_snapshot!("notebook_exec_approval_code_popup_100x30", rendered);
+}
+
 /// Snapshot: cost metrics at 100x30.
 #[test]
 fn snapshot_cost_metrics_100x30() {

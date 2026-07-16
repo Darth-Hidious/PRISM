@@ -3315,10 +3315,103 @@ fn draw_notebook_pane(f: &mut Frame, app: &App) {
 
 fn draw_approval_popup(f: &mut Frame, app: &App) {
     let t = app.theme();
+    let (tool, message) = app.approval_pending.as_ref().unwrap();
+
+    // When the prompt carries code (notebook_exec — arbitrary Python on the
+    // kernel SHARED with the human), the popup must show the WHOLE cell so
+    // the human can read exactly what they approve. Wrapped, bounded height,
+    // scrollable with ↑/↓ when it doesn't fit.
+    if let Some(code) = &app.approval_code {
+        let area = centered_rect(72, 70, f.area());
+        f.render_widget(Clear, area);
+
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.approval));
+        let inner = outer.inner(area);
+        f.render_widget(outer, area);
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // banner + tool/message
+                Constraint::Min(3),    // code block
+                Constraint::Length(1), // key hints
+            ])
+            .split(inner);
+
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![Span::styled(
+                    "  ⚠ APPROVAL REQUIRED  ",
+                    Style::default()
+                        .fg(t.overlay_bg)
+                        .bg(t.approval)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  Tool: "),
+                    Span::styled(
+                        tool.clone(),
+                        Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  —  "),
+                    Span::styled(message.clone(), Style::default().fg(t.text)),
+                ]),
+            ]),
+            rows[0],
+        );
+
+        let code_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.divider))
+            .title(Span::styled(
+                " Cell code — review before answering ",
+                Style::default().fg(t.muted),
+            ));
+        let code_area = code_block.inner(rows[1]);
+        f.render_widget(code_block, rows[1]);
+
+        // Manual wrap so the scroll bound is exact (Paragraph::wrap gives no
+        // rendered-line count on stable ratatui).
+        let wrapped = wrap_plain(code, code_area.width.max(1) as usize);
+        let visible = code_area.height as usize;
+        let max_scroll = wrapped.len().saturating_sub(visible) as u16;
+        app.approval_max_scroll.set(max_scroll);
+        let scroll = app.approval_scroll.min(max_scroll) as usize;
+        let lines: Vec<Line> = wrapped
+            .iter()
+            .skip(scroll)
+            .take(visible)
+            .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(t.text))))
+            .collect();
+        f.render_widget(Paragraph::new(lines), code_area);
+
+        let mut hints = vec![
+            Span::raw("  [y] "),
+            Span::styled("Allow", Style::default().fg(t.ok)),
+            Span::raw("   [a] "),
+            Span::styled("Allow all", Style::default().fg(t.warn)),
+            Span::raw("   [n] "),
+            Span::styled("Deny", Style::default().fg(t.err)),
+        ];
+        if max_scroll > 0 {
+            hints.push(Span::styled(
+                format!(
+                    "   ↑/↓ scroll code ({}/{})",
+                    scroll + visible.min(wrapped.len()),
+                    wrapped.len()
+                ),
+                Style::default().fg(t.muted),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(hints)), rows[2]);
+        return;
+    }
+
     let area = centered_rect(60, 20, f.area());
     f.render_widget(Clear, area);
-
-    let (tool, message) = app.approval_pending.as_ref().unwrap();
 
     let popup = Paragraph::new(vec![
         Line::from(""),
@@ -3361,6 +3454,37 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
     .alignment(Alignment::Left);
 
     f.render_widget(popup, area);
+}
+
+/// Hard-wrap plain text to `width` characters per line (no word splitting
+/// smarts — code must never be reflowed in a way that hides content). Every
+/// input line yields at least one output line, so nothing is dropped.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut count = 0;
+        for ch in line.chars() {
+            current.push(ch);
+            count += 1;
+            if count == width {
+                out.push(std::mem::take(&mut current));
+                count = 0;
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 /// Helper: centered rect for popups.

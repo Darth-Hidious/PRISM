@@ -322,18 +322,26 @@ impl Kernel {
     }
 
     async fn shutdown(&mut self) {
+        // Capture the group id BEFORE wait() reaps the child (`id()` returns
+        // None afterwards). The sidecar is its own group leader (see spawn).
+        let pgid = self.child.id();
         let _ = self.stdin.write_all(b"{\"op\":\"shutdown\"}\n").await;
         let _ = self.stdin.flush().await;
-        // Give it a moment to tear the IPython kernel down cleanly, then reap
-        // the whole process group so no cell-spawned child is orphaned.
+        // Give it a moment to tear the IPython kernel down cleanly.
         if timeout(Duration::from_secs(5), self.child.wait())
             .await
             .is_err()
         {
-            if let Some(pid) = self.child.id() {
-                kill_process_group(pid);
-            }
             let _ = self.child.start_kill();
+            let _ = self.child.wait().await;
+        }
+        // Kill the process group even after a CLEAN exit: background
+        // processes a cell spawned (e.g. `subprocess.Popen(['sleep', …])`)
+        // share the sidecar's group and would otherwise survive every
+        // reset/shutdown. The pgid stays valid while any member lives; with
+        // no members left this is a harmless ESRCH.
+        if let Some(pgid) = pgid {
+            kill_process_group(pgid);
         }
     }
 }
@@ -401,6 +409,10 @@ fn kill_process_group(pid: u32) {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) {}
 
+/// How many saved `cell-*.png` files to keep in the state dir. Oldest beyond
+/// this are pruned so a long session can't grow the dir without bound.
+const MAX_SAVED_IMAGES: usize = 64;
+
 /// Persist any base64 images a cell produced to PNG files under the state dir,
 /// returning their paths. Keeps huge blobs out of the agent's context: the
 /// tool result carries paths, not bytes, unless base64 is explicitly asked
@@ -424,7 +436,38 @@ fn save_images(exec_count: u64, images: &Value) -> Vec<String> {
             paths.push(path.to_string_lossy().to_string());
         }
     }
+    if !paths.is_empty() {
+        prune_cell_images(&dir, MAX_SAVED_IMAGES);
+    }
     paths
+}
+
+/// Best-effort: delete the oldest saved `cell-*.png` files so at most `keep`
+/// remain. Only touches the notebook's own image files — nothing else in the
+/// state dir (the sidecar script lives there too).
+fn prune_cell_images(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("cell-") && name.ends_with(".png")
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by_key(|(modified, _)| *modified);
+    for (_, path) in files.iter().take(files.len() - keep) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Join a kernel `error` object into a single displayable string.
@@ -491,8 +534,13 @@ pub async fn execute(code: &str, timeout_secs: Option<u64>, origin: &str) -> Res
     }
     let mut kernel = kernel.expect("kernel spawned above");
 
-    // Hard guard: sidecar timeout + a small margin for the round-trip.
-    let hard = Duration::from_secs(timeout_secs + 5);
+    // Hard guard: sidecar timeout + a margin wide enough for the sidecar's
+    // own soft-timeout recovery — interrupt + up to 5s drain-to-idle grace +
+    // 1s shell-reply reap (see notebook_kernel.py) ≈ timeout + 6s. A tighter
+    // margin would let this hard kill fire FIRST, losing the sidecar's honest
+    // `kernel_dead` report and any partial output it captured. 15s keeps a
+    // real ceiling while letting the soft path finish.
+    let hard = Duration::from_secs(timeout_secs + 15);
 
     // On the success path we get a clean `result`; on a hard timeout or an I/O
     // fault the kernel is suspect, so we kill+restart it and record honestly.
@@ -638,11 +686,23 @@ pub fn cells() -> Vec<Cell> {
 }
 
 /// Shut the kernel down and clear all cell state — a fresh notebook.
+///
+/// Refuses while a cell is in flight: the executing call holds the kernel
+/// checked out of the shared state, so a reset here would clear the log only
+/// for the cell's success path to put the old kernel AND its cell straight
+/// back — silently undoing the reset. Bailing is honest; the caller retries
+/// once the cell finishes.
 pub async fn reset() -> Result<()> {
     let kernel = {
         let mut guard = lock();
         match guard.as_mut() {
             Some(state) => {
+                if state.busy {
+                    bail!(
+                        "notebook kernel is busy running a cell — wait for it to \
+                         finish, then reset"
+                    );
+                }
                 state.cells.clear();
                 state.exec_count = 0;
                 state.kernel.take()
@@ -653,6 +713,9 @@ pub async fn reset() -> Result<()> {
     if let Some(mut kernel) = kernel {
         kernel.shutdown().await;
     }
+    // The cell log is gone, so its saved plot files are unreachable — remove
+    // them (best-effort) instead of letting the state dir grow forever.
+    prune_cell_images(&notebook_dir(), 0);
     Ok(())
 }
 
@@ -804,6 +867,163 @@ mod tests {
         );
 
         reset().await.unwrap();
+        reset_global();
+    }
+
+    #[tokio::test]
+    async fn huge_exception_message_does_not_kill_the_shared_session() {
+        let _serial = test_serial().lock().await;
+        let Some(py) = test_python() else {
+            return;
+        };
+        reset_global();
+        configure(py, std::env::temp_dir());
+
+        let c1 = execute("keep = 'alive'", Some(30), "user").await.unwrap();
+        assert!(c1.success, "error: {:?}", c1.error);
+
+        // ~40 MB exception message — far beyond the 16 MiB line cap if the
+        // sidecar emitted the error uncapped. Must come back as a normal
+        // failed cell, NOT a TooLarge bail that reaps the kernel.
+        let cell = execute("raise ValueError('x' * 40_000_000)", Some(120), "user")
+            .await
+            .expect("a huge exception is a failed cell, not a dead kernel");
+        assert!(!cell.success);
+        let err = cell.error.expect("error surfaced");
+        assert!(err.contains("ValueError"), "exception name kept: {err}");
+        assert!(err.contains("truncated"), "truncation reported: {err}");
+
+        // THE point: the kernel — and the human's variables — survived.
+        let c3 = execute("keep", Some(30), "user").await.unwrap();
+        assert_eq!(
+            c3.result.as_deref(),
+            Some("'alive'"),
+            "the shared session must survive a large recoverable exception"
+        );
+
+        reset().await.unwrap();
+        reset_global();
+    }
+
+    #[tokio::test]
+    async fn print_flood_is_capped_at_append_time() {
+        let _serial = test_serial().lock().await;
+        let Some(py) = test_python() else {
+            return;
+        };
+        reset_global();
+        // Builtin backend: exercises the capped stdout writer deterministically.
+        unsafe { std::env::set_var("PRISM_NOTEBOOK_FORCE_BUILTIN", "1") };
+        configure(py, std::env::temp_dir());
+
+        let cell = execute(
+            "for _ in range(8):\n    print('y' * 1_000_000)",
+            Some(60),
+            "user",
+        )
+        .await;
+        unsafe { std::env::remove_var("PRISM_NOTEBOOK_FORCE_BUILTIN") };
+
+        let cell = cell.expect("flood cell should execute");
+        assert!(cell.success, "error: {:?}", cell.error);
+        assert!(
+            cell.stdout.len() <= 1_100_000,
+            "stdout must stay near the 1 MB cap, got {} bytes",
+            cell.stdout.len()
+        );
+        assert!(
+            cell.stdout.contains("truncated"),
+            "the cap must be reported, not silent"
+        );
+
+        reset().await.unwrap();
+        reset_global();
+    }
+
+    #[tokio::test]
+    async fn reset_refuses_while_a_cell_is_in_flight() {
+        let _serial = test_serial().lock().await;
+        reset_global();
+        configure(PathBuf::from("python3"), std::env::temp_dir());
+        {
+            let mut guard = lock();
+            let state = ensure_state(&mut guard).unwrap();
+            state.busy = true;
+            state.exec_count = 1;
+            state.cells.push(Cell {
+                execution_count: 1,
+                origin: "user".to_string(),
+                code: "x = 1".to_string(),
+                stdout: String::new(),
+                stderr: String::new(),
+                result: None,
+                image_paths: Vec::new(),
+                error: None,
+                success: true,
+            });
+        }
+
+        let err = reset().await.expect_err("reset must bail while busy");
+        assert!(format!("{err:#}").contains("busy"), "got: {err:#}");
+        assert_eq!(cells().len(), 1, "a refused reset must not clear the log");
+
+        if let Some(state) = lock().as_mut() {
+            state.busy = false;
+        }
+        reset().await.expect("reset succeeds once idle");
+        assert_eq!(cells().len(), 0);
+        reset_global();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_shutdown_kills_cell_spawned_children() {
+        let _serial = test_serial().lock().await;
+        let Some(py) = test_python() else {
+            return;
+        };
+        reset_global();
+        // Builtin backend: the cell's child lives in the sidecar's process
+        // group, which the shutdown group-kill must reap.
+        unsafe { std::env::set_var("PRISM_NOTEBOOK_FORCE_BUILTIN", "1") };
+        configure(py, std::env::temp_dir());
+
+        let cell = execute(
+            "import subprocess\np = subprocess.Popen(['sleep', '300'])\np.pid",
+            Some(30),
+            "user",
+        )
+        .await;
+        unsafe { std::env::remove_var("PRISM_NOTEBOOK_FORCE_BUILTIN") };
+        let cell = cell.expect("spawn cell should execute");
+        assert!(cell.success, "error: {:?}", cell.error);
+        let pid: i32 = cell
+            .result
+            .as_deref()
+            .expect("pid echoed")
+            .parse()
+            .expect("pid parses");
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the sleep child should be alive before shutdown"
+        );
+
+        // Clean shutdown: the sidecar exits 0 — the leaked child must die too.
+        reset().await.unwrap();
+        let mut alive = true;
+        for _ in 0..30 {
+            alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !alive,
+            "a cell-spawned background process must not survive a clean \
+             shutdown/reset (pid {pid} still alive)"
+        );
         reset_global();
     }
 

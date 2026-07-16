@@ -3950,11 +3950,14 @@ async fn handle_notebook_slash_command(
             Ok(true)
         }
         Some("reset") => {
-            let _ = crate::notebook::reset().await;
-            emit_notification(
-                "ui.text.delta",
-                serde_json::json!({ "text": "Notebook kernel reset — cell state cleared." }),
-            );
+            // reset() bails while a cell is in flight (a reset then would be
+            // silently undone by the in-flight cell) — report that honestly
+            // instead of claiming a clean slate.
+            let text = match crate::notebook::reset().await {
+                Ok(()) => "Notebook kernel reset — cell state cleared.".to_string(),
+                Err(error) => format!("Notebook reset failed: {error:#}"),
+            };
+            emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
             emit_notebook_state();
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
