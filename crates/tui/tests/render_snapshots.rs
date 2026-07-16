@@ -852,6 +852,7 @@ fn snapshot_model_picker_100x30() {
             serde_json::json!({"id":"anthropic/claude-sonnet-4","label":"Claude Sonnet 4","provider":"anthropic","free":false}),
         ],
         current: "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf".into(),
+        notice: None,
     });
     freeze_metrics(&mut app);
 
@@ -943,6 +944,7 @@ fn stress_renders_without_panic() {
     app.apply_agent_msg(prism_tui::msg::AgentMsg::ModelList {
         models,
         current: "m0".into(),
+        notice: None,
     });
     let sessions: Vec<_> = (0..1000)
         .map(|i| serde_json::json!({"session_id":format!("s{i}"),"created_at":i as f64,"turn_count":i,"model":"m","is_latest":i==0}))

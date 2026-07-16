@@ -7657,18 +7657,21 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
     };
 
     // Live catalog first; if the platform is unreachable, fall back to the
-    // local cache so `prism models` keeps working offline.
-    let catalog = match fetch_platform_catalog_live(paths).await {
-        Ok(models) => models,
+    // local cache so `prism models` keeps working offline. Provenance
+    // (source + age) is carried through so the TUI can be honest about a
+    // stale list instead of silently showing cached data as live.
+    let (catalog, source, age_secs) = match fetch_platform_catalog_live(paths).await {
+        Ok(models) => (models, "live", None),
         Err(err) => match prism_agent::models::load_catalog_cache() {
             Some(cache) => {
+                let age = cache.age().as_secs();
                 eprintln!(
                     "[prism] platform catalog unreachable ({err:#}); using cached catalog \
                      ({} models, {}m old)",
                     cache.models.len(),
-                    cache.age().as_secs() / 60
+                    age / 60
                 );
-                cache.models
+                (cache.models, "cache", Some(age))
             }
             None => {
                 return Err(err.context(
@@ -7692,7 +7695,16 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
             }
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&models)?);
+                // Object (not bare array) so the TUI picker can render the
+                // list's provenance; the protocol parser reads `models`.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "models": models,
+                        "source": source,
+                        "age_secs": age_secs,
+                    }))?
+                );
             } else {
                 print_models_summary(&models);
             }

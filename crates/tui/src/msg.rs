@@ -61,7 +61,13 @@ pub enum AgentMsg {
 
     /// `ui.model.list` — hosted model catalog (response to `/models list`),
     /// rendered as a fuzzy model picker. Each item is `{id,label,provider,free}`.
-    ModelList { models: Vec<Value>, current: String },
+    /// `notice` carries list provenance (e.g. stale-cache warning) so the
+    /// picker never presents cached data as a live list.
+    ModelList {
+        models: Vec<Value>,
+        current: String,
+        notice: Option<String>,
+    },
 
     /// `ui.gpu.list` — live GPU procurement catalog (response to `/gpus`),
     /// rendered as the GPU picker. Each item is
@@ -279,6 +285,10 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            notice: params
+                .get("notice")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         },
 
         // ── GPU picker ───────────────────────────────────────────────

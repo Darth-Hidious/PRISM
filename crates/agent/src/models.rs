@@ -57,14 +57,17 @@ pub struct ModelConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Static seed — offline last resort ONLY
+// Static seed — offline baseline ONLY
 // ---------------------------------------------------------------------------
 //
-// Deliberately tiny: a handful of well-known models so a fresh offline
-// install still has sane budget/cost accounting for the compiled-in
-// defaults (`get_default_model`, the subagent default, the TUI picker's
-// curated fallback). Everything else comes from the platform catalog or
-// `~/.prism/models.toml` — do NOT grow this list when a new model ships.
+// The well-known models with their real, field-for-field values, so a fresh
+// offline install — or a direct-provider user (`OPENAI_API_KEY` path) whose
+// project-scoped catalog never lists these ids — still gets correct
+// budget/cost accounting instead of the $0/128k UNKNOWN stub. The live
+// catalog and `~/.prism/models.toml` AUGMENT this baseline (later source
+// wins per id); they do not replace it. Add a new id here only when it is a
+// stable default users hit offline — everything transient comes from the
+// catalog.
 
 #[allow(clippy::too_many_arguments)] // positional table constructor, used only for SEED below
 const fn seed(
@@ -163,6 +166,17 @@ const SEED: &[ModelConfig] = &[
         true,
     ),
     seed(
+        "claude-sonnet-4-20250318",
+        "anthropic",
+        200_000,
+        64_000,
+        16_384,
+        3.00,
+        15.00,
+        true,
+        true,
+    ),
+    seed(
         "claude-haiku-4-5",
         "anthropic",
         200_000,
@@ -174,11 +188,55 @@ const SEED: &[ModelConfig] = &[
         false,
     ),
     seed(
-        "gpt-5", "openai", 400_000, 128_000, 16_384, 1.25, 10.00, false, true,
+        "claude-haiku-4-5-20251001",
+        "anthropic",
+        200_000,
+        64_000,
+        8_192,
+        1.00,
+        5.00,
+        true,
+        false,
     ),
+    // --- OpenAI ---
     seed(
         "gpt-4o", "openai", 128_000, 16_384, 8_192, 2.50, 10.00, false, false,
     ),
+    seed(
+        "gpt-4o-mini",
+        "openai",
+        128_000,
+        16_384,
+        4_096,
+        0.15,
+        0.60,
+        false,
+        false,
+    ),
+    seed(
+        "gpt-4.1", "openai", 1_000_000, 32_768, 16_384, 2.00, 8.00, false, false,
+    ),
+    seed(
+        "gpt-4.1-mini",
+        "openai",
+        1_000_000,
+        32_768,
+        8_192,
+        0.40,
+        1.60,
+        false,
+        false,
+    ),
+    seed(
+        "gpt-5", "openai", 400_000, 128_000, 16_384, 1.25, 10.00, false, true,
+    ),
+    seed(
+        "o3", "openai", 200_000, 100_000, 16_384, 2.00, 8.00, false, true,
+    ),
+    seed(
+        "o3-mini", "openai", 200_000, 100_000, 8_192, 1.10, 4.40, false, true,
+    ),
+    // --- Google ---
     seed(
         "gemini-2.5-pro",
         "google",
@@ -191,7 +249,44 @@ const SEED: &[ModelConfig] = &[
         true,
     ),
     seed(
+        "gemini-2.5-flash",
+        "google",
+        1_000_000,
+        65_536,
+        8_192,
+        0.30,
+        2.50,
+        false,
+        false,
+    ),
+    seed(
+        "gemini-3.1-pro",
+        "google",
+        1_000_000,
+        65_536,
+        16_384,
+        2.00,
+        12.00,
+        false,
+        true,
+    ),
+    // --- Zhipu ---
+    seed(
         "glm-5", "zhipu", 200_000, 128_000, 16_384, 1.00, 3.20, false, false,
+    ),
+    seed(
+        "glm-4.7", "zhipu", 128_000, 16_384, 8_192, 0.38, 1.70, false, false,
+    ),
+    seed(
+        "glm-4.5-air",
+        "zhipu",
+        128_000,
+        16_384,
+        4_096,
+        0.10,
+        0.50,
+        false,
+        false,
     ),
 ];
 
@@ -235,6 +330,63 @@ pub struct UserModel {
     pub supports_caching: Option<bool>,
 }
 
+impl UserModel {
+    /// Reject values that would corrupt cost/limit accounting or leak a
+    /// secret. Applied on register (hard error) AND on load (drop + warn),
+    /// so a hand-edited `models.toml` can't inject a NaN price, a zero
+    /// context window, or a pasted API key masquerading as an env-var name.
+    fn validate(&self) -> Result<()> {
+        if self.provider.trim().is_empty() {
+            bail!("provider must not be empty");
+        }
+        if self.context_window == 0 {
+            bail!("context_window must be > 0");
+        }
+        if let Some(0) = self.max_output_tokens {
+            bail!("max_output_tokens must be > 0 when set");
+        }
+        // `< 0.0` is false for NaN, and clap/TOML accept `nan`/`inf` — a
+        // non-finite price makes estimate_cost return NaN. Require finite ≥ 0.
+        if !(self.input_price.is_finite() && self.input_price >= 0.0) {
+            bail!("input_price must be a finite value >= 0 (USD per 1M tokens)");
+        }
+        if !(self.output_price.is_finite() && self.output_price >= 0.0) {
+            bail!("output_price must be a finite value >= 0 (USD per 1M tokens)");
+        }
+        if let Some(env) = &self.api_key_env
+            && !is_valid_env_var_name(env)
+        {
+            bail!(
+                "api_key_env must be an environment variable NAME (e.g. ZAI_API_KEY), \
+                 not the key value — got {env:?}"
+            );
+        }
+        if let Some(url) = &self.base_url
+            && !is_http_url(url)
+        {
+            bail!("base_url must be an http(s) URL — got {url:?}");
+        }
+        Ok(())
+    }
+}
+
+/// A POSIX-ish env var name: `^[A-Za-z_][A-Za-z0-9_]*$`. Rejects a pasted
+/// key (which contains `-`, `.`, `/`, or is empty) from being persisted.
+fn is_valid_env_var_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Lightweight http(s) URL check — no new dependency. Enough to reject a
+/// non-URL string; the reqwest client validates fully at request time.
+fn is_http_url(s: &str) -> bool {
+    let rest = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"));
+    matches!(rest, Some(host) if !host.is_empty() && !host.starts_with('/'))
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct UserModelsFile {
     #[serde(default)]
@@ -266,7 +418,16 @@ fn load_user_models() -> Vec<(String, UserModel)> {
         return Vec::new();
     };
     match parse_user_models(&raw) {
-        Ok(models) => models,
+        Ok(models) => models
+            .into_iter()
+            .filter(|(id, m)| match m.validate() {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("ignoring invalid model {id:?} in {}: {e}", path.display());
+                    false
+                }
+            })
+            .collect(),
         Err(e) => {
             tracing::warn!("ignoring malformed {}: {e}", path.display());
             Vec::new()
@@ -290,15 +451,7 @@ fn register_user_model_at(path: &Path, id: &str, model: UserModel) -> Result<Pat
     if id.is_empty() {
         bail!("model id must not be empty");
     }
-    if model.provider.trim().is_empty() {
-        bail!("--provider must not be empty");
-    }
-    if model.context_window == 0 {
-        bail!("--context-window must be > 0");
-    }
-    if model.input_price < 0.0 || model.output_price < 0.0 {
-        bail!("prices must be >= 0 (USD per 1M tokens)");
-    }
+    model.validate()?;
 
     // A malformed existing file is a hard error here — registering must
     // never silently clobber hand-edited user config.
@@ -438,18 +591,36 @@ fn leak(s: &str) -> &'static str {
     Box::leak(s.to_owned().into_boxed_str())
 }
 
+/// A price field from JSON: only a finite, non-negative value survives —
+/// a poisoned/hand-edited cache with NaN, inf, or a negative price falls
+/// back to $0 rather than poisoning `estimate_cost`.
+fn sane_price(v: &serde_json::Value, key: &str) -> f64 {
+    match v.get(key).and_then(serde_json::Value::as_f64) {
+        Some(p) if p.is_finite() && p >= 0.0 => p,
+        _ => 0.0,
+    }
+}
+
 /// Map one raw platform-catalog entry to a `ModelConfig`. Entries without
-/// a model id are skipped. Missing limits get the same conservative
-/// defaults as `UNKNOWN_MODEL_CONFIG` (128k / 16k); missing prices are $0,
-/// which is what the platform means by a free model.
+/// a model id are skipped. Missing/absurd limits get the same conservative
+/// defaults as `UNKNOWN_MODEL_CONFIG` (128k / 16k); missing/invalid prices
+/// are $0, which is what the platform means by a free model.
+///
+/// `base_url` / `api_key_env` are deliberately NOT read from the catalog or
+/// its on-disk cache: only the user's own `~/.prism/models.toml` may set a
+/// custom endpoint or a secret env-var name. Importing them here would let a
+/// poisoned catalog/cache pair an arbitrary env-secret name with an attacker
+/// URL — a latent exfil primitive the moment endpoint routing wires up.
 fn catalog_entry_to_config(v: &serde_json::Value) -> Option<ModelConfig> {
     let id = v
         .get("model_id")
         .or_else(|| v.get("id"))
         .and_then(|x| x.as_str())?;
+    // A positive u64; 0 or absurd → treat as absent (use the default).
     let get_usize = |keys: &[&str]| {
         keys.iter()
             .find_map(|k| v.get(*k).and_then(|x| x.as_u64()))
+            .filter(|x| *x > 0)
             .map(|x| x as usize)
     };
     let get_bool = |k: &str| v.get(k).and_then(serde_json::Value::as_bool);
@@ -465,16 +636,14 @@ fn catalog_entry_to_config(v: &serde_json::Value) -> Option<ModelConfig> {
         context_window,
         max_output_tokens,
         default_max_tokens: max_output_tokens.min(DEFAULT_MAX_OUTPUT_TOKENS),
-        input_price_per_mtok: v.get("input_price").and_then(|x| x.as_f64()).unwrap_or(0.0),
-        output_price_per_mtok: v
-            .get("output_price")
-            .and_then(|x| x.as_f64())
-            .unwrap_or(0.0),
+        input_price_per_mtok: sane_price(v, "input_price"),
+        output_price_per_mtok: sane_price(v, "output_price"),
         supports_caching: get_bool("supports_prompt_caching").unwrap_or(false),
         supports_thinking: get_bool("supports_reasoning").unwrap_or(false),
         supports_tools: get_bool("supports_function_calling").unwrap_or(true),
-        base_url: v.get("base_url").and_then(|x| x.as_str()).map(leak),
-        api_key_env: v.get("api_key_env").and_then(|x| x.as_str()).map(leak),
+        // Never from the catalog — user config only (see fn doc).
+        base_url: None,
+        api_key_env: None,
     })
 }
 
@@ -536,9 +705,13 @@ fn registry() -> Registry {
 }
 
 /// Drop the in-process registry so the next lookup rebuilds it from disk.
-/// Called after `models.toml` or the catalog cache changes.
+/// Called after `models.toml` or the catalog cache changes. Also clears the
+/// UNKNOWN-warned set so a newly-orphaned model id warns again.
 pub fn reload() {
     *REGISTRY.write().expect("registry lock") = None;
+    if let Some(seen) = WARNED_UNKNOWN.get() {
+        seen.lock().expect("warned-models lock").clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +734,13 @@ pub fn estimate_cost(usage: &UsageInfo, config: &ModelConfig) -> f64 {
 // get_model_config — lookup with fallback chain
 // ---------------------------------------------------------------------------
 
+/// Minimum query length before the fuzzy (suffix/prefix) steps engage.
+/// Shorter queries (`""`, `"g"`, `"o3"`) are too ambiguous to resolve
+/// safely — they fall through to UNKNOWN rather than silently matching
+/// whatever ranks top. (Every real short id like `o3` is in the seed and
+/// hits the exact-match step long before this.)
+const MIN_FUZZY_LEN: usize = 3;
+
 /// Look up model configuration by ID.
 ///
 /// Lookup order:
@@ -568,9 +748,12 @@ pub fn estimate_cost(usage: &UsageInfo, config: &ModelConfig) -> f64 {
 /// 2. Strip OpenRouter prefix (`provider/model-name`)
 /// 3. Bare-name suffix — `glm-5.2` matches a router-style catalog id
 ///    `z-ai/glm-5.2` (same rule as the CLI's `resolve_catalog_model`)
-/// 4. Prefix match — newest matching entry wins ([`recency_key`])
-/// 5. Fallback: unknown provider, 128K context, $0 pricing — logged once
-///    per id so wrong cost accounting is visible.
+/// 4. Prefix match — but only up to a token boundary (`-`/`.`/`/`), so
+///    `o3` never grabs `o3-mini`; newest + most-canonical provider wins.
+///
+/// Steps 3–4 require a query of at least [`MIN_FUZZY_LEN`] chars and
+/// `tracing::debug` the resolved id so fuzzy hits are observable, not
+/// silent. No match → honest UNKNOWN, logged once per id.
 ///
 /// Sources per id: user `models.toml` > platform catalog cache > static seed.
 #[must_use]
@@ -581,6 +764,44 @@ pub fn get_model_config(model_id: &str) -> ModelConfig {
     }
     warn_unknown_once(model_id);
     UNKNOWN_MODEL_CONFIG
+}
+
+/// Preference when a fuzzy query is ambiguous across providers — lower =
+/// more canonical. A direct vendor beats a router/cloud reseller, so bare
+/// `o3` resolves to `openai/o3`, not `azure/o3`.
+fn provider_rank(provider: &str) -> u8 {
+    match provider {
+        "anthropic" | "openai" | "google" | "zhipu" | "mistral" => 0,
+        "vertexai" => 1,
+        "openrouter" => 2,
+        _ => 3,
+    }
+}
+
+/// Pick the best of several fuzzy candidates: newest ([`recency_key`]),
+/// then most-canonical provider ([`provider_rank`]), then lexicographically
+/// first id. Fully deterministic — independent of `HashMap` order.
+fn best_fuzzy<'a>(
+    it: impl Iterator<Item = (&'a String, &'a ModelConfig)>,
+) -> Option<(&'a String, ModelConfig)> {
+    it.max_by(|(a_id, a), (b_id, b)| {
+        recency_key(a_id)
+            .cmp(&recency_key(b_id))
+            .then_with(|| provider_rank(b.provider).cmp(&provider_rank(a.provider)))
+            .then_with(|| b_id.cmp(a_id))
+    })
+    .map(|(id, cfg)| (id, *cfg))
+}
+
+/// `key` starts with `prefix` AND the char right after is a token boundary
+/// (or the string ends) — so `claude-opus` matches `claude-opus-4-8` but
+/// `o3` does not match `o3-mini` and `glm-4` does not match `glm-4o`.
+fn prefix_to_boundary(key: &str, prefix: &str) -> bool {
+    key.starts_with(prefix)
+        && matches!(
+            key.as_bytes().get(prefix.len()),
+            None | Some(b'-' | b'.' | b'/')
+        )
 }
 
 fn lookup(reg: &HashMap<String, ModelConfig>, model_id: &str) -> Option<ModelConfig> {
@@ -594,31 +815,48 @@ fn lookup(reg: &HashMap<String, ModelConfig>, model_id: &str) -> Option<ModelCon
     {
         return Some(*cfg);
     }
-    // Newest-first tie-break shared by the fuzzy steps below.
-    let newest =
-        |a: &String, b: &String| recency_key(a).cmp(&recency_key(b)).then_with(|| b.cmp(a));
-    // 3. Bare-name suffix: `glm-5.2` → catalog id `z-ai/glm-5.2`.
+    // Fuzzy steps only for queries long enough to be unambiguous.
+    if model_id.len() < MIN_FUZZY_LEN {
+        return None;
+    }
+    // 3. Bare-name suffix: `glm-5.2` → catalog id `z-ai/glm-5.2` (exact tail).
     if !model_id.contains('/')
-        && let Some(cfg) = reg
-            .iter()
-            .filter(|(key, _)| key.split_once('/').map(|(_, tail)| tail) == Some(model_id))
-            .max_by(|(a, _), (b, _)| newest(a, b))
-            .map(|(_, cfg)| *cfg)
+        && let Some((id, cfg)) = best_fuzzy(
+            reg.iter()
+                .filter(|(key, _)| key.split_once('/').map(|(_, tail)| tail) == Some(model_id)),
+        )
     {
+        tracing::debug!(
+            query = model_id,
+            resolved = id.as_str(),
+            "model resolved by suffix match"
+        );
         return Some(cfg);
     }
-    // 4. Prefix match — deterministic: the newest matching id wins.
-    reg.iter()
-        .filter(|(key, _)| key.starts_with(model_id))
-        .max_by(|(a, _), (b, _)| newest(a, b))
-        .map(|(_, cfg)| *cfg)
+    // 4. Prefix match — bounded at a token boundary, newest/canonical wins.
+    if let Some((id, cfg)) = best_fuzzy(
+        reg.iter()
+            .filter(|(key, _)| prefix_to_boundary(key, model_id)),
+    ) {
+        tracing::debug!(
+            query = model_id,
+            resolved = id.as_str(),
+            "model resolved by prefix match"
+        );
+        return Some(cfg);
+    }
+    None
 }
 
-/// Warn once per unknown model id per process. Returns whether this call
-/// produced the warning (first sighting).
+/// Model ids already warned about, so the UNKNOWN warning fires once per id
+/// per process instead of every turn. Cleared by [`reload`] so a model that
+/// gets registered (and later re-orphaned) can warn again.
+static WARNED_UNKNOWN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Warn once per unknown model id. Returns whether this call produced the
+/// warning (first sighting).
 fn warn_unknown_once(model_id: &str) -> bool {
-    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let mut seen = WARNED
+    let mut seen = WARNED_UNKNOWN
         .get_or_init(Default::default)
         .lock()
         .expect("warned-models lock");
@@ -654,16 +892,39 @@ const UNKNOWN_MODEL_CONFIG: ModelConfig = ModelConfig {
 // Listing + ranking
 // ---------------------------------------------------------------------------
 
-/// Version-ish ranking key: the numeric components of a model id, compared
-/// lexicographically. `glm-5.2` → [5, 2] sorts above `glm-4.7` → [4, 7];
-/// `claude-sonnet-4-20250514` → [4, 20250514]. A heuristic — good enough
-/// to put newer models first in listings and prefix matches.
+/// Version-ish ranking key: the version-like numeric components of a model
+/// id, compared lexicographically. `glm-5.2` → [5, 2] sorts above
+/// `glm-4.7` → [4, 7]; `claude-sonnet-5` → [5] above `claude-sonnet-4-6`
+/// → [4, 6]. A heuristic to put newer models first in listings.
+///
+/// Two kinds of digit run are *ignored* so they can't masquerade as a
+/// higher version:
+///  - date stamps (≥ 6 digits, e.g. `-20250514`) — a dated snapshot must
+///    not outrank the clean `-4-6`;
+///  - param-count / size tokens (a run followed by `b`/`m`/`k`, e.g. `34b`,
+///    `72b`) — `yi-34b` must not outrank `claude-…-5` on "34 > 5".
 #[must_use]
 pub fn recency_key(id: &str) -> Vec<u64> {
-    id.split(|c: char| !c.is_ascii_digit())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().unwrap_or(0))
-        .collect()
+    let bytes = id.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let digits = &id[start..i];
+        let followed_by_size =
+            matches!(bytes.get(i), Some(b'b' | b'B' | b'm' | b'M' | b'k' | b'K'));
+        if digits.len() < 6 && !followed_by_size {
+            out.push(digits.parse().unwrap_or(0));
+        }
+    }
+    out
 }
 
 /// All registered models (user config + catalog cache + seed), newest
@@ -859,6 +1120,46 @@ supports_thinking = true
     }
 
     #[test]
+    fn catalog_never_imports_base_url_or_api_key_env() {
+        // S1: a poisoned catalog/cache entry pairing an env-secret name with
+        // an attacker URL must NOT populate ModelConfig.base_url/api_key_env —
+        // only the user's own models.toml may set an endpoint/secret ref.
+        let v = serde_json::json!({
+            "model_id": "evil-1",
+            "provider": "acme",
+            "base_url": "https://attacker.example/exfil",
+            "api_key_env": "OPENAI_API_KEY",
+        });
+        let cfg = catalog_entry_to_config(&v).unwrap();
+        assert_eq!(cfg.base_url, None);
+        assert_eq!(cfg.api_key_env, None);
+    }
+
+    #[test]
+    fn catalog_prices_and_limits_are_sanitized() {
+        // C4: NaN/inf/negative prices → $0, not a poisoned estimate_cost; a
+        // zero/absent context window → the conservative 128k default.
+        let v = serde_json::json!({
+            "model_id": "junk-1",
+            "provider": "acme",
+            "input_price": f64::NAN,
+            "output_price": -5.0,
+            "context_window": 0,
+            "max_output_tokens": 0,
+        });
+        let cfg = catalog_entry_to_config(&v).unwrap();
+        assert_eq!(cfg.input_price_per_mtok, 0.0);
+        assert_eq!(cfg.output_price_per_mtok, 0.0);
+        assert_eq!(cfg.context_window, 128_000);
+        assert_eq!(cfg.max_output_tokens, 16_384);
+        // inf serializes as null in serde_json, so also test it explicitly.
+        assert_eq!(
+            sane_price(&serde_json::json!({ "p": f64::INFINITY }), "p"),
+            0.0
+        );
+    }
+
+    #[test]
     fn ranking_is_newest_first() {
         assert!(recency_key("glm-5.2") > recency_key("glm-5"));
         assert!(recency_key("glm-5") > recency_key("glm-4.7"));
@@ -878,7 +1179,8 @@ supports_thinking = true
             .map(|m| m.id)
             .filter(|id| id.starts_with("glm"))
             .collect();
-        assert_eq!(glm_ids, vec!["glm-5.2", "glm-5"]);
+        // glm-5.2 (user/catalog) + the full seed's glm ids, newest first.
+        assert_eq!(glm_ids, vec!["glm-5.2", "glm-5", "glm-4.7", "glm-4.5-air"]);
     }
 
     #[test]
@@ -907,6 +1209,167 @@ supports_thinking = true
         // Seed-only prefix: claude-opus → opus-4-8 (newest), deterministic.
         let reg = build_registry_from(&[], &[]);
         assert_eq!(lookup(&reg, "claude-opus").unwrap().id, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn prefix_match_respects_token_boundary_and_min_length() {
+        // C1: the probe-confirmed mis-resolutions. The catalog adds the
+        // wrong-priced neighbours (`o3-mini`, `glm-4.7-air`) alongside the
+        // seed's exact `o3` / `glm-4.7`.
+        let catalog = vec![
+            serde_json::json!({ "model_id": "o3-mini", "provider": "openai",
+                "context_window": 200_000, "input_price": 1.10 }),
+            serde_json::json!({ "model_id": "glm-4.7-air", "provider": "zhipu",
+                "context_window": 128_000, "input_price": 0.10 }),
+        ];
+        let reg = build_registry_from(&[], &catalog);
+        // `o3` / `glm-4.7` resolve to their EXACT seed entry — never the
+        // cheaper neighbour that shares their prefix.
+        let o3 = lookup(&reg, "o3").expect("exact seed o3");
+        assert_eq!(o3.id, "o3");
+        assert!(
+            (o3.input_price_per_mtok - 2.00).abs() < f64::EPSILON,
+            "not o3-mini's $1.10"
+        );
+        let glm47 = lookup(&reg, "glm-4.7").expect("exact seed glm-4.7");
+        assert_eq!(glm47.id, "glm-4.7");
+        assert!(
+            (glm47.input_price_per_mtok - 0.38).abs() < f64::EPSILON,
+            "not glm-4.7-air's $0.10"
+        );
+        // Mid-token prefixes (no boundary after the query) never match:
+        // `gpt-4` must not grab `gpt-4o`, `o3-min` must not grab `o3-mini`.
+        assert_ne!(lookup(&reg, "gpt-4").map(|c| c.id), Some("gpt-4o"));
+        assert!(lookup(&reg, "o3-min").is_none(), "mid-token, no boundary");
+        // Too-short queries never fuzzy-match (→ UNKNOWN).
+        assert!(lookup(&reg, "o").is_none());
+        assert!(lookup(&reg, "").is_none());
+        // A real family prefix ending on a boundary still resolves.
+        assert_eq!(lookup(&reg, "claude-sonnet").unwrap().provider, "anthropic");
+        assert_eq!(
+            lookup(&reg, "gpt-4").unwrap().id,
+            "gpt-4.1",
+            "newest gpt-4.x"
+        );
+    }
+
+    #[test]
+    fn suffix_tiebreak_prefers_canonical_provider() {
+        // C1: bare "o3" across azure/openai must be deterministic AND sensible
+        // — the direct vendor wins, not whatever HashMap order or lexicography
+        // surfaces.
+        let catalog = vec![
+            serde_json::json!({ "model_id": "azure/o3-pro", "provider": "azure",
+                "context_window": 200_000, "input_price": 9.0 }),
+            serde_json::json!({ "model_id": "openai/o3-pro", "provider": "openai",
+                "context_window": 200_000, "input_price": 2.0 }),
+        ];
+        let reg = build_registry_from(&[], &catalog);
+        let cfg = lookup(&reg, "o3-pro").expect("bare o3-pro suffix-matches");
+        assert_eq!(cfg.provider, "openai", "canonical provider wins the tie");
+    }
+
+    #[test]
+    fn recency_key_ignores_dates_and_param_counts() {
+        // C3: a snapshot date must not masquerade as a higher version …
+        assert_eq!(recency_key("claude-sonnet-4-20250514"), vec![4]);
+        assert!(recency_key("claude-sonnet-4-6") > recency_key("claude-sonnet-4-20250514"));
+        // … nor a param-count / size token.
+        assert_eq!(recency_key("yi-34b"), Vec::<u64>::new());
+        assert!(recency_key("claude-sonnet-5") > recency_key("yi-34b"));
+        assert_eq!(recency_key("qwen-2.5-72b-instruct"), vec![2, 5]);
+        // Genuine versions still compare correctly.
+        assert!(recency_key("glm-5.2") > recency_key("glm-5"));
+        assert_eq!(recency_key("gpt-4o"), vec![4]);
+    }
+
+    #[test]
+    fn env_var_name_and_url_validation() {
+        assert!(is_valid_env_var_name("ZAI_API_KEY"));
+        assert!(is_valid_env_var_name("_x1"));
+        assert!(!is_valid_env_var_name(""));
+        assert!(!is_valid_env_var_name("1ABC"));
+        assert!(!is_valid_env_var_name("sk-live-abc123")); // a pasted key
+        assert!(!is_valid_env_var_name("A B"));
+        assert!(is_http_url("https://api.z.ai/api/anthropic"));
+        assert!(is_http_url("http://localhost:11434/v1"));
+        assert!(!is_http_url("api.z.ai"));
+        assert!(!is_http_url("ftp://x"));
+        assert!(!is_http_url("https://"));
+    }
+
+    #[test]
+    fn user_model_validate_rejects_junk() {
+        let base = || UserModel {
+            provider: "zhipu".into(),
+            base_url: None,
+            api_key_env: None,
+            input_price: 1.0,
+            output_price: 3.2,
+            context_window: 200_000,
+            max_output_tokens: None,
+            supports_tools: None,
+            supports_thinking: None,
+            supports_caching: None,
+        };
+        assert!(base().validate().is_ok());
+        // C4: NaN/inf prices (clap/TOML accept them) are rejected.
+        let mut m = base();
+        m.input_price = f64::NAN;
+        assert!(m.validate().is_err());
+        let mut m = base();
+        m.output_price = f64::INFINITY;
+        assert!(m.validate().is_err());
+        let mut m = base();
+        m.input_price = -1.0;
+        assert!(m.validate().is_err());
+        // Zero context window / output cap.
+        let mut m = base();
+        m.context_window = 0;
+        assert!(m.validate().is_err());
+        let mut m = base();
+        m.max_output_tokens = Some(0);
+        assert!(m.validate().is_err());
+        // S2: a pasted key as the "env var name", and a non-url base_url.
+        let mut m = base();
+        m.api_key_env = Some("sk-live-abc123".into());
+        assert!(m.validate().is_err());
+        let mut m = base();
+        m.base_url = Some("api.z.ai".into());
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn load_user_models_drops_invalid_entries() {
+        // On LOAD (not just register), a hand-edited junk entry is dropped
+        // with a warning while valid siblings survive.
+        let raw = r#"
+[models."good"]
+provider = "zhipu"
+input_price = 1.0
+output_price = 2.0
+context_window = 128000
+
+[models."bad-price"]
+provider = "zhipu"
+input_price = -1.0
+output_price = 2.0
+context_window = 128000
+
+[models."zero-ctx"]
+provider = "zhipu"
+input_price = 1.0
+output_price = 2.0
+context_window = 0
+"#;
+        let parsed = parse_user_models(raw).unwrap();
+        assert_eq!(parsed.len(), 3, "parse is structural");
+        let kept: Vec<&str> = parsed
+            .iter()
+            .filter(|(_, m)| m.validate().is_ok())
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(kept, vec!["good"]);
     }
 
     #[test]
@@ -1003,6 +1466,9 @@ supports_thinking = true
         // The miss is logged (once per id, not spammed every turn).
         assert!(warn_unknown_once("some-never-seen-model"));
         assert!(!warn_unknown_once("some-never-seen-model"));
+        // S4: reload() clears the warned set so a re-orphaned id warns again.
+        reload();
+        assert!(warn_unknown_once("some-never-seen-model"));
     }
 
     #[test]

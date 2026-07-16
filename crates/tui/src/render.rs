@@ -1967,6 +1967,13 @@ fn draw_model_picker(f: &mut Frame, app: &App) {
             ),
         ]));
     }
+    // Provenance banner: honest about a stale/offline list.
+    if let Some(notice) = &app.model_picker.notice {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ {notice}"),
+            Style::default().fg(t.warn),
+        )));
+    }
 
     let total_catalog = app.model_picker.models.len();
     let qdisp = if app.model_picker.query.is_empty() {

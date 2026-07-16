@@ -3572,6 +3572,21 @@ async fn handle_models_slash_command(
             }
             let json_args = ensure_json_flag(&full_args);
             let value = run_cli_backed_slash_command_json(&json_args, slash_ctx).await?;
+            // Provenance: when the CLI served a stale cache (platform
+            // unreachable) it says so in the JSON. Surface it — no lying
+            // "live" list. `source == "live"` → no notice. Read before the
+            // `models` extraction consumes `value`.
+            let notice = match value_string(&value, &["source"]) {
+                Some("cache") => {
+                    let mins = value
+                        .get("age_secs")
+                        .and_then(Value::as_u64)
+                        .map(|s| s / 60)
+                        .unwrap_or(0);
+                    Some(format!("offline — cached catalog, {mins}m old"))
+                }
+                _ => None,
+            };
             let models = value_array(&value, &["models", "items", "data"])
                 .cloned()
                 .unwrap_or_else(|| match value {
@@ -3594,7 +3609,7 @@ async fn handle_models_slash_command(
                 .collect();
             emit_notification(
                 "ui.model.list",
-                serde_json::json!({ "models": norm, "current": current_model }),
+                serde_json::json!({ "models": norm, "current": current_model, "notice": notice }),
             );
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)

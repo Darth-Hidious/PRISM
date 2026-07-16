@@ -131,6 +131,9 @@ pub struct ModelPicker {
     pub selected: usize,
     pub query: String,
     pub loading: bool,
+    /// List provenance banner (e.g. "offline — cached catalog, 12m old").
+    /// `None` when the list is live.
+    pub notice: Option<String>,
 }
 
 /// Preferred models shown in the `/model` picker's default (empty-query)
@@ -3100,16 +3103,25 @@ impl App {
                     self.toast(format!("gh: {err}"), ToastKind::Warn);
                 }
             }
-            AgentMsg::ModelList { models, current } => {
+            AgentMsg::ModelList {
+                models,
+                current,
+                notice,
+            } => {
                 // Populate the model picker; open it if not already (so a
                 // `/models list` from the input also surfaces the picker).
                 self.model_picker.models = models;
                 self.model_picker.current = current;
+                self.model_picker.notice = notice.clone();
                 self.model_picker.loading = false;
                 self.model_picker.selected = 0;
                 self.model_picker.query.clear();
                 if !self.model_picker.open {
                     self.model_picker.open = true;
+                }
+                // Also toast the provenance so it's visible even at a glance.
+                if let Some(notice) = notice {
+                    self.toast(format!("models: {notice}"), ToastKind::Warn);
                 }
             }
             AgentMsg::GpuList { gpus, error } => {
