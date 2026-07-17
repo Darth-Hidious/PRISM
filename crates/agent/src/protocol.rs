@@ -3840,6 +3840,8 @@ async fn handle_node_slash_command(
                 current_exe: slash_ctx.current_exe.clone(),
                 project_root: slash_ctx.project_root.clone(),
                 python_bin: slash_ctx.python_bin.clone(),
+                // Node lifecycle only — never launches a workflow.
+                ..Default::default()
             };
             let report = match crate::node_supervisor::node_up(&runtime, &args[2..]).await {
                 Ok(report) => report,
@@ -4432,10 +4434,51 @@ async fn handle_publish_slash_command(
     Ok(true)
 }
 
+/// Assemble the `values` map for a workflow run, threading the two pieces of
+/// runtime context a launcher must supply for hands-off execution. Shared by
+/// every launch surface that holds a resolved [`LlmConfig`] — the interactive
+/// slash path and the node's HTTP `run_workflow` handler:
+///
+///  * **`_node_token`** (execute mode only) — a workflow's `tool` steps call
+///    the auth-gated node (`POST /api/tools/{name}/run`); without this
+///    loopback credential they 401. Dry runs never call tools, so no token is
+///    minted. `node_token` is `None` when logged out / node unreachable, in
+///    which case an online tool step still fails honestly with 401 rather than
+///    silently succeeding.
+///  * **`llm_base_url` / `llm_model`** — a workflow's `llm_*` steps otherwise
+///    resolve to the engine's built-in localhost default; injecting the
+///    resolved chat endpoint (the SAME `LlmConfig` the chat path uses) points
+///    them at the real model.
+///
+/// A caller-supplied value (via `--set`) always wins — `or_insert` never
+/// clobbers it.
+pub fn assemble_workflow_run_values(
+    mut values: BTreeMap<String, String>,
+    execute: bool,
+    node_token: Option<String>,
+    llm_config: &LlmConfig,
+) -> BTreeMap<String, String> {
+    if execute && let Some(token) = node_token {
+        values.entry("_node_token".to_string()).or_insert(token);
+    }
+    if !llm_config.base_url.is_empty() {
+        values
+            .entry("llm_base_url".to_string())
+            .or_insert_with(|| llm_config.base_url.clone());
+    }
+    if !llm_config.model.is_empty() {
+        values
+            .entry("llm_model".to_string())
+            .or_insert_with(|| llm_config.model.clone());
+    }
+    values
+}
+
 async fn handle_workflow_slash_command(
     args: &[String],
     slash_ctx: &SlashCommandContext,
     policy_engine: &mut Option<prism_policy::PolicyEngine>,
+    llm_config: &LlmConfig,
 ) -> Result<bool> {
     if args.first().map(String::as_str) != Some("workflow") {
         return Ok(false);
@@ -4512,6 +4555,17 @@ async fn handle_workflow_slash_command(
                 }
             }
 
+            // Execute-mode tool steps authenticate to the local node; mint and
+            // thread the loopback session token the same way the CLI and
+            // agent-tool paths do (dry runs plan only, so no token). Also point
+            // `llm_*` steps at the resolved chat endpoint.
+            let node_token = if execute {
+                command_tools::mint_agent_node_token().await
+            } else {
+                None
+            };
+            let values = assemble_workflow_run_values(values, execute, node_token, llm_config);
+
             let result = execute_workflow_with_policy(
                 spec,
                 &values,
@@ -4531,9 +4585,21 @@ async fn handle_workflow_slash_command(
             let request = parse_workflow_command_args(&args[1..])?;
             let spec = find_workflow(&specs, &request.name)
                 .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", request.name))?;
+            // Same node-token + llm-endpoint threading as the `run` arm above.
+            let node_token = if request.execute {
+                command_tools::mint_agent_node_token().await
+            } else {
+                None
+            };
+            let values = assemble_workflow_run_values(
+                request.values,
+                request.execute,
+                node_token,
+                llm_config,
+            );
             let result = execute_workflow_with_policy(
                 spec,
-                &request.values,
+                &values,
                 request.execute,
                 policy_engine.as_mut(),
                 Some(interactive_principal.as_str()),
@@ -6902,7 +6968,7 @@ async fn handle_command(
                 return Ok(true);
             }
 
-            if handle_workflow_slash_command(&args, slash_ctx, policy_engine).await? {
+            if handle_workflow_slash_command(&args, slash_ctx, policy_engine, llm_config).await? {
                 return Ok(true);
             }
             if handle_models_slash_command(&args, slash_ctx, &llm_config.model).await? {
@@ -6978,7 +7044,10 @@ pub struct AgentSeed {
 
 /// Spawn the Python tool server and assemble the shared agent machinery.
 /// Single construction path for all agent transports — see [`AgentSeed`].
-pub async fn build_agent_seed(tool_server_config: &ToolServer) -> Result<AgentSeed> {
+pub async fn build_agent_seed(
+    tool_server_config: &ToolServer,
+    llm_config: &LlmConfig,
+) -> Result<AgentSeed> {
     tracing::info!("spawning python tool server");
     let mut tool_server: ToolServerHandle = tool_server_config
         .spawn()
@@ -7024,6 +7093,11 @@ pub async fn build_agent_seed(tool_server_config: &ToolServer) -> Result<AgentSe
             .context("failed to locate current prism executable")?,
         project_root: tool_server_config.project_root.clone(),
         python_bin: tool_server_config.python_bin.clone(),
+        // Carry the resolved chat endpoint so agent-launched workflows'
+        // `llm_*` steps reach the real model, not the engine's localhost
+        // default. Empty base_url (unresolved) ⇒ None ⇒ env fallback.
+        llm_base_url: Some(llm_config.base_url.clone()).filter(|s| !s.is_empty()),
+        llm_model: Some(llm_config.model.clone()).filter(|s| !s.is_empty()),
     };
     let hooks = Arc::new(build_default_hooks());
     let permissions = build_effective_permission_context(
@@ -7053,7 +7127,7 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
         config,
         hooks,
         permissions,
-    } = build_agent_seed(&tool_server_config).await?;
+    } = build_agent_seed(&tool_server_config, &llm_config).await?;
 
     // Auto-approve flag — set from init params, read by the approval gate.
     // Stored separately so we don't need to rebuild the Arc<AgentConfig>.
@@ -7622,15 +7696,27 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
 mod tests {
     use super::{
         BashSlashAction, DiffSlashAction, EditSlashAction, PythonSlashAction, SessionMode,
-        SlashCommandContext, WriteSlashAction, build_effective_permission_context,
-        build_tool_card_payload, format_skill_create, format_skill_run, format_skills_list,
-        handle_skills_slash_command, humanize_tool_verb, inline_list, load_plan_snapshot,
-        parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
-        parse_edit_slash_action, parse_python_slash_action, parse_read_slash_path,
-        parse_skill_create_args, parse_slash_command, parse_write_slash_action,
-        persist_plan_snapshot, pick_organization, pick_project, plan_snapshot_path,
-        project_api_history, shell_command_join, summarize_api_view, truncate_for_ui,
+        SlashCommandContext, WriteSlashAction, assemble_workflow_run_values,
+        build_effective_permission_context, build_tool_card_payload, format_skill_create,
+        format_skill_run, format_skills_list, handle_skills_slash_command, humanize_tool_verb,
+        inline_list, load_plan_snapshot, parse_bash_slash_action, parse_command_tail,
+        parse_diff_slash_action, parse_edit_slash_action, parse_python_slash_action,
+        parse_read_slash_path, parse_skill_create_args, parse_slash_command,
+        parse_write_slash_action, persist_plan_snapshot, pick_organization, pick_project,
+        plan_snapshot_path, project_api_history, shell_command_join, summarize_api_view,
+        truncate_for_ui,
     };
+    use prism_ingest::LlmConfig;
+    use std::collections::BTreeMap;
+
+    /// A resolved chat endpoint, as `build_llm_config` would produce.
+    fn resolved_llm() -> LlmConfig {
+        LlmConfig {
+            base_url: "https://api.marc27.com/llm/p/proj123".to_string(),
+            model: "claude-sonnet-5".to_string(),
+            ..Default::default()
+        }
+    }
     use crate::commands::is_cli_backed_slash_root;
     use crate::permissions::PermissionOverrides;
     use crate::tool_catalog::ToolCatalog;
@@ -7638,6 +7724,106 @@ mod tests {
     use prism_ingest::llm::{ChatMessage, FunctionCall, ToolCallResponse};
     use prism_runtime::StoredCredentials;
     use tempfile::TempDir;
+
+    #[test]
+    fn assemble_values_injects_node_token_on_execute() {
+        // The slash path drops the minted loopback token before the fix; the
+        // helper is what threads it into the workflow values so tool steps
+        // authenticate to the node instead of 401'ing.
+        let mut values = BTreeMap::new();
+        values.insert("query".to_string(), "titanium".to_string());
+        let out = assemble_workflow_run_values(
+            values,
+            true,
+            Some("loopback-token".to_string()),
+            &resolved_llm(),
+        );
+        assert_eq!(
+            out.get("_node_token").map(String::as_str),
+            Some("loopback-token")
+        );
+        // User `--set` values are preserved.
+        assert_eq!(out.get("query").map(String::as_str), Some("titanium"));
+    }
+
+    #[test]
+    fn assemble_values_node_token_absent_on_dry_run() {
+        // Dry runs never call tools, so no credential is threaded.
+        let out = assemble_workflow_run_values(
+            BTreeMap::new(),
+            false,
+            Some("tok".to_string()),
+            &resolved_llm(),
+        );
+        assert!(!out.contains_key("_node_token"));
+    }
+
+    #[test]
+    fn assemble_values_node_token_absent_when_unminted() {
+        // No token minted (logged out / node down) ⇒ no header ⇒ honest 401
+        // on an online tool step, never a silent success.
+        let out = assemble_workflow_run_values(BTreeMap::new(), true, None, &resolved_llm());
+        assert!(!out.contains_key("_node_token"));
+    }
+
+    #[test]
+    fn assemble_values_does_not_clobber_user_node_token() {
+        // A caller-supplied `_node_token` via `--set` wins over the minted one.
+        let mut values = BTreeMap::new();
+        values.insert("_node_token".to_string(), "user-set".to_string());
+        let out =
+            assemble_workflow_run_values(values, true, Some("minted".to_string()), &resolved_llm());
+        assert_eq!(out.get("_node_token").map(String::as_str), Some("user-set"));
+    }
+
+    #[test]
+    fn assemble_values_injects_resolved_llm_endpoint() {
+        // Bug (c): `llm_*` steps otherwise hit the engine's localhost default.
+        // The resolved chat endpoint + model must land in the workflow values
+        // (both dry-run and execute — the endpoint is rendered either way).
+        for execute in [false, true] {
+            let out = assemble_workflow_run_values(BTreeMap::new(), execute, None, &resolved_llm());
+            assert_eq!(
+                out.get("llm_base_url").map(String::as_str),
+                Some("https://api.marc27.com/llm/p/proj123"),
+                "execute={execute}"
+            );
+            assert_eq!(
+                out.get("llm_model").map(String::as_str),
+                Some("claude-sonnet-5"),
+                "execute={execute}"
+            );
+        }
+    }
+
+    #[test]
+    fn assemble_values_llm_user_override_wins() {
+        // Explicit `--set llm_base_url=…` / `llm_model=…` are not clobbered.
+        let mut values = BTreeMap::new();
+        values.insert(
+            "llm_base_url".to_string(),
+            "http://localhost:9999/v1".to_string(),
+        );
+        values.insert("llm_model".to_string(), "local-gemma".to_string());
+        let out = assemble_workflow_run_values(values, true, None, &resolved_llm());
+        assert_eq!(
+            out.get("llm_base_url").map(String::as_str),
+            Some("http://localhost:9999/v1")
+        );
+        assert_eq!(
+            out.get("llm_model").map(String::as_str),
+            Some("local-gemma")
+        );
+    }
+
+    #[test]
+    fn assemble_values_skips_empty_llm_config() {
+        // An unresolved (default/empty) LlmConfig injects nothing — the
+        // workflow falls back to its own env resolution.
+        let out = assemble_workflow_run_values(BTreeMap::new(), true, None, &LlmConfig::default());
+        assert!(!out.contains_key("llm_base_url"));
+        assert!(!out.contains_key("llm_model"));
+    }
 
     #[test]
     fn humanize_tool_verb_maps_known_tools() {

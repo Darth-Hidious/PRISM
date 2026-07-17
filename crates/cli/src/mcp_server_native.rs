@@ -24,10 +24,25 @@ const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 pub async fn run(project_root: PathBuf, python_bin: PathBuf) -> Result<()> {
+    // Resolve the chat LLM endpoint so MCP-hosted `workflow_run` calls point
+    // their `llm_*` steps at the real model (same resolution the chat path
+    // uses). Unresolvable (e.g. no PrismPaths) ⇒ None ⇒ env fallback.
+    let (llm_base_url, llm_model) = match prism_runtime::PrismPaths::discover().ok() {
+        Some(paths) => match crate::resolve_workflow_llm_pair(&project_root, &paths) {
+            Some((base_url, model)) => (
+                Some(base_url).filter(|s| !s.is_empty()),
+                Some(model).filter(|s| !s.is_empty()),
+            ),
+            None => (None, None),
+        },
+        None => (None, None),
+    };
     let runtime = CommandToolRuntime {
         current_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("prism")),
         project_root,
         python_bin,
+        llm_base_url,
+        llm_model,
     };
 
     let stdin = tokio::io::stdin();

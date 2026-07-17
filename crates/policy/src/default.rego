@@ -178,13 +178,21 @@ tool_is_destructive if {
     input.context.mode == "write"
 }
 
-# Workflows the agent can run without human approval
+# Workflows the agent can run without human approval.
+# NOTE: allowlisting here only clears the workflow to LAUNCH. It grants no tool
+# permission: each `tool` step is still evaluated on its own `tool.call` rule.
+# The workflows below happen to use only non-destructive tools, so those steps
+# are permitted anyway — but a step that DID invoke a destructive tool would
+# still be admin-gated regardless of this list. So this never loosens tool policy.
 agent_approved_workflows := {
     "train-indexer",
     "forge",
     "search",
     "predict",
     "data-export",
+    # Shipped builtins the agent actually runs (app/workflows/builtin/).
+    "ingest",
+    "materials_discovery",
 }
 
 # Detect write operations in queries

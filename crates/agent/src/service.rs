@@ -194,7 +194,7 @@ impl ChatService {
             config,
             hooks,
             permissions,
-        } = build_agent_seed(&tool_server_config).await?;
+        } = build_agent_seed(&tool_server_config, &llm_config).await?;
 
         // Same policy bootstrap as run_server: built-in + discovered
         // OPA/Rego policies; absence is a warning, not an error.

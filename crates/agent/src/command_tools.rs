@@ -16,11 +16,19 @@ use tokio::time::timeout;
 use crate::permissions::PermissionMode;
 use crate::tool_catalog::LoadedTool;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CommandToolRuntime {
     pub current_exe: PathBuf,
     pub project_root: PathBuf,
     pub python_bin: PathBuf,
+    /// Resolved LLM endpoint for this agent process (from `build_llm_config` —
+    /// the SAME config the chat path uses). Injected into a workflow's context
+    /// as `llm_base_url` so `llm_*` steps reach the real model instead of the
+    /// engine's built-in localhost default. `None` when unresolved (falls back
+    /// to the workflow's own env resolution).
+    pub llm_base_url: Option<String>,
+    /// Resolved model id, injected into workflow context as `llm_model`.
+    pub llm_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2934,7 +2942,7 @@ async fn execute_cli_command(
 /// Returns `None` when the agent isn't logged in or the node is unreachable —
 /// the workflow then runs tokenless (tool-free workflows are unaffected; an
 /// online tool step fails honestly with 401 rather than silently succeeding).
-async fn mint_agent_node_token() -> Option<String> {
+pub(crate) async fn mint_agent_node_token() -> Option<String> {
     let paths = prism_runtime::PrismPaths::discover().ok()?;
     let state = paths.load_cli_state().ok()?;
     let user_id = state.credentials.as_ref()?.user_id.clone()?;
@@ -3011,8 +3019,23 @@ async fn execute_workflow_command(
             // Authenticate the workflow's `tool` steps to the local node.
             // Execute mode only — dry runs plan without calling tools.
             let mut values = values.clone();
+            // `or_insert`: an explicit workflow `_node_token` value wins over
+            // the minted one (consistent with the slash/CLI paths).
             if *execute && let Some(token) = mint_agent_node_token().await {
-                values.insert("_node_token".to_string(), token);
+                values.entry("_node_token".to_string()).or_insert(token);
+            }
+            // Point `llm_*` steps at the resolved chat endpoint (the SAME
+            // config the agent's chat path uses). `or_insert` lets an explicit
+            // workflow value win. Both modes: dry runs render the endpoint too.
+            if let Some(base_url) = &runtime.llm_base_url {
+                values
+                    .entry("llm_base_url".to_string())
+                    .or_insert_with(|| base_url.clone());
+            }
+            if let Some(model) = &runtime.llm_model {
+                values
+                    .entry("llm_model".to_string())
+                    .or_insert_with(|| model.clone());
             }
             match find_workflow(&specs, name) {
                 Some(spec) => match execute_workflow_with_policy(

@@ -167,9 +167,12 @@ async fn run_parent_turn(
     base_url: String,
     subagent_depth: usize,
 ) -> (String, Vec<AgentEvent>) {
-    let seed = build_agent_seed(&tool_server_config(project, python))
-        .await
-        .expect("backend seed");
+    let seed = build_agent_seed(
+        &tool_server_config(project, python),
+        &llm_config(base_url.clone()),
+    )
+    .await
+    .expect("backend seed");
     let prism_agent::protocol::AgentSeed {
         mut tool_server,
         command_tool_runtime,
