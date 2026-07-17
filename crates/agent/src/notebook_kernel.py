@@ -232,19 +232,38 @@ def _enforce_line_budget(obj):
     def line_len():
         return len(json.dumps(obj).encode("utf-8"))
 
-    # Each pass shaves the currently-largest field by at least the overage,
-    # so this converges in a handful of iterations; the guard is paranoia.
+    # Each pass shaves the currently-largest field below the overage, so a big
+    # field clears in one pass and this converges in ~len(fields) passes. If a
+    # pass makes NO progress — the pathological case: many frames each smaller
+    # than the ~45B truncation marker, where truncating a frame GROWS it — stop
+    # at once and let the wholesale collapse below handle it. Never thrash, and
+    # never fall through with an over-cap line.
     guard = 0
-    while slots and guard < 10_000 and line_len() > LINE_BUDGET_BYTES:
+    while slots and guard < 128 and line_len() > LINE_BUDGET_BYTES:
         guard += 1
+        before = line_len()
         read, write = max(slots, key=lambda slot: len(slot[0]().encode("utf-8")))
         current = read()
         cur_bytes = len(current.encode("utf-8"))
-        overage = line_len() - LINE_BUDGET_BYTES
+        overage = before - LINE_BUDGET_BYTES
         write(_truncate_utf8_bytes(current, max(0, cur_bytes - overage - 1024)))
+        if line_len() >= before:
+            break  # no progress → wholesale collapse below
 
-    if obj.get("images") and line_len() > LINE_BUDGET_BYTES:
-        obj["images"] = []  # unreachable in practice; keeps the invariant hard.
+    if line_len() > LINE_BUDGET_BYTES:
+        # Last resort — the per-field shave couldn't converge. The one way that
+        # happens is thousands of traceback frames each SMALLER than the
+        # truncation marker, where truncating a frame GROWS it. Collapse the
+        # bulky fields wholesale so the line is ALWAYS under the cap regardless
+        # of MAX_TEXT/margin coupling: emitting an over-cap line would reap the
+        # kernel and wipe the shared session. Fields stay schema-valid (short
+        # markers / empty list), so the Rust reader still parses the line.
+        if error is not None:
+            error["traceback"] = ["...[traceback dropped to fit the wire limit]"]
+        for key in ("stdout", "stderr", "result"):
+            if isinstance(obj.get(key), str):
+                obj[key] = _truncate_utf8_bytes(obj[key], 4096)
+        obj["images"] = []
     return obj
 
 
