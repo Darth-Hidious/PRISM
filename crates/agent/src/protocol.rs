@@ -7868,11 +7868,10 @@ mod tests {
         format_skill_run, format_skills_list, handle_skills_slash_command, humanize_tool_verb,
         inline_list, load_plan_snapshot, parse_bash_slash_action, parse_command_tail,
         parse_diff_slash_action, parse_edit_slash_action, parse_notebook_run_args,
-        parse_python_slash_action,
-        parse_read_slash_path, parse_skill_create_args, parse_slash_command,
-        parse_write_slash_action, persist_plan_snapshot, pick_organization, pick_project,
-        plan_snapshot_path, project_api_history, shell_command_join, summarize_api_view,
-        truncate_for_ui,
+        parse_python_slash_action, parse_read_slash_path, parse_skill_create_args,
+        parse_slash_command, parse_write_slash_action, persist_plan_snapshot, pick_organization,
+        pick_project, plan_snapshot_path, project_api_history, shell_command_join,
+        summarize_api_view, truncate_for_ui,
     };
     use prism_ingest::LlmConfig;
     use std::collections::BTreeMap;
