@@ -3936,6 +3936,161 @@ async fn node_status_body() -> String {
     lines.join("\n")
 }
 
+/// `/notebook [open|run|status|reset]` — the in-app Python notebook.
+///
+/// The notebook kernel ([`crate::notebook`]) is a persistent Python sidecar
+/// SHARED with the agent's `notebook_exec` tool: a cell the human runs and a
+/// cell the agent runs land in the same kernel and the same cell log. `open`
+/// pushes the current state to the pane, `run --code <…>` executes one cell,
+/// `status` shows the kernel, `reset` restarts it. The legacy Jupyter-Lab
+/// manager verbs (`start|list|stop`) fall through to the CLI path unchanged.
+async fn handle_notebook_slash_command(
+    args: &[String],
+    slash_ctx: &SlashCommandContext,
+) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("notebook") {
+        return Ok(false);
+    }
+    // Point the kernel at PRISM's managed interpreter + the project root.
+    crate::notebook::configure(slash_ctx.python_bin.clone(), slash_ctx.project_root.clone());
+
+    match args.get(1).map(String::as_str) {
+        None | Some("open") => {
+            emit_notebook_state();
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        Some("run") => {
+            let (code, timeout) = parse_notebook_run_args(&args[2..]);
+            if code.trim().is_empty() {
+                emit_notification(
+                    "ui.text.delta",
+                    serde_json::json!({
+                        "text": "Provide code to run, e.g. /notebook run --code \"print(1+1)\""
+                    }),
+                );
+                emit_notification("ui.turn.complete", serde_json::json!({}));
+                return Ok(true);
+            }
+            match crate::notebook::execute(&code, timeout, "user").await {
+                Ok(cell) => emit_notebook_cell(&cell),
+                Err(error) => {
+                    emit_notification(
+                        "ui.text.delta",
+                        serde_json::json!({ "text": format!("Notebook error: {error:#}") }),
+                    );
+                    // A spawn failure produced no cell, so the pane would stay
+                    // stuck at "running…". Push state to clear the flag.
+                    emit_notebook_state();
+                }
+            }
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        Some("status") => {
+            emit_view(
+                "notebook",
+                "Notebook kernel",
+                &notebook_status_body(),
+                "info",
+            );
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        Some("reset") => {
+            // reset() bails while a cell is in flight (a reset then would be
+            // silently undone by the in-flight cell) — report that honestly
+            // instead of claiming a clean slate.
+            let text = match crate::notebook::reset().await {
+                Ok(()) => "Notebook kernel reset — cell state cleared.".to_string(),
+                Err(error) => format!("Notebook reset failed: {error:#}"),
+            };
+            emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
+            emit_notebook_state();
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        // start | list | stop = the detached Jupyter-Lab manager → CLI path.
+        _ => Ok(false),
+    }
+}
+
+/// Parse `--code <code> [--timeout <secs>]` out of a `/notebook run` tail.
+/// Each flag's value is the very next (already shlex-unquoted) token, so code
+/// containing anything survives.
+fn parse_notebook_run_args(rest: &[String]) -> (String, Option<u64>) {
+    let mut code = String::new();
+    let mut timeout = None;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--code" => {
+                code = rest.get(index + 1).cloned().unwrap_or_default();
+                index += 2;
+            }
+            "--timeout" => {
+                timeout = rest.get(index + 1).and_then(|value| value.parse().ok());
+                index += 2;
+            }
+            _ => index += 1,
+        }
+    }
+    (code, timeout)
+}
+
+/// Push the full notebook state (kernel status + cell log) to the pane.
+fn emit_notebook_state() {
+    let status = crate::notebook::status();
+    emit_notification(
+        "ui.notebook.state",
+        serde_json::json!({
+            "running": status.running,
+            "backend": status.backend,
+            "python": status.python,
+            "detail": status.detail,
+            "cell_count": status.cell_count,
+            "cells": crate::notebook::cells(),
+        }),
+    );
+}
+
+/// Push a single freshly-run cell to the pane (used by both the human `run`
+/// path and the agent-tool live update).
+fn emit_notebook_cell(cell: &crate::notebook::Cell) {
+    let status = crate::notebook::status();
+    emit_notification(
+        "ui.notebook.cell",
+        serde_json::json!({
+            "cell": cell,
+            "backend": status.backend,
+            "python": status.python,
+            "running": status.running,
+        }),
+    );
+}
+
+/// Body for the `/notebook status` view.
+fn notebook_status_body() -> String {
+    let status = crate::notebook::status();
+    let mut lines = Vec::new();
+    if status.running {
+        lines.push(format!(
+            "Kernel running — backend {}, Python {}",
+            status.backend.as_deref().unwrap_or("?"),
+            status.python.as_deref().unwrap_or("?"),
+        ));
+        if let Some(detail) = &status.detail
+            && !detail.is_empty()
+        {
+            lines.push(format!("  {detail}"));
+        }
+    } else {
+        lines.push("Kernel not running — it starts on the first run.".to_string());
+    }
+    lines.push(format!("Cells this session: {}", status.cell_count));
+    lines.join("\n")
+}
+
 /// The four fields a `/skills create` invocation carries, parsed from the
 /// `--name / --language / --description / --code` flags the TUI form builds.
 struct SkillCreateFields {
@@ -4742,6 +4897,15 @@ fn emit_agent_event(event: AgentEvent) {
                     "data": data,
                 }),
             );
+            // When the AGENT ran a notebook cell, mirror it into the human's
+            // notebook pane so both see the one shared kernel live.
+            if matches!(
+                tool_name.as_str(),
+                "notebook_exec" | "notebook_run" | "run_python_notebook"
+            ) && let Some(cell) = crate::notebook::cells().last()
+            {
+                emit_notebook_cell(cell);
+            }
         }
         AgentEvent::ToolApprovalRequest {
             tool_name,
@@ -6983,6 +7147,9 @@ async fn handle_command(
             if handle_node_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
+            if handle_notebook_slash_command(&args, slash_ctx).await? {
+                return Ok(true);
+            }
             if handle_skills_slash_command(&args, tools).await? {
                 return Ok(true);
             }
@@ -7700,7 +7867,8 @@ mod tests {
         build_effective_permission_context, build_tool_card_payload, format_skill_create,
         format_skill_run, format_skills_list, handle_skills_slash_command, humanize_tool_verb,
         inline_list, load_plan_snapshot, parse_bash_slash_action, parse_command_tail,
-        parse_diff_slash_action, parse_edit_slash_action, parse_python_slash_action,
+        parse_diff_slash_action, parse_edit_slash_action, parse_notebook_run_args,
+        parse_python_slash_action,
         parse_read_slash_path, parse_skill_create_args, parse_slash_command,
         parse_write_slash_action, persist_plan_snapshot, pick_organization, pick_project,
         plan_snapshot_path, project_api_history, shell_command_join, summarize_api_view,
@@ -7909,6 +8077,28 @@ mod tests {
     fn parse_command_tail_handles_quotes() {
         let parsed = parse_command_tail(r#"--model "gemma 4""#).expect("tail args should parse");
         assert_eq!(parsed, vec!["--model", "gemma 4"]);
+    }
+
+    #[test]
+    fn parse_notebook_run_args_extracts_code_and_timeout() {
+        // Order-independent; the value after --code is taken verbatim (it can
+        // itself look like a flag) so arbitrary Python survives.
+        let (code, timeout) = parse_notebook_run_args(&[
+            "--timeout".to_string(),
+            "90".to_string(),
+            "--code".to_string(),
+            "print('hi'); x = 1".to_string(),
+        ]);
+        assert_eq!(code, "print('hi'); x = 1");
+        assert_eq!(timeout, Some(90));
+
+        // Missing timeout defaults to None; missing code to empty.
+        let (code, timeout) = parse_notebook_run_args(&["--code".to_string(), "1+1".to_string()]);
+        assert_eq!(code, "1+1");
+        assert_eq!(timeout, None);
+        let empty: [String; 0] = [];
+        let (code, _) = parse_notebook_run_args(&empty);
+        assert!(code.is_empty());
     }
 
     #[test]

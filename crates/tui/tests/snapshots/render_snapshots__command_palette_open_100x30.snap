@@ -16,13 +16,13 @@ expression: rendered
                │    Knowledge               Search & ingest — one pane      palette │
                │    Material properties     Structure, lattice, moduli, ba… palette │
                │    Nodes                   See your connected nodes        palette │
+               │    Notebook                Python notebook — persistent k… palette │
                │    Predict properties      ML prediction for a composition palette │
                │    Procure GPU compute     Live GPU catalog with prices    palette │
                │    Run simulation          Relax/MD via MACE + pyiron      palette │
                │    Goal status             Check a discovery campaign's p… palette │
                │    List goals              Discovery campaigns on this no… palette │
                │    Node status             Local daemon + platform regist… palette │
-               │    Node stop               Stop the local node daemon      palette │
                │  … 52 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘

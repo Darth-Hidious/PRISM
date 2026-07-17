@@ -7,7 +7,8 @@ use crate::gh::{self, GhPanel, GhTab};
 use crate::keymap;
 use crate::knowledge::{self, IngestPhase, KnowledgePane, KnowledgeTab};
 use crate::msg::{AgentMsg, parse_notification};
-use crate::sanitize::sanitize_for_render;
+use crate::notebook::{self, NotebookCell, NotebookPane};
+use crate::sanitize::{sanitize_code_for_preview, sanitize_for_render};
 use crate::theme;
 use crate::toast::{self, ToastKind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -402,6 +403,16 @@ pub struct App {
     pub turn_cost: f64,
     pub is_waiting: bool,
     pub approval_pending: Option<(String, String)>,
+    /// Full code of a pending `notebook_exec` approval (from the prompt's
+    /// `tool_args`). The kernel is SHARED with the human, so the popup must
+    /// show EXACTLY what they are approving — a 60-char first-line preview
+    /// could hide `print(api_key)` on line two. `None` for other tools.
+    pub approval_code: Option<String>,
+    /// Scroll offset into the approval popup's code block.
+    pub approval_scroll: u16,
+    /// Max code-block scroll, recomputed by the renderer each frame
+    /// (wrapped lines − viewport), same pattern as `view_max_scroll`.
+    pub approval_max_scroll: std::cell::Cell<u16>,
     pub should_quit: bool,
     pub status_text: String,
     pub tool_count: u64,
@@ -490,6 +501,8 @@ pub struct App {
     pub form: Option<FormPane>,
     /// Knowledge pane (Search | Ingest tabs + file browser).
     pub knowledge: KnowledgePane,
+    /// Notebook pane — the in-app Python notebook (kernel shared with agent).
+    pub notebook: NotebookPane,
 }
 
 impl App {
@@ -512,6 +525,9 @@ impl App {
             turn_cost: 0.0,
             is_waiting: false,
             approval_pending: None,
+            approval_code: None,
+            approval_scroll: 0,
+            approval_max_scroll: std::cell::Cell::new(0),
             should_quit: false,
             status_text: "Ready".to_string(),
             tool_count: 0,
@@ -558,11 +574,27 @@ impl App {
             link_picker: LinkPicker::default(),
             form: None,
             knowledge: KnowledgePane::default(),
+            notebook: NotebookPane::default(),
         }
     }
 
     /// Handle a crossterm key event.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // An approval prompt is drawn OVER every pane (see render.rs — it is
+        // the highest-priority overlay), so it must intercept keys before any
+        // pane does. Otherwise, with a pane open (notably the notebook pane,
+        // whose whole flow is "agent calls notebook_exec → approval"), the
+        // human's `y`/`n` would be typed into an invisible editor and `Esc`
+        // would silently close the pane. Ctrl-C still quits (emergency exit).
+        if self.approval_pending.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+            } else {
+                self.handle_approval_key(key);
+            }
+            return;
+        }
+
         // The command palette (Ctrl-P) intercepts all keys while open,
         // mirroring opencode's DialogSelect. Inside the palette, Ctrl-C
         // and Esc *cancel the palette* — they do not quit the app. Only
@@ -582,6 +614,12 @@ impl App {
         // The Knowledge pane intercepts keys while open.
         if self.knowledge.open {
             self.handle_knowledge_key(key);
+            return;
+        }
+
+        // The Notebook pane intercepts keys while open.
+        if self.notebook.open {
+            self.handle_notebook_key(key);
             return;
         }
 
@@ -690,11 +728,8 @@ impl App {
             return;
         }
 
-        // If approval is pending, handle approval keys
-        if self.approval_pending.is_some() {
-            self.handle_approval_key(key);
-            return;
-        }
+        // (Approval is handled at the very top of this function — it outranks
+        // every pane/overlay, matching the render priority.)
 
         // Global: Ctrl-P opens the command palette (opencode primitive).
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
@@ -760,6 +795,11 @@ impl App {
             Focus::Input => self.handle_input_key(key),
             Focus::Chat => self.handle_chat_key(key),
             Focus::Workspace => self.handle_workspace_key(key),
+            // Unreachable in practice: focus only becomes Approval together
+            // with `approval_pending = Some`, and that case returns at the
+            // top of this function. Kept because the variant is also render
+            // state; handle_approval_key guards pending=None, so a stale
+            // Approval focus can never send a phantom approval.
             Focus::Approval => self.handle_approval_key(key),
         }
     }
@@ -1102,32 +1142,59 @@ impl App {
     fn ensure_tool_catalog(&mut self) {}
 
     fn handle_approval_key(&mut self, key: KeyEvent) {
-        let tool = self
-            .approval_pending
-            .as_ref()
-            .map(|(t, _)| t.clone())
-            .unwrap_or_default();
+        // Unreachable with no pending prompt in normal flow (focus only
+        // becomes Approval alongside `approval_pending = Some`), but guard
+        // anyway: answering a prompt that doesn't exist would silently send
+        // an approval for an empty tool name.
+        let Some((tool, _)) = self.approval_pending.as_ref() else {
+            self.focus = Focus::Input;
+            return;
+        };
+        let tool = tool.clone();
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 let _ = self.backend.send_approval("y", &tool);
-                self.approval_pending = None;
+                self.clear_approval();
                 self.push_system(&format!("[approved {tool}]"));
-                self.focus = Focus::Input;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 let _ = self.backend.send_approval("n", &tool);
-                self.approval_pending = None;
+                self.clear_approval();
                 self.push_system(&format!("[denied {tool}]"));
-                self.focus = Focus::Input;
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 let _ = self.backend.send_approval("a", &tool);
-                self.approval_pending = None;
+                self.clear_approval();
                 self.push_system(&format!("[allow-all {tool}]"));
-                self.focus = Focus::Input;
+            }
+            // Scroll the code block (long notebook_exec cells must be fully
+            // reviewable before answering).
+            KeyCode::Up => self.approval_scroll = self.approval_scroll.saturating_sub(1),
+            KeyCode::Down => {
+                self.approval_scroll = self
+                    .approval_scroll
+                    .saturating_add(1)
+                    .min(self.approval_max_scroll.get());
+            }
+            KeyCode::PageUp => self.approval_scroll = self.approval_scroll.saturating_sub(5),
+            KeyCode::PageDown => {
+                self.approval_scroll = self
+                    .approval_scroll
+                    .saturating_add(5)
+                    .min(self.approval_max_scroll.get());
             }
             _ => {}
         }
+    }
+
+    /// Resolve the pending approval: drop the prompt, its code preview, and
+    /// the scroll state together so they can never desync.
+    fn clear_approval(&mut self) {
+        self.approval_pending = None;
+        self.approval_code = None;
+        self.approval_scroll = 0;
+        self.approval_max_scroll.set(0);
+        self.focus = Focus::Input;
     }
 
     // ── Command palette (Ctrl-P) ────────────────────────────────────
@@ -1661,6 +1728,85 @@ impl App {
         self.input.insert_str(prompt);
         self.focus = Focus::Input;
         self.toast("review the prompt, then Enter", ToastKind::Info);
+    }
+
+    // ── Notebook pane ────────────────────────────────────────────────
+
+    /// Open the notebook pane and ask the backend for the current kernel
+    /// state + cell log (so re-opening shows prior cells, not a blank pane).
+    ///
+    /// A fresh pane is created only on the FIRST open; reopening keeps any
+    /// in-progress draft and the local cell list (the `/notebook open` refresh
+    /// below re-syncs cells from the backend anyway).
+    pub fn open_notebook_pane(&mut self) {
+        if self.notebook.cells.is_empty() && self.notebook.code().trim().is_empty() {
+            self.notebook = NotebookPane::opened();
+        } else {
+            self.notebook.open = true;
+        }
+        let _ = self.backend.send_command("/notebook open");
+    }
+
+    /// Keys while the Notebook pane is open. The code editor takes typed
+    /// input (Enter inserts a newline — cells are multi-line); Ctrl-R runs the
+    /// current cell (dispatching `/notebook run`); PgUp/PgDn scroll the cell
+    /// history; Esc / Ctrl-C close the pane. Editor keys are driven manually
+    /// (same reason as [`Self::handle_textarea_key`]: ratatui-crossterm mismatch).
+    fn handle_notebook_key(&mut self, key: KeyEvent) {
+        use ratatui_textarea::CursorMove;
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => self.notebook.open = false,
+                KeyCode::Char('r') => self.run_notebook_cell(),
+                KeyCode::Char('a') => self.notebook.input.move_cursor(CursorMove::Head),
+                KeyCode::Char('e') => self.notebook.input.move_cursor(CursorMove::End),
+                KeyCode::Char('u') => {
+                    self.notebook.input.delete_line_by_head();
+                }
+                KeyCode::Char('k') => {
+                    self.notebook.input.delete_line_by_end();
+                }
+                KeyCode::Char('w') => {
+                    self.notebook.input.delete_word();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.notebook.open = false,
+            KeyCode::Enter => self.notebook.input.insert_newline(),
+            KeyCode::Char(c) => self.notebook.input.insert_char(c),
+            KeyCode::Backspace => {
+                self.notebook.input.delete_char();
+            }
+            KeyCode::Delete => {
+                self.notebook.input.delete_next_char();
+            }
+            KeyCode::Left => self.notebook.input.move_cursor(CursorMove::Back),
+            KeyCode::Right => self.notebook.input.move_cursor(CursorMove::Forward),
+            KeyCode::Up => self.notebook.input.move_cursor(CursorMove::Up),
+            KeyCode::Down => self.notebook.input.move_cursor(CursorMove::Down),
+            KeyCode::Home => self.notebook.input.move_cursor(CursorMove::Head),
+            KeyCode::End => self.notebook.input.move_cursor(CursorMove::End),
+            KeyCode::PageUp => self.notebook.scroll = self.notebook.scroll.saturating_sub(5),
+            KeyCode::PageDown => self.notebook.scroll = self.notebook.scroll.saturating_add(5),
+            _ => {}
+        }
+    }
+
+    /// Run the notebook editor's current contents as one cell.
+    fn run_notebook_cell(&mut self) {
+        match notebook::run_command(&self.notebook.code()) {
+            Some(cmd) => {
+                self.notebook.running = true;
+                self.notebook.clear_input();
+                let _ = self.backend.send_command(&cmd);
+            }
+            None => self.toast("write some Python first", ToastKind::Warn),
+        }
     }
 
     // ── Which-key panel (`?`) ────────────────────────────────────────
@@ -2820,12 +2966,7 @@ impl App {
             // aliases that land on the right tab (muscle memory).
             "knowledge.open" | "sci.search" => self.open_knowledge_pane(KnowledgeTab::Search),
             "sci.ingest" => self.open_knowledge_pane(KnowledgeTab::Ingest),
-            "sci.notebook" => {
-                self.toast(
-                    "In-app notebooks are coming — agent-watched + editable (not wired yet).",
-                    ToastKind::Info,
-                );
-            }
+            "sci.notebook" => self.open_notebook_pane(),
             "help.show" => self.modal = Some(Modal::Help),
             "which_key.show" => self.open_which_key(),
             "theme.list" => self.open_theme_picker(),
@@ -3270,15 +3411,43 @@ impl App {
                 }
             }
             AgentMsg::ApprovalPrompt {
-                tool_name, message, ..
+                tool_name,
+                message,
+                tool_args,
+                ..
             } => {
-                // `..` ignores call_id, tool_args, tool_description,
-                // requires_approval, permission_mode, choices, prompt_type —
-                // current behavior uses only tool_name + message.
-                // Sanitize both before storing in approval_pending and
+                // `..` ignores call_id, tool_description, requires_approval,
+                // permission_mode, choices, prompt_type.
+                // Sanitize everything before storing in approval_pending and
                 // the ChatLine.
                 let clean_name = sanitize_for_render(&tool_name);
                 let clean_msg = sanitize_for_render(&message);
+                // notebook_exec runs arbitrary code on the kernel SHARED with
+                // the human — surface the FULL cell in the popup so consent
+                // is informed, not "Allow notebook_exec?" blind. Other tools
+                // keep the compact prompt.
+                self.approval_code = matches!(
+                    clean_name.as_str(),
+                    "notebook_exec" | "notebook_run" | "run_python_notebook"
+                )
+                .then(|| {
+                    let args = tool_args.as_ref()?;
+                    let code = args.get("code")?.as_str()?;
+                    let reset = args.get("reset").and_then(Value::as_bool).unwrap_or(false);
+                    let mut preview = String::new();
+                    if reset {
+                        preview.push_str("[resets the shared kernel first — all variables lost]\n");
+                    }
+                    preview.push_str(code);
+                    // NOT sanitize_for_render: that DELETES bare `\r` (which
+                    // CPython runs as a newline), so hidden code could execute
+                    // while the popup showed one benign line. This renderer
+                    // shows the SAME line structure the kernel executes.
+                    Some(sanitize_code_for_preview(&preview))
+                })
+                .flatten();
+                self.approval_scroll = 0;
+                self.approval_max_scroll.set(0);
                 self.approval_pending = Some((clean_name.clone(), clean_msg.clone()));
                 self.focus = Focus::Approval;
                 self.push_message(ChatLine {
@@ -3351,6 +3520,69 @@ impl App {
             AgentMsg::Error(e) => {
                 self.push_error(&e);
                 self.reset_stream_metrics();
+            }
+            AgentMsg::NotebookState {
+                running,
+                backend,
+                python,
+                cells,
+            } => {
+                let header =
+                    notebook::kernel_header(running, backend.as_deref(), python.as_deref());
+                let cells = cells.iter().map(NotebookCell::from_value).collect();
+                // A state push implies the notebook is in play — open the pane
+                // if it isn't already (e.g. the agent started using the kernel).
+                // Open IN PLACE (mirroring open_notebook_pane): replacing the
+                // pane would wipe an in-progress draft the human typed before
+                // closing it (apply_state below refreshes the cells anyway).
+                if !self.notebook.open {
+                    if self.notebook.cells.is_empty() && self.notebook.code().trim().is_empty() {
+                        self.notebook = NotebookPane::opened();
+                    } else {
+                        self.notebook.open = true;
+                    }
+                }
+                self.notebook.apply_state(running, header, cells);
+            }
+            AgentMsg::NotebookCell {
+                cell,
+                running,
+                backend,
+                python,
+            } => {
+                let header =
+                    notebook::kernel_header(running, backend.as_deref(), python.as_deref());
+                let parsed = NotebookCell::from_value(&cell);
+                if self.notebook.open {
+                    self.notebook.apply_cell(parsed, Some(header));
+                } else {
+                    // Pane closed (e.g. the agent ran a cell mid-chat): surface
+                    // it as a compact chat line so the human still sees it.
+                    let origin = if parsed.origin == "agent" {
+                        "agent"
+                    } else {
+                        "notebook"
+                    };
+                    let body = if parsed.success {
+                        parsed
+                            .result
+                            .clone()
+                            .or_else(|| {
+                                (!parsed.stdout.trim().is_empty())
+                                    .then(|| parsed.stdout.trim().to_string())
+                            })
+                            .unwrap_or_else(|| "(ok)".to_string())
+                    } else {
+                        parsed
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "(error)".to_string())
+                    };
+                    self.push_system(&format!(
+                        "[{origin} notebook In[{}]] {body}",
+                        parsed.execution_count
+                    ));
+                }
             }
             AgentMsg::Unknown(_) => {}
         }
@@ -4066,6 +4298,161 @@ mod tests {
         assert!(
             !app.palette.open,
             "palette must not open while an approval is pending"
+        );
+    }
+
+    #[test]
+    fn approval_is_answerable_while_notebook_pane_open() {
+        // The notebook's whole flow is: agent calls notebook_exec → approval
+        // popup (drawn OVER the pane). The human's `y` must approve, not get
+        // typed into the invisible cell editor.
+        let mut app = fresh();
+        app.open_notebook_pane();
+        assert!(app.notebook.open);
+        app.approval_pending = Some(("notebook_exec".into(), "Allow?".into()));
+
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(
+            app.approval_pending.is_none(),
+            "`y` must resolve the approval, not land in the editor"
+        );
+        assert!(
+            app.notebook.code().trim().is_empty(),
+            "the approval keystroke must not be typed into the cell"
+        );
+        assert!(app.notebook.open, "approving must not close the pane");
+    }
+
+    #[test]
+    fn reopening_notebook_preserves_in_progress_draft() {
+        let mut app = fresh();
+        app.open_notebook_pane();
+        app.notebook.input.insert_str("x = 41");
+        app.notebook.open = false; // user pressed Esc
+
+        app.open_notebook_pane(); // reopen from the palette
+        assert!(app.notebook.open);
+        assert_eq!(
+            app.notebook.code(),
+            "x = 41",
+            "an in-progress draft must survive close/reopen"
+        );
+    }
+
+    #[test]
+    fn notebook_state_push_while_closed_keeps_draft() {
+        // Repro of the draft clobber: type a draft → Esc → a state push
+        // arrives (e.g. `/notebook reset` from the palette) → the draft
+        // must survive the auto-reopen.
+        let mut app = fresh();
+        app.open_notebook_pane();
+        app.notebook.input.insert_str("draft = 1");
+        app.notebook.open = false; // user pressed Esc
+
+        app.apply_agent_msg(AgentMsg::NotebookState {
+            running: false,
+            backend: None,
+            python: None,
+            cells: vec![],
+        });
+        assert!(app.notebook.open, "a state push opens the pane");
+        assert_eq!(
+            app.notebook.code(),
+            "draft = 1",
+            "a state push must not wipe an in-progress draft"
+        );
+    }
+
+    #[test]
+    fn notebook_exec_approval_shows_full_code_and_clears_on_answer() {
+        // The kernel is shared with the human — the popup must carry the
+        // full cell (line two could be `print(api_key)`), and answering
+        // must drop the preview together with the prompt.
+        let mut app = fresh();
+        app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+            tool_name: "notebook_exec".into(),
+            message: "Allow notebook_exec?".into(),
+            call_id: None,
+            tool_args: Some(serde_json::json!({
+                "code": "import os\nprint(os.environ['SECRET'])",
+                "reset": false,
+            })),
+            tool_description: None,
+            requires_approval: Some(true),
+            permission_mode: None,
+            choices: vec![],
+            prompt_type: None,
+        });
+        assert_eq!(
+            app.approval_code.as_deref(),
+            Some("import os\nprint(os.environ['SECRET'])"),
+            "the popup must carry the FULL cell code, not a 60-char preview"
+        );
+
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.approval_pending.is_none());
+        assert!(
+            app.approval_code.is_none(),
+            "answering must clear the code preview with the prompt"
+        );
+    }
+
+    #[test]
+    fn notebook_exec_approval_flags_a_reset() {
+        let mut app = fresh();
+        app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+            tool_name: "notebook_exec".into(),
+            message: "Allow notebook_exec?".into(),
+            call_id: None,
+            tool_args: Some(serde_json::json!({ "code": "x = 1", "reset": true })),
+            tool_description: None,
+            requires_approval: Some(true),
+            permission_mode: None,
+            choices: vec![],
+            prompt_type: None,
+        });
+        let preview = app.approval_code.as_deref().expect("code preview present");
+        assert!(
+            preview.contains("resets the shared kernel"),
+            "a reset=true exec must be flagged in the preview: {preview}"
+        );
+        assert!(preview.contains("x = 1"));
+    }
+
+    #[test]
+    fn non_notebook_approval_has_no_code_preview() {
+        let mut app = fresh();
+        app.apply_agent_msg(AgentMsg::ApprovalPrompt {
+            tool_name: "compute_submit".into(),
+            message: "Allow compute_submit?".into(),
+            call_id: None,
+            tool_args: Some(serde_json::json!({ "code": "not a notebook" })),
+            tool_description: None,
+            requires_approval: Some(true),
+            permission_mode: None,
+            choices: vec![],
+            prompt_type: None,
+        });
+        assert!(
+            app.approval_code.is_none(),
+            "only notebook_exec gets the code panel"
+        );
+    }
+
+    #[test]
+    fn stale_approval_focus_with_no_prompt_sends_nothing() {
+        // Guard for the (unreachable-in-practice) Focus::Approval arm: with
+        // no pending prompt, a `y` must NOT emit a phantom approval.
+        let mut app = fresh();
+        app.focus = Focus::Approval;
+        assert!(app.approval_pending.is_none());
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.focus, Focus::Input, "stale focus resets to input");
+        assert!(
+            !app.messages
+                .iter()
+                .any(|line| line.text.contains("[approved")),
+            "no approval may be recorded without a pending prompt"
         );
     }
 

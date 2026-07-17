@@ -61,6 +61,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_form_pane(f, app);
     } else if app.knowledge.open {
         draw_knowledge_pane(f, app);
+    } else if app.notebook.open {
+        draw_notebook_pane(f, app);
     } else if app.theme_picker.open {
         draw_theme_picker(f, app);
     } else if app.which_key.open {
@@ -3179,12 +3181,244 @@ fn draw_knowledge_pane(f: &mut Frame, app: &App) {
     f.render_widget(para, area);
 }
 
-fn draw_approval_popup(f: &mut Frame, app: &App) {
+// ── Notebook pane ─────────────────────────────────────────────────
+//
+// The in-app Python notebook: a scrollable cell history (In[n]/Out[n],
+// stderr + errors in red, plots shown as saved file paths) over a
+// multi-line code editor. The kernel is shared with the agent, so cells
+// the agent runs appear here too.
+fn draw_notebook_pane(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(60, 20, f.area());
+    let pane = &app.notebook;
+    let area = centered_rect(82, 82, f.area());
     f.render_widget(Clear, area);
 
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.accent))
+        .style(Style::default().bg(t.overlay_bg))
+        .title(Span::styled(
+            " Notebook ",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    // header (status) · history (fill) · editor (7) · footer (1)
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(7),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // Header: kernel status + running indicator.
+    let status = if pane.running {
+        format!("{}  · running…", pane.kernel_status)
+    } else {
+        pane.kernel_status.clone()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {status}"),
+            Style::default().fg(t.muted),
+        ))),
+        rows[0],
+    );
+
+    // Cell history.
+    let mut lines: Vec<Line> = Vec::new();
+    if pane.cells.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No cells yet — write Python below and press Ctrl-R.",
+            Style::default().fg(t.muted),
+        )));
+    }
+    let code_width = rows[1].width.saturating_sub(8) as usize;
+    for cell in &pane.cells {
+        let marker = format!("In[{}]", cell.execution_count);
+        let origin = if cell.origin == "agent" {
+            Span::styled("  (agent)", Style::default().fg(t.accent))
+        } else {
+            Span::raw("")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {marker} "),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
+            origin,
+        ]));
+        for code_line in cell.code.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("   {}", clip(code_line, code_width)),
+                Style::default().fg(t.text),
+            )));
+        }
+        for out_line in cell.stdout.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("   {}", clip(out_line, code_width)),
+                Style::default().fg(t.dim),
+            )));
+        }
+        if let Some(result) = &cell.result {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" Out[{}] ", cell.execution_count),
+                    Style::default().fg(t.muted),
+                ),
+                Span::styled(clip(result, code_width), Style::default().fg(t.text)),
+            ]));
+        }
+        for path in &cell.image_paths {
+            lines.push(Line::from(Span::styled(
+                format!("   [plot saved: {}]", clip(path, code_width)),
+                Style::default().fg(t.accent),
+            )));
+        }
+        for err_line in cell.stderr.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("   {}", clip(err_line, code_width)),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        if let Some(error) = &cell.error {
+            for err_line in error.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("   {}", clip(err_line, code_width)),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+    let history = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((pane.scroll, 0))
+        .style(Style::default().bg(t.overlay_bg));
+    f.render_widget(history, rows[1]);
+
+    // Code editor.
+    let editor_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.divider))
+        .title(Span::styled(" Cell ", Style::default().fg(t.muted)));
+    let editor_inner = editor_block.inner(rows[2]);
+    f.render_widget(editor_block, rows[2]);
+    f.render_widget(&pane.input, editor_inner);
+
+    // Footer hints.
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Ctrl-R run · Enter newline · PgUp/PgDn scroll · Esc close",
+            Style::default().fg(t.muted),
+        ))),
+        rows[3],
+    );
+}
+
+fn draw_approval_popup(f: &mut Frame, app: &App) {
+    let t = app.theme();
     let (tool, message) = app.approval_pending.as_ref().unwrap();
+
+    // When the prompt carries code (notebook_exec — arbitrary Python on the
+    // kernel SHARED with the human), the popup must show the WHOLE cell so
+    // the human can read exactly what they approve. Wrapped, bounded height,
+    // scrollable with ↑/↓ when it doesn't fit.
+    if let Some(code) = &app.approval_code {
+        let area = centered_rect(72, 70, f.area());
+        f.render_widget(Clear, area);
+
+        let outer = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.approval));
+        let inner = outer.inner(area);
+        f.render_widget(outer, area);
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // banner + tool/message
+                Constraint::Min(3),    // code block
+                Constraint::Length(1), // key hints
+            ])
+            .split(inner);
+
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![Span::styled(
+                    "  ⚠ APPROVAL REQUIRED  ",
+                    Style::default()
+                        .fg(t.overlay_bg)
+                        .bg(t.approval)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  Tool: "),
+                    Span::styled(
+                        tool.clone(),
+                        Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  —  "),
+                    Span::styled(message.clone(), Style::default().fg(t.text)),
+                ]),
+            ]),
+            rows[0],
+        );
+
+        let code_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.divider))
+            .title(Span::styled(
+                " Cell code — review before answering ",
+                Style::default().fg(t.muted),
+            ));
+        let code_area = code_block.inner(rows[1]);
+        f.render_widget(code_block, rows[1]);
+
+        // Manual wrap so the scroll bound is exact (Paragraph::wrap gives no
+        // rendered-line count on stable ratatui).
+        let wrapped = wrap_plain(code, code_area.width.max(1) as usize);
+        let visible = code_area.height as usize;
+        let max_scroll = wrapped.len().saturating_sub(visible) as u16;
+        app.approval_max_scroll.set(max_scroll);
+        let scroll = app.approval_scroll.min(max_scroll) as usize;
+        let lines: Vec<Line> = wrapped
+            .iter()
+            .skip(scroll)
+            .take(visible)
+            .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(t.text))))
+            .collect();
+        f.render_widget(Paragraph::new(lines), code_area);
+
+        let mut hints = vec![
+            Span::raw("  [y] "),
+            Span::styled("Allow", Style::default().fg(t.ok)),
+            Span::raw("   [a] "),
+            Span::styled("Allow all", Style::default().fg(t.warn)),
+            Span::raw("   [n] "),
+            Span::styled("Deny", Style::default().fg(t.err)),
+        ];
+        if max_scroll > 0 {
+            hints.push(Span::styled(
+                format!(
+                    "   ↑/↓ scroll code ({}/{})",
+                    scroll + visible.min(wrapped.len()),
+                    wrapped.len()
+                ),
+                Style::default().fg(t.muted),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(hints)), rows[2]);
+        return;
+    }
+
+    let area = centered_rect(60, 20, f.area());
+    f.render_widget(Clear, area);
 
     let popup = Paragraph::new(vec![
         Line::from(""),
@@ -3229,6 +3463,45 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
     f.render_widget(popup, area);
 }
 
+/// Hard-wrap plain text to `width` DISPLAY COLUMNS per line (no word-splitting
+/// smarts — code must never be reflowed in a way that hides content). Wraps on
+/// unicode display width, not char count, so a CJK/emoji-heavy line (each such
+/// glyph is 2 columns wide) is not right-clipped past the panel edge where the
+/// popup has no horizontal scroll. Every input line yields at least one output
+/// line, so nothing is dropped.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut col = 0usize;
+        for ch in line.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            // Break before this glyph would spill past the edge (but never on
+            // an empty line, so a lone wide char wider than `width` still
+            // emits rather than looping).
+            if col + w > width && !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+                col = 0;
+            }
+            current.push(ch);
+            col += w;
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Helper: centered rect for popups.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()
@@ -3248,4 +3521,43 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn wrap_plain_bounds_wide_chars_by_display_width() {
+        // Each `中` is 2 columns wide: at width 4 only two fit per line, so a
+        // char-count wrap (old behavior) would overflow the panel and clip.
+        let wrapped = wrap_plain("中中中中中", 4);
+        for line in &wrapped {
+            assert!(
+                line.width() <= 4,
+                "line {line:?} is {} cols, over the 4-col width",
+                line.width()
+            );
+        }
+        assert_eq!(wrapped.concat(), "中中中中中", "no glyph may be dropped");
+    }
+
+    #[test]
+    fn wrap_plain_ascii_still_wraps_by_column() {
+        let wrapped = wrap_plain("abcdefgh", 3);
+        assert_eq!(wrapped, vec!["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn wrap_plain_preserves_blank_lines() {
+        assert_eq!(wrap_plain("a\n\nb", 10), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn wrap_plain_emits_lone_overwide_glyph() {
+        // A single glyph wider than the whole width still emits (no infinite
+        // loop, nothing dropped).
+        assert_eq!(wrap_plain("🚀", 1), vec!["🚀"]);
+    }
 }

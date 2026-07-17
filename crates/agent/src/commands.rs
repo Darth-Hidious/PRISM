@@ -41,6 +41,16 @@ const BUILTIN_COMMANDS: &[SlashCommandSpec] = &[
         category: "Reference",
     },
     SlashCommandSpec {
+        usage: "/notebook",
+        description: "Open the in-app Python notebook (kernel shared with the agent)",
+        category: "Reference",
+    },
+    SlashCommandSpec {
+        usage: "/notebook run --code <code> [--timeout <s>]",
+        description: "Run one Python cell in the persistent notebook kernel",
+        category: "Reference",
+    },
+    SlashCommandSpec {
         usage: "/read <path>",
         description: "Read a project file directly",
         category: "Reference",

@@ -204,6 +204,25 @@ pub enum AgentMsg {
     /// the old `"" => Error(err.to_string())` arm.  New code should
     /// prefer `BackendError`.
     Error(String),
+
+    // ── Notebook pane ────────────────────────────────────────────────
+    /// `ui.notebook.state` — full kernel status + cell log (response to
+    /// `/notebook open`). `cells` are raw cell objects the pane parses.
+    NotebookState {
+        running: bool,
+        backend: Option<String>,
+        python: Option<String>,
+        cells: Vec<Value>,
+    },
+    /// `ui.notebook.cell` — one freshly-run cell (from the human's `/notebook
+    /// run` or, live, from the agent's `notebook_exec` tool).
+    NotebookCell {
+        cell: Value,
+        running: bool,
+        backend: Option<String>,
+        python: Option<String>,
+    },
+
     /// Any unrecognized notification.  Kept so malformed-event tests
     /// can assert the TUI doesn't crash on unknown payloads.
     Unknown(Value),
@@ -494,6 +513,42 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .unwrap_or_default();
             AgentMsg::View { title, tabs }
         }
+
+        // ── Notebook pane ────────────────────────────────────────────
+        "ui.notebook.state" => AgentMsg::NotebookState {
+            running: params
+                .get("running")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            backend: params
+                .get("backend")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            python: params
+                .get("python")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            cells: params
+                .get("cells")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+        },
+        "ui.notebook.cell" => AgentMsg::NotebookCell {
+            cell: params.get("cell").cloned().unwrap_or(Value::Null),
+            running: params
+                .get("running")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            backend: params
+                .get("backend")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            python: params
+                .get("python")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        },
 
         // ── Backend health ───────────────────────────────────────────
         "ui.backend.warning" => AgentMsg::BackendWarning {
