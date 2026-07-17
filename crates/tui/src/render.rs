@@ -3456,10 +3456,14 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
     f.render_widget(popup, area);
 }
 
-/// Hard-wrap plain text to `width` characters per line (no word splitting
-/// smarts — code must never be reflowed in a way that hides content). Every
-/// input line yields at least one output line, so nothing is dropped.
+/// Hard-wrap plain text to `width` DISPLAY COLUMNS per line (no word-splitting
+/// smarts — code must never be reflowed in a way that hides content). Wraps on
+/// unicode display width, not char count, so a CJK/emoji-heavy line (each such
+/// glyph is 2 columns wide) is not right-clipped past the panel edge where the
+/// popup has no horizontal scroll. Every input line yields at least one output
+/// line, so nothing is dropped.
 fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
     let mut out = Vec::new();
     for line in text.lines() {
@@ -3468,14 +3472,18 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
             continue;
         }
         let mut current = String::new();
-        let mut count = 0;
+        let mut col = 0usize;
         for ch in line.chars() {
-            current.push(ch);
-            count += 1;
-            if count == width {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            // Break before this glyph would spill past the edge (but never on
+            // an empty line, so a lone wide char wider than `width` still
+            // emits rather than looping).
+            if col + w > width && !current.is_empty() {
                 out.push(std::mem::take(&mut current));
-                count = 0;
+                col = 0;
             }
+            current.push(ch);
+            col += w;
         }
         if !current.is_empty() {
             out.push(current);
@@ -3506,4 +3514,43 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn wrap_plain_bounds_wide_chars_by_display_width() {
+        // Each `中` is 2 columns wide: at width 4 only two fit per line, so a
+        // char-count wrap (old behavior) would overflow the panel and clip.
+        let wrapped = wrap_plain("中中中中中", 4);
+        for line in &wrapped {
+            assert!(
+                line.width() <= 4,
+                "line {line:?} is {} cols, over the 4-col width",
+                line.width()
+            );
+        }
+        assert_eq!(wrapped.concat(), "中中中中中", "no glyph may be dropped");
+    }
+
+    #[test]
+    fn wrap_plain_ascii_still_wraps_by_column() {
+        let wrapped = wrap_plain("abcdefgh", 3);
+        assert_eq!(wrapped, vec!["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn wrap_plain_preserves_blank_lines() {
+        assert_eq!(wrap_plain("a\n\nb", 10), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn wrap_plain_emits_lone_overwide_glyph() {
+        // A single glyph wider than the whole width still emits (no infinite
+        // loop, nothing dropped).
+        assert_eq!(wrap_plain("🚀", 1), vec!["🚀"]);
+    }
 }

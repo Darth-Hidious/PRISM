@@ -51,6 +51,19 @@ MAX_TEXT = 1_000_000  # ~1 MB per stdout/stderr/result stream
 MAX_IMAGES = 10  # keep at most this many figures per cell
 MAX_IMAGE_BYTES_TOTAL = 8_000_000  # ~8 MB of base64 image data per cell
 
+# The Rust reader (notebook.rs `MAX_LINE_BYTES`) reaps + restarts the kernel
+# the instant ONE response line's UTF-8 length exceeds this hard cap — which
+# would wipe the whole shared session over a normal exception or print. It is
+# mirrored here EXACTLY. The per-field CHARACTER caps above cannot bound this:
+# json.dumps (ensure_ascii=True) escapes non-ASCII, so one BMP char becomes
+# `\uXXXX` (6 bytes) and one emoji a surrogate pair (12 bytes). A 1M-char field
+# can thus serialize to ~12 MB, and three such fields blow past 16 MiB. So
+# `_emit` enforces a total-BYTE budget on the serialized line (below the Rust
+# cap by a safe margin) as the real guard.
+MAX_LINE_BYTES = 16 * 1024 * 1024  # MUST equal notebook.rs MAX_LINE_BYTES
+LINE_BUDGET_MARGIN = 256 * 1024  # headroom for the trailing newline + markers
+LINE_BUDGET_BYTES = MAX_LINE_BYTES - LINE_BUDGET_MARGIN
+
 
 def _cap_text(value):
     """Truncate an over-long captured string, noting how much was dropped."""
@@ -158,9 +171,97 @@ class _CappedBuffer(io.TextIOBase):
     getvalue = value
 
 
+def _truncate_utf8_bytes(text, max_bytes):
+    """Truncate ``text`` so its UTF-8 encoding is at most ``max_bytes``.
+
+    Cuts on a codepoint boundary (``errors="ignore"`` drops any dangling
+    partial char) and appends a VISIBLE marker reporting the dropped byte
+    count, so a byte-level truncation is never silent.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    dropped = len(encoded) - max_bytes
+    head = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return head + f"\n...[truncated {dropped} bytes to fit the wire limit]"
+
+
+def _enforce_line_budget(obj):
+    """Return a copy of ``obj`` whose ``json.dumps`` UTF-8 length is under
+    LINE_BUDGET_BYTES, shaving the largest string fields BY BYTES until it
+    fits. The per-field character caps cannot guarantee this (see
+    MAX_LINE_BYTES): under JSON escaping one char can cost up to 12 bytes.
+
+    Truncatable fields are the text-bearing ones (``stdout``/``stderr``/
+    ``result`` and the error's ``evalue``/``ename``/traceback frames).
+    Images are base64 and already capped far below the budget
+    (MAX_IMAGE_BYTES_TOTAL), so they are never the overflow source and are
+    left untouched (truncating base64 would corrupt an otherwise-valid PNG);
+    an unreachable last-resort drops them wholesale if text alone can't fit.
+    """
+    obj = dict(obj)
+    error = obj.get("error")
+    if isinstance(error, dict):
+        error = dict(error)
+        error["traceback"] = list(error.get("traceback") or [])
+        obj["error"] = error
+    else:
+        error = None
+
+    slots = []  # (read, write) for each shrinkable string field.
+
+    def add_dict_slot(container, key):
+        if isinstance(container.get(key), str):
+            slots.append((lambda: container[key], lambda v: container.__setitem__(key, v)))
+
+    for key in ("stdout", "stderr", "result"):
+        add_dict_slot(obj, key)
+    if error is not None:
+        for key in ("evalue", "ename"):
+            add_dict_slot(error, key)
+        frames = error["traceback"]
+        for index in range(len(frames)):
+            if isinstance(frames[index], str):
+                slots.append(
+                    (
+                        lambda i=index: frames[i],
+                        lambda v, i=index: frames.__setitem__(i, v),
+                    )
+                )
+
+    def line_len():
+        return len(json.dumps(obj).encode("utf-8"))
+
+    # Each pass shaves the currently-largest field by at least the overage,
+    # so this converges in a handful of iterations; the guard is paranoia.
+    guard = 0
+    while slots and guard < 10_000 and line_len() > LINE_BUDGET_BYTES:
+        guard += 1
+        read, write = max(slots, key=lambda slot: len(slot[0]().encode("utf-8")))
+        current = read()
+        cur_bytes = len(current.encode("utf-8"))
+        overage = line_len() - LINE_BUDGET_BYTES
+        write(_truncate_utf8_bytes(current, max(0, cur_bytes - overage - 1024)))
+
+    if obj.get("images") and line_len() > LINE_BUDGET_BYTES:
+        obj["images"] = []  # unreachable in practice; keeps the invariant hard.
+    return obj
+
+
 def _emit(obj):
-    """Write one protocol JSON line to stdout and flush."""
-    sys.stdout.write(json.dumps(obj) + "\n")
+    """Write one protocol JSON line to stdout and flush.
+
+    Guarantees the emitted line's UTF-8 byte length stays under the Rust
+    reader's per-line cap (see LINE_BUDGET_BYTES / MAX_LINE_BYTES): a line
+    over that cap makes the supervisor reap + restart the kernel, wiping the
+    shared session over a normal exception or print. When the serialized
+    payload would exceed the budget, the largest string fields are truncated
+    by BYTES (with a visible marker) until it fits.
+    """
+    line = json.dumps(obj)
+    if len(line.encode("utf-8")) > LINE_BUDGET_BYTES:
+        line = json.dumps(_enforce_line_budget(obj))
+    sys.stdout.write(line + "\n")
     sys.stdout.flush()
 
 

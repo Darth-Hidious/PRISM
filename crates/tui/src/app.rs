@@ -8,7 +8,7 @@ use crate::keymap;
 use crate::knowledge::{self, IngestPhase, KnowledgePane, KnowledgeTab};
 use crate::msg::{AgentMsg, parse_notification};
 use crate::notebook::{self, NotebookCell, NotebookPane};
-use crate::sanitize::sanitize_for_render;
+use crate::sanitize::{sanitize_code_for_preview, sanitize_for_render};
 use crate::theme;
 use crate::toast::{self, ToastKind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -3427,7 +3427,11 @@ impl App {
                         preview.push_str("[resets the shared kernel first — all variables lost]\n");
                     }
                     preview.push_str(code);
-                    Some(sanitize_for_render(&preview))
+                    // NOT sanitize_for_render: that DELETES bare `\r` (which
+                    // CPython runs as a newline), so hidden code could execute
+                    // while the popup showed one benign line. This renderer
+                    // shows the SAME line structure the kernel executes.
+                    Some(sanitize_code_for_preview(&preview))
                 })
                 .flatten();
                 self.approval_scroll = 0;

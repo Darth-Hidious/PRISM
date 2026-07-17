@@ -322,8 +322,8 @@ impl Kernel {
     }
 
     async fn shutdown(&mut self) {
-        // Capture the group id BEFORE wait() reaps the child (`id()` returns
-        // None afterwards). The sidecar is its own group leader (see spawn).
+        // Capture the group id BEFORE any wait() reaps the child (`id()`
+        // returns None afterwards). The sidecar is its own group leader.
         let pgid = self.child.id();
         let _ = self.stdin.write_all(b"{\"op\":\"shutdown\"}\n").await;
         let _ = self.stdin.flush().await;
@@ -332,14 +332,25 @@ impl Kernel {
             .await
             .is_err()
         {
+            // Unclean: the leader ignored shutdown and is STILL ALIVE, so its
+            // pgid is guaranteed valid and the group non-empty. Kill the whole
+            // group BEFORE reaping (race-free, mirrors `reap_kernel`), which
+            // also takes any cell-spawned children down with it.
+            if let Some(pgid) = pgid {
+                kill_process_group(pgid);
+            }
             let _ = self.child.start_kill();
             let _ = self.child.wait().await;
+            return;
         }
-        // Kill the process group even after a CLEAN exit: background
-        // processes a cell spawned (e.g. `subprocess.Popen(['sleep', …])`)
-        // share the sidecar's group and would otherwise survive every
-        // reset/shutdown. The pgid stays valid while any member lives; with
-        // no members left this is a harmless ESRCH.
+        // Clean exit: the leader is gone. Cell-spawned background processes
+        // (e.g. `subprocess.Popen(['sleep', …])`) share the sidecar's group
+        // and must not survive the shutdown. The pgid stays valid while ANY
+        // such child lives, so this killpg reaps them; with none left it is a
+        // harmless ESRCH. (A pgid only becomes reusable once every member has
+        // exited, and the OS will not recycle it to an unrelated new leader
+        // within this un-awaited window, so the theoretical recycle race is
+        // sub-ms and benign.)
         if let Some(pgid) = pgid {
             kill_process_group(pgid);
         }
@@ -899,6 +910,93 @@ mod tests {
             c3.result.as_deref(),
             Some("'alive'"),
             "the shared session must survive a large recoverable exception"
+        );
+
+        reset().await.unwrap();
+        reset_global();
+    }
+
+    #[tokio::test]
+    async fn huge_nonascii_exception_does_not_kill_the_shared_session() {
+        // HIGH-1 regression: char caps bound CHARACTERS, but json.dumps
+        // escapes each emoji to a 12-byte surrogate pair. A 1M-char evalue
+        // (+ its traceback frame) serializes to ~20+ MiB — far past the
+        // 16 MiB wire cap — so WITHOUT the `_emit` byte budget the Rust
+        // reader would TooLarge-bail and reap the kernel, wiping the session.
+        let _serial = test_serial().lock().await;
+        let Some(py) = test_python() else {
+            return;
+        };
+        reset_global();
+        configure(py, std::env::temp_dir());
+
+        let c1 = execute("keep = 'alive'", Some(30), "user").await.unwrap();
+        assert!(c1.success, "error: {:?}", c1.error);
+
+        // 2M emoji -> ~22.9 MiB serialized line if emitted uncapped.
+        let cell = execute(
+            "raise ValueError('\u{1F600}' * 2_000_000)",
+            Some(120),
+            "user",
+        )
+        .await
+        .expect("a huge non-ASCII exception is a failed cell, not a dead kernel");
+        assert!(!cell.success);
+        let err = cell.error.expect("error surfaced");
+        assert!(err.contains("ValueError"), "exception name kept: {err}");
+        assert!(err.contains("truncated"), "truncation reported: {err}");
+
+        // THE point: the kernel — and the human's variables — survived.
+        let c3 = execute("keep", Some(30), "user").await.unwrap();
+        assert_eq!(
+            c3.result.as_deref(),
+            Some("'alive'"),
+            "the shared session must survive a large non-ASCII exception"
+        );
+
+        reset().await.unwrap();
+        reset_global();
+    }
+
+    #[tokio::test]
+    async fn huge_nonascii_output_across_streams_does_not_kill_the_session() {
+        // HIGH-1 regression: even split across stdout + stderr + result, a
+        // 1M-char-per-stream non-ASCII flood serializes to ~17 MiB (each `中`
+        // escapes to `中`, 6 bytes). Per-field char caps can't see the
+        // aggregate wire size; the `_emit` byte budget must, returning a
+        // normal (truncated) cell rather than reaping the kernel.
+        let _serial = test_serial().lock().await;
+        let Some(py) = test_python() else {
+            return;
+        };
+        reset_global();
+        configure(py, std::env::temp_dir());
+
+        let c1 = execute("survivor = 7", Some(30), "user").await.unwrap();
+        assert!(c1.success, "error: {:?}", c1.error);
+
+        let code = "import sys\n\
+                    s = '\u{4E2D}' * 1_000_000\n\
+                    sys.stdout.write(s)\n\
+                    sys.stderr.write(s)\n\
+                    s";
+        let cell = execute(code, Some(120), "user")
+            .await
+            .expect("a huge multi-stream output is a completed cell, not a dead kernel");
+        assert!(cell.success, "error: {:?}", cell.error);
+        assert!(
+            cell.stdout.contains("truncated")
+                || cell.stderr.contains("truncated")
+                || cell.result.as_deref().unwrap_or("").contains("truncated"),
+            "byte truncation must be reported somewhere"
+        );
+
+        // The kernel was NOT reaped — the earlier variable still resolves.
+        let c3 = execute("survivor", Some(30), "user").await.unwrap();
+        assert_eq!(
+            c3.result.as_deref(),
+            Some("7"),
+            "the shared session must survive a large multi-stream output"
         );
 
         reset().await.unwrap();
