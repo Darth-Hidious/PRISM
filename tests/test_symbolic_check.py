@@ -25,12 +25,16 @@ class TestVerdictEquivalence:
         assert r["method"] == "simplify(a-b)==0"
 
     def test_fail_carries_counterexample_and_success_true(self):
-        """x**3 != x*x**2 + 1 — a counterexample exists. CRITICAL: fail is success=True."""
+        """x**3 != x*x**2 + 1 — simplify(a-b) = -1, a nonzero constant -> fail
+        via the H3b constant-residual path. CRITICAL: fail is success=True."""
         r = symbolic_check("x**3", "x*x**2 + 1", mode="equivalence", n_points=8)
         assert r["success"] is True, "a fail verdict MUST be success=true (gate contract)"
         assert r["verdict"] == "fail", r
-        assert r["counterexample"] is not None, "fail must carry a counterexample"
-        assert r["abs_diff"] > 1e-9
+        # The fail carries evidence — either a numeric counterexample (abs_diff)
+        # or a constant-residual proof (residual). Both are honest fail evidence.
+        assert r["counterexample"] is not None or r.get("residual") is not None, (
+            "fail must carry counterexample or residual evidence: %r" % r
+        )
 
     def test_sqrt_squared_needs_assumption(self):
         """sqrt(x**2) == x only holds for x>=0. Without the nonnegative
@@ -112,6 +116,39 @@ class TestNumericHonesty:
         tol doesn't mask real disagreement)."""
         r = symbolic_check("(x+10)**8", "(x+11)**8", mode="numeric_spot", n_points=20)
         assert r["verdict"] == "fail"
+
+
+class TestSpotCheckHonesty:
+    """FIX2-H3/H3b/H7: the spot-check must not lie 'numerically_consistent'."""
+
+    def test_h3_zero_valid_points_is_inconclusive(self):
+        """sqrt(-x**2-1) is complex at every real sample. The old code swallowed
+        every float() failure and returned 'numerically_consistent' claiming
+        n_points agreement with ZERO comparisons. Now: inconclusive, n_points=0."""
+        r = symbolic_check("sqrt(-x**2 - 1)", "sqrt(-x**2 - 1)",
+                           mode="numeric_spot", n_points=16)
+        assert r["verdict"] == "inconclusive", r
+        assert "could not evaluate" in r.get("reason", ""), r
+
+    def test_h3b_nonzero_constant_residual_is_fail(self):
+        """x vs x+5: simplify(a-b) = -5, a nonzero CONSTANT -> a symbolic proof
+        of inequality. The old code fell through to sampling; now it short-
+        circuits to 'fail' with the residual."""
+        r = symbolic_check("x", "x + 5", mode="equivalence")
+        assert r["verdict"] == "fail", r
+        assert r.get("residual") in ("5", "-5")
+
+    def test_h7_nan_is_not_agreement(self):
+        """x/x vs 1: at x=0 this is NaN (0/0). NaN must NOT count as agreement
+        (nan > TOL is False in IEEE-754, so the old code silently accepted it).
+        The guard skips non-finite points; the identity still holds at the
+        finite samples -> numerically_consistent (not a false pass via NaN)."""
+        r = symbolic_check("x/x", "1", mode="numeric_spot", n_points=16)
+        # Must not be 'fail' (it's a true identity) and must have compared >0
+        # finite points (so NaN was skipped, not counted as agreement).
+        assert r["verdict"] in ("numerically_consistent", "proven"), r
+        if r["verdict"] == "numerically_consistent":
+            assert r.get("n_points", 0) > 0
 
 
 class TestDimensional:

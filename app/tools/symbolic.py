@@ -215,6 +215,11 @@ def parse_user_expression(s):
 
 def numeric_spot(a, b, frees, n_points, seed, assumptions):
     rng = random.Random(seed)
+    # H3: count points ACTUALLY compared. The old code returned
+    # "numerically_consistent" claiming n_points agreement when ZERO points were
+    # comparable (every sample complex/NaN -> float() raised -> continue). Report
+    # the VALID count, and if 0 -> inconclusive.
+    compared = 0
     for _ in range(n_points):
         point = {}
         for s in frees:
@@ -231,6 +236,11 @@ def numeric_spot(a, b, frees, n_points, seed, assumptions):
             vb = float(N(b.subs(point)))
         except (TypeError, ValueError, ZeroDivisionError):
             continue
+        # H7: NaN/inf is NOT agreement (`nan > TOL` is False in IEEE-754, so the
+        # old code silently counted it as consistent). A non-finite point is
+        # unevaluable -> skip (counts toward the zero-valid-points check).
+        if not (math.isfinite(va) and math.isfinite(vb)):
+            continue
         diff = abs(va - vb)
         # H4: RELATIVE tolerance. The old absolute `diff > TOL` fabricated "fail"
         # counterexamples for true large-magnitude identities (float64 noise at
@@ -246,7 +256,14 @@ def numeric_spot(a, b, frees, n_points, seed, assumptions):
                 "value_b": vb,
                 "abs_diff": diff,
             })
-    return ("numerically_consistent", {"n_points": n_points})
+        compared += 1
+    if compared == 0:
+        # H3: could not evaluate at ANY real point -> cannot claim consistency.
+        return ("inconclusive", {
+            "reason": "could not evaluate at any real point in the sampled domain",
+            "n_points": 0,
+        })
+    return ("numerically_consistent", {"n_points": compared})
 
 
 def run(cfg):
@@ -296,6 +313,23 @@ def run(cfg):
         if is_zero:
             emit({"ok": True, "result": {
                 "verdict": "proven", "method": "simplify(a-b)==0",
+            }})
+            return
+        # H3b: a NONZERO CONSTANT residual (no free symbols) is a symbolic proof
+        # of INEQUALITY -> verdict fail, with the residual as evidence. The old
+        # code always fell through to numeric sampling, which could coincidentally
+        # miss and report "numerically_consistent" for expressions that provably
+        # differ by a constant.
+        try:
+            residual_is_const = not diff.free_symbols
+        except Exception:
+            residual_is_const = False
+        if residual_is_const and diff != 0:
+            emit({"ok": True, "result": {
+                "verdict": "fail",
+                "method": "nonzero constant residual (proof of inequality)",
+                "residual": str(diff),
+                "counterexample": "a-b = {} (constant, nonzero)".format(str(diff)),
             }})
             return
         frees = sorted(frees_a, key=str)
