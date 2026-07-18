@@ -166,14 +166,18 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
     while i < n:
         ln = lines[i]
 
-        # Once we hit a chain marker, keep everything from here to the end —
-        # chained-exception root causes are load-bearing (VS1/F2 lesson: for a
-        # chain, keep BOTH final blocks).
+        # G4: a chain marker ("During handling..." / "The above exception...")
+        # starts a NEW exception block. Flush any pending library run, keep the
+        # marker, and CONTINUE the normal frame classification into the next
+        # block — so library frames in the SECOND block are also collapsed (the
+        # old code kept the entire tail verbatim, leaking raw site-packages
+        # frames after the marker). Both final exception lines survive (they're
+        # non-frame, non-indented lines kept by the fallback).
         if any(marker in ln for marker in _CHAIN_MARKERS):
             flush_library_run()
-            # Tail = this line + everything remaining, verbatim.
-            kept.extend(lines[i:])
-            break
+            kept.append(ln)
+            i += 1
+            continue
 
         # A traceback frame is the `File "..."` line + ALL following indented
         # continuation lines (the source line AND, on Python 3.11+, the PEP 657

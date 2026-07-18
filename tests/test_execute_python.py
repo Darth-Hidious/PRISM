@@ -307,6 +307,43 @@ class TestTracebackFilter:
         assert "During handling" in r["stderr"]
         assert "RuntimeError: wrapped" in r["stderr"]
 
+    def test_g4_chained_exception_collapses_library_frames_in_both_blocks(self):
+        """G4: library frames in the SECOND exception block must be collapsed
+        too. The old code kept the entire chain tail verbatim after the marker,
+        leaking raw site-packages frames. Now each block is filtered."""
+        from app.tools.code import _filter_traceback
+        tb = (
+            'Traceback (most recent call last):\n'
+            '  File "<string>", line 2, in <module>\n'
+            '    int("abc")\n'
+            '  File "/x/site-packages/numpy/a.py", line 1, in f\n'
+            '    pass\n'
+            '  File "/x/site-packages/numpy/b.py", line 2, in g\n'
+            '    pass\n'
+            "ValueError: invalid literal for int() with base 10: 'abc'\n"
+            "\n"
+            "During handling of the above exception, another exception occurred:\n"
+            "\n"
+            'Traceback (most recent call last):\n'
+            '  File "<string>", line 4, in <module>\n'
+            '    raise RuntimeError("wrapped")\n'
+            '  File "/x/site-packages/numpy/c.py", line 3, in h\n'
+            '    pass\n'
+            '  File "/x/site-packages/numpy/d.py", line 4, in k\n'
+            '    pass\n'
+            'RuntimeError: wrapped\n'
+        )
+        r = _filter_traceback(tb, "/cwd")
+        # No raw library paths leak in EITHER block.
+        assert "site-packages/numpy" not in r["stderr"], (
+            "library frames must be collapsed in BOTH chained blocks: %r" % r["stderr"]
+        )
+        # Both final exception lines survive.
+        assert "ValueError: invalid literal" in r["stderr"]
+        assert "RuntimeError: wrapped" in r["stderr"]
+        # All 4 library frames across both blocks counted.
+        assert r["traceback_elided_frames"] >= 4, r
+
     def test_writes_full_traceback_and_returns_path(self):
         from app.tools.code import _filter_traceback
         from pathlib import Path

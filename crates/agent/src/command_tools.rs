@@ -2222,7 +2222,6 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
     let mut run_of_library = 0u32;
     let mut i = 0usize;
     let n = lines.len();
-    let mut hit_chain = false;
     // FIX-3: count FRAMES elided (sum of each run), not marker lines. The old
     // code counted "[... N library frame(s) elided]" marker lines via
     // kept.iter().filter(...).count(), so a single collapsed run of N frames
@@ -2235,13 +2234,14 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
 
         // Chain marker: keep everything from here to the end verbatim.
         if chain_markers.iter().any(|m| ln_trim.contains(m)) {
+            // G4: a chain marker ("During handling..." / "The above exception...")
+            // starts a NEW exception block. Flush any pending library run, keep
+            // the marker, and CONTINUE the normal frame classification into the
+            // next block — so library frames in the SECOND block are also
+            // collapsed (the old code kept the entire tail verbatim, leaking raw
+            // site-packages frames after the marker). Both final exception lines
+            // survive (they're non-frame, non-indented lines kept by the fallback).
             flush_library_run(&mut run_of_library, &mut total_elided_frames, &mut kept);
-            kept.push(ln.to_string());
-            hit_chain = true;
-            i += 1;
-            continue;
-        }
-        if hit_chain {
             kept.push(ln.to_string());
             i += 1;
             continue;
@@ -3999,6 +3999,45 @@ RuntimeError: wrapped\n";
         assert!(filtered.contains("ValueError: invalid literal"));
         assert!(filtered.contains("During handling"));
         assert!(filtered.contains("RuntimeError: wrapped"));
+    }
+
+    #[test]
+    fn g4_chained_exception_collapses_library_frames_in_both_blocks() {
+        // G4: library frames in the SECOND exception block must be collapsed
+        // too. The old code kept the entire chain tail verbatim after the
+        // marker, leaking raw site-packages frames. Now each block is filtered.
+        let stderr = concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"<string>\", line 2, in <module>\n",
+            "    int(\"abc\")\n",
+            "  File \"/x/site-packages/numpy/a.py\", line 1, in f\n",
+            "    pass\n",
+            "  File \"/x/site-packages/numpy/b.py\", line 2, in g\n",
+            "    pass\n",
+            "ValueError: invalid literal for int() with base 10: 'abc'\n",
+            "\n",
+            "During handling of the above exception, another exception occurred:\n",
+            "\n",
+            "Traceback (most recent call last):\n",
+            "  File \"<string>\", line 4, in <module>\n",
+            "    raise RuntimeError(\"wrapped\")\n",
+            "  File \"/x/site-packages/numpy/c.py\", line 3, in h\n",
+            "    pass\n",
+            "  File \"/x/site-packages/numpy/d.py\", line 4, in k\n",
+            "    pass\n",
+            "RuntimeError: wrapped\n",
+        );
+        let (filtered, n) = filter_notebook_traceback(stderr, "/cwd");
+        assert!(
+            !filtered.contains("site-packages/numpy"),
+            "library frames must collapse in BOTH chained blocks: {filtered}"
+        );
+        assert!(filtered.contains("ValueError: invalid literal"));
+        assert!(filtered.contains("RuntimeError: wrapped"));
+        assert!(
+            n >= 4,
+            "all 4 library frames across both blocks counted: got {n}"
+        );
     }
 
     #[test]
