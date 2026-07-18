@@ -322,7 +322,7 @@ fn classify_for_provenance(result: &Value) -> (Option<String>, Option<i64>) {
 const PROV_CODE_EXEC_TOOLS: &[&str] = &["execute_python", "execute_bash", "notebook_exec"];
 
 #[derive(Clone, Debug)]
-struct LastCodeRun {
+pub struct LastCodeRun {
     // The canonical tool name is the HashMap KEY, so it's not stored here too.
     record_id: String,
     failed: bool,
@@ -339,11 +339,31 @@ static LAST_CODE_RUN: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Clear the repair-chain memory (FIX-6). Called at turn start so a new turn's
-/// first code run is not tagged repair_attempt pointing at last turn's failure,
-/// and so an in-process subagent does not splice into the parent's chain.
+/// first code run is not tagged repair_attempt pointing at last turn's failure.
 pub fn reset_code_run_chain() {
     if let Ok(mut guard) = LAST_CODE_RUN.lock() {
         guard.clear();
+    }
+}
+
+/// G2: snapshot/restore the repair-chain memory around a nested subagent turn.
+///
+/// `reset_code_run_chain` at `run_turn` entry was meant to isolate subagents
+/// but it WIPES the parent's in-flight chain (parent loses its parent_id), and
+/// the subagent's leftover record is never cleared on return -> the parent's
+/// next code call chains against the subagent's record (wrong parent_id +
+/// repair_attempt tag). Snapshot BEFORE the nested turn and RESTORE AFTER so
+/// the parent's chain survives intact and the subagent's writes are discarded.
+pub fn snapshot_code_run_chain() -> std::collections::HashMap<String, LastCodeRun> {
+    LAST_CODE_RUN
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+pub fn restore_code_run_chain(map: std::collections::HashMap<String, LastCodeRun>) {
+    if let Ok(mut guard) = LAST_CODE_RUN.lock() {
+        *guard = map;
     }
 }
 
@@ -792,6 +812,51 @@ mod tests {
         assert_eq!(parent, None);
         assert!(!tags.contains(&"repair_attempt".to_string()));
         assert!(tags.contains(&"code_exec".to_string()));
+    }
+
+    #[test]
+    fn g2_snapshot_restore_roundtrip_preserves_state() {
+        // G2: snapshot/restore the global LAST_CODE_RUN map. A snapshot taken
+        // before a (simulated) subagent reset, then restored, recovers the
+        // parent's chain intact. This is the unit-testable core of the fix;
+        // the subagent.rs wiring calls these around the nested run_turn.
+        reset_code_run_chain();
+        // Populate the global via the public restore (insert a parent record).
+        let mut parent_map: HashMap<String, LastCodeRun> = HashMap::new();
+        parent_map.insert(
+            "execute_python".to_string(),
+            LastCodeRun {
+                record_id: "PARENT-REC-1".to_string(),
+                failed: true,
+            },
+        );
+        restore_code_run_chain(parent_map.clone());
+
+        // Subagent entry: snapshot, then the nested run_turn resets the global.
+        let snap = snapshot_code_run_chain();
+        assert_eq!(
+            snap.get("execute_python").map(|r| r.record_id.as_str()),
+            Some("PARENT-REC-1")
+        );
+        reset_code_run_chain(); // nested turn wipes it
+        // During the nested turn, the global is empty (subagent starts clean).
+        let empty_snap = snapshot_code_run_chain();
+        assert!(empty_snap.is_empty());
+
+        // Subagent exit: restore the parent's snapshot.
+        restore_code_run_chain(snap);
+        // The parent's chain is intact: chain_code_run finds the parent record.
+        let (parent_id, tags) =
+            chain_code_run("execute_python", "error", &snapshot_code_run_chain());
+        assert_eq!(
+            parent_id.as_deref(),
+            Some("PARENT-REC-1"),
+            "parent's chain must survive the nested subagent turn"
+        );
+        assert!(tags.contains(&"repair_attempt".to_string()));
+
+        // Clean up global state so this test doesn't leak into others.
+        reset_code_run_chain();
     }
 
     #[test]

@@ -319,6 +319,14 @@ async fn execute_spawn_subagent_inner(
         // Boxed as a dyn future: run_turn → spawn_subagent → run_turn is
         // recursive, so the indirection (and the erased type) breaks the
         // otherwise-infinite future size / auto-trait cycle.
+        //
+        // G2: snapshot the parent's repair-chain memory around the nested turn.
+        // run_turn's entry-reset would otherwise WIPE the parent's in-flight
+        // chain, and the subagent's leftover record would chain into the
+        // parent's next call. Snapshot before, restore after (on both Ok/Err)
+        // so the parent's chain survives intact and the subagent's is isolated
+        // + discarded.
+        let parent_chain_snapshot = crate::hooks::snapshot_code_run_chain();
         let nested: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> =
             Box::pin(crate::agent_loop::run_turn(
                 &sub_llm,
@@ -338,7 +346,11 @@ async fn execute_spawn_subagent_inner(
                 approval_rx,
                 policy,
             ));
-        nested.await?;
+        let nested_result = nested.await;
+        // Restore the parent's chain regardless of nested success/failure so a
+        // subagent error doesn't corrupt the parent's repair tracking.
+        crate::hooks::restore_code_run_chain(parent_chain_snapshot);
+        nested_result?;
     }
 
     // References, not blobs: best-effort provenance pointers to what the
