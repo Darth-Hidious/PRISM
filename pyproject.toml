@@ -54,6 +54,10 @@ dependencies = [
     "ddgs>=9.0.0",
     "duckduckgo-search>=7.0.0",
     "beautifulsoup4>=4.12.0",
+    # VS2-P2: symbolic_check grounds verification in sympy. Pin at top level so
+    # a pymatgen refactor can't silently drop the transitive (mp-api → pymatgen
+    # → sympy) chain. Pure-python, ~0 install cost; already 1.14.0 in the venv.
+    "sympy>=1.12",
 ]
 
 [project.optional-dependencies]

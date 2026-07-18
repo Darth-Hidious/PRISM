@@ -266,6 +266,63 @@ mod tests {
         assert!(!tool_result_is_error(&v));
     }
 
+    // ── VS2-P2: symbolic_check verdict-vs-success contract ────────────
+    //
+    // symbolic_check returns success=true when the check RAN, regardless of the
+    // verdict. A "fail" verdict (counterexample found) MUST stay is_error=false
+    // — otherwise the gate would mask the counterexample as a runtime error and
+    // the model would never see it. This is the load-bearing VS1-gate-aware
+    // rule for the verification tool.
+
+    #[test]
+    fn p2_symbolic_fail_verdict_is_not_error() {
+        // Wrapped (as tool_server.py would deliver it): success=true, verdict=fail,
+        // plus a counterexample. The gate must NOT flag this.
+        let v = json!({
+            "result": {
+                "success": true,
+                "verdict": "fail",
+                "counterexample": {"x": 1.5, "abs_diff": 2.5},
+                "mode": "equivalence",
+            }
+        });
+        assert!(
+            !tool_result_is_error(&v),
+            "a fail verdict with success=true must NOT be flagged as error — \
+             the counterexample must reach the model unmasked"
+        );
+    }
+
+    #[test]
+    fn p2_symbolic_inconclusive_verdict_is_not_error() {
+        let v = json!({
+            "result": { "success": true, "verdict": "inconclusive", "reason": "..." }
+        });
+        assert!(!tool_result_is_error(&v));
+    }
+
+    #[test]
+    fn p2_symbolic_runtime_failure_is_error() {
+        // success:false (timeout/crash/parse-error) IS a real error — the check
+        // could not run. This must still trip the gate.
+        let v = json!({
+            "result": {
+                "success": false,
+                "verdict": "inconclusive",
+                "reason": "timed out after 60s",
+                "timed_out": true,
+            }
+        });
+        assert!(tool_result_is_error(&v));
+    }
+
+    #[test]
+    fn p2_symbolic_unwrapped_fail_verdict_is_not_error() {
+        // Unwrapped (Rust-side direct call): same contract, top-level fields.
+        let v = json!({ "success": true, "verdict": "fail", "counterexample": "x=1.5" });
+        assert!(!tool_result_is_error(&v));
+    }
+
     // ── tool_exit_code ────────────────────────────────────────────────
 
     #[test]

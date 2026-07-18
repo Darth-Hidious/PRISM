@@ -24,6 +24,7 @@ def build_full_registry(
     from app.tools.property_selection import create_property_selection_tools
     from app.tools.code import create_code_tools
     from app.tools.bash import create_bash_tools
+    from app.tools.symbolic import create_symbolic_tools
     from app.tools.dataset import create_dataset_tool
     from app.tools.platform_status import create_platform_status_tools
     from app.tools.agent_capabilities import create_agent_capabilities_tool
@@ -41,6 +42,9 @@ def build_full_registry(
     create_property_selection_tools(registry)
     create_code_tools(registry)
     create_bash_tools(registry)
+    # VS2-P2: symbolic/numeric verification tool (sympy-grounded). Approval-gated
+    # like execute_python — parse_expr evaluates, so the blast radius is equal.
+    create_symbolic_tools(registry)
     # NOTE: the old `discover_capabilities` aggregator (app/tools/capabilities.py)
     # was retired 2026-07-04 — dead (needed the uninstalled `marc27` SDK) and
     # redundant: its reads are covered by `agent_capabilities` (/agent/capabilities),
