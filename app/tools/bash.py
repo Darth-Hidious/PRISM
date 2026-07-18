@@ -137,6 +137,14 @@ def _bash_task_paths(task_id: str) -> tuple[Path, Path]:
 
 
 def _read_tail(path: Path, max_bytes: int = _TASK_TAIL_BYTES) -> str:
+    """Return the last ``max_bytes`` of a task log file.
+
+    When the file is larger than the tail window, an explicit marker is
+    prepended naming how many of bytes were dropped from the front. Without
+    it, an early compiler/simulation error scrolls out of the window silently
+    and the model has no idea anything was cut (VS1/F4). The marker is
+    byte-accurate to match the seek math.
+    """
     if not path.exists():
         return ""
 
@@ -146,7 +154,12 @@ def _read_tail(path: Path, max_bytes: int = _TASK_TAIL_BYTES) -> str:
         handle.seek(max(size - max_bytes, 0), os.SEEK_SET)
         data = handle.read()
 
-    return data.decode("utf-8", errors="replace")
+    text = data.decode("utf-8", errors="replace")
+    dropped = size - len(data)
+    if dropped > 0:
+        marker = f"[earlier output truncated — {dropped} bytes before this point]\n"
+        return marker + text
+    return text
 
 
 def _terminate_process(process: subprocess.Popen) -> None:
