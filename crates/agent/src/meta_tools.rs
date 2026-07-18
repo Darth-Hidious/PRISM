@@ -356,9 +356,22 @@ async fn run_skill(args: &Value) -> Result<Value> {
     let skill = crate::skills::load(&name)?;
     let (lang, code) = (skill.language.clone(), skill.code.clone());
     let out = tokio::task::spawn_blocking(move || crate::skills::execute(&lang, &code)).await??;
+    // VS1 fix-round #1: emit the `success`/`error` contract, not just `ok`.
+    // The shared is_error gate + provenance classifier
+    // (crates/agent/src/tool_result.rs) key on `success`/`error`; a failed
+    // stored skill that reported only `ok:false` slipped every rule and was
+    // rendered as a green "completed" card with provenance status:ok — the
+    // exact VS1 mask, left live for run_skill. `ok` is kept because the TUI
+    // renderer (protocol.rs::format_skill_run) reads it; `success` mirrors it
+    // for the gate and `error` (null when clean) trips the string-error rule.
     Ok(json!({
         "name": name,
         "ok": out.ok,
+        "success": out.ok,
+        "error": (!out.ok).then(|| match out.code {
+            Some(c) => format!("skill '{name}' exited non-zero (exit {c}); see stderr"),
+            None => format!("skill '{name}' was killed by a signal; see stderr"),
+        }),
         "exit_code": out.code,
         "stdout": clip(&out.stdout, 4000),
         "stderr": clip_head_tail(&out.stderr, 500, 1500),
@@ -849,6 +862,55 @@ mod tests {
         assert_eq!(out["matches"][0]["tool_name"], json!("file"));
         // Keyword matches carry no semantic score.
         assert!(out["matches"][0]["score"].is_null());
+    }
+
+    /// VS1 fix-round #1: a stored skill can pass write-time verification yet
+    /// FAIL on a later run (environment drift). run_skill must then report the
+    /// failure via the `success`/`error` contract the shared is_error gate +
+    /// provenance classifier read — not a bare `ok:false` that renders as a
+    /// green "completed" card. We store a failing body directly (the same
+    /// `skills::store` path write_skill uses after verification) to reach the
+    /// "stored-then-broke" state deterministically.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn run_skill_failure_emits_success_error_contract() {
+        let (_g, _dir) = crate::skills::test_env_guard("meta-runskill-fail");
+        let catalog = ToolCatalog::from_tool_server_json(&json!({ "tools": [] }));
+
+        let drifted = crate::skills::AuthoredSkill::new(
+            "drifted",
+            "fails at run time",
+            "shell",
+            "exit 7",
+            true,
+        );
+        crate::skills::store(&drifted).unwrap();
+
+        let r = execute_meta_tool(
+            "run_skill",
+            &json!({ "name": "drifted" }),
+            None,
+            "",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["ok"], json!(false), "failing skill reports ok:false: {r}");
+        assert_eq!(
+            r["success"],
+            json!(false),
+            "and success:false for the shared gate: {r}"
+        );
+        assert!(
+            r["error"].is_string(),
+            "and a string error so the gate/provenance catch it: {r}"
+        );
+        // The gate over the wrapped shape the agent loop actually builds.
+        let wrapped = json!({ "result": r });
+        assert!(
+            crate::tool_result::tool_result_is_error(&wrapped),
+            "a wrapped failed run_skill MUST classify as error: {wrapped}"
+        );
     }
 
     /// The self-authoring (Voyager) loop end to end through the meta-tool layer:

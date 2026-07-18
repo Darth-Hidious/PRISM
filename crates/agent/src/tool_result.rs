@@ -148,6 +148,45 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_run_skill_failure_is_error() {
+        // VS1 fix-round #1: a stored skill that now crashes returns
+        // {"result": {"ok":false, "success":false, "error":..., ...}}. Before
+        // the fix run_skill emitted only `ok` (no success/error) and every rule
+        // missed it -> green "completed" card + provenance status:ok. With the
+        // success/error contract it must trip rule 2 (success:false OR error).
+        let v = json!({
+            "result": {
+                "name": "broken_skill",
+                "ok": false,
+                "success": false,
+                "error": "skill 'broken_skill' exited non-zero (exit 1); see stderr",
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "Traceback ...\nValueError: boom"
+            }
+        });
+        assert!(tool_result_is_error(&v));
+    }
+
+    #[test]
+    fn wrapped_run_skill_success_is_not_error() {
+        // A clean skill run: ok/success true, error is null -> must NOT flag
+        // (the null `error` must not be read as a string-error).
+        let v = json!({
+            "result": {
+                "name": "good_skill",
+                "ok": true,
+                "success": true,
+                "error": null,
+                "exit_code": 0,
+                "stdout": "42\n",
+                "stderr": ""
+            }
+        });
+        assert!(!tool_result_is_error(&v));
+    }
+
+    #[test]
     fn unwrapped_notebook_failure_is_error_despite_string_result() {
         // notebook_exec has a top-level success bool AND a top-level "result"
         // field that is the last-expression VALUE (string), not a wrapped

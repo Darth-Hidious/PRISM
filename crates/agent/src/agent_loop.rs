@@ -191,6 +191,28 @@ fn check_doom_loop(recent: &VecDeque<String>, sig: &str) -> bool {
     recent.iter().rev().take(DOOM_LOOP_WINDOW).all(|s| s == sig)
 }
 
+/// Build the value handed to the post-hooks (esp. the provenance classifier)
+/// from the model-facing `raw_content`.
+///
+/// VS1 fix-round #2: the hard dispatch-`Err` arm sets `raw_content` to a plain
+/// `"Tool error: ..."` string that is not JSON. The old code re-parsed it and
+/// fell back to a bare [`Value::String`], which
+/// [`crate::tool_result::tool_result_is_error`] classifies as *not* an error
+/// (its `.as_object()` is `None`) — so a failed tool call was recorded with
+/// provenance `status:ok`. When the content is already valid JSON we pass it
+/// through unchanged; when it is a non-JSON error string we wrap it as
+/// `{success:false, error:...}` so the shared classifier records the failure.
+/// A non-JSON, non-error content stays a bare string (unchanged behaviour).
+fn hook_result_value(raw_content: &str, is_error: bool) -> Value {
+    serde_json::from_str(raw_content).unwrap_or_else(|_| {
+        if is_error {
+            serde_json::json!({ "success": false, "error": raw_content })
+        } else {
+            Value::String(raw_content.to_string())
+        }
+    })
+}
+
 /// Returns true if a tool result looks like 0/empty results.
 fn is_empty_result(content: &str) -> bool {
     if let Ok(val) = serde_json::from_str::<Value>(content) {
@@ -1371,8 +1393,15 @@ pub async fn run_turn(
             };
 
             // ── h6. Fire post-hooks ───────────────────────────────
-            let result_value: Value = serde_json::from_str(&raw_content)
-                .unwrap_or_else(|_| Value::String(raw_content.to_string()));
+            // VS1 fix-round #2: the hard dispatch-Err arm sets raw_content to a
+            // plain "Tool error: ..." string (not JSON). Re-parsing it here fell
+            // through to a bare Value::String, which the provenance classifier
+            // reads as status:ok (its `.as_object()` is None) — provenance LIED
+            // that a failed tool call succeeded. hook_result_value wraps a
+            // non-JSON, is_error content as {success:false,error:...} so the
+            // shared classifier records status:error. Model-facing raw_content
+            // is unchanged (the provenance hook never mutates the value).
+            let result_value: Value = hook_result_value(&raw_content, is_error);
             let post_result = hooks.fire_after(tool_name, &args, &result_value, elapsed_ms as f64);
             let content_after_hooks = if post_result != result_value {
                 serde_json::to_string(&post_result).unwrap_or(raw_content.to_string())
@@ -1527,6 +1556,40 @@ mod tests {
 
     fn tool_json(name: &str, desc: &str) -> serde_json::Value {
         serde_json::json!({ "name": name, "description": desc, "input_schema": { "type": "object" } })
+    }
+
+    // ── VS1 fix-round #2: provenance must not read a hard-Err as status:ok ──
+
+    #[test]
+    fn hook_result_value_passes_through_valid_json() {
+        // The Ok(resp) arm serializes a JSON payload; it must survive verbatim.
+        let v = hook_result_value(r#"{"success":false,"stderr":"boom"}"#, true);
+        assert_eq!(v, serde_json::json!({ "success": false, "stderr": "boom" }));
+    }
+
+    #[test]
+    fn hook_result_value_wraps_non_json_error_so_provenance_records_error() {
+        // THE REGRESSION GUARD: the dispatch-Err arm hands us "Tool error: ..."
+        // (not JSON). A bare Value::String is classified status:ok by the shared
+        // helper -> provenance would LIE. The wrap must make it read as error.
+        let v = hook_result_value("Tool error: connection refused", true);
+        assert!(
+            crate::tool_result::tool_result_is_error(&v),
+            "a hard tool Err must classify as an error for provenance, got {v}"
+        );
+        assert_eq!(
+            v["error"],
+            serde_json::json!("Tool error: connection refused")
+        );
+    }
+
+    #[test]
+    fn hook_result_value_leaves_non_json_non_error_as_bare_string() {
+        // Defensive: a non-JSON, non-error content keeps the old shape and must
+        // NOT be forced into an error (no over-flagging).
+        let v = hook_result_value("plain text result", false);
+        assert_eq!(v, Value::String("plain text result".to_string()));
+        assert!(!crate::tool_result::tool_result_is_error(&v));
     }
 
     #[test]
