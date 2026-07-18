@@ -1832,6 +1832,31 @@ fn spec_by_name(tool_name: &str) -> Option<&'static CommandToolSpec> {
     })
 }
 
+/// VS2-P1 FIX-5: resolve a model-supplied tool name to its CANONICAL name if it
+/// is a code-execution tool, else return the raw name unchanged.
+///
+/// The model can invoke notebook_exec via its aliases (`notebook_run`,
+/// `run_python_notebook`) or its root (`notebook`), case-insensitively
+/// (spec_by_name). But the repair cap (h7c) and the PROV-O chain
+/// (chain_code_run) keyed on the raw model-supplied name, so an alias call
+/// executed but never counted toward the cap and never got the `code_exec` tag.
+/// This normalizer lets both key on the canonical name so aliases count.
+pub fn canonical_code_exec_tool(name: &str) -> &str {
+    // Fast path: the common canonical names pass through verbatim.
+    if matches!(name, "execute_python" | "execute_bash" | "notebook_exec") {
+        return name;
+    }
+    // Resolve via spec_by_name (handles aliases + root + case-insensitivity).
+    // Only command-tools go through spec_by_name; execute_python/execute_bash
+    // are Python-registered and have no aliases, so they hit the fast path above.
+    if let Some(spec) = spec_by_name(name)
+        && matches!(spec.name, "notebook_exec")
+    {
+        return "notebook_exec";
+    }
+    name
+}
+
 fn parse_args(input: &Value) -> Result<Vec<String>> {
     let Some(raw_args) = input.get("args") else {
         return Ok(Vec::new());

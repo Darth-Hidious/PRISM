@@ -1518,50 +1518,60 @@ pub async fn run_turn(
             // THEN a directive to stop editing and report honestly. Do NOT
             // swallow the real result, and do NOT ask the model to narrate the
             // trace. Resets on any successful code-exec call, mirroring h7b.
-            if CODE_EXEC_TOOLS.contains(&tool_name.as_str()) {
+            //
+            // FIX-5: normalize the tool name (notebook_run/run_python_notebook/
+            // notebook -> notebook_exec) so alias-invoked cells count toward
+            // the cap and share the streak with the canonical name.
+            let canonical_tool = command_tools::canonical_code_exec_tool(tool_name.as_str());
+            if CODE_EXEC_TOOLS.contains(&canonical_tool) {
                 if is_error {
-                    let streak = code_failure_streak.entry(tool_name.clone()).or_insert(0);
+                    let streak = code_failure_streak
+                        .entry(canonical_tool.to_string())
+                        .or_insert(0);
                     *streak += 1;
-                    if let Some(directive) = code_repair_directive(tool_name, *streak) {
+                    if let Some(directive) = code_repair_directive(canonical_tool, *streak) {
                         // h8/h12 haven't run yet (we're before them), so push
                         // the real filtered error ourselves first — never swallow it.
                         let real_content =
                             process_large_result(&content_after_hooks, &mut result_store);
                         let real_summary = summarize_tool_result(
-                            tool_name,
+                            canonical_tool,
                             preview.as_deref(),
                             &real_content,
                             true,
                         );
                         emit(AgentEvent::ToolCallResult {
                             call_id: call_id.clone(),
-                            tool_name: tool_name.clone(),
+                            tool_name: canonical_tool.to_string(),
                             content: real_content.clone(),
                             summary: Some(real_summary.clone()),
                             preview: preview.clone(),
                             elapsed_ms,
                             is_error: true,
                         });
-                        history.push(ChatMessage {
-                            role: "tool".to_string(),
-                            content: Some(real_content),
-                            tool_calls: None,
-                            tool_call_id: Some(call_id.clone()),
-                        });
                         traj_steps.push(real_summary);
-                        // THEN the directive as its own tool message.
+                        // FIX-4: emit the directive as a SEPARATE TUI stream
+                        // event (so the human pane sees result-then-directive),
+                        // but push ONE merged tool message to history. Two
+                        // role:"tool" messages with the same tool_call_id is a
+                        // protocol violation for strict OpenAI-compat backends.
                         emit(AgentEvent::ToolCallResult {
                             call_id: call_id.clone(),
-                            tool_name: tool_name.clone(),
+                            tool_name: canonical_tool.to_string(),
                             content: directive.clone(),
-                            summary: Some(format!("{tool_name}: repair cap reached")),
+                            summary: Some(format!("{canonical_tool}: repair cap reached")),
                             preview: preview.clone(),
                             elapsed_ms,
                             is_error: true,
                         });
+                        let merged_content = format!(
+                            "{real_content}\n\n---\n{directive}\n\n[repair cap reached: {canonical_tool} \
+                             failed {streak} consecutive times. See the real error above; do NOT retry the \
+                             same approach.]"
+                        );
                         history.push(ChatMessage {
                             role: "tool".to_string(),
-                            content: Some(directive),
+                            content: Some(merged_content),
                             tool_calls: None,
                             tool_call_id: Some(call_id.clone()),
                         });
@@ -1569,7 +1579,7 @@ pub async fn run_turn(
                     }
                 } else {
                     // Success: reset this tool's failure streak.
-                    code_failure_streak.remove(tool_name.as_str());
+                    code_failure_streak.remove(canonical_tool);
                 }
             }
 
@@ -1735,12 +1745,26 @@ mod tests {
 
     #[test]
     fn p1b_code_exec_tools_canonical() {
-        // Aliases (notebook_run, run_python_notebook) resolve to notebook_exec,
-        // so only the 3 canonical names belong in the set.
+        // FIX-5: the constant holds the 3 canonical names...
         assert_eq!(
             CODE_EXEC_TOOLS,
             &["execute_python", "execute_bash", "notebook_exec"]
         );
+        // ...and canonical_code_exec_tool resolves aliases/root/case variants
+        // to those canonical names so alias-invoked cells count toward the cap.
+        use crate::command_tools::canonical_code_exec_tool as canon;
+        assert_eq!(canon("notebook_run"), "notebook_exec");
+        assert_eq!(canon("run_python_notebook"), "notebook_exec");
+        assert_eq!(canon("NOTEBOOK_EXEC"), "notebook_exec");
+        assert_eq!(canon("notebook"), "notebook_exec"); // root
+        assert_eq!(canon("Notebook_Run"), "notebook_exec"); // case-insensitive
+        // Canonical names pass through.
+        assert_eq!(canon("execute_python"), "execute_python");
+        assert_eq!(canon("execute_bash"), "execute_bash");
+        assert_eq!(canon("notebook_exec"), "notebook_exec");
+        // Non-code tools are unchanged.
+        assert_eq!(canon("search"), "search");
+        assert_eq!(canon("read_file"), "read_file");
     }
 
     #[test]

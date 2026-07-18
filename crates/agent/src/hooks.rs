@@ -352,13 +352,17 @@ fn chain_code_run(
     status: &str,
     last: &Option<LastCodeRun>,
 ) -> (Option<String>, Vec<String>) {
-    if !PROV_CODE_EXEC_TOOLS.contains(&tool_name) {
+    // FIX-5: normalize the tool name so alias-invoked notebook cells
+    // (notebook_run/run_python_notebook/notebook -> notebook_exec) get the
+    // code_exec tag and chain correctly.
+    let canonical = crate::command_tools::canonical_code_exec_tool(tool_name);
+    if !PROV_CODE_EXEC_TOOLS.contains(&canonical) {
         return (None, Vec::new());
     }
     let mut tags = vec!["code_exec".to_string()];
     let mut parent_id = None;
     if let Some(prev) = last
-        && prev.tool == tool_name
+        && prev.tool == canonical
         && prev.failed
     {
         parent_id = Some(prev.record_id.clone());
@@ -423,10 +427,12 @@ fn provenance_hook() -> Hook {
             record.tags.extend(chain_tags);
             // Update LAST_CODE_RUN only for code-exec tools (non-code tools
             // never participate in a repair chain). `failed` drives whether the
-            // NEXT same-tool call is tagged repair_attempt.
-            if PROV_CODE_EXEC_TOOLS.contains(&tool_name) {
+            // NEXT same-tool call is tagged repair_attempt. FIX-5: store the
+            // CANONICAL name so an alias-invoked cell updates the same slot.
+            let canonical_for_chain = crate::command_tools::canonical_code_exec_tool(tool_name);
+            if PROV_CODE_EXEC_TOOLS.contains(&canonical_for_chain) {
                 let this_run = LastCodeRun {
-                    tool: tool_name.to_string(),
+                    tool: canonical_for_chain.to_string(),
                     record_id: record.id.clone(),
                     failed: status_str == "error",
                 };
