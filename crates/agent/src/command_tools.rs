@@ -2049,6 +2049,20 @@ fn truncate_for_ui(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect::<String>() + "\n\n[Output truncated]"
 }
 
+// VS2-P1a FIX-3 helper: flush a run of consecutive library frames into a single
+// collapse-marker, accumulating the FRAME count (not marker count) into
+// `total`. A free function (not a closure) so it can take multiple &mut borrows
+// without conflicting with the filter loop's other borrows.
+fn flush_library_run(run: &mut u32, total: &mut u32, kept: &mut Vec<String>) {
+    if *run > 0 {
+        kept.push(format!(
+            "[... {run} library frame(s) elided — notebook pane keeps the full trace]\n"
+        ));
+        *total += *run;
+        *run = 0;
+    }
+}
+
 // VS2-P1a: agent-facing traceback filter for notebook_exec. The kernel is
 // SHARED with the human pane, so the filter is applied HERE (the agent-facing
 // composition), not in the sidecar — the human debug pane keeps the raw
@@ -2060,8 +2074,10 @@ fn truncate_for_ui(text: &str, max_chars: usize) -> String {
 //   - ALWAYS keep the final exception line(s); for a chain
 //     ("During handling..." / "The above exception...") keep BOTH final blocks
 //     (VS1/F2 lesson: the root cause lives in the earlier block)
-// Returns (filtered_text, n_elided_blocks). When nothing was elided, returns
+// Returns (filtered_text, n_elided_frames). When nothing was elided, returns
 // the input verbatim with n=0 so we don't pollute clean traces with markers.
+//
+// FIX-3: the count is FRAMES (sum of each collapsed run), not marker lines.
 fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
     if stderr.trim().is_empty() {
         return (stderr.to_string(), 0);
@@ -2100,15 +2116,11 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
     let mut i = 0usize;
     let n = lines.len();
     let mut hit_chain = false;
-
-    let flush = |run: &mut u32, kept: &mut Vec<String>| {
-        if *run > 0 {
-            kept.push(format!(
-                "[... {run} library frame(s) elided — notebook pane keeps the full trace]\n"
-            ));
-            *run = 0;
-        }
-    };
+    // FIX-3: count FRAMES elided (sum of each run), not marker lines. The old
+    // code counted "[... N library frame(s) elided]" marker lines via
+    // kept.iter().filter(...).count(), so a single collapsed run of N frames
+    // reported traceback_elided_frames=1.
+    let mut total_elided_frames: u32 = 0;
 
     while i < n {
         let ln = lines[i];
@@ -2116,7 +2128,7 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
 
         // Chain marker: keep everything from here to the end verbatim.
         if chain_markers.iter().any(|m| ln_trim.contains(m)) {
-            flush(&mut run_of_library, &mut kept);
+            flush_library_run(&mut run_of_library, &mut total_elided_frames, &mut kept);
             kept.push(ln.to_string());
             hit_chain = true;
             i += 1;
@@ -2129,28 +2141,30 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
         }
 
         if ln_trim.trim_start().starts_with("File ") {
-            // A frame is the File line + the following indented code line.
-            let mut consumed = 1;
-            let mut code_line: Option<&str> = None;
-            if i + 1 < n {
-                let next = lines[i + 1].trim_end_matches('\n');
+            // FIX-3: a frame is the File line + ALL following indented
+            // continuation lines (source + Python 3.11+ PEP 657 caret/annotation
+            // lines). The old code consumed only ONE indented line, so the caret
+            // fell through and flushed the library run each iteration -> one
+            // marker per frame + orphaned `^^^^`.
+            let mut consumed = 1usize;
+            let mut continuation: Vec<&str> = Vec::new();
+            while i + consumed < n {
+                let next = lines[i + consumed].trim_end_matches('\n');
                 if next.starts_with("    ") {
-                    code_line = Some(lines[i + 1]);
-                    consumed = 2;
+                    continuation.push(lines[i + consumed]);
+                    consumed += 1;
+                } else {
+                    break;
                 }
             }
-            // FIX-2: classify LIBRARY first. A venv inside the project
-            // (<cwd>/.venv/.../site-packages) CONTAINS cwd, so checking is_user
-            // first (cwd in line) mis-classified every library frame as user and
-            // elided nothing. Library markers win regardless of cwd. A non-
-            // library File frame is kept verbatim (user code OR an unrecognized
-            // framework path — stay honest rather than guess).
+            // FIX-2: classify LIBRARY first; a non-library File frame is kept
+            // verbatim with all its continuation lines.
             if is_library(ln_trim) {
                 run_of_library += 1;
             } else {
-                flush(&mut run_of_library, &mut kept);
+                flush_library_run(&mut run_of_library, &mut total_elided_frames, &mut kept);
                 kept.push(ln.to_string());
-                if let Some(cl) = code_line {
+                for cl in continuation {
                     kept.push(cl.to_string());
                 }
             }
@@ -2159,16 +2173,16 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
         }
 
         // Header, code line, or final exception line.
-        flush(&mut run_of_library, &mut kept);
+        flush_library_run(&mut run_of_library, &mut total_elided_frames, &mut kept);
         kept.push(ln.to_string());
         i += 1;
     }
-    flush(&mut run_of_library, &mut kept);
+    // Final flush (loop may have ended in a library run). Use the helper which
+    // only zeroes run_of_library when it actually flushed, avoiding a dead-store
+    // warning on this last call.
+    flush_library_run(&mut run_of_library, &mut total_elided_frames, &mut kept);
 
-    let elided = kept
-        .iter()
-        .filter(|l| l.contains("library frame(s) elided"))
-        .count();
+    let elided = total_elided_frames as usize;
     if elided == 0 {
         return (stderr.to_string(), 0);
     }
@@ -3735,6 +3749,54 @@ ValueError: Singular matrix\n"
             "venv-under-cwd library frames must be elided, not kept as user: {filtered}"
         );
         assert!(n >= 1);
+    }
+
+    #[test]
+    fn fix3_python311_plus_caret_lines_collapse_correctly() {
+        // FIX-3: Python 3.11+ emits a caret/annotation line (`    ~~~~^~~`)
+        // AFTER the source line. The old filter consumed only ONE indented
+        // line per frame, so the caret fell through and flushed the library
+        // run each iteration -> one marker PER library frame + orphaned carets,
+        // and traceback_elided_frames counted markers not frames. This is the
+        // production format (the repo runs python3.14).
+        //
+        // NOTE: built with concat! (not "\<newline>" continuation, which strips
+        // leading whitespace) so the 4-space indents on source/caret lines are
+        // real — matching the production traceback format.
+        let stderr = concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"<string>\", line 4, in <module>\n",
+            "    numpy.linalg.inv(mat)\n",
+            "    ~~~~~~~~~~~~~~~~~~~~~~\n",
+            "  File \"/x/site-packages/numpy/linalg/a.py\", line 10, in inv\n",
+            "    ainv = _umath_linalg.inv(a)\n",
+            "    ~~~~~~~~~~~~~~~~~~~~~~~~~~~\n",
+            "  File \"/x/site-packages/numpy/linalg/b.py\", line 20, in _common\n",
+            "    raise ValueError(msg)\n",
+            "    ~~~~~~~~~~~~~~~~~~~~~\n",
+            "ValueError: Singular matrix\n",
+        );
+        let (filtered, n) = filter_notebook_traceback(stderr, "/cwd");
+        // ONE collapse marker for the run of 2 library frames (not 2 markers).
+        let marker_count = filtered.matches("library frame(s) elided").count();
+        assert_eq!(
+            marker_count, 1,
+            "a run of consecutive library frames must collapse to ONE marker (got {marker_count}): {filtered}"
+        );
+        // The frame COUNT is reported, not the marker count.
+        assert_eq!(
+            n, 2,
+            "traceback_elided_frames must be the FRAME count (2): got {n}"
+        );
+        // The final exception line survives.
+        assert!(filtered.contains("ValueError: Singular matrix"));
+        // The user frame survives (kept verbatim, not elided).
+        assert!(filtered.contains("File \"<string>\""));
+        // No raw library path leaks (the library frames + their carets are gone).
+        assert!(
+            !filtered.contains("site-packages/numpy"),
+            "raw library path must not leak: {filtered}"
+        );
     }
 
     #[test]

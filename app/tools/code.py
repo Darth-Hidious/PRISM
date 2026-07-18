@@ -124,15 +124,20 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
     # the final exception line at the very end.
     kept: list[str] = []
     run_of_library = 0
+    # FIX-3: count FRAMES elided (sum of each run), not marker lines emitted.
+    # The old code counted "[... N library frame(s) elided]" marker lines, so a
+    # single collapsed run of 8 frames reported traceback_elided_frames=1.
+    total_elided_frames = 0
     in_chain_tail = False
 
     def flush_library_run():
         """Emit a single collapse-marker for a run of consecutive library frames."""
-        nonlocal run_of_library
+        nonlocal run_of_library, total_elided_frames
         if run_of_library > 0:
             kept.append(
                 f"[... {run_of_library} library frame(s) elided — full trace: {full_path}]"
             )
+            total_elided_frames += run_of_library
             run_of_library = 0
 
     i = 0
@@ -149,36 +154,30 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
             kept.extend(lines[i:])
             break
 
-        # A traceback frame is a `File "..."` line, optionally followed by an
-        # indented code-source line (`    expression`). Treat them as a unit so
-        # eliding a frame removes its code line too (no orphaned code lines).
+        # A traceback frame is the `File "..."` line + ALL following indented
+        # continuation lines (the source line AND, on Python 3.11+, the PEP 657
+        # caret/annotation lines like `    ~~~~^~~`). Treat them as a unit so
+        # eliding a frame removes its code+caret lines too (no orphaned carets —
+        # FIX-3: the old code consumed only ONE indented line, so the caret fell
+        # through and flushed the library run each iteration -> one marker per
+        # frame + orphaned `^^^^`).
         if ln.lstrip().startswith("File "):
-            # Grab the following code line if there is one.
-            code_line = ""
+            # Grab ALL following indented continuation lines.
+            continuation: list[str] = []
             consumed = 1
-            if i + 1 < n and lines[i + 1].startswith("    "):
-                code_line = lines[i + 1]
-                consumed = 2
+            while i + consumed < n and lines[i + consumed].startswith("    "):
+                continuation.append(lines[i + consumed])
+                consumed += 1
 
-            # FIX-2: classify LIBRARY first, unconditionally by path markers
-            # (site-packages/dist-packages/pythonX.Y stdlib). A venv inside the
-            # project (<cwd>/.venv/.../site-packages/numpy) CONTAINS cwd, so
-            # checking _is_user_frame first (cwd in line) mis-classified every
-            # library frame as user and elided nothing. Library wins.
+            # FIX-2: classify LIBRARY first (see comment above).
             if _is_library_frame(ln):
                 run_of_library += 1
-            elif _is_user_frame(ln, cwd):
-                flush_library_run()
-                kept.append(ln)
-                if code_line:
-                    kept.append(code_line)
             else:
-                # Unrecognized File frame (e.g. a framework path). Keep it to
-                # stay honest rather than guess.
+                # User frame (<string>/cwd) OR an unrecognized File frame — keep
+                # it and ALL its continuation lines verbatim.
                 flush_library_run()
                 kept.append(ln)
-                if code_line:
-                    kept.append(code_line)
+                kept.extend(continuation)
             i += consumed
             continue
 
@@ -192,11 +191,12 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
     # flush it so the marker appears.
     flush_library_run()
 
-    elided = sum(
-        1 for ln in kept if "library frame(s) elided" in ln
-    )
+    # FIX-3: report the FRAME count (total_elided_frames), not the marker-line
+    # count. The old `sum(1 for ln in kept if "library frame(s) elided")` counted
+    # MARKERS, so a single collapsed run of N frames reported 1.
+    elided_frames = total_elided_frames
     # If we never collapsed anything, return verbatim (no marker pollution).
-    if elided == 0:
+    if elided_frames == 0:
         return {
             "stderr": raw_stderr,
             "traceback_elided_frames": 0,
@@ -207,7 +207,7 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
         filtered += "\n"
     return {
         "stderr": filtered,
-        "traceback_elided_frames": elided,
+        "traceback_elided_frames": elided_frames,
         "stderr_full_path": full_path,
     }
 

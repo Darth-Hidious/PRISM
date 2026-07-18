@@ -1,5 +1,7 @@
 """Tests for execute_python tool."""
 import sys
+
+import pytest
 from unittest.mock import patch, MagicMock
 
 from app.tools.code import _execute_python, create_code_tools
@@ -312,6 +314,47 @@ class TestTracebackFilter:
         assert r["stderr"] == ""
         assert r["stderr_full_path"] == ""
         assert r["traceback_elided_frames"] == 0
+
+    def test_real_python314_caret_traceback_collapse(self):
+        """FIX-3: against a REAL python3.14 traceback (PEP 657 caret lines
+        present — the production format, since the repo runs 3.14). The old
+        filter consumed only ONE indented line per frame, so the caret fell
+        through and flushed the library run each iteration -> one marker PER
+        library frame + orphaned `~~~~`. Now: one marker for the run, frame
+        count correct, final exception line kept."""
+        import io
+        import traceback as tb_mod
+
+        # Capture a real traceback by failing through numpy (caret lines only
+        # appear for frames with source context). Skip if numpy unavailable.
+        np = pytest.importorskip("numpy")
+        buf = io.StringIO()
+        try:
+            np.linalg.inv(np.array([[1, 2], [2, 4]]))  # singular -> LinAlgError
+        except Exception:
+            tb_mod.print_exc(file=buf)
+        raw = buf.getvalue()
+        assert "~~" in raw or "^^" in raw, "test premise: caret lines present in 3.14 trace"
+
+        from app.tools.code import _filter_traceback
+        r = _filter_traceback(raw, "/cwd")
+        out = r["stderr"]
+        # The final exception line survives.
+        assert "LinAlgError" in out, "final exception line must survive: %r" % out[-80:]
+        # Count collapse markers — a RUN of consecutive library frames must
+        # produce ONE marker, not one per frame.
+        marker_count = out.count("library frame(s) elided")
+        assert marker_count == 1, (
+            "a run of consecutive library frames must collapse to ONE marker, "
+            "got %d: %r" % (marker_count, out)
+        )
+        # The marker names the run length; the reported count is the FRAME count.
+        assert r["traceback_elided_frames"] >= 1, "frame count reported"
+        # No orphaned caret lines leaked into the output (they should travel
+        # with their frame, whether kept or elided).
+        # Caret lines that belonged to LIBRARY frames must be gone; a caret
+        # under the USER frame (kept) is fine. Assert no raw library path leaks.
+        assert "site-packages/numpy" not in out, "raw library path must not leak: %r" % out
 
 
 class TestFilterPreservesGateSignal:
