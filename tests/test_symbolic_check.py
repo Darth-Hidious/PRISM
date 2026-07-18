@@ -75,6 +75,45 @@ class TestNumericSpot:
         assert r["counterexample"] is not None
 
 
+class TestNumericHonesty:
+    """FIX2-H1/H4: the tool must not lie 'proven' on unequal numbers, nor
+    fabricate 'fail' counterexamples for true large-magnitude identities."""
+
+    def test_h1_unequal_large_numbers_not_proven(self):
+        """6.022e23 vs 6.022e23+1e6 are UNEQUAL. The old lossy-Float parse
+        absorbed +1e6 -> simplify(a-b)==0 -> a false 'proven'. Exact parse
+        (rationalize) now keeps them distinct."""
+        r = symbolic_check("6.022e23", "6.022e23 + 1e6", mode="equivalence")
+        assert r["verdict"] != "proven", (
+            "two genuinely unequal numbers must NOT be 'proven' equal: %r" % r
+        )
+
+    def test_h1_real_identity_still_proven(self):
+        """Regression: a real identity still proves (exact parse doesn't break legit math)."""
+        r = symbolic_check("(x+1)**2", "x**2 + 2*x + 1", mode="equivalence")
+        assert r["verdict"] == "proven"
+
+    def test_h4_true_large_identity_not_fabricated_fail(self):
+        """(x+10)**8 vs its CORRECT expansion is a true identity. The old absolute
+        TOL=1e-9 fabricated a 'fail' counterexample from float64 noise at
+        magnitude ~5e7. Relative tolerance (abs_diff/max(|a|,|b|,1)) must call
+        this agreement, not a fail."""
+        correct = (
+            "x**8 + 80*x**7 + 2800*x**6 + 56000*x**5 + 700000*x**4 + "
+            "5600000*x**3 + 28000000*x**2 + 80000000*x + 100000000"
+        )
+        r = symbolic_check("(x+10)**8", correct, mode="numeric_spot", n_points=20)
+        assert r["verdict"] != "fail", (
+            "a true identity must not fabricate a 'fail' under relative tol: %r" % r
+        )
+
+    def test_h4_real_disagreement_still_fails(self):
+        """A genuinely unequal pair at large magnitude must still 'fail' (relative
+        tol doesn't mask real disagreement)."""
+        r = symbolic_check("(x+10)**8", "(x+11)**8", mode="numeric_spot", n_points=20)
+        assert r["verdict"] == "fail"
+
+
 class TestDimensional:
     def test_velocity_consistent(self):
         """d/t with d in meters, t in seconds is dimensionally m/s."""

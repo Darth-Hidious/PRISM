@@ -117,9 +117,9 @@ def _child_prelimit() -> None:
 #   {"ok": true, "result": {...verdict...}}  -> check ran (any verdict)
 #   {"ok": false, "error": "..."}            -> crash/parse-error (could not run)
 _CHILD_SCRIPT = '''
-import json, sys, random
+import json, sys, random, math
 
-from sympy.parsing.sympy_parser import parse_expr, standard_transformations
+from sympy.parsing.sympy_parser import parse_expr, standard_transformations, rationalize
 from sympy import (
     simplify, N, Symbol, Integer, Float, Rational, Pow,
     sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh,
@@ -148,7 +148,18 @@ _SAFE_GLOBALS = {
 # User-declared symbols override these via local_dict (see parse_restricted), so
 # a user symbol named E/pi/I/S is THEIR symbol, not the constant.
 _RESERVED = {"E", "pi", "I", "S", "oo", "zoo"}
-TOL = 1e-9
+# H1/H4: parse numeric literals as EXACT (rationalize transform converts Float
+# literals to Rational/Integer AT PARSE, before evaluation). The old path relied
+# on lossy Float64 — `6.022e23 + 1e6` absorbed `+1e6` -> simplify(a-b)==0 -> a
+# false "proven" for two unequal numbers. With rationalize, `6.022e23+1e6` parses
+# to the exact integer ...001000000, so a-b != 0. "proven" ONLY from an exact
+# symbolic zero.
+_TRANSFORMS = standard_transformations + (rationalize,)
+# H4: RELATIVE tolerance. The old absolute TOL=1e-9 fabricated "fail"
+# counterexamples for true large-magnitude identities (e.g. (x+10)**8 vs its
+# expansion: abs_diff ~4e-8 at magnitude ~5e7 is pure float64 noise, but
+# exceeded 1e-9). Compare abs_diff / max(|a|,|b|, 1) against RTOL.
+RTOL = 1e-9
 
 
 def emit(obj):
@@ -161,12 +172,14 @@ def parse_restricted(s, local_dict=None):
     Every untrusted string (expression_a/b, assumption unit strings) MUST go
     through here. local_dict binds user symbol names -> Symbol(name) so a user
     symbol named E/pi/I/S is THEIR symbol, not the sympy constant (C1.2 / H6).
+    Numeric literals parse EXACT (rationalize) so lossy Floats can't fake a
+    "proven" (H1).
     """
     return parse_expr(
         s,
         local_dict=local_dict or {},
         global_dict=_SAFE_GLOBALS,
-        transformations=standard_transformations,
+        transformations=_TRANSFORMS,
         evaluate=True,
     )
 
@@ -219,7 +232,13 @@ def numeric_spot(a, b, frees, n_points, seed, assumptions):
         except (TypeError, ValueError, ZeroDivisionError):
             continue
         diff = abs(va - vb)
-        if diff > TOL:
+        # H4: RELATIVE tolerance. The old absolute `diff > TOL` fabricated "fail"
+        # counterexamples for true large-magnitude identities (float64 noise at
+        # magnitude ~5e7 exceeded 1e-9). Normalize by the value scale so a "fail"
+        # is a REAL disagreement, not rounding noise. A small absolute floor (1)
+        # keeps tiny-magnitude comparisons meaningful.
+        scale = max(abs(va), abs(vb), 1.0)
+        if diff > RTOL * scale:
             return ("fail", {
                 "counterexample": json.dumps(point),
                 "point": json.dumps(point),
