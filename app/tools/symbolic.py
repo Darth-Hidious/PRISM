@@ -362,10 +362,10 @@ def run(cfg):
         a = parse_user_expression(a_str, assumptions)
         b = parse_user_expression(b_str, assumptions) if b_str is not None else None
     except Exception as e:
-        emit({"ok": True, "result": {
-            "verdict": "inconclusive",
-            "reason": "parse error: " + type(e).__name__,
-        }})
+        # CONTRACT: a parse error means the check could NOT run -> ok:false ->
+        # success:false (a real VERDICT stays ok:true/success:true; a fail
+        # verdict is success:true). Aligns code with the module docstring.
+        emit({"ok": False, "error": "parse error: " + type(e).__name__})
         return
 
     if mode == "equivalence":

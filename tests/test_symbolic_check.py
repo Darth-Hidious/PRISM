@@ -314,11 +314,14 @@ class TestSafetyAndErrors:
             assert r["verdict"] == "inconclusive"
             assert "timed out" in r["reason"]
 
-    def test_parse_error_is_inconclusive_with_success_true(self):
-        """Gibberish that can't parse -> inconclusive (the check ran, decided it
-        couldn't decide). success:True because the subprocess executed fine."""
+    def test_parse_error_is_success_false(self):
+        """FIX2-CONTRACT: gibberish that can't parse -> success:False (the check
+        did NOT run), verdict inconclusive. Aligns with the docstring contract:
+        success means 'the check ran'; a parse error means it couldn't. A real
+        VERDICT (proven/numerically_consistent/fail/inconclusive-from-the-check)
+        stays success:True — see test_fail_verdict_is_success_true."""
         r = symbolic_check("x ++ + +", "x", mode="equivalence")
-        assert r["success"] is True
+        assert r["success"] is False, "parse error means the check did not run"
         assert r["verdict"] == "inconclusive"
         assert "parse error" in r["reason"]
 
