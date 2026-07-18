@@ -2088,6 +2088,69 @@ fn flush_library_run(run: &mut u32, total: &mut u32, kept: &mut Vec<String>) {
     }
 }
 
+/// Strip ANSI SGR escape sequences (`\x1b[...m`) from a string.
+///
+/// G1: the jupyter/ipykernel backend (the PREFERRED notebook backend when
+/// installed) emits ANSI-colored tracebacks — every keyword is wrapped, e.g.
+/// `\x1b[96mFile \x1b[39m`. Without stripping, `starts_with("File ")` never
+/// matches and the filter is a verbatim NO-OP on jupyter traces, leaking raw
+/// site-packages frames to the model. Stripping is also good hygiene: ANSI
+/// codes in tool output are noise to the model.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // CSI sequence: skip `\x1b[` ... `m` (and other final bytes).
+            i += 2;
+            while i < bytes.len() {
+                let c = bytes[i];
+                i += 1;
+                // SGR ends at 'm'; be lenient and also break on any letter
+                // (covers other CSI sequences ipykernel might emit).
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            // Safe UTF-8 append: push the whole char starting at this byte.
+            let ch_start = i;
+            let ch_len = utf8_len(bytes[i]);
+            if let Some(slice) = s.get(ch_start..ch_start + ch_len) {
+                out.push_str(slice);
+            }
+            i += ch_len;
+        }
+    }
+    out
+}
+
+/// Length in bytes of the UTF-8 codepoint starting at `first`.
+fn utf8_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1 // invalid lead byte — drop just it
+    }
+}
+
+/// G1: recognize BOTH stdlib and IPython frame-header forms (after ANSI strip).
+/// stdlib form: `  File "...", line N, in func`. ipykernel forms:
+/// `File ~/path:N, in func` (unquoted, `~`-collapsed, colon) and
+/// `Cell In[N], line M, in func` (live kernel cell). All start with `File ` or
+/// `Cell In[` once ANSI-stripped + trimmed.
+fn is_frame_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("File ") || t.starts_with("Cell In[")
+}
+
 // VS2-P1a: agent-facing traceback filter for notebook_exec. The kernel is
 // SHARED with the human pane, so the filter is applied HERE (the agent-facing
 // composition), not in the sidecar — the human debug pane keeps the raw
@@ -2107,6 +2170,19 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
     if stderr.trim().is_empty() {
         return (stderr.to_string(), 0);
     }
+    // G1: STRIP ANSI FIRST. The jupyter/ipykernel backend (preferred when
+    // installed) emits ANSI-colored tracebacks — `\x1b[96mFile \x1b[39m` etc.
+    // Without stripping, the frame matcher never matches and the filter is a
+    // verbatim NO-OP on jupyter traces, leaking raw site-packages frames. Work
+    // on the stripped text for the whole filter; ANSI codes in tool output are
+    // noise to the model anyway.
+    let stderr_owned: String;
+    let stderr = if stderr.contains('\u{1b}') {
+        stderr_owned = strip_ansi(stderr);
+        &stderr_owned
+    } else {
+        stderr
+    };
     // Only filter when this actually looks like a Python traceback.
     let has_header = stderr.contains("Traceback (most recent call last)");
     if !has_header {
@@ -2165,8 +2241,8 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
             continue;
         }
 
-        if ln_trim.trim_start().starts_with("File ") {
-            // FIX-3: a frame is the File line + ALL following indented
+        if is_frame_line(ln_trim) {
+            // FIX-3: a frame is the File/Cell line + ALL following indented
             // continuation lines (source + Python 3.11+ PEP 657 caret/annotation
             // lines). The old code consumed only ONE indented line, so the caret
             // fell through and flushed the library run each iteration -> one
@@ -2182,9 +2258,10 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
                     break;
                 }
             }
-            // FIX-2: classify LIBRARY first; a non-library File frame is kept
-            // verbatim with all its continuation lines.
-            if is_library(ln_trim) {
+            // G1: a `Cell In[N]` frame is the user's notebook cell -> always KEPT
+            // (never library). A `File ...` frame is classified by is_library.
+            let frame_is_library = is_library(ln_trim);
+            if frame_is_library {
                 run_of_library += 1;
             } else {
                 flush_library_run(&mut run_of_library, &mut total_elided_frames, &mut kept);
@@ -3822,6 +3899,53 @@ ValueError: Singular matrix\n"
             !filtered.contains("site-packages/numpy"),
             "raw library path must not leak: {filtered}"
         );
+    }
+
+    #[test]
+    fn g1_real_ipykernel_ansi_trace_is_filtered_not_passthrough() {
+        // G1 (the gap the green gate missed): a REAL captured ipykernel 7.2 ANSI
+        // traceback. The old filter was a verbatim NO-OP here — ipykernel wraps
+        // `File` in ANSI (`\x1b[96mFile \x1b[39m`), so `starts_with("File ")`
+        // never matched -> 0 frames -> raw site-packages frames leaked. This
+        // fixture is the exact byte sequence from InteractiveTB.stb2text on a
+        // failing numpy call (captured live, not hand-written).
+        let ansi_trace = concat!(
+            "\x1b[31m---------------------------------------------------------------------------\x1b[39m\n",
+            "\x1b[31mIndexError\x1b[39m                                Traceback (most recent call last)\n",
+            // ipykernel frame form: cyan "File ", green "path:lineno", cyan func, blue "()"
+            "\x1b[36mFile \x1b[39m\x1b[32m/var/folders/.../site-packages/numpy/linalg/_linalg.py:648\x1b[39m, in \x1b[36minv\x1b[39m\x1b[34m()\x1b[39m\n",
+            // source lines with line-number + caret coloring
+            "\x1b[32m    646\x1b[39m     ainv = _umath_linalg.inv(a)\n",
+            "\x1b[32m--> 648\x1b[39m     ainv = _umath_linalg.inv(a, signature=signature)\n",
+            "\x1b[31mIndexError\x1b[39m: only integers, slices (`:`) are valid indices",
+        );
+        let (filtered, n) = filter_notebook_traceback(ansi_trace, "/cwd");
+        // ANSI must be stripped (no escape bytes in the output).
+        assert!(
+            !filtered.contains('\u{1b}'),
+            "ANSI must be stripped from the agent-facing trace: {filtered:?}"
+        );
+        // The final exception line survives.
+        assert!(
+            filtered.contains("IndexError: only integers"),
+            "final exception line must survive: {filtered}"
+        );
+        // The library frame must be collapsed (not leaked raw).
+        assert!(
+            !filtered.contains("site-packages/numpy"),
+            "raw library path must not leak post-strip: {filtered}"
+        );
+        assert!(n >= 1, "at least one library frame elided: got {n}");
+    }
+
+    #[test]
+    fn g1_strip_ansi_helper() {
+        assert_eq!(strip_ansi("\x1b[96mFile \x1b[39mhello"), "File hello");
+        assert_eq!(strip_ansi("\x1b[1;31mErr\x1b[39m: msg"), "Err: msg");
+        assert_eq!(strip_ansi("\x1b[38;5;15mX\x1b[39m"), "X");
+        assert_eq!(strip_ansi("no ansi here"), "no ansi here");
+        // multibyte safe
+        assert_eq!(strip_ansi("\x1b[32m✓\x1b[39m ok"), "✓ ok");
     }
 
     #[test]
