@@ -203,7 +203,14 @@ pub fn audit_hook() -> Hook {
         name: "audit_log".into(),
         before: None,
         after: Some(Box::new(|tool_name, _inputs, result, elapsed_ms| {
-            let status = if result.get("error").is_some() {
+            // VS1 fix-round: classify via the SHARED helper, not a naive
+            // `get("error").is_some()`. The old check keyed on error-key
+            // PRESENCE, so (a) `{"error": null}` on a *successful* run_skill
+            // logged ERROR (false positive), and (b) a run_skill failure that
+            // carried no `error` key logged OK (the mask, the other direction).
+            // Using tool_result_is_error keeps this audit line consistent with
+            // the is_error gate and the provenance status.
+            let status = if crate::tool_result::tool_result_is_error(result) {
                 "ERROR"
             } else {
                 "OK"
@@ -443,6 +450,44 @@ mod tests {
         let after = hook.after.as_ref().unwrap();
         let result = after("search", &json!({}), &json!({"error": "fail"}), 50.0);
         assert!(result.log_message.contains("[AUDIT] search ERROR (50ms)"));
+    }
+
+    #[test]
+    fn audit_hook_null_error_on_success_is_ok_not_error() {
+        // VS1 fix-round regression guard: a successful run_skill now carries a
+        // PRESENT-but-null `error` key. The old `get("error").is_some()` check
+        // logged that as ERROR (false positive). The shared classifier reads
+        // null via .as_str() -> not an error, so this must log OK.
+        let hook = audit_hook();
+        let after = hook.after.as_ref().unwrap();
+        let ok_skill = json!({ "name": "s", "ok": true, "success": true, "error": null });
+        let result = after("run_skill", &json!({}), &ok_skill, 10.0);
+        assert!(
+            result.log_message.contains("[AUDIT] run_skill OK (10ms)"),
+            "null error on a successful skill must log OK: {}",
+            result.log_message
+        );
+    }
+
+    #[test]
+    fn audit_hook_failed_skill_logs_error() {
+        // The other direction the old check got wrong: a failed run_skill that
+        // (pre-fix) carried no `error` key logged OK. It now carries the
+        // success/error contract and must log ERROR via the shared classifier.
+        let hook = audit_hook();
+        let after = hook.after.as_ref().unwrap();
+        let bad_skill = json!({
+            "name": "s", "ok": false, "success": false,
+            "error": "skill 's' exited non-zero (exit 7); see stderr"
+        });
+        let result = after("run_skill", &json!({}), &bad_skill, 20.0);
+        assert!(
+            result
+                .log_message
+                .contains("[AUDIT] run_skill ERROR (20ms)"),
+            "failed skill must log ERROR: {}",
+            result.log_message
+        );
     }
 
     #[test]
