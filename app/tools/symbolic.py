@@ -160,6 +160,26 @@ _TRANSFORMS = standard_transformations + (rationalize,)
 # expansion: abs_diff ~4e-8 at magnitude ~5e7 is pure float64 noise, but
 # exceeded 1e-9). Compare abs_diff / max(|a|,|b|, 1) against RTOL.
 RTOL = 1e-9
+# H5: the assumption vocabulary sympy-literate callers actually write. The old
+# code only recognized the literal "nonnegative", silently ignoring the canonical
+# "positive" (so sqrt(x**2) vs x with {x:positive} sampled a negative x -> a
+# false "fail"). Map each to its sympy Symbol kwarg for the symbolic step AND
+# drive the sampling domain below. An assumption NOT in this map -> inconclusive
+# (never silently ignored).
+_ASSUMPTION_KWARGS = {
+    "positive": {"positive": True},
+    "negative": {"negative": True},
+    "nonnegative": {"nonnegative": True},
+    "nonpositive": {"nonpositive": True},
+    "real": {"real": True},
+    "integer": {"integer": True},
+    "rational": {"rational": True},
+    "complex": {"complex": True},
+    "even": {"even": True},
+    "odd": {"odd": True},
+    "prime": {"prime": True},
+    "imaginary": {"imaginary": True},
+}
 
 
 def emit(obj):
@@ -184,14 +204,43 @@ def parse_restricted(s, local_dict=None):
     )
 
 
-def build_local_dict(names):
-    """Map each user symbol NAME to Symbol(name). Names that collide with sympy
-    constants (E, pi, I, S, oo) get bound to the user's Symbol so the constant
-    is shadowed. (Assumption kwargs are added in H5.)"""
+def build_local_dict(names, assumptions):
+    """Map each user symbol NAME to Symbol(name, **kwargs). Names colliding with
+    sympy constants (E, pi, I, S, oo) are bound to the user's Symbol so the
+    constant is shadowed. H5: declared assumptions (positive/real/...) are
+    applied as sympy Symbol kwargs, so the symbolic simplify() step sees them
+    (e.g. sqrt(x**2)==x under x:positive can reach proven). Returns (ld, err):
+    err is a string naming an unrecognized assumption, or None."""
     ld = {}
     for n in names:
-        ld[n] = Symbol(n)
+        kw = {}
+        if n in assumptions:
+            declared = assumptions[n]
+            # Dimensional mode passes unit STRINGS (not assumptions) here; only
+            # apply assumption kwargs for recognized vocabulary.
+            if declared in _ASSUMPTION_KWARGS:
+                kw = _ASSUMPTION_KWARGS[declared]
+        ld[n] = Symbol(n, **kw)
     return ld
+
+
+def _validate_assumptions(assumptions):
+    """H5: every assumption value must be recognized vocabulary OR a unit string
+    (dimensional mode). Return an error string naming the first unrecognized
+    non-unit assumption, or None. Unit strings (containing /, *, or known unit
+    names) are allowed for dimensional mode."""
+    for name, val in assumptions.items():
+        if val in _ASSUMPTION_KWARGS:
+            continue
+        # Allow unit-like strings (contain a digit, /, *, or are short unit
+        # tokens) for dimensional mode. If it's alphabetic and not a known
+        # assumption, it's unrecognized.
+        if isinstance(val, str) and any(c in val for c in "/*0123456789"):
+            continue
+        return "assumption '{}'='{}' not recognized (use one of: {})".format(
+            name, val, ", ".join(sorted(_ASSUMPTION_KWARGS))
+        )
+    return None
 
 
 def _symbol_names(expr_str):
@@ -202,15 +251,36 @@ def _symbol_names(expr_str):
     return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr_str or ""))
 
 
-def parse_user_expression(s):
+def parse_user_expression(s, assumptions):
     """Parse an expression string, binding its bare identifiers as user Symbols
-    via local_dict (so E/pi/etc. are symbols, not constants)."""
+    (with assumptions applied) via local_dict, so E/pi/etc. are symbols not
+    constants and assumption-bearing Symbols reach simplify()."""
     names = _symbol_names(s)
-    # Only bind names that are NOT whitelisted math functions (sin, exp, ...) —
-    # those should resolve to the function. Reserved constants ARE bound (so a
-    # user symbol named E wins over Euler's number).
     bind = {n for n in names if n in _RESERVED or n not in _SAFE_GLOBALS}
-    return parse_restricted(s, build_local_dict(bind))
+    return parse_restricted(s, build_local_dict(bind, assumptions))
+
+
+def _sample_for_assumption(rng, assumption):
+    """Sample a real value respecting the declared assumption domain (H5).
+
+    The old code only honored the literal "nonnegative"; sympy's canonical
+    "positive"/"real"/"integer"/... were silently ignored, so an identity true
+    only on a declared domain was sampled outside it -> a false "fail".
+    """
+    if assumption in ("positive", "nonnegative"):
+        return rng.uniform(0.1, 10.0)
+    if assumption == "negative":
+        return rng.uniform(-10.0, -0.1)
+    if assumption == "nonpositive":
+        return rng.uniform(-10.0, 0.0)
+    if assumption == "integer":
+        # small nonzero integers
+        return float(rng.randint(-5, 5) or 1)
+    # real / rational / complex / None -> the default real domain.
+    val = rng.uniform(-5.0, 5.0)
+    if abs(val) < 1e-6:
+        val = 0.5
+    return val
 
 
 def numeric_spot(a, b, frees, n_points, seed, assumptions):
@@ -221,16 +291,19 @@ def numeric_spot(a, b, frees, n_points, seed, assumptions):
     # the VALID count, and if 0 -> inconclusive.
     compared = 0
     for _ in range(n_points):
+        # H5: key the point by the SYMBOL OBJECT, not its string name. With an
+        # assumption applied (e.g. Symbol('x', positive=True)), string-keyed
+        # subs does NOT match (the assumption-bearing Symbol is a distinct
+        # object from the plain Symbol('x') sympy creates internally for a
+        # string key) -> every sample failed -> 0 compared -> a false
+        # "inconclusive". Symbol-keyed subs matches correctly.
         point = {}
+        point_readable = {}
         for s in frees:
             name = str(s)
-            if assumptions.get(name) == "nonnegative":
-                val = rng.uniform(0.1, 10.0)
-            else:
-                val = rng.uniform(-5.0, 5.0)
-                if abs(val) < 1e-6:
-                    val = 0.5
-            point[name] = val
+            val = _sample_for_assumption(rng, assumptions.get(name))
+            point[s] = val
+            point_readable[name] = val
         try:
             va = float(N(a.subs(point)))
             vb = float(N(b.subs(point)))
@@ -250,8 +323,8 @@ def numeric_spot(a, b, frees, n_points, seed, assumptions):
         scale = max(abs(va), abs(vb), 1.0)
         if diff > RTOL * scale:
             return ("fail", {
-                "counterexample": json.dumps(point),
-                "point": json.dumps(point),
+                "counterexample": json.dumps(point_readable),
+                "point": json.dumps(point_readable),
                 "value_a": va,
                 "value_b": vb,
                 "abs_diff": diff,
@@ -274,9 +347,20 @@ def run(cfg):
     seed = cfg.get("seed", 0)
     assumptions = cfg.get("assumptions") or {}
 
+    # H5: validate assumption vocabulary up front. An unrecognized assumption
+    # (that isn't a unit string for dimensional mode) -> inconclusive naming it,
+    # never silently ignored.
+    if mode != "dimensional":
+        bad = _validate_assumptions(assumptions)
+        if bad:
+            emit({"ok": True, "result": {
+                "verdict": "inconclusive", "reason": bad,
+            }})
+            return
+
     try:
-        a = parse_user_expression(a_str)
-        b = parse_user_expression(b_str) if b_str is not None else None
+        a = parse_user_expression(a_str, assumptions)
+        b = parse_user_expression(b_str, assumptions) if b_str is not None else None
     except Exception as e:
         emit({"ok": True, "result": {
             "verdict": "inconclusive",

@@ -151,6 +151,54 @@ class TestSpotCheckHonesty:
             assert r.get("n_points", 0) > 0
 
 
+class TestAssumptionVocabulary:
+    """FIX2-H5: recognize sympy's assumption vocabulary (positive/real/integer/
+    ...), apply it to BOTH the symbolic step (Symbol kwarg) AND the sampling
+    domain. The old code only honored the literal 'nonnegative'."""
+
+    def test_h5_positive_assumption_reaches_symbolic_proof(self):
+        """sqrt(x**2) == x holds for x>=0. With {x: positive}, the symbolic step
+        applies positive=True to the Symbol and can reach 'proven' (the old code
+        ignored 'positive', sampled a negative x, and false-failed)."""
+        r = symbolic_check("sqrt(x**2)", "x", mode="equivalence",
+                           assumptions={"x": "positive"})
+        assert r["verdict"] != "fail", (
+            "positive assumption must prevent a false fail: %r" % r
+        )
+
+    def test_h5_negative_assumption(self):
+        """sqrt(x**2) == -x holds for x<=0. With {x: negative}."""
+        r = symbolic_check("sqrt(x**2)", "-x", mode="equivalence",
+                           assumptions={"x": "negative"}, n_points=12)
+        assert r["verdict"] != "fail", r
+
+    def test_h5_unknown_assumption_is_inconclusive(self):
+        """An unrecognized assumption is named, not silently ignored."""
+        r = symbolic_check("x", "x", mode="equivalence",
+                           assumptions={"x": "bogus_domain"})
+        assert r["verdict"] == "inconclusive", r
+        assert "not recognized" in r.get("reason", ""), r
+
+    def test_h5_integer_sampling_works(self):
+        """{x: integer} samples integers. The symbol-key subs fix means an
+        integer=True Symbol substitutes correctly (string-key subs failed)."""
+        r = symbolic_check("x + x", "2*x", mode="numeric_spot",
+                           assumptions={"x": "integer"}, n_points=8)
+        assert r["verdict"] == "numerically_consistent", r
+        assert r.get("n_points", 0) > 0
+
+    def test_h5_counterexample_serializes_with_assumption(self):
+        """A fail under an assumption still produces a JSON-serializable
+        counterexample (symbol-keyed point must be converted to readable form)."""
+        r = symbolic_check("x", "x + 1", mode="numeric_spot",
+                           assumptions={"x": "positive"}, n_points=8)
+        assert r["verdict"] == "fail"
+        assert r["counterexample"] is not None
+        # Must be valid JSON (a string like '{"x": 3.14}').
+        import json
+        json.loads(r["counterexample"])  # raises if not serializable
+
+
 class TestDimensional:
     def test_velocity_consistent(self):
         """d/t with d in meters, t in seconds is dimensionally m/s."""
