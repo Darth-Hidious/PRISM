@@ -956,6 +956,36 @@ fn summarize_manual_tool_result(
     is_error: bool,
 ) -> String {
     if is_error {
+        // Mirror agent_loop's richer failure summary: prefer the actual error
+        // line / exit code / timed-out signal over an opaque content prefix.
+        if let Ok(val) = serde_json::from_str::<Value>(content) {
+            let timed_out = val
+                .get("timed_out")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let exit_code = val.get("exit_code").and_then(|v| v.as_i64());
+            let err_str = val.get("error").and_then(|v| v.as_str());
+            if timed_out {
+                if let Some(code) = exit_code {
+                    return format!("{tool_name}: error — timed out (exit {code})");
+                }
+                return format!("{tool_name}: error — timed out");
+            }
+            if let Some(code) = exit_code
+                && code != 0
+            {
+                if let Some(err) = err_str {
+                    return format!(
+                        "{tool_name}: error — exit {code}: {}",
+                        short_first_line(err)
+                    );
+                }
+                return format!("{tool_name}: error — exit {code}");
+            }
+            if let Some(err) = err_str {
+                return format!("{tool_name}: error — {}", short_first_line(err));
+            }
+        }
         let short = if content.len() > 80 {
             &content[..80]
         } else {
@@ -982,6 +1012,18 @@ fn summarize_manual_tool_result(
     preview
         .map(str::to_string)
         .unwrap_or_else(|| format!("{tool_name}: completed"))
+}
+
+/// First line of `s`, clipped to 80 chars (whole chars). Companion to the
+/// `first_line` helper in agent_loop.rs — kept local because protocol.rs does
+/// not depend on agent_loop's private fns.
+fn short_first_line(s: &str) -> String {
+    let line = s.lines().next().unwrap_or("").trim_end();
+    if line.chars().count() <= 80 {
+        return line.to_string();
+    }
+    let clipped: String = line.chars().take(79).collect();
+    format!("{clipped}…")
 }
 
 async fn execute_manual_tool_call(
@@ -1072,13 +1114,17 @@ async fn execute_manual_tool_call(
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (raw_content, is_error) = match result {
         Ok(resp) => {
-            if let Some(err) = resp.get("error").and_then(|value| value.as_str()) {
-                (err.to_string(), true)
-            } else if let Some(value) = resp.get("result") {
-                (serde_json::to_string(value).unwrap_or_default(), false)
+            // is_error via the shared helper — keep in lockstep with the
+            // agent_loop gate and the provenance hook. The OLD gate only
+            // matched a top-level "error" key and missed wrapped Python-tool
+            // failures (success:false under "result"). See tool_result.rs.
+            let is_error = crate::tool_result::tool_result_is_error(&resp);
+            let raw_content = if let Some(value) = resp.get("result") {
+                serde_json::to_string(value).unwrap_or_default()
             } else {
-                (serde_json::to_string(&resp).unwrap_or_default(), false)
-            }
+                serde_json::to_string(&resp).unwrap_or_default()
+            };
+            (raw_content, is_error)
         }
         Err(error) => (format!("Tool error: {error}"), true),
     };

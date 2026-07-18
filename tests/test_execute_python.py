@@ -151,3 +151,21 @@ class TestCrashHandling:
         result = _execute_python(code='print("ok")')
         assert result["success"] is True
         assert "error" not in result
+
+
+class TestFailureContract:
+    """VS1/F1: every failure path must carry `success: False` so the Rust
+    is_error gate (keyed on the tool's own success boolean) flags it. A path
+    that sets `error` but omits `success` would still be caught by the
+    error-string rule, but the contract should be consistent across branches.
+    """
+
+    def test_timeout_carries_success_false(self):
+        """The TimeoutExpired branch must emit success: False (not just error)."""
+        result = _execute_python(code="import time; time.sleep(30)", timeout=1)
+        assert result["timed_out"] is True
+        assert result["success"] is False, (
+            "timeout branch must carry success:False so the is_error gate "
+            "flags it via the !success rule, not only the error string"
+        )
+        assert "error" in result

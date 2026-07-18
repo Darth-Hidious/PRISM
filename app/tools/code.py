@@ -80,6 +80,7 @@ def _execute_python(code: str, timeout: int = 60, description: str = "") -> dict
         # subprocess.run already kills the child on timeout
         return {
             "error": f"Timed out after {timeout}s",
+            "success": False,
             "exit_code": 124,
             "stdout": (e.stdout or "").decode() if isinstance(e.stdout, bytes) else (e.stdout or ""),
             "stderr": (e.stderr or "").decode() if isinstance(e.stderr, bytes) else (e.stderr or ""),
@@ -90,6 +91,7 @@ def _execute_python(code: str, timeout: int = 60, description: str = "") -> dict
     except Exception as e:
         return {
             "error": str(e),
+            "success": False,
             "description": description,
             "cwd": cwd,
             "timed_out": False,

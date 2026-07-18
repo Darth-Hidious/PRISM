@@ -312,6 +312,38 @@ fn summarize_tool_result(
     is_error: bool,
 ) -> String {
     if is_error {
+        // Richer failure summaries for code-execution tools. Today the error
+        // branch only emitted "{tool}: error — {preview}", but execute_python /
+        // execute_bash / skills failures carry `success:false`, `exit_code`,
+        // `timed_out`, and/or an `error` string — surface those instead of the
+        // opaque content prefix so the model can see WHY it failed.
+        if let Ok(val) = serde_json::from_str::<Value>(content) {
+            let timed_out = val
+                .get("timed_out")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let exit_code = val.get("exit_code").and_then(|v| v.as_i64());
+            let err_str = val.get("error").and_then(|v| v.as_str());
+            if timed_out {
+                if let Some(code) = exit_code {
+                    return format!("{tool_name}: error — timed out (exit {code})");
+                }
+                return format!("{tool_name}: error — timed out");
+            }
+            if let Some(code) = exit_code
+                && code != 0
+            {
+                if let Some(err) = err_str {
+                    let err_short = first_line(err, 80);
+                    return format!("{tool_name}: error — exit {code}: {err_short}");
+                }
+                return format!("{tool_name}: error — exit {code}");
+            }
+            if let Some(err) = err_str {
+                let err_short = first_line(err, 80);
+                return format!("{tool_name}: error — {err_short}");
+            }
+        }
         let preview = if content.len() > 60 {
             &content[..60]
         } else {
@@ -460,6 +492,19 @@ fn summarize_tool_result(
         return preview.to_string();
     }
     format!("{tool_name}: completed")
+}
+
+/// First line of `s`, clipped to `max` chars (whole chars, not bytes). Used by
+/// `summarize_tool_result` to surface the actual error line (e.g. a Python
+/// `ValueError: ...` or a bash `command not found`) instead of the raw prefix
+/// of a multi-line payload. Returns "(no detail)" for empty input.
+fn first_line(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or("").trim_end();
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let clipped: String = line.chars().take(max.saturating_sub(1)).collect();
+    format!("{clipped}…")
 }
 
 pub(crate) fn compact_history(history: &mut Vec<ChatMessage>, summary: &str, keep_last: usize) {
@@ -1307,13 +1352,20 @@ pub async fn run_turn(
 
             let (raw_content, is_error): (String, bool) = match result {
                 Ok(resp) => {
-                    if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
-                        (err.to_string(), true)
-                    } else if let Some(r) = resp.get("result") {
-                        (serde_json::to_string(r).unwrap_or_default(), false)
+                    // is_error is derived via the shared tool_result helper so
+                    // this gate and the protocol.rs / provenance-hook gates can
+                    // never drift. The OLD gate only matched a top-level
+                    // "error" key, but tool_server.py wraps every Python-tool
+                    // payload under "result" — so a failed run (success:false)
+                    // arrived as is_error=false and was rendered as a green
+                    // "results" card. See crates/agent/src/tool_result.rs.
+                    let is_error = crate::tool_result::tool_result_is_error(&resp);
+                    let raw_content = if let Some(r) = resp.get("result") {
+                        serde_json::to_string(r).unwrap_or_default()
                     } else {
-                        (serde_json::to_string(&resp).unwrap_or_default(), false)
-                    }
+                        serde_json::to_string(&resp).unwrap_or_default()
+                    };
+                    (raw_content, is_error)
                 }
                 Err(e) => (format!("Tool error: {e}"), true),
             };
@@ -2068,6 +2120,140 @@ mod tests {
         assert!(
             !names.iter().any(|n| n == "deploy_create"),
             "non-core non-pinned tool dropped"
+        );
+    }
+
+    // ── VS1 / F1: is_error crux + richer failure summary ───────────────
+    //
+    // These tests lock in the contract that a wrapped Python-tool failure
+    // (success:false under "result") is flagged as an error, while a
+    // grep-no-match (exit 1 but success:true) is NOT. They also verify the
+    // failure summary surfaces exit code / timed-out / error string.
+
+    fn gate_is_error(resp: &serde_json::Value) -> bool {
+        crate::tool_result::tool_result_is_error(resp)
+    }
+
+    #[test]
+    fn f1_gate_wrapped_python_raise_is_error() {
+        let resp = serde_json::json!({
+            "result": {
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "Traceback (most recent call last):\nValueError: boom",
+                "success": false
+            }
+        });
+        assert!(
+            gate_is_error(&resp),
+            "wrapped python raise must be an error"
+        );
+    }
+
+    #[test]
+    fn f1_gate_wrapped_bash_grep_no_match_is_not_error() {
+        // THE REGRESSION GUARD: grep exit-1 with success:true must stay a
+        // non-error. Over-flagging here would break every "no match" search.
+        let resp = serde_json::json!({
+            "result": {
+                "success": true,
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "",
+                "return_code_interpretation": "No matches found"
+            }
+        });
+        assert!(
+            !gate_is_error(&resp),
+            "grep no-match (success:true) must NOT be flagged as error"
+        );
+    }
+
+    #[test]
+    fn f1_gate_wrapped_timeout_is_error() {
+        let resp = serde_json::json!({
+            "result": { "success": false, "timed_out": true, "exit_code": 124 }
+        });
+        assert!(gate_is_error(&resp));
+    }
+
+    #[test]
+    fn f1_gate_unwrapped_notebook_failure_with_string_result_is_error() {
+        // notebook_exec: top-level "result" is the last-expr value (string),
+        // NOT a wrapped payload — the gate must not be fooled by it.
+        let resp = serde_json::json!({
+            "success": false,
+            "exit_code": 1,
+            "result": "some last-expression string"
+        });
+        assert!(gate_is_error(&resp));
+    }
+
+    #[test]
+    fn f1_summary_python_raise_shows_exit_code() {
+        let content = serde_json::json!({
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "ValueError: boom",
+            "success": false
+        })
+        .to_string();
+        let summary = summarize_tool_result("execute_python", None, &content, true);
+        assert!(
+            summary.contains("exit 1"),
+            "python failure summary must show exit code: {summary}"
+        );
+        assert!(
+            !summary.contains("completed"),
+            "failed run must not be summarized as completed: {summary}"
+        );
+    }
+
+    #[test]
+    fn f1_summary_timeout_shows_timed_out() {
+        let content = serde_json::json!({ "success": false, "timed_out": true, "exit_code": 124 })
+            .to_string();
+        let summary = summarize_tool_result("execute_python", None, &content, true);
+        assert!(
+            summary.contains("timed out"),
+            "timeout summary must say timed out: {summary}"
+        );
+    }
+
+    #[test]
+    fn f1_summary_bash_error_shows_exit_and_first_error_line() {
+        let content = serde_json::json!({
+            "success": false,
+            "exit_code": 127,
+            "stderr": "bash: frobnicate: command not found",
+            "error": "bash: frobnicate: command not found"
+        })
+        .to_string();
+        let summary = summarize_tool_result("execute_bash", None, &content, true);
+        assert!(
+            summary.contains("exit 127"),
+            "bash failure must show exit code: {summary}"
+        );
+        assert!(
+            summary.contains("command not found"),
+            "bash failure must surface the first error line: {summary}"
+        );
+    }
+
+    #[test]
+    fn f1_summary_grep_no_match_stays_non_error_completed() {
+        // Guard the OTHER direction: success:true (grep no-match) summarized
+        // on the non-error path must still read as a normal completion.
+        let content = serde_json::json!({
+            "success": true,
+            "exit_code": 1,
+            "return_code_interpretation": "No matches found"
+        })
+        .to_string();
+        let summary = summarize_tool_result("execute_bash", None, &content, false);
+        assert!(
+            !summary.contains("error"),
+            "grep no-match must not be summarized as an error: {summary}"
         );
     }
 }

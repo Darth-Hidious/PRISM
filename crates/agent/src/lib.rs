@@ -21,5 +21,6 @@ pub mod skills;
 pub mod subagent;
 pub mod task;
 pub mod tool_catalog;
+pub mod tool_result;
 pub mod transcript;
 pub mod types;
