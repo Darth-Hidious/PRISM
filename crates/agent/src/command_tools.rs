@@ -3462,6 +3462,31 @@ async fn execute_notebook(
         }
     };
 
+    Ok(compose_notebook_result(
+        &cell,
+        &runtime.project_root.to_string_lossy(),
+        include_images_base64,
+        invocation,
+        crate::notebook::status().backend.as_deref().unwrap_or(""),
+    ))
+}
+
+/// Build the model-facing notebook_exec result JSON from a executed `Cell`.
+///
+/// Extracted from `execute_notebook` (FIX-1) so the agent-facing composition —
+/// including the traceback filter — is unit-testable without a live runtime.
+/// The filter runs on `cell.error` (where an uncaught exception's traceback
+/// lives; `cell.stderr` is empty for a plain raise). The raw trace is never
+/// pushed to the model: stdout and the `error` field both carry the FILTERED
+/// trace. The human TUI pane is a separate path (`emit_notebook_cell` emits
+/// the raw `Cell`) and does not go through here.
+fn compose_notebook_result(
+    cell: &crate::notebook::Cell,
+    cwd: &str,
+    include_images_base64: bool,
+    invocation: &str,
+    kernel_backend: &str,
+) -> Value {
     // Compose the readable cell output the model sees in `stdout`.
     let mut display = String::new();
     if !cell.stdout.is_empty() {
@@ -3479,12 +3504,9 @@ async fn execute_notebook(
         }
         display.push_str(&format!("[plot saved: {path}]"));
     }
-    if let Some(error) = &cell.error {
-        if !display.is_empty() && !display.ends_with('\n') {
-            display.push('\n');
-        }
-        display.push_str(error);
-    }
+    // NOTE: the raw cell.error is NOT pushed into display here. The agent-facing
+    // FILTERED trace is appended below (FIX-1) so stdout and the `error` field
+    // agree and the model never sees raw library frames.
 
     let images: Vec<Value> = cell
         .image_paths
@@ -3499,12 +3521,39 @@ async fn execute_notebook(
         })
         .collect();
 
-    // VS2-P1a: agent-facing traceback filter. The human pane keeps the raw
-    // cell.stderr (the kernel is shared); only the agent sees this filtered
-    // form, so library frames don't bury the final error line.
-    let (filtered_stderr, traceback_elided_frames) = filter_notebook_traceback(&cell.stderr, "");
+    // VS2-P1a (FIX-1): the agent-facing traceback filter. An uncaught exception
+    // lands its traceback in `cell.error` (NOT cell.stderr, which is empty for a
+    // plain raise — see notebook.rs::format_error). The filter must therefore
+    // run on `cell.error`. We push the FILTERED trace into display/stdout (not
+    // the raw error) and expose it as the model-facing `error` field too, so
+    // the model sees ONE filtered trace — never the raw library frames. The
+    // human TUI pane is a separate path (protocol.rs emit_notebook_cell emits
+    // the raw Cell) and is untouched.
+    let (filtered_error, elided_error_frames) = match &cell.error {
+        Some(raw) => filter_notebook_traceback(raw, cwd),
+        None => (String::new(), 0),
+    };
+    // stderr rarely carries a traceback, but filter it for parity (a
+    // sys.stderr.write of a trace, or a warning that includes frames).
+    let (filtered_stderr, elided_stderr_frames) = filter_notebook_traceback(&cell.stderr, cwd);
+    let traceback_elided_frames = elided_error_frames.max(elided_stderr_frames);
 
-    Ok(json!({
+    // Push the FILTERED error (not raw) into display/stdout so the model-facing
+    // stdout matches the filtered error field.
+    if cell.error.is_some() && !filtered_error.is_empty() {
+        if !display.is_empty() && !display.ends_with('\n') {
+            display.push('\n');
+        }
+        display.push_str(&filtered_error);
+    }
+    // The model-facing `error` field is the filtered trace (when present).
+    let model_error: Option<String> = if cell.error.is_some() && !filtered_error.is_empty() {
+        Some(filtered_error)
+    } else {
+        cell.error.clone()
+    };
+
+    json!({
         "root": "notebook",
         "invocation": invocation,
         "success": cell.success,
@@ -3515,10 +3564,10 @@ async fn execute_notebook(
         "traceback_elided_frames": traceback_elided_frames,
         "execution_count": cell.execution_count,
         "result": cell.result,
-        "error": cell.error,
+        "error": model_error,
         "images": images,
-        "kernel_backend": crate::notebook::status().backend,
-    }))
+        "kernel_backend": kernel_backend,
+    })
 }
 
 fn notebook_status_result(invocation: &str) -> Value {
@@ -3697,6 +3746,117 @@ RuntimeError: wrapped\n";
         let (filtered, n) = filter_notebook_traceback("", "");
         assert_eq!(filtered, "");
         assert_eq!(n, 0);
+    }
+
+    // ── VS2-P1 FIX-1: the REAL composition (cell.error channel) ────────
+    //
+    // The original tests only exercised the standalone filter_notebook_traceback
+    // fn. The adversarial review found the composition wired the filter to
+    // cell.stderr (empty for a raise) while the traceback leaked raw via
+    // cell.error -> stdout + error. These tests hit compose_notebook_result
+    // (the actual model-facing path) with a Cell shaped like a real raise.
+
+    fn raising_cell(raw_traceback: &str) -> crate::notebook::Cell {
+        // Mirror what notebook.rs::format_error produces for an uncaught
+        // exception: stderr empty, error = Some(<joined traceback>).
+        crate::notebook::Cell {
+            execution_count: 1,
+            origin: "agent".to_string(),
+            code: "raise ValueError('boom')".to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            result: None,
+            image_paths: Vec::new(),
+            error: Some(raw_traceback.to_string()),
+            success: false,
+        }
+    }
+
+    #[test]
+    fn fix1_model_facing_error_is_filtered_not_raw() {
+        // A traceback with library frames in cell.error (stderr EMPTY — the real
+        // raise shape). The model-facing "error" field must contain the FILTERED
+        // trace (final line + elided marker), NOT the raw library paths.
+        let tb = "Traceback (most recent call last):\n\
+  File \"<string>\", line 4, in <module>\n\
+    numpy.linalg.inv(mat)\n\
+  File \"/opt/homebrew/lib/python3.14/site-packages/numpy/linalg/linalg.py\", line 540, in inv\n\
+    ainv = _umath_linalg.inv(a)\n\
+ValueError: Singular matrix\n";
+        let cell = raising_cell(tb);
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin");
+
+        let model_error = result["error"].as_str().unwrap_or("");
+        assert!(
+            model_error.contains("ValueError: Singular matrix"),
+            "final error line must reach the model: {model_error}"
+        );
+        assert!(
+            !model_error.contains("site-packages/numpy"),
+            "raw library path must NOT reach the model via error: {model_error}"
+        );
+    }
+
+    #[test]
+    fn fix1_model_facing_stdout_carries_filtered_trace_not_raw() {
+        // stdout (display) previously push_str'd the RAW cell.error. Now it must
+        // carry the filtered trace too.
+        let tb = "Traceback (most recent call last):\n\
+  File \"<string>\", line 1, in <module>\n\
+    f()\n\
+  File \"/x/site-packages/numpy/core.py\", line 1, in f\n\
+    pass\n\
+RuntimeError: boom\n";
+        let cell = raising_cell(tb);
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin");
+        let stdout = result["stdout"].as_str().unwrap_or("");
+        assert!(stdout.contains("RuntimeError: boom"));
+        assert!(
+            !stdout.contains("site-packages/numpy"),
+            "raw library path must NOT reach the model via stdout: {stdout}"
+        );
+    }
+
+    #[test]
+    fn fix1_stderr_empty_raise_still_reports_elided_frames() {
+        // The bug: stderr-empty raise -> filter on stderr -> elided=0 (false
+        // "nothing to filter"). Now the error channel drives the count.
+        let tb = "Traceback (most recent call last):\n\
+  File \"<string>\", line 1, in <module>\n\
+    f()\n\
+  File \"/x/site-packages/numpy/a.py\", line 1, in f\n\
+    pass\n\
+  File \"/x/site-packages/numpy/b.py\", line 2, in g\n\
+    pass\n\
+RuntimeError: boom\n";
+        let cell = raising_cell(tb);
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin");
+        let elided = result["traceback_elided_frames"].as_u64().unwrap_or(0);
+        assert!(
+            elided >= 2,
+            "elided frame count must reflect the error channel, not the empty stderr: got {elided}"
+        );
+    }
+
+    #[test]
+    fn fix1_successful_cell_no_error_passthrough() {
+        // A successful cell (no error) must compose unchanged — no spurious
+        // filtered-trace injection.
+        let cell = crate::notebook::Cell {
+            execution_count: 1,
+            origin: "agent".to_string(),
+            code: "1+1".to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            result: Some("2".to_string()),
+            image_paths: Vec::new(),
+            error: None,
+            success: true,
+        };
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin");
+        assert_eq!(result["error"].as_str(), None);
+        assert!(result["stdout"].as_str().unwrap_or("").contains("=> 2"));
+        assert_eq!(result["traceback_elided_frames"].as_u64(), Some(0));
     }
 
     #[test]
