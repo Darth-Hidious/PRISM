@@ -15,6 +15,17 @@ use uuid::Uuid;
 
 use crate::{ComputeBackend, ExperimentPlan, JobStatus};
 
+/// Cap on the number of log lines fetched from a crashed container (VS1/F3).
+/// A chatty container can emit MBs/GBs before crashing; without `--tail`, the
+/// whole buffer is read into memory and then the downstream 30k cliff keeps
+/// only the verbose HEAD — the actual crash line at the END would be lost.
+/// `--tail` bounds the fetch; `crash_error_message` then head+tail-caps the
+/// text so the crash line survives the cliff too.
+const CRASH_LOG_TAIL_LINES: usize = 5_000;
+/// Hard char cap (head + tail) on the crash log text we splice into the error
+/// message. Keeps the bail! string bounded regardless of `--tail` line sizes.
+const CRASH_LOG_TEXT_CHARS: usize = 20_000;
+
 /// Local Docker/Podman compute backend.
 pub struct LocalBackend {
     /// Container runtime binary ("docker" or "podman").
@@ -230,10 +241,17 @@ impl LocalBackend {
 
     /// Fetch the container's combined stdout+stderr logs. Returns an empty
     /// string on any failure (no `--stdout`/`--no-stderr` flags — bare
-    /// `docker logs` already merges both streams, matching byoc.rs).
+    /// `docker logs` already merges both streams, matching byoc.rs). Capped
+    /// to the last `CRASH_LOG_TAIL_LINES` lines so a chatty container cannot
+    /// OOM us or push the actual crash line past the downstream 30k cliff.
     async fn fetch_logs(&self, container_name: &str) -> String {
         let output = Command::new(&self.runtime)
-            .args(["logs", container_name])
+            .args([
+                "logs",
+                "--tail",
+                &CRASH_LOG_TAIL_LINES.to_string(),
+                container_name,
+            ])
             .output()
             .await;
         match output {
@@ -254,6 +272,11 @@ impl LocalBackend {
 /// it can be unit-tested without docker. The container's logs + exit code are
 /// the honest "what actually went wrong" signal — far better than a bare
 /// "no result file" that tells the agent nothing it can act on.
+///
+/// The crash line lives at the END of the log, so when the log exceeds
+/// `CRASH_LOG_TEXT_CHARS` we keep a head (context) + tail (the crash line)
+/// with an explicit elided-middle marker — otherwise the downstream 30k cliff
+/// would keep only the verbose head and drop the actual error.
 fn crash_error_message(job_id: Uuid, exit_code: Option<i32>, logs: &str) -> String {
     let code_part = match exit_code {
         Some(c) => format!("exited with code {c}"),
@@ -266,9 +289,35 @@ fn crash_error_message(job_id: Uuid, exit_code: Option<i32>, logs: &str) -> Stri
              no container logs were available"
         );
     }
+    let bounded = cap_log_head_tail(logs, CRASH_LOG_TEXT_CHARS);
     format!(
         "compute job {job_id} crashed before writing a result ({code_part}); \
-         container logs:\n{logs}"
+         container logs:\n{bounded}"
+    )
+}
+
+/// Cap a log string to `max` chars keeping a head and a tail with an explicit
+/// elided-middle marker. The tail is load-bearing (crash lines live there).
+/// Pure and whole-char-safe.
+fn cap_log_head_tail(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    // Favor the tail (crash line) over the head (context): 1/4 head, 3/4 tail.
+    let head = max / 4;
+    let tail = max - head;
+    let head_str: String = s.chars().take(head).collect();
+    let skip = total - tail;
+    let tail_byte_start = s
+        .char_indices()
+        .nth(skip)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(s.len());
+    let tail_str = &s[tail_byte_start..];
+    let elided = total - head - tail;
+    format!(
+        "{head_str}\n[…{elided} chars elided — showing head + tail; the crash line is at the end…]\n{tail_str}"
     )
 }
 
@@ -410,6 +459,38 @@ mod tests {
         assert!(
             !msg.starts_with("no result file"),
             "must not be the opaque old message: {msg}"
+        );
+    }
+
+    #[test]
+    fn f3_crash_message_keeps_crash_line_when_log_is_huge() {
+        // The crash line lives at the END. A head-only cap (or the downstream
+        // 30k cliff) would keep the verbose head and drop the crash line.
+        // crash_error_message must head+tail-cap so the crash survives.
+        let id = Uuid::new_v4();
+        let mut log = String::new();
+        // ~50k chars of noise, then the real crash line at the end.
+        for _ in 0..5000 {
+            log.push_str("verbose build line blah blah blah\n");
+        }
+        log.push_str("RuntimeError: out of memory in material simulation\n");
+        let msg = crash_error_message(id, Some(137), &log);
+
+        assert!(
+            msg.contains("RuntimeError: out of memory in material simulation"),
+            "the crash line (at the end) must survive head+tail cap: {}",
+            &msg[msg.len().saturating_sub(200)..]
+        );
+        assert!(
+            msg.contains("chars elided"),
+            "elision of the huge log must be marked: {}",
+            &msg[..msg.len().min(160)]
+        );
+        // The message itself stays bounded — no multi-MB bail! string.
+        assert!(
+            msg.len() < 60_000,
+            "crash message must be bounded, got {} bytes",
+            msg.len()
         );
     }
 
