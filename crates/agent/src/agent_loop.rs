@@ -815,6 +815,11 @@ pub async fn run_turn(
     // VS2-P1b: track consecutive FAILED code-exec calls per tool name. Resets
     // on any successful code-exec call. Mirrors empty_result_streak's pattern.
     let mut code_failure_streak: HashMap<String, usize> = HashMap::new();
+    // VS2-P1 FIX-6: reset the provenance repair-chain memory at turn start so a
+    // new turn's first code run is not tagged repair_attempt pointing at last
+    // turn's failure, and so an in-process subagent does not splice into the
+    // parent's chain. Matches the turn-scope of the streak maps above.
+    crate::hooks::reset_code_run_chain();
     // Tools the model discovered via find_tools this turn — pinned so their
     // FULL definitions stay in the request every later iteration. Without this,
     // find_tools returned names the model could never actually call.

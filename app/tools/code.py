@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from app.tools.base import Tool, ToolRegistry
@@ -29,12 +30,19 @@ def _traceback_dir() -> Path:
 
 
 def _persist_full_traceback(raw: str) -> str:
-    """Write the raw stderr to a timestamped file, prune to KEEP newest. Return path."""
+    """Write the raw stderr to a timestamped file, prune to KEEP newest. Return path.
+
+    FIX-7: the filename includes a short uuid suffix (was ms-resolution only) so
+    two failures within the same ms (fast retries, parallel subagents) don't
+    collide and overwrite each other.
+    """
     if not raw:
         return ""
     try:
         out_dir = _traceback_dir()
-        path = out_dir / f"tb-{int(time.time() * 1000)}.txt"
+        # ms timestamp + 8 hex chars of uuid: collision-safe under fast retries.
+        suffix = uuid.uuid4().hex[:8]
+        path = out_dir / f"tb-{int(time.time() * 1000)}-{suffix}.txt"
         path.write_text(raw, encoding="utf-8", errors="replace")
         # Prune: keep only the newest _TRACEBACK_KEEP files by mtime.
         files = sorted(out_dir.glob("tb-*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -102,19 +110,23 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
     if not raw_stderr or not raw_stderr.strip():
         return {"stderr": raw_stderr, "traceback_elided_frames": 0, "stderr_full_path": ""}
 
-    full_path = _persist_full_traceback(raw_stderr)
     lines = raw_stderr.splitlines()
 
     # If this isn't a traceback at all (e.g. a compiler SyntaxError preamble, a
-    # warning, or plain stdout leak), don't filter — return verbatim with a
-    # full-path pointer so it's still recoverable.
+    # warning, or plain stdout leak), don't filter and DON'T persist — FIX-7: the
+    # old code called _persist_full_traceback here unconditionally, so a one-line
+    # DeprecationWarning on a SUCCESSFUL run wrote a tb-*.txt and pruned to 32,
+    # evicting real full traces. Persistence is reserved for actual tracebacks.
     has_tb_header = any("Traceback (most recent call last)" in ln for ln in lines)
     if not has_tb_header:
         return {
             "stderr": raw_stderr,
             "traceback_elided_frames": 0,
-            "stderr_full_path": full_path,
+            "stderr_full_path": "",
         }
+
+    # This IS a traceback — persist the full raw trace for recoverability.
+    full_path = _persist_full_traceback(raw_stderr)
 
     # Split off the trailing "final exception block(s)" — everything from the
     # LAST non-traceback-frame chain marker onward is kept verbatim. We walk

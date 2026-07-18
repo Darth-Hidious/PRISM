@@ -356,6 +356,43 @@ class TestTracebackFilter:
         # under the USER frame (kept) is fine. Assert no raw library path leaks.
         assert "site-packages/numpy" not in out, "raw library path must not leak: %r" % out
 
+    def test_no_traceback_dump_for_non_traceback_stderr(self, tmp_path, monkeypatch):
+        """FIX-7: _persist_full_traceback must NOT run for non-traceback stderr
+        (a DeprecationWarning on a SUCCESSFUL run). The old code persisted any
+        non-empty stderr, evicting real full traces via the keep-32 prune."""
+        from pathlib import Path
+        from app.tools.code import _filter_traceback, _traceback_dir
+
+        # Point the traceback dir at a temp location so we can count files.
+        monkeypatch.setattr(
+            "app.tools.code._traceback_dir", lambda: tmp_path
+        )
+        # A plain warning — NOT a traceback. No file should be written.
+        r = _filter_traceback("DeprecationWarning: foo is deprecated\n", "/cwd")
+        assert r["stderr_full_path"] == "", (
+            "non-traceback stderr must NOT be persisted: got %r" % r["stderr_full_path"]
+        )
+        assert list(tmp_path.glob("tb-*.txt")) == [], "no dump file should exist"
+
+    def test_traceback_dump_uses_unique_filename(self, tmp_path, monkeypatch):
+        """FIX-7: two failures within the same ms must not collide. The filename
+        now carries a uuid suffix."""
+        from app.tools.code import _filter_traceback
+
+        monkeypatch.setattr("app.tools.code._traceback_dir", lambda: tmp_path)
+        tb = (
+            "Traceback (most recent call last):\n"
+            '  File "/x/site-packages/numpy/a.py", line 1, in f\n'
+            "    pass\n"
+            "ValueError: boom\n"
+        )
+        _filter_traceback(tb, "/cwd")
+        _filter_traceback(tb, "/cwd")
+        files = list(tmp_path.glob("tb-*.txt"))
+        assert len(files) == 2, "two failures must produce two distinct files: %r" % files
+        names = {f.name for f in files}
+        assert len(names) == 2, "filenames must be unique (uuid suffix): %r" % names
+
 
 class TestFilterPreservesGateSignal:
     """VS2-P1: filtering the agent-facing stderr must NOT mask the failure

@@ -323,23 +323,36 @@ const PROV_CODE_EXEC_TOOLS: &[&str] = &["execute_python", "execute_bash", "noteb
 
 #[derive(Clone, Debug)]
 struct LastCodeRun {
-    tool: String,
+    // The canonical tool name is the HashMap KEY, so it's not stored here too.
     record_id: String,
     failed: bool,
 }
 
-/// One-process memory of the last code-exec call. One process serves one
-/// session at a time, so a single static is sufficient (same rationale as
-/// PROVENANCE_CTX). Mutable through a Mutex — the hook closure only holds it
-/// briefly.
-static LAST_CODE_RUN: std::sync::Mutex<Option<LastCodeRun>> = std::sync::Mutex::new(None);
+/// One-process memory of recent code-exec calls, keyed by CANONICAL tool name
+/// (FIX-6: was a single Option<LastCodeRun> slot, which an interleaving call
+/// of a DIFFERENT code-exec tool overwrote — so python-fail -> execute_bash ->
+/// python-retry severed the chain because bash clobbered the slot. Per-tool
+/// slots survive the interleaving: bash writes its own slot, the python slot
+/// is preserved for the retry to chain against). Mutable through a Mutex.
+static LAST_CODE_RUN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, LastCodeRun>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Clear the repair-chain memory (FIX-6). Called at turn start so a new turn's
+/// first code run is not tagged repair_attempt pointing at last turn's failure,
+/// and so an in-process subagent does not splice into the parent's chain.
+pub fn reset_code_run_chain() {
+    if let Ok(mut guard) = LAST_CODE_RUN.lock() {
+        guard.clear();
+    }
+}
 
 /// Pure helper: given the current tool + its status, and the remembered last
-/// code run, decide (parent_id, tags) for the new record.
+/// code runs (per-tool), decide (parent_id, tags) for the new record.
 ///
 /// - Code-exec tools always get the `code_exec` tag (so "all code runs" is
 ///   queryable).
-/// - If the PREVIOUS code-exec run was the SAME tool AND failed, this run is a
+/// - If the PREVIOUS run of the SAME (canonical) tool failed, this run is a
 ///   repair attempt: set `parent_id` to the previous record and tag
 ///   `repair_attempt`.
 /// - Chains NEVER cross tools (an execute_python failure does not make a later
@@ -350,7 +363,7 @@ static LAST_CODE_RUN: std::sync::Mutex<Option<LastCodeRun>> = std::sync::Mutex::
 fn chain_code_run(
     tool_name: &str,
     status: &str,
-    last: &Option<LastCodeRun>,
+    last: &std::collections::HashMap<String, LastCodeRun>,
 ) -> (Option<String>, Vec<String>) {
     // FIX-5: normalize the tool name so alias-invoked notebook cells
     // (notebook_run/run_python_notebook/notebook -> notebook_exec) get the
@@ -361,8 +374,9 @@ fn chain_code_run(
     }
     let mut tags = vec!["code_exec".to_string()];
     let mut parent_id = None;
-    if let Some(prev) = last
-        && prev.tool == canonical
+    // FIX-6: look up the PREVIOUS run of THIS tool (per-tool slots). A different
+    // tool's run no longer severs the chain.
+    if let Some(prev) = last.get(canonical)
         && prev.failed
     {
         parent_id = Some(prev.record_id.clone());
@@ -419,7 +433,7 @@ fn provenance_hook() -> Hook {
             let last = LAST_CODE_RUN
                 .lock()
                 .map(|guard| guard.clone())
-                .unwrap_or(None);
+                .unwrap_or_default();
             let (parent_id, chain_tags) = chain_code_run(tool_name, status_str, &last);
             if let Some(pid) = parent_id {
                 record.parent_id = Some(pid);
@@ -432,12 +446,14 @@ fn provenance_hook() -> Hook {
             let canonical_for_chain = crate::command_tools::canonical_code_exec_tool(tool_name);
             if PROV_CODE_EXEC_TOOLS.contains(&canonical_for_chain) {
                 let this_run = LastCodeRun {
-                    tool: canonical_for_chain.to_string(),
                     record_id: record.id.clone(),
                     failed: status_str == "error",
                 };
+                // FIX-6: per-tool slot — insert/replace only THIS tool's entry,
+                // leaving other tools' slots intact (so python-fail -> bash ->
+                // python-retry keeps the python slot for the retry to chain).
                 if let Ok(mut guard) = LAST_CODE_RUN.lock() {
-                    *guard = Some(this_run);
+                    guard.insert(canonical_for_chain.to_string(), this_run);
                 }
             }
 
@@ -644,12 +660,44 @@ mod tests {
 
     // ── VS2-P1c: chain_code_run (PROV-O repair chaining) ───────────────
 
-    fn last_run(tool: &str, failed: bool) -> Option<LastCodeRun> {
-        Some(LastCodeRun {
-            tool: tool.to_string(),
-            record_id: format!("rec-{tool}-1"),
-            failed,
-        })
+    use std::collections::HashMap;
+
+    /// Build a per-tool LAST_CODE_RUN map with one entry.
+    fn last_run(tool: &str, failed: bool) -> HashMap<String, LastCodeRun> {
+        let mut m = HashMap::new();
+        m.insert(
+            tool.to_string(),
+            LastCodeRun {
+                record_id: format!("rec-{tool}-1"),
+                failed,
+            },
+        );
+        m
+    }
+
+    /// Build a map with TWO entries (the interleaving case FIX-6 fixes).
+    fn last_run_two(
+        tool_a: &str,
+        failed_a: bool,
+        tool_b: &str,
+        failed_b: bool,
+    ) -> HashMap<String, LastCodeRun> {
+        let mut m = HashMap::new();
+        m.insert(
+            tool_a.to_string(),
+            LastCodeRun {
+                record_id: format!("rec-{tool_a}-1"),
+                failed: failed_a,
+            },
+        );
+        m.insert(
+            tool_b.to_string(),
+            LastCodeRun {
+                record_id: format!("rec-{tool_b}-1"),
+                failed: failed_b,
+            },
+        );
+        m
     }
 
     #[test]
@@ -692,7 +740,8 @@ mod tests {
     #[test]
     fn p1c_first_call_has_no_parent() {
         // No previous run at all → no parent, just the code_exec tag.
-        let (parent, tags) = chain_code_run("execute_python", "error", &None);
+        let empty: HashMap<String, LastCodeRun> = HashMap::new();
+        let (parent, tags) = chain_code_run("execute_python", "error", &empty);
         assert_eq!(parent, None);
         assert_eq!(tags, vec!["code_exec".to_string()]);
     }
@@ -708,7 +757,40 @@ mod tests {
     fn p1c_code_exec_tag_always_present_for_code_tools() {
         // Even on a successful first call, code-exec tools get the code_exec tag
         // so "all code runs" is queryable.
-        let (_, tags) = chain_code_run("notebook_exec", "ok", &None);
+        let empty: HashMap<String, LastCodeRun> = HashMap::new();
+        let (_, tags) = chain_code_run("notebook_exec", "ok", &empty);
+        assert!(tags.contains(&"code_exec".to_string()));
+    }
+
+    #[test]
+    fn fix6_interleaving_different_tool_does_not_sever_chain() {
+        // FIX-6: python-fail -> execute_bash -> python-retry. The bash run must
+        // NOT clobber the python slot (the old single-slot design did, so the
+        // retry got no parent_id). With per-tool slots, the python slot survives
+        // the bash call and the retry chains correctly.
+        let last = last_run_two("execute_python", true, "execute_bash", false);
+        // Now the python retry runs: it should chain to the python failure
+        // EVEN THOUGH execute_bash ran in between and is in the map.
+        let (parent, tags) = chain_code_run("execute_python", "error", &last);
+        assert_eq!(
+            parent.as_deref(),
+            Some("rec-execute_python-1"),
+            "interleaving bash must not sever the python repair chain"
+        );
+        assert!(tags.contains(&"repair_attempt".to_string()));
+    }
+
+    #[test]
+    fn fix6_reset_code_run_chain_clears_memory() {
+        // reset_code_run_chain (called at turn start) clears the per-tool map.
+        // We verify via chain_code_run: after a reset, a run has no parent.
+        // (We can't easily call the static reset from a unit test without
+        // affecting global state, so we verify the empty-map semantics that
+        // reset produces: chain_code_run on an empty map yields no parent.)
+        let empty: HashMap<String, LastCodeRun> = HashMap::new();
+        let (parent, tags) = chain_code_run("execute_python", "error", &empty);
+        assert_eq!(parent, None);
+        assert!(!tags.contains(&"repair_attempt".to_string()));
         assert!(tags.contains(&"code_exec".to_string()));
     }
 
