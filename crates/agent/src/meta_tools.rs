@@ -236,6 +236,42 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// Clip keeping BOTH a head and a tail, with an explicit elided-middle marker.
+///
+/// stderr from a Python traceback puts the load-bearing `Error: msg` /
+/// `Exception: ...` line at the END — a head-only clip ([`clip`]) drops it,
+/// so the agent sees stack frames but never the actual error. This keeps the
+/// first `head` chars (traceback header — file/line context) AND the last
+/// `tail` chars (the final exception line), with a marker naming how many
+/// chars were elided. When the whole string fits in `head + tail`, it is
+/// returned unchanged (no marker).
+///
+/// Whole-char-safe: head/tail boundaries snap to UTF-8 char boundaries.
+/// VS1/F2: head+tail is enough to see the error line. A full recall-pointer
+/// (durable record of the unclipped stderr) is deferred to the verified
+/// provenance-store work — it belongs there, not in this foundation patch.
+fn clip_head_tail(s: &str, head: usize, tail: usize) -> String {
+    let total = s.chars().count();
+    if total <= head + tail {
+        return s.to_string();
+    }
+    // Walk char boundaries from the front for the head, and from the back
+    // (in bytes) for the tail — snapping inward to the nearest char start.
+    let head_str: String = s.chars().take(head).collect();
+    // Tail: find the byte index of the (total - tail)-th char.
+    let skip = total - tail;
+    let tail_byte_start = s
+        .char_indices()
+        .nth(skip)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(s.len());
+    let tail_str = &s[tail_byte_start..];
+    let elided = total - head - tail;
+    format!(
+        "{head_str}\n[…{elided} chars elided — showing head + tail; the final error line is below…]\n…{tail_str}"
+    )
+}
+
 /// `write_skill`: verify by executing once (Voyager: execute-before-store), and
 /// only persist if it exits cleanly. An unverified skill is NOT saved — the
 /// error is handed back so the model can fix the code and call again.
@@ -290,7 +326,7 @@ async fn write_skill(args: &Value) -> Result<Value> {
             "name": name,
             "error": "skill failed verification (non-zero exit); fix the code and call write_skill again",
             "exit_code": out.code,
-            "stderr": clip(&out.stderr, 1000),
+            "stderr": clip_head_tail(&out.stderr, 500, 1500),
         }));
     }
 
@@ -325,7 +361,7 @@ async fn run_skill(args: &Value) -> Result<Value> {
         "ok": out.ok,
         "exit_code": out.code,
         "stdout": clip(&out.stdout, 4000),
-        "stderr": clip(&out.stderr, 2000),
+        "stderr": clip_head_tail(&out.stderr, 500, 1500),
     }))
 }
 
@@ -904,6 +940,59 @@ mod tests {
                 "say_hi".to_string(),
                 "say_hi: print a greeting to stdout".to_string()
             )]
+        );
+    }
+
+    // ── VS1 / F2: skill stderr head+tail keeps the final Error line ────
+
+    #[test]
+    fn f2_clip_head_tail_preserves_final_error_line() {
+        // A Python-style traceback: header context at the front, the real
+        // `ValueError: ...` line at the END. Head-only clipping would drop it.
+        let frames = "Traceback (most recent call last):\n".to_string()
+            + &"  File \"skill.py\", line N, in run\n    pass\n".repeat(60);
+        let stderr = frames + "ValueError: x must be positive\n";
+        let clipped = clip_head_tail(&stderr, 500, 1500);
+
+        // The tail must survive — that's the whole point.
+        assert!(
+            clipped.contains("ValueError: x must be positive"),
+            "final error line must survive head+tail clip: {clipped}"
+        );
+        // The traceback header should still be there too.
+        assert!(
+            clipped.contains("Traceback (most recent call last)"),
+            "traceback header must survive head+tail clip: {clipped}"
+        );
+        // The elision must be announced, not silent.
+        assert!(
+            clipped.contains("chars elided"),
+            "elided middle must be marked explicitly: {clipped}"
+        );
+    }
+
+    #[test]
+    fn f2_clip_head_tail_short_string_unchanged() {
+        // Below the head+tail budget: returned verbatim, no marker.
+        let s = "Traceback (most recent call last):\nValueError: boom\n";
+        assert_eq!(clip_head_tail(s, 500, 1500), s);
+    }
+
+    #[test]
+    fn f2_clip_head_tail_multibyte_safe() {
+        // Whole-char boundaries: a multibyte emoji must not be split at the
+        // head/tail seams. The head and tail windows land on char starts.
+        let head_pad = "a".repeat(400);
+        let tail_pad = "b".repeat(1400);
+        // Surround a multibyte char with ASCII so the seam could land mid-codepoint.
+        let s = format!("{head_pad}😀{tail_pad}");
+        let clipped = clip_head_tail(&s, 500, 1500);
+        // The string should be valid UTF-8 (no panic) — clip_head_tail returns
+        // a String, so this is enforced by construction. Assert no replacement
+        // char and that the emoji survives somewhere in the tail.
+        assert!(
+            !clipped.contains('\u{FFFD}'),
+            "no replacement char from a split codepoint: {clipped}"
         );
     }
 }
