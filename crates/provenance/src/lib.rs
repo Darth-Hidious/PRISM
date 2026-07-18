@@ -40,6 +40,16 @@ pub struct ProvenanceRecord {
     pub material_ref: Option<String>,
     pub confidence: f64,
     pub tags: Vec<String>,
+    /// VS1/F5: structured outcome flag — "ok" | "error" | None.
+    /// None means "unknown" (a legacy row written before this field existed,
+    /// or a non-tool record where the notion does not apply). Honest
+    /// "unknown" rather than a defaulted lie. Lets "which runs failed" be a
+    /// real query, not something inferred by grepping output_json.
+    pub status: Option<String>,
+    /// VS1/F5: the tool's exit code when one was reported. None when absent
+    /// or non-numeric. Same signal as the F1 is_error gate, captured here for
+    /// queryability.
+    pub exit_code: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -98,6 +108,35 @@ fn opt_to_value(s: &Option<String>) -> Value {
     }
 }
 
+/// VS1/F5 migration helper: add a column only if it is not already present.
+///
+/// There is no migration framework here — only `CREATE TABLE IF NOT EXISTS`,
+/// which does NOT upgrade an existing table's schema. On a legacy database
+/// the ALTER raises "duplicate column name"; we swallow that specific case so
+/// the migration is idempotent across opens. Any OTHER error (e.g. the table
+/// itself missing — which would indicate a corrupted schema) is propagated.
+async fn add_column_if_absent(
+    conn: &turso::Connection,
+    table: &str,
+    column: &str,
+    col_type: &str,
+) -> Result<()> {
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}");
+    match conn.execute(sql, ()).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            // SQLite/Turso: "duplicate column name: <col>" when it already
+            // exists. Tolerate it; propagate everything else.
+            if msg.contains("duplicate column name") {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(e).context(format!("failed to add column {column} to {table}")))
+            }
+        }
+    }
+}
+
 pub struct ProvenanceStore {
     conn: turso::Connection,
 }
@@ -136,11 +175,23 @@ impl ProvenanceStore {
                 parent_id TEXT,
                 material_ref TEXT,
                 confidence REAL DEFAULT 0,
-                tags TEXT
+                tags TEXT,
+                status TEXT,
+                exit_code INTEGER
             )"#,
             (),
         )
         .await?;
+
+        // VS1/F5 migration: add `status` + `exit_code` to pre-existing user
+        // databases. CREATE TABLE IF NOT EXISTS will NOT add columns to a
+        // table that already exists, so an older ~/.prism/provenance.db would
+        // be missing these columns and the INSERT below would fail at runtime.
+        // Each ALTER is guarded: re-running on an already-migrated DB raises
+        // "duplicate column name", which we swallow. Both fresh and legacy
+        // DBs converge on the same 15-column shape.
+        add_column_if_absent(conn, "provenance_records", "status", "TEXT").await?;
+        add_column_if_absent(conn, "provenance_records", "exit_code", "INTEGER").await?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_prov_session ON provenance_records(session_id)",
@@ -195,8 +246,8 @@ impl ProvenanceStore {
                 r#"INSERT INTO provenance_records
                    (id, timestamp, session_id, action_type, actor,
                     tool_name, llm_model, input_json, output_json,
-                    parent_id, material_ref, confidence, tags)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+                    parent_id, material_ref, confidence, tags, status, exit_code)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
                 [
                     Value::Text(rec.id.clone()),
                     Value::Text(rec.timestamp.clone()),
@@ -214,6 +265,11 @@ impl ProvenanceStore {
                     opt_to_value(&rec.material_ref),
                     Value::Real(rec.confidence),
                     Value::Text(tags_json),
+                    opt_to_value(&rec.status),
+                    match rec.exit_code {
+                        Some(c) => Value::Integer(c),
+                        None => Value::Null,
+                    },
                 ],
             )
             .await?;
@@ -321,7 +377,7 @@ impl ProvenanceStore {
     ) -> Result<Vec<(ProvenanceRecord, f32)>> {
         const RECORD_COLS: &str = "r.id, r.timestamp, r.session_id, r.action_type, r.actor, \
              r.tool_name, r.llm_model, r.input_json, r.output_json, \
-             r.parent_id, r.material_ref, r.confidence, r.tags";
+             r.parent_id, r.material_ref, r.confidence, r.tags, r.status, r.exit_code";
         let mut rows = match session_id {
             Some(sid) => {
                 self.conn
@@ -351,7 +407,9 @@ impl ProvenanceStore {
         let mut scored = Vec::new();
         while let Some(row) = rows.next().await? {
             let record = row_to_record(&row)?;
-            let vector = match row.get_value(13)? {
+            // RECORD_COLS now selects 15 columns (0..14), so the joined
+            // e.vector sits at index 15.
+            let vector = match row.get_value(15)? {
                 Value::Blob(bytes) => prism_embed::le_bytes_to_vec(&bytes),
                 _ => continue,
             };
@@ -444,6 +502,12 @@ fn row_to_record(row: &turso::Row) -> Result<ProvenanceRecord> {
         .and_then(|v| v.as_real().copied())
         .unwrap_or(0.0);
 
+    // VS1/F5: status (col 13) and exit_code (col 14). SELECT * returns them in
+    // table-definition order, after `tags` (col 12). For the explicit-column
+    // semantic_search path, RECORD_COLS lists them in the same order.
+    let status = get_opt_str(row, 13)?.filter(|s| !s.is_empty());
+    let exit_code = row.get_value(14).ok().and_then(|v| v.as_integer().copied());
+
     Ok(ProvenanceRecord {
         id: get_str(row, 0)?,
         timestamp: get_str(row, 1)?,
@@ -458,6 +522,8 @@ fn row_to_record(row: &turso::Row) -> Result<ProvenanceRecord> {
         material_ref: get_opt_str(row, 10)?,
         confidence,
         tags,
+        status,
+        exit_code,
     })
 }
 
@@ -505,6 +571,8 @@ pub fn new_record(
         material_ref: None,
         confidence: 0.0,
         tags: Vec::new(),
+        status: None,
+        exit_code: None,
     }
 }
 
@@ -705,5 +773,133 @@ mod tests {
 
         rec.output_json = Some(serde_json::Value::String("x".repeat(10_000)));
         assert_eq!(embedding_text(&rec).chars().count(), 2_000);
+    }
+
+    // ── VS1 / F5: structured status + exit_code round-trip + migration ──
+
+    #[tokio::test]
+    async fn f5_status_and_exit_code_round_trip() {
+        // A failed tool call's record must persist status:error + exit_code
+        // so "which runs failed" is a real query.
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let mut rec = new_record(
+            "sess-f5",
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some("execute_python"),
+            None,
+            serde_json::json!({"code": "raise ValueError('boom')"}),
+        );
+        rec.output_json = Some(serde_json::json!({
+            "success": false, "exit_code": 1, "stderr": "ValueError: boom"
+        }));
+        rec.status = Some("error".to_string());
+        rec.exit_code = Some(1);
+
+        store.record(&rec).await.unwrap();
+        let results = store.query_by_session("sess-f5").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status.as_deref(), Some("error"));
+        assert_eq!(results[0].exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn f5_status_ok_round_trips_too() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let mut rec = new_record(
+            "sess-f5-ok",
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some("execute_bash"),
+            None,
+            serde_json::json!({"command": "echo hi"}),
+        );
+        rec.output_json = Some(serde_json::json!({"success": true, "exit_code": 0}));
+        rec.status = Some("ok".to_string());
+        rec.exit_code = Some(0);
+
+        store.record(&rec).await.unwrap();
+        let results = store.query_by_session("sess-f5-ok").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status.as_deref(), Some("ok"));
+        assert_eq!(results[0].exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn f5_legacy_record_without_status_round_trips_as_none() {
+        // A legacy row (or a non-tool record where the notion doesn't apply)
+        // has status None and exit_code None. Must round-trip honestly as
+        // None, not a defaulted lie.
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let rec = new_record(
+            "sess-f5-legacy",
+            ActionType::LlmCall,
+            Actor::Agent,
+            None,
+            None,
+            serde_json::json!({"prompt": "hi"}),
+        );
+        // Deliberately leave status / exit_code at their None defaults.
+        store.record(&rec).await.unwrap();
+        let results = store.query_by_session("sess-f5-legacy").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, None, "legacy record stays None");
+        assert_eq!(results[0].exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn f5_schema_migration_is_idempotent_on_reopen() {
+        // Simulate a pre-existing user DB: create it once, then open it again.
+        // The guarded ALTER must tolerate "duplicate column name" on the second
+        // open rather than erroring. Use a temp file (not :memory:) so the DB
+        // persists across two ProvenanceStore::open calls.
+        let tmp = std::env::temp_dir().join(format!(
+            "prism-f5-migration-{}.db",
+            Uuid::new_v4().as_simple()
+        ));
+        // First open creates the 15-column table + runs the (fresh) ALTERs.
+        {
+            let store = ProvenanceStore::open(&tmp).await.unwrap();
+            let rec = new_record(
+                "sess-mig",
+                ActionType::ToolCall,
+                Actor::Agent,
+                Some("web"),
+                None,
+                serde_json::json!({"q": "x"}),
+            );
+            store.record(&rec).await.unwrap();
+        }
+        // Second open must not fail on the already-present columns.
+        {
+            let store = ProvenanceStore::open(&tmp).await.unwrap();
+            let results = store.query_by_session("sess-mig").await.unwrap();
+            assert_eq!(results.len(), 1, "data survives reopen");
+            // And a fresh write after reopen still works.
+            let rec2 = new_record(
+                "sess-mig",
+                ActionType::ToolCall,
+                Actor::Agent,
+                Some("web"),
+                None,
+                serde_json::json!({"q": "y"}),
+            );
+            store.record(&rec2).await.unwrap();
+        }
+        let _ = std::fs::remove_file(&tmp);
+
+        // Third check: opening :memory: (fresh each time) also works — the
+        // ALTER against a just-created table must not raise either.
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let rec = new_record(
+            "sess-fresh",
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some("read_file"),
+            None,
+            serde_json::json!({"path": "a.txt"}),
+        );
+        store.record(&rec).await.unwrap();
+        assert_eq!(store.query_by_session("sess-fresh").await.unwrap().len(), 1);
     }
 }

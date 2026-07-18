@@ -286,6 +286,24 @@ pub fn build_default_hooks() -> HookRegistry {
     registry
 }
 
+/// Derive the (status, exit_code) pair for a provenance record from the tool
+/// result. Extracted as a pure helper so it can be unit-tested WITHOUT firing
+/// the hook (which spawns a real DB write — out of bounds for unit tests).
+/// The status string is the SAME signal the F1 is_error gate uses
+/// ([`crate::tool_result::tool_result_is_error`]); keeping it inline in the
+/// closure would let the record drift from the gate.
+fn classify_for_provenance(result: &Value) -> (Option<String>, Option<i64>) {
+    let status = if crate::tool_result::tool_result_is_error(result) {
+        "error"
+    } else {
+        "ok"
+    };
+    (
+        Some(status.to_string()),
+        crate::tool_result::tool_exit_code(result),
+    )
+}
+
 /// Provenance hook — records every tool call to Turso via a spawned
 /// async task. Non-blocking: the hook returns immediately, the write
 /// happens in the background.
@@ -312,28 +330,61 @@ fn provenance_hook() -> Hook {
             // Record the output too so `recall` can pull the full result
             // back later (by id or keyword), not just the tool's inputs.
             record.output_json = Some(result.clone());
+            // VS1/F5: structured outcome flag, derived from the SAME signal
+            // as the F1 is_error gate (crates/agent/src/tool_result.rs) so the
+            // flag, the gate, and the summary can never disagree. "which runs
+            // failed" is now a real query against the provenance store.
+            let (status, exit_code) = classify_for_provenance(result);
+            record.status = status;
+            record.exit_code = exit_code;
 
-            // Try to spawn a background write task
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let db_path = dirs::home_dir()
-                        .map(|h| h.join(".prism/provenance.db"))
-                        .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
-                    match prism_provenance::ProvenanceStore::open(&db_path).await {
-                        Ok(store) => {
-                            if let Err(e) = store.record(&record).await {
-                                warn!("provenance write failed: {e}");
-                            } else {
-                                // Semantic memory: embed the record so `recall`
-                                // can find it by meaning, not just keyword.
-                                crate::embeddings::embed_record(&store, &record).await;
+            // Try to spawn a background write task.
+            // VS1/F5: a write failure must NOT be silent. There is no shared
+            // metrics counter in the agent crate today, so each failure path
+            // emits a warn! under a distinct, grep-able target
+            // ("provenance_drop") naming the record + cause. Building a real
+            // counter/metric is deferred (see report). The Handle::try_current
+            // Err branch — previously completely silent — now warns too.
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        let db_path = dirs::home_dir()
+                            .map(|h| h.join(".prism/provenance.db"))
+                            .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+                        match prism_provenance::ProvenanceStore::open(&db_path).await {
+                            Ok(store) => {
+                                if let Err(e) = store.record(&record).await {
+                                    warn!(
+                                        target: "provenance_drop",
+                                        tool = %record.tool_name.as_deref().unwrap_or("?"),
+                                        session = %record.session_id,
+                                        "provenance write failed (record dropped): {e}"
+                                    );
+                                } else {
+                                    // Semantic memory: embed the record so `recall`
+                                    // can find it by meaning, not just keyword.
+                                    crate::embeddings::embed_record(&store, &record).await;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    target: "provenance_drop",
+                                    tool = %record.tool_name.as_deref().unwrap_or("?"),
+                                    session = %record.session_id,
+                                    "provenance store open failed (record dropped): {e}"
+                                );
                             }
                         }
-                        Err(e) => {
-                            warn!("provenance store open failed: {e}");
-                        }
-                    }
-                });
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        target: "provenance_drop",
+                        tool = %record.tool_name.as_deref().unwrap_or("?"),
+                        session = %record.session_id,
+                        "provenance write skipped — no tokio runtime (record dropped): {e}"
+                    );
+                }
             }
 
             PostHookResult {
@@ -406,6 +457,48 @@ mod tests {
         };
         assert!(hook.matches("allowed_tool"));
         assert!(!hook.matches("other_tool"));
+    }
+
+    // ── VS1 / F5: provenance status derivation ─────────────────────────
+    //
+    // classify_for_provenance is a pure helper so it can be tested without
+    // firing the hook (which spawns a real DB write). The contract: the
+    // status string MUST agree with the F1 is_error gate.
+
+    #[test]
+    fn f5_classify_wrapped_python_failure_is_error() {
+        let (status, exit) = classify_for_provenance(&json!({
+            "success": false, "exit_code": 1, "stderr": "ValueError: boom"
+        }));
+        assert_eq!(status.as_deref(), Some("error"));
+        assert_eq!(exit, Some(1));
+    }
+
+    #[test]
+    fn f5_classify_success_is_ok() {
+        let (status, exit) = classify_for_provenance(&json!({ "success": true, "exit_code": 0 }));
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(exit, Some(0));
+    }
+
+    #[test]
+    fn f5_classify_grep_no_match_is_ok_not_error() {
+        // Regression guard: grep exit-1 with success:true must record as ok,
+        // not error — same rule as the F1 gate.
+        let (status, exit) = classify_for_provenance(&json!({
+            "success": true,
+            "exit_code": 1,
+            "return_code_interpretation": "No matches found"
+        }));
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(exit, Some(1));
+    }
+
+    #[test]
+    fn f5_classify_top_level_error_is_error() {
+        let (status, exit) = classify_for_provenance(&json!({ "error": "unknown tool: frob" }));
+        assert_eq!(status.as_deref(), Some("error"));
+        assert_eq!(exit, None);
     }
 
     #[test]
