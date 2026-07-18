@@ -2193,22 +2193,28 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
         "During handling of the above exception, another exception occurred:",
         "The above exception was the direct cause of the following exception:",
     ];
-    // FIX-2: only the library/non-library distinction matters now. A non-
-    // library File frame (user code in <string> or the cwd, OR an unrecognized
-    // framework path) is kept verbatim — cwd-based user detection no longer
-    // needs a separate branch, so is_user is folded into the else.
-    let _ = cwd; // kept for parity with the Python twin + future use
+    // G3: split library markers into RELIABLE (unconditional — a venv under cwd
+    // is still library, keep the F2 fix) and AMBIGUOUS (substring false
+    // positives: `python3.`/`/lib/python`/`/Frameworks/` match user paths like
+    // `<cwd>/scripts/port_python3.14_helpers.py`). For the ambiguous ones,
+    // require the frame is NOT under cwd (a real stdlib/framework path won't be
+    // under the project cwd). cwd is now load-bearing here.
     let is_library = |line: &str| {
-        line.trim_start().starts_with("File ")
-            && [
-                "site-packages",
-                "dist-packages",
-                "python3.",
-                "/lib/python",
-                "/Frameworks/",
-            ]
-            .iter()
-            .any(|m| line.contains(m))
+        let t = line.trim_start();
+        if !(t.starts_with("File ") || t.starts_with("Cell In[")) {
+            return false;
+        }
+        // Reliable markers: unconditional library.
+        let reliable = ["site-packages", "dist-packages"];
+        if reliable.iter().any(|m| line.contains(m)) {
+            return true;
+        }
+        // Ambiguous markers: library only if the frame path is NOT under cwd.
+        let ambiguous = ["python3.", "/lib/python", "/Frameworks/"];
+        if ambiguous.iter().any(|m| line.contains(m)) {
+            return !cwd.is_empty() && !line.contains(cwd);
+        }
+        false
     };
 
     let lines: Vec<&str> = stderr.split_inclusive('\n').collect();
@@ -3849,6 +3855,33 @@ ValueError: Singular matrix\n"
         assert!(
             !filtered.contains(".venv/lib"),
             "venv-under-cwd library frames must be elided, not kept as user: {filtered}"
+        );
+        assert!(n >= 1);
+    }
+
+    #[test]
+    fn g3_ambiguous_marker_under_cwd_kept_as_user() {
+        // G3: a user path containing an ambiguous substring (python3.) must NOT
+        // be elided. <cwd>/scripts/port_python3.14_helpers.py was wrongly elided
+        // by the unconditional substring match. Ambiguous markers now require
+        // the frame to NOT be under cwd.
+        let cwd = "/Users/me/project";
+        let stderr = format!(
+            "Traceback (most recent call last):\n\
+  File \"{cwd}/scripts/port_python3.14_helpers.py\", line 1, in <module>\n\
+    do_thing()\n\
+  File \"/usr/lib/python3.14/site-packages/numpy/core.py\", line 2, in f\n\
+    pass\n\
+RuntimeError: boom\n"
+        );
+        let (filtered, n) = filter_notebook_traceback(&stderr, cwd);
+        assert!(
+            filtered.contains("port_python3.14_helpers.py"),
+            "ambiguous marker under cwd must be kept as user frame: {filtered}"
+        );
+        assert!(
+            !filtered.contains("site-packages/numpy"),
+            "reliable library marker still elided: {filtered}"
         );
         assert!(n >= 1);
     }

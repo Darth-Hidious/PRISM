@@ -235,6 +235,30 @@ class TestTracebackFilter:
         )
         assert r["traceback_elided_frames"] >= 1
 
+    def test_g3_ambiguous_marker_under_cwd_is_user_not_library(self):
+        """G3: a user path containing an ambiguous substring (python3.) must NOT
+        be elided. <cwd>/scripts/port_python3.14_helpers.py was wrongly elided
+        by the unconditional substring match. Now ambiguous markers require the
+        frame to NOT be under cwd."""
+        from app.tools.code import _filter_traceback
+        cwd = "/Users/me/project"
+        tb = (
+            'Traceback (most recent call last):\n'
+            f'  File "{cwd}/scripts/port_python3.14_helpers.py", line 1, in <module>\n'
+            '    do_thing()\n'
+            '  File "/usr/lib/python3.14/site-packages/numpy/core.py", line 2, in f\n'
+            '    pass\n'
+            'RuntimeError: boom\n'
+        )
+        r = _filter_traceback(tb, cwd)
+        # The user file with `python3.` in its name is KEPT (under cwd).
+        assert "port_python3.14_helpers.py" in r["stderr"], (
+            "ambiguous marker under cwd must be kept as user frame: %r" % r["stderr"]
+        )
+        # The real site-packages library frame is still elided (reliable marker).
+        assert "site-packages/numpy" not in r["stderr"]
+        assert r["traceback_elided_frames"] >= 1
+
     def test_unchanged_when_nothing_to_elide(self):
         from app.tools.code import _filter_traceback
         tb = (

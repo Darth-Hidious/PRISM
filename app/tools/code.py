@@ -74,14 +74,23 @@ def _is_user_frame(line: str, cwd: str) -> bool:
     return ('File "<string>"' in line) or (cwd and cwd in line)
 
 
-def _is_library_frame(line: str) -> bool:
-    """A frame line references library code (site-packages / stdlib / venv)."""
-    if not line.strip().startswith("File "):
+def _is_library_frame(line: str, cwd: str = "") -> bool:
+    """A frame line references library code (site-packages / stdlib / venv).
+
+    G3: RELIABLE markers (site-packages/dist-packages) are unconditional — a
+    venv under cwd is still library (keep the F2 fix). AMBIGUOUS markers
+    (python3./lib/python/Frameworks) are substring false-positives on user
+    paths like <cwd>/scripts/port_python3.14_helpers.py, so require the frame
+    is NOT under cwd.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("File "):
         return False
-    return any(
-        marker in line
-        for marker in ("site-packages", "dist-packages", "python3.", "/lib/python", "/Frameworks/")
-    )
+    if any(m in line for m in ("site-packages", "dist-packages")):
+        return True
+    if any(m in line for m in ("python3.", "/lib/python", "/Frameworks/")):
+        return not (cwd and cwd in line)
+    return False
 
 
 def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
@@ -181,8 +190,9 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
                 continuation.append(lines[i + consumed])
                 consumed += 1
 
-            # FIX-2: classify LIBRARY first (see comment above).
-            if _is_library_frame(ln):
+            # FIX-2/G3: classify LIBRARY first (reliable markers unconditional;
+            # ambiguous markers require not-under-cwd).
+            if _is_library_frame(ln, cwd):
                 run_of_library += 1
             else:
                 # User frame (<string>/cwd) OR an unrecognized File frame — keep
