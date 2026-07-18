@@ -67,13 +67,6 @@ _CHAIN_MARKERS = (
 )
 
 
-def _is_user_frame(line: str, cwd: str) -> bool:
-    """A frame line references user code if it names <string> or the cwd."""
-    if not line.strip().startswith("File "):
-        return False
-    return ('File "<string>"' in line) or (cwd and cwd in line)
-
-
 def _is_library_frame(line: str, cwd: str = "") -> bool:
     """A frame line references library code (site-packages / stdlib / venv).
 
@@ -93,7 +86,7 @@ def _is_library_frame(line: str, cwd: str = "") -> bool:
     return False
 
 
-def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
+def _filter_traceback(raw_stderr: str, cwd: str = "", persist: bool = True) -> dict:
     """Filter a Python traceback for the AGENT-FACING stderr (VS2-P1a).
 
     Owner decision: the human debug pane keeps the FULL/RAW traceback; only the
@@ -110,7 +103,9 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
         ("During handling..." / "The above exception...") keep BOTH final
         blocks — the root cause lives in the earlier one.
       - NEVER put raw stderr in the returned dict. The full raw trace is
-        written to ~/.prism/state/tracebacks/ and only its PATH is returned.
+        written to ~/.prism/state/tracebacks/ (only when persist=True — a
+        SUCCESSFUL run that prints a caught traceback should not churn the
+        dump dir) and only its PATH is returned.
 
     Returns {stderr, traceback_elided_frames, stderr_full_path}. If there is
     nothing to filter (no traceback, or no library frames), stderr is returned
@@ -135,7 +130,10 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
         }
 
     # This IS a traceback — persist the full raw trace for recoverability.
-    full_path = _persist_full_traceback(raw_stderr)
+    # G5d: only persist on the failure path (persist=True). A SUCCESSFUL run
+    # that prints a caught traceback to stderr should not churn the dump dir
+    # (the keep-32 prune would evict real failure traces).
+    full_path = _persist_full_traceback(raw_stderr) if persist else ""
 
     # Split off the trailing "final exception block(s)" — everything from the
     # LAST non-traceback-frame chain marker onward is kept verbatim. We walk
@@ -155,8 +153,13 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
         """Emit a single collapse-marker for a run of consecutive library frames."""
         nonlocal run_of_library, total_elided_frames
         if run_of_library > 0:
+            # G5e: when persistence failed (empty path), omit the pointer
+            # instead of emitting "full trace: ]".
+            pointer = (
+                f"full trace: {full_path}" if full_path else "full trace not persisted"
+            )
             kept.append(
-                f"[... {run_of_library} library frame(s) elided — full trace: {full_path}]"
+                f"[... {run_of_library} library frame(s) elided — {pointer}]"
             )
             total_elided_frames += run_of_library
             run_of_library = 0
@@ -305,8 +308,10 @@ def _execute_python(code: str, timeout: int = 60, description: str = "") -> dict
         # VS2-P1a: filter the traceback for the agent-facing stderr. The RAW
         # stderr is persisted to ~/.prism/state/tracebacks/ and only its path
         # is returned — the raw trace never reaches the model. On a clean run
-        # (no traceback) this is a no-op pass-through.
-        filtered = _filter_traceback(result.stderr, cwd)
+        # (no traceback) this is a no-op pass-through. G5d: persist only on the
+        # failure path (a successful run printing a caught traceback should not
+        # churn the dump dir).
+        filtered = _filter_traceback(result.stderr, cwd, persist=result.returncode != 0)
         out["stderr"] = filtered["stderr"]
         out["traceback_elided_frames"] = filtered["traceback_elided_frames"]
         if filtered["stderr_full_path"]:

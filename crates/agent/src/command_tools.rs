@@ -3658,8 +3658,9 @@ fn compose_notebook_result(
     };
     // stderr rarely carries a traceback, but filter it for parity (a
     // sys.stderr.write of a trace, or a warning that includes frames).
+    // G5c: SUM (was .max) — when both channels elide frames, max under-reports.
     let (filtered_stderr, elided_stderr_frames) = filter_notebook_traceback(&cell.stderr, cwd);
-    let traceback_elided_frames = elided_error_frames.max(elided_stderr_frames);
+    let traceback_elided_frames = elided_error_frames + elided_stderr_frames;
 
     // Push the FILTERED error (not raw) into display/stdout so the model-facing
     // stdout matches the filtered error field.
@@ -4165,6 +4166,37 @@ RuntimeError: boom\n";
         assert_eq!(result["error"].as_str(), None);
         assert!(result["stdout"].as_str().unwrap_or("").contains("=> 2"));
         assert_eq!(result["traceback_elided_frames"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn g5c_elided_frame_count_sums_error_and_stderr() {
+        // G5c: traceback_elided_frames must SUM the error + stderr channel
+        // counts (was .max, which under-reported when both channels elide).
+        let tb = "Traceback (most recent call last):\n\
+  File \"/x/site-packages/numpy/a.py\", line 1, in f\n\
+    pass\n\
+  File \"/x/site-packages/numpy/b.py\", line 2, in g\n\
+    pass\n\
+ValueError: boom\n";
+        // Both cell.error and cell.stderr carry a traceback with 2 library
+        // frames each -> the composed count must be 4 (sum), not 2 (max).
+        let cell = crate::notebook::Cell {
+            execution_count: 1,
+            origin: "agent".to_string(),
+            code: "raise".to_string(),
+            stdout: String::new(),
+            stderr: tb.to_string(),
+            result: None,
+            image_paths: Vec::new(),
+            error: Some(tb.to_string()),
+            success: false,
+        };
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin");
+        let elided = result["traceback_elided_frames"].as_u64().unwrap_or(0);
+        assert!(
+            elided >= 4,
+            "elided count must SUM both channels (>=4), got {elided}"
+        );
     }
 
     #[test]

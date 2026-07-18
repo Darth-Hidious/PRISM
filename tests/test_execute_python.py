@@ -454,6 +454,44 @@ class TestTracebackFilter:
         names = {f.name for f in files}
         assert len(names) == 2, "filenames must be unique (uuid suffix): %r" % names
 
+    def test_g5d_successful_run_with_caught_traceback_does_not_dump(self, tmp_path, monkeypatch):
+        """G5d: a SUCCESSFUL run (exit 0) that prints a caught traceback to
+        stderr must NOT persist a dump. The old code gated on traceback-PRESENCE,
+        so a success-path caught traceback churned the dump dir + evicted real
+        failure traces via the keep-32 prune."""
+        from app.tools.code import _filter_traceback
+        monkeypatch.setattr("app.tools.code._traceback_dir", lambda: tmp_path)
+        tb = (
+            "Traceback (most recent call last):\n"
+            '  File "/x/site-packages/numpy/a.py", line 1, in f\n'
+            "    pass\n"
+            "ValueError: caught-and-handled\n"
+        )
+        # persist=False simulates the success path (returncode == 0).
+        r = _filter_traceback(tb, "/cwd", persist=False)
+        assert r["stderr_full_path"] == "", "success path must not dump: %r" % r
+        assert list(tmp_path.glob("tb-*.txt")) == [], "no dump file written"
+        # The elision marker still appears (filtering happened) but with no path.
+        assert "library frame(s) elided" in r["stderr"]
+        assert "not persisted" in r["stderr"], "marker must omit the empty pointer"
+
+    def test_g5e_persist_failure_marker_omits_empty_path(self, tmp_path, monkeypatch):
+        """G5e: when persistence fails (empty path), the marker reads 'full
+        trace not persisted' instead of the old 'full trace: ]' (empty path)."""
+        from app.tools.code import _filter_traceback
+        # Point at a read-only dir to force persistence to fail? Simpler:
+        # persist=False forces empty path directly.
+        monkeypatch.setattr("app.tools.code._traceback_dir", lambda: tmp_path)
+        tb = (
+            "Traceback (most recent call last):\n"
+            '  File "/x/site-packages/numpy/a.py", line 1, in f\n'
+            "    pass\n"
+            "ValueError: x\n"
+        )
+        r = _filter_traceback(tb, "/cwd", persist=False)
+        assert "full trace: ]" not in r["stderr"], "no empty-path pointer"
+        assert "not persisted" in r["stderr"]
+
 
 class TestFilterPreservesGateSignal:
     """VS2-P1: filtering the agent-facing stderr must NOT mask the failure

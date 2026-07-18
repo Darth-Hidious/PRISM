@@ -4945,9 +4945,11 @@ fn emit_agent_event(event: AgentEvent) {
             );
             // When the AGENT ran a notebook cell, mirror it into the human's
             // notebook pane so both see the one shared kernel live.
+            // G5f: also match the root canonical name "notebook" (was omitted —
+            // a root-invoked cell ran but missed the live TUI mirror).
             if matches!(
                 tool_name.as_str(),
-                "notebook_exec" | "notebook_run" | "run_python_notebook"
+                "notebook_exec" | "notebook_run" | "run_python_notebook" | "notebook"
             ) && let Some(cell) = crate::notebook::cells().last()
             {
                 emit_notebook_cell(cell);
