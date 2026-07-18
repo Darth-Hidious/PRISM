@@ -151,7 +151,18 @@ impl ComputeBackend for LocalBackend {
         let result_path = tmp_dir.join("result.json");
 
         if !result_path.exists() {
-            bail!("no result file for job {job_id}");
+            // The container crashed before writing result.json. The OLD code
+            // bailed with a bare "no result file for job {job_id}", throwing
+            // away the real traceback in the container's logs. Surface those
+            // logs + the exit code instead (mirroring byoc.rs::results(), which
+            // already does `docker logs`). MUST fetch before cleanup() —
+            // cleanup() runs `docker rm -f`, which destroys the logs.
+            let container_name = Self::container_name(job_id);
+            let exit_code = self.fetch_exit_code(&container_name).await;
+            let logs = self.fetch_logs(&container_name).await;
+            // Still clean up on the error path so we don't leak the container.
+            self.cleanup(job_id).await;
+            bail!("{}", crash_error_message(job_id, exit_code, &logs));
         }
 
         let content = tokio::fs::read_to_string(&result_path).await?;
@@ -199,6 +210,66 @@ impl LocalBackend {
                 .ok();
         }
     }
+
+    /// Fetch the container's exit code via `inspect`. Returns None if the
+    /// container is gone or `inspect` fails for any reason — callers must
+    /// tolerate "unknown" rather than propagating a hard error (the logs are
+    /// the load-bearing signal on a crash path).
+    async fn fetch_exit_code(&self, container_name: &str) -> Option<i32> {
+        let output = Command::new(&self.runtime)
+            .args(["inspect", "--format", "{{.State.ExitCode}}", container_name])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        raw.trim().parse::<i32>().ok()
+    }
+
+    /// Fetch the container's combined stdout+stderr logs. Returns an empty
+    /// string on any failure (no `--stdout`/`--no-stderr` flags — bare
+    /// `docker logs` already merges both streams, matching byoc.rs).
+    async fn fetch_logs(&self, container_name: &str) -> String {
+        let output = Command::new(&self.runtime)
+            .args(["logs", container_name])
+            .output()
+            .await;
+        match output {
+            Ok(o) => {
+                let mut combined = String::new();
+                combined.push_str(&String::from_utf8_lossy(&o.stdout));
+                if !o.stderr.is_empty() {
+                    combined.push_str(&String::from_utf8_lossy(&o.stderr));
+                }
+                combined
+            }
+            Err(_) => String::new(),
+        }
+    }
+}
+
+/// Build the error message for a crashed container (no result.json). Pure so
+/// it can be unit-tested without docker. The container's logs + exit code are
+/// the honest "what actually went wrong" signal — far better than a bare
+/// "no result file" that tells the agent nothing it can act on.
+fn crash_error_message(job_id: Uuid, exit_code: Option<i32>, logs: &str) -> String {
+    let code_part = match exit_code {
+        Some(c) => format!("exited with code {c}"),
+        None => "exit code unknown (container already removed)".to_string(),
+    };
+    let logs = logs.trim();
+    if logs.is_empty() {
+        return format!(
+            "compute job {job_id} crashed before writing a result ({code_part}); \
+             no container logs were available"
+        );
+    }
+    format!(
+        "compute job {job_id} crashed before writing a result ({code_part}); \
+         container logs:\n{logs}"
+    )
 }
 
 /// Detect available container runtime.
@@ -312,5 +383,86 @@ mod tests {
         // Arbitrary custom runtime name is stored verbatim.
         let backend3 = LocalBackend::with_runtime("nerdctl");
         assert_eq!(backend3.runtime, "nerdctl");
+    }
+
+    // ── VS1 / F3: surface container logs on crash ──────────────────────
+
+    #[test]
+    fn f3_crash_message_names_job_exit_code_and_logs() {
+        // The pure message builder — the load-bearing signal is that the
+        // container's traceback and exit code reach the caller, not a bare
+        // "no result file" they can't act on.
+        let id = Uuid::parse_str("00000000-0000-4000-8000-00000000000f").unwrap();
+        let msg = crash_error_message(
+            id,
+            Some(137),
+            "Traceback (most recent call last):\nRuntimeError: OOM\n",
+        );
+        assert!(
+            msg.contains(&id.to_string()),
+            "message names the job: {msg}"
+        );
+        assert!(msg.contains("137"), "message includes the exit code: {msg}");
+        assert!(
+            msg.contains("RuntimeError: OOM"),
+            "message includes the container logs: {msg}"
+        );
+        assert!(
+            !msg.starts_with("no result file"),
+            "must not be the opaque old message: {msg}"
+        );
+    }
+
+    #[test]
+    fn f3_crash_message_handles_unknown_exit_code() {
+        // Container already removed by the time we inspect -> exit code is
+        // None. Must still produce an honest, non-empty message.
+        let id = Uuid::new_v4();
+        let msg = crash_error_message(id, None, "partial log\n");
+        assert!(msg.contains(&id.to_string()));
+        assert!(
+            msg.contains("unknown") || msg.contains("partial log"),
+            "tolerates unknown exit code: {msg}"
+        );
+    }
+
+    #[test]
+    fn f3_crash_message_handles_empty_logs() {
+        // No logs recoverable — still honest about what happened.
+        let id = Uuid::new_v4();
+        let msg = crash_error_message(id, Some(1), "");
+        assert!(msg.contains(&id.to_string()));
+        assert!(msg.contains("1"));
+        assert!(
+            msg.contains("no container logs were available"),
+            "honest about missing logs rather than faking silence: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn f3_results_on_unknown_job_surfaces_error_with_job_id_not_silent_ok() {
+        // A job id that was never submitted has no result.json. results()
+        // must surface a real error naming the job — and must NOT return
+        // Ok (which would be indistinguishable from a successful empty run).
+        // The docker logs/inspect calls fail on a nonexistent container and
+        // are handled gracefully, so this test does not require real docker.
+        let backend = LocalBackend::with_runtime("docker");
+        let unknown = Uuid::new_v4();
+
+        let result = backend.results(unknown).await;
+
+        assert!(
+            result.is_err(),
+            "missing result.json must be an error, not Ok"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains(&unknown.to_string()),
+            "error must name the job id: {msg}"
+        );
+        assert!(
+            !msg.starts_with("no result file"),
+            "must be richer than the old opaque message: {msg}"
+        );
     }
 }
