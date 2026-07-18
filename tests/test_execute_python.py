@@ -208,6 +208,31 @@ class TestTracebackFilter:
         assert "library frame(s) elided" in r["stderr"]
         assert "site-packages/numpy" not in r["stderr"], "raw lib path must not leak"
 
+    def test_venv_under_cwd_library_frames_still_elided(self):
+        """FIX-2: a project-local venv (<cwd>/.venv/.../site-packages) CONTAINS
+        cwd, so the old order (is_user before is_library) kept every library
+        frame. Library classification must win regardless of cwd."""
+        from app.tools.code import _filter_traceback
+        cwd = "/Users/me/project"
+        tb = (
+            'Traceback (most recent call last):\n'
+            f'  File "{cwd}/my_script.py", line 4, in <module>\n'
+            '    numpy.linalg.inv(mat)\n'
+            f'  File "{cwd}/.venv/lib/python3.14/site-packages/numpy/linalg/linalg.py", line 540, in inv\n'
+            '    ainv = _umath_linalg.inv(a)\n'
+            f'  File "{cwd}/.venv/lib/python3.14/site-packages/numpy/core.py", line 12, in _commonType\n'
+            '    raise ValueError(msg)\n'
+            'ValueError: Singular matrix\n'
+        )
+        r = _filter_traceback(tb, cwd)
+        # The user script frame survives; the venv-site-packages frames elide.
+        assert "my_script.py" in r["stderr"], "user frame must survive"
+        assert "ValueError: Singular matrix" in r["stderr"]
+        assert ".venv/lib" not in r["stderr"], (
+            "venv-under-cwd library frames must be elided, not kept as user frames"
+        )
+        assert r["traceback_elided_frames"] >= 1
+
     def test_unchanged_when_nothing_to_elide(self):
         from app.tools.code import _filter_traceback
         tb = (

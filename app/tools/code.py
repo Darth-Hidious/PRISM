@@ -160,13 +160,18 @@ def _filter_traceback(raw_stderr: str, cwd: str = "") -> dict:
                 code_line = lines[i + 1]
                 consumed = 2
 
-            if _is_user_frame(ln, cwd):
+            # FIX-2: classify LIBRARY first, unconditionally by path markers
+            # (site-packages/dist-packages/pythonX.Y stdlib). A venv inside the
+            # project (<cwd>/.venv/.../site-packages/numpy) CONTAINS cwd, so
+            # checking _is_user_frame first (cwd in line) mis-classified every
+            # library frame as user and elided nothing. Library wins.
+            if _is_library_frame(ln):
+                run_of_library += 1
+            elif _is_user_frame(ln, cwd):
                 flush_library_run()
                 kept.append(ln)
                 if code_line:
                     kept.append(code_line)
-            elif _is_library_frame(ln):
-                run_of_library += 1
             else:
                 # Unrecognized File frame (e.g. a framework path). Keep it to
                 # stay honest rather than guess.

@@ -2076,10 +2076,11 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
         "During handling of the above exception, another exception occurred:",
         "The above exception was the direct cause of the following exception:",
     ];
-    let is_user = |line: &str| {
-        line.trim_start().starts_with("File ")
-            && (line.contains("File \"<string>\"") || (!cwd.is_empty() && line.contains(cwd)))
-    };
+    // FIX-2: only the library/non-library distinction matters now. A non-
+    // library File frame (user code in <string> or the cwd, OR an unrecognized
+    // framework path) is kept verbatim — cwd-based user detection no longer
+    // needs a separate branch, so is_user is folded into the else.
+    let _ = cwd; // kept for parity with the Python twin + future use
     let is_library = |line: &str| {
         line.trim_start().starts_with("File ")
             && [
@@ -2138,13 +2139,13 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
                     consumed = 2;
                 }
             }
-            if is_user(ln_trim) {
-                flush(&mut run_of_library, &mut kept);
-                kept.push(ln.to_string());
-                if let Some(cl) = code_line {
-                    kept.push(cl.to_string());
-                }
-            } else if is_library(ln_trim) {
+            // FIX-2: classify LIBRARY first. A venv inside the project
+            // (<cwd>/.venv/.../site-packages) CONTAINS cwd, so checking is_user
+            // first (cwd in line) mis-classified every library frame as user and
+            // elided nothing. Library markers win regardless of cwd. A non-
+            // library File frame is kept verbatim (user code OR an unrecognized
+            // framework path — stay honest rather than guess).
+            if is_library(ln_trim) {
                 run_of_library += 1;
             } else {
                 flush(&mut run_of_library, &mut kept);
@@ -3710,6 +3711,30 @@ ZeroDivisionError: division by zero\n";
         let (filtered, n) = filter_notebook_traceback(stderr, "");
         assert_eq!(filtered, stderr, "verbatim when no library frames");
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn fix2_venv_under_cwd_library_frames_still_elided() {
+        // FIX-2: a project-local venv (<cwd>/.venv/.../site-packages) CONTAINS
+        // cwd, so the old order (is_user before is_library) kept every library
+        // frame. Library classification must win regardless of cwd.
+        let cwd = "/Users/me/project";
+        let stderr = format!(
+            "Traceback (most recent call last):\n\
+  File \"{cwd}/my_script.py\", line 4, in <module>\n\
+    numpy.linalg.inv(mat)\n\
+  File \"{cwd}/.venv/lib/python3.14/site-packages/numpy/linalg/linalg.py\", line 540, in inv\n\
+    ainv = _umath_linalg.inv(a)\n\
+ValueError: Singular matrix\n"
+        );
+        let (filtered, n) = filter_notebook_traceback(&stderr, cwd);
+        assert!(filtered.contains("my_script.py"), "user frame survives");
+        assert!(filtered.contains("ValueError: Singular matrix"));
+        assert!(
+            !filtered.contains(".venv/lib"),
+            "venv-under-cwd library frames must be elided, not kept as user: {filtered}"
+        );
+        assert!(n >= 1);
     }
 
     #[test]
