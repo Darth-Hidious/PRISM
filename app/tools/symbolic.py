@@ -23,12 +23,23 @@ VS1-GATE-AWARE RESULT CONTRACT (the load-bearing rule):
   error and the model would never see the counterexample. ``success: False``
   is reserved for timeout / crash / parse error / unsafe input.
 
+SECURITY (C1, the PRIMARY gate): every caller-controlled string (expression_a,
+expression_b, assumption unit strings) is parsed with a RESTRICTED namespace —
+an explicit whitelist of safe symbolic names, NOT ``sympy.__dict__``. The old
+``_GLOBALS = sympy.__dict__`` exposed ``sympify`` (a callable eval sink), and
+``parse_expr(evaluate=True)`` invoked it, giving arbitrary code execution via
+string-splitting past the substring blocklist. The whitelist contains NO
+callable that evals/imports (no sympify, no Function, no lambdify, no eval);
+with ``sympify`` absent, ``sympify('...')`` in a parsed expression auto-
+symbolizes to ``Symbol('sympify')`` applied as a symbolic function — no real
+call, no execution. User symbols are bound via ``local_dict`` so a symbol named
+``E``/``pi``/``I``/``S``/``oo`` is a SYMBOL, not the sympy constant.
+
 Execution: the check runs in a subprocess (same pattern as _execute_python)
 because ``simplify()`` can hang or OOM on pathological input — the timeout
-kills it honestly. The child receives its config as a JSON blob on argv[1]
-(no string templating, so the child's own braces/format calls are untouched).
-``parse_expr`` is given a restricted namespace and an EMPTY ``global_dict`` so
-``__import__``/builtins can't escape; the subprocess is the secondary net.
+kills it honestly. Defense-in-depth: the child gets a memory + CPU ulimit
+(``preexec_fn``) so a pathological input can't crash the tool server via OOM.
+The child receives its config as a JSON blob on argv[1].
 """
 from __future__ import annotations
 
@@ -41,49 +52,102 @@ from pathlib import Path
 from app.tools.base import Tool, ToolRegistry
 from app.tools.code import MAX_TIMEOUT, _child_env
 
-# Substrings that disqualify an expression from being handed to parse_expr at
-# all. Defense in depth: the child uses global_dict={} so builtins are not
-# reachable, but we reject obvious escapes before spawning a child.
-_UNSAFE_TOKENS = ("__import__", "__", " eval(", "eval(", "exec(", "open(", "os.")
 _NUMERIC_TOL = 1e-9
 _DEFAULT_N_POINTS = 16
-
-
-def _is_unsafe(expr: str) -> bool:
-    """Reject expressions that try to escape the parse namespace."""
-    if not expr or not expr.strip():
-        return True
-    low = expr.lower()
-    return any(tok.lower() in low for tok in _UNSAFE_TOKENS)
+# Memory cap (bytes) for the child subprocess — defense-in-depth against an
+# OOM/SIGSEGV from a pathological simplify() input. ~1 GB.
+_CHILD_MEM_LIMIT_BYTES = 1024 * 1024 * 1024
 
 
 def _monotonic_ms() -> int:
     return int(time.monotonic() * 1000)
 
 
+# C1: a cheap SECONDARY pre-spawn reject. The PRIMARY gate is the child's
+# restricted namespace (no sympify/Function/eval reachable) — that is what makes
+# the RCE impossible. This scan just avoids spawning a child for inputs that are
+# obviously trying to escape (substring match across EVERY caller string,
+# including assumptions values which the old _is_unsafe never checked). It is
+# NOT a security boundary on its own: string-splitting defeats it, which is why
+# the namespace restriction is the real fix.
+_DANGEROUS_TOKENS = ("__import__", "__", "eval(", "exec(", "open(", "os.", "getattr")
+
+
+def _looks_dangerous(*strings: str) -> bool:
+    """Cheap secondary reject across all caller-controlled strings."""
+    for s in strings:
+        if not s:
+            continue
+        low = s.lower()
+        if any(tok.lower() in low for tok in _DANGEROUS_TOKENS):
+            return True
+    return False
+
+
+def _child_prelimit() -> None:
+    """preexec_fn: cap the child's memory + CPU so a pathological simplify()
+    input can't crash the tool server via OOM (C1.4 defense-in-depth). The
+    restricted namespace is the PRIMARY fix; this is the secondary boundary.
+
+    POSIX-only — on platforms without ``resource`` the limits are silently
+    skipped (the timeout still bounds wall time).
+    """
+    try:
+        import resource
+
+        # Address-space cap: a runaway simplify allocating GBs dies with
+        # MemoryError instead of the OS killing the parent.
+        resource.setrlimit(resource.RLIMIT_AS, (_CHILD_MEM_LIMIT_BYTES, _CHILD_MEM_LIMIT_BYTES))
+        # CPU seconds: belt-and-suspenders alongside the subprocess timeout
+        # (CPU time can exceed wall time under parallelism, and a tight CPU
+        # limit catches a busy-spin that the timeout takes a moment to kill).
+        soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
+        resource.setrlimit(resource.RLIMIT_CPU, (300, hard if hard != -1 else 300))
+    except (ImportError, ValueError, OSError):
+        # Non-POSIX or limit already lower — the namespace restriction + the
+        # subprocess timeout remain in force.
+        pass
+
+
 # The generated child script. It receives its config as JSON on argv[1] — there
 # is NO string templating on this template, so every brace/format call below is
 # literal Python the child executes. Keeping the logic in the child means a
-# hang/OOM in simplify() is bounded by the subprocess timeout, not the tool
-# server. The child prints exactly one JSON line on stdout:
+# hang/OOM in simplify() is bounded by the subprocess timeout + the preexec
+# ulimit, not the tool server. The child prints exactly one JSON line on stdout:
 #   {"ok": true, "result": {...verdict...}}  -> check ran (any verdict)
-#   {"ok": false, "error": "..."}            -> crash (check could not run)
+#   {"ok": false, "error": "..."}            -> crash/parse-error (could not run)
 _CHILD_SCRIPT = '''
 import json, sys, random
-import sympy
-from sympy.parsing.sympy_parser import parse_expr, standard_transformations
-from sympy import simplify, N
 
-# parse_expr namespace. We use the FULL sympy namespace as global_dict so that
-# Integer/Float/Symbol/Function all resolve (a hand-built whitelist was
-# whack-a-mole). This does NOT expose Python builtins: sympy.__dict__ has no
-# __import__/eval/exec/open reachable as expression names, and the PRIMARY
-# safety gate is the parent's _is_unsafe() substring check (rejects
-# __import__/eval/exec/open/os./__ before the child is even spawned). The
-# subprocess itself is the secondary boundary — symbolic_check runs with
-# requires_approval=True, so the user has consented to the same blast radius
-# as execute_python.
-_GLOBALS = sympy.__dict__
+from sympy.parsing.sympy_parser import parse_expr, standard_transformations
+from sympy import (
+    simplify, N, Symbol, Integer, Float, Rational, Pow,
+    sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh,
+    exp, log, sqrt, Abs, Min, Max, floor, ceiling, sign, gamma,
+    pi, oo, zoo, E,
+)
+
+# C1 SECURITY: an explicit whitelist of ONLY safe symbolic names. NO callable
+# that evals/imports — no sympify, no Function, no lambdify, no eval/exec. The
+# old `_GLOBALS = sympy.__dict__` exposed sympify (an eval sink reachable as an
+# expression name), which parse_expr(evaluate=True) INVOKED -> arbitrary code
+# execution via string-splitting past the substring blocklist. With sympify
+# ABSENT from this namespace, `sympify('...')` in a parsed expression
+# auto-symbolizes to Symbol('sympify') applied as a symbolic function — no real
+# call, no execution.
+_SAFE_GLOBALS = {
+    "Symbol": Symbol, "Integer": Integer, "Float": Float, "Rational": Rational,
+    "Pow": Pow,
+    "sin": sin, "cos": cos, "tan": tan, "asin": asin, "acos": acos, "atan": atan,
+    "atan2": atan2, "sinh": sinh, "cosh": cosh, "tanh": tanh,
+    "exp": exp, "log": log, "sqrt": sqrt, "Abs": Abs, "Min": Min, "Max": Max,
+    "floor": floor, "ceiling": ceiling, "sign": sign, "gamma": gamma,
+    "pi": pi, "oo": oo, "zoo": zoo, "E": E,
+}
+# Symbols that sympy would otherwise resolve to constants via _SAFE_GLOBALS.
+# User-declared symbols override these via local_dict (see parse_restricted), so
+# a user symbol named E/pi/I/S is THEIR symbol, not the constant.
+_RESERVED = {"E", "pi", "I", "S", "oo", "zoo"}
 TOL = 1e-9
 
 
@@ -91,14 +155,49 @@ def emit(obj):
     print(json.dumps(obj))
 
 
-def parse_safe(s):
+def parse_restricted(s, local_dict=None):
+    """Parse a caller-controlled string against the SAFE whitelist ONLY.
+
+    Every untrusted string (expression_a/b, assumption unit strings) MUST go
+    through here. local_dict binds user symbol names -> Symbol(name) so a user
+    symbol named E/pi/I/S is THEIR symbol, not the sympy constant (C1.2 / H6).
+    """
     return parse_expr(
         s,
-        local_dict={},
-        global_dict=_GLOBALS,
+        local_dict=local_dict or {},
+        global_dict=_SAFE_GLOBALS,
         transformations=standard_transformations,
         evaluate=True,
     )
+
+
+def build_local_dict(names):
+    """Map each user symbol NAME to Symbol(name). Names that collide with sympy
+    constants (E, pi, I, S, oo) get bound to the user's Symbol so the constant
+    is shadowed. (Assumption kwargs are added in H5.)"""
+    ld = {}
+    for n in names:
+        ld[n] = Symbol(n)
+    return ld
+
+
+def _symbol_names(expr_str):
+    """Cheap pre-parse scan for bare identifier names, so we can build a
+    local_dict BEFORE parsing (binding user symbols over reserved constants).
+    This does NOT execute anything — it's a regex over the raw string."""
+    import re
+    return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr_str or ""))
+
+
+def parse_user_expression(s):
+    """Parse an expression string, binding its bare identifiers as user Symbols
+    via local_dict (so E/pi/etc. are symbols, not constants)."""
+    names = _symbol_names(s)
+    # Only bind names that are NOT whitelisted math functions (sin, exp, ...) —
+    # those should resolve to the function. Reserved constants ARE bound (so a
+    # user symbol named E wins over Euler's number).
+    bind = {n for n in names if n in _RESERVED or n not in _SAFE_GLOBALS}
+    return parse_restricted(s, build_local_dict(bind))
 
 
 def numeric_spot(a, b, frees, n_points, seed, assumptions):
@@ -140,8 +239,8 @@ def run(cfg):
     assumptions = cfg.get("assumptions") or {}
 
     try:
-        a = parse_safe(a_str)
-        b = parse_safe(b_str) if b_str is not None else None
+        a = parse_user_expression(a_str)
+        b = parse_user_expression(b_str) if b_str is not None else None
     except Exception as e:
         emit({"ok": True, "result": {
             "verdict": "inconclusive",
@@ -202,16 +301,15 @@ def run(cfg):
         return
 
     if mode == "dimensional":
-        # Dimensional consistency via sympy.physics.units. We substitute each
-        # free symbol with the unit declared in `assumptions` (else meter) and
-        # check whether both sides carry the same physical dimension. We compare
-        # via the RATIO (dim_a/dim_b dimensionless == 1) rather than subtraction,
-        # because subtracting quantities of different dimensions raises in sympy.
+        # Dimensional consistency via sympy.physics.units. Substitute each free
+        # symbol with the unit declared in `assumptions` and compare dimensions
+        # via the ratio (dim_a/dim_b == 1). C1: unit strings are parsed with
+        # parse_restricted (the SAME safe namespace), NOT sympy.sympify.
         from sympy.physics import units
-        from sympy import Expr
 
         def _resolve_unit(uname):
-            """Resolve a unit string (single or compound like 'm/s') to a unit expr."""
+            """Resolve a unit string to a unit expr, or None if unrecognized.
+            C1: parse unit strings with the RESTRICTED namespace (no sympify)."""
             base = {
                 "m": units.meter, "meter": units.meter,
                 "s": units.second, "sec": units.second, "second": units.second,
@@ -226,12 +324,10 @@ def run(cfg):
             }
             if uname in base:
                 return base[uname]
-            # Compound: try parsing e.g. "m/s", "kg*m/s**2" against the unit
-            # namespace via sympify (the unit objects compose arithmetically).
             try:
-                return sympy.sympify(uname, locals=base)
+                return parse_restricted(uname, base)
             except Exception:
-                return units.meter
+                return None
 
         try:
             subs_a = {
@@ -247,7 +343,6 @@ def run(cfg):
                 dim_b = simplify(b.subs(subs_b))
             else:
                 dim_b = dim_a
-            # Ratio test: dim_a/dim_b should be dimensionless 1 if consistent.
             ratio = simplify(dim_a / dim_b)
             consistent = ratio == 1
             if consistent:
@@ -317,6 +412,7 @@ def _run_check_subprocess(
             timeout=timeout,
             cwd=cwd,
             env=_child_env(),
+            preexec_fn=_child_prelimit,
         )
     except subprocess.TimeoutExpired:
         return {
@@ -434,22 +530,26 @@ def symbolic_check(
             "timed_out": False,
         }
 
-    # Safety: reject obvious escapes BEFORE spawning a child.
-    if _is_unsafe(expression_a) or (expression_b is not None and _is_unsafe(expression_b)):
+    assumptions = assumptions or {}
+    if n_points < 1:
+        n_points = _DEFAULT_N_POINTS
+
+    # C1: cheap SECONDARY reject across EVERY caller string (expressions AND
+    # assumption values — the old _is_unsafe never scanned assumptions, which
+    # was a live RCE vector). The PRIMARY gate is the child's restricted
+    # namespace; this just avoids spawning for obvious escape attempts.
+    assumption_values = [str(v) for v in assumptions.values()]
+    if _looks_dangerous(expression_a or "", expression_b or "", *assumption_values):
         return {
             "success": False,
             "verdict": "inconclusive",
             "reason": (
-                "expression rejected: contains a forbidden token (__import__, eval, "
-                "exec, open, os.). symbolic_check parses with a restricted namespace; "
-                "do not attempt to escape it."
+                "input rejected: contains a forbidden token. symbolic_check parses "
+                "with a restricted namespace (no sympify/Function/eval); do not "
+                "attempt to escape it."
             ),
             "timed_out": False,
         }
-
-    assumptions = assumptions or {}
-    if n_points < 1:
-        n_points = _DEFAULT_N_POINTS
 
     return _run_check_subprocess(
         mode=mode,

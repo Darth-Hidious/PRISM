@@ -10,7 +10,7 @@ import pytest
 from app.tools.base import ToolRegistry
 from app.tools.symbolic import (
     _DEFAULT_N_POINTS,
-    _is_unsafe,
+    _looks_dangerous,
     create_symbolic_tools,
     symbolic_check,
 )
@@ -157,17 +157,97 @@ class TestSafetyAndErrors:
         assert r["verdict"] == "inconclusive"
         assert "parse error" in r["reason"]
 
-    def test_is_unsafe_helper(self):
-        assert _is_unsafe("__import__('os')")
-        assert _is_unsafe("eval('x')")
-        assert _is_unsafe("exec('y')")
-        assert _is_unsafe("open('/etc/passwd')")
-        assert _is_unsafe("os.system('id')")
-        assert _is_unsafe("")
-        assert _is_unsafe("   ")
-        assert not _is_unsafe("(x+1)**2")
-        assert not _is_unsafe("sqrt(x**2) + sin(y)")
-        assert not _is_unsafe("x + y**2")
+    def test_looks_dangerous_helper(self):
+        # The cheap secondary reject (the PRIMARY gate is the child's restricted
+        # namespace — this just avoids spawning for obvious attempts).
+        assert _looks_dangerous("__import__('os')")
+        assert _looks_dangerous("eval('x')")
+        assert _looks_dangerous("exec('y')")
+        assert _looks_dangerous("open('/etc/passwd')")
+        assert _looks_dangerous("os.system('id')")
+        assert _looks_dangerous("x.__class__")
+        assert _looks_dangerous("getattr(os, 'system')")
+        assert not _looks_dangerous("(x+1)**2")
+        assert not _looks_dangerous("sqrt(x**2) + sin(y)")
+        assert not _looks_dangerous("x + y**2")
+
+
+class TestRCEBlocked:
+    """FIX2-C1: the two PROVEN-live RCE payloads MUST NOT execute. The PRIMARY
+    gate is the child's restricted namespace (no sympify/Function/eval); the
+    secondary _looks_dangerous scan covers the obvious forms. We assert no
+    marker file is written — the direct evidence the RCE is closed."""
+
+    def _marker(self, tmp_path):
+        import os
+        m = str(tmp_path / "pwned.txt")
+        if os.path.exists(m):
+            os.remove(m)
+        return m
+
+    def test_rce_expr_a_sympify_split_blocked(self, tmp_path):
+        """Bypass 1 (PROVEN): string-split sympify in expression_a. With the
+        restricted namespace, sympify is NOT callable -> no execution."""
+        import os
+        marker = self._marker(tmp_path)
+        payload = (
+            "sympify('_'+'_import_'+'_'+'(\"os\").system(\"echo PWNED > %s\")')"
+            % marker.replace("\\", "/")
+        )
+        r = symbolic_check(payload, "x", mode="equivalence")
+        # The check does not execute the payload — no marker file appears.
+        assert not os.path.exists(marker), "RCE executed: marker file written"
+        # The verdict is inconclusive (parse either rejected or auto-symbolized).
+        assert r["verdict"] == "inconclusive"
+
+    def test_rce_assumptions_injection_blocked(self, tmp_path):
+        """Bypass 2 (PROVEN): assumptions values flow into the unit resolver.
+        The secondary scan now covers assumptions (the old _is_unsafe did not)."""
+        import os
+        marker = self._marker(tmp_path)
+        payload = "__import__('os').system('echo PWNED > %s')" % marker.replace("\\", "/")
+        r = symbolic_check("x", "x", mode="dimensional", assumptions={"x": payload})
+        assert not os.path.exists(marker), "RCE via assumptions: marker written"
+        assert r["success"] is False
+        assert r["verdict"] == "inconclusive"
+
+    def test_rce_getattr_obfuscation_blocked(self, tmp_path):
+        """An obfuscation variant (getattr). The namespace restriction defeats it
+        even if the secondary scan missed the split form."""
+        import os
+        marker = self._marker(tmp_path)
+        payload = "getattr(getattr(x, '__class__'), '__bases__')"
+        r = symbolic_check(payload, "x", mode="equivalence")
+        assert not os.path.exists(marker), "getattr obfuscation executed"
+
+    def test_rce_unit_string_injection_blocked(self, tmp_path):
+        """A unit string in assumptions is parsed with the RESTRICTED namespace
+        (was sympy.sympify — an eval sink). No execution."""
+        import os
+        marker = self._marker(tmp_path)
+        payload = "__import__('os').system('echo PWNED > %s')" % marker.replace("\\", "/")
+        # velocity = d/t; pass a malicious unit for d.
+        r = symbolic_check("d/t", "v", mode="dimensional",
+                           assumptions={"d": payload, "t": "s", "v": "m/s"})
+        assert not os.path.exists(marker), "unit-string injection executed"
+
+    def test_legitimate_math_still_parses(self):
+        """Regression: the restricted namespace must still parse real math."""
+        r = symbolic_check("(x+1)**2", "x**2 + 2*x + 1", mode="equivalence")
+        assert r["verdict"] == "proven"
+        # Trig functions resolve from the whitelist; matching free symbols.
+        r2 = symbolic_check("sin(x)**2 + cos(x)**2", "cos(x)**2 + sin(x)**2",
+                            mode="equivalence")
+        assert r2["verdict"] == "proven"
+
+    def test_user_symbol_named_E_not_eulers_number(self):
+        """H6 (fixed by C1.2): a user symbol named E is a SYMBOL, not Euler's
+        number. E vs E must parse as the same free symbol -> proven."""
+        r = symbolic_check("E", "E", mode="equivalence")
+        assert r["verdict"] == "proven"
+        # And E vs E+1 must NOT be proven (E is a symbol, not the constant 2.718).
+        r2 = symbolic_check("E", "E + 1", mode="equivalence")
+        assert r2["verdict"] != "proven", "E must be a user symbol, not the constant"
 
 
 class TestRegistration:
