@@ -2049,6 +2049,131 @@ fn truncate_for_ui(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect::<String>() + "\n\n[Output truncated]"
 }
 
+// VS2-P1a: agent-facing traceback filter for notebook_exec. The kernel is
+// SHARED with the human pane, so the filter is applied HERE (the agent-facing
+// composition), not in the sidecar — the human debug pane keeps the raw
+// traceback. Mirrors app/tools/code.py::_filter_traceback:
+//   - keep the "Traceback (most recent call last):" header
+//   - keep user frames (File "<string>" or the cwd)
+//   - collapse consecutive library frames (site-packages / stdlib / Frameworks)
+//     to one marker naming how many were elided
+//   - ALWAYS keep the final exception line(s); for a chain
+//     ("During handling..." / "The above exception...") keep BOTH final blocks
+//     (VS1/F2 lesson: the root cause lives in the earlier block)
+// Returns (filtered_text, n_elided_blocks). When nothing was elided, returns
+// the input verbatim with n=0 so we don't pollute clean traces with markers.
+fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
+    if stderr.trim().is_empty() {
+        return (stderr.to_string(), 0);
+    }
+    // Only filter when this actually looks like a Python traceback.
+    let has_header = stderr.contains("Traceback (most recent call last)");
+    if !has_header {
+        return (stderr.to_string(), 0);
+    }
+
+    let chain_markers = [
+        "During handling of the above exception, another exception occurred:",
+        "The above exception was the direct cause of the following exception:",
+    ];
+    let is_user = |line: &str| {
+        line.trim_start().starts_with("File ")
+            && (line.contains("File \"<string>\"") || (!cwd.is_empty() && line.contains(cwd)))
+    };
+    let is_library = |line: &str| {
+        line.trim_start().starts_with("File ")
+            && [
+                "site-packages",
+                "dist-packages",
+                "python3.",
+                "/lib/python",
+                "/Frameworks/",
+            ]
+            .iter()
+            .any(|m| line.contains(m))
+    };
+
+    let lines: Vec<&str> = stderr.split_inclusive('\n').collect();
+    let mut kept: Vec<String> = Vec::new();
+    let mut run_of_library = 0u32;
+    let mut i = 0usize;
+    let n = lines.len();
+    let mut hit_chain = false;
+
+    let flush = |run: &mut u32, kept: &mut Vec<String>| {
+        if *run > 0 {
+            kept.push(format!(
+                "[... {run} library frame(s) elided — notebook pane keeps the full trace]\n"
+            ));
+            *run = 0;
+        }
+    };
+
+    while i < n {
+        let ln = lines[i];
+        let ln_trim = ln.trim_end_matches('\n');
+
+        // Chain marker: keep everything from here to the end verbatim.
+        if chain_markers.iter().any(|m| ln_trim.contains(m)) {
+            flush(&mut run_of_library, &mut kept);
+            kept.push(ln.to_string());
+            hit_chain = true;
+            i += 1;
+            continue;
+        }
+        if hit_chain {
+            kept.push(ln.to_string());
+            i += 1;
+            continue;
+        }
+
+        if ln_trim.trim_start().starts_with("File ") {
+            // A frame is the File line + the following indented code line.
+            let mut consumed = 1;
+            let mut code_line: Option<&str> = None;
+            if i + 1 < n {
+                let next = lines[i + 1].trim_end_matches('\n');
+                if next.starts_with("    ") {
+                    code_line = Some(lines[i + 1]);
+                    consumed = 2;
+                }
+            }
+            if is_user(ln_trim) {
+                flush(&mut run_of_library, &mut kept);
+                kept.push(ln.to_string());
+                if let Some(cl) = code_line {
+                    kept.push(cl.to_string());
+                }
+            } else if is_library(ln_trim) {
+                run_of_library += 1;
+            } else {
+                flush(&mut run_of_library, &mut kept);
+                kept.push(ln.to_string());
+                if let Some(cl) = code_line {
+                    kept.push(cl.to_string());
+                }
+            }
+            i += consumed;
+            continue;
+        }
+
+        // Header, code line, or final exception line.
+        flush(&mut run_of_library, &mut kept);
+        kept.push(ln.to_string());
+        i += 1;
+    }
+    flush(&mut run_of_library, &mut kept);
+
+    let elided = kept
+        .iter()
+        .filter(|l| l.contains("library frame(s) elided"))
+        .count();
+    if elided == 0 {
+        return (stderr.to_string(), 0);
+    }
+    (kept.concat(), elided)
+}
+
 fn parse_workflow_run_subcommand_args(
     args: &[String],
 ) -> Result<(String, BTreeMap<String, String>, bool)> {
@@ -3374,6 +3499,11 @@ async fn execute_notebook(
         })
         .collect();
 
+    // VS2-P1a: agent-facing traceback filter. The human pane keeps the raw
+    // cell.stderr (the kernel is shared); only the agent sees this filtered
+    // form, so library frames don't bury the final error line.
+    let (filtered_stderr, traceback_elided_frames) = filter_notebook_traceback(&cell.stderr, "");
+
     Ok(json!({
         "root": "notebook",
         "invocation": invocation,
@@ -3381,7 +3511,8 @@ async fn execute_notebook(
         "timed_out": false,
         "exit_code": if cell.success { 0 } else { 1 },
         "stdout": truncate_for_ui(&display, 30_000),
-        "stderr": truncate_for_ui(&cell.stderr, 30_000),
+        "stderr": truncate_for_ui(&filtered_stderr, 30_000),
+        "traceback_elided_frames": traceback_elided_frames,
         "execution_count": cell.execution_count,
         "result": cell.result,
         "error": cell.error,
@@ -3498,6 +3629,75 @@ pub fn to_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── VS2-P1a: filter_notebook_traceback ─────────────────────────────
+
+    #[test]
+    fn p1a_notebook_filter_keeps_final_line_elides_library_frames() {
+        let stderr = "Traceback (most recent call last):\n\
+  File \"<string>\", line 4, in <module>\n\
+    numpy.linalg.inv(mat)\n\
+  File \"/opt/homebrew/lib/python3.14/site-packages/numpy/linalg/linalg.py\", line 540, in inv\n\
+    ainv = _umath_linalg.inv(a)\n\
+  File \"/opt/homebrew/lib/python3.14/site-packages/numpy/linalg/linalg.py\", line 100, in _commonType\n\
+    raise ValueError(msg)\n\
+ValueError: Singular matrix\n";
+        let (filtered, n) = filter_notebook_traceback(stderr, "");
+        assert!(filtered.contains("ValueError: Singular matrix"));
+        assert!(filtered.contains("File \"<string>\""));
+        assert!(n > 0, "library frames must be collapsed: {filtered}");
+        assert!(
+            !filtered.contains("site-packages/numpy"),
+            "raw library path must not appear in agent-facing stderr"
+        );
+    }
+
+    #[test]
+    fn p1a_notebook_filter_unchanged_when_nothing_to_elide() {
+        let stderr = "Traceback (most recent call last):\n\
+  File \"<string>\", line 2, in <module>\n\
+    1/0\n\
+ZeroDivisionError: division by zero\n";
+        let (filtered, n) = filter_notebook_traceback(stderr, "");
+        assert_eq!(filtered, stderr, "verbatim when no library frames");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn p1a_notebook_filter_keeps_both_final_lines_for_chained_exception() {
+        let stderr = "Traceback (most recent call last):\n\
+  File \"<string>\", line 2, in <module>\n\
+    int(\"abc\")\n\
+ValueError: invalid literal for int() with base 10: 'abc'\n\
+\n\
+During handling of the above exception, another exception occurred:\n\
+\n\
+Traceback (most recent call last):\n\
+  File \"<string>\", line 4, in <module>\n\
+    raise RuntimeError(\"wrapped\")\n\
+RuntimeError: wrapped\n";
+        let (filtered, _) = filter_notebook_traceback(stderr, "");
+        // VS1/F2 lesson: for a chain, BOTH final blocks survive.
+        assert!(filtered.contains("ValueError: invalid literal"));
+        assert!(filtered.contains("During handling"));
+        assert!(filtered.contains("RuntimeError: wrapped"));
+    }
+
+    #[test]
+    fn p1a_notebook_filter_no_traceback_passthrough() {
+        // A plain warning (no "Traceback" header) passes through verbatim.
+        let s = "DeprecationWarning: foo is deprecated\n";
+        let (filtered, n) = filter_notebook_traceback(s, "");
+        assert_eq!(filtered, s);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn p1a_notebook_filter_empty_input() {
+        let (filtered, n) = filter_notebook_traceback("", "");
+        assert_eq!(filtered, "");
+        assert_eq!(n, 0);
+    }
 
     #[test]
     fn builds_internal_command_tools() {

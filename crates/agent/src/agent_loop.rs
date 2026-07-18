@@ -45,6 +45,15 @@ const MAX_TOOL_RESULT_CHARS: usize = 30_000;
 const DOOM_LOOP_WINDOW: usize = 3;
 /// How many consecutive empty results from the same tool before we stop
 const EMPTY_RESULT_MAX: usize = 2;
+// VS2-P1b: bounded verify-by-execution. Code-exec tools that fail repeatedly
+// get an honest cap — self-repair beyond ~2 attempts rarely fixes root cause
+// (research: feedback quality > attempt count; a model narrating its own trace
+// degrades the fix). 3 = initial + 2 repairs. After this we push the real last
+// error THEN a directive to stop editing and report honestly.
+const CODE_REPAIR_MAX: usize = 3;
+/// The code-execution tools whose failures count toward the repair cap. Canonical
+/// names only — notebook_run / run_python_notebook resolve to notebook_exec.
+const CODE_EXEC_TOOLS: &[&str] = &["execute_python", "execute_bash", "notebook_exec"];
 
 // ── Large-result handling ─────────────────────────────────────────
 
@@ -229,6 +238,32 @@ fn is_empty_result(content: &str) -> bool {
         }
     }
     false
+}
+
+/// VS2-P1b: build the "stop self-repairing" directive for a code-exec tool that
+/// has failed `streak` consecutive times. Returns `None` unless `streak >=
+/// CODE_REPAIR_MAX` AND `tool` is a code-exec tool — so the call site can gate
+/// on `if let Some(msg) = code_repair_directive(...)`. Pure (no loop state) so
+/// it is unit-testable in isolation.
+///
+/// The message is a DIRECTIVE, not a narration of the trace — research shows a
+/// model narrating its own trace degrades the fix. The real last error is
+/// pushed to history separately (h12) BEFORE this directive so the model has
+/// both the honest failure and the instruction to stop.
+fn code_repair_directive(tool: &str, streak: usize) -> Option<String> {
+    if streak < CODE_REPAIR_MAX {
+        return None;
+    }
+    if !CODE_EXEC_TOOLS.contains(&tool) {
+        return None;
+    }
+    Some(format!(
+        "{tool} failed {streak} consecutive times. Self-repair beyond 2 attempts rarely \
+         fixes the root cause — STOP editing and retrying. Report honestly: quote the \
+         traceback (the final error line is the real cause), and either ask the user for \
+         help or take a fundamentally different approach. Do not narrate the trace; act on \
+         the final error line."
+    ))
 }
 
 // ── Summarize tool result ─────────────────────────────────────────
@@ -777,6 +812,9 @@ pub async fn run_turn(
     let mut recent_sigs: VecDeque<String> = VecDeque::with_capacity(DOOM_LOOP_WINDOW + 1);
     // Track consecutive empty results per tool name
     let mut empty_result_streak: HashMap<String, usize> = HashMap::new();
+    // VS2-P1b: track consecutive FAILED code-exec calls per tool name. Resets
+    // on any successful code-exec call. Mirrors empty_result_streak's pattern.
+    let mut code_failure_streak: HashMap<String, usize> = HashMap::new();
     // Tools the model discovered via find_tools this turn — pinned so their
     // FULL definitions stay in the request every later iteration. Without this,
     // find_tools returned names the model could never actually call.
@@ -1473,6 +1511,68 @@ pub async fn run_turn(
                 empty_result_streak.remove(tool_name.as_str());
             }
 
+            // ── h7c. Bounded verify-by-execution (VS2-P1b) ─────────
+            // A code-exec tool that fails N>=CODE_REPAIR_MAX times in a row is
+            // spiraling: self-repair beyond ~2 attempts rarely fixes root cause.
+            // Push the REAL last error (so the model has the honest failure)
+            // THEN a directive to stop editing and report honestly. Do NOT
+            // swallow the real result, and do NOT ask the model to narrate the
+            // trace. Resets on any successful code-exec call, mirroring h7b.
+            if CODE_EXEC_TOOLS.contains(&tool_name.as_str()) {
+                if is_error {
+                    let streak = code_failure_streak.entry(tool_name.clone()).or_insert(0);
+                    *streak += 1;
+                    if let Some(directive) = code_repair_directive(tool_name, *streak) {
+                        // h8/h12 haven't run yet (we're before them), so push
+                        // the real filtered error ourselves first — never swallow it.
+                        let real_content =
+                            process_large_result(&content_after_hooks, &mut result_store);
+                        let real_summary = summarize_tool_result(
+                            tool_name,
+                            preview.as_deref(),
+                            &real_content,
+                            true,
+                        );
+                        emit(AgentEvent::ToolCallResult {
+                            call_id: call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            content: real_content.clone(),
+                            summary: Some(real_summary.clone()),
+                            preview: preview.clone(),
+                            elapsed_ms,
+                            is_error: true,
+                        });
+                        history.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: Some(real_content),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id.clone()),
+                        });
+                        traj_steps.push(real_summary);
+                        // THEN the directive as its own tool message.
+                        emit(AgentEvent::ToolCallResult {
+                            call_id: call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            content: directive.clone(),
+                            summary: Some(format!("{tool_name}: repair cap reached")),
+                            preview: preview.clone(),
+                            elapsed_ms,
+                            is_error: true,
+                        });
+                        history.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: Some(directive),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id.clone()),
+                        });
+                        continue;
+                    }
+                } else {
+                    // Success: reset this tool's failure streak.
+                    code_failure_streak.remove(tool_name.as_str());
+                }
+            }
+
             // ── h8. Large-result handling ─────────────────────────
             let content = process_large_result(&content_after_hooks, &mut result_store);
 
@@ -1590,6 +1690,57 @@ mod tests {
         let v = hook_result_value("plain text result", false);
         assert_eq!(v, Value::String("plain text result".to_string()));
         assert!(!crate::tool_result::tool_result_is_error(&v));
+    }
+
+    // ── VS2-P1b: code_repair_directive ─────────────────────────────────
+
+    #[test]
+    fn p1b_code_repair_directive_none_below_cap() {
+        assert_eq!(code_repair_directive("execute_python", 0), None);
+        assert_eq!(code_repair_directive("execute_python", 1), None);
+        assert_eq!(code_repair_directive("execute_python", 2), None);
+    }
+
+    #[test]
+    fn p1b_code_repair_directive_some_at_cap_for_code_tools() {
+        for tool in CODE_EXEC_TOOLS {
+            let msg =
+                code_repair_directive(tool, CODE_REPAIR_MAX).expect("cap reached for code tool");
+            assert!(
+                msg.contains(&format!(
+                    "{tool} failed {CODE_REPAIR_MAX} consecutive times"
+                )),
+                "directive names the tool + streak: {msg}"
+            );
+            assert!(
+                msg.to_lowercase().contains("stop"),
+                "directive must tell the model to stop retrying: {msg}"
+            );
+            assert!(
+                msg.to_lowercase().contains("do not narrate"),
+                "directive must explicitly tell the model not to narrate its trace: {msg}"
+            );
+        }
+        // Above the cap still fires.
+        assert!(code_repair_directive("execute_bash", 5).is_some());
+    }
+
+    #[test]
+    fn p1b_code_repair_directive_none_for_non_code_tools() {
+        // A non-code tool failing repeatedly is NOT a verify-by-execution spiral
+        // — don't gate it with the repair directive.
+        assert_eq!(code_repair_directive("read_file", 3), None);
+        assert_eq!(code_repair_directive("search", 10), None);
+    }
+
+    #[test]
+    fn p1b_code_exec_tools_canonical() {
+        // Aliases (notebook_run, run_python_notebook) resolve to notebook_exec,
+        // so only the 3 canonical names belong in the set.
+        assert_eq!(
+            CODE_EXEC_TOOLS,
+            &["execute_python", "execute_bash", "notebook_exec"]
+        );
     }
 
     #[test]

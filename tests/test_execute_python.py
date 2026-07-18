@@ -169,3 +169,139 @@ class TestFailureContract:
             "flags it via the !success rule, not only the error string"
         )
         assert "error" in result
+
+
+class TestTracebackFilter:
+    """VS2-P1a: _filter_traceback produces an AGENT-FACING stderr that keeps
+    the header + user frames + the final error line, while collapsing library
+    frames. The full raw trace is written to ~/.prism/state/tracebacks/."""
+
+    def test_keeps_final_value_error_line(self):
+        from app.tools.code import _filter_traceback
+        tb = (
+            'Traceback (most recent call last):\n'
+            '  File "<string>", line 4, in <module>\n'
+            '    numpy.linalg.inv(mat)\n'
+            '  File "/opt/homebrew/lib/python3.14/site-packages/numpy/linalg/linalg.py", line 540, in inv\n'
+            '    ainv = _umath_linalg.inv(a)\n'
+            'ValueError: Singular matrix\n'
+        )
+        r = _filter_traceback(tb, "/cwd")
+        assert "ValueError: Singular matrix" in r["stderr"], (
+            "final error line must survive: %r" % r["stderr"]
+        )
+
+    def test_elides_library_frames_with_marker(self):
+        from app.tools.code import _filter_traceback
+        tb = (
+            'Traceback (most recent call last):\n'
+            '  File "<string>", line 1, in <module>\n'
+            '    f()\n'
+            '  File "/x/site-packages/numpy/core.py", line 1, in f\n'
+            '    pass\n'
+            '  File "/x/site-packages/numpy/core.py", line 2, in g\n'
+            '    pass\n'
+            'RuntimeError: boom\n'
+        )
+        r = _filter_traceback(tb, "/cwd")
+        assert r["traceback_elided_frames"] >= 1
+        assert "library frame(s) elided" in r["stderr"]
+        assert "site-packages/numpy" not in r["stderr"], "raw lib path must not leak"
+
+    def test_unchanged_when_nothing_to_elide(self):
+        from app.tools.code import _filter_traceback
+        tb = (
+            'Traceback (most recent call last):\n'
+            '  File "<string>", line 2, in <module>\n'
+            '    1/0\n'
+            'ZeroDivisionError: division by zero\n'
+        )
+        r = _filter_traceback(tb, "/cwd")
+        assert r["stderr"] == tb, "verbatim when nothing to elide"
+        assert r["traceback_elided_frames"] == 0
+
+    def test_never_returns_empty_when_there_is_a_final_line(self):
+        from app.tools.code import _filter_traceback
+        # Even if EVERY frame is a library frame, the final error line survives.
+        tb = (
+            'Traceback (most recent call last):\n'
+            '  File "/x/site-packages/a.py", line 1, in x\n'
+            '    pass\n'
+            '  File "/x/site-packages/b.py", line 2, in y\n'
+            '    pass\n'
+            'RuntimeError: deep\n'
+        )
+        r = _filter_traceback(tb, "/cwd")
+        assert r["stderr"].strip() != "", "filtered stderr must never be empty"
+        assert "RuntimeError: deep" in r["stderr"]
+
+    def test_chained_exception_keeps_both_final_lines(self):
+        from app.tools.code import _filter_traceback
+        tb = (
+            'Traceback (most recent call last):\n'
+            '  File "<string>", line 2, in <module>\n'
+            '    int("abc")\n'
+            "ValueError: invalid literal for int() with base 10: 'abc'\n"
+            "\n"
+            "During handling of the above exception, another exception occurred:\n"
+            "\n"
+            'Traceback (most recent call last):\n'
+            '  File "<string>", line 4, in <module>\n'
+            '    raise RuntimeError("wrapped")\n'
+            'RuntimeError: wrapped\n'
+        )
+        r = _filter_traceback(tb, "/cwd")
+        # VS1/F2 lesson: keep BOTH final blocks for a chain.
+        assert "ValueError: invalid literal" in r["stderr"]
+        assert "During handling" in r["stderr"]
+        assert "RuntimeError: wrapped" in r["stderr"]
+
+    def test_writes_full_traceback_and_returns_path(self):
+        from app.tools.code import _filter_traceback
+        from pathlib import Path
+        tb = (
+            'Traceback (most recent call last):\n'
+            '  File "/x/site-packages/numpy/a.py", line 1, in f\n'
+            '    pass\n'
+            'ValueError: x\n'
+        )
+        r = _filter_traceback(tb, "/cwd")
+        assert r["stderr_full_path"], "path must be returned"
+        p = Path(r["stderr_full_path"])
+        assert p.exists(), "the full raw traceback must be persisted"
+        # CRITICAL: the raw stderr must NOT be in the agent-facing stderr.
+        assert "site-packages/numpy" not in r["stderr"]
+        # But the full raw IS in the file.
+        assert "site-packages/numpy" in p.read_text()
+
+    def test_no_traceback_passthrough(self):
+        from app.tools.code import _filter_traceback
+        # A plain warning (no Traceback header) passes through verbatim.
+        r = _filter_traceback("DeprecationWarning: foo\n", "/cwd")
+        assert r["stderr"] == "DeprecationWarning: foo\n"
+        assert r["traceback_elided_frames"] == 0
+
+    def test_empty_input(self):
+        from app.tools.code import _filter_traceback
+        r = _filter_traceback("", "/cwd")
+        assert r["stderr"] == ""
+        assert r["stderr_full_path"] == ""
+        assert r["traceback_elided_frames"] == 0
+
+
+class TestFilterPreservesGateSignal:
+    """VS2-P1: filtering the agent-facing stderr must NOT mask the failure
+    from the F1 is_error gate. The gate keys on `success`, and _execute_python
+    sets success:False on failure regardless of stderr content — so a filtered
+    failure still trips the gate."""
+
+    def test_filtered_failure_still_has_success_false(self):
+        # A real failing program: the filtered stderr is in the result, but
+        # success:False is the load-bearing signal for the gate.
+        result = _execute_python(code="raise ValueError('boom')")
+        assert result["success"] is False
+        assert result["exit_code"] != 0
+        # The final error line must be present in the filtered stderr.
+        assert "ValueError: boom" in result.get("stderr", "")
+        # And the agent-facing stderr must NOT contain raw library frames.
+        assert "traceback_elided_frames" in result

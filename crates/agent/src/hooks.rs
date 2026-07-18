@@ -311,6 +311,66 @@ fn classify_for_provenance(result: &Value) -> (Option<String>, Option<i64>) {
     )
 }
 
+// ── VS2-P1c: PROV-O chaining for the verify-by-execution repair loop ──────
+//
+// Records the last code-exec tool call so the NEXT one (if it's a repair of
+// the same tool after a failure) can point at it via `parent_id` and tag
+// itself `repair_attempt`. Walking the `parent_id` chain then reconstructs the
+// whole repair sequence. Mirrors the PROVENANCE_CTX static pattern.
+
+/// Code-execution tools whose consecutive failures form a repair chain.
+const PROV_CODE_EXEC_TOOLS: &[&str] = &["execute_python", "execute_bash", "notebook_exec"];
+
+#[derive(Clone, Debug)]
+struct LastCodeRun {
+    tool: String,
+    record_id: String,
+    failed: bool,
+}
+
+/// One-process memory of the last code-exec call. One process serves one
+/// session at a time, so a single static is sufficient (same rationale as
+/// PROVENANCE_CTX). Mutable through a Mutex — the hook closure only holds it
+/// briefly.
+static LAST_CODE_RUN: std::sync::Mutex<Option<LastCodeRun>> = std::sync::Mutex::new(None);
+
+/// Pure helper: given the current tool + its status, and the remembered last
+/// code run, decide (parent_id, tags) for the new record.
+///
+/// - Code-exec tools always get the `code_exec` tag (so "all code runs" is
+///   queryable).
+/// - If the PREVIOUS code-exec run was the SAME tool AND failed, this run is a
+///   repair attempt: set `parent_id` to the previous record and tag
+///   `repair_attempt`.
+/// - Chains NEVER cross tools (an execute_python failure does not make a later
+///   execute_bash run a "repair").
+/// - Non-code-exec tools: empty tags, no parent.
+///
+/// Extracted as a pure fn so it's unit-testable without the static / the hook.
+fn chain_code_run(
+    tool_name: &str,
+    status: &str,
+    last: &Option<LastCodeRun>,
+) -> (Option<String>, Vec<String>) {
+    if !PROV_CODE_EXEC_TOOLS.contains(&tool_name) {
+        return (None, Vec::new());
+    }
+    let mut tags = vec!["code_exec".to_string()];
+    let mut parent_id = None;
+    if let Some(prev) = last
+        && prev.tool == tool_name
+        && prev.failed
+    {
+        parent_id = Some(prev.record_id.clone());
+        tags.push("repair_attempt".to_string());
+    }
+    // status is "error" or "ok" (from classify_for_provenance); unused beyond
+    // the call site updating LAST_CODE_RUN, but kept in the signature so the
+    // helper is self-contained and testable for the "reset on success" path.
+    let _ = status;
+    (parent_id, tags)
+}
+
 /// Provenance hook — records every tool call to Turso via a spawned
 /// async task. Non-blocking: the hook returns immediately, the write
 /// happens in the background.
@@ -342,8 +402,38 @@ fn provenance_hook() -> Hook {
             // flag, the gate, and the summary can never disagree. "which runs
             // failed" is now a real query against the provenance store.
             let (status, exit_code) = classify_for_provenance(result);
-            record.status = status;
+            record.status = status.clone();
             record.exit_code = exit_code;
+
+            // VS2-P1c: PROV-O chaining for the verify-by-execution repair loop.
+            // For code-exec tools, if the previous code-exec run was the SAME
+            // tool and FAILED, this run is a repair attempt — point at the
+            // previous record via parent_id and tag repair_attempt. Always tag
+            // code_exec. Then remember THIS run as the new "last" for the next
+            // call. Walking parent_id reconstructs the whole repair chain.
+            let status_str = status.as_deref().unwrap_or("ok");
+            let last = LAST_CODE_RUN
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or(None);
+            let (parent_id, chain_tags) = chain_code_run(tool_name, status_str, &last);
+            if let Some(pid) = parent_id {
+                record.parent_id = Some(pid);
+            }
+            record.tags.extend(chain_tags);
+            // Update LAST_CODE_RUN only for code-exec tools (non-code tools
+            // never participate in a repair chain). `failed` drives whether the
+            // NEXT same-tool call is tagged repair_attempt.
+            if PROV_CODE_EXEC_TOOLS.contains(&tool_name) {
+                let this_run = LastCodeRun {
+                    tool: tool_name.to_string(),
+                    record_id: record.id.clone(),
+                    failed: status_str == "error",
+                };
+                if let Ok(mut guard) = LAST_CODE_RUN.lock() {
+                    *guard = Some(this_run);
+                }
+            }
 
             // Try to spawn a background write task.
             // VS1/F5: a write failure must NOT be silent. There is no shared
@@ -544,6 +634,76 @@ mod tests {
         let (status, exit) = classify_for_provenance(&json!({ "error": "unknown tool: frob" }));
         assert_eq!(status.as_deref(), Some("error"));
         assert_eq!(exit, None);
+    }
+
+    // ── VS2-P1c: chain_code_run (PROV-O repair chaining) ───────────────
+
+    fn last_run(tool: &str, failed: bool) -> Option<LastCodeRun> {
+        Some(LastCodeRun {
+            tool: tool.to_string(),
+            record_id: format!("rec-{tool}-1"),
+            failed,
+        })
+    }
+
+    #[test]
+    fn p1c_chains_fail_to_attempt_same_tool() {
+        // Previous execute_python failed → this execute_python is a repair.
+        let (parent, tags) =
+            chain_code_run("execute_python", "error", &last_run("execute_python", true));
+        assert_eq!(parent.as_deref(), Some("rec-execute_python-1"));
+        assert!(tags.contains(&"code_exec".to_string()));
+        assert!(tags.contains(&"repair_attempt".to_string()));
+    }
+
+    #[test]
+    fn p1c_does_not_chain_across_different_tools() {
+        // A failed execute_python does NOT make a later execute_bash a "repair".
+        let (parent, tags) =
+            chain_code_run("execute_bash", "error", &last_run("execute_python", true));
+        assert_eq!(parent, None, "no cross-tool chaining");
+        assert!(tags.contains(&"code_exec".to_string()));
+        assert!(
+            !tags.contains(&"repair_attempt".to_string()),
+            "different tool is not a repair attempt"
+        );
+    }
+
+    #[test]
+    fn p1c_resets_on_success_no_repair_tag() {
+        // Previous execute_python SUCCEEDED → this one is not a repair, even
+        // though it's the same tool.
+        let (parent, tags) = chain_code_run(
+            "execute_python",
+            "error",
+            &last_run("execute_python", false),
+        );
+        assert_eq!(parent, None, "success resets the chain");
+        assert!(tags.contains(&"code_exec".to_string()));
+        assert!(!tags.contains(&"repair_attempt".to_string()));
+    }
+
+    #[test]
+    fn p1c_first_call_has_no_parent() {
+        // No previous run at all → no parent, just the code_exec tag.
+        let (parent, tags) = chain_code_run("execute_python", "error", &None);
+        assert_eq!(parent, None);
+        assert_eq!(tags, vec!["code_exec".to_string()]);
+    }
+
+    #[test]
+    fn p1c_non_code_tools_get_no_tags() {
+        let (parent, tags) = chain_code_run("search", "error", &last_run("search", true));
+        assert_eq!(parent, None);
+        assert!(tags.is_empty(), "non-code tools don't participate");
+    }
+
+    #[test]
+    fn p1c_code_exec_tag_always_present_for_code_tools() {
+        // Even on a successful first call, code-exec tools get the code_exec tag
+        // so "all code runs" is queryable.
+        let (_, tags) = chain_code_run("notebook_exec", "ok", &None);
+        assert!(tags.contains(&"code_exec".to_string()));
     }
 
     #[test]
