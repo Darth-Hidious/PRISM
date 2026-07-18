@@ -131,6 +131,47 @@ class TestDimensional:
         assert "dimensions differ" in r.get("counterexample", ""), r
 
 
+class TestDimensionalHonesty:
+    """FIX2-H2/H9: dimensional mode must FAIL LOUD on typos / undeclared
+    symbols (no silent meter fallback) and reduce named-vs-derived units."""
+
+    def test_h2_typo_unit_is_inconclusive(self):
+        """A typo'd unit string must NOT silently become meter (the old fallback
+        faked a 'proven'). It is inconclusive naming the unrecognized unit."""
+        r = symbolic_check("d/t", "v", mode="dimensional",
+                           assumptions={"d": "m", "t": "s", "v": "mter/s"})
+        assert r["verdict"] == "inconclusive", r
+        assert "not recognized" in r.get("reason", ""), r
+
+    def test_h2_undeclared_symbol_is_inconclusive(self):
+        """An undeclared free symbol must NOT default to meter. The old default
+        'proved' v=t for undeclared v. Now it names the missing declaration."""
+        r = symbolic_check("d/t", "v", mode="dimensional",
+                           assumptions={"d": "m", "t": "s"})
+        assert r["verdict"] == "inconclusive", r
+        assert "not declared" in r.get("reason", ""), r
+
+    def test_h2_velocity_declared_is_proven(self):
+        """Regression: properly-declared v=d/t (m/s) still proves."""
+        r = symbolic_check("d/t", "v", mode="dimensional",
+                           assumptions={"d": "m", "t": "s", "v": "m/s"})
+        assert r["verdict"] == "proven"
+
+    def test_h9_named_vs_derived_units_reduce(self):
+        """newton vs kg*m/s**2 are physically identical. dimsys_SI.equivalent_dims
+        reduces them, so the verdict is 'proven' (more honest than the old
+        false 'fail', and better than the spec's 'inconclusive' fallback)."""
+        r = symbolic_check("m*a", "F", mode="dimensional",
+                           assumptions={"m": "kg", "a": "m/s**2", "F": "newton"})
+        assert r["verdict"] == "proven", r
+
+    def test_h2_real_mismatch_still_fails(self):
+        """A genuine dimensional mismatch (time vs distance) is still 'fail'."""
+        r = symbolic_check("t", "d", mode="dimensional",
+                           assumptions={"t": "s", "d": "m"})
+        assert r["verdict"] == "fail"
+
+
 class TestGateContract:
     """The VS1-gate-aware rule: success means 'ran', not 'claim holds'.
 

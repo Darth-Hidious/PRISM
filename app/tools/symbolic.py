@@ -321,14 +321,22 @@ def run(cfg):
 
     if mode == "dimensional":
         # Dimensional consistency via sympy.physics.units. Substitute each free
-        # symbol with the unit declared in `assumptions` and compare dimensions
-        # via the ratio (dim_a/dim_b == 1). C1: unit strings are parsed with
+        # symbol with the unit declared in `assumptions` and compare the resulting
+        # DIMENSIONS via the SI dimension system. C1: unit strings parsed with
         # parse_restricted (the SAME safe namespace), NOT sympy.sympify.
+        # H2: FAIL LOUD — the old code silently substituted units.meter on any
+        # unrecognized unit string AND defaulted undeclared symbols to meter ->
+        # a typo or missing declaration "proved" dimensional consistency.
+        # H9: named-vs-derived units (newton vs kg*m/s**2) ARE physically
+        # identical; dimsys_SI.equivalent_dims reduces them correctly (a plain
+        # ratio==1 could not, which produced a false "fail").
         from sympy.physics import units
+        from sympy.physics.units import Quantity
+        from sympy.physics.units.systems.si import dimsys_SI
 
         def _resolve_unit(uname):
             """Resolve a unit string to a unit expr, or None if unrecognized.
-            C1: parse unit strings with the RESTRICTED namespace (no sympify)."""
+            NO silent meter fallback (H2)."""
             base = {
                 "m": units.meter, "meter": units.meter,
                 "s": units.second, "sec": units.second, "second": units.second,
@@ -344,26 +352,56 @@ def run(cfg):
             if uname in base:
                 return base[uname]
             try:
-                return parse_restricted(uname, base)
+                parsed = parse_restricted(uname, base)
             except Exception:
                 return None
+            # Reject if the parse produced free symbols that are NOT recognized
+            # Quantities (a typo like "mter" becomes a free Symbol, not a unit).
+            if parsed.free_symbols:
+                return None
+            return parsed
+
+        def _resolve_side(expr):
+            """Resolve every free symbol's unit. FAIL LOUD on:
+            - an undeclared symbol (no unit in assumptions) -> inconclusive
+            - an unrecognized unit string -> inconclusive
+            Returns (subs_dict, None) or (None, reason_str)."""
+            subs = {}
+            for s in expr.free_symbols:
+                name = str(s)
+                if name not in assumptions:
+                    return None, "dimension of symbol '{}' not declared (pass it in assumptions, e.g. {{'{}': 'm'}})".format(name, name)
+                uname = assumptions[name]
+                unit = _resolve_unit(uname)
+                if unit is None:
+                    return None, "unit '{}' not recognized".format(uname)
+                subs[s] = unit
+            return subs, None
+
+        def _dim_of(expr):
+            """Reduce an expression of Quantities to its Dimension."""
+            subs = {q: q.dimension for q in expr.atoms(Quantity)}
+            return simplify(expr.subs(subs))
 
         try:
-            subs_a = {
-                s: _resolve_unit(assumptions.get(str(s), "m"))
-                for s in a.free_symbols
-            }
-            dim_a = simplify(a.subs(subs_a))
+            subs_a, err = _resolve_side(a)
+            if err:
+                emit({"ok": True, "result": {
+                    "verdict": "inconclusive", "reason": err,
+                }})
+                return
+            dim_a = _dim_of(a.subs(subs_a))
             if b is not None:
-                subs_b = {
-                    s: _resolve_unit(assumptions.get(str(s), "m"))
-                    for s in b.free_symbols
-                }
-                dim_b = simplify(b.subs(subs_b))
+                subs_b, err = _resolve_side(b)
+                if err:
+                    emit({"ok": True, "result": {
+                        "verdict": "inconclusive", "reason": err,
+                    }})
+                    return
+                dim_b = _dim_of(b.subs(subs_b))
             else:
                 dim_b = dim_a
-            ratio = simplify(dim_a / dim_b)
-            consistent = ratio == 1
+            consistent = dimsys_SI.equivalent_dims(dim_a, dim_b)
             if consistent:
                 emit({"ok": True, "result": {
                     "verdict": "proven", "method": "dimensional consistency",
@@ -373,7 +411,7 @@ def run(cfg):
                 emit({"ok": True, "result": {
                     "verdict": "fail", "method": "dimensional",
                     "dimension_a": str(dim_a), "dimension_b": str(dim_b),
-                    "counterexample": "dimensions differ (ratio={})".format(str(ratio)),
+                    "counterexample": "dimensions differ",
                 }})
         except Exception as e:
             emit({"ok": True, "result": {
