@@ -2141,13 +2141,51 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
+/// F2 (PEP 654): strip a leading ExceptionGroup / TaskGroup gutter so the
+/// remaining content keeps its NATURAL traceback indentation for classification.
+///
+/// CPython prefixes every line inside an ExceptionGroup traceback with a gutter:
+/// `  | ` (outer) or `    | ` (nested sub-exception), and the group header with
+/// `  + `. Without stripping, a `File ".../site-packages/..."` frame reads as
+/// `|   File ...` — `is_frame_line`/`is_library` miss it and the ENTIRE group
+/// traceback leaks verbatim (the H1 leak class). Strip exactly the
+/// `<indent>[|+] ` gutter: the remainder keeps its own indentation (frame
+/// `  File`, body `    src`, and the final `EType: msg` at column 0) so the
+/// normal frame/body/final-line checks apply to `| File ".../site-packages/…"`.
+///
+/// Divider lines (`+-+---------------- 1 ----------------`,
+/// `+------------------------------------`) have a `-`/`+` immediately after the
+/// corner — NOT a space — so they don't match the `[|+] ` gutter and are
+/// returned unchanged; `is_group_divider` keeps them classified as structure
+/// (kept verbatim, never consumed as a frame body).
+fn strip_group_margin(line: &str) -> &str {
+    let trimmed = line.trim_start_matches(' ');
+    trimmed
+        .strip_prefix("| ")
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .unwrap_or(line)
+}
+
+/// F2: a PEP 654 group divider — after indentation, a `+` corner followed only
+/// by `+`/`-`/space/digit runs (`+-+---------------- 1 ----------------`,
+/// `+------------------------------------`). Group STRUCTURE: never a frame or a
+/// body line, always kept verbatim so the sub-exception boundaries survive.
+fn is_group_divider(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with('+')
+        && t.contains("--")
+        && t.chars()
+            .all(|c| matches!(c, '+' | '-' | ' ') || c.is_ascii_digit())
+}
+
 /// G1: recognize BOTH stdlib and IPython frame-header forms (after ANSI strip).
 /// stdlib form: `  File "...", line N, in func`. ipykernel forms:
 /// `File ~/path:N, in func` (unquoted, `~`-collapsed, colon) and
 /// `Cell In[N], line M, in func` (live kernel cell). All start with `File ` or
-/// `Cell In[` once ANSI-stripped + trimmed.
+/// `Cell In[` once ANSI-stripped + trimmed. F2: also after stripping any
+/// ExceptionGroup gutter, so `| File …` inside a group is recognized.
 fn is_frame_line(line: &str) -> bool {
-    let t = line.trim_start();
+    let t = strip_group_margin(line).trim_start();
     t.starts_with("File ") || t.starts_with("Cell In[")
 }
 
@@ -2170,6 +2208,17 @@ fn is_frame_line(line: &str) -> bool {
 /// column-0, non-arrow, non-blank line is the final exception line and ENDS the
 /// body.
 fn is_traceback_body_line(line: &str) -> bool {
+    // F2: a PEP 654 group divider is STRUCTURE, never a frame body — it must
+    // BREAK the continuation run so the `+---- N ----` boundaries survive
+    // (otherwise, being space-indented, it would be swallowed as body).
+    if is_group_divider(line) {
+        return false;
+    }
+    // F2: strip any ExceptionGroup gutter so the content keeps its natural
+    // indentation — a `  |     src` body stays `    src` (still indented → body),
+    // while the final `  | EType: msg` line drops to column 0 and correctly ENDS
+    // the body instead of being kept as an indented continuation.
+    let line = strip_group_margin(line);
     if line.trim().is_empty() {
         return false;
     }
@@ -2244,7 +2293,10 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
         .filter(|h| !h.is_empty())
         .and_then(|h| cwd.strip_prefix(&h).map(|rest| format!("~{rest}")));
     let is_library = |line: &str| {
-        let t = line.trim_start();
+        // F2: strip an ExceptionGroup gutter first so `| File ".../site-packages/…"`
+        // is recognized as a frame; the `line.contains(...)` marker/cwd checks
+        // below still see the (unstripped) full path, so they're unaffected.
+        let t = strip_group_margin(line).trim_start();
         if !(t.starts_with("File ") || t.starts_with("Cell In[")) {
             return false;
         }
@@ -4204,6 +4256,165 @@ RuntimeError: boom\n"
                 "library source/path leaked: {leaked:?}\n---\n{filtered}"
             );
         }
+    }
+
+    /// REAL PEP 654 ExceptionGroup capture from ipykernel (`fresh11_group_stderr.txt`,
+    /// left by the P1-fix-3 reviewers): a user cell raises an `ExceptionGroup`
+    /// whose outer traceback and both sub-exceptions run through a fake
+    /// `site-packages/fakelib`. Every line carries a CPython group gutter
+    /// (`  | ` / `    | `) or is a group divider (`+---- N ----`). Embedded
+    /// BYTE-FOR-BYTE. Pre-F2 the whole group leaked verbatim (`|   File` never
+    /// matched the frame check).
+    const REAL_IPYKERNEL_GROUP_TRACE: &str = r#"  + Exception Group Traceback (most recent call last):
+  |   File "/opt/homebrew/lib/python3.14/site-packages/IPython/core/interactiveshell.py", line 3701, in run_code
+  |     exec(code_obj, self.user_global_ns, self.user_ns)
+  |     ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |   File "/var/folders/g9/ctk1s9tx0j79d2_bq782vnpm0000gn/T/ipykernel_33660/2764102629.py", line 3, in <module>
+  |     group_entry(0)
+  |     ~~~~~~~~~~~^^^
+  |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 105, in group_entry
+  |     raise ExceptionGroup("several fakelib failures", errs)  # SECRET_SRC_GROUP_RAISE
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  | ExceptionGroup: several fakelib failures (2 sub-exceptions)
+  +-+---------------- 1 ----------------
+    | Traceback (most recent call last):
+    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
+    |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER
+    |     ~~~~~~~~~~~~~~~~^^^
+    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
+    |     raise ValueError("fakelib inner transform exploded")  # SECRET_SRC_RAISE
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    | ValueError: fakelib inner transform exploded
+    +---------------- 2 ----------------
+    | Traceback (most recent call last):
+    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
+    |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER
+    |     ~~~~~~~~~~~~~~~~^^^
+    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
+    |     raise ValueError("fakelib inner transform exploded")  # SECRET_SRC_RAISE
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    | ValueError: fakelib inner transform exploded
+    +------------------------------------
+"#;
+
+    /// REAL PEP 654 ExceptionGroup capture from `python -c` (`stdlib2_group.txt`).
+    /// Same shape, but the user frame is `File "<string>"` (no ipykernel temp).
+    /// Embedded BYTE-FOR-BYTE.
+    const REAL_STDLIB_GROUP_TRACE: &str = r#"  + Exception Group Traceback (most recent call last):
+  |   File "<string>", line 3, in <module>
+  |     group_entry(0)
+  |     ~~~~~~~~~~~^^^
+  |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 105, in group_entry
+  |     raise ExceptionGroup("several fakelib failures", errs)  # SECRET_SRC_GROUP_RAISE
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  | ExceptionGroup: several fakelib failures (2 sub-exceptions)
+  +-+---------------- 1 ----------------
+    | Traceback (most recent call last):
+    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
+    |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER
+    |     ~~~~~~~~~~~~~~~~^^^
+    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
+    |     raise ValueError("fakelib inner transform exploded")  # SECRET_SRC_RAISE
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    | ValueError: fakelib inner transform exploded
+    +---------------- 2 ----------------
+    | Traceback (most recent call last):
+    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
+    |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER
+    |     ~~~~~~~~~~~~~~~~^^^
+    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
+    |     raise ValueError("fakelib inner transform exploded")  # SECRET_SRC_RAISE
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    | ValueError: fakelib inner transform exploded
+    +------------------------------------
+"#;
+
+    // Shared assertions for a filtered ExceptionGroup: no library SOURCE or path
+    // leaks, but the group STRUCTURE (header + `+---- N ----` dividers) and every
+    // final exception line survive (fail-open collapse, never a mask).
+    fn assert_group_filtered(filtered: &str, n: usize) {
+        // The library FRAMES collapse: no site-packages path, no raw library
+        // source, none of the SECRET_SRC_* markers embedded in library source.
+        for leaked in [
+            "site-packages/fakelib",
+            "site-packages/IPython",
+            "SECRET_SRC_GROUP_RAISE",
+            "SECRET_SRC_GROUP_INNER",
+            "SECRET_SRC_RAISE",
+            "_inner_transform(i)",
+            "raise ValueError(\"fakelib inner transform exploded\")",
+            "raise ExceptionGroup(",
+            "exec(code_obj",
+        ] {
+            assert!(
+                !filtered.contains(leaked),
+                "ExceptionGroup library source/path leaked: {leaked:?}\n---\n{filtered}"
+            );
+        }
+        // Group STRUCTURE survives: the header and BOTH sub-exception dividers +
+        // the closing divider.
+        assert!(
+            filtered.contains("Exception Group Traceback (most recent call last):"),
+            "group header must survive: {filtered}"
+        );
+        assert!(
+            filtered.contains("---------------- 1 ----------------"),
+            "sub-exception 1 divider must survive: {filtered}"
+        );
+        assert!(
+            filtered.contains("---------------- 2 ----------------"),
+            "sub-exception 2 divider must survive: {filtered}"
+        );
+        assert!(
+            filtered.contains("+------------------------------------"),
+            "closing divider must survive: {filtered}"
+        );
+        // Final exception lines survive (outer group + each sub-exception).
+        assert!(
+            filtered.contains("ExceptionGroup: several fakelib failures (2 sub-exceptions)"),
+            "outer ExceptionGroup final line must survive: {filtered}"
+        );
+        assert!(
+            filtered.contains("ValueError: fakelib inner transform exploded"),
+            "sub-exception final line must survive: {filtered}"
+        );
+        // Something WAS collapsed.
+        assert!(n >= 1, "at least one library frame elided: got {n}");
+    }
+
+    #[test]
+    fn f2_real_ipykernel_exception_group_collapses_library_keeps_structure() {
+        // F2 (PEP 654): the last leak variant. Every group line is gutter-prefixed
+        // (`  | File ...`), so the pre-fix frame check missed all of them and the
+        // ENTIRE group traceback leaked verbatim. The margin-strip must collapse
+        // the site-packages frames while KEEPING the group dividers + final lines.
+        // Sanity: the fixture really is the raw capture (secrets present).
+        assert!(REAL_IPYKERNEL_GROUP_TRACE.contains("SECRET_SRC_GROUP_RAISE"));
+        assert!(REAL_IPYKERNEL_GROUP_TRACE.contains("site-packages/fakelib"));
+        let (filtered, n) = filter_notebook_traceback(REAL_IPYKERNEL_GROUP_TRACE, "/some/project");
+        assert_group_filtered(&filtered, n);
+        // The ipykernel outer block: IPython + fakelib (2) library frames plus, in
+        // each of the 2 sub-exceptions, 2 fakelib frames -> 6 library frames total.
+        assert_eq!(
+            n, 6,
+            "all six library frames across the group elided: got {n}\n{filtered}"
+        );
+    }
+
+    #[test]
+    fn f2_real_stdlib_exception_group_collapses_library_keeps_structure() {
+        // F2: the `python -c` form (stderr). Same margin logic; the user frame is
+        // `File "<string>"` (kept), the fakelib frames collapse.
+        assert!(REAL_STDLIB_GROUP_TRACE.contains("SECRET_SRC_RAISE"));
+        let (filtered, n) = filter_notebook_traceback(REAL_STDLIB_GROUP_TRACE, "");
+        assert_group_filtered(&filtered, n);
+        // The user `<string>` frame is KEPT (not a library frame).
+        assert!(
+            filtered.contains("File \"<string>\""),
+            "user <string> frame must survive: {filtered}"
+        );
+        // Outer block: 1 fakelib frame; each sub-exception: 2 -> 5 total.
+        assert_eq!(n, 5, "all five library frames elided: got {n}\n{filtered}");
     }
 
     #[test]

@@ -518,6 +518,116 @@ class TestTracebackFilter:
         assert "not persisted" in r["stderr"]
 
 
+    # ── F2 (PEP 654): ExceptionGroup / TaskGroup margin ────────────────
+    # Real captures left by the P1-fix-3 reviewers, embedded BYTE-FOR-BYTE. Every
+    # line carries a CPython group gutter (`  | ` / `    | `) or is a divider
+    # (`+---- N ----`); pre-F2 the whole group leaked verbatim because `| File …`
+    # never matched the frame check. The fix must COLLAPSE the site-packages
+    # frames while KEEPING the group header + dividers + every final line.
+
+    def _assert_group_filtered(self, out):
+        for leaked in (
+            "site-packages/fakelib",
+            "site-packages/IPython",
+            "SECRET_SRC_GROUP_RAISE",
+            "SECRET_SRC_GROUP_INNER",
+            "SECRET_SRC_RAISE",
+            "_inner_transform(i)",
+            'raise ValueError("fakelib inner transform exploded")',
+            "raise ExceptionGroup(",
+            "exec(code_obj",
+        ):
+            assert leaked not in out, "library source/path leaked: %r\n---\n%s" % (leaked, out)
+        assert "Exception Group Traceback (most recent call last):" in out, out
+        assert "---------------- 1 ----------------" in out, out
+        assert "---------------- 2 ----------------" in out, out
+        assert "+------------------------------------" in out, out
+        assert "ExceptionGroup: several fakelib failures (2 sub-exceptions)" in out, out
+        assert "ValueError: fakelib inner transform exploded" in out, out
+
+    def test_f2_real_ipykernel_exception_group_collapses_library_keeps_structure(self):
+        from app.tools.code import _filter_traceback
+        tb = (
+            "  + Exception Group Traceback (most recent call last):\n"
+            "  |   File \"/opt/homebrew/lib/python3.14/site-packages/IPython/core/interactiveshell.py\", line 3701, in run_code\n"
+            "  |     exec(code_obj, self.user_global_ns, self.user_ns)\n"
+            "  |     ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+            "  |   File \"/var/folders/g9/ctk1s9tx0j79d2_bq782vnpm0000gn/T/ipykernel_33660/2764102629.py\", line 3, in <module>\n"
+            "  |     group_entry(0)\n"
+            "  |     ~~~~~~~~~~~^^^\n"
+            "  |   File \"/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py\", line 105, in group_entry\n"
+            "  |     raise ExceptionGroup(\"several fakelib failures\", errs)  # SECRET_SRC_GROUP_RAISE\n"
+            "  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+            "  | ExceptionGroup: several fakelib failures (2 sub-exceptions)\n"
+            "  +-+---------------- 1 ----------------\n"
+            "    | Traceback (most recent call last):\n"
+            "    |   File \"/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py\", line 102, in group_entry\n"
+            "    |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER\n"
+            "    |     ~~~~~~~~~~~~~~~~^^^\n"
+            "    |   File \"/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py\", line 39, in _inner_transform\n"
+            "    |     raise ValueError(\"fakelib inner transform exploded\")  # SECRET_SRC_RAISE\n"
+            "    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+            "    | ValueError: fakelib inner transform exploded\n"
+            "    +---------------- 2 ----------------\n"
+            "    | Traceback (most recent call last):\n"
+            "    |   File \"/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py\", line 102, in group_entry\n"
+            "    |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER\n"
+            "    |     ~~~~~~~~~~~~~~~~^^^\n"
+            "    |   File \"/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py\", line 39, in _inner_transform\n"
+            "    |     raise ValueError(\"fakelib inner transform exploded\")  # SECRET_SRC_RAISE\n"
+            "    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+            "    | ValueError: fakelib inner transform exploded\n"
+            "    +------------------------------------\n"
+        )
+        # Sanity: the fixture really is the raw capture (secrets present).
+        assert "SECRET_SRC_GROUP_RAISE" in tb and "site-packages/fakelib" in tb
+        r = _filter_traceback(tb, "/some/project", persist=False)
+        out = r["stderr"]
+        self._assert_group_filtered(out)
+        # Outer block: IPython + fakelib (2) + each sub-exception 2 -> 6 frames.
+        assert r["traceback_elided_frames"] == 6, (out, r["traceback_elided_frames"])
+
+    def test_f2_real_stdlib_exception_group_collapses_library_keeps_structure(self):
+        from app.tools.code import _filter_traceback
+        tb = (
+            "  + Exception Group Traceback (most recent call last):\n"
+            "  |   File \"<string>\", line 3, in <module>\n"
+            "  |     group_entry(0)\n"
+            "  |     ~~~~~~~~~~~^^^\n"
+            "  |   File \"/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py\", line 105, in group_entry\n"
+            "  |     raise ExceptionGroup(\"several fakelib failures\", errs)  # SECRET_SRC_GROUP_RAISE\n"
+            "  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+            "  | ExceptionGroup: several fakelib failures (2 sub-exceptions)\n"
+            "  +-+---------------- 1 ----------------\n"
+            "    | Traceback (most recent call last):\n"
+            "    |   File \"/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py\", line 102, in group_entry\n"
+            "    |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER\n"
+            "    |     ~~~~~~~~~~~~~~~~^^^\n"
+            "    |   File \"/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py\", line 39, in _inner_transform\n"
+            "    |     raise ValueError(\"fakelib inner transform exploded\")  # SECRET_SRC_RAISE\n"
+            "    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+            "    | ValueError: fakelib inner transform exploded\n"
+            "    +---------------- 2 ----------------\n"
+            "    | Traceback (most recent call last):\n"
+            "    |   File \"/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py\", line 102, in group_entry\n"
+            "    |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER\n"
+            "    |     ~~~~~~~~~~~~~~~~^^^\n"
+            "    |   File \"/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py\", line 39, in _inner_transform\n"
+            "    |     raise ValueError(\"fakelib inner transform exploded\")  # SECRET_SRC_RAISE\n"
+            "    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+            "    | ValueError: fakelib inner transform exploded\n"
+            "    +------------------------------------\n"
+        )
+        assert "SECRET_SRC_RAISE" in tb
+        r = _filter_traceback(tb, "", persist=False)
+        out = r["stderr"]
+        self._assert_group_filtered(out)
+        # The user `<string>` frame is KEPT (not a library frame).
+        assert 'File "<string>"' in out, out
+        # Outer block: 1 fakelib frame; each sub-exception: 2 -> 5 total.
+        assert r["traceback_elided_frames"] == 5, (out, r["traceback_elided_frames"])
+
+
 class TestFilterPreservesGateSignal:
     """VS2-P1: filtering the agent-facing stderr must NOT mask the failure
     from the F1 is_error gate. The gate keys on `success`, and _execute_python

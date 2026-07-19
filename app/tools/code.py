@@ -76,7 +76,10 @@ def _is_library_frame(line: str, cwd: str = "") -> bool:
     paths like <cwd>/scripts/port_python3.14_helpers.py, so require the frame
     is NOT under cwd.
     """
-    stripped = line.strip()
+    # F2: strip an ExceptionGroup gutter first so `| File ".../site-packages/…"`
+    # is recognized as a frame; the marker/cwd `in line` checks below still see
+    # the (unstripped) full path, so they're unaffected.
+    stripped = _strip_group_margin(line).strip()
     if not stripped.startswith("File "):
         return False
     if any(m in line for m in ("site-packages", "dist-packages")):
@@ -91,9 +94,40 @@ def _is_library_frame(line: str, cwd: str = "") -> bool:
     return False
 
 
+def _strip_group_margin(line: str) -> str:
+    """F2 (PEP 654): strip a leading ExceptionGroup / TaskGroup gutter so the
+    remaining content keeps its NATURAL traceback indentation for classification
+    (mirrors the Rust twin command_tools.rs::strip_group_margin).
+
+    CPython prefixes every line inside an ExceptionGroup traceback with a gutter:
+    `  | ` (outer) / `    | ` (nested sub-exception), and the group header with
+    `  + `. Without stripping, a `File ".../site-packages/..."` frame reads as
+    `|   File ...` — the frame/library checks miss it and the ENTIRE group leaks
+    verbatim. Strip exactly the `<indent>[|+] ` gutter so the remainder keeps its
+    own indentation (frame `  File`, body `    src`, final `EType: msg` at
+    column 0). Divider lines (`+---- N ----`) have a `-`/`+` after the corner —
+    not a space — so they don't match and are returned unchanged.
+    """
+    stripped = line.lstrip(" ")
+    for gutter in ("| ", "+ "):
+        if stripped.startswith(gutter):
+            return stripped[len(gutter):]
+    return line
+
+
+def _is_group_divider(line: str) -> bool:
+    """F2: a PEP 654 group divider — after indentation, a `+` corner followed
+    only by `+`/`-`/space/digit runs (`+-+---------------- 1 ----------------`,
+    `+------------------------------------`). Group STRUCTURE: never a frame or a
+    body line, always kept verbatim so the sub-exception boundaries survive."""
+    t = line.lstrip()
+    return t.startswith("+") and "--" in t and all(c in "+- " or c.isdigit() for c in t)
+
+
 def _is_frame_header(line: str) -> bool:
-    """A traceback FRAME header — stdlib `  File "..."` (2-space indented)."""
-    return line.lstrip().startswith("File ")
+    """A traceback FRAME header — stdlib `  File "..."` (2-space indented). F2:
+    also after stripping an ExceptionGroup gutter, so `| File …` is recognized."""
+    return _strip_group_margin(line).lstrip().startswith("File ")
 
 
 def _is_traceback_body_line(line: str) -> bool:
@@ -107,6 +141,15 @@ def _is_traceback_body_line(line: str) -> bool:
     raw source leaked. Blanks are handled by the caller; a column-0 non-arrow,
     non-blank line is the final `EType: msg` exception line and ENDS the body.
     """
+    # F2: a PEP 654 group divider is STRUCTURE, never a frame body — it must
+    # BREAK the continuation run so the `+---- N ----` boundaries survive
+    # (otherwise, being space-indented, it would be swallowed as body).
+    if _is_group_divider(line):
+        return False
+    # F2: strip any ExceptionGroup gutter so the content keeps its natural
+    # indentation — a `  |     src` body stays `    src` (still indented), while
+    # the final `  | EType: msg` line drops to column 0 and correctly ENDS body.
+    line = _strip_group_margin(line)
     if not line.strip():
         return False
     if line[:1] in (" ", "\t"):
