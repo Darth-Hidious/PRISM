@@ -61,6 +61,15 @@ same reason), so on Darwin the wall-clock timeout is the working defense. A limi
 that can't be applied is LOGGED, not silently swallowed, so a limit unexpectedly
 broken on the Linux deploy target raises an alarm. The child receives its config
 as a JSON blob on argv[1].
+
+SANDBOX POSTURE (honest — Q4): the isolation this provides is (1) a restricted
+parse namespace + token-level attribute block (the RCE gate), (2) a separate
+subprocess, (3) a wall-clock timeout, and (4) a best-effort Linux-only memory/CPU
+ulimit. It is NOT a network sandbox — the child inherits the FULL parent
+environment (``_child_env`` copies ``os.environ``, including any secrets) and can
+open sockets. Do not rely on this for network or filesystem isolation; real
+egress control is out of scope. The security guarantee is "no code execution from
+a parsed expression", not "the child cannot touch the network".
 """
 from __future__ import annotations
 
