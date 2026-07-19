@@ -577,6 +577,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// F1: serialize the tests that mutate the PROCESS-GLOBAL `LAST_CODE_RUN`
+    /// static. `g2_snapshot_restore_roundtrip_preserves_state`,
+    /// `h3_chain_guard_restores_on_normal_drop`, and
+    /// `h3_chain_guard_restores_on_panic_unwind` all reset/populate/assert on
+    /// that one static with NO synchronization, so at DEFAULT parallelism they
+    /// race (one test's `reset_code_run_chain` wipes another's mid-assert →
+    /// ~10% flaky; `--test-threads=1` was always green). This mirrors the
+    /// `SERIAL_TEST_LOCK` already used in tests/subagent_nested_turn.rs. A plain
+    /// std Mutex suffices (these tests are sync, not async); we recover from a
+    /// poisoned lock (`into_inner`) since the guard only serializes — it holds no
+    /// invariant of its own.
+    static SERIAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn safety_hook_blocks_destructive_keywords() {
         let registry = build_default_hooks();
@@ -855,6 +868,7 @@ mod tests {
         // before a (simulated) subagent reset, then restored, recovers the
         // parent's chain intact. This is the unit-testable core of the fix;
         // the subagent.rs wiring calls these around the nested run_turn.
+        let _serial = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_code_run_chain();
         // Populate the global via the public restore (insert a parent record).
         let mut parent_map: HashMap<String, LastCodeRun> = HashMap::new();
@@ -898,6 +912,7 @@ mod tests {
     fn h3_chain_guard_restores_on_normal_drop() {
         // H3: the RAII guard restores the parent's chain when it drops at end of
         // scope — the Ok path. A subagent-populated slot is discarded.
+        let _serial = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_code_run_chain();
         restore_code_run_chain(last_run("execute_python", true)); // parent failed
         {
@@ -925,6 +940,11 @@ mod tests {
         // H3 (the core of the fix): a PANIC unwinding through the nested turn
         // must still restore the parent's chain. The old manual restore ran
         // before `?` and was SKIPPED on unwind; `Drop` runs on unwind too.
+        //
+        // The panic is contained by catch_unwind below, so it never poisons
+        // SERIAL_TEST_LOCK — but the other serialized tests recover from poison
+        // regardless.
+        let _serial = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_code_run_chain();
         restore_code_run_chain(last_run("execute_python", true));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
