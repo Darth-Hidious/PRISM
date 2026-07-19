@@ -35,6 +35,21 @@ symbolizes to ``Symbol('sympify')`` applied as a symbolic function — no real
 call, no execution. User symbols are bound via ``local_dict`` so a symbol named
 ``E``/``pi``/``I``/``S``/``oo`` is a SYMBOL, not the sympy constant.
 
+THREAT MODEL — ATTRIBUTE ACCESS is the real risk the whitelist alone does NOT
+close. ``standard_transformations``' auto_symbol deliberately skips a NAME after
+``.`` ("Don't convert attribute access"), so once any identifier resolves to a
+real object (a whitelisted sympy fn OR any user Symbol — Symbols are real
+objects) a ``.``/``[]`` chain runs as plain Python. That turns a math string
+into ``x.__class__.__mro__[-1].__subclasses__()`` -> subprocess.Popen. The
+``"__"`` substring in _DANGEROUS_TOKENS is NOT a security boundary (the code
+says so). The real gate is ``_reject_attribute_access`` — a token-level
+transformation PREPENDED to ``_TRANSFORMS`` that rejects the ``.`` OP token, so
+attribute traversal is impossible at parse (a float literal is a single NUMBER
+token, so floats still parse). This makes the whitelist load-bearing: with no
+attribute access and no eval-callable in the namespace, there is no path from a
+parsed expression to code execution. Applied at BOTH parse sites (expressions
+and dimensional unit strings).
+
 Execution: the check runs in a subprocess (same pattern as _execute_python)
 because ``simplify()`` can hang or OOM on pathological input — the timeout
 kills it honestly. Defense-in-depth: the child gets a memory + CPU ulimit
@@ -148,13 +163,46 @@ _SAFE_GLOBALS = {
 # User-declared symbols override these via local_dict (see parse_restricted), so
 # a user symbol named E/pi/I/S is THEIR symbol, not the constant.
 _RESERVED = {"E", "pi", "I", "S", "oo", "zoo"}
+def _reject_attribute_access(tokens, local_dict, global_dict):
+    """C1/Q1: block attribute access at the TOKEN level so the restricted
+    whitelist is actually LOAD-BEARING. Root cause: standard_transformations'
+    auto_symbol deliberately skips a NAME token that follows a `.` ("Don't
+    convert attribute access"), so once any identifier resolves to a real object
+    (a whitelisted sympy fn OR any user Symbol — Symbols ARE real objects) a
+    `.`/`[]` chain runs as normal Python. That lets a math expression traverse
+    `x.__class__.__mro__[-1].__subclasses__()` to reach subprocess.Popen — the
+    whitelist alone does NOT stop it; only the `"__"` substring in
+    _DANGEROUS_TOKENS did, and the code itself calls that "NOT a security
+    boundary". A math-expression tool never needs attribute access, so we reject
+    the `.` OP token outright.
+
+    A float literal (`1.5`, `.5`, `1.`) tokenizes as a SINGLE NUMBER token (the
+    `.` is part of the number, never a standalone OP), so rejecting the OP `.`
+    blocks `x.__class__` WITHOUT breaking floats. Prepended before auto_symbol so
+    the `.`-chain dies before any NAME resolves to a real object.
+    """
+    from token import OP
+
+    for toknum, tokval in tokens:
+        if toknum == OP and tokval == ".":
+            raise ValueError(
+                "attribute access ('.') is not permitted in symbolic expressions"
+            )
+    return tokens
+
+
 # H1/H4: parse numeric literals as EXACT (rationalize transform converts Float
 # literals to Rational/Integer AT PARSE, before evaluation). The old path relied
 # on lossy Float64 — `6.022e23 + 1e6` absorbed `+1e6` -> simplify(a-b)==0 -> a
 # false "proven" for two unequal numbers. With rationalize, `6.022e23+1e6` parses
 # to the exact integer ...001000000, so a-b != 0. "proven" ONLY from an exact
 # symbolic zero.
-_TRANSFORMS = standard_transformations + (rationalize,)
+# C1/Q1: _reject_attribute_access is PREPENDED (before auto_symbol) — it is now
+# the REAL gate that makes the whitelist load-bearing; the `"__"` substring in
+# _DANGEROUS_TOKENS is only a cheap secondary. Both parse sites
+# (parse_user_expression for expr_a/b AND parse_restricted for dimensional unit
+# strings) share _TRANSFORMS, so the block covers both.
+_TRANSFORMS = (_reject_attribute_access,) + standard_transformations + (rationalize,)
 # H4: RELATIVE tolerance. The old absolute TOL=1e-9 fabricated "fail"
 # counterexamples for true large-magnitude identities (e.g. (x+10)**8 vs its
 # expansion: abs_diff ~4e-8 at magnitude ~5e7 is pure float64 noise, but

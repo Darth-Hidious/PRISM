@@ -418,6 +418,91 @@ class TestRCEBlocked:
         assert r2["verdict"] != "proven", "E must be a user symbol, not the constant"
 
 
+class TestAttributeAccessBlocked:
+    """FIX2-Q1: attribute access is blocked at the TOKEN level (a `.` OP token is
+    rejected in _TRANSFORMS, PREPENDED before auto_symbol), so the whitelist is
+    load-bearing. auto_symbol skips NAME-after-`.`, so without this a `.`-chain
+    like x.__class__.__mro__[-1].__subclasses__() traverses to subprocess.Popen.
+    We assert at the PARSE layer directly (bypassing the _looks_dangerous
+    substring scan) so this proves the token block, not the `"__"` secondary."""
+
+    def _child_ns(self):
+        from app.tools.symbolic import _CHILD_SCRIPT
+
+        ns = {"__name__": "child_test"}
+        exec(compile(_CHILD_SCRIPT, "<child_test>", "exec"), ns)
+        return ns
+
+    def test_attribute_gadget_rejected_at_parse(self):
+        """The reviewer's gadget must be REJECTED at parse, not return a live
+        class list. Tested at BOTH parse sites (parse_user_expression AND
+        parse_restricted), bypassing the _looks_dangerous substring scan."""
+        ns = self._child_ns()
+        gadget = "x.__class__.__mro__[-1].__subclasses__()"
+        with pytest.raises(ValueError):
+            ns["parse_user_expression"](gadget, {})
+        with pytest.raises(ValueError):
+            ns["parse_restricted"](gadget)
+
+    def test_plain_attribute_access_rejected(self):
+        """`x.y` and `x.real` have NO `__` so they slip past _looks_dangerous —
+        the token-level block is what rejects them at parse."""
+        ns = self._child_ns()
+        for expr in ("x.y", "x.real", "x.__dict__"):
+            with pytest.raises(ValueError):
+                ns["parse_restricted"](expr)
+
+    def test_floats_still_parse(self):
+        """The `.` block must NOT break float literals (each is one NUMBER token)
+        nor legit expressions."""
+        ns = self._child_ns()
+        pr = ns["parse_restricted"]
+        # None of these raise; float literals and legit math parse fine.
+        for expr in ("1.5", ".5", "1.", "6.022e23", "2.5*x + 1.0",
+                     "sin(x)**2 + cos(x)**2", "(x+1)**2"):
+            pr(expr)  # raises if the `.` block over-rejects
+
+    def test_attribute_expr_via_symbolic_check_is_success_false(self):
+        """End-to-end through the subprocess: `x.y` (no `__`, passes
+        _looks_dangerous) reaches parse and is rejected -> parse error ->
+        success:False (the check did not run)."""
+        r = symbolic_check("x.y", "x", mode="equivalence")
+        assert r["success"] is False, r
+        assert r["verdict"] == "inconclusive"
+        assert "parse error" in r["reason"]
+
+    def test_dimensional_unit_attribute_access_rejected(self):
+        """Q1 covers the SECOND parse site: a unit string with attribute access
+        is rejected by the unit resolver -> inconclusive (not silently resolved)."""
+        r = symbolic_check("d/t", "v", mode="dimensional",
+                           assumptions={"d": "m", "t": "s", "v": "meter.__class__"})
+        assert r["verdict"] == "inconclusive", r
+
+    def test_spec_rce_bypass1_still_inert(self, tmp_path):
+        """FIX2-C1 regression: the exact string-split sympify payload from the
+        spec must remain inert (no marker file, no execution)."""
+        import os
+        marker = str(tmp_path / "marker")
+        if os.path.exists(marker):
+            os.remove(marker)
+        payload = ("sympify('_'+'_import_'+'_'+\"('builtins').\"+'open'+"
+                   "\"('%s','w').write('x')\")" % marker.replace("\\", "/"))
+        symbolic_check(payload, "x", mode="equivalence")
+        assert not os.path.exists(marker), "RCE bypass1 executed: marker written"
+
+    def test_spec_rce_bypass2_still_inert(self, tmp_path):
+        """FIX2-C1 regression: the exact assumptions-injection payload from the
+        spec (dimensional mode) must remain inert."""
+        import os
+        marker = str(tmp_path / "marker")
+        if os.path.exists(marker):
+            os.remove(marker)
+        payload = "__import__('builtins').open('%s','w').write('x')" % marker.replace("\\", "/")
+        r = symbolic_check("x", "x", mode="dimensional", assumptions={"x": payload})
+        assert not os.path.exists(marker), "RCE bypass2 executed: marker written"
+        assert r["success"] is False
+
+
 class TestRegistration:
     def test_tool_registered_with_approval(self):
         reg = ToolRegistry()
