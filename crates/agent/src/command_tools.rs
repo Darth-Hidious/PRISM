@@ -2151,6 +2151,38 @@ fn is_frame_line(line: &str) -> bool {
     t.starts_with("File ") || t.starts_with("Cell In[")
 }
 
+/// FIX-3(H1): is `line` a BODY/continuation line of the current frame (as
+/// opposed to the next frame header or the final `EType: msg` exception line)?
+///
+/// Covers BOTH traceback dialects the shared kernel can emit:
+///   - stdlib (`python -c`): 4-space-indented source lines + PEP 657
+///     caret/annotation lines (`    ~~~~^~~`).
+///   - IPython/ipykernel "Context" xmode (the PREFERRED backend, never
+///     overridden): indented numbered source (`    642 ...`), `(...)`
+///     context-elision lines (`   (...)   639`), and — critically — the
+///     failing line rendered as a COLUMN-0 arrow (`--> 642 ...` / `----> 3
+///     ...`). The old consumer only grabbed `starts_with("    ")` lines, so the
+///     column-0 arrow BROKE the loop and the library's raw source leaked into
+///     the fallback next to the elision marker (H1).
+///
+/// Blank lines are NOT classified here (the caller treats them as body
+/// separators so consecutive library frames still collapse into one marker); a
+/// column-0, non-arrow, non-blank line is the final exception line and ENDS the
+/// body.
+fn is_traceback_body_line(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return false;
+    }
+    // Indented => source / caret / numbered / `(...)` continuation.
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return true;
+    }
+    // Column-0 IPython arrow: one-or-more `-` then `>` (distinct from the
+    // all-dashes separator rule `-----`, which has no `>`).
+    let after_dashes = line.trim_start_matches('-');
+    after_dashes.len() < line.len() && after_dashes.starts_with('>')
+}
+
 // VS2-P1a: agent-facing traceback filter for notebook_exec. The kernel is
 // SHARED with the human pane, so the filter is applied HERE (the agent-facing
 // composition), not in the sidecar — the human debug pane keeps the raw
@@ -2248,19 +2280,30 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
         }
 
         if is_frame_line(ln_trim) {
-            // FIX-3: a frame is the File/Cell line + ALL following indented
-            // continuation lines (source + Python 3.11+ PEP 657 caret/annotation
-            // lines). The old code consumed only ONE indented line, so the caret
-            // fell through and flushed the library run each iteration -> one
-            // marker per frame + orphaned `^^^^`.
+            // FIX-3: a frame is the File/Cell line + ALL following BODY lines
+            // (source, PEP 657 carets, IPython numbered/`(...)`/`--> N` arrow
+            // lines, and the blank separator that follows the frame). The body
+            // ends at the NEXT frame header, a chain marker, or the final
+            // column-0 exception line.
+            //
+            // FIX-3(H1): the old loop only consumed `starts_with("    ")` lines,
+            // so IPython's column-0 arrow (`--> 642 _assert_stacked_square(a)`)
+            // broke the loop and the library's raw source leaked verbatim into
+            // the fallback next to the elision marker. Consuming the trailing
+            // blank too keeps consecutive (blank-separated) library frames in
+            // ONE run so they collapse to a single marker.
             let mut consumed = 1usize;
             let mut continuation: Vec<&str> = Vec::new();
             while i + consumed < n {
                 let next = lines[i + consumed].trim_end_matches('\n');
-                if next.starts_with("    ") {
+                if is_frame_line(next) || chain_markers.iter().any(|m| next.contains(m)) {
+                    break;
+                }
+                if next.trim().is_empty() || is_traceback_body_line(next) {
                     continuation.push(lines[i + consumed]);
                     consumed += 1;
                 } else {
+                    // Column-0, non-arrow, non-blank => the final exception line.
                     break;
                 }
             }
@@ -3970,6 +4013,96 @@ RuntimeError: boom\n"
             "raw library path must not leak post-strip: {filtered}"
         );
         assert!(n >= 1, "at least one library frame elided: got {n}");
+    }
+
+    /// The exact byte sequence PRISM's notebook sidecar sees for a plain
+    /// library failure: a REAL ipykernel 7.2 / IPython 9.10 ANSI traceback,
+    /// captured live via a `jupyter_client` kernel round-trip (the kernel's
+    /// `error` message `traceback` array joined with `\n`, exactly as
+    /// notebook.rs::format_error produces it). NOT a hand-written 4-space
+    /// fixture — this is the `----> N` / `(...)` "Context" xmode form that the
+    /// 4-space-only consumer leaked on (H1). A user cell calls
+    /// `np.linalg.inv(np.zeros((2, 3)))`; numpy raises two frames deep.
+    const REAL_IPYKERNEL_ARROW_TRACE: &str = concat!(
+        "\x1b[31m---------------------------------------------------------------------------\x1b[39m\n",
+        "\x1b[31mLinAlgError\x1b[39m                               Traceback (most recent call last)\n",
+        "\x1b[36mCell\x1b[39m\x1b[36m \x1b[39m\x1b[32mIn[1]\x1b[39m\x1b[32m, line 2\x1b[39m\n",
+        "\x1b[32m      1\x1b[39m \x1b[38;5;28;01mimport\x1b[39;00m\x1b[38;5;250m \x1b[39m\x1b[34;01mnumpy\x1b[39;00m\x1b[38;5;250m \x1b[39m\x1b[38;5;28;01mas\x1b[39;00m\x1b[38;5;250m \x1b[39m\x1b[34;01mnp\x1b[39;00m\n",
+        "\x1b[32m----> \x1b[39m\x1b[32m2\x1b[39m \x1b[43mnp\x1b[49m\x1b[43m.\x1b[49m\x1b[43mlinalg\x1b[49m\x1b[43m.\x1b[49m\x1b[43minv\x1b[49m\x1b[43m(\x1b[49m\x1b[43mnp\x1b[49m\x1b[43m.\x1b[49m\x1b[43mzeros\x1b[49m\x1b[43m(\x1b[49m\x1b[43m(\x1b[49m\x1b[32;43m2\x1b[39;49m\x1b[43m,\x1b[49m\x1b[43m \x1b[49m\x1b[32;43m3\x1b[39;49m\x1b[43m)\x1b[49m\x1b[43m)\x1b[49m\x1b[43m)\x1b[49m\n",
+        "\n",
+        "\x1b[36mFile \x1b[39m\x1b[32m/opt/homebrew/lib/python3.14/site-packages/numpy/linalg/_linalg.py:642\x1b[39m, in \x1b[36minv\x1b[39m\x1b[34m(a)\x1b[39m\n",
+        "\x1b[32m    538\x1b[39m \x1b[38;5;250m\x1b[39m\x1b[33;03m\"\"\"\x1b[39;00m\n",
+        "\x1b[32m    539\x1b[39m \x1b[33;03mCompute the inverse of a matrix.\x1b[39;00m\n",
+        "\x1b[32m    540\x1b[39m \n",
+        "\x1b[32m   (...)\x1b[39m\x1b[32m    639\x1b[39m \n",
+        "\x1b[32m    640\x1b[39m \x1b[33;03m\"\"\"\x1b[39;00m\n",
+        "\x1b[32m    641\x1b[39m a, wrap = _makearray(a)\n",
+        "\x1b[32m--> \x1b[39m\x1b[32m642\x1b[39m \x1b[43m_assert_stacked_square\x1b[49m\x1b[43m(\x1b[49m\x1b[43ma\x1b[49m\x1b[43m)\x1b[49m\n",
+        "\x1b[32m    643\x1b[39m t, result_t = _commonType(a)\n",
+        "\x1b[32m    645\x1b[39m signature = \x1b[33m'\x1b[39m\x1b[33mD->D\x1b[39m\x1b[33m'\x1b[39m \x1b[38;5;28;01mif\x1b[39;00m isComplexType(t) \x1b[38;5;28;01melse\x1b[39;00m \x1b[33m'\x1b[39m\x1b[33md->d\x1b[39m\x1b[33m'\x1b[39m\n",
+        "\n",
+        "\x1b[36mFile \x1b[39m\x1b[32m/opt/homebrew/lib/python3.14/site-packages/numpy/linalg/_linalg.py:246\x1b[39m, in \x1b[36m_assert_stacked_square\x1b[39m\x1b[34m(*arrays)\x1b[39m\n",
+        "\x1b[32m    243\x1b[39m     \x1b[38;5;28;01mraise\x1b[39;00m LinAlgError(\x1b[33m'\x1b[39m\x1b[38;5;132;01m%d\x1b[39;00m\x1b[33m-dimensional array given. Array must be \x1b[39m\x1b[33m'\x1b[39m\n",
+        "\x1b[32m    244\x1b[39m             \x1b[33m'\x1b[39m\x1b[33mat least two-dimensional\x1b[39m\x1b[33m'\x1b[39m % a.ndim)\n",
+        "\x1b[32m    245\x1b[39m \x1b[38;5;28;01mif\x1b[39;00m m != n:\n",
+        "\x1b[32m--> \x1b[39m\x1b[32m246\x1b[39m     \x1b[38;5;28;01mraise\x1b[39;00m LinAlgError(\x1b[33m'\x1b[39m\x1b[33mLast 2 dimensions of the array must be square\x1b[39m\x1b[33m'\x1b[39m)\n",
+        "\n",
+        "\x1b[31mLinAlgError\x1b[39m: Last 2 dimensions of the array must be square",
+    );
+
+    #[test]
+    fn h1_real_ipykernel_arrow_body_no_library_source_leaks() {
+        // H1 (the gap the green gate missed TWICE): IPython's default "Context"
+        // xmode renders the failing line as a COLUMN-0 arrow (`--> 642 ...`),
+        // not a 4-space line. The old consumer broke there and leaked the
+        // library's raw SOURCE verbatim next to the elision marker. This asserts
+        // against a REAL ipykernel capture (see REAL_IPYKERNEL_ARROW_TRACE) that
+        // NO library source survives — only the elision marker + final line.
+        let (filtered, n) = filter_notebook_traceback(REAL_IPYKERNEL_ARROW_TRACE, "/some/project");
+
+        // ANSI stripped.
+        assert!(
+            !filtered.contains('\u{1b}'),
+            "ANSI must be stripped: {filtered:?}"
+        );
+        // Final exception line ALWAYS survives.
+        assert!(
+            filtered.contains("LinAlgError: Last 2 dimensions of the array must be square"),
+            "final exception line must survive: {filtered}"
+        );
+        // The user's Cell frame (their own code) is KEPT.
+        assert!(
+            filtered.contains("Cell In[1], line 2"),
+            "user cell frame must be kept: {filtered}"
+        );
+        assert!(
+            filtered.contains("np.linalg.inv(np.zeros((2, 3)))"),
+            "user cell source must be kept: {filtered}"
+        );
+        // The two library frames collapse to exactly ONE marker.
+        let marker_count = filtered.matches("library frame(s) elided").count();
+        assert_eq!(
+            marker_count, 1,
+            "consecutive library frames collapse to ONE marker: {filtered}"
+        );
+        assert_eq!(n, 2, "both library frames counted: got {n}");
+        // NO library SOURCE line may leak — this is the H1 assertion the old
+        // green-but-leaking tests never made. Every one of these is a real line
+        // from inside numpy that the old arrow-broken consumer leaked verbatim.
+        for leaked in [
+            "_assert_stacked_square(a)",            // `--> 642` arrow body
+            "raise LinAlgError('Last 2 dimensions", // `--> 246` arrow body
+            "t, result_t = _commonType(a)",         // plain library source
+            "signature = 'D->D'",                   // plain library source
+            "Compute the inverse of a matrix.",     // library docstring fragment
+            "a, wrap = _makearray(a)",              // plain library source
+            "site-packages/numpy",                  // raw library path
+        ] {
+            assert!(
+                !filtered.contains(leaked),
+                "library source/path leaked into agent-facing trace: {leaked:?}\n---\n{filtered}"
+            );
+        }
     }
 
     #[test]

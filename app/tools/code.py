@@ -86,6 +86,30 @@ def _is_library_frame(line: str, cwd: str = "") -> bool:
     return False
 
 
+def _is_frame_header(line: str) -> bool:
+    """A traceback FRAME header — stdlib `  File "..."` (2-space indented)."""
+    return line.lstrip().startswith("File ")
+
+
+def _is_traceback_body_line(line: str) -> bool:
+    """A BODY/continuation line of the current frame (mirrors the Rust twin
+    command_tools.rs::is_traceback_body_line).
+
+    Covers stdlib 4-space source + PEP 657 caret lines AND — for parity, in case
+    this ever filters an IPython-form trace — indented numbered/`(...)` lines and
+    column-0 `--> N` / `----> N` arrow lines. The old consumer only grabbed
+    `startswith("    ")`, so a column-0 arrow broke the loop and the library's
+    raw source leaked. Blanks are handled by the caller; a column-0 non-arrow,
+    non-blank line is the final `EType: msg` exception line and ENDS the body.
+    """
+    if not line.strip():
+        return False
+    if line[:1] in (" ", "\t"):
+        return True
+    stripped = line.lstrip("-")
+    return len(stripped) < len(line) and stripped.startswith(">")
+
+
 def _filter_traceback(raw_stderr: str, cwd: str = "", persist: bool = True) -> dict:
     """Filter a Python traceback for the AGENT-FACING stderr (VS2-P1a).
 
@@ -182,20 +206,28 @@ def _filter_traceback(raw_stderr: str, cwd: str = "", persist: bool = True) -> d
             i += 1
             continue
 
-        # A traceback frame is the `File "..."` line + ALL following indented
-        # continuation lines (the source line AND, on Python 3.11+, the PEP 657
-        # caret/annotation lines like `    ~~~~^~~`). Treat them as a unit so
-        # eliding a frame removes its code+caret lines too (no orphaned carets —
-        # FIX-3: the old code consumed only ONE indented line, so the caret fell
-        # through and flushed the library run each iteration -> one marker per
-        # frame + orphaned `^^^^`).
-        if ln.lstrip().startswith("File "):
-            # Grab ALL following indented continuation lines.
+        # A traceback frame is the `File "..."` line + ALL following BODY lines
+        # (the source line AND, on Python 3.11+, the PEP 657 caret/annotation
+        # lines like `    ~~~~^~~`). Treat them as a unit so eliding a frame
+        # removes its code+caret lines too (no orphaned carets).
+        #
+        # FIX-3(H1): the body ends at the NEXT frame header, a chain marker, or
+        # the final column-0 exception line — NOT merely at the first non-4-space
+        # line. The old `startswith("    ")` consumer broke on IPython column-0
+        # arrows (`--> 642 ...`), leaking the library's raw source. Consuming the
+        # trailing blank keeps consecutive library frames in one collapse run.
+        if _is_frame_header(ln):
             continuation: list[str] = []
             consumed = 1
-            while i + consumed < n and lines[i + consumed].startswith("    "):
-                continuation.append(lines[i + consumed])
-                consumed += 1
+            while i + consumed < n:
+                nxt = lines[i + consumed]
+                if _is_frame_header(nxt) or any(m in nxt for m in _CHAIN_MARKERS):
+                    break
+                if not nxt.strip() or _is_traceback_body_line(nxt):
+                    continuation.append(nxt)
+                    consumed += 1
+                else:
+                    break
 
             # FIX-2/G3: classify LIBRARY first (reliable markers unconditional;
             # ambiguous markers require not-under-cwd).
