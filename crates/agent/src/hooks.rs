@@ -341,8 +341,14 @@ static LAST_CODE_RUN: std::sync::LazyLock<
 /// Clear the repair-chain memory (FIX-6). Called at turn start so a new turn's
 /// first code run is not tagged repair_attempt pointing at last turn's failure.
 pub fn reset_code_run_chain() {
-    if let Ok(mut guard) = LAST_CODE_RUN.lock() {
-        guard.clear();
+    // F4: degrade-safe on lock poison (no-op), but LOG it so a permanently
+    // disabled repair chain isn't silent-forever. Very low likelihood.
+    match LAST_CODE_RUN.lock() {
+        Ok(mut guard) => guard.clear(),
+        Err(_) => warn!(
+            target: "provenance_drop",
+            "LAST_CODE_RUN poisoned; repair-chain reset skipped (chaining degraded)"
+        ),
     }
 }
 
@@ -362,8 +368,14 @@ pub fn snapshot_code_run_chain() -> std::collections::HashMap<String, LastCodeRu
 }
 
 pub fn restore_code_run_chain(map: std::collections::HashMap<String, LastCodeRun>) {
-    if let Ok(mut guard) = LAST_CODE_RUN.lock() {
-        *guard = map;
+    // F4: degrade-safe on lock poison (no-op), but LOG it — a silently dropped
+    // restore permanently+invisibly disables repair-chain provenance.
+    match LAST_CODE_RUN.lock() {
+        Ok(mut guard) => *guard = map,
+        Err(_) => warn!(
+            target: "provenance_drop",
+            "LAST_CODE_RUN poisoned; repair-chain restore skipped (chaining degraded)"
+        ),
     }
 }
 
