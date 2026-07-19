@@ -367,6 +367,41 @@ pub fn restore_code_run_chain(map: std::collections::HashMap<String, LastCodeRun
     }
 }
 
+/// H3: RAII guard that snapshots the repair-chain memory on construct and
+/// restores it on DROP — covering the normal return, an `Err`, AND a panic
+/// unwinding through the nested subagent turn.
+///
+/// The previous manual snapshot + restore-before-`?` in subagent.rs restored on
+/// Ok/Err but a panic unwinding through `run_turn` SKIPPED the restore, leaving
+/// `LAST_CODE_RUN` reset/subagent-populated for whatever ran next. `Drop` runs
+/// on unwind too, so the parent's chain is always put back. Lock-poison degrades
+/// safe (restore is a no-op if the mutex is poisoned).
+#[must_use = "hold the guard for the duration of the nested turn; dropping it early restores the chain prematurely"]
+pub struct CodeRunChainGuard {
+    snapshot: std::collections::HashMap<String, LastCodeRun>,
+}
+
+impl CodeRunChainGuard {
+    /// Snapshot the current repair-chain memory; restored when the guard drops.
+    pub fn new() -> Self {
+        Self {
+            snapshot: snapshot_code_run_chain(),
+        }
+    }
+}
+
+impl Default for CodeRunChainGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for CodeRunChainGuard {
+    fn drop(&mut self) {
+        restore_code_run_chain(std::mem::take(&mut self.snapshot));
+    }
+}
+
 /// Pure helper: given the current tool + its status, and the remembered last
 /// code runs (per-tool), decide (parent_id, tags) for the new record.
 ///
@@ -856,6 +891,59 @@ mod tests {
         assert!(tags.contains(&"repair_attempt".to_string()));
 
         // Clean up global state so this test doesn't leak into others.
+        reset_code_run_chain();
+    }
+
+    #[test]
+    fn h3_chain_guard_restores_on_normal_drop() {
+        // H3: the RAII guard restores the parent's chain when it drops at end of
+        // scope — the Ok path. A subagent-populated slot is discarded.
+        reset_code_run_chain();
+        restore_code_run_chain(last_run("execute_python", true)); // parent failed
+        {
+            let _g = CodeRunChainGuard::new(); // snapshots the parent chain
+            reset_code_run_chain(); // nested run_turn entry wipes it
+            restore_code_run_chain(last_run("execute_bash", false)); // subagent slot
+            assert!(snapshot_code_run_chain().contains_key("execute_bash"));
+            assert!(!snapshot_code_run_chain().contains_key("execute_python"));
+        } // guard drops here -> parent snapshot restored
+        let after = snapshot_code_run_chain();
+        assert_eq!(
+            after.get("execute_python").map(|r| r.record_id.as_str()),
+            Some("rec-execute_python-1"),
+            "parent chain restored on drop"
+        );
+        assert!(
+            !after.contains_key("execute_bash"),
+            "subagent slot discarded on drop"
+        );
+        reset_code_run_chain();
+    }
+
+    #[test]
+    fn h3_chain_guard_restores_on_panic_unwind() {
+        // H3 (the core of the fix): a PANIC unwinding through the nested turn
+        // must still restore the parent's chain. The old manual restore ran
+        // before `?` and was SKIPPED on unwind; `Drop` runs on unwind too.
+        reset_code_run_chain();
+        restore_code_run_chain(last_run("execute_python", true));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = CodeRunChainGuard::new();
+            reset_code_run_chain();
+            restore_code_run_chain(last_run("execute_bash", false));
+            panic!("simulate a panic unwinding through the nested run_turn");
+        }));
+        assert!(result.is_err(), "the closure panicked");
+        let after = snapshot_code_run_chain();
+        assert_eq!(
+            after.get("execute_python").map(|r| r.record_id.as_str()),
+            Some("rec-execute_python-1"),
+            "parent chain restored even on panic unwind"
+        );
+        assert!(
+            !after.contains_key("execute_bash"),
+            "subagent slot discarded on panic unwind"
+        );
         reset_code_run_chain();
     }
 
