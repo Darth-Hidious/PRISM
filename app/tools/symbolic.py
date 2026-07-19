@@ -273,17 +273,20 @@ def build_local_dict(names, assumptions):
 
 
 def _validate_assumptions(assumptions):
-    """H5: every assumption value must be recognized vocabulary OR a unit string
-    (dimensional mode). Return an error string naming the first unrecognized
-    non-unit assumption, or None. Unit strings (containing /, *, or known unit
-    names) are allowed for dimensional mode."""
+    """H5/Q5: in equivalence/numeric_spot mode every assumption value MUST be an
+    EXACT recognized-vocabulary member (positive/negative/nonnegative/real/
+    integer/...). Return an error string naming the first unrecognized value, or
+    None. This validator is ONLY called for non-dimensional modes (see run()).
+
+    Q5: the old unit-string allowance (`/`, `*`, digits) leaked into
+    equivalence/numeric_spot, so a real constraint like {'x': 'x>0'} (the `0`
+    tripped the digit allowance) was SILENTLY DROPPED -> the tool sampled a
+    negative x and returned a FALSE 'fail' with a counterexample OUTSIDE the
+    declared domain (violating H5 "never silently ignored"). Unit strings are
+    valid ONLY in dimensional mode, which resolves them via _resolve_unit and
+    never calls this validator — so there is no unit-string allowance here."""
     for name, val in assumptions.items():
         if val in _ASSUMPTION_KWARGS:
-            continue
-        # Allow unit-like strings (contain a digit, /, *, or are short unit
-        # tokens) for dimensional mode. If it's alphabetic and not a known
-        # assumption, it's unrecognized.
-        if isinstance(val, str) and any(c in val for c in "/*0123456789"):
             continue
         return "assumption '{}'='{}' not recognized (use one of: {})".format(
             name, val, ", ".join(sorted(_ASSUMPTION_KWARGS))

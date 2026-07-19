@@ -179,6 +179,38 @@ class TestAssumptionVocabulary:
         assert r["verdict"] == "inconclusive", r
         assert "not recognized" in r.get("reason", ""), r
 
+    def test_q5_constraint_syntax_not_silently_dropped(self):
+        """FIX2-Q5: {'x': 'x>0'} contains a digit, which the old unit-string
+        allowance let slip through in equivalence mode -> the constraint was
+        SILENTLY DROPPED, x sampled negative, a FALSE 'fail' returned outside the
+        declared domain. Now non-dimensional modes require exact vocabulary, so
+        this is inconclusive naming the unrecognized value (NOT a silent fail)."""
+        r = symbolic_check("sqrt(x**2)", "x", mode="equivalence",
+                           assumptions={"x": "x>0"})
+        assert r["verdict"] == "inconclusive", r
+        assert "not recognized" in r.get("reason", ""), r
+        # It must NOT be the false, domain-violating 'fail' the old code produced.
+        assert r["verdict"] != "fail"
+
+    def test_q5_unit_string_in_equivalence_is_inconclusive(self):
+        """A unit-like string ('m/s') is meaningful ONLY in dimensional mode; in
+        equivalence/numeric_spot it is not recognized vocabulary -> inconclusive,
+        never silently ignored."""
+        r = symbolic_check("x", "x", mode="numeric_spot",
+                           assumptions={"x": "m/s"}, n_points=8)
+        assert r["verdict"] == "inconclusive", r
+        assert "not recognized" in r.get("reason", ""), r
+
+    def test_q5_dimensional_unit_strings_still_work(self):
+        """Regression: the tightened validator must not touch dimensional mode —
+        unit strings with '/','*',digits still resolve there."""
+        r = symbolic_check("d/t", "v", mode="dimensional",
+                           assumptions={"d": "m", "t": "s", "v": "m/s**2"})
+        # v declared as m/s**2 but d/t is m/s -> a real dimensional mismatch =
+        # fail (the point is the unit strings resolved, not that it's proven).
+        assert r["verdict"] in ("fail", "proven"), r
+        assert r["success"] is True
+
     def test_h5_integer_sampling_works(self):
         """{x: integer} samples integers. The symbol-key subs fix means an
         integer=True Symbol substitutes correctly (string-key subs failed)."""
