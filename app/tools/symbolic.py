@@ -209,6 +209,20 @@ from sympy import (
 # auto-symbolizes to Symbol('sympify') applied as a symbolic function — no real
 # call, no execution.
 _SAFE_GLOBALS = {
+    # C1 ROOT-CAUSE (the definitive RCE fix — holds on EVERY Python version).
+    # sympy's parse_expr() ends in `eval(code, global_dict, local_dict)` with THIS
+    # dict as global_dict (passed straight through — no copy, no augmentation).
+    # Python's eval AUTO-INJECTS the full real builtins module into any globals
+    # that lacks a "__builtins__" key, so WITHOUT this line `open`/`eval`/`exec`/
+    # `__import__`/`print` are all reachable by name inside the evaluated code —
+    # e.g. an f-string unit string `f"{open('/tmp/x','w')}"` runs with full Python
+    # semantics and writes to disk (CONFIRMED RCE, VS2-P2-fix-3). An empty
+    # "__builtins__" forces every non-whitelisted name to NameError instead. A
+    # pure sympy math/unit parse resolves ONLY the constructor/function names
+    # below (Symbol/Integer/Float/.../sin/cos), so ZERO real builtins are needed
+    # (verified: floats, sci-notation, trig, polynomials all still parse). DO NOT
+    # remove this and DO NOT widen it to the real builtins — it is load-bearing.
+    "__builtins__": {},
     "Symbol": Symbol, "Integer": Integer, "Float": Float, "Rational": Rational,
     "Pow": Pow,
     "sin": sin, "cos": cos, "tan": tan, "asin": asin, "acos": acos, "atan": atan,
