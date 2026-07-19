@@ -53,13 +53,14 @@ and dimensional unit strings).
 Execution: the check runs in a subprocess (same pattern as _execute_python)
 because ``simplify()`` can hang or OOM on pathological input. The WALL-CLOCK
 TIMEOUT is the cross-platform defense — it kills a hang/blowup honestly on every
-OS. Defense-in-depth: the child also gets a memory + CPU ulimit (``preexec_fn``),
-but that memory cap is BEST-EFFORT and NOT enforced on macOS —
-``setrlimit(RLIMIT_AS)`` raises there, so on Darwin it is a no-op and the
-wall-clock timeout is the working defense. A limit that can't be applied is now
-LOGGED, not silently swallowed, so a limit unexpectedly broken on the Linux
-deploy target raises an alarm. The child receives its config as a JSON blob on
-argv[1].
+OS. Defense-in-depth: on LINUX the child also gets a memory + CPU ulimit
+(``preexec_fn``). It is NOT installed on macOS — ``setrlimit(RLIMIT_AS)`` is a
+no-op there AND ``preexec_fn`` forces the fork() path that is macOS-fragile from
+the multithreaded tool server (the sibling ``_execute_python`` avoids it for the
+same reason), so on Darwin the wall-clock timeout is the working defense. A limit
+that can't be applied is LOGGED, not silently swallowed, so a limit unexpectedly
+broken on the Linux deploy target raises an alarm. The child receives its config
+as a JSON blob on argv[1].
 """
 from __future__ import annotations
 
@@ -154,6 +155,22 @@ def _child_prelimit() -> None:
         resource.setrlimit(resource.RLIMIT_CPU, (300, hard if hard != -1 else 300))
     except (ValueError, OSError) as e:
         _warn(_RLIMIT_FAIL_MARKER + "CPU not applied ({})\n".format(e))
+
+
+# Q3: install the memory/CPU ulimit (preexec_fn) ONLY on Linux. On macOS the
+# RLIMIT_AS cap is a no-op anyway (Q2 — setrlimit raises), and preexec_fn forces
+# the fork() path that is macOS-fragile from the multithreaded tool server — the
+# sibling _execute_python (app/tools/code.py) deliberately avoids preexec_fn for
+# exactly this reason (#68). Windows doesn't support preexec_fn at all. So on any
+# non-Linux platform we don't install it and rely on the wall-clock timeout.
+_INSTALL_PRELIMIT = sys.platform.startswith("linux")
+if not _INSTALL_PRELIMIT:
+    logger.info(
+        "symbolic_check: child memory/CPU ulimit not installed on platform %r "
+        "(RLIMIT_AS is a no-op / preexec_fn is fork-fragile there); the "
+        "wall-clock timeout is the defense.",
+        sys.platform,
+    )
 
 
 # The generated child script. It receives its config as JSON on argv[1] — there
@@ -670,7 +687,9 @@ def _run_check_subprocess(
             timeout=timeout,
             cwd=cwd,
             env=_child_env(),
-            preexec_fn=_child_prelimit,
+            # Q3: Linux only — see _INSTALL_PRELIMIT. On macOS this is None so we
+            # don't force the fork() path the sibling _execute_python avoids.
+            preexec_fn=_child_prelimit if _INSTALL_PRELIMIT else None,
         )
     except subprocess.TimeoutExpired:
         return {

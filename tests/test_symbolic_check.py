@@ -488,6 +488,38 @@ class TestChildResourceLimits:
 
         _child_prelimit()  # no exception
 
+    def test_q3_prelimit_installed_only_on_linux(self):
+        """FIX2-Q3: preexec_fn is gated to Linux. On macOS it would force the
+        fork() path the sibling _execute_python deliberately avoids (and the
+        RLIMIT_AS it sets is a no-op there anyway)."""
+        import sys
+
+        from app.tools import symbolic
+
+        assert symbolic._INSTALL_PRELIMIT == sys.platform.startswith("linux")
+
+    def test_q3_subprocess_preexec_matches_platform(self, monkeypatch):
+        """The actual subprocess.run receives preexec_fn only on Linux; None
+        elsewhere (no macOS fork-fragility for a no-op limit)."""
+        import sys
+
+        from app.tools import symbolic
+
+        captured = {}
+        real_run = symbolic.subprocess.run
+
+        def spy(*args, **kwargs):
+            captured["preexec_fn"] = kwargs.get("preexec_fn")
+            return real_run(*args, **kwargs)
+
+        monkeypatch.setattr(symbolic.subprocess, "run", spy)
+        r = symbolic.symbolic_check("(x+1)**2", "x**2 + 2*x + 1", mode="equivalence")
+        assert r["verdict"] == "proven"  # still works with the gated preexec
+        if sys.platform.startswith("linux"):
+            assert captured["preexec_fn"] is symbolic._child_prelimit
+        else:
+            assert captured["preexec_fn"] is None
+
 
 class TestAttributeAccessBlocked:
     """FIX2-Q1: attribute access is blocked at the TOKEN level (a `.` OP token is
