@@ -450,6 +450,45 @@ class TestRCEBlocked:
         assert r2["verdict"] != "proven", "E must be a user symbol, not the constant"
 
 
+class TestChildResourceLimits:
+    """FIX2-Q2: a resource limit that can't be applied (e.g. RLIMIT_AS on macOS,
+    which raises) must be LOGGED, never silently swallowed — otherwise the memory
+    cap is a silent no-op and a prod misconfiguration passes unnoticed."""
+
+    def test_q2_prelimit_logs_not_swallows_on_failure(self, monkeypatch):
+        """When setrlimit raises, _child_prelimit writes a marker to stderr
+        (fd 2) instead of a bare `except: pass`. Tested by faking the failure and
+        capturing os.write — robust across the Q3 install-site change since it
+        exercises _child_prelimit directly."""
+        import os as _os
+        import resource as _res
+
+        from app.tools import symbolic
+
+        def _boom(*_a, **_k):
+            raise ValueError("simulated: RLIMIT not enforceable on this platform")
+
+        monkeypatch.setattr(_res, "setrlimit", _boom)
+        written = []
+        monkeypatch.setattr(_os, "write", lambda fd, b: (written.append((fd, b)), len(b))[1])
+
+        # Must NOT raise — a failed limit is non-fatal (timeout still bounds it).
+        symbolic._child_prelimit()
+
+        blob = b"".join(b for _, b in written)
+        assert b"RLIMIT_" in blob, "a failed limit must be reported, not swallowed"
+        assert b"not applied" in blob
+        # And it goes to stderr (fd 2), not stdout (fd 1 — would corrupt the JSON).
+        assert all(fd == 2 for fd, _ in written), written
+
+    def test_q2_prelimit_does_not_raise_on_this_platform(self):
+        """Calling it for real must never raise, whatever the platform enforces
+        (on macOS RLIMIT_AS raises internally and is caught+logged)."""
+        from app.tools.symbolic import _child_prelimit
+
+        _child_prelimit()  # no exception
+
+
 class TestAttributeAccessBlocked:
     """FIX2-Q1: attribute access is blocked at the TOKEN level (a `.` OP token is
     rejected in _TRANSFORMS, PREPENDED before auto_symbol), so the whitelist is

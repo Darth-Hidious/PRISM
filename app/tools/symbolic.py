@@ -51,14 +51,20 @@ parsed expression to code execution. Applied at BOTH parse sites (expressions
 and dimensional unit strings).
 
 Execution: the check runs in a subprocess (same pattern as _execute_python)
-because ``simplify()`` can hang or OOM on pathological input — the timeout
-kills it honestly. Defense-in-depth: the child gets a memory + CPU ulimit
-(``preexec_fn``) so a pathological input can't crash the tool server via OOM.
-The child receives its config as a JSON blob on argv[1].
+because ``simplify()`` can hang or OOM on pathological input. The WALL-CLOCK
+TIMEOUT is the cross-platform defense — it kills a hang/blowup honestly on every
+OS. Defense-in-depth: the child also gets a memory + CPU ulimit (``preexec_fn``),
+but that memory cap is BEST-EFFORT and NOT enforced on macOS —
+``setrlimit(RLIMIT_AS)`` raises there, so on Darwin it is a no-op and the
+wall-clock timeout is the working defense. A limit that can't be applied is now
+LOGGED, not silently swallowed, so a limit unexpectedly broken on the Linux
+deploy target raises an alarm. The child receives its config as a JSON blob on
+argv[1].
 """
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 import time
@@ -66,6 +72,8 @@ from pathlib import Path
 
 from app.tools.base import Tool, ToolRegistry
 from app.tools.code import MAX_TIMEOUT, _child_env
+
+logger = logging.getLogger(__name__)
 
 _NUMERIC_TOL = 1e-9
 _DEFAULT_N_POINTS = 16
@@ -99,29 +107,53 @@ def _looks_dangerous(*strings: str) -> bool:
     return False
 
 
+# Q2: marker the child writes to stderr when a resource limit can't be applied,
+# so the parent can surface it (a failed RLIMIT_AS means the memory cap is NOT
+# enforced — this must never be a silent no-op). Scanned by _run_check_subprocess.
+_RLIMIT_FAIL_MARKER = "symbolic_check[preexec]: RLIMIT_"
+
+
 def _child_prelimit() -> None:
-    """preexec_fn: cap the child's memory + CPU so a pathological simplify()
-    input can't crash the tool server via OOM (C1.4 defense-in-depth). The
-    restricted namespace is the PRIMARY fix; this is the secondary boundary.
+    """preexec_fn (installed on Linux only — see _run_check_subprocess): cap the
+    child's address space + CPU so a pathological simplify() can't OOM/segfault
+    the tool server (defense-in-depth; the restricted namespace is the PRIMARY
+    fix). This runs post-fork/pre-exec in the child.
 
-    POSIX-only — on platforms without ``resource`` the limits are silently
-    skipped (the timeout still bounds wall time).
+    HONEST PLATFORM POSTURE (Q2): the memory cap is enforced on Linux ONLY.
+    macOS ``setrlimit(RLIMIT_AS)`` raises ValueError -> it is a NO-OP there, so
+    the caller does not install this on Darwin (Q3) and the wall-clock timeout is
+    the working macOS defense. If a limit CANNOT be applied we write a marker to
+    stderr (captured + logged by the parent) rather than swallowing it silently,
+    so a limit that is unexpectedly broken on the deploy target raises an alarm.
     """
-    try:
-        import resource
+    import os
+    import resource
 
-        # Address-space cap: a runaway simplify allocating GBs dies with
-        # MemoryError instead of the OS killing the parent.
-        resource.setrlimit(resource.RLIMIT_AS, (_CHILD_MEM_LIMIT_BYTES, _CHILD_MEM_LIMIT_BYTES))
-        # CPU seconds: belt-and-suspenders alongside the subprocess timeout
-        # (CPU time can exceed wall time under parallelism, and a tight CPU
-        # limit catches a busy-spin that the timeout takes a moment to kill).
+    def _warn(msg: str) -> None:
+        # Post-fork, pre-exec in a (possibly multithreaded) parent: use raw
+        # os.write to stderr — do NOT touch the logging lock or stdio buffers
+        # inherited across the fork.
+        try:
+            os.write(2, msg.encode("utf-8", "replace"))
+        except OSError:
+            pass
+
+    # Address-space cap: a runaway simplify allocating GBs dies with MemoryError
+    # instead of the OS killing the parent. NOT enforced on macOS (raises).
+    try:
+        resource.setrlimit(
+            resource.RLIMIT_AS, (_CHILD_MEM_LIMIT_BYTES, _CHILD_MEM_LIMIT_BYTES)
+        )
+    except (ValueError, OSError) as e:
+        _warn(_RLIMIT_FAIL_MARKER + "AS not applied ({}): memory cap NOT enforced\n".format(e))
+    # CPU seconds: belt-and-suspenders alongside the subprocess timeout (CPU time
+    # can exceed wall time under parallelism, and a tight CPU limit catches a
+    # busy-spin that the timeout takes a moment to kill).
+    try:
         soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
         resource.setrlimit(resource.RLIMIT_CPU, (300, hard if hard != -1 else 300))
-    except (ImportError, ValueError, OSError):
-        # Non-POSIX or limit already lower — the namespace restriction + the
-        # subprocess timeout remain in force.
-        pass
+    except (ValueError, OSError) as e:
+        _warn(_RLIMIT_FAIL_MARKER + "CPU not applied ({})\n".format(e))
 
 
 # The generated child script. It receives its config as JSON on argv[1] — there
@@ -664,6 +696,14 @@ def _run_check_subprocess(
         }
 
     elapsed = _monotonic_ms() - started
+    # Q2: surface a failed child resource limit even on the success path (the
+    # child's stderr is otherwise discarded when it produced a verdict). A
+    # RLIMIT that couldn't be applied on the deploy target must not be a silent
+    # no-op — log it so a prod misconfiguration is visible.
+    if proc.stderr and _RLIMIT_FAIL_MARKER in proc.stderr:
+        for line in proc.stderr.splitlines():
+            if _RLIMIT_FAIL_MARKER in line:
+                logger.warning("symbolic_check child resource limit: %s", line.strip())
     out = proc.stdout.strip()
     base = {
         "mode": mode,
