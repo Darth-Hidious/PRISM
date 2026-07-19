@@ -21,6 +21,14 @@
 use std::path::{Path, PathBuf};
 
 use prism_agent::agent_loop;
+
+/// Serialize the tests in this binary. They all drive `run_turn`, whose entry
+/// resets the PROCESS-GLOBAL repair-chain memory (`hooks::LAST_CODE_RUN`); the
+/// H4 test also ASSERTS on that global, so a concurrent turn's entry-reset would
+/// wipe its state mid-test. One async lock keeps the turns from overlapping
+/// (tokio Mutex so it can be held across `.await` without deadlocking).
+static SERIAL_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 use prism_agent::protocol::build_agent_seed;
 use prism_agent::types::AgentEvent;
 use prism_ingest::LlmConfig;
@@ -235,6 +243,7 @@ fn tool_result_content<'a>(events: &'a [AgentEvent], tool: &str) -> Option<&'a s
 
 #[tokio::test(flavor = "multi_thread")]
 async fn spawn_subagent_runs_a_nested_turn_that_calls_tools() {
+    let _serial = SERIAL_TEST_LOCK.lock().await;
     let Some(python) = find_python() else {
         eprintln!("SKIP: python3 not on PATH");
         return;
@@ -277,6 +286,7 @@ async fn spawn_subagent_runs_a_nested_turn_that_calls_tools() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn spawn_subagent_refuses_beyond_max_depth() {
+    let _serial = SERIAL_TEST_LOCK.lock().await;
     let Some(python) = find_python() else {
         eprintln!("SKIP: python3 not on PATH");
         return;
@@ -310,4 +320,134 @@ async fn spawn_subagent_refuses_beyond_max_depth() {
         !calls_log.exists(),
         "no nested tool may run past the depth cap"
     );
+}
+
+// ── H4: the G2/H3 repair-chain guard, through the REAL nested wiring ──
+//
+// The only prior G2 test (hooks::tests::g2_snapshot_restore_roundtrip) called
+// the snapshot/restore helpers directly, never subagent.rs. This drives the
+// ACTUAL parent-fail -> spawn_subagent(fails) -> parent wiring and asserts the
+// parent's repair-chain memory survives and the subagent's code-run does NOT
+// splice into it — the property the CodeRunChainGuard exists to guarantee.
+
+/// A tool server exposing the two code-exec tools whose runs populate the
+/// repair-chain memory (`hooks::LAST_CODE_RUN`). Both return a FAILURE payload
+/// (`success: false`) so the run is recorded as a failed code-exec.
+const H4_CODE_EXEC_TOOL_SERVER_PY: &str = r#"
+import sys, json
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    if method == "list_tools":
+        resp = {"tools": [
+            {"name": "execute_python", "description": "stub code exec (test only).",
+             "input_schema": {"type": "object", "properties": {}}, "requires_approval": False},
+            {"name": "execute_bash", "description": "stub code exec (test only).",
+             "input_schema": {"type": "object", "properties": {}}, "requires_approval": False},
+        ]}
+    elif method == "call_tool":
+        # A FAILED code run: is_error via inner success:false + error string.
+        resp = {"result": {"ok": True, "success": False, "error": "stub code-exec failure"}}
+    else:
+        resp = {"error": "unknown method"}
+    sys.stdout.write(json.dumps(resp) + "\n")
+    sys.stdout.flush()
+"#;
+
+fn write_h4_project(dir: &Path) {
+    let app = dir.join("app");
+    std::fs::create_dir_all(&app).expect("create app dir");
+    std::fs::write(app.join("__init__.py"), "").expect("write __init__");
+    std::fs::write(app.join("tool_server.py"), H4_CODE_EXEC_TOOL_SERVER_PY).expect("write stub");
+}
+
+/// - `stub-model` (parent): execute_python (fails) -> spawn_subagent -> PARENT_DONE.
+/// - `claude-fable-5` (subagent): execute_bash (fails) -> SUBAGENT_DONE.
+///
+/// Routes on the number of `tool`-role messages already in the request so each
+/// step is deterministic.
+async fn start_h4_stub_llm() -> String {
+    use axum::routing::post;
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(
+            |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                let tool_msgs = body["messages"]
+                    .as_array()
+                    .map(|msgs| msgs.iter().filter(|m| m["role"] == "tool").count())
+                    .unwrap_or(0);
+                let sse = match (model.as_str(), tool_msgs) {
+                    ("claude-fable-5", 0) => sse_tool_call("execute_bash", "{}"),
+                    ("claude-fable-5", _) => sse_text("SUBAGENT_DONE"),
+                    (_, 0) => sse_tool_call("execute_python", "{}"),
+                    (_, 1) => sse_tool_call(
+                        "spawn_subagent",
+                        "{\"task\": \"run a code cell and report back\"}",
+                    ),
+                    (_, _) => sse_text("PARENT_DONE"),
+                };
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .expect("stub response")
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub llm");
+    let addr = listener.local_addr().expect("stub llm addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawn_subagent_preserves_parent_repair_chain() {
+    let _serial = SERIAL_TEST_LOCK.lock().await;
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_h4_project(project.path());
+    let base_url = start_h4_stub_llm().await;
+
+    // Clean the process-global chain so we assert only on THIS turn's records.
+    prism_agent::hooks::reset_code_run_chain();
+
+    let (answer, events) = run_parent_turn(project.path(), &python, base_url, 0).await;
+
+    // The parent finished ON TOP of the subagent (the real wiring ran).
+    assert_eq!(answer, "PARENT_DONE");
+    let sub_result =
+        tool_result_content(&events, "spawn_subagent").expect("spawn_subagent result event");
+    assert!(
+        sub_result.contains("SUBAGENT_DONE"),
+        "the nested subagent turn really ran: {sub_result}"
+    );
+
+    // The guard restored the parent's chain across the nested turn: the parent's
+    // execute_python slot SURVIVES, and the subagent's execute_bash slot was
+    // DISCARDED (never spliced into the parent's chain). Without the guard the
+    // nested run_turn's entry-reset would have wiped execute_python and left
+    // execute_bash — the exact corruption H3 fixes.
+    let chain = prism_agent::hooks::snapshot_code_run_chain();
+    let keys: Vec<&String> = chain.keys().collect();
+    assert!(
+        chain.contains_key("execute_python"),
+        "parent's repair chain must survive the nested subagent turn: {keys:?}"
+    );
+    assert!(
+        !chain.contains_key("execute_bash"),
+        "subagent's code-run slot must NOT splice into the parent's chain: {keys:?}"
+    );
+
+    prism_agent::hooks::reset_code_run_chain();
 }
