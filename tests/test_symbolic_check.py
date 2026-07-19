@@ -606,6 +606,150 @@ class TestAttributeAccessBlocked:
         assert r["success"] is False
 
 
+class TestRCEFStringBuiltins:
+    """VS2-P2-fix-3: close the CONFIRMED f-string RCE at the root.
+
+    A prior security review REPRODUCED a working RCE on Python 3.11.14: a
+    dimensional unit f-string reached real compile()+eval() inside
+    sympy.parse_expr and WROTE A FILE TO DISK while symbolic_check() reported a
+    benign success:True / verdict:"inconclusive". Two independent defenses now
+    close it:
+      F-A  empty ``__builtins__`` in _SAFE_GLOBALS  -> sympy's
+           eval(code, _SAFE_GLOBALS, local_dict) can no longer resolve
+           open/eval/exec/__import__/print by name; a non-whitelisted name
+           NameErrors instead of executing. This is the version-independent
+           ROOT-CAUSE fix (holds on 3.11 AND 3.12/3.13/3.14).
+      F-B  reject string-literal / f-string tokens at BOTH parse sites -> the
+           pre-3.12 SINGLE opaque STRING token can't smuggle code past
+           _reject_attribute_access's `.`-scan.
+
+    CRITICAL: these tests MUST run on Python 3.11 (the vulnerable interpreter)
+    to prove the fix — on 3.12+ PEP 701 exposes the inner f-string tokens and a
+    weaker fix could pass for the wrong reason. Run this file under a 3.11
+    interpreter to get that guarantee (the child subprocess uses sys.executable,
+    so it runs on the same interpreter as the test).
+    """
+
+    # The EXACT confirmed payload from the review (marker path %s-substituted so
+    # each test targets its own tmp_path instead of a shared /tmp file).
+    _DIM_FSTRING = "f\"{print ('MARKER_CONTENT', file=open ('%s', 'w'))}\""
+    # Same open() gadget wrapped in an f-string, used as an EXPRESSION (exercises
+    # the OTHER parse site: parse_user_expression).
+    _EXPR_FSTRING = "f\"{open ('%s', 'w').write ('x')}\""
+    # eval + runtime-built __import__ inside an f-string (the review's second
+    # gadget shape) that ends in an open() write.
+    _EVAL_IMPORT_FSTRING = (
+        "f\"{eval ('_'+'_import_'+'_')('builtins').open ('%s', 'w').write ('x')}\""
+    )
+
+    def _child_ns(self):
+        from app.tools.symbolic import _CHILD_SCRIPT
+
+        ns = {"__name__": "child_test"}
+        exec(compile(_CHILD_SCRIPT, "<child_test>", "exec"), ns)
+        return ns
+
+    def _marker(self, tmp_path):
+        import os
+        m = str(tmp_path / "pwned_marker")
+        if os.path.exists(m):
+            os.remove(m)
+        return m
+
+    # ---- F-A: empty builtins is the root cause fix -----------------------
+
+    def test_fa_safe_globals_pins_empty_builtins(self):
+        """Structural: _SAFE_GLOBALS pins __builtins__ to an empty dict, so
+        sympy's eval() cannot auto-inject the real builtins module."""
+        ns = self._child_ns()
+        assert ns["_SAFE_GLOBALS"]["__builtins__"] == {}
+
+    def test_fa_eval_against_safe_globals_nameerrors_on_builtin(self):
+        """Functional root-cause proof, INDEPENDENT of the token gate: evaluating
+        a bare builtin name against _SAFE_GLOBALS raises NameError (not the real
+        callable). This is exactly the eval sympy performs; empty builtins is
+        what makes open/eval/__import__ unreachable on EVERY Python version."""
+        ns = self._child_ns()
+        g = ns["_SAFE_GLOBALS"]
+        for name in ("open", "eval", "exec", "__import__", "print", "globals"):
+            with pytest.raises(NameError):
+                eval(name, g, {})  # noqa: S307 - deliberately proving it NameErrors
+
+    # ---- F-B: string-literal / f-string tokens rejected at BOTH sites -----
+
+    def test_fb_fstring_rejected_at_both_parse_sites(self):
+        """Token-gate proof, bypassing _looks_dangerous: an f-string is rejected
+        with ValueError at BOTH parse_user_expression AND parse_restricted."""
+        ns = self._child_ns()
+        fstr = "f\"{open('x','w')}\""
+        with pytest.raises(ValueError):
+            ns["parse_user_expression"](fstr, {})
+        with pytest.raises(ValueError):
+            ns["parse_restricted"](fstr)
+
+    def test_fb_plain_string_literal_rejected_at_both_sites(self):
+        """A plain (non-f) string literal has no legit use in a math/unit string
+        and is rejected too (covers plain-string sympify gadgets)."""
+        ns = self._child_ns()
+        for s in ("'abc'", "'a' + 'b'", 'sympify("x")'):
+            with pytest.raises(ValueError):
+                ns["parse_restricted"](s)
+
+    def test_fb_legit_inputs_with_no_quote_still_parse(self):
+        """Regression: the strict string reject must NOT touch legit inputs —
+        floats, sci-notation, trig, polynomials and unit strings have no quote."""
+        ns = self._child_ns()
+        pr = ns["parse_restricted"]
+        for g in ("1.5", ".5", "1.", "6.022e23", "2.5*x + 1.0",
+                  "sin(x)**2 + cos(x)**2", "(x+1)**2", "m/s**2"):
+            pr(g)  # raises if the string reject over-rejects
+
+    # ---- End-to-end through symbolic_check: NO marker on disk ------------
+
+    def test_spec_dimensional_fstring_writes_no_marker(self, tmp_path):
+        """THE reproduced exploit, end-to-end: the dimensional-mode unit f-string
+        must NOT write the marker (parse site: the unit resolver). Inert result,
+        no side effect."""
+        import os
+        marker = self._marker(tmp_path)
+        payload = self._DIM_FSTRING % marker.replace("\\", "/")
+        r = symbolic_check("x", "x", mode="dimensional", assumptions={"x": payload})
+        assert not os.path.exists(marker), "RCE executed: marker file written"
+        # Inert: the check ran but the malicious unit is simply unrecognized.
+        assert r["verdict"] == "inconclusive", r
+
+    def test_expr_fstring_writes_no_marker(self, tmp_path):
+        """Same open() gadget as an EXPRESSION (parse site: parse_user_expression)
+        must not write the marker; the parse is rejected -> success:False."""
+        import os
+        marker = self._marker(tmp_path)
+        payload = self._EXPR_FSTRING % marker.replace("\\", "/")
+        r = symbolic_check(payload, "x", mode="equivalence")
+        assert not os.path.exists(marker), "RCE executed via expression: marker written"
+        assert r["success"] is False, r
+        assert "parse error" in r["reason"], r
+
+    def test_eval_import_fstring_variant_writes_no_marker(self, tmp_path):
+        """The eval + runtime-built __import__ f-string variant must not write the
+        marker (F-B rejects the f-string; F-A would NameError eval anyway)."""
+        import os
+        marker = self._marker(tmp_path)
+        payload = self._EVAL_IMPORT_FSTRING % marker.replace("\\", "/")
+        r = symbolic_check(payload, "x", mode="equivalence")
+        assert not os.path.exists(marker), "eval/import RCE executed: marker written"
+        assert r["success"] is False, r
+
+    def test_bare_string_literal_expression_is_rejected(self, tmp_path):
+        """A bare non-f string literal as an expression is a clean rejection
+        (parse error), never a silent success-with-side-effect."""
+        import os
+        marker = self._marker(tmp_path)
+        r = symbolic_check("'MARKER'", "x", mode="equivalence")
+        assert not os.path.exists(marker)
+        assert r["success"] is False, r
+        assert "parse error" in r["reason"], r
+
+
 class TestRegistration:
     def test_tool_registered_with_approval(self):
         reg = ToolRegistry()
