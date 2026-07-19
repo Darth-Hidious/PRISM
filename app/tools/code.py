@@ -82,7 +82,12 @@ def _is_library_frame(line: str, cwd: str = "") -> bool:
     if any(m in line for m in ("site-packages", "dist-packages")):
         return True
     if any(m in line for m in ("python3.", "/lib/python", "/Frameworks/")):
-        return not (cwd and cwd in line)
+        # H5: align the empty-cwd default with the Rust twin (command_tools.rs).
+        # When cwd is unknown we cannot prove the frame is under the project, so
+        # prefer the safer under-elide direction: treat it as a USER frame (keep
+        # it), NOT library. The old `not (cwd and cwd in line)` returned
+        # True/library on empty cwd — the OPPOSITE of Rust.
+        return bool(cwd) and cwd not in line
     return False
 
 
@@ -171,7 +176,6 @@ def _filter_traceback(raw_stderr: str, cwd: str = "", persist: bool = True) -> d
     # The old code counted "[... N library frame(s) elided]" marker lines, so a
     # single collapsed run of 8 frames reported traceback_elided_frames=1.
     total_elided_frames = 0
-    in_chain_tail = False
 
     def flush_library_run():
         """Emit a single collapse-marker for a run of consecutive library frames."""

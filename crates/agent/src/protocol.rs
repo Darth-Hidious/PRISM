@@ -3994,7 +3994,12 @@ async fn handle_notebook_slash_command(
     args: &[String],
     slash_ctx: &SlashCommandContext,
 ) -> Result<bool> {
-    if args.first().map(String::as_str) != Some("notebook") {
+    // H6: case-insensitive to mirror spec_by_name (which matches roots via
+    // eq_ignore_ascii_case) — `/Notebook` should reach the same handler.
+    if !args
+        .first()
+        .is_some_and(|a| a.eq_ignore_ascii_case("notebook"))
+    {
         return Ok(false);
     }
     // Point the kernel at PRISM's managed interpreter + the project root.

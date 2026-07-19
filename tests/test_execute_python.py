@@ -259,6 +259,31 @@ class TestTracebackFilter:
         assert "site-packages/numpy" not in r["stderr"]
         assert r["traceback_elided_frames"] >= 1
 
+    def test_h5_ambiguous_marker_empty_cwd_is_kept_as_user(self):
+        """H5: with an EMPTY cwd, an ambiguous-marker frame (`python3.` etc.)
+        must be KEPT (not library) — aligning with the Rust twin's safer
+        under-elide direction. The old default elided it on empty cwd."""
+        from app.tools.code import _is_library_frame, _filter_traceback
+        line = '  File "/some/where/port_python3.14_helpers.py", line 1, in f'
+        assert _is_library_frame(line, "") is False, (
+            "empty cwd must not classify an ambiguous frame as library"
+        )
+        tb = (
+            'Traceback (most recent call last):\n'
+            '  File "/some/where/port_python3.14_helpers.py", line 1, in <module>\n'
+            '    do_thing()\n'
+            '  File "/x/site-packages/numpy/core.py", line 2, in f\n'
+            '    pass\n'
+            'RuntimeError: boom\n'
+        )
+        r = _filter_traceback(tb, "")
+        assert "port_python3.14_helpers.py" in r["stderr"], (
+            "ambiguous frame kept as user under empty cwd: %r" % r["stderr"]
+        )
+        # The reliable site-packages frame is still elided regardless of cwd.
+        assert "site-packages/numpy" not in r["stderr"]
+        assert r["traceback_elided_frames"] == 1
+
     def test_unchanged_when_nothing_to_elide(self):
         from app.tools.code import _filter_traceback
         tb = (
