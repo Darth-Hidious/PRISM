@@ -2231,6 +2231,18 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
     // `<cwd>/scripts/port_python3.14_helpers.py`). For the ambiguous ones,
     // require the frame is NOT under cwd (a real stdlib/framework path won't be
     // under the project cwd). cwd is now load-bearing here.
+    //
+    // H2: IPython tilde-compresses under-$HOME paths — it emits
+    // `File ~/project/scripts/foo.py:3` where the header path starts with `~/`,
+    // NOT the absolute cwd. Since most projects live under $HOME, the plain
+    // `line.contains(cwd)` (cwd absolute) missed the tilde form, so a USER frame
+    // under $HOME was misclassified library and elided (the frame G3 exists to
+    // protect). Precompute the `~`-compressed form of cwd and accept EITHER
+    // spelling as "under cwd".
+    let cwd_tilde: Option<String> = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .and_then(|h| cwd.strip_prefix(&h).map(|rest| format!("~{rest}")));
     let is_library = |line: &str| {
         let t = line.trim_start();
         if !(t.starts_with("File ") || t.starts_with("Cell In[")) {
@@ -2241,10 +2253,17 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
         if reliable.iter().any(|m| line.contains(m)) {
             return true;
         }
-        // Ambiguous markers: library only if the frame path is NOT under cwd.
+        // Ambiguous markers: library only if the frame path is NOT under cwd
+        // (matching either the absolute cwd or its `~`-compressed form).
         let ambiguous = ["python3.", "/lib/python", "/Frameworks/"];
         if ambiguous.iter().any(|m| line.contains(m)) {
-            return !cwd.is_empty() && !line.contains(cwd);
+            if cwd.is_empty() {
+                // Can't prove under cwd -> keep as user (safer under-elide).
+                return false;
+            }
+            let under_cwd =
+                line.contains(cwd) || cwd_tilde.as_deref().is_some_and(|t| line.contains(t));
+            return !under_cwd;
         }
         false
     };
@@ -4101,6 +4120,88 @@ RuntimeError: boom\n"
             assert!(
                 !filtered.contains(leaked),
                 "library source/path leaked into agent-facing trace: {leaked:?}\n---\n{filtered}"
+            );
+        }
+    }
+
+    /// REAL ipykernel capture (same live round-trip as REAL_IPYKERNEL_ARROW_TRACE)
+    /// where the user's helper lives UNDER $HOME, so IPython tilde-compresses its
+    /// frame to `File ~/.prism-review-tmp-g3/scripts/port_python3.14_helpers.py:3`.
+    /// The filename contains the ambiguous marker `python3.`, so without the H2
+    /// tilde normalization the absolute-cwd contains-check misses it and the USER
+    /// frame is misclassified library + elided.
+    const REAL_IPYKERNEL_TILDE_TRACE: &str = concat!(
+        "\x1b[31m---------------------------------------------------------------------------\x1b[39m\n",
+        "\x1b[31mLinAlgError\x1b[39m                               Traceback (most recent call last)\n",
+        "\x1b[36mCell\x1b[39m\x1b[36m \x1b[39m\x1b[32mIn[1]\x1b[39m\x1b[32m, line 4\x1b[39m\n",
+        "\x1b[32m      2\x1b[39m p = os.path.join(os.getcwd(), \x1b[33m'\x1b[39m\x1b[33mscripts\x1b[39m\x1b[33m'\x1b[39m, \x1b[33m'\x1b[39m\x1b[33mport_python3.14_helpers.py\x1b[39m\x1b[33m'\x1b[39m)\n",
+        "\x1b[32m      3\x1b[39m exec(\x1b[38;5;28mcompile\x1b[39m(\x1b[38;5;28mopen\x1b[39m(p).read(), p, \x1b[33m'\x1b[39m\x1b[33mexec\x1b[39m\x1b[33m'\x1b[39m))\n",
+        "\x1b[32m----> \x1b[39m\x1b[32m4\x1b[39m \x1b[43mdo_thing\x1b[49m\x1b[43m(\x1b[49m\x1b[43m)\x1b[49m\n",
+        "\n",
+        "\x1b[36mFile \x1b[39m\x1b[32m~/.prism-review-tmp-g3/scripts/port_python3.14_helpers.py:3\x1b[39m, in \x1b[36mdo_thing\x1b[39m\x1b[34m()\x1b[39m\n",
+        "\x1b[32m      2\x1b[39m \x1b[38;5;28;01mdef\x1b[39;00m\x1b[38;5;250m \x1b[39m\x1b[34mdo_thing\x1b[39m():\n",
+        "\x1b[32m----> \x1b[39m\x1b[32m3\x1b[39m     \x1b[38;5;28;01mreturn\x1b[39;00m \x1b[43mnp\x1b[49m\x1b[43m.\x1b[49m\x1b[43mlinalg\x1b[49m\x1b[43m.\x1b[49m\x1b[43minv\x1b[49m\x1b[43m(\x1b[49m\x1b[43mnp\x1b[49m\x1b[43m.\x1b[49m\x1b[43mzeros\x1b[49m\x1b[43m(\x1b[49m\x1b[43m(\x1b[49m\x1b[32;43m2\x1b[39;49m\x1b[43m,\x1b[49m\x1b[43m \x1b[49m\x1b[32;43m3\x1b[39;49m\x1b[43m)\x1b[49m\x1b[43m)\x1b[49m\x1b[43m)\x1b[49m\n",
+        "\n",
+        "\x1b[36mFile \x1b[39m\x1b[32m/opt/homebrew/lib/python3.14/site-packages/numpy/linalg/_linalg.py:642\x1b[39m, in \x1b[36minv\x1b[39m\x1b[34m(a)\x1b[39m\n",
+        "\x1b[32m    641\x1b[39m a, wrap = _makearray(a)\n",
+        "\x1b[32m--> \x1b[39m\x1b[32m642\x1b[39m \x1b[43m_assert_stacked_square\x1b[49m\x1b[43m(\x1b[49m\x1b[43ma\x1b[49m\x1b[43m)\x1b[49m\n",
+        "\x1b[32m    643\x1b[39m t, result_t = _commonType(a)\n",
+        "\n",
+        "\x1b[36mFile \x1b[39m\x1b[32m/opt/homebrew/lib/python3.14/site-packages/numpy/linalg/_linalg.py:246\x1b[39m, in \x1b[36m_assert_stacked_square\x1b[39m\x1b[34m(*arrays)\x1b[39m\n",
+        "\x1b[32m    245\x1b[39m \x1b[38;5;28;01mif\x1b[39;00m m != n:\n",
+        "\x1b[32m--> \x1b[39m\x1b[32m246\x1b[39m     \x1b[38;5;28;01mraise\x1b[39;00m LinAlgError(\x1b[33m'\x1b[39m\x1b[33mLast 2 dimensions of the array must be square\x1b[39m\x1b[33m'\x1b[39m)\n",
+        "\n",
+        "\x1b[31mLinAlgError\x1b[39m: Last 2 dimensions of the array must be square",
+    );
+
+    #[test]
+    fn h2_real_ipykernel_tilde_userfile_is_kept_not_elided() {
+        // H2: a user file UNDER $HOME whose name contains the ambiguous marker
+        // `python3.`. IPython emits its frame tilde-compressed (`File ~/…`). The
+        // absolute-cwd contains-check misses the `~` form, so the pre-fix filter
+        // elided the user frame. cwd is <$HOME>/.prism-review-tmp-g3 so its
+        // `~`-compressed form (`~/.prism-review-tmp-g3`) matches the frame path.
+        let Ok(home) = std::env::var("HOME") else {
+            eprintln!("SKIP: HOME unset");
+            return;
+        };
+        if home.is_empty() {
+            eprintln!("SKIP: HOME empty");
+            return;
+        }
+        let cwd = format!("{home}/.prism-review-tmp-g3");
+        let (filtered, n) = filter_notebook_traceback(REAL_IPYKERNEL_TILDE_TRACE, &cwd);
+
+        // The USER frame under $HOME is KEPT (the H2 assertion) — its filename
+        // and its own source both reach the model.
+        assert!(
+            filtered.contains("port_python3.14_helpers.py"),
+            "tilde-path user frame under $HOME must be KEPT, not elided: {filtered}"
+        );
+        assert!(
+            filtered.contains("return np.linalg.inv(np.zeros((2, 3)))"),
+            "the user frame's own source must survive: {filtered}"
+        );
+        // The final exception line ALWAYS survives.
+        assert!(
+            filtered.contains("LinAlgError: Last 2 dimensions of the array must be square"),
+            "final exception line must survive: {filtered}"
+        );
+        // Only the TWO numpy site-packages frames are elided (the user frame is
+        // NOT counted). Pre-H2 this was 3 (the user frame wrongly included).
+        assert_eq!(
+            n, 2,
+            "exactly the 2 numpy library frames elided (user frame kept): got {n}"
+        );
+        // And no numpy library source leaks (H1 still holds on the tilde trace).
+        for leaked in [
+            "_assert_stacked_square(a)",
+            "t, result_t = _commonType(a)",
+            "site-packages/numpy",
+        ] {
+            assert!(
+                !filtered.contains(leaked),
+                "library source/path leaked: {leaked:?}\n---\n{filtered}"
             );
         }
     }
