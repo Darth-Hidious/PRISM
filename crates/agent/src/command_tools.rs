@@ -2232,6 +2232,21 @@ fn is_traceback_body_line(line: &str) -> bool {
     after_dashes.len() < line.len() && after_dashes.starts_with('>')
 }
 
+/// H2/F3: compute the `~`-compressed form of `cwd` given `$HOME`, so a USER
+/// frame IPython emits tilde-collapsed (`File ~/proj/foo.py:3`) matches the cwd.
+///
+/// F3: a trailing slash on `$HOME` (`HOME=/Users/x/`) made `strip_prefix` yield
+/// `~proj…` (no separator) while IPython emits `~/proj/…`, so the user frame was
+/// over-elided. Trim a trailing `/` from HOME first. Returns None when HOME is
+/// empty (or `/`, which trims to empty) or when cwd is not under HOME.
+fn cwd_tilde_form(home: &str, cwd: &str) -> Option<String> {
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return None;
+    }
+    cwd.strip_prefix(home).map(|rest| format!("~{rest}"))
+}
+
 // VS2-P1a: agent-facing traceback filter for notebook_exec. The kernel is
 // SHARED with the human pane, so the filter is applied HERE (the agent-facing
 // composition), not in the sidecar — the human debug pane keeps the raw
@@ -2290,8 +2305,7 @@ fn filter_notebook_traceback(stderr: &str, cwd: &str) -> (String, usize) {
     // spelling as "under cwd".
     let cwd_tilde: Option<String> = std::env::var("HOME")
         .ok()
-        .filter(|h| !h.is_empty())
-        .and_then(|h| cwd.strip_prefix(&h).map(|rest| format!("~{rest}")));
+        .and_then(|h| cwd_tilde_form(&h, cwd));
     let is_library = |line: &str| {
         // F2: strip an ExceptionGroup gutter first so `| File ".../site-packages/…"`
         // is recognized as a frame; the `line.contains(...)` marker/cwd checks
@@ -4415,6 +4429,39 @@ RuntimeError: boom\n"
         );
         // Outer block: 1 fakelib frame; each sub-exception: 2 -> 5 total.
         assert_eq!(n, 5, "all five library frames elided: got {n}\n{filtered}");
+    }
+
+    #[test]
+    fn f3_cwd_tilde_form_trims_trailing_slash_home() {
+        // F3: a trailing-slash $HOME must still yield IPython's `~/proj`
+        // spelling. Before the trim, HOME=/Users/x/ produced `~proj` (no
+        // separator), so the under-$HOME user frame `File ~/proj/foo.py` didn't
+        // match cwd_tilde and was over-elided. Pure helper -> no racy env mutation.
+        assert_eq!(
+            cwd_tilde_form("/Users/x/", "/Users/x/proj"),
+            Some("~/proj".to_string()),
+            "trailing-slash HOME must keep the `/` separator"
+        );
+        // No-trailing-slash case unchanged.
+        assert_eq!(
+            cwd_tilde_form("/Users/x", "/Users/x/proj"),
+            Some("~/proj".to_string())
+        );
+        // Multiple trailing slashes also trimmed.
+        assert_eq!(
+            cwd_tilde_form("/Users/x//", "/Users/x/proj"),
+            Some("~/proj".to_string())
+        );
+        // cwd IS home -> `~`.
+        assert_eq!(
+            cwd_tilde_form("/Users/x/", "/Users/x"),
+            Some("~".to_string())
+        );
+        // cwd not under home -> None.
+        assert_eq!(cwd_tilde_form("/Users/x", "/tmp/proj"), None);
+        // Empty / root HOME -> None (no spurious `~/…` matching everything).
+        assert_eq!(cwd_tilde_form("", "/Users/x/proj"), None);
+        assert_eq!(cwd_tilde_form("/", "/Users/x/proj"), None);
     }
 
     #[test]
