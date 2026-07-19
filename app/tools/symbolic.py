@@ -263,18 +263,60 @@ def _reject_attribute_access(tokens, local_dict, global_dict):
     return tokens
 
 
+def _reject_string_literals(tokens, local_dict, global_dict):
+    """C1/L2 (defense-in-depth alongside the empty ``__builtins__`` in
+    _SAFE_GLOBALS): reject ANY string literal at the TOKEN level, at BOTH parse
+    sites (they share _TRANSFORMS).
+
+    VERSION-HONESTY / WHY THIS EXISTS (do NOT delete — the `.`-token scan does
+    NOT subsume it): before Python 3.12 (pre-PEP 701) an f-string tokenizes as a
+    SINGLE OPAQUE ``STRING`` token — the ``.``/names/calls inside its ``{...}``
+    are INVISIBLE to _reject_attribute_access's ``.``-scan. When the reconstructed
+    source then hits real compile()+eval() inside sympy.parse_expr, that embedded
+    expression runs with FULL Python semantics (real attribute access, real name
+    resolution). That is exactly how the CONFIRMED VS2-P2 RCE reached open()/print
+    via a dimensional unit string ``f"{open('/tmp/x','w')}"`` on Python 3.11 — the
+    3.12+ CI never saw it because PEP 701 exposes the inner tokens there. The
+    empty ``__builtins__`` (F-A) is the true root-cause fix; this token reject is
+    the belt-and-suspenders that also stops any future string-eval gadget.
+
+    STRICT FORM (chosen deliberately): a restricted math expression and a
+    dimensional unit string have NO legitimate reason to contain ANY string
+    literal — no whitelisted name accepts a string, and no legit test input
+    contains a quote char (verified). So we reject ANY string token outright,
+    which covers f-strings (pre- AND post-3.12) AND plain-string sympify gadgets.
+    ``FSTRING_START`` (3.12+, PEP 701) is rejected explicitly as belt-and-
+    suspenders in case a future tokenizer surfaces the inner tokens.
+    """
+    from token import STRING
+    import token as _token
+
+    # FSTRING_START only exists on Python 3.12+ (PEP 701). On <3.12 an f-string
+    # is a single STRING token (prefix contains f/F) — caught by the STRING check.
+    _FSTRING_START = getattr(_token, "FSTRING_START", None)
+    for toknum, tokval in tokens:
+        if toknum == STRING or (_FSTRING_START is not None and toknum == _FSTRING_START):
+            raise ValueError(
+                "string literals are not permitted in symbolic expressions"
+            )
+    return tokens
+
+
 # H1/H4: parse numeric literals as EXACT (rationalize transform converts Float
 # literals to Rational/Integer AT PARSE, before evaluation). The old path relied
 # on lossy Float64 — `6.022e23 + 1e6` absorbed `+1e6` -> simplify(a-b)==0 -> a
 # false "proven" for two unequal numbers. With rationalize, `6.022e23+1e6` parses
 # to the exact integer ...001000000, so a-b != 0. "proven" ONLY from an exact
 # symbolic zero.
-# C1/Q1: _reject_attribute_access is PREPENDED (before auto_symbol) — it is now
-# the REAL gate that makes the whitelist load-bearing; the `"__"` substring in
-# _DANGEROUS_TOKENS is only a cheap secondary. Both parse sites
-# (parse_user_expression for expr_a/b AND parse_restricted for dimensional unit
-# strings) share _TRANSFORMS, so the block covers both.
-_TRANSFORMS = (_reject_attribute_access,) + standard_transformations + (rationalize,)
+# C1/Q1/L2: _reject_attribute_access AND _reject_string_literals are PREPENDED
+# (before auto_symbol) — they are the REAL gate that makes the whitelist
+# load-bearing; the `"__"` substring in _DANGEROUS_TOKENS is only a cheap
+# secondary. The string-literal reject specifically closes the pre-3.12
+# opaque-f-string hole that the `.`-token scan cannot see (see
+# _reject_string_literals). Both parse sites (parse_user_expression for expr_a/b
+# AND parse_restricted for dimensional unit strings) share _TRANSFORMS, so both
+# blocks cover both sites.
+_TRANSFORMS = (_reject_attribute_access, _reject_string_literals) + standard_transformations + (rationalize,)
 # H4: RELATIVE tolerance. The old absolute TOL=1e-9 fabricated "fail"
 # counterexamples for true large-magnitude identities (e.g. (x+10)**8 vs its
 # expansion: abs_diff ~4e-8 at magnitude ~5e7 is pure float64 noise, but
