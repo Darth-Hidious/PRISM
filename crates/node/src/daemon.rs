@@ -303,7 +303,10 @@ pub async fn run_daemon(
                 delay_secs = 1;
             }
             Err(e) => {
-                tracing::warn!(error = %e, delay_secs, "disconnected, reconnecting");
+                // ?e (Debug) — surface the full source chain so a swallowed
+                // post-registration step (WS handshake, key exchange, message
+                // parse) is diagnosable instead of looping silently offline.
+                tracing::warn!(error = ?e, delay_secs, "disconnected, reconnecting");
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                 delay_secs = (delay_secs * 2).min(300);
             }

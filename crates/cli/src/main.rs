@@ -2439,7 +2439,13 @@ async fn main() -> Result<()> {
                                 daemon_platform_client = Some(platform);
                             }
                             Err(e) => {
-                                eprintln!("  Warning: Platform registration failed: {e}");
+                                // {e:?} — print the full source chain, not just
+                                // the top-level context. The error is wrapped at
+                                // `node_registry.rs` with `.context("failed to
+                                // register node")`; `{e}` shows only that
+                                // context and hides the underlying HTTP/WS/parse
+                                // cause that determines the real fix.
+                                eprintln!("  Warning: Platform registration failed: {e:?}");
                                 eprintln!("  (Continuing in offline mode.)");
                             }
                         }
