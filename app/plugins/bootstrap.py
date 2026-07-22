@@ -235,6 +235,16 @@ def build_full_registry(
     except Exception:
         logger.exception("materials_search tool registration failed")
 
+    # Free first-class materials-informatics tools (OPTIMADE redesign S8).
+    # Compose the federated search + pymatgen/pandas — no paid APIs. These close
+    # the gap to commercial screening platforms (screen/compare/lookup).
+    try:
+        from app.tools.materials import create_materials_informatics_tools
+
+        create_materials_informatics_tools(registry)
+    except Exception:
+        logger.exception("materials-informatics tools registration failed")
+
     # Plugins (entry points + local — can register into ANY sub-registry)
     if enable_plugins:
         try:
