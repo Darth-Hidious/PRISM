@@ -1,0 +1,317 @@
+# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+"""High-Entropy Alloy (HEA) / Multi-Principal-Element Alloy (MPEA) design tools.
+
+The free Thermo-Calc alternative for alloy design. Thermo-Calc charges
+$15K–$40K+ for TCHEA (HEA database) + the Scheil solidification calculator.
+These tools replicate the empirical HEA-formability screening using open
+math (no commercial database) — the "is this composition a viable HEA?"
+question, free.
+
+`hea_descriptors`: computes the formability descriptors that decide whether a
+multi-principal-element alloy forms a solid solution vs intermetallic vs
+segregated: mixing enthalpy (ΔH_mix), entropy of mixing (ΔS_mix), the Yang Ω
+parameter, valence electron concentration (VEC), atomic-radius mismatch (δ),
+and the Yang solid-solution criterion.
+
+References:
+  - Yang & Zhang (2012), "Prediction of solid solution formation...", Mater. Chem. Phys.
+    (the Ω + δ criterion).
+  - Guo, Liu (2011), "A valence electron concentration criterion for HEAs",
+    Intermetallics (the VEC → FCC/BCC criterion).
+  - Takeuchi, Inoue (2005), "Classification of bulk metallic glasses by atomic
+    size difference, ΔH_mix and ΔS_mix" (the ΔH_mix pair table source).
+  - Senkov et al. for refractory HEA validation compositions.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from typing import Any
+
+from app.tools.base import Tool, ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+# Valence electron concentration (VEC) per element — the Guo/Liu convention
+# used universally in HEA literature. For transition metals this is the group
+# number; for the common HEA p-block elements it's the standard value. A pure
+# transition-metal VEC comes from pymatgen's group, but we tabulate to match
+# the published HEA values exactly (pymatgen's .valence raises on ambiguous TMs).
+_VEC: dict[str, float] = {
+    "Sc": 3, "Ti": 4, "V": 5, "Cr": 6, "Mn": 7, "Fe": 8, "Co": 9, "Ni": 10,
+    "Cu": 11, "Zn": 12, "Y": 3, "Zr": 4, "Nb": 5, "Mo": 6, "Tc": 7, "Ru": 8,
+    "Rh": 9, "Pd": 10, "Ag": 11, "Cd": 12, "Hf": 4, "Ta": 5, "W": 6, "Re": 7,
+    "Os": 8, "Ir": 9, "Pt": 10, "Au": 11, "Al": 3, "Si": 4, "Ga": 3, "Ge": 4,
+    "Sn": 4, "Sb": 5, "Pb": 4, "Bi": 5, "C": 4, "N": 5, "B": 3, "P": 5,
+    "La": 3, "Ce": 3, "Pr": 3, "Nd": 3, "Gd": 3, "Dy": 3, "Mg": 2, "Li": 1,
+    "Be": 2, "Na": 1, "K": 1, "Ca": 2, "Sr": 2, "Ba": 2,
+}
+
+# Binary mixing enthalpy (ΔH_mix, kJ/mol) for common HEA element pairs, from
+# the Miedema model as tabulated by Takeuchi & Inoue (2005) — the standard
+# reference used in HEA screening. Symmetric: ΔH(A,B) == ΔH(B,A). Missing pairs
+# default to 0 (ideal mixing). Values are rounded to 0.5 kJ/mol as published.
+_DH_MIX_PAIRS: dict[tuple[str, str], float] = {}
+_PAIR_DATA = """
+Al-Co -19 Al-Cr -10 Al-Cu -1 Al-Fe -11 Al-Hf -31 Al-Mg -2 Al-Mn -19
+Al-Mo -15 Al-Nb -18 Al-Ni -22 Al-Sc -38 Al-Si -19 Al-Ta -19 Al-Ti -30
+Al-Ti -30 Al-V -16 Al-W -13 Al-Zr -44
+Co-Cr -4 Co-Cu 6 Co-Fe -1 Co-Hf -21 Co-Mn -5 Co-Mo -5 Co-Nb -10 Co-Ni 0
+Co-Sc -27 Co-Si -21 Co-Ta -11 Co-Ti -18 Co-V -14 Co-W -4 Co-Zr -41
+Cr-Cu 12 Cr-Fe -1 Cr-Hf -7 Cr-Mn 2 Cr-Mo 0 Cr-Nb -7 Cr-Ni -7 Cr-Sc -18
+Cr-Si -20 Cr-Ta -9 Cr-Ti -7 Cr-V -2 Cr-W 1 Cr-Zr -12
+Cu-Fe 13 Cu-Hf -15 Cu-Mg -3 Cu-Mn -4 Cu-Mo -3 Cu-Nb -3 Cu-Ni 4 Cu-Sc -15
+Cu-Si -6 Cu-Ta 1 Cu-Ti -9 Cu-V -2 Cu-W 1 Cu-Zr -23
+Fe-Hf -19 Fe-Mn 0 Fe-Mo -2 Fe-Nb -6 Fe-Ni -2 Fe-Sc -16 Fe-Si -18 Fe-Ta -10
+Fe-Ti -17 Fe-V -7 Fe-W 0 Fe-Zr -25
+Hf-Mo -4 Hf-Nb -4 Hf-Si -24 Hf-Ta -3 Hf-Ti 0 Hf-V -2 Hf-W -2 Hf-Zr 0
+Mg-Mn 4 Mg-Mo 9 Mg-Nb -4 Mg-Ni -4 Mg-Si -9 Mg-Sn -6 Mg-Ti -16 Mg-Zr -6
+Mn-Mo 5 Mn-Nb -5 Mn-Ni -8 Mn-Si -19 Mn-Ta -8 Mn-Ti -8 Mn-V -1 Mn-Zr -15
+Mo-Nb -6 Mo-Ni -7 Mo-Si -18 Mo-Ta -1 Mo-Ti -4 Mo-V -1 Mo-W 0 Mo-Zr -6
+Nb-Ni -9 Nb-Si -24 Nb-Ta 0 Nb-Ti -2 Nb-V -1 Nb-Zr -4
+Ni-Si -23 Ni-Ta -13 Ni-Ti -18 Ni-V -18 Ni-W -3 Ni-Zr -34
+Si-Ta -15 Si-Ti -26 Si-V -17 Si-W -12 Si-Zr -36
+Ta-Ti -1 Ta-V -1 Ta-Zr -2
+Ti-V 0 Ti-Zr -3 V-Zr -4
+"""
+for _line in _PAIR_DATA.strip().split("\n"):
+    _parts = _line.split()
+    # Format: "El1-El2 value El3-El4 value ..." — each pair is hyphen-joined.
+    for _i in range(0, len(_parts), 2):
+        _pair, _val = _parts[_i], _parts[_i + 1]
+        _a, _b = _pair.split("-")
+        _DH_MIX_PAIRS[(_a, _b)] = float(_val)
+        _DH_MIX_PAIRS[(_b, _a)] = float(_val)
+
+
+def _dh_mix_for_pair(a: str, b: str) -> float:
+    """Binary mixing enthalpy ΔH_mix(A,B) in kJ/mol (0 = ideal)."""
+    return _DH_MIX_PAIRS.get((a, b), 0.0)
+
+
+def _parse_composition(spec: str | dict[str, float]) -> tuple[list[str], list[float]] | None:
+    """Parse a composition spec into (elements, fractions).
+
+    Accepts:
+      - "Cr0.2Fe0.2Ni0.2Co0.2Cu0.2" (reduced formula with explicit fractions)
+      - "NbMoTaW" (equal fractions assumed)
+      - {"Cr": 0.2, "Fe": 0.2, ...} (element-fraction dict)
+    Returns None if it can't parse (caller surfaces the error).
+    """
+    if isinstance(spec, dict):
+        elems = list(spec.keys())
+        fracs = [float(spec[e]) for e in elems]
+    elif isinstance(spec, str):
+        try:
+            from pymatgen.core import Composition
+
+            c = Composition(spec)
+            elems = [str(e) for e in c.elements]
+            fracs = [c.get_atomic_fraction(e) for e in c.elements]
+        except Exception:
+            return None
+    else:
+        return None
+    if not elems or len(elems) < 2:
+        return None
+    # Normalize fractions to sum to 1.
+    total = sum(fracs)
+    if total <= 0:
+        return None
+    fracs = [f / total for f in fracs]
+    return elems, fracs
+
+
+def _atomic_radius(sym: str) -> float | None:
+    """Metallic atomic radius in Å from pymatgen (None if unavailable)."""
+    try:
+        from pymatgen.core.periodic_table import Element
+
+        r = Element(sym).atomic_radius
+        return float(r) if r else None
+    except Exception:
+        return None
+
+
+def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, Any]:
+    """Compute the full HEA formability descriptor set.
+
+    Pure math — no network, no ML, no database. Returns a dict with:
+      - ΔS_mix (configurational entropy of mixing), J/(mol·K)
+      - ΔH_mix (mixing enthalpy via Miedema pair table), kJ/mol
+      - Ω (Yang parameter: Tm·ΔS_mix / |ΔH_mix|)
+      - VEC (valence electron concentration)
+      - δ (atomic-radius mismatch, %)
+      - Δχ (electronegativity difference, Pauling)
+      - phase_prediction (solid_solution | intermetallic | segregated) via Yang+Guo
+    """
+    n = len(elems)
+    R = 8.314  # J/(mol·K) gas constant
+
+    # ΔS_mix = -R Σ c_i ln(c_i)  (configurational / ideal mixing entropy)
+    dS_mix = -R * sum(f * math.log(f) for f in fracs if f > 0)
+
+    # ΔH_mix = 4 Σ_{i≠j} c_i c_j ΔH_mix(i,j)  (Miedema, regular-solution form)
+    dH_mix = 0.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dH_mix += fracs[i] * fracs[j] * _dh_mix_for_pair(elems[i], elems[j])
+    dH_mix *= 4.0  # kJ/mol
+
+    # VEC = Σ c_i VEC_i  (Guo/Liu)
+    vec = sum(fracs[i] * _VEC.get(elems[i], 0.0) for i in range(n))
+
+    # δ = sqrt(Σ c_i (1 - r_i/r_bar)^2)  ×100 (%)  (atomic-radius mismatch)
+    radii = [_atomic_radius(e) for e in elems]
+    if all(r is not None for r in radii):
+        r_bar = sum(fracs[i] * radii[i] for i in range(n))
+        delta = 100.0 * math.sqrt(
+            sum(fracs[i] * (1.0 - radii[i] / r_bar) ** 2 for i in range(n))
+        )
+    else:
+        delta = None  # radius missing for some element
+
+    # Δχ (electronegativity mismatch, Pauling) — optional, if available
+    dchi = None
+    try:
+        from pymatgen.core.periodic_table import Element
+
+        chis = [Element(e).X for e in elems]
+        if all(c is not None for c in chis):
+            chi_bar = sum(fracs[i] * chis[i] for i in range(n))
+            dchi = math.sqrt(sum(fracs[i] * (chis[i] - chi_bar) ** 2 for i in range(n)))
+    except Exception:
+        pass
+
+    # Melting point estimate (weighted average of pure-element Tm, °C→K)
+    try:
+        from pymatgen.core.periodic_table import Element
+
+        tms = [Element(e).melting_point for e in elems]
+        if all(t is not None for t in tms):
+            tm_bar = sum(fracs[i] * tms[i] for i in range(n))  # K
+        else:
+            tm_bar = None
+    except Exception:
+        tm_bar = None
+
+    # Ω = Tm·ΔS_mix / |ΔH_mix|  (Yang solid-solution parameter; ΔS in kJ for unit match)
+    omega = None
+    if tm_bar and abs(dH_mix) > 1e-9:
+        omega = (tm_bar * (dS_mix / 1000.0)) / abs(dH_mix)  # ΔS→kJ/(mol·K)
+
+    # Phase prediction (Yang 2012 + Guo/Liu 2011):
+    #  Solid solution likely when Ω ≥ 1.1 AND δ ≤ 6.6%
+    #  VEC < 8.0 → BCC; 8.0 ≤ VEC < 8.6 → BCC+FCC mixed; VEC ≥ 8.6 → FCC
+    phase = "intermetallic_or_segregated"
+    criterion_notes = []
+    if omega is not None and delta is not None:
+        if omega >= 1.1 and delta <= 6.6:
+            phase = "solid_solution"
+            criterion_notes.append(
+                f"Yang criterion MET: Ω={omega:.2f} ≥ 1.1 and δ={delta:.2f}% ≤ 6.6%"
+            )
+        else:
+            criterion_notes.append(
+                f"Yang criterion NOT met: Ω={omega:.2f} (need ≥1.1), δ={delta:.2f}% (need ≤6.6%)"
+            )
+    # Crystal structure hint from VEC (Guo/Liu)
+    if vec is not None:
+        if vec < 8.0:
+            criterion_notes.append(f"VEC={vec:.2f} < 8.0 → BCC favored (Guo/Liu)")
+        elif vec < 8.6:
+            criterion_notes.append(f"VEC={vec:.2f} ∈ [8.0, 8.6) → BCC+FCC mixed (Guo/Liu)")
+        else:
+            criterion_notes.append(f"VEC={vec:.2f} ≥ 8.6 → FCC favored (Guo/Liu)")
+
+    return {
+        "delta_H_mix_kJ_per_mol": round(dH_mix, 2),
+        "delta_S_mix_J_per_molK": round(dS_mix, 2),
+        "omega": round(omega, 3) if omega is not None else None,
+        "VEC": round(vec, 3),
+        "delta_radius_pct": round(delta, 3) if delta is not None else None,
+        "delta_chi": round(dchi, 4) if dchi is not None else None,
+        "Tm_estimate_K": round(tm_bar, 1) if tm_bar is not None else None,
+        "phase_prediction": phase,
+        "criterion": "Yang (Ω, δ) + Guo/Liu (VEC)",
+        "rationale": criterion_notes,
+        "n_elements": n,
+        "elements": elems,
+        "fractions": [round(f, 4) for f in fracs],
+    }
+
+
+def create_hea_tools(registry: ToolRegistry) -> None:
+    """Register the HEA / alloy-design tools."""
+    registry.register(_hea_descriptors_tool())
+    logger.info("Registered hea_descriptors tool")
+
+
+_HEA_SCHEMA: dict = {
+    "type": "object",
+    "description": (
+        "Compute the high-entropy-alloy (HEA) formability descriptors for a "
+        "multi-principal-element composition and predict whether it forms a "
+        "solid solution. Answers 'is this alloy composition a viable HEA?' "
+        "using the established empirical criteria (Yang Ω+δ, Guo/Liu VEC) — "
+        "the free equivalent of the screening Thermo-Calc's TCHEA database "
+        "is used for. Pure math, no database required."
+    ),
+    "properties": {
+        "composition": {
+            "type": "string",
+            "description": (
+                "Composition as a reduced formula with explicit fractions, e.g. "
+                "'Cr0.2Fe0.2Ni0.2Co0.2Cu0.2' (the Cantor alloy), or 'NbMoTaW' "
+                "(equal fractions assumed), or a space-separated list."
+            ),
+        },
+        "fractions": {
+            "type": "object",
+            "description": (
+                "Alternative: pass element→fraction directly, e.g. "
+                "{\"Cr\":0.2,\"Fe\":0.2,\"Ni\":0.2,\"Co\":0.2,\"Cu\":0.2}. "
+                "Use this when fractions aren't expressible in a formula string."
+            ),
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+def _hea_descriptors_tool() -> Tool:
+    def _hea(**kwargs) -> dict:
+        comp = kwargs.get("composition")
+        fracs_dict = kwargs.get("fractions")
+        if not comp and not fracs_dict:
+            return {"error": "provide a composition (formula string or fractions dict)"}
+        parsed = _parse_composition(fracs_dict if fracs_dict else comp)
+        if parsed is None:
+            return {"error": f"could not parse composition: {comp or fracs_dict}"}
+        elems, fracs = parsed
+        return compute_hea_descriptors(elems, fracs)
+
+    return Tool(
+        name="hea_descriptors",
+        description=(
+            "Compute HEA formability descriptors (ΔH_mix, ΔS_mix, Ω, VEC, δ, Δχ) "
+            "and predict solid-solution vs intermetallic formation (Yang + Guo/Liu "
+            "criteria). The free screening tool for 'is this alloy a viable HEA?'."
+        ),
+        input_schema=_HEA_SCHEMA,
+        func=_hea,
+        requires_approval=False,
+        source="builtin",
+        source_detail="materials.hea",
+        examples=[
+            {
+                "input": {"composition": "Cr0.2Fe0.2Ni0.2Co0.2Cu0.2"},
+                "output_note": "the Cantor alloy — expected solid_solution, VEC~8.0, FCC/BCC boundary",
+            },
+            {
+                "input": {"composition": "NbMoTaW"},
+                "output_note": "Senkov refractory HEA — expected solid_solution, BCC, VEC~5",
+            },
+        ],
+    )

@@ -245,6 +245,15 @@ def build_full_registry(
     except Exception:
         logger.exception("materials-informatics tools registration failed")
 
+    # Free HEA / alloy-design tools (E3+). The Thermo-Calc-TCHEA alternative:
+    # empirical HEA formability screening (ΔH_mix, Ω, VEC, δ) via pure math.
+    try:
+        from app.tools.materials.hea import create_hea_tools
+
+        create_hea_tools(registry)
+    except Exception:
+        logger.exception("HEA tools registration failed")
+
     # Plugins (entry points + local — can register into ANY sub-registry)
     if enable_plugins:
         try:
