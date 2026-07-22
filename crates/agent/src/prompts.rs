@@ -201,6 +201,13 @@ pub fn append_runtime_tool_guidance(
         );
     }
 
+    if has_tool(&tool_names, "report_bug") {
+        bullets.push(
+            "If you hit a problem you can't resolve — a broken or erroring tool, a platform failure, a capability gap you've tried to work around — call `report_bug` to file it so the team can fix it (include what you tried and what went wrong)."
+                .to_string(),
+        );
+    }
+
     if bullets.is_empty() {
         return base_prompt.to_string();
     }
@@ -677,5 +684,38 @@ mod tests {
 
         let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert!(prompt.contains("external MCP servers"));
+    }
+
+    #[test]
+    fn runtime_guidance_mentions_report_bug_when_present() {
+        // TASK 4: the agent gets a one-line neural hint to self-report
+        // problems ONLY when report_bug is in the loaded catalog.
+        let mut catalog = ToolCatalog::default();
+        catalog.extend(vec![LoadedTool {
+            name: "report_bug".to_string(),
+            description: "File a bug report".to_string(),
+            input_schema: json!({ "type": "object" }),
+            requires_approval: true,
+            permission_mode: PermissionMode::FullAccess,
+            source: None,
+            source_detail: None,
+        }]);
+
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
+        assert!(
+            prompt.contains("report_bug"),
+            "prompt must hint at report_bug when the tool is loaded"
+        );
+        // Lean — a single line, not a section.
+        assert!(prompt.contains("call `report_bug`"));
+    }
+
+    #[test]
+    fn runtime_guidance_omits_report_bug_when_absent() {
+        // Without report_bug in the catalog, the hint must NOT appear — the
+        // dynamic guidance stays aligned with the actual tool surface.
+        let catalog = ToolCatalog::default();
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
+        assert!(!prompt.contains("report_bug"));
     }
 }

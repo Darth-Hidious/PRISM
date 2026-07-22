@@ -101,6 +101,8 @@ enum CommandToolKind {
     BillingUsage,
     BillingHistory,
     BillingPrices,
+    // ── Self-bug-report (reuses `prism report` machinery) ─────────────
+    ReportBug,
     // ── In-app notebook kernel (crate::notebook) ──────────────────────
     NotebookExec,
     NotebookStatus,
@@ -834,6 +836,21 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
+    // ── Self-bug-report ───────────────────────────────────────────────
+    // The agent's escape hatch when it hits a problem it cannot resolve on its
+    // own — a broken/erroring tool, a platform error, a missing capability.
+    // Reuses the existing `prism report` machinery (system-context capture +
+    // file to GitHub + MARC27 support ticket). Approval-gated because it files
+    // an external issue/ticket; the prompt hint tells the agent WHEN to use it.
+    CommandToolSpec {
+        name: "report_bug",
+        root: "report",
+        aliases: &["bug_report", "report_issue"],
+        kind: CommandToolKind::ReportBug,
+        description: "File a bug or issue report when you hit a problem you cannot resolve on your own — a tool that errors or returns broken output, a platform failure, or a missing capability. Captures system context automatically and files it (GitHub issue + MARC27 support ticket) so the team can fix it. Say what you tried and what went wrong in `description`; optionally attach a log/error file path. Use this instead of silently failing or looping on a broken tool.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
     // ── In-app notebook kernel ────────────────────────────────────────
     // A persistent Python kernel shared with the human's TUI notebook pane
     // (crate::notebook). Lets the agent write AND run code, then read the
@@ -1098,6 +1115,24 @@ fn job_status_schema() -> Value {
             }
         },
         "required": ["job_id"],
+        "additionalProperties": false
+    })
+}
+
+fn report_bug_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "description": {
+                "type": "string",
+                "description": "What went wrong and what you tried. Be specific: name the tool, the error message or broken output you got, and the steps you attempted to recover. This becomes the bug report body — the team fixes what they can see."
+            },
+            "log_file": {
+                "type": "string",
+                "description": "Optional path to a log or error-output file to attach. Omit if there is no file."
+            }
+        },
+        "required": ["description"],
         "additionalProperties": false
     })
 }
@@ -1801,6 +1836,7 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         | CommandToolKind::BillingUsage
         | CommandToolKind::BillingHistory
         | CommandToolKind::BillingPrices => empty_schema(),
+        CommandToolKind::ReportBug => report_bug_schema(),
         CommandToolKind::NotebookExec => notebook_exec_schema(),
         CommandToolKind::NotebookStatus | CommandToolKind::NotebookReset => empty_schema(),
         CommandToolKind::NodeProbe | CommandToolKind::NodeStatus => empty_schema(),
@@ -3067,6 +3103,27 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             root: spec.root,
             args: vec!["prices".to_string()],
         }),
+        CommandToolKind::ReportBug => {
+            // Reuses the `prism report` machinery (handle_report: captures
+            // system context, files a GitHub issue, sends a MARC27 support
+            // ticket). `description` is the CLI's required positional;
+            // `log_file` maps to --log-file. We pass --no-github from the
+            // agent path: an automated agent filing issues directly to the
+            // public GitHub repo is a spam/abuse risk, and the MARC27 support
+            // ticket (auth-gated, attributable to the user's account) is the
+            // safer default. The human can always file a GitHub issue via the
+            // `prism report` CLI themselves.
+            let mut args = vec![required_string(input, "description")?];
+            if let Some(log_file) = optional_string(input, "log_file") {
+                args.push("--log-file".to_string());
+                args.push(log_file);
+            }
+            args.push("--no-github".to_string());
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
         CommandToolKind::ComputeSubmit => {
             let mut args = vec![
                 "submit".to_string(),
@@ -4983,6 +5040,59 @@ ValueError: boom\n";
         assert_eq!(command_tool_requires_approval("doctor"), Some(false));
         let preview = command_tool_preview("doctor", &json!({})).expect("doctor preview renders");
         assert_eq!(preview, "prism doctor");
+    }
+
+    #[test]
+    fn report_bug_is_registered_approval_gated_and_builds_prism_report() {
+        // TASK 4: the agent's self-bug-report escape hatch. Reuses the
+        // `prism report` machinery; approval-gated because it files an external
+        // issue/ticket; --no-github by default (agent path files to the
+        // attributable MARC27 support ticket, not the public repo).
+        assert!(is_command_tool("report_bug"));
+        assert!(is_command_tool("bug_report"), "alias resolves");
+        assert!(is_command_tool("report_issue"), "alias resolves");
+        // Files an external issue/ticket → FullAccess + approval-gated.
+        assert_eq!(
+            command_tool_requires_approval("report_bug"),
+            Some(true),
+            "report_bug must be approval-gated (outward-facing)"
+        );
+
+        // Description-only → prism report "<desc>" --no-github.
+        let preview = command_tool_preview(
+            "report_bug",
+            &json!({"description": "materials_search returned HTTP 500"}),
+        )
+        .expect("preview renders");
+        assert!(
+            preview.starts_with("prism report "),
+            "must shell to prism report: {preview}"
+        );
+        assert!(
+            preview.contains("--no-github"),
+            "agent path defaults to --no-github: {preview}"
+        );
+
+        // With a log file → --log-file appended.
+        let preview_with_log = command_tool_preview(
+            "report_bug",
+            &json!({"description": "compute_submit hung", "log_file": "/tmp/err.log"}),
+        )
+        .expect("preview with log renders");
+        assert!(
+            preview_with_log.contains("--log-file /tmp/err.log"),
+            "log_file maps to --log-file: {preview_with_log}"
+        );
+
+        // Offered in the agent surface (not excluded).
+        let tools = command_tools_filtered(true);
+        assert!(
+            tools.iter().any(|t| t.name == "report_bug"),
+            "report_bug must be offered to the agent"
+        );
+        // Typed schema: description required, log_file optional.
+        let spec = tools.iter().find(|t| t.name == "report_bug").unwrap();
+        assert_eq!(spec.input_schema["required"], json!(["description"]));
     }
 
     #[test]
