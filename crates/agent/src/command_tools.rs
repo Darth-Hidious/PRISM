@@ -3561,11 +3561,41 @@ async fn execute_workflow_command(
 
 /// Tools that hit the LOCAL knowledge graph (the bundled Turso store behind
 /// the local node) or the local node dashboard. Offering them while the node is
-/// down produced dead-end failures for every semantic/graph call, so they
-/// are only listed in the default catalog when the node is reachable. The
-/// specs stay registered — `execute_command_tool` still resolves them — so
+/// down produced dead-end failures for every semantic/graph call, so they are
+/// only listed in the default catalog when the node is reachable. The specs
+/// stay registered — `execute_command_tool` still resolves them — so
 /// nothing breaks if an older transcript or client calls one by name.
 const LOCAL_NODE_TOOLS: &[&str] = &["query", "query_local", "query_federated"];
+
+/// Command tools EXCLUDED from the agent tool surface (but still resolvable
+/// by `execute_command_tool` for backward compatibility with old transcripts).
+///
+/// Per `docs/PRISM_TOOL_SURFACE_AUDIT.md` (TASK 0). Two reasons a spec lives
+/// here:
+///
+/// 1. **CLI-wrapper red herring** — a bare `prism <x>` passthrough whose only
+///    input is an untyped `args: array<string>` and which duplicates one or
+///    more *typed* siblings. These inflate the "126 tools" count and confuse
+///    model selection (the model sees two tools for every verb). They stay as
+///    human CLI commands; they are just not offered to the agent.
+///    `agent` / `run` / `research` are the first batch (zero prompt coupling,
+///    unambiguous typed siblings `run_submit` / `research_query`).
+///
+/// 2. **Shadowing a working Python tool** — `billing_balance`: the Rust
+///    variant 404s on prod (bare `prism billing`, no `balance` subcommand) and
+///    `ToolCatalog::extend` is last-writer-wins, so it silently evicts the
+///    *working* Python `billing_balance`. Excluding the Rust variant lets the
+///    Python tool (correctly typed, works) be what the agent sees.
+///
+/// Collapsing is incremental and gated — each batch is paired with a check
+/// that nothing in the system prompt or catalog dangles (see the audit doc's
+/// fix plan F2/F5). The specs stay registered so old sessions keep working.
+const AGENT_SURFACE_EXCLUDED: &[&str] = &[
+    "agent",           // CLI-wrapper red herring → no typed sibling needed (mgmt shell)
+    "run",             // CLI-wrapper red herring → typed sibling `run_submit`
+    "research",        // CLI-wrapper red herring → typed sibling `research_query`
+    "billing_balance", // FIX: 404s on prod; shadows the working Python tool
+];
 
 /// Cheap connectivity probe for the local node dashboard — the same
 /// `127.0.0.1:7327` endpoint the boot checks use. TCP-level only: a refused
@@ -3590,6 +3620,11 @@ pub fn command_tools_filtered(local_node_online: bool) -> Vec<LoadedTool> {
     COMMAND_TOOLS
         .iter()
         .filter(|spec| local_node_online || !LOCAL_NODE_TOOLS.contains(&spec.name))
+        // Exclude the collapsed/red-herring/broken tools from the AGENT surface.
+        // Specs stay registered (execute_command_tool still resolves them) so old
+        // transcripts keep working — this only changes what is *offered* to the
+        // model. See docs/PRISM_TOOL_SURFACE_AUDIT.md.
+        .filter(|spec| !AGENT_SURFACE_EXCLUDED.contains(&spec.name))
         .map(|spec| LoadedTool {
             name: spec.name.to_string(),
             description: spec.description.to_string(),
@@ -4710,6 +4745,50 @@ ValueError: boom\n";
             workflow_run.input_schema["properties"]["values"]["type"],
             serde_json::json!("object")
         );
+    }
+
+    #[test]
+    fn agent_surface_excludes_red_herrings_and_shadowed_broken_tools() {
+        // Per docs/PRISM_TOOL_SURFACE_AUDIT.md (TASK 0). The collapsed tools are
+        // NOT offered to the agent (they inflate the count / confuse selection /
+        // shadow a working Python tool), but they STAY REGISTERED so old
+        // transcripts keep resolving.
+        let tools = command_tools_filtered(true);
+        let offered_names: std::collections::HashSet<&str> =
+            tools.iter().map(|t| t.name.as_str()).collect();
+
+        // The 3 CLI-wrapper red herrings + the broken billing_balance are gone
+        // from the offered surface...
+        assert!(!offered_names.contains("agent"), "agent wrapper collapsed");
+        assert!(!offered_names.contains("run"), "run wrapper collapsed");
+        assert!(
+            !offered_names.contains("research"),
+            "research wrapper collapsed"
+        );
+        assert!(
+            !offered_names.contains("billing_balance"),
+            "broken Rust billing_balance excluded so the working Python tool wins"
+        );
+
+        // ...but their typed siblings ARE still offered (the collapse is safe).
+        assert!(offered_names.contains("run_submit"), "typed sibling kept");
+        assert!(
+            offered_names.contains("research_query"),
+            "typed sibling kept"
+        );
+        assert!(
+            offered_names.contains("billing_usage"),
+            "typed billing reads kept"
+        );
+
+        // ...and the specs stay REGISTERED (backward compat for old transcripts).
+        assert!(
+            is_command_tool("billing_balance"),
+            "spec stays registered even though excluded from the surface"
+        );
+        assert!(is_command_tool("run"));
+        assert!(is_command_tool("research"));
+        assert!(is_command_tool("agent"));
     }
 
     #[test]
