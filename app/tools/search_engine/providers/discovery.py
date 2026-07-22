@@ -114,7 +114,11 @@ async def discover_providers(
     fallbacks = fallback_index_urls or FALLBACK_INDEX_URLS
     endpoints: list[dict] = []
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    # E2 fix: follow_redirects=True — the Materials Cloud index (and others)
+    # 301-redirect, and without this the 2-hop children (mc3d, mc2d, 2dtopo...)
+    # never get discovered. This was the reason the provider expansion showed
+    # only 17 instead of ~40 endpoints.
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         # Hop 1: fetch provider index
         data = await _fetch_json(client, PROVIDERS_INDEX_URL)
         if data is None:
