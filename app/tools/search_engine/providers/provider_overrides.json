@@ -16,7 +16,7 @@
     "matcloud": "",
     "mcloud": "",
     "jarvis": "https://jarvis.nist.gov/optimade/jarvisdft/v1",
-    "oqmd": ""
+    "oqmd": "https://oqmd.org/optimade"
   },
 
   "defaults": {
@@ -74,13 +74,17 @@
       "tier": 1,
       "description": "Alexandria PBESol — DFT bulk properties with PBESol functional",
       "data_type": "dft",
+      "enabled": false,
       "capabilities": {
         "provider_specific_fields": [
           "_alexandria_formation_energy_per_atom", "_alexandria_band_gap",
           "_alexandria_scan_total_energy"
         ]
       },
-      "reliability": { "validation_score": "57/57" }
+      "reliability": {
+        "validation_score": "57/57",
+        "known_quirks": ["Structures endpoint returns HTTP 500 on every query as of 2026-07 (info endpoint works but /structures is broken). Disabled to stop poisoning searches; the PBE variant covers the same DFT space. Re-probe periodically."]
+      }
     },
     "oqmd": {
       "tier": 1,
