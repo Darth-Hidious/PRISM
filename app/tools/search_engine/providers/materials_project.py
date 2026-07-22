@@ -27,13 +27,19 @@ class MaterialsProjectProvider(Provider):
         )
 
     async def search(self, query: MaterialSearchQuery) -> list[Material]:
-        api_key = self._resolve_api_key()
-        if not api_key:
-            logger.info(
-                "No MP API key available (local env or MARC27 credentials) — skipping MP native"
-            )
-            return []
+        # E13 proxy fix: route MP requests through the platform proxy when there
+        # is no LOCAL MP_API_KEY. The old code's _resolve_api_key tier-2 returned
+        # the user's platform JWT and handed it to MPRester as if it were an MP
+        # key — but a JWT is not a valid X-API-KEY, so MP native always failed
+        # keylessly. Now: local key → MPRester (direct); no local key → platform
+        # proxy (server-side key injection, via _query_materials_project).
+        env_key = os.environ.get("MP_API_KEY", "")
+        if env_key:
+            return await self._search_via_mprester(query, env_key)
+        return await self._search_via_platform_proxy(query)
 
+    async def _search_via_mprester(self, query: MaterialSearchQuery, api_key: str) -> list[Material]:
+        """Direct MPRester path (local MP_API_KEY present)."""
         try:
             from mp_api.client import MPRester
 
@@ -41,62 +47,71 @@ class MaterialsProjectProvider(Provider):
             kwargs.setdefault(
                 "fields",
                 [
-                    "material_id",
-                    "formula_pretty",
-                    "elements",
-                    "nelements",
-                    "band_gap",
-                    "formation_energy_per_atom",
-                    "energy_above_hull",
+                    "material_id", "formula_pretty", "elements", "nelements",
+                    "band_gap", "formation_energy_per_atom", "energy_above_hull",
                     "symmetry",
                 ],
             )
-
             with MPRester(api_key) as mpr:
                 docs = mpr.materials.summary.search(
-                    num_chunks=1,
-                    chunk_size=min(query.limit, 100),
-                    **kwargs,
+                    num_chunks=1, chunk_size=min(query.limit, 100), **kwargs,
                 )
-
             return [self._parse_doc(self._doc_to_dict(d)) for d in docs]
         except Exception as e:
-            logger.warning("MP native query failed: %s", e)
+            logger.warning("MP native (MPRester) query failed: %s", e)
             raise
 
-    def _resolve_api_key(self) -> str:
-        """Resolve the Materials Project API key.
+    async def _search_via_platform_proxy(self, query: MaterialSearchQuery) -> list[Material]:
+        """Platform-proxy path (no local key — server injects MP_API_KEY).
 
-        Priority:
-          1. MP_API_KEY env var (explicit local override)
-          2. ~/.prism/credentials.json → access_token (MARC27 login)
-             The MARC27 platform holds the real MP key server-side and
-             proxies requests. When the user logs in via `prism login`,
-             their access token is saved here and used for MP queries.
-          3. Empty string (no key — provider returns [])
+        Reuses the existing _query_materials_project helper (data.py) which has
+        the same 3-tier fallback. This is the keyless path every PRISM user gets
+        via `prism login`.
         """
-        import os
-        from pathlib import Path
-
-        # Tier 1: explicit env var
-        env_key = os.environ.get(self._endpoint.auth.auth_env_var or "MP_API_KEY", "")
-        if env_key:
-            return env_key
-
-        # Tier 2: MARC27 credentials from login
         try:
-            creds_path = Path.home() / ".prism" / "credentials.json"
-            if creds_path.exists():
-                import json
+            from app.tools.data import _query_materials_project
+        except ImportError:
+            return []
 
-                creds = json.loads(creds_path.read_text())
-                token = creds.get("access_token", "")
-                if token:
-                    return token
-        except Exception:
-            pass
+        # Build a formula query if the query has one; else do a wildcard pull.
+        formula = query.formula
+        if not formula and query.elements:
+            # MP proxy takes formula; without one, do a broad pull by the first
+            # element (the proxy returns up to 20 per call).
+            formula = query.elements[0]
+        if not formula:
+            return []
 
-        return ""
+        res = _query_materials_project(
+            formula=formula,
+            properties=[
+                "material_id", "formula_pretty", "elements", "nelements",
+                "band_gap", "formation_energy_per_atom", "energy_above_hull",
+                "symmetry",
+            ],
+        )
+        if not isinstance(res, dict) or res.get("error") or not res.get("results"):
+            return []
+
+        materials = []
+        for doc in res["results"][: query.limit]:
+            try:
+                m = self._parse_doc(doc)
+                if m:
+                    materials.append(m)
+            except Exception:
+                continue
+        return materials
+
+    def _resolve_api_key(self) -> str:
+        """Resolve a LOCAL MP API key only (the proxy path doesn't need one).
+
+        E13: this now returns ONLY the local env key. The platform JWT is no
+        longer misused as an MP key — the proxy path (_search_via_platform_proxy)
+        handles the keyless case. Kept for backward compat with any caller that
+        checks it directly.
+        """
+        return os.environ.get(self._endpoint.auth.auth_env_var or "MP_API_KEY", "")
 
     def _doc_to_dict(self, doc) -> dict:
         """Convert MPRester doc object to plain dict."""

@@ -83,14 +83,15 @@ class MPCollector(DataCollector):
     def collect(self, formula: str = None, elements: List[str] = None, max_results: int = 50) -> List[Dict]:
         import os
         api_key = os.getenv("MP_API_KEY")
-        if not api_key:
-            # Misconfiguration, not "no materials found" — raise so the caller
-            # records the skip instead of the agent reading an empty result as
-            # "Materials Project has nothing".
-            raise CollectorConfigError(
-                "mp source requires MP_API_KEY (Materials Project) — not configured; "
-                "run `prism login` to use the platform proxy instead"
-            )
+        # E13 proxy fix: when there's no local MP_API_KEY, route through the
+        # platform proxy (server-side key) instead of raising. The error message
+        # used to say "run prism login to use the proxy" but never actually
+        # implemented it — now it does, reusing _query_materials_project.
+        if api_key:
+            return self._collect_via_mprester(formula, elements, max_results, api_key)
+        return self._collect_via_platform_proxy(formula, elements, max_results)
+
+    def _collect_via_mprester(self, formula, elements, max_results, api_key) -> List[Dict]:
         try:
             from mp_api.client import MPRester
             with MPRester(api_key) as mpr:
@@ -111,3 +112,24 @@ class MPCollector(DataCollector):
                 return results
         except Exception:
             return []
+
+    def _collect_via_platform_proxy(self, formula, elements, max_results) -> List[Dict]:
+        """Keyless path: route through the MARC27 platform proxy (server MP_API_KEY)."""
+        try:
+            from app.tools.data import _query_materials_project
+        except ImportError:
+            return []
+        # The proxy takes formula or material_id; map elements → first element.
+        q_formula = formula or (elements[0] if elements else None)
+        if not q_formula:
+            return []
+        fields = ["material_id", "formula_pretty", "band_gap",
+                  "formation_energy_per_atom", "energy_above_hull", "density"]
+        res = _query_materials_project(formula=q_formula, properties=fields)
+        if not isinstance(res, dict) or res.get("error") or not res.get("results"):
+            return []
+        results = []
+        for doc in res["results"][:max_results]:
+            entry = {k: v for k, v in doc.items() if v is not None and isinstance(v, (str, int, float, bool))}
+            results.append(entry)
+        return results
