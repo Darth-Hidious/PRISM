@@ -47,7 +47,7 @@
       "tier": 1,
       "description": "MPDD (PhasesLab) — ML stability predictions via SIPFENN, formation energies",
       "data_type": "ml_predicted",
-      "behavior": { "use_https": false },
+      "behavior": { "use_https": false, "timeout_ms": 10000 },
       "capabilities": {
         "provider_specific_fields": [
           "_mpdd_crystal_system", "_mpdd_sipfenn_formation_energy", "_mpdd_sipfenn_stability"
@@ -55,7 +55,7 @@
       },
       "reliability": {
         "validation_score": "41/46",
-        "known_quirks": ["Uses HTTP not HTTPS", "Timeout issues on large queries"]
+        "known_quirks": ["Uses HTTP not HTTPS", "Timeout issues on large queries — raised to 10s (S2 union timeout)"]
       }
     },
     "alexandria.alexandria-pbe": {
@@ -145,6 +145,61 @@
       "data_type": "dft",
       "reliability": { "validation_score": "44/50" }
     },
+    "mcloud.mc3d-pbesol-v1": {
+      "tier": 2,
+      "description": "Materials Cloud 3D — curated DFT 3D structures (PBEsol v1)",
+      "data_type": "dft"
+    },
+    "mcloud.mc3d-pbesol-v2": {
+      "tier": 2,
+      "description": "Materials Cloud 3D — curated DFT 3D structures (PBEsol v2)",
+      "data_type": "dft"
+    },
+    "mcloud.2dtopo": {
+      "tier": 2,
+      "description": "Materials Cloud — 2D topological insulators (DFT)",
+      "data_type": "dft"
+    },
+    "mcloud.curated-cofs": {
+      "tier": 2,
+      "description": "Materials Cloud — CURATED covalent organic frameworks (DFT)",
+      "data_type": "dft"
+    },
+    "mcloud.pyrene-mofs": {
+      "tier": 2,
+      "description": "Materials Cloud — pyrene-based metal-organic frameworks",
+      "data_type": "dft"
+    },
+    "mcloud.autowannier": {
+      "tier": 3,
+      "description": "Materials Cloud — automated high-throughput Wannier functions (electronic)",
+      "data_type": "dft"
+    },
+    "mcloud.stoceriaitf": {
+      "tier": 3,
+      "description": "Materials Cloud — SrTiO3-CeO2 interfaces (niche interface study)",
+      "data_type": "dft"
+    },
+    "mcloudarchive.ed-g2": {
+      "tier": 3,
+      "description": "Materials Cloud Archive — Trinquet optical materials dataset",
+      "data_type": "dft"
+    },
+    "mcloudarchive.1z-pd": {
+      "tier": 3,
+      "description": "Materials Cloud Archive — Trinquet accelerating materials discovery",
+      "data_type": "dft"
+    },
+    "mcloudarchive.m0-zg": {
+      "tier": 3,
+      "description": "Materials Cloud Archive — He machine learning on multi-fidelity data",
+      "data_type": "ml_predicted"
+    },
+    "psdi.cathub-datasets": {
+      "tier": 3,
+      "description": "PSDI — Catalysis Data Infrastructure (catalysis/surface science)",
+      "data_type": "dft"
+    },
     "tcod": {
       "tier": 2,
       "description": "TCOD — experimental crystal structures (theoretical crystallography)",
@@ -178,11 +233,20 @@
     },
     "mpds": {
       "tier": 3,
-      "description": "MPDS — experimental + curated properties (auth-gated)",
+      "description": "MPDS — Materials Platform for Data Science: experimental + curated properties",
       "data_type": "experimental",
-      "enabled": false,
+      "enabled": true,
       "reliability": {
-        "known_quirks": ["Auth-gated, access via PRISM marketplace. OPTIMADE endpoint limited."]
+        "known_quirks": ["E2 re-enable: OPTIMADE endpoint returns real data (live-probed 2026-07), but heavier queries may rate-limit. Circuit breaker handles transient failures."]
+      }
+    },
+    "matterverse": {
+      "tier": 2,
+      "description": "Matterverse — 31M+ ML-predicted hypothetical materials + Materials Project entries",
+      "data_type": "ml_predicted",
+      "behavior": { "timeout_ms": 10000 },
+      "reliability": {
+        "known_quirks": ["Large DB; queries can exceed 5s — raised to 10s (S2 union timeout honored)"]
       }
     },
     "cmr": {

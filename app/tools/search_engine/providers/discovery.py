@@ -74,8 +74,15 @@ def parse_links_response(response: dict) -> list[dict]:
         base_url = attrs.get("base_url")
         if not base_url:
             continue
+        cid = entry.get("id", "")
+        # E2: skip OPTIMADE meta-index endpoints. Some providers (Materials
+        # Cloud, MC Archive) advertise an "index" child whose base_url is a
+        # /index meta-database — it 404s on /structures and is not a data
+        # source. Filter it out so it doesn't poison searches.
+        if cid == "index":
+            continue
         children.append({
-            "id": entry.get("id", ""),
+            "id": cid,
             "name": attrs.get("name", ""),
             "base_url": base_url,
         })
