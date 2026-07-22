@@ -170,6 +170,20 @@ _MATERIALS_SEARCH_SCHEMA: dict = {
             "default": 100,
             "description": "Maximum number of unique materials to return after fusion.",
         },
+        "timeout_seconds": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 30,
+            "default": 8,
+            "description": (
+                "Hard deadline for the whole federated search in seconds "
+                "(default 8). The engine fans out to every healthy provider "
+                "concurrently and returns PARTIAL results if this deadline "
+                "fires — providers that didn't finish are reported as "
+                "timed-out in providers_queried. Raise for exhaustive searches; "
+                "lower for a fast best-effort pass."
+            ),
+        },
     },
     "required": [],
     "additionalProperties": False,
@@ -189,17 +203,24 @@ def _materials_search_factory(provider_registry: ProviderRegistry):
     def _materials_search(**kwargs) -> dict:
         # Pydantic-validate the inbound shape so a bad agent call fails
         # with a clear message before we hit any network.
+        # S5: an optional timeout_seconds (default 8s, capped 1-30s in the
+        # engine) lets the agent bound the whole fan-out. Popped before
+        # query construction (it's not a search filter).
+        timeout_seconds = kwargs.pop("timeout_seconds", None)
         query = MaterialSearchQuery(**_normalize_property_ranges(kwargs))
 
-        # SearchEngine.search() is async; we're called from sync MCP.
-        # Spin up a fresh loop per call (the engine spawns its own
-        # tasks internally). This is fine for the tool-call cadence;
-        # if we ever want to share an event loop, refactor the
-        # registration to expose async tools natively.
+        # SearchEngine.search() is async; we're called from the tool server's
+        # sync handler. Spin up a fresh loop per call (the engine spawns its
+        # own tasks internally). The agent's Rust loop is NOT blocked by
+        # Python's GIL — the tool server is a separate subprocess — but the
+        # agent does await this call's result, so the engine's hard deadline
+        # (S2/S5) is what guarantees the agent gets an answer within ~timeout.
         try:
             loop = asyncio.new_event_loop()
             try:
-                result = loop.run_until_complete(engine.search(query))
+                result = loop.run_until_complete(
+                    engine.search(query, timeout_seconds=timeout_seconds)
+                )
             finally:
                 loop.close()
         except Exception as exc:

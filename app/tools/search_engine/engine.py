@@ -45,20 +45,34 @@ class SearchEngine:
         registry: ProviderRegistry,
         cache: SearchCache | None = None,
         health_manager: HealthManager | None = None,
-        global_timeout: float = 5.0,
+        global_timeout: float = 8.0,
     ):
         self._registry = registry
         self._cache = cache or SearchCache(disk_dir=DEFAULT_CACHE_DIR)
         self._health = health_manager or HealthManager(persist_path=DEFAULT_HEALTH_PATH)
         self._health.load()
+        # S5: the default whole-fan-out deadline. Raised from the old 5.0 to 8.0
+        # so a healthy provider fan-out completes more often within budget; the
+        # hard ceiling is now per-call overridable (search(timeout_seconds=...)).
         self._global_timeout = global_timeout
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def search(self, query: MaterialSearchQuery) -> SearchResult:
-        """Fan out to providers, collect, fuse, rank, return."""
+    async def search(
+        self, query: MaterialSearchQuery, timeout_seconds: float | None = None
+    ) -> SearchResult:
+        """Fan out to providers, collect, fuse, rank, return.
+
+        ``timeout_seconds`` overrides the engine's default whole-fan-out
+        deadline for THIS call only (S5). Capped at 30s so a runaway caller
+        can't pin the agent indefinitely.
+        """
+        # S5: per-call deadline override (the agent may pass timeout_seconds).
+        original_timeout = self._global_timeout
+        if timeout_seconds is not None:
+            self._global_timeout = min(max(float(timeout_seconds), 1.0), 30.0)
         start = time.time()
         # Carries the whole-fan-out deadline notice if S2's deadline fires.
         warnings: list[str] = []
@@ -66,6 +80,7 @@ class SearchEngine:
         # 1. Cache check
         cached = self._cache.get(query)
         if cached is not None:
+            self._global_timeout = original_timeout
             return cached
 
         # 2. Select capable providers with healthy circuits
@@ -73,6 +88,7 @@ class SearchEngine:
         providers = [p for p in capable if self._health.get(p.id).should_query()]
 
         if not providers:
+            self._global_timeout = original_timeout
             return SearchResult(
                 materials=[],
                 total_count=0,
@@ -219,6 +235,8 @@ class SearchEngine:
         self._cache.put(query, search_result)
         self._health.save()
 
+        # S5: restore the default deadline (the override was per-call only).
+        self._global_timeout = original_timeout
         return search_result
 
     def get_provider_status(self) -> dict[str, dict]:

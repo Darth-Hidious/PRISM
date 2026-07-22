@@ -69,7 +69,23 @@ impl ToolServerHandle {
         self.stdin.flush().await?;
 
         let mut response_line = String::new();
-        let bytes_read = self.stdout.read_line(&mut response_line).await?;
+        // S5: a hard cap on how long the agent waits for ANY tool-server
+        // response. The Python tools have their own internal deadlines (e.g.
+        // materials_search's timeout_seconds), but without this ceiling a
+        // wedged/looping tool could pin the agent forever. 60s is generous —
+        // it only fires when something is genuinely broken (the tool ignored
+        // its own deadline), in which case surfacing the timeout is correct.
+        let bytes_read = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.stdout.read_line(&mut response_line),
+        )
+        .await
+        .map_err(|_| {
+            PythonBridgeError::Spawn(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tool server did not respond within 60s",
+            ))
+        })??;
         if bytes_read == 0 {
             return Err(PythonBridgeError::Spawn(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
