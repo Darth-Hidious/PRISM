@@ -254,6 +254,15 @@ def build_full_registry(
     except Exception:
         logger.exception("HEA tools registration failed")
 
+    # Phase-stability screening (E4): convex-hull distance via the platform-
+    # brokered MP key. Free Thermo-Calc phase-stability equivalent.
+    try:
+        from app.tools.materials.stability import create_phase_stability_tool
+
+        create_phase_stability_tool(registry)
+    except Exception:
+        logger.exception("phase_stability tool registration failed")
+
     # Plugins (entry points + local — can register into ANY sub-registry)
     if enable_plugins:
         try:
