@@ -8,6 +8,7 @@ import time
 from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
 from app.tools.search_engine.providers.endpoint import ProviderEndpoint
 from app.tools.search_engine.query import MaterialSearchQuery
+from app.tools.search_engine.resilience.retries import with_transient_retry
 from app.tools.search_engine.result import Material, PropertyValue, ProviderQueryLog
 from app.tools.search_engine.translator import QueryTranslator
 
@@ -61,7 +62,13 @@ class OptimadeProvider(Provider):
         timeout = self._endpoint.behavior.timeout_ms / 1000
         headers = {"Accept": "application/json"}
 
-        try:
+        # S4: bounded transient retry (resilience/retries.py). Recovers a
+        # single transient 429/503/connection-reset with one backed-off retry;
+        # never retries 400/404/500/timeouts (those raise immediately). The
+        # factory re-builds the coroutine each attempt (an awaitable is
+        # one-shot). httpx.AsyncClient is per-attempt so a reset connection is
+        # replaced, not reused.
+        async def _do_get() -> dict:
             async with httpx.AsyncClient(
                 timeout=timeout,
                 headers=headers,
@@ -69,7 +76,10 @@ class OptimadeProvider(Provider):
             ) as client:
                 resp = await client.get(url, params=params)
                 resp.raise_for_status()
-                data = resp.json()
+                return resp.json()
+
+        try:
+            data = await with_transient_retry(_do_get, provider_id=self.id)
         except httpx.TimeoutException:
             logger.warning("OPTIMADE timeout for %s (%.1fs)", self.id, timeout)
             raise
