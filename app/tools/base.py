@@ -112,6 +112,18 @@ class Tool:
                 verdict = "warn"
             if verdict in ("ok", "warn", "invalid"):
                 result["scientific_validity"] = verdict
+            else:
+                # A gate that returns something outside the contract is itself
+                # defective — silently dropping it would hide the bug. Degrade
+                # to "warn" (so the agent still gets a verdict) AND log loudly so
+                # the gate author can fix it.
+                logger.warning(
+                    "tool '%s' validate() returned %r — must be one of "
+                    "ok/warn/invalid; defaulting to 'warn'",
+                    self.name,
+                    verdict,
+                )
+                result["scientific_validity"] = "warn"
         if not self.record_artifacts:
             return result
         # Lazy import to avoid a circular dependency at module load. The

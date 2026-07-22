@@ -3627,31 +3627,34 @@ const LOCAL_NODE_TOOLS: &[&str] = &["query", "query_local", "query_federated"];
 /// Command tools EXCLUDED from the agent tool surface (but still resolvable
 /// by `execute_command_tool` for backward compatibility with old transcripts).
 ///
-/// Per `docs/PRISM_TOOL_SURFACE_AUDIT.md` (TASK 0). Two reasons a spec lives
-/// here:
+/// Per `docs/PRISM_TOOL_SURFACE_AUDIT.md` (TASK 0). A spec lives here when it is
+/// a **CLI-wrapper red herring** — a bare `prism <x>` passthrough whose only
+/// input is an untyped `args: array<string>` and which duplicates one or more
+/// *typed* siblings. These inflate the "126 tools" count and confuse model
+/// selection (the model sees two tools for every verb). They stay as human CLI
+/// commands; they are just not offered to the agent.
 ///
-/// 1. **CLI-wrapper red herring** — a bare `prism <x>` passthrough whose only
-///    input is an untyped `args: array<string>` and which duplicates one or
-///    more *typed* siblings. These inflate the "126 tools" count and confuse
-///    model selection (the model sees two tools for every verb). They stay as
-///    human CLI commands; they are just not offered to the agent.
-///    `agent` / `run` / `research` are the first batch (zero prompt coupling,
-///    unambiguous typed siblings `run_submit` / `research_query`).
+/// `agent` / `run` / `research` are the first batch (zero prompt coupling,
+/// unambiguous typed siblings `run_submit` / `research_query`).
 ///
-/// 2. **Shadowing a working Python tool** — `billing_balance`: the Rust
-///    variant 404s on prod (bare `prism billing`, no `balance` subcommand) and
-///    `ToolCatalog::extend` is last-writer-wins, so it silently evicts the
-///    *working* Python `billing_balance`. Excluding the Rust variant lets the
-///    Python tool (correctly typed, works) be what the agent sees.
+/// NOTE on `billing_balance`: an earlier revision of this list also excluded
+/// the Rust `billing_balance` on the belief it 404'd on prod. Live re-probing
+/// (2026-07-22, 3/3 runs) proved that wrong — bare `prism billing` (the exact
+/// argv this tool emits, `args: vec![]`) returns the balance correctly
+/// ("Balance: N credits ($N.NN)"). The transient 404 observed once was a
+/// platform hiccup, not a persistent bug. Furthermore, even if exclusion were
+/// warranted, it would be *ineffective*: dispatch routes by NAME via
+/// `is_command_tool` (agent_loop.rs:1374, service.rs:328) BEFORE the Python
+/// tool server, so the Rust path executes regardless of catalog membership.
+/// So `billing_balance` is correctly NOT in this list.
 ///
 /// Collapsing is incremental and gated — each batch is paired with a check
 /// that nothing in the system prompt or catalog dangles (see the audit doc's
 /// fix plan F2/F5). The specs stay registered so old sessions keep working.
 const AGENT_SURFACE_EXCLUDED: &[&str] = &[
-    "agent",           // CLI-wrapper red herring → no typed sibling needed (mgmt shell)
-    "run",             // CLI-wrapper red herring → typed sibling `run_submit`
-    "research",        // CLI-wrapper red herring → typed sibling `research_query`
-    "billing_balance", // FIX: 404s on prod; shadows the working Python tool
+    "agent",  // CLI-wrapper red herring → no typed sibling needed (mgmt shell)
+    "run",    // CLI-wrapper red herring → typed sibling `run_submit`
+    "research", // CLI-wrapper red herring → typed sibling `research_query`
 ];
 
 /// Cheap connectivity probe for the local node dashboard — the same
@@ -4805,26 +4808,20 @@ ValueError: boom\n";
     }
 
     #[test]
-    fn agent_surface_excludes_red_herrings_and_shadowed_broken_tools() {
+    fn agent_surface_excludes_cli_wrapper_red_herrings() {
         // Per docs/PRISM_TOOL_SURFACE_AUDIT.md (TASK 0). The collapsed tools are
-        // NOT offered to the agent (they inflate the count / confuse selection /
-        // shadow a working Python tool), but they STAY REGISTERED so old
-        // transcripts keep resolving.
+        // NOT offered to the agent (they inflate the count / confuse selection),
+        // but they STAY REGISTERED so old transcripts keep resolving.
         let tools = command_tools_filtered(true);
         let offered_names: std::collections::HashSet<&str> =
             tools.iter().map(|t| t.name.as_str()).collect();
 
-        // The 3 CLI-wrapper red herrings + the broken billing_balance are gone
-        // from the offered surface...
+        // The 3 CLI-wrapper red herrings are gone from the offered surface...
         assert!(!offered_names.contains("agent"), "agent wrapper collapsed");
         assert!(!offered_names.contains("run"), "run wrapper collapsed");
         assert!(
             !offered_names.contains("research"),
             "research wrapper collapsed"
-        );
-        assert!(
-            !offered_names.contains("billing_balance"),
-            "broken Rust billing_balance excluded so the working Python tool wins"
         );
 
         // ...but their typed siblings ARE still offered (the collapse is safe).
@@ -4833,19 +4830,49 @@ ValueError: boom\n";
             offered_names.contains("research_query"),
             "typed sibling kept"
         );
-        assert!(
-            offered_names.contains("billing_usage"),
-            "typed billing reads kept"
-        );
 
         // ...and the specs stay REGISTERED (backward compat for old transcripts).
         assert!(
-            is_command_tool("billing_balance"),
+            is_command_tool("run"),
             "spec stays registered even though excluded from the surface"
         );
-        assert!(is_command_tool("run"));
         assert!(is_command_tool("research"));
         assert!(is_command_tool("agent"));
+    }
+
+    #[test]
+    fn billing_balance_executes_the_balance_path_not_a_bare_404() {
+        // Adversarial-review correction (2026-07-22): an earlier commit excluded
+        // Rust billing_balance from the surface on the belief bare `prism
+        // billing` 404'd. Live re-proving (3/3) shows bare `prism billing` DOES
+        // return the balance ("Balance: N credits"). Dispatch also routes by
+        // NAME via is_command_tool before the Python server, so surface
+        // exclusion wouldn't change execution anyway. This test pins the REAL
+        // contract: a billing_balance call must build the argv that returns the
+        // balance, and it must be offered + resolvable.
+        let tools = command_tools_filtered(true);
+        let offered_names: std::collections::HashSet<&str> =
+            tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            offered_names.contains("billing_balance"),
+            "billing_balance must be offered (bare `prism billing` works; not excluded)"
+        );
+        assert!(is_command_tool("billing_balance"));
+
+        // The execution arm must build `prism billing` (no subcommand) — that is
+        // the CLI's documented balance action. `prism billing balance` is an
+        // UNRECOGNIZED subcommand (verified live), so adding "balance" would
+        // break it. Empty args is correct here.
+        assert_eq!(
+            command_tool_preview("billing_balance", &json!({})),
+            Some("prism billing".to_string()),
+            "billing_balance runs bare `prism billing`, which returns the balance"
+        );
+        // And it's a free, unapproved read.
+        assert_eq!(
+            command_tool_requires_approval("billing_balance"),
+            Some(false)
+        );
     }
 
     #[test]
