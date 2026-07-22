@@ -117,8 +117,10 @@ class MPCollector(DataCollector):
         """Keyless path: route through the MARC27 platform proxy (server MP_API_KEY)."""
         try:
             from app.tools.data import _query_materials_project
-        except ImportError:
-            return []
+        except ImportError as exc:
+            raise CollectorConfigError(
+                f"MP platform proxy unavailable (import failed): {exc}"
+            ) from exc
         # The proxy takes formula or material_id; map elements → first element.
         q_formula = formula or (elements[0] if elements else None)
         if not q_formula:
@@ -126,7 +128,16 @@ class MPCollector(DataCollector):
         fields = ["material_id", "formula_pretty", "band_gap",
                   "formation_energy_per_atom", "energy_above_hull", "density"]
         res = _query_materials_project(formula=q_formula, properties=fields)
-        if not isinstance(res, dict) or res.get("error") or not res.get("results"):
+        # C2 honesty fix: a proxy error must RAISE (the pre-E13 code honestly
+        # raised CollectorConfigError; E13 regressed it to `return []`, which
+        # made an MP outage indistinguishable from "source is empty").
+        if not isinstance(res, dict):
+            raise CollectorConfigError(
+                f"MP platform proxy returned unexpected payload: {type(res).__name__}"
+            )
+        if res.get("error"):
+            raise CollectorConfigError(f"MP platform proxy error: {res['error']}")
+        if not res.get("results"):
             return []
         results = []
         for doc in res["results"][:max_results]:

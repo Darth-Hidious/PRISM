@@ -64,9 +64,9 @@ def _describe_structure_tool() -> Tool:
                 return {"error": f"could not parse CIF: {exc}"}
         else:
             try:
-                from app.plugins.bootstrap import build_full_registry
+                from app.tools.materials._shared import get_shared_registry
 
-                reg, _, _ = build_full_registry()
+                reg = get_shared_registry()
                 ms = reg.get("materials_search")
                 res = ms.func(formula=formula, limit=3, timeout_seconds=8)
                 mats = res.get("materials", [])

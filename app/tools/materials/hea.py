@@ -1,11 +1,13 @@
 # Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
 """High-Entropy Alloy (HEA) / Multi-Principal-Element Alloy (MPEA) design tools.
 
-The free Thermo-Calc alternative for alloy design. Thermo-Calc charges
-$15K–$40K+ for TCHEA (HEA database) + the Scheil solidification calculator.
-These tools replicate the empirical HEA-formability screening using open
-math (no commercial database) — the "is this composition a viable HEA?"
-question, free.
+SCOPE (honest): these are empirical Hume-Rothery-style SCREENING heuristics —
+a fast first-pass "is a single-phase solid solution plausible?" flag built
+from open literature parameters. They are NOT a CALPHAD phase-equilibria
+calculation: no Gibbs-energy minimization, no phase fractions, no temperature
+dependence, no ternary+ interaction terms. A commercial database like
+Thermo-Calc TCHEA delivers those; this tool deliberately does not claim to.
+Use it to triage compositions before committing to CALPHAD/DFT/experiment.
 
 `hea_descriptors`: computes the formability descriptors that decide whether a
 multi-principal-element alloy forms a solid solution vs intermetallic vs
@@ -51,16 +53,30 @@ _VEC: dict[str, float] = {
 # Binary mixing enthalpy (ΔH_mix, kJ/mol) for common HEA element pairs, from
 # the Miedema model as tabulated by Takeuchi & Inoue (2005) — the standard
 # reference used in HEA screening. Symmetric: ΔH(A,B) == ΔH(B,A). Missing pairs
-# default to 0 (ideal mixing). Values are rounded to 0.5 kJ/mol as published.
+# default to 0 (ideal mixing).
+#
+# VERIFICATION STATUS (adversarial review a7bfe76 vs the printed Takeuchi-Inoue
+# 2005 table + the Senkov refractory-HEA literature):
+#   VERIFIED CORRECT: the Al row; the Cr/Mn/Fe/Co/Ni 3d block (reproduces the
+#     Cantor-alloy ΔH_mix = -4.16 kJ/mol exactly); the Nb/Mo/Ta/W refractory
+#     set as corrected below (Senkov et al. pair values).
+#   CORRECTED against the printed table: Ni-Ti (-18→-35), Ni-Nb (-9→-30),
+#     Ni-Zr (-34→-49), Mo-Si (-18→-35), Cr-Ta (-9→-7), Mo-Ta (-1→-5),
+#     Co-Ti (-18→-28); added missing Nb-W (-8) and Ta-W (-7).
+#   TODO(verify vs printed Takeuchi-Inoue 2005): cells OUTSIDE the sets above
+#     are NOT re-verified — in particular the Si/metalloid rows (literature
+#     silicide values are far more negative than tabulated here, e.g. Ti-Si
+#     canon ≈ -66 vs -26 here), Co-Nb, Co-Hf, Ti-V, and the Mg/Sc rows. Treat
+#     ΔH_mix for compositions leaning on those cells as indicative only.
 _DH_MIX_PAIRS: dict[tuple[str, str], float] = {}
 _PAIR_DATA = """
 Al-Co -19 Al-Cr -10 Al-Cu -1 Al-Fe -11 Al-Hf -31 Al-Mg -2 Al-Mn -19
 Al-Mo -15 Al-Nb -18 Al-Ni -22 Al-Sc -38 Al-Si -19 Al-Ta -19 Al-Ti -30
-Al-Ti -30 Al-V -16 Al-W -13 Al-Zr -44
+Al-V -16 Al-W -13 Al-Zr -44
 Co-Cr -4 Co-Cu 6 Co-Fe -1 Co-Hf -21 Co-Mn -5 Co-Mo -5 Co-Nb -10 Co-Ni 0
-Co-Sc -27 Co-Si -21 Co-Ta -11 Co-Ti -18 Co-V -14 Co-W -4 Co-Zr -41
+Co-Sc -27 Co-Si -21 Co-Ta -11 Co-Ti -28 Co-V -14 Co-W -4 Co-Zr -41
 Cr-Cu 12 Cr-Fe -1 Cr-Hf -7 Cr-Mn 2 Cr-Mo 0 Cr-Nb -7 Cr-Ni -7 Cr-Sc -18
-Cr-Si -20 Cr-Ta -9 Cr-Ti -7 Cr-V -2 Cr-W 1 Cr-Zr -12
+Cr-Si -20 Cr-Ta -7 Cr-Ti -7 Cr-V -2 Cr-W 1 Cr-Zr -12
 Cu-Fe 13 Cu-Hf -15 Cu-Mg -3 Cu-Mn -4 Cu-Mo -3 Cu-Nb -3 Cu-Ni 4 Cu-Sc -15
 Cu-Si -6 Cu-Ta 1 Cu-Ti -9 Cu-V -2 Cu-W 1 Cu-Zr -23
 Fe-Hf -19 Fe-Mn 0 Fe-Mo -2 Fe-Nb -6 Fe-Ni -2 Fe-Sc -16 Fe-Si -18 Fe-Ta -10
@@ -68,11 +84,11 @@ Fe-Ti -17 Fe-V -7 Fe-W 0 Fe-Zr -25
 Hf-Mo -4 Hf-Nb -4 Hf-Si -24 Hf-Ta -3 Hf-Ti 0 Hf-V -2 Hf-W -2 Hf-Zr 0
 Mg-Mn 4 Mg-Mo 9 Mg-Nb -4 Mg-Ni -4 Mg-Si -9 Mg-Sn -6 Mg-Ti -16 Mg-Zr -6
 Mn-Mo 5 Mn-Nb -5 Mn-Ni -8 Mn-Si -19 Mn-Ta -8 Mn-Ti -8 Mn-V -1 Mn-Zr -15
-Mo-Nb -6 Mo-Ni -7 Mo-Si -18 Mo-Ta -1 Mo-Ti -4 Mo-V -1 Mo-W 0 Mo-Zr -6
-Nb-Ni -9 Nb-Si -24 Nb-Ta 0 Nb-Ti -2 Nb-V -1 Nb-Zr -4
-Ni-Si -23 Ni-Ta -13 Ni-Ti -18 Ni-V -18 Ni-W -3 Ni-Zr -34
+Mo-Nb -6 Mo-Ni -7 Mo-Si -35 Mo-Ta -5 Mo-Ti -4 Mo-V -1 Mo-W 0 Mo-Zr -6
+Nb-Ni -30 Nb-Si -24 Nb-Ta 0 Nb-Ti -2 Nb-V -1 Nb-W -8 Nb-Zr -4
+Ni-Si -23 Ni-Ta -13 Ni-Ti -35 Ni-V -18 Ni-W -3 Ni-Zr -49
 Si-Ta -15 Si-Ti -26 Si-V -17 Si-W -12 Si-Zr -36
-Ta-Ti -1 Ta-V -1 Ta-Zr -2
+Ta-Ti -1 Ta-V -1 Ta-W -7 Ta-Zr -2
 Ti-V 0 Ti-Zr -3 V-Zr -4
 """
 for _line in _PAIR_DATA.strip().split("\n"):
@@ -123,13 +139,23 @@ def _parse_composition(spec: str | dict[str, float]) -> tuple[list[str], list[fl
     return elems, fracs
 
 
-def _atomic_radius(sym: str) -> float | None:
-    """Metallic atomic radius in Å from pymatgen (None if unavailable)."""
+def _metallic_radius(sym: str) -> float | None:
+    """Goldschmidt (CN12) metallic radius in Å from pymatgen (None if unavailable).
+
+    The HEA δ literature (Yang & Zhang 2012; Guo & Liu 2011) uses metallic
+    CN12 radii. pymatgen's `.atomic_radius` is the Slater set — quantized to
+    0.05 Å — which inflates δ by 30-60% and even inverts the sign of Al's size
+    mismatch vs the 3d metals (Slater Al 1.25 Å < 3d radii, metallic Al 1.43 Å
+    > 3d radii). With `.metallic_radius`, δ(CoCrFeMnNi) = 1.12% (literature ≈1%).
+    """
     try:
         from pymatgen.core.periodic_table import Element
 
-        r = Element(sym).atomic_radius
-        return float(r) if r else None
+        r = Element(sym).metallic_radius
+        if r is None:
+            return None
+        r = float(r)
+        return r if math.isfinite(r) and r > 0 else None
     except Exception:
         return None
 
@@ -142,9 +168,11 @@ def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, A
       - ΔH_mix (mixing enthalpy via Miedema pair table), kJ/mol
       - Ω (Yang parameter: Tm·ΔS_mix / |ΔH_mix|)
       - VEC (valence electron concentration)
-      - δ (atomic-radius mismatch, %)
+      - δ (atomic-size mismatch, %, Goldschmidt CN12 metallic radii)
       - Δχ (electronegativity difference, Pauling)
-      - phase_prediction (solid_solution | intermetallic | segregated) via Yang+Guo
+      - phase_prediction (solid_solution | solid_solution_segregation_risk |
+        intermetallic_or_segregated) via Yang Ω+δ, with a demixing flag for
+        positive-ΔH_mix compositions (e.g. Cu-bearing 3d HEAs)
     """
     n = len(elems)
     R = 8.314  # J/(mol·K) gas constant
@@ -162,8 +190,9 @@ def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, A
     # VEC = Σ c_i VEC_i  (Guo/Liu)
     vec = sum(fracs[i] * _VEC.get(elems[i], 0.0) for i in range(n))
 
-    # δ = sqrt(Σ c_i (1 - r_i/r_bar)^2)  ×100 (%)  (atomic-radius mismatch)
-    radii = [_atomic_radius(e) for e in elems]
+    # δ = sqrt(Σ c_i (1 - r_i/r_bar)^2)  ×100 (%)  (atomic-size mismatch,
+    # Goldschmidt CN12 metallic radii — the convention of the HEA δ literature)
+    radii = [_metallic_radius(e) for e in elems]
     if all(r is not None for r in radii):
         r_bar = sum(fracs[i] * radii[i] for i in range(n))
         delta = 100.0 * math.sqrt(
@@ -203,7 +232,7 @@ def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, A
 
     # Phase prediction (Yang 2012 + Guo/Liu 2011):
     #  Solid solution likely when Ω ≥ 1.1 AND δ ≤ 6.6%
-    #  VEC < 8.0 → BCC; 8.0 ≤ VEC < 8.6 → BCC+FCC mixed; VEC ≥ 8.6 → FCC
+    #  VEC ≥ 8.0 → FCC; VEC < 6.87 → BCC; 6.87 ≤ VEC < 8.0 → FCC+BCC mixed
     phase = "intermetallic_or_segregated"
     criterion_notes = []
     if omega is not None and delta is not None:
@@ -216,14 +245,45 @@ def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, A
             criterion_notes.append(
                 f"Yang criterion NOT met: Ω={omega:.2f} (need ≥1.1), δ={delta:.2f}% (need ≤6.6%)"
             )
-    # Crystal structure hint from VEC (Guo/Liu)
+
+    # Positive ΔH_mix = net demixing tendency. Ω uses |ΔH_mix|, so the Yang
+    # criterion alone can pass compositions that phase-separate — the textbook
+    # case is Cu in 3d-TM alloys (CoCrFeNiCu: ΔH_mix = +3.2 kJ/mol, Cu-rich
+    # second FCC phase via spinodal-like segregation). Flag it, never silently
+    # return solid_solution.
+    segregation_risk = False
+    if phase == "solid_solution" and dH_mix > 0:
+        segregation_risk = True
+        phase = "solid_solution_segregation_risk"
+        pos_pairs = sorted(
+            (
+                (elems[i], elems[j], _dh_mix_for_pair(elems[i], elems[j]))
+                for i in range(n)
+                for j in range(i + 1, n)
+                if _dh_mix_for_pair(elems[i], elems[j]) > 0
+            ),
+            key=lambda p: -p[2],
+        )
+        pair_str = ", ".join(f"{a}-{b} +{v:g}" for a, b, v in pos_pairs[:3])
+        criterion_notes.append(
+            f"WARNING: ΔH_mix = +{dH_mix:.2f} kJ/mol > 0 (net repulsive; "
+            f"most positive pairs: {pair_str}) — spinodal-like segregation "
+            "risk (e.g. Cu-rich demixing in CoCrFeNiCu). Yang Ω uses |ΔH_mix| "
+            "and cannot see this; treat single-phase prediction as NOT assured."
+        )
+
+    # Crystal structure hint from VEC (Guo & Liu 2011, Intermetallics 19:698 /
+    # J. Appl. Phys. 109:103505: FCC stable at VEC ≥ 8.0, BCC stable at
+    # VEC < 6.87, FCC+BCC duplex in between).
     if vec is not None:
-        if vec < 8.0:
-            criterion_notes.append(f"VEC={vec:.2f} < 8.0 → BCC favored (Guo/Liu)")
-        elif vec < 8.6:
-            criterion_notes.append(f"VEC={vec:.2f} ∈ [8.0, 8.6) → BCC+FCC mixed (Guo/Liu)")
+        if vec < 6.87:
+            criterion_notes.append(f"VEC={vec:.2f} < 6.87 → BCC favored (Guo & Liu 2011)")
+        elif vec < 8.0:
+            criterion_notes.append(
+                f"VEC={vec:.2f} ∈ [6.87, 8.0) → BCC+FCC mixed (Guo & Liu 2011)"
+            )
         else:
-            criterion_notes.append(f"VEC={vec:.2f} ≥ 8.6 → FCC favored (Guo/Liu)")
+            criterion_notes.append(f"VEC={vec:.2f} ≥ 8.0 → FCC favored (Guo & Liu 2011)")
 
     return {
         "delta_H_mix_kJ_per_mol": round(dH_mix, 2),
@@ -234,7 +294,8 @@ def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, A
         "delta_chi": round(dchi, 4) if dchi is not None else None,
         "Tm_estimate_K": round(tm_bar, 1) if tm_bar is not None else None,
         "phase_prediction": phase,
-        "criterion": "Yang (Ω, δ) + Guo/Liu (VEC)",
+        "segregation_risk": segregation_risk,
+        "criterion": "Yang (Ω, δ) + Guo/Liu (VEC) — empirical screening, not phase equilibria",
         "rationale": criterion_notes,
         "n_elements": n,
         "elements": elems,
@@ -252,18 +313,20 @@ _HEA_SCHEMA: dict = {
     "type": "object",
     "description": (
         "Compute the high-entropy-alloy (HEA) formability descriptors for a "
-        "multi-principal-element composition and predict whether it forms a "
-        "solid solution. Answers 'is this alloy composition a viable HEA?' "
-        "using the established empirical criteria (Yang Ω+δ, Guo/Liu VEC) — "
-        "the free equivalent of the screening Thermo-Calc's TCHEA database "
-        "is used for. Pure math, no database required."
+        "multi-principal-element composition and flag whether a single-phase "
+        "solid solution is PLAUSIBLE, using the established empirical "
+        "screening criteria (Yang Ω+δ, Guo & Liu 2011 VEC). This is a fast "
+        "Hume-Rothery-style first-pass screen — NOT phase equilibria: no "
+        "phase fractions, no temperature dependence, no Gibbs energies "
+        "(that is what CALPHAD databases like Thermo-Calc TCHEA compute). "
+        "Pure math from open literature parameters."
     ),
     "properties": {
         "composition": {
             "type": "string",
             "description": (
                 "Composition as a reduced formula with explicit fractions, e.g. "
-                "'Cr0.2Fe0.2Ni0.2Co0.2Cu0.2' (the Cantor alloy), or 'NbMoTaW' "
+                "'Co0.2Cr0.2Fe0.2Mn0.2Ni0.2' (the Cantor alloy), or 'NbMoTaW' "
                 "(equal fractions assumed), or a space-separated list."
             ),
         },
@@ -271,7 +334,7 @@ _HEA_SCHEMA: dict = {
             "type": "object",
             "description": (
                 "Alternative: pass element→fraction directly, e.g. "
-                "{\"Cr\":0.2,\"Fe\":0.2,\"Ni\":0.2,\"Co\":0.2,\"Cu\":0.2}. "
+                "{\"Co\":0.2,\"Cr\":0.2,\"Fe\":0.2,\"Mn\":0.2,\"Ni\":0.2}. "
                 "Use this when fractions aren't expressible in a formula string."
             ),
         },
@@ -296,8 +359,9 @@ def _hea_descriptors_tool() -> Tool:
         name="hea_descriptors",
         description=(
             "Compute HEA formability descriptors (ΔH_mix, ΔS_mix, Ω, VEC, δ, Δχ) "
-            "and predict solid-solution vs intermetallic formation (Yang + Guo/Liu "
-            "criteria). The free screening tool for 'is this alloy a viable HEA?'."
+            "and flag solid-solution plausibility (Yang Ω+δ + Guo/Liu VEC "
+            "empirical screening criteria). A first-pass screen — not a "
+            "phase-equilibria (CALPHAD) calculation."
         ),
         input_schema=_HEA_SCHEMA,
         func=_hea,
@@ -306,12 +370,16 @@ def _hea_descriptors_tool() -> Tool:
         source_detail="materials.hea",
         examples=[
             {
-                "input": {"composition": "Cr0.2Fe0.2Ni0.2Co0.2Cu0.2"},
-                "output_note": "the Cantor alloy — expected solid_solution, VEC~8.0, FCC/BCC boundary",
+                "input": {"composition": "Co0.2Cr0.2Fe0.2Mn0.2Ni0.2"},
+                "output_note": "the Cantor alloy (CoCrFeMnNi) — solid_solution, VEC=8.0 → FCC, δ≈1.1%",
             },
             {
                 "input": {"composition": "NbMoTaW"},
-                "output_note": "Senkov refractory HEA — expected solid_solution, BCC, VEC~5",
+                "output_note": "Senkov refractory HEA — solid_solution, VEC=5.5 → BCC",
+            },
+            {
+                "input": {"composition": "CrFeNiCoCu"},
+                "output_note": "Cu-bearing (ΔH_mix=+3.2 kJ/mol) — flagged solid_solution_segregation_risk (Cu-rich demixing), NOT the Cantor alloy",
             },
         ],
     )

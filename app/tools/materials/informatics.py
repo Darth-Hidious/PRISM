@@ -2,7 +2,9 @@
 """Free materials-informatics tools (E7-E11): the Citrine/Intellegens-equivalent stack.
 
 These rival what commercial materials-informatics platforms charge for, using
-only open libs (pymatgen, matminer, scipy, sklearn) already in the PRISM venv:
+only open libs (pymatgen, scipy, sklearn; matminer/robocrystallographer are
+OPTIONAL extras — tools honestly degrade or report the fallback backend when
+they are absent):
 
   - structure_similarity (E7): find structurally-analogous materials
     (pymatgen StructureMatcher — FREE, no ML). The "find cheaper analogs" verb.
@@ -80,11 +82,12 @@ def _structure_similarity_tool() -> Tool:
         except ImportError:
             return {"error": "pymatgen not installed", "tool_available": False}
 
-        # Pull candidates from the federation.
+        # Pull candidates from the federation (shared process-level registry —
+        # not rebuilt per call, so engine cache/breaker state persists).
         try:
-            from app.plugins.bootstrap import build_full_registry
+            from app.tools.materials._shared import get_shared_registry
 
-            reg, _, _ = build_full_registry()
+            reg = get_shared_registry()
             ms = reg.get("materials_search")
         except Exception as exc:
             return {"error": f"materials_search unavailable: {exc}"}
@@ -231,11 +234,13 @@ def _predict_property_tool() -> Tool:
         "type": "object",
         "description": (
             "Predict a materials property (formation energy, band gap, etc.) "
-            "for new compositions using a matminer+sklearn model trained on "
-            "Materials Project data (via the platform proxy — no local "
-            "MP_API_KEY). Returns predictions WITH UNCERTAINTY (ensemble std), "
-            "cross-validation metrics, and provenance. The free Citrine/"
-            "ExoMatter property-prediction equivalent."
+            "for new compositions using an sklearn model over composition "
+            "features (matminer Magpie 132-feature set when installed, else a "
+            "builtin 22-feature fallback — the response reports which backend "
+            "actually ran), trained on Materials Project data (via the "
+            "platform proxy — no local MP_API_KEY). Returns predictions WITH "
+            "UNCERTAINTY (ensemble std), cross-validation metrics, and "
+            "provenance."
         ),
         "properties": {
             "formulas": {"type": "array", "items": {"type": "string"},
@@ -282,7 +287,16 @@ def _predict_property_tool() -> Tool:
         if len(rows) < 20:
             return {"error": f"insufficient training data ({len(rows)} rows) from MP proxy for {prop}"}
 
-        # Featurize + train.
+        # Featurize + train. Report the ACTUAL feature backend (C6): matminer
+        # Magpie only if it is really installed, else the builtin 22-feature
+        # composition-statistics fallback — never claim Magpie when the
+        # fallback ran.
+        from app.tools.ml.features import get_feature_backend
+
+        if get_feature_backend() == "matminer":
+            backend_label = "matminer magpie (132 features)"
+        else:
+            backend_label = "builtin 22-feature composition statistics (matminer not installed)"
         X, y = [], []
         for f, v in rows:
             feats = composition_features(f)
@@ -320,8 +334,11 @@ def _predict_property_tool() -> Tool:
             "predictions": predictions,
             "model_meta": {"r2": round(meta.get("r2", 0), 3), "mae": round(meta.get("mae", 0), 4),
                            "n_train": meta.get("n_train", len(X)), "model": model_type,
-                           "feature_backend": "matminer magpie"},
-            "provenance": f"matminer+sklearn {model_type} trained on {len(X)} MP rows via platform proxy; uncertainty = tree-ensemble std",
+                           "feature_backend": backend_label},
+            "provenance": (
+                f"sklearn {model_type} on {backend_label} features, trained on "
+                f"{len(X)} MP rows via platform proxy; uncertainty = tree-ensemble std"
+            ),
         }
 
     return Tool(

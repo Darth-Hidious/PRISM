@@ -182,3 +182,54 @@ class TestSupportedParams:
         from app.tools.data_collectors.patent_collector import PatentCollector
         c = PatentCollector()
         assert "query" in c.supported_params()
+
+
+class TestMPCollectorProxyHonesty:
+    """C2 honesty fix: an MP-proxy failure must RAISE CollectorConfigError
+    (surfaced as a logged skip by collect_all), never return [] — an outage
+    must be distinguishable from "source is genuinely empty"."""
+
+    def test_proxy_error_raises(self):
+        from app.tools.data_collectors.base_collector import CollectorConfigError
+        from app.tools.data_collectors.collector import MPCollector
+
+        c = MPCollector()
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "app.tools.data._query_materials_project",
+                return_value={"error": "MP proxy unreachable"},
+            ),
+        ):
+            with pytest.raises(CollectorConfigError, match="proxy"):
+                c.collect(formula="Fe2O3")
+
+    def test_proxy_empty_results_is_honest_empty(self):
+        from app.tools.data_collectors.collector import MPCollector
+
+        c = MPCollector()
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "app.tools.data._query_materials_project",
+                return_value={"results": [], "count": 0},
+            ),
+        ):
+            assert c.collect(formula="Xx99Zz") == []
+
+    def test_proxy_success_returns_entries(self):
+        from app.tools.data_collectors.collector import MPCollector
+
+        c = MPCollector()
+        fake = {
+            "results": [
+                {"material_id": "mp-1", "formula_pretty": "Fe2O3", "band_gap": 2.2}
+            ],
+            "count": 1,
+        }
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("app.tools.data._query_materials_project", return_value=fake),
+        ):
+            out = c.collect(formula="Fe2O3")
+        assert out == [{"material_id": "mp-1", "formula_pretty": "Fe2O3", "band_gap": 2.2}]

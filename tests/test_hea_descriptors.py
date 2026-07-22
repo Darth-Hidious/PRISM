@@ -25,27 +25,84 @@ def test_parse_composition_rejects_invalid():
 
 
 def test_cantor_alloy_is_solid_solution_fcc():
-    """The Cantor alloy (CrFeNiCoCu) is THE canonical single-phase FCC HEA."""
-    elems, fracs = _parse_composition("Cr0.2Fe0.2Ni0.2Co0.2Cu0.2")
+    """The REAL Cantor alloy is CoCrFeMnNi — the canonical single-phase FCC HEA.
+
+    Literature anchors: VEC = 8.00 exactly (Guo & Liu 2011: VEC ≥ 8.0 → FCC);
+    ΔH_mix = -4.16 kJ/mol (Takeuchi-Inoue 2005 pair table); δ ≈ 1.1% with
+    Goldschmidt CN12 metallic radii (Yang & Zhang 2012 convention).
+    """
+    elems, fracs = _parse_composition("Co0.2Cr0.2Fe0.2Mn0.2Ni0.2")
     d = compute_hea_descriptors(elems, fracs)
     assert d["phase_prediction"] == "solid_solution"
-    # VEC ~8.8 (textbook value) → FCC
-    assert 8.5 < d["VEC"] < 9.0
-    assert any("FCC" in n for n in d["rationale"])
+    assert d["segregation_risk"] is False
+    # VEC = (9+6+8+7+10)/5 = 8.00 exactly → FCC (Guo & Liu 2011 threshold)
+    assert abs(d["VEC"] - 8.0) < 1e-6
+    assert any("FCC favored" in n for n in d["rationale"])
+    assert not any("mixed" in n for n in d["rationale"])
+    # ΔH_mix must reproduce the Takeuchi-Inoue value exactly
+    assert abs(d["delta_H_mix_kJ_per_mol"] - (-4.16)) < 0.01
     # Ω must be comfortably > 1.1
     assert d["omega"] > 1.1
-    # δ must be small (similar-size 3d TMs)
-    assert d["delta_radius_pct"] < 6.6
+    # δ ≈ 1.1% with metallic (CN12) radii. The old Slater .atomic_radius set
+    # gave 1.77% — assert tightly enough to catch a regression to Slater radii.
+    assert 0.9 < d["delta_radius_pct"] < 1.4
 
 
 def test_senkov_refractory_hea_is_solid_solution_bcc():
-    """NbMoTaW is the canonical refractory BCC HEA."""
+    """NbMoTaW is the canonical refractory BCC HEA (Senkov et al.)."""
     elems, fracs = _parse_composition("NbMoTaW")
     d = compute_hea_descriptors(elems, fracs)
     assert d["phase_prediction"] == "solid_solution"
-    # VEC ~5.5 → BCC
-    assert 5.0 < d["VEC"] < 6.0
-    assert any("BCC" in n for n in d["rationale"])
+    # VEC = (5+6+5+6)/4 = 5.5 < 6.87 → BCC (Guo & Liu 2011)
+    assert abs(d["VEC"] - 5.5) < 1e-6
+    assert any("BCC favored" in n for n in d["rationale"])
+    # ΔH_mix = 4/16·(Mo-Nb -6 + Mo-Ta -5 + Nb-W -8 + Ta-W -7) = -6.5 kJ/mol
+    # (Senkov pair set from Takeuchi-Inoue)
+    assert abs(d["delta_H_mix_kJ_per_mol"] - (-6.5)) < 0.01
+
+
+def test_cocrfenicu_flags_segregation_risk():
+    """CrFeNiCoCu (NOT the Cantor alloy) has ΔH_mix = +3.2 kJ/mol: Cu has
+    positive mixing enthalpy with Fe/Cr/Co/Ni and segregates into a Cu-rich
+    second FCC phase — the tool must flag this, never return a plain
+    solid_solution verdict."""
+    elems, fracs = _parse_composition("Cr0.2Fe0.2Ni0.2Co0.2Cu0.2")
+    d = compute_hea_descriptors(elems, fracs)
+    assert abs(d["delta_H_mix_kJ_per_mol"] - 3.2) < 0.01  # Takeuchi-Inoue pairs
+    assert d["segregation_risk"] is True
+    assert d["phase_prediction"] == "solid_solution_segregation_risk"
+    assert any("segregation" in n.lower() for n in d["rationale"])
+
+
+def test_vec_thresholds_guo_liu_2011():
+    """Guo & Liu 2011: FCC stable at VEC ≥ 8.0, BCC at VEC < 6.87, duplex in
+    [6.87, 8.0). The old 8.6/8.0 thresholds mislabeled CoCrFeMnNi (VEC 8.00,
+    real single-phase FCC) as mixed."""
+    fcc = compute_hea_descriptors(*_parse_composition("Co0.2Cr0.2Fe0.2Mn0.2Ni0.2"))
+    assert any("FCC favored" in n for n in fcc["rationale"])
+    bcc = compute_hea_descriptors(*_parse_composition("NbMoTaW"))
+    assert any("BCC favored" in n for n in bcc["rationale"])
+    # Al0.3CoCrFeNi: VEC = (0.3·3 + 9 + 6 + 8 + 10)/4.3 ≈ 7.88 → duplex window
+    mixed = compute_hea_descriptors(*_parse_composition("Al0.3CoCrFeNi"))
+    assert 6.87 <= mixed["VEC"] < 8.0
+    assert any("mixed" in n for n in mixed["rationale"])
+
+
+def test_miedema_pairs_match_takeuchi_inoue():
+    """Spot-check the ΔH_mix pair table against the printed Takeuchi-Inoue 2005
+    values that the adversarial review verified (plus the Senkov refractory
+    set). These were wrong before (e.g. Ni-Ti was -18)."""
+    from app.tools.materials.hea import _dh_mix_for_pair
+
+    expected = {
+        ("Ni", "Ti"): -35, ("Ni", "Nb"): -30, ("Ni", "Zr"): -49,
+        ("Mo", "Si"): -35, ("Cr", "Ta"): -7, ("Co", "Ti"): -28,
+        ("Nb", "W"): -8, ("Ta", "W"): -7, ("Mo", "Ta"): -5,
+        ("Al", "Ni"): -22,  # Al row was verified correct
+    }
+    for (a, b), v in expected.items():
+        assert _dh_mix_for_pair(a, b) == v, f"{a}-{b}: {_dh_mix_for_pair(a, b)} != {v}"
+        assert _dh_mix_for_pair(b, a) == v  # symmetric
 
 
 def test_binary_not_hea():

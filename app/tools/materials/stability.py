@@ -1,11 +1,13 @@
 # Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
 """Phase-stability screening — convex-hull distance via Materials Project.
 
-The free equivalent of Thermo-Calc's phase-stability / decomposition-energy
-capability. Instead of a commercial CALPHAD database, this uses the Materials
-Project convex hull (energy_above_hull) accessed through the platform's
-server-brokered MP key — so every PRISM user gets phase stability FREE without
-a local MP_API_KEY.
+SCOPE (honest): this looks up the Materials Project 0 K DFT convex hull
+(energy_above_hull) for a compound — a thermodynamic SCREENING signal for
+"is this phase stable/synthesizable at 0 K?". It is NOT a CALPHAD
+phase-equilibria calculation: no temperature dependence, no phase fractions,
+no Gibbs-energy minimization (that is what Thermo-Calc-class databases
+compute). MP requests route through the platform's server-brokered MP key —
+no local MP_API_KEY needed.
 
 `phase_stability`: given a composition/formula, returns its distance to the
 convex hull (eV/atom), whether it's thermodynamically stable (on the hull),
@@ -37,9 +39,10 @@ _PHASE_SCHEMA: dict = {
         "to the convex hull (energy_above_hull in eV/atom), whether it's stable "
         "(on the hull), its formation energy, and competing phases. Routes "
         "Materials Project data through the platform's server-brokered key — "
-        "no local MP_API_KEY needed. The free Thermo-Calc phase-stability "
-        "equivalent. Use after screening to gate candidates: on-hull or "
-        "near-hull (< 0.05 eV/atom) materials are synthesizable."
+        "no local MP_API_KEY needed. This is 0 K DFT convex-hull screening, "
+        "NOT CALPHAD phase equilibria (no temperature dependence or phase "
+        "fractions). Use after screening to gate candidates: on-hull or "
+        "near-hull (< 0.05 eV/atom) materials are likely synthesizable."
     ),
     "properties": {
         "formula": {
@@ -132,8 +135,8 @@ def _phase_stability_tool() -> Tool:
         description=(
             "Check a material's thermodynamic phase stability: distance to the "
             "convex hull (energy_above_hull eV/atom), stable-vs-unstable verdict, "
-            "formation energy. Free Thermo-Calc phase-stability equivalent, "
-            "via the platform-brokered Materials Project key (no local MP_API_KEY)."
+            "formation energy. 0 K DFT convex-hull screening (Materials Project, "
+            "platform-brokered key — no local MP_API_KEY); not CALPHAD equilibria."
         ),
         input_schema=_PHASE_SCHEMA,
         func=_stability,

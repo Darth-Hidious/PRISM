@@ -105,6 +105,57 @@ def test_predict_property_requires_formulas():
     assert "error" in out
 
 
+def test_predict_property_reports_actual_feature_backend():
+    """C6 honesty: the provenance must report the feature backend that ACTUALLY
+    ran (matminer Magpie only when matminer is installed; otherwise the builtin
+    22-feature fallback) — the old code hardcoded 'matminer magpie' even when
+    the fallback ran. ML plumbing is mocked; this tests the provenance logic.
+    """
+    from app.tools.base import ToolRegistry
+    from app.tools.materials.informatics import create_informatics_tools
+
+    try:
+        import sklearn  # noqa: F401
+        import numpy  # noqa: F401
+    except ImportError:
+        pytest.skip("sklearn/numpy not installed")
+
+    reg = ToolRegistry()
+    create_informatics_tools(reg)
+
+    formulas = [f"El{i}O{i % 3 + 1}" for i in range(30)]
+    fake_mp = {
+        "results": [
+            {"formula_pretty": f, "formation_energy_per_atom": -0.05 * i}
+            for i, f in enumerate(formulas)
+        ]
+    }
+
+    def _fake_features(formula):
+        # deterministic small vector so train/predict run without matminer
+        return [float(len(formula)), float(sum(map(ord, formula)) % 97), 1.0]
+
+    with (
+        patch("app.tools.data._query_materials_project", return_value=fake_mp),
+        patch("app.tools.ml.features.composition_features", side_effect=_fake_features),
+    ):
+        out = reg.get("predict_property").func(formulas=["Cu2O"])
+
+    assert "predictions" in out, f"predict_property failed: {out}"
+    backend = out["model_meta"]["feature_backend"]
+
+    from app.tools.ml.features import get_feature_backend
+
+    if get_feature_backend() == "matminer":
+        assert "matminer" in backend
+    else:
+        # matminer absent → must NOT claim magpie; must name the real fallback
+        assert "matminer magpie" != backend
+        assert "builtin" in backend and "matminer not installed" in backend
+        assert "matminer magpie" not in out["provenance"]
+        assert "builtin" in out["provenance"]
+
+
 # ---- E12: predict_synthesizability (heuristic) ----
 
 def test_synthesizability_is_honest_heuristic():

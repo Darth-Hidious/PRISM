@@ -72,13 +72,49 @@ def test_screen_materials_ranks_by_property():
         "providers_summary": {"succeeded": 1, "failed": 0},
         "warnings": [],
     }
-    with patch("app.plugins.bootstrap.build_full_registry") as mock_boot:
-        mock_boot.return_value = (MagicMock(get=MagicMock(return_value=fake_ms)), None, None)
+    with patch("app.tools.materials._shared.get_shared_registry") as mock_reg:
+        mock_reg.return_value = MagicMock(get=MagicMock(return_value=fake_ms))
         out = screen.func(elements=["Cu"], rank_by="band_gap", limit=10)
     formulas = [c["formula"] for c in out["candidates"]]
     assert formulas == ["B", "C", "A"], "must be ranked by band_gap descending"
     assert out["ranked_by"] == "band_gap"
     assert out["count"] == 3
+
+
+def test_screen_materials_formation_energy_ranks_most_stable_first():
+    """SCI-8: formation energy is an energy — MORE NEGATIVE = MORE STABLE, so a
+    stability ranking must be ASCENDING. The old reverse=True surfaced the
+    LEAST stable candidates as 'top'. Missing values must still sort last."""
+    from app.tools.base import ToolRegistry
+    from app.tools.materials import create_materials_informatics_tools
+
+    reg = ToolRegistry()
+    create_materials_informatics_tools(reg)
+    screen = reg.get("screen_materials")
+    fake_ms = MagicMock()
+    materials = [
+        _fake_material("MildlyStable"),
+        _fake_material("MostStable"),
+        _fake_material("Unstable"),
+        _fake_material("NoData"),
+    ]
+    materials[0]["formation_energy"] = {"value": -0.5, "source": "mock", "unit": "eV/atom"}
+    materials[1]["formation_energy"] = {"value": -2.0, "source": "mock", "unit": "eV/atom"}
+    materials[2]["formation_energy"] = {"value": 0.3, "source": "mock", "unit": "eV/atom"}
+    fake_ms.func.return_value = {
+        "materials": materials,
+        "count": 4,
+        "coverage": {},
+        "providers_summary": {"succeeded": 1, "failed": 0},
+        "warnings": [],
+    }
+    with patch("app.tools.materials._shared.get_shared_registry") as mock_reg:
+        mock_reg.return_value = MagicMock(get=MagicMock(return_value=fake_ms))
+        out = screen.func(elements=["Fe"], rank_by="formation_energy", limit=10)
+    formulas = [c["formula"] for c in out["candidates"]]
+    assert formulas == ["MostStable", "MildlyStable", "Unstable", "NoData"], (
+        f"formation_energy must rank ascending (most negative first): {formulas}"
+    )
 
 
 def test_compare_materials_builds_matrix():
@@ -96,8 +132,8 @@ def test_compare_materials_builds_matrix():
         return {"materials": [_fake_material(f, band_gap=1.0)]}
 
     fake_ms.func.side_effect = fake_func
-    with patch("app.plugins.bootstrap.build_full_registry") as mock_boot:
-        mock_boot.return_value = (MagicMock(get=MagicMock(return_value=fake_ms)), None, None)
+    with patch("app.tools.materials._shared.get_shared_registry") as mock_reg:
+        mock_reg.return_value = MagicMock(get=MagicMock(return_value=fake_ms))
         out = cmp_tool.func(materials=["Si", "Ge"], properties=["band_gap"])
     assert len(out["comparison"]) == 2
     assert "band_gap" in out["matrix"]
@@ -121,8 +157,8 @@ def test_lookup_structure_returns_best_hit():
         ],
         "providers_summary": {"succeeded": 1, "failed": 0},
     }
-    with patch("app.plugins.bootstrap.build_full_registry") as mock_boot:
-        mock_boot.return_value = (MagicMock(get=MagicMock(return_value=fake_ms)), None, None)
+    with patch("app.tools.materials._shared.get_shared_registry") as mock_reg:
+        mock_reg.return_value = MagicMock(get=MagicMock(return_value=fake_ms))
         out = lookup.func(formula="Si")
     assert out["found"] is True
     assert out["formula"] == "Si"  # the richer hit, not the bare one

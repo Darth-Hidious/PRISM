@@ -70,8 +70,10 @@ class MaterialsProjectProvider(Provider):
         """
         try:
             from app.tools.data import _query_materials_project
-        except ImportError:
-            return []
+        except ImportError as exc:
+            # A broken install must surface as a provider failure, not as
+            # "queried MP, found nothing".
+            raise RuntimeError(f"MP platform proxy unavailable (import failed): {exc}") from exc
 
         # Build a formula query if the query has one; else do a wildcard pull.
         formula = query.formula
@@ -90,7 +92,17 @@ class MaterialsProjectProvider(Provider):
                 "symmetry",
             ],
         )
-        if not isinstance(res, dict) or res.get("error") or not res.get("results"):
+        # C1 honesty fix: a proxy error (outage, auth failure, HTTP error) must
+        # RAISE so the engine's circuit breaker + query_log record an honest
+        # provider failure. Returning [] here would report status=success,
+        # count=0 — an outage masquerading as "nothing found".
+        if not isinstance(res, dict):
+            raise RuntimeError(
+                f"MP platform proxy returned unexpected payload: {type(res).__name__}"
+            )
+        if res.get("error"):
+            raise RuntimeError(f"MP platform proxy error: {res['error']}")
+        if not res.get("results"):
             return []
 
         materials = []

@@ -3,7 +3,7 @@
 
 These close the gap to commercial materials-discovery platforms (Citrine,
 ExoMatter) using ONLY open data (the OPTIMADE federation via materials_search)
-and open libs already in the PRISM venv (pymatgen, pandas) — no paid APIs.
+— pure federation reshaping, no external libs, no paid APIs.
 
 Each tool follows the PRISM-Alpha authoring contract (typed inputs/outputs,
 units in field names, examples, honest errors, provenance). They compose the
@@ -106,7 +106,11 @@ _SCREEN_SCHEMA: dict = {
         "rank_by": {
             "type": "string",
             "enum": ["band_gap", "bulk_modulus", "formation_energy"],
-            "description": "Property to rank candidates by (descending).",
+            "description": (
+                "Property to rank candidates by, best-first: descending for "
+                "band_gap/bulk_modulus, ASCENDING for formation_energy "
+                "(more negative = more stable)."
+            ),
         },
         "limit": {
             "type": "integer",
@@ -159,11 +163,12 @@ def _screen_materials_tool() -> Tool:
             }
         query = MaterialSearchQuery(limit=max(limit * 3, 50), **query_kwargs)
         # Run the federated search via the registered materials_search tool so we
-        # reuse its engine (cache, breakers, honest output).
+        # reuse its engine (cache, breakers, honest output). The registry is a
+        # process-level singleton — NOT rebuilt per call (SCI-9/C3).
         try:
-            from app.plugins.bootstrap import build_full_registry
+            from app.tools.materials._shared import get_shared_registry
 
-            reg, _, _ = build_full_registry()
+            reg = get_shared_registry()
             ms = reg.get("materials_search")
             call_args: dict[str, Any] = query.model_dump(exclude_none=True, mode="json")
             call_args["timeout_seconds"] = timeout
@@ -173,22 +178,27 @@ def _screen_materials_tool() -> Tool:
             return {"error": f"{type(exc).__name__}: {exc}"}
 
         materials = search_result.get("materials", [])
-        # Rank by the requested property (descending; missing props sort last).
+        # Rank by the requested property; missing props sort last. Direction is
+        # property-aware: formation_energy is an energy where MORE NEGATIVE =
+        # MORE STABLE, so stability ranking sorts ASCENDING (a descending sort
+        # would surface the LEAST stable candidates first — SCI-8 fix).
         if rank_by:
             prop_key = {
                 "band_gap": "band_gap",
                 "bulk_modulus": "bulk_modulus",
                 "formation_energy": "formation_energy",
             }.get(rank_by, rank_by)
+            ascending = rank_by == "formation_energy"
+            missing = float("inf") if ascending else float("-inf")
 
             def _rank_val(m):
                 pv = m.get(prop_key)
                 try:
-                    return float(pv.get("value")) if pv and pv.get("value") is not None else float("-inf")
+                    return float(pv.get("value")) if pv and pv.get("value") is not None else missing
                 except (TypeError, ValueError):
-                    return float("-inf")
+                    return missing
 
-            materials = sorted(materials, key=_rank_val, reverse=True)
+            materials = sorted(materials, key=_rank_val, reverse=not ascending)
 
         candidates = [
             {
@@ -299,9 +309,9 @@ def _compare_materials_tool() -> Tool:
             "crystal_system",
         ]
         try:
-            from app.plugins.bootstrap import build_full_registry
+            from app.tools.materials._shared import get_shared_registry
 
-            reg, _, _ = build_full_registry()
+            reg = get_shared_registry()
             ms = reg.get("materials_search")
         except Exception as exc:
             return {"error": f"search engine unavailable: {exc}"}
@@ -394,9 +404,9 @@ def _lookup_structure_tool() -> Tool:
         if not formula and not elements:
             return {"error": "provide a formula or elements to look up"}
         try:
-            from app.plugins.bootstrap import build_full_registry
+            from app.tools.materials._shared import get_shared_registry
 
-            reg, _, _ = build_full_registry()
+            reg = get_shared_registry()
             ms = reg.get("materials_search")
         except Exception as exc:
             return {"error": f"search engine unavailable: {exc}"}
