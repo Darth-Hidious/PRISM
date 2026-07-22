@@ -268,6 +268,8 @@ def _materials_search_factory(provider_registry: ProviderRegistry):
             "providers_queried": providers_queried,
             "providers_summary": summary,
             "warnings": result.warnings,
+            # S7: honest coverage — which filters ran server-side vs client-side.
+            "coverage": result.coverage,
             "query_hash": query.query_hash(),
         }
 

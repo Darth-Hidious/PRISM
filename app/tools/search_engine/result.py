@@ -73,3 +73,8 @@ class SearchResult(BaseModel):
     cached: bool = False
     search_time_ms: float = 0
     cache_stats: dict | None = None
+    # S7: which filters were applied server-side vs client-side. OPTIMADE
+    # providers can't filter on property ranges server-side, so the engine
+    # post-filters locally and reports it here so the agent can cite honestly
+    # that e.g. a band_gap constraint was enforced client-side, not by the DB.
+    coverage: dict = Field(default_factory=dict)

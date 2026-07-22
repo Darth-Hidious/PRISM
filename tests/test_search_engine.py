@@ -304,3 +304,86 @@ def _make_log(pid, status, error_message=None):
         result_count=5 if status == "success" else 0,
         error_message=error_message,
     )
+
+
+# ---------------------------------------------------------------------------
+# S7: capability-aware coverage + client-side post-filter
+# ---------------------------------------------------------------------------
+
+
+def test_s7_post_filter_drops_materials_outside_property_range():
+    """S7: a band_gap range must narrow results client-side (OPTIMADE providers
+    can't filter on it server-side, so we do it locally and report it)."""
+    from app.tools.search_engine.engine import _post_filter_client_side
+    from app.tools.search_engine.result import Material, PropertyValue
+
+    mats = [
+        Material(id="a", formula="A", elements=["A"], n_elements=1, sources=["x"],
+                 band_gap=PropertyValue(value=0.2, source="x")),   # below range -> drop
+        Material(id="b", formula="B", elements=["B"], n_elements=1, sources=["x"],
+                 band_gap=PropertyValue(value=1.5, source="x")),   # in range -> keep
+        Material(id="c", formula="C", elements=["C"], n_elements=1, sources=["x"],
+                 band_gap=PropertyValue(value=5.0, source="x")),   # above range -> drop
+        Material(id="d", formula="D", elements=["D"], n_elements=1, sources=["x"]),  # missing -> drop
+    ]
+    q = MaterialSearchQuery(elements=["Cu"], band_gap=PropertyRange(min=0.5, max=3.0))
+    out = _post_filter_client_side(mats, q)
+    kept_ids = {m.id for m in out}
+    assert kept_ids == {"b"}, f"only the in-range material survives; got {kept_ids}"
+
+
+def test_s7_coverage_reports_filter_strength_and_post_filter():
+    """S7: the coverage block surfaces the strongest server-side filter + whether
+    property filters were applied client-side."""
+    from app.tools.search_engine.engine import _coverage_for_query
+
+    # element + band_gap: strength is 'element' (server), band_gap is client-side
+    cov = _coverage_for_query(
+        MaterialSearchQuery(elements=["Cu"], band_gap=PropertyRange(min=0.5, max=3.0))
+    )
+    assert cov["filter_strength"] == "element"
+    assert "band_gap" in cov["property_filters_present"]
+    assert "atomgpt" in cov["providers_supporting_property_filter"]
+
+    # formula only: strength is 'formula', no property filters
+    cov2 = _coverage_for_query(MaterialSearchQuery(formula="Cu2O"))
+    assert cov2["filter_strength"] == "formula"
+    assert cov2["property_filters_present"] == []
+
+
+def test_s7_coverage_in_engine_output():
+    """S7: a search with a property range returns the coverage block, and
+    out-of-range materials are dropped client-side (honestly reported)."""
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+
+    bg = PropertyValue(value=0.1, source="x")  # OUT of the [0.5, 3.0] range
+
+    class P(Provider):
+        id = "mock"
+        name = "Mock"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+
+        async def search(self, query):
+            return [
+                Material(id="out", formula="A", elements=["A"], n_elements=1,
+                         sources=["mock"], band_gap=bg),
+                Material(id="ok", formula="B", elements=["B"], n_elements=1,
+                         sources=["mock"],
+                         band_gap=PropertyValue(value=1.5, source="x")),
+            ]
+
+    reg = ProviderRegistry()
+    reg.register(P())
+    engine = _isolated_engine(reg)
+    q = MaterialSearchQuery(elements=["Cu"], band_gap=PropertyRange(min=0.5, max=3.0))
+    result = asyncio.run(engine.search(q))
+    # Only the in-range material survives client-side post-filter
+    assert result.total_count == 1
+    assert result.materials[0].id == "ok"
+    # Coverage honestly reports client-side filtering happened
+    assert result.coverage["filter_strength"] == "element"
+    assert "band_gap" in result.coverage["property_filters_present"]
+    assert result.coverage["client_side_post_filtered"] is True
+    assert result.coverage["dropped_by_post_filter"] == 1
+

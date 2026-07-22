@@ -19,8 +19,17 @@ def test_provider_capabilities_can_handle():
     )
     q1 = MaterialSearchQuery(elements=["Fe", "O"])
     assert cap.can_handle(q1) is True
+    # S7: property-range filters are NOT server-side gates. A provider that
+    # doesn't advertise band_gap is still eligible — the engine fetches by the
+    # server-side filter and post-filters band_gap client-side. The OLD behavior
+    # (can_handle=False for band_gap) silently dropped providers that RETURN the
+    # property but can't FILTER on it, losing coverage. Now it returns True.
     q2 = MaterialSearchQuery(band_gap=PropertyRange(min=1.0))
-    assert cap.can_handle(q2) is False
+    assert cap.can_handle(q2) is True
+    # A genuinely unsupported SERVER-SIDE filter still excludes the provider.
+    cap_no_spacegroup = ProviderCapabilities(filterable_fields={"elements"})
+    q3 = MaterialSearchQuery(space_group="Fm-3m")
+    assert cap_no_spacegroup.can_handle(q3) is False
 
 
 def test_build_registry_returns_providers(tmp_path):

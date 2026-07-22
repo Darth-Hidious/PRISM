@@ -18,21 +18,33 @@ class ProviderCapabilities(BaseModel):
     max_results: int | None = None
 
     def can_handle(self, query: MaterialSearchQuery) -> bool:
-        """Check if this provider can handle the query's filters."""
-        field_map = {
-            "elements": "elements", "elements_any": "elements",
-            "exclude_elements": "elements", "formula": "formula",
-            "n_elements": "nelements", "space_group": "space_group",
+        """Check if this provider can handle the query's SERVER-SIDE filters.
+
+        S7: property-range filters (band_gap, formation_energy, bulk_modulus,
+        debye_temperature, energy_above_hull) are NOT server-side gates here —
+        most OPTIMADE providers can't filter on them, but many RETURN them, so
+        the engine fetches by the strongest server-side filter (elements/formula)
+        and post-filters property ranges client-side (see engine
+        _post_filter_client_side). Excluding a provider for an unadvertised
+        property filter would silently drop coverage; instead we keep the
+        provider and narrow locally.
+        """
+        # The fields a provider MUST support server-side to be eligible.
+        # Property-range fields are intentionally absent — handled client-side.
+        server_side_fields = {
+            "elements": "elements",
+            "elements_any": "elements",
+            "exclude_elements": "elements",
+            "formula": "formula",
+            "n_elements": "nelements",
+            "space_group": "space_group",
             "crystal_system": "crystal_system",
-            "band_gap": "band_gap", "formation_energy": "formation_energy",
-            "energy_above_hull": "energy_above_hull",
-            "bulk_modulus": "bulk_modulus", "debye_temperature": "debye_temperature",
         }
         query_data = query.model_dump(exclude_none=True)
         for field_name in query_data:
             if field_name in ("providers", "limit"):
                 continue
-            cap_name = field_map.get(field_name)
+            cap_name = server_side_fields.get(field_name)
             if cap_name and cap_name not in self.filterable_fields:
                 return False
         return True

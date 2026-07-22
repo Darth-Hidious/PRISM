@@ -33,6 +33,98 @@ def _sanitize_error(msg: str) -> str:
 DEFAULT_HEALTH_PATH = Path.home() / ".prism" / "cache" / "provider_health.json"
 
 
+# S7: the OPTIMADE providers known (live-probed 2026-07) to support server-side
+# property-range filters. The vast majority return HTTP 400 for band_gap /
+# bulk_modulus / etc. filters, so the translator never sends them to OPTIMADE
+# providers — instead we post-filter client-side (see _post_filter_client_side).
+# This set is informational, surfaced in the coverage block so the agent knows
+# which providers COULD have filtered server-side.
+_PROVIDERS_SUPPORTING_PROPERTY_FILTER = frozenset(
+    {"omdb", "jarvis", "atomgpt"}
+)
+
+
+def _coverage_for_query(query: MaterialSearchQuery) -> dict:
+    """Build the coverage block describing what filters were applicable.
+
+    Surfaces the strongest server-side filter strength and whether the query
+    asked for property ranges that most OPTIMADE providers can't enforce
+    server-side (so they're applied client-side instead).
+    """
+    property_fields = [
+        "band_gap",
+        "formation_energy",
+        "energy_above_hull",
+        "bulk_modulus",
+        "debye_temperature",
+    ]
+    present = [f for f in property_fields if getattr(query, f, None) is not None]
+    # The strongest filter the translator sends server-side to OPTIMADE providers.
+    if query.formula:
+        strength = "formula"
+    elif query.elements or query.elements_any:
+        strength = "element"
+    else:
+        strength = "none"
+    return {
+        "filter_strength": strength,
+        "property_filters_present": present,
+        "providers_supporting_property_filter": sorted(
+            _PROVIDERS_SUPPORTING_PROPERTY_FILTER
+        ),
+        "client_side_post_filtered": False,
+        "dropped_by_post_filter": 0,
+    }
+
+
+def _in_range(value: float | None, pr) -> bool:
+    """True if value is within the PropertyRange (None values = open bound)."""
+    if value is None:
+        return False  # a missing property can't satisfy a range filter
+    lo = pr.min if pr.min is not None else float("-inf")
+    hi = pr.max if pr.max is not None else float("inf")
+    return lo <= value <= hi
+
+
+def _material_prop_value(material: Material, field: str) -> float | None:
+    """Extract a numeric property value from a Material's PropertyValue field."""
+    pv = getattr(material, field, None)
+    if pv is None or pv.value is None:
+        return None
+    try:
+        return float(pv.value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _post_filter_client_side(
+    materials: list[Material], query: MaterialSearchQuery
+) -> list[Material]:
+    """Narrow results by property ranges the OPTIMADE providers can't filter on.
+
+    A material with a MISSING property is dropped (it can't satisfy a range it
+    doesn't report). This is honest: if a provider didn't return band_gap for a
+    hit, we can't claim it satisfies the constraint.
+    """
+    out = []
+    for m in materials:
+        keep = True
+        for field in (
+            "band_gap",
+            "formation_energy",
+            "energy_above_hull",
+            "bulk_modulus",
+            "debye_temperature",
+        ):
+            pr = getattr(query, field, None)
+            if pr is not None and not _in_range(_material_prop_value(m, field), pr):
+                keep = False
+                break
+        if keep:
+            out.append(m)
+    return out
+
+
 class SearchEngine:
     """Federated materials database search engine.
 
@@ -218,6 +310,22 @@ class SearchEngine:
         # 5. Fuse duplicates across providers
         fused = fuse_materials(all_materials)
 
+        # S7: client-side post-filter for property ranges. OPTIMADE providers
+        # cannot filter on band_gap/formation_energy/etc. server-side (only ~3
+        # of 15 support it, and the translator doesn't send those filters to
+        # OPTIMADE providers anyway). But many providers RETURN the property in
+        # the result attributes. So we fetch by the strongest server-side filter
+        # (elements/formula), then narrow locally on any property ranges the
+        # agent asked for — honestly reporting that this was client-side.
+        pre_filter_count = len(fused)
+        coverage = _coverage_for_query(query)
+        if coverage["property_filters_present"]:
+            fused = _post_filter_client_side(fused, query)
+            post_filtered = pre_filter_count - len(fused)
+            if post_filtered > 0:
+                coverage["client_side_post_filtered"] = True
+                coverage["dropped_by_post_filter"] = post_filtered
+
         # 6. Apply limit
         fused = fused[: query.limit]
 
@@ -228,6 +336,7 @@ class SearchEngine:
             query=query,
             query_log=query_log,
             warnings=warnings,
+            coverage=coverage,
             search_time_ms=(time.time() - start) * 1000,
         )
 
