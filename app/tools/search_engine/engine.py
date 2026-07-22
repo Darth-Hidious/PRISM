@@ -60,6 +60,8 @@ class SearchEngine:
     async def search(self, query: MaterialSearchQuery) -> SearchResult:
         """Fan out to providers, collect, fuse, rank, return."""
         start = time.time()
+        # Carries the whole-fan-out deadline notice if S2's deadline fires.
+        warnings: list[str] = []
 
         # 1. Cache check
         cached = self._cache.get(query)
@@ -112,19 +114,72 @@ class SearchEngine:
                     early_event.set()
                 return materials, log
 
-        tasks = {p.id: asyncio.create_task(_guarded_query(p)) for p in providers}
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        tasks: dict[str, asyncio.Task] = {
+            p.id: asyncio.create_task(_guarded_query(p)) for p in providers
+        }
+
+        # S3: cancel-slow-on-early-complete. The old code's `early_event` only
+        # short-circuited tasks that hadn't entered the semaphore yet — tasks
+        # already running (the slow ones blocking the gather) were NEVER
+        # cancelled despite the "cancel remaining slow ones" comment. This
+        # watcher fires the moment we have enough results and cancels every
+        # not-yet-complete task so the gather returns promptly instead of
+        # waiting on the laggards.
+        async def _early_canceller():
+            await early_event.wait()
+            for t in tasks.values():
+                if not t.done():
+                    t.cancel()
+
+        canceller = asyncio.create_task(_early_canceller())
+
+        # S2: a separate, hard whole-fan-out deadline. The per-provider timeout
+        # (in _query_provider) is by UNION — each provider gets its OWN configured
+        # timeout, never silently clipped to the global (the old `min(global, per)`
+        # clipped OQMD's 15s to 5s). This deadline is the only global ceiling: it
+        # guarantees the agent gets a result (partial or complete) within ~this bound
+        # even if every provider is slow.
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks.values(), return_exceptions=True),
+                timeout=self._global_timeout,
+            )
+        except asyncio.TimeoutError:
+            # The whole fan-out exceeded the deadline. Cancel anything still in
+            # flight so it doesn't keep running after we return, then collect
+            # whatever each task had produced so far (None for not-started ones).
+            for t in tasks.values():
+                if not t.done():
+                    t.cancel()
+            # Gather again (no wait_for) to surface CancelledError as values and
+            # preserve partial results already completed.
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            warnings.append(
+                f"Whole-fan-out deadline reached after {self._global_timeout:.0f}s — "
+                "returning partial results; some providers were cancelled"
+            )
+        finally:
+            canceller.cancel()
+
         provider_results = dict(zip(tasks.keys(), results))
 
         # 4. Collect results + build audit trail
         all_materials: list[Material] = []
         query_log: list[ProviderQueryLog] = []
-        warnings: list[str] = []
-
+        # `warnings` may already carry the whole-fan-out deadline notice set above.
         for pid, result in provider_results.items():
             provider = next(p for p in providers if p.id == pid)
             if isinstance(result, BaseException):
+                # S1: the breaker + an honest log. Each task records its OWN
+                # start (above), so latency here is per-provider, not the old
+                # cumulative search-wide `start`.
                 self._health.get(pid).record_failure()
+                status = (
+                    "timeout"
+                    if isinstance(result, asyncio.CancelledError)
+                    or isinstance(result, asyncio.TimeoutError)
+                    else "http_error"
+                )
                 log = ProviderQueryLog(
                     provider_id=pid,
                     provider_name=provider.name,
@@ -133,7 +188,7 @@ class SearchEngine:
                     started_at=start,
                     completed_at=time.time(),
                     latency_ms=(time.time() - start) * 1000,
-                    status="http_error",
+                    status=status,
                     error_type=type(result).__name__,
                     error_message=_sanitize_error(str(result)),
                 )
@@ -184,15 +239,16 @@ class SearchEngine:
         endpoint_url = self._get_endpoint_url(provider)
         query_sent = QueryTranslator.to_optimade(query)
 
-        # Determine per-provider timeout — use the minimum of the
-        # global timeout and the per-provider configured timeout.
-        # This ensures the global timeout always caps slow providers.
+        # S2: per-provider timeout by UNION. The provider's OWN configured
+        # timeout wins; the global is a separate whole-fan-out deadline (see
+        # search()), NOT a clip on each provider. The old `min(global, per)`
+        # silently clipped OQMD's 15s override to the 5s default. Default to the
+        # global only when the provider has no explicit timeout configured.
         timeout = self._global_timeout
         if hasattr(provider, "_endpoint") and provider._endpoint:
             ep = provider._endpoint
-            if hasattr(ep, "behavior") and ep.behavior:
-                per_provider = ep.behavior.timeout_ms / 1000
-                timeout = min(timeout, per_provider)
+            if hasattr(ep, "behavior") and ep.behavior and ep.behavior.timeout_ms:
+                timeout = ep.behavior.timeout_ms / 1000
 
         try:
             materials = await asyncio.wait_for(

@@ -210,21 +210,43 @@ def _materials_search_factory(provider_registry: ProviderRegistry):
                 "query": query.model_dump(exclude_none=True, mode="json"),
             }
 
-        # Return a JSON-serialisable shape that keeps provenance — the
-        # agent should be able to cite "Materials Project says X for
-        # Inconel 718" vs "OPTIMADE-Alexandria says Y."
+        # S1: HONEST output. The old shape marked every provider ok:true
+        # (getattr(log,"ok",True) — ProviderQueryLog has no `ok` field) and
+        # dropped status/error/warnings, so the agent couldn't tell which
+        # providers actually failed. Now we surface the full per-provider log
+        # plus a one-glance summary + the engine's warnings array.
+        providers_queried = []
+        summary = {"succeeded": 0, "failed": 0, "skipped": 0, "circuit_open": 0}
+        for log in result.query_log:
+            ok = log.status == "success"
+            providers_queried.append(
+                {
+                    "provider": log.provider_name,
+                    "provider_id": log.provider_id,
+                    "endpoint": log.endpoint_url,
+                    "status": log.status,
+                    "ok": ok,
+                    "latency_ms": round(log.latency_ms, 1),
+                    "result_count": log.result_count,
+                    "http_status": log.http_status_code,
+                    "error": log.error_message,
+                }
+            )
+            if log.status == "success":
+                summary["succeeded"] += 1
+            elif log.status == "skipped":
+                summary["skipped"] += 1
+            elif log.status == "circuit_open":
+                summary["circuit_open"] += 1
+            else:
+                summary["failed"] += 1
+
         return {
             "materials": [m.model_dump(mode="json") for m in result.materials],
             "count": len(result.materials),
-            "providers_queried": [
-                {
-                    "provider": log.provider_name,
-                    "endpoint": log.endpoint_url,
-                    "latency_ms": log.latency_ms,
-                    "ok": getattr(log, "ok", True),
-                }
-                for log in result.query_log
-            ],
+            "providers_queried": providers_queried,
+            "providers_summary": summary,
+            "warnings": result.warnings,
             "query_hash": query.query_hash(),
         }
 
