@@ -213,6 +213,13 @@ impl PrismPaths {
             "user_id": creds.user_id,
             "org_id": creds.org_id,
             "project_id": creds.project_id,
+            // Persisted so a cli-state rebuilt from this mirror keeps the
+            // expiry and the proactive (within-5-min) refresh fires. Without
+            // it the mirror yields expires_at=None → every launch falls into
+            // the reactive retry path. Extra field: ignored by readers that
+            // don't know it (the Python _platform_creds.py reader), and
+            // emitted as RFC 3339 so it deserializes back into DateTime<Utc>.
+            "expires_at": creds.expires_at,
         });
         let Ok(json) = serde_json::to_string_pretty(&mirror) else {
             return;
@@ -380,12 +387,17 @@ mod tests {
             user_id: Some("u1".into()),
             org_id: Some("o1".into()),
             project_id: Some("p1".into()),
+            // expires_at MUST survive into the mirror: without it a cli-state
+            // rebuilt from the mirror gets expires_at=None → the proactive
+            // (within-5-min) refresh never fires → every launch falls into the
+            // reactive retry path. (F0 review fix #3.)
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(24)),
             ..Default::default()
         };
 
         paths.persist_credentials(&creds).unwrap();
 
-        // Store 1: cli-state.json round-trips the rotated tokens.
+        // Store 1: cli-state.json round-trips the rotated tokens + expiry.
         let stored = paths
             .load_cli_state()
             .unwrap()
@@ -393,9 +405,13 @@ mod tests {
             .expect("cli-state must hold credentials");
         assert_eq!(stored.access_token, "at-new");
         assert_eq!(stored.refresh_token, "rt-rotated");
+        assert!(
+            stored.expires_at.is_some(),
+            "cli-state must persist expires_at"
+        );
 
-        // Store 2: SDK mirror exists with the exact 6-field shape the Python
-        // platform tools read.
+        // Store 2: SDK mirror exists with the 6-field Python shape PLUS
+        // expires_at (review fix #3).
         let mirror_path = home.join(".prism").join("credentials.json");
         assert!(
             mirror_path.exists(),
@@ -409,6 +425,19 @@ mod tests {
         assert_eq!(mirror["user_id"], "u1");
         assert_eq!(mirror["org_id"], "o1");
         assert_eq!(mirror["project_id"], "p1");
+        assert!(
+            !mirror["expires_at"].is_null(),
+            "SDK mirror MUST carry expires_at (F0 review fix #3) — a mirror \
+             without it yields expires_at=None on rebuild and the proactive \
+             refresh never fires"
+        );
+        // And it must deserialize back into a DateTime<Utc> (the shape
+        // StoredCredentials expects on reload).
+        assert!(
+            serde_json::from_value::<chrono::DateTime<chrono::Utc>>(mirror["expires_at"].clone())
+                .is_ok(),
+            "mirror expires_at must be a valid RFC 3339 timestamp"
+        );
 
         // The mirror holds bearer + refresh tokens — must be owner-only (0600).
         #[cfg(unix)]

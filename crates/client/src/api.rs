@@ -137,6 +137,14 @@ impl PlatformClient {
         &self.base_url
     }
 
+    /// Return the credential (API key or access token) this client authenticates
+    /// with, if any. Used by node-up to assert the stored client carries the
+    /// refreshed token after a 401-retry (a previous bug stored the stale,
+    /// 401'd client and the daemon then ran all REST calls on the dead token).
+    pub fn access_token(&self) -> Option<&str> {
+        self.access_token.as_deref()
+    }
+
     /// Return a reference to the inner reqwest client.
     pub fn inner(&self) -> &reqwest::Client {
         &self.client
@@ -254,7 +262,11 @@ impl PlatformClient {
         let resp = self
             .client
             .post(&url)
-            .headers(self.auth_headers().expect("auth headers valid"))
+            .headers(self.auth_headers().map_err(|e| ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                body_text: format!("invalid token in authorization header: {e}"),
+                code: Some("bad_credentials".to_string()),
+            })?)
             .json(body)
             .send()
             .await

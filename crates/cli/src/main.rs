@@ -2423,10 +2423,30 @@ async fn main() -> Result<()> {
                         // stale copy) `POST /nodes/register` 401'd and the node
                         // silently fell back to offline mode while the platform
                         // still listed it online.
-                        let token = resolve_node_token(&paths, &endpoints, creds).await?;
-                        let platform = PlatformClient::new(&endpoints.api_base).with_token(&token);
-                        let registry =
-                            prism_client::node_registry::NodeRegistryClient::new(&platform);
+                        //
+                        // `resolve_node_token` returns the rotated creds when it
+                        // refreshed (it consumes the single-use refresh token);
+                        // we MUST keep those as the effective creds for any later
+                        // refresh, never the stale startup `creds` binding, or we
+                        // replay a now-REVOKED token and trip token-family
+                        // invalidation.
+                        let (token, maybe_refreshed) =
+                            resolve_node_token(&paths, &endpoints, creds).await?;
+                        // The EFFECTIVE creds — `resolve_node_token`'s rotation
+                        // if it refreshed, else the startup creds. The 401-retry
+                        // arm refreshes from THIS (never the stale `creds`
+                        // binding), so a single-use refresh token already
+                        // consumed by resolve_node_token is never replayed.
+                        let effective_creds = maybe_refreshed.unwrap_or_else(|| creds.clone());
+                        // `mut`: the 401-retry arm reassigns this to a client
+                        // built from the refreshed token, so the value stored
+                        // into the daemon state below carries the LIVE token
+                        // (not the one that just 401'd — a prior bug stored the
+                        // stale client and the daemon then heartbeat/role-sync/
+                        // deregister'd on the dead token → all 401 → stale
+                        // "online" record).
+                        let mut platform =
+                            PlatformClient::new(&endpoints.api_base).with_token(&token);
                         let caps = serde_json::json!({
                             "compute": !no_compute,
                             "storage": !no_storage,
@@ -2438,45 +2458,59 @@ async fn main() -> Result<()> {
                         // token (401 / token_expired) can be recovered with a
                         // refresh + single retry instead of the opaque
                         // "returned error status" that hid the cause.
-                        let reg = match registry.register_node_inspect(&node_name, &caps).await {
-                            Ok(reg) => reg,
-                            Err(api_err) if api_err.is_token_expired() => {
-                                tracing::info!(
-                                    "node register rejected with token_expired — refreshing and retrying once"
-                                );
-                                let refreshed = refresh_access_token(&paths, &endpoints, creds)
+                        let reg = {
+                            let registry =
+                                prism_client::node_registry::NodeRegistryClient::new(&platform);
+                            match registry.register_node_inspect(&node_name, &caps).await {
+                                Ok(reg) => reg,
+                                Err(api_err) if api_err.is_token_expired() => {
+                                    tracing::info!(
+                                        "node register rejected with token_expired — refreshing and retrying once"
+                                    );
+                                    // Refresh from the EFFECTIVE creds (rotated
+                                    // by resolve_node_token if it already
+                                    // refreshed), never the stale startup
+                                    // binding.
+                                    let refreshed = refresh_access_token(
+                                        &paths, &endpoints, &effective_creds,
+                                    )
                                     .await
                                     .context(
                                         "token expired and refresh failed — run `prism login` to re-authenticate",
                                     )?;
-                                let platform = PlatformClient::new(&endpoints.api_base)
-                                    .with_token(&refreshed.access_token);
-                                let registry =
-                                    prism_client::node_registry::NodeRegistryClient::new(&platform);
-                                registry
-                                    .register_node_inspect(&node_name, &caps)
-                                    .await
-                                    .map_err(|e| {
-                                        anyhow!(
-                                            "platform registration failed after token refresh: {e}"
-                                        )
-                                    })?
-                            }
-                            Err(e) => {
-                                // Fail LOUD: a non-offline `node up` that cannot
-                                // register leaves the node in a dangerous
-                                // half-state — the dashboard/mesh run, but the
-                                // node never receives broker-dispatched jobs, and
-                                // the platform may still list a stale record as
-                                // online. Fail with a clear message + non-zero
-                                // exit instead of silently dropping to "offline
-                                // mode". (Pass --offline to run without the
-                                // platform.)
-                                return Err(anyhow!(
-                                    "platform registration failed: {e}\n\
-                                     re-authenticate with `prism login`, or pass --offline \
-                                     to run without platform dispatch."
-                                ));
+                                    // Reassign the OUTER client so the daemon
+                                    // state (stored below) carries the live token.
+                                    platform = PlatformClient::new(&endpoints.api_base)
+                                        .with_token(&refreshed.access_token);
+                                    let registry =
+                                        prism_client::node_registry::NodeRegistryClient::new(
+                                            &platform,
+                                        );
+                                    registry
+                                        .register_node_inspect(&node_name, &caps)
+                                        .await
+                                        .map_err(|e| {
+                                            anyhow!(
+                                                "platform registration failed after token refresh: {e}"
+                                            )
+                                        })?
+                                }
+                                Err(e) => {
+                                    // Fail LOUD: a non-offline `node up` that cannot
+                                    // register leaves the node in a dangerous
+                                    // half-state — the dashboard/mesh run, but the
+                                    // node never receives broker-dispatched jobs, and
+                                    // the platform may still list a stale record as
+                                    // online. Fail with a clear message + non-zero
+                                    // exit instead of silently dropping to "offline
+                                    // mode". (Pass --offline to run without the
+                                    // platform.)
+                                    return Err(anyhow!(
+                                        "platform registration failed: {e}\n\
+                                         re-authenticate with `prism login`, or pass --offline \
+                                         to run without platform dispatch."
+                                    ));
+                                }
                             }
                         };
 
@@ -2490,6 +2524,11 @@ async fn main() -> Result<()> {
                             reg.node_id
                         );
                         daemon_platform_node_id = Some(reg.node_id);
+                        // `platform` is the LIVE client: either the original
+                        // (register succeeded first try) or the reassigned
+                        // refreshed one (after a 401-retry). Storing the stale
+                        // client here was the bug that made the daemon's REST
+                        // calls all 401 silently.
                         server_node_state.platform_client = Some(platform.clone());
                         daemon_platform_client = Some(platform);
                     } else {
@@ -9226,22 +9265,27 @@ async fn refresh_access_token(
 /// 2. `MARC27_API_KEY` env — headless/agent path, no expiry;
 /// 3. cli-state creds, refreshed once if `expires_at` has passed.
 ///
-/// Returns the token string to attach to the `PlatformClient`. The daemon's WS
-/// path already does all of this; this is the same logic for the REST register
-/// that precedes it, closing the gap that let a 24h-old token 401.
+/// Returns `(token, refreshed_creds)`:
+/// - `token` is the string to attach to the `PlatformClient`;
+/// - `refreshed_creds` is `Some(...)` ONLY when this call refreshed (rotating
+///   the single-use refresh token). The caller MUST use these refreshed creds
+///   for any later refresh (e.g. the 401-retry) — never the stale startup
+///   binding — or it will replay a now-REVOKED refresh token and trip the
+///   server's token-family invalidation (forcing re-login + potentially
+///   revoking the good tokens just issued).
 async fn resolve_node_token(
     paths: &PrismPaths,
     endpoints: &PlatformEndpoints,
     creds: &StoredCredentials,
-) -> Result<String> {
+) -> Result<(String, Option<StoredCredentials>)> {
     if let Some(node_token) = paths.load_node_token() {
         tracing::debug!("using durable node token (does not rotate)");
-        return Ok(node_token.key);
+        return Ok((node_token.key, None));
     }
     if let Ok(key) = std::env::var("MARC27_API_KEY") {
         let key = key.trim().to_string();
         if !key.is_empty() {
-            return Ok(key);
+            return Ok((key, None));
         }
     }
     if let Some(expires_at) = creds.expires_at
@@ -9249,9 +9293,11 @@ async fn resolve_node_token(
     {
         tracing::info!("access token expired before node register, refreshing");
         let refreshed = refresh_access_token(paths, endpoints, creds).await?;
-        return Ok(refreshed.access_token);
+        // Thread the rotated creds out so the caller doesn't replay the
+        // single-use refresh_token that `refresh_access_token` just consumed.
+        return Ok((refreshed.access_token.clone(), Some(refreshed)));
     }
-    Ok(creds.access_token.clone())
+    Ok((creds.access_token.clone(), None))
 }
 
 // Old Ink/TypeScript TUI launcher removed — native Ratatui TUI is in crates/cli/src/tui/
@@ -10083,6 +10129,104 @@ mod tests {
         // #132: unauthenticated + untouched default must NOT silently become
         // localhost — it errors instead.
         assert!(resolve_unauth_llm_url(DEFAULT_LLM_URL).is_err());
+    }
+
+    // ── F0 review-fix primitives ───────────────────────────────────────
+    // These pin the contracts the node-up register-with-refresh logic depends
+    // on. They would have caught the two review bugs:
+    //  (1) storing the stale (401'd) client instead of the refreshed one
+    //  (2) refreshing from the stale startup creds instead of the rotated ones
+
+    #[test]
+    fn platform_client_access_token_reflects_with_token() {
+        // Bug (1) primitive: the value `node up` stores into the daemon state
+        // is the `PlatformClient`; the daemon's REST heartbeat/role-sync runs
+        // on whatever token it carries. `access_token()` MUST report the token
+        // from the most recent `with_token`, so reassigning `platform` to a
+        // refreshed client makes the stored client carry the LIVE token (not
+        // the one that just 401'd).
+        let stale = PlatformClient::new("https://api.marc27.com/api/v1").with_token("stale-dead");
+        assert_eq!(stale.access_token(), Some("stale-dead"));
+        let refreshed =
+            PlatformClient::new("https://api.marc27.com/api/v1").with_token("fresh-live");
+        assert_eq!(refreshed.access_token(), Some("fresh-live"));
+        // Reassignment (the exact shape of the fix): a `mut` binding that is
+        // overwritten by the refreshed client reports the refreshed token.
+        let mut platform = stale;
+        assert_eq!(platform.access_token(), Some("stale-dead"));
+        platform = refreshed;
+        assert_eq!(
+            platform.access_token(),
+            Some("fresh-live"),
+            "reassigned client must carry the refreshed token"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_node_token_fresh_creds_returns_no_rotation() {
+        // Bug (2) primitive: when the creds are NOT expired (and no node-token
+        // file / API key is set), `resolve_node_token` returns the access token
+        // with `None` rotation. The 401-retry arm refreshes from the EFFECTIVE
+        // creds; this contract ensures `None` ⇒ "use the original creds, no
+        // rotation happened", so the retry doesn't replay an already-consumed
+        // single-use refresh token.
+        //
+        // Uses a real temp-dir PrismPaths (all fields public) so the
+        // durable-token branch finds no file; clears any inherited API key so
+        // the API-key branch is skipped. Fresh creds → the refresh branch
+        // (the only network call) is never taken.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "prism-resolve-token-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = PrismPaths {
+            config_dir: dir.join("cfg"),
+            cache_dir: dir.join("cache"),
+            data_dir: dir.join("data"),
+            state_dir: dir.join("state"),
+        };
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        let creds = StoredCredentials {
+            access_token: "fresh-untouched".to_string(),
+            refresh_token: "unused-in-this-branch".to_string(),
+            platform_url: "https://api.marc27.com".to_string(),
+            user_id: None,
+            display_name: None,
+            org_id: None,
+            org_name: None,
+            project_id: None,
+            project_name: None,
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        };
+        // env mutation is process-global + unsafe in edition 2024; avoid it.
+        // If MARC27_API_KEY happens to be set in the test env, the function's
+        // API-key branch short-circuits and this contract isn't exercisable —
+        // skip gracefully rather than racing the global env.
+        if std::env::var("MARC27_API_KEY").is_ok() {
+            eprintln!(
+                "skipping resolve_node_token_fresh_creds_returns_no_rotation: \
+                 MARC27_API_KEY is set in the env"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let endpoints = PlatformEndpoints {
+            api_base: "https://api.marc27.com/api/v1".to_string(),
+            node_ws: "wss://api.marc27.com/api/v1/nodes/connect".to_string(),
+        };
+        let (token, rotated) = resolve_node_token(&paths, &endpoints, &creds)
+            .await
+            .expect("fresh creds resolve without network");
+        assert_eq!(token, "fresh-untouched");
+        assert!(
+            rotated.is_none(),
+            "non-expired creds must NOT signal a rotation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
