@@ -1429,10 +1429,9 @@ async fn main() -> Result<()> {
                     .expires_at
                     .is_some_and(|exp| chrono::Utc::now() + chrono::Duration::minutes(5) >= exp)
             {
-                match refresh_access_token(&endpoints, creds).await {
+                match refresh_access_token(&paths, &endpoints, creds).await {
                     Ok(new_creds) => {
                         state.credentials = Some(new_creds);
-                        paths.save_cli_state(&state)?;
                         tracing::info!("access token refreshed proactively");
                     }
                     Err(e) => {
@@ -1456,11 +1455,10 @@ async fn main() -> Result<()> {
                 && let Some(creds) = state.credentials.as_ref()
                 && !creds.refresh_token.is_empty()
             {
-                match refresh_access_token(&endpoints, creds).await {
+                match refresh_access_token(&paths, &endpoints, creds).await {
                     Ok(new_creds) => {
                         tracing::info!("access token refreshed after server-side rejection");
                         state.credentials = Some(new_creds);
-                        paths.save_cli_state(&state)?;
                         // Redo the boot checks with the new token.
                         boot_checks =
                             boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints)
@@ -2414,8 +2412,19 @@ async fn main() -> Result<()> {
                 if !offline {
                     if let Some(ref creds) = cli_state.credentials {
                         daemon_org_id = creds.org_id.clone();
-                        let platform = PlatformClient::new(&endpoints.api_base)
-                            .with_token(&creds.access_token);
+
+                        // Resolve the platform token through the SAME priority
+                        // + refresh path the WS daemon uses
+                        // (daemon::load_access_token): durable node token →
+                        // MARC27_API_KEY → cli-state creds, refreshed when
+                        // expired. Previously this built the client straight
+                        // from `creds.access_token` with NO refresh, so once the
+                        // session token aged past 24h (and the SDK mirror held a
+                        // stale copy) `POST /nodes/register` 401'd and the node
+                        // silently fell back to offline mode while the platform
+                        // still listed it online.
+                        let token = resolve_node_token(&paths, &endpoints, creds).await?;
+                        let platform = PlatformClient::new(&endpoints.api_base).with_token(&token);
                         let registry =
                             prism_client::node_registry::NodeRegistryClient::new(&platform);
                         let caps = serde_json::json!({
@@ -2423,36 +2432,73 @@ async fn main() -> Result<()> {
                             "storage": !no_storage,
                             "dashboard_port": dashboard_port,
                         });
-                        match registry.register_node(&node_name, &caps).await {
-                            Ok(reg) => {
-                                // NOTE: the in-app node supervisor
-                                // (prism_agent::node_supervisor) parses this
-                                // line out of the daemon log to learn the
-                                // platform node id — keep the
-                                // "(node_id: …)" shape if rewording.
-                                println!(
-                                    "  \u{2713} Registered with platform (node_id: {})",
-                                    reg.node_id
+
+                        // register_node_inspect returns a typed ApiError
+                        // carrying the HTTP status + parsed `code`, so a stale
+                        // token (401 / token_expired) can be recovered with a
+                        // refresh + single retry instead of the opaque
+                        // "returned error status" that hid the cause.
+                        let reg = match registry.register_node_inspect(&node_name, &caps).await {
+                            Ok(reg) => reg,
+                            Err(api_err) if api_err.is_token_expired() => {
+                                tracing::info!(
+                                    "node register rejected with token_expired — refreshing and retrying once"
                                 );
-                                daemon_platform_node_id = Some(reg.node_id);
-                                server_node_state.platform_client = Some(platform.clone());
-                                daemon_platform_client = Some(platform);
+                                let refreshed = refresh_access_token(&paths, &endpoints, creds)
+                                    .await
+                                    .context(
+                                        "token expired and refresh failed — run `prism login` to re-authenticate",
+                                    )?;
+                                let platform = PlatformClient::new(&endpoints.api_base)
+                                    .with_token(&refreshed.access_token);
+                                let registry =
+                                    prism_client::node_registry::NodeRegistryClient::new(&platform);
+                                registry
+                                    .register_node_inspect(&node_name, &caps)
+                                    .await
+                                    .map_err(|e| {
+                                        anyhow!(
+                                            "platform registration failed after token refresh: {e}"
+                                        )
+                                    })?
                             }
                             Err(e) => {
-                                // {e:?} — print the full source chain, not just
-                                // the top-level context. The error is wrapped at
-                                // `node_registry.rs` with `.context("failed to
-                                // register node")`; `{e}` shows only that
-                                // context and hides the underlying HTTP/WS/parse
-                                // cause that determines the real fix.
-                                eprintln!("  Warning: Platform registration failed: {e:?}");
-                                eprintln!("  (Continuing in offline mode.)");
+                                // Fail LOUD: a non-offline `node up` that cannot
+                                // register leaves the node in a dangerous
+                                // half-state — the dashboard/mesh run, but the
+                                // node never receives broker-dispatched jobs, and
+                                // the platform may still list a stale record as
+                                // online. Fail with a clear message + non-zero
+                                // exit instead of silently dropping to "offline
+                                // mode". (Pass --offline to run without the
+                                // platform.)
+                                return Err(anyhow!(
+                                    "platform registration failed: {e}\n\
+                                     re-authenticate with `prism login`, or pass --offline \
+                                     to run without platform dispatch."
+                                ));
                             }
-                        }
-                    } else {
-                        eprintln!(
-                            "  Warning: No credentials — run `prism setup` first to register with platform."
+                        };
+
+                        // NOTE: the in-app node supervisor
+                        // (prism_agent::node_supervisor) parses this
+                        // line out of the daemon log to learn the
+                        // platform node id — keep the
+                        // "(node_id: …)" shape if rewording.
+                        println!(
+                            "  \u{2713} Registered with platform (node_id: {})",
+                            reg.node_id
                         );
+                        daemon_platform_node_id = Some(reg.node_id);
+                        server_node_state.platform_client = Some(platform.clone());
+                        daemon_platform_client = Some(platform);
+                    } else {
+                        // No creds + not --offline → fail LOUD with the remedy,
+                        // same rationale as the registration-error arm above.
+                        return Err(anyhow!(
+                            "not authenticated — run `prism login` (or `prism setup`), \
+                             set MARC27_API_KEY, or pass --offline to run without the platform"
+                        ));
                     }
                 }
 
@@ -3698,10 +3744,9 @@ async fn main() -> Result<()> {
                     .expires_at
                     .is_some_and(|exp| chrono::Utc::now() + chrono::Duration::minutes(5) >= exp)
             {
-                match refresh_access_token(&endpoints, creds).await {
+                match refresh_access_token(&paths, &endpoints, creds).await {
                     Ok(new_creds) => {
                         state.credentials = Some(new_creds);
-                        let _ = paths.save_cli_state(&state);
                         tracing::info!("access token refreshed proactively");
                     }
                     Err(e) => {
@@ -3717,11 +3762,10 @@ async fn main() -> Result<()> {
             if auth_rejected
                 && let Some(creds) = state.credentials.as_ref()
                 && !creds.refresh_token.is_empty()
-                && let Ok(new_creds) = refresh_access_token(&endpoints, creds).await
+                && let Ok(new_creds) = refresh_access_token(&paths, &endpoints, creds).await
             {
                 tracing::info!("access token refreshed after server-side rejection");
                 state.credentials = Some(new_creds);
-                let _ = paths.save_cli_state(&state);
                 boot_checks =
                     boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
@@ -3794,10 +3838,9 @@ async fn main() -> Result<()> {
                     .expires_at
                     .is_some_and(|exp| chrono::Utc::now() + chrono::Duration::minutes(5) >= exp)
             {
-                match refresh_access_token(&endpoints, creds).await {
+                match refresh_access_token(&paths, &endpoints, creds).await {
                     Ok(new_creds) => {
                         state.credentials = Some(new_creds);
-                        let _ = paths.save_cli_state(&state);
                         tracing::info!("access token refreshed proactively");
                     }
                     Err(e) => {
@@ -3813,11 +3856,10 @@ async fn main() -> Result<()> {
             if auth_rejected
                 && let Some(creds) = state.credentials.as_ref()
                 && !creds.refresh_token.is_empty()
-                && let Ok(new_creds) = refresh_access_token(&endpoints, creds).await
+                && let Ok(new_creds) = refresh_access_token(&paths, &endpoints, creds).await
             {
                 tracing::info!("access token refreshed after server-side rejection");
                 state.credentials = Some(new_creds);
-                let _ = paths.save_cli_state(&state);
                 boot_checks =
                     boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
             }
@@ -9146,6 +9188,7 @@ where
 }
 
 async fn refresh_access_token(
+    paths: &PrismPaths,
     endpoints: &PlatformEndpoints,
     creds: &StoredCredentials,
 ) -> Result<StoredCredentials> {
@@ -9161,17 +9204,54 @@ async fn refresh_access_token(
         chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
     });
 
-    // Mirror the rotated tokens to the SDK store (`~/.prism/credentials.json`)
-    // that the Python platform tools read. Every caller already re-saves
-    // `cli-state.json`, but the SDK mirror was left untouched on silent
-    // refresh — so after rotation it held a refresh token the server had
-    // REVOKED (single-use rotation). Replaying that stale token tripped the
-    // server's token-family invalidation and forced a device-flow re-login
-    // (the "re-login every ~24h" dance). Writing it here keeps both stores in
-    // lockstep on every refresh. Best-effort: a mirror hiccup never fails auth.
-    prism_runtime::PrismPaths::save_sdk_credentials(&new_creds);
+    // Persist rotated tokens to BOTH stores atomically: the authoritative
+    // `cli-state.json` AND the `~/.prism/credentials.json` SDK mirror that the
+    // Python platform tools read. Writing only one store left the other holding
+    // a refresh token that single-use rotation had since REVOKED — replaying the
+    // stale token tripped the server's token-family invalidation, forced a
+    // device-flow re-login (the "re-login every ~24h" drift), and (for the SDK
+    // mirror specifically) left node-up reading an expired access token that
+    // 401'd on `POST /nodes/register` and dropped to silent offline mode.
+    // `persist_credentials` is the single well-tested both-store writer.
+    paths.persist_credentials(&new_creds)?;
 
     Ok(new_creds)
+}
+
+/// Resolve the platform credential for the node-up register call, mirroring the
+/// priority order of `daemon::load_access_token` so the REST register path
+/// never sends an expired session token:
+///
+/// 1. durable node token (`prism node token mint`) — non-rotating, no expiry;
+/// 2. `MARC27_API_KEY` env — headless/agent path, no expiry;
+/// 3. cli-state creds, refreshed once if `expires_at` has passed.
+///
+/// Returns the token string to attach to the `PlatformClient`. The daemon's WS
+/// path already does all of this; this is the same logic for the REST register
+/// that precedes it, closing the gap that let a 24h-old token 401.
+async fn resolve_node_token(
+    paths: &PrismPaths,
+    endpoints: &PlatformEndpoints,
+    creds: &StoredCredentials,
+) -> Result<String> {
+    if let Some(node_token) = paths.load_node_token() {
+        tracing::debug!("using durable node token (does not rotate)");
+        return Ok(node_token.key);
+    }
+    if let Ok(key) = std::env::var("MARC27_API_KEY") {
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+    if let Some(expires_at) = creds.expires_at
+        && chrono::Utc::now() >= expires_at
+    {
+        tracing::info!("access token expired before node register, refreshing");
+        let refreshed = refresh_access_token(paths, endpoints, creds).await?;
+        return Ok(refreshed.access_token);
+    }
+    Ok(creds.access_token.clone())
 }
 
 // Old Ink/TypeScript TUI launcher removed — native Ratatui TUI is in crates/cli/src/tui/

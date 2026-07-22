@@ -108,8 +108,24 @@ impl<'a> NodeRegistryClient<'a> {
         capabilities: &serde_json::Value,
     ) -> Result<RegisteredNode> {
         debug!(%name, "registering node");
+        self.register_node_inspect(name, capabilities)
+            .await
+            .map_err(|e| anyhow!("failed to register node: {e}"))
+    }
+
+    /// Register a node, returning a typed [`crate::api::ApiError`] on failure so
+    /// callers can react to a stale-token `401` (`code: token_expired`) with a
+    /// refresh + retry instead of dropping to silent offline mode. The opaque
+    /// status-only error path hid the underlying 401 behind a generic context
+    /// string and made node registration undiagnosable.
+    pub async fn register_node_inspect(
+        &self,
+        name: &str,
+        capabilities: &serde_json::Value,
+    ) -> std::result::Result<RegisteredNode, crate::api::ApiError> {
+        debug!(%name, "registering node");
         self.platform
-            .post(
+            .post_inspect(
                 "/nodes/register",
                 &serde_json::json!({
                     "name": name,
@@ -117,7 +133,6 @@ impl<'a> NodeRegistryClient<'a> {
                 }),
             )
             .await
-            .context("failed to register node")
     }
 
     /// List registered nodes, optionally filtered by organisation.
