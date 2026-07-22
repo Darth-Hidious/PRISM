@@ -273,6 +273,23 @@ def build_full_registry(
     except Exception:
         logger.exception("CALPHAD tools registration failed")
 
+    # Informatics tools (E7-E11): similarity / descriptor / predict / pareto /
+    # active-learning. Free Citrine/Intellegens-equivalent stack.
+    try:
+        from app.tools.materials.informatics import create_informatics_tools
+
+        create_informatics_tools(registry)
+    except Exception:
+        logger.exception("informatics tools registration failed")
+
+    # Structure description + synthesizability heuristic (E12).
+    try:
+        from app.tools.materials.structure_desc import create_structure_desc_tools
+
+        create_structure_desc_tools(registry)
+    except Exception:
+        logger.exception("structure_desc tools registration failed")
+
     # Plugins (entry points + local — can register into ANY sub-registry)
     if enable_plugins:
         try:
