@@ -263,6 +263,16 @@ def build_full_registry(
     except Exception:
         logger.exception("phase_stability tool registration failed")
 
+    # CALPHAD phase-stability + Scheil solidification (E5+E6): the Thermo-Calc
+    # TCHEA-equilibrium + Scheil Calculator equivalents, via pycalphad + the
+    # bundled open steel TDB. Honest-degrade on py3.14 (no symengine wheel).
+    try:
+        from app.tools.materials.calculations import create_calphad_tools
+
+        create_calphad_tools(registry)
+    except Exception:
+        logger.exception("CALPHAD tools registration failed")
+
     # Plugins (entry points + local — can register into ANY sub-registry)
     if enable_plugins:
         try:
