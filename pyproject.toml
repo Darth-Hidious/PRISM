@@ -72,6 +72,12 @@ ml = [
     "matplotlib>=3.7.0",
     "pyarrow>=14.0.0",
     "joblib>=1.3.0",
+    # robocrystallographer: generates human-readable structure descriptions
+    # from crystallographic data (the describe_structure tool). pymatgen-
+    # ecosystem (hackingmaterials.lbl.gov). Not yet published for Python 3.14
+    # (no wheel); gate below 3.14 so it installs on 3.12/3.13 and the tool
+    # degrades honestly ("robocrystallographer not installed") on 3.14.
+    "robocrystallographer>=0.2.3; python_version<'3.14'",
 ]
 simulation = [
     # pyiron officially supports Python 3.9–3.14 as of pyiron_atomistics /
@@ -86,6 +92,10 @@ simulation = [
 calphad = [
     # pycalphad supports Python 3.9–3.14; same window as pyiron.
     "pycalphad>=0.10,<0.12; python_version<'3.15'",
+    # The `scheil` package: free Scheil solidification simulation built on
+    # pycalphad (the Thermo-Calc Scheil Calculator equivalent). Used by the
+    # scheil_solidification tool for non-equilibrium solidification paths.
+    "scheil>=0.2.0; python_version<'3.15'",
 ]
 mace = [
     # MACE foundation interatomic potentials (MACE-MP-0, MACE-MH-1).
