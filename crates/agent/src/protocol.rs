@@ -4873,6 +4873,7 @@ fn humanize_tool_verb(tool_name: &str, preview: Option<&str>) -> String {
         },
         "execute_python" => "Running Python code".to_string(),
         "recall" => "Recalling earlier results".to_string(),
+        "list_failures" => "Listing failed runs".to_string(),
         "find_tools" => "Finding tools".to_string(),
         _ => format!("Running {tool_name}"),
     }
@@ -7555,7 +7556,7 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                     // the rest stay discoverable via the find_tools meta-tool.
                     "model_tool_selection": {
                         "max_per_request": crate::tool_catalog::MAX_TOOLS_PER_REQUEST,
-                        "meta_tools": ["recall", "find_tools"],
+                        "meta_tools": ["recall", "find_tools", "list_failures"],
                     },
                 });
 

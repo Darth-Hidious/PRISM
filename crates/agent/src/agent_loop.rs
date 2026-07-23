@@ -313,6 +313,7 @@ fn tool_preview(tool_name: &str, args: &Value) -> Option<String> {
             .or_else(|| args.get("id"))
             .and_then(|value| value.as_str())
             .map(|what| format!("recall {what}")),
+        "list_failures" => Some("list failed runs".to_string()),
         "find_tools" => args
             .get("query")
             .and_then(|value| value.as_str())

@@ -464,17 +464,37 @@ impl ProvenanceStore {
         })
     }
 
-    /// Return the records of failed runs — VS3's direct "which runs failed?"
-    /// query. Filters on the structured `status` column (set by
+    /// Return the records of failed **tool** runs — VS3's direct "which tool
+    /// runs failed?" query. Filters on the structured `status` column (set by
     /// [`crate::hooks`] via `classify_for_provenance`), newest-first, bounded
     /// by `limit`. Optionally scoped to a `session_id` (None = across all
     /// sessions). Reuses [`row_to_record`] over the same 15-column `SELECT *`
     /// ordering that the other readers use.
+    ///
+    /// `limit` is CLAMPED to `FAILURE_QUERY_MAX_LIMIT` before it reaches SQL.
+    /// Without this, `limit as i64` wraps NEGATIVE for `limit > i64::MAX`, and
+    /// SQLite/Turso treats a negative `LIMIT n` as UNBOUNDED — so a hostile or
+    /// oversized caller input could dump the whole store. Any caller value
+    /// above the cap is silently truncated; callers wanting a smaller window
+    /// should pass a smaller `limit`.
+    ///
+    /// **VS3 scope limitation (flagged for owner):** this answers "which TOOL
+    /// runs failed", NOT "which runs failed" in full. A failed LLM call is
+    /// ABSENT from the ledger entirely — `agent_loop.rs` returns at the `?`
+    /// BEFORE the LLM-turn recorder runs, so no record is ever written for it.
+    /// (It is not `status=None`; it simply does not exist.) Extending VS3 to
+    /// record LLM-call failures requires writing BEFORE the `?` — a separate,
+    /// larger change deferred for now.
     pub async fn query_failures(
         &self,
         session_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ProvenanceRecord>> {
+        // Clamp BEFORE the `as i64` cast so the SQL `LIMIT` is always a sane,
+        // non-negative number. 1000 is far above any reasonable single-response
+        // window yet bounded enough to keep a runaway dump cheap.
+        const FAILURE_QUERY_MAX_LIMIT: usize = 1000;
+        let limit = limit.min(FAILURE_QUERY_MAX_LIMIT);
         let mut records = Vec::new();
         let mut rows = match session_id {
             Some(sid) => {
@@ -1131,5 +1151,28 @@ mod tests {
         }
         let top = store.query_failures(None, 2).await.unwrap();
         assert_eq!(top.len(), 2, "limit caps the result");
+    }
+
+    #[tokio::test]
+    async fn query_failures_clamps_oversized_limit() {
+        // SECURITY: a caller (meta-tool / HTTP input) can pass any usize. The
+        // store must clamp it before the `as i64` cast — otherwise a huge value
+        // wraps to a NEGATIVE i64 and SQLite/Turso reads a negative LIMIT as
+        // UNBOUNDED, dumping the whole store. Seed 1200 failures and request
+        // usize::MAX; the capped result must be exactly 1000, not 1200.
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        for i in 0..1200 {
+            let mut rec = outcome_record("s", "execute_python", Some("error"), Some(i));
+            rec.timestamp = format!("2026-01-{:04}T00:00:00+00:00", i);
+            store.record(&rec).await.unwrap();
+        }
+        let capped = store.query_failures(None, usize::MAX).await.unwrap();
+        assert_eq!(
+            capped.len(),
+            1000,
+            "oversized limit is clamped to 1000, never unbounded"
+        );
+        // A modest limit still works through the same clamp (it's a min()).
+        assert_eq!(store.query_failures(None, 5).await.unwrap().len(), 5);
     }
 }

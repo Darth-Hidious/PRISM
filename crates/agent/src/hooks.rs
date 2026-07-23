@@ -299,7 +299,13 @@ pub fn build_default_hooks() -> HookRegistry {
 /// The status string is the SAME signal the F1 is_error gate uses
 /// ([`crate::tool_result::tool_result_is_error`]); keeping it inline in the
 /// closure would let the record drift from the gate.
-fn classify_for_provenance(result: &Value) -> (Option<String>, Option<i64>) {
+///
+/// VS3: `pub(crate)` so the single-tool executor (`crate::service`) records the
+/// SAME outcome the provenance hook does, rather than re-deriving the
+/// success/error match inline (which would drift from this single source of
+/// truth). A hard dispatch `Err` is recorded as an error by the caller before
+/// calling this (this fn only classifies a produced `Value`).
+pub(crate) fn classify_for_provenance(result: &Value) -> (Option<String>, Option<i64>) {
     let status = if crate::tool_result::tool_result_is_error(result) {
         "error"
     } else {
@@ -734,6 +740,41 @@ mod tests {
     #[test]
     fn f5_classify_top_level_error_is_error() {
         let (status, exit) = classify_for_provenance(&json!({ "error": "unknown tool: frob" }));
+        assert_eq!(status.as_deref(), Some("error"));
+        assert_eq!(exit, None);
+    }
+
+    // ── VS3: the single-tool executor (`crate::service::invoke_tool`) now
+    // records status/exit_code by calling this same classifier on the record's
+    // output_json. These pin the EXACT shapes that path feeds in — a guard
+    // against drift, since the executor previously re-derived the match inline.
+
+    #[test]
+    fn f5_classify_service_wrapped_failure_is_error() {
+        // service.rs Ok arm when a Python tool failed: output_json is the
+        // tool_server-wrapped {"result": {"success":false, ...}}.
+        let (status, exit) = classify_for_provenance(&json!({
+            "result": { "success": false, "exit_code": -11, "stderr": "SIGSEGV" }
+        }));
+        assert_eq!(status.as_deref(), Some("error"));
+        assert_eq!(exit, Some(-11));
+    }
+
+    #[test]
+    fn f5_classify_service_wrapped_success_is_ok() {
+        let (status, exit) = classify_for_provenance(&json!({
+            "result": { "success": true, "exit_code": 0, "stdout": "ok" }
+        }));
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(exit, Some(0));
+    }
+
+    #[test]
+    fn f5_classify_service_dispatch_err_is_error() {
+        // service.rs Err arm: output_json is {"error": "<formatted err>"}.
+        // Must classify as error with no exit code (there was no process).
+        let (status, exit) =
+            classify_for_provenance(&json!({ "error": "tool dispatch failed: timeout" }));
         assert_eq!(status.as_deref(), Some("error"));
         assert_eq!(exit, None);
     }

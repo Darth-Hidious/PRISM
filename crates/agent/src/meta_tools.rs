@@ -28,6 +28,7 @@ const META_TOOLS: &[&str] = &[
     "run_skill",
     "list_skills",
     "spawn_subagent",
+    "list_failures",
 ];
 
 /// How many matches `recall(query)` returns by default.
@@ -92,6 +93,34 @@ pub fn definitions() -> Vec<LoadedTool> {
                     "limit": {
                         "type": "integer",
                         "description": "Max matches for a keyword search (default 5)."
+                    }
+                }
+            }),
+            requires_approval: false,
+            permission_mode: PermissionMode::ReadOnly,
+            source: Some("builtin".to_string()),
+            source_detail: Some("durable-memory".to_string()),
+        },
+        LoadedTool {
+            name: "list_failures".to_string(),
+            description: "List this session's FAILED tool runs from durable memory, newest \
+                first — the answer to 'which runs failed?'. Each entry carries the tool \
+                name, its exit_code, the recorded error, and a timestamp. Use this after \
+                a sequence of tool calls to see at a glance what broke (e.g. a code-exec \
+                that crashed with SIGSEGV) without re-running anything. Pass `session_id` \
+                to scope to another session; otherwise the current session is used. \
+                `limit` caps the list (default 10, max 1000)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional session to scope to (defaults to the current session)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max failures to return (default 10)."
                     }
                 }
             }),
@@ -215,6 +244,7 @@ pub async fn execute_meta_tool(
         "write_skill" => write_skill(args).await,
         "run_skill" => run_skill(args).await,
         "list_skills" => Ok(list_skills()),
+        "list_failures" => list_failures(args, store, session_id).await,
         // Needs the live turn machinery (LLM client, tool server, approval
         // channel), which this signature cannot carry — the agent loop
         // intercepts it BEFORE this dispatcher (see agent_loop.rs). Reaching
@@ -575,6 +605,77 @@ async fn recall_with_backend(
     }))
 }
 
+/// Default cap on how many failures `list_failures` returns at once. The store
+/// itself clamps to 1000 regardless (see `ProvenanceStore::query_failures`); a
+/// smaller default keeps the model-facing payload readable.
+const DEFAULT_FAILURES_LIMIT: usize = 10;
+
+/// VS3: the agent-callable "which runs failed?" query. Returns the session's
+/// (or another session's) failed tool runs, newest first, with the tool name,
+/// exit code, a one-line error, and a timestamp — enough to see what broke
+/// without re-running anything. Mirrors `recall`'s store-missing handling.
+async fn list_failures(
+    args: &Value,
+    store: Option<&ProvenanceStore>,
+    session_id: &str,
+) -> Result<Value> {
+    let Some(store) = store else {
+        return Ok(json!({ "error": "durable memory is unavailable in this session" }));
+    };
+
+    // Optional session scope (defaults to the current session), bounded limit.
+    let scope = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FAILURES_LIMIT);
+
+    let failures = store
+        .query_failures(scope.as_deref().or(Some(session_id)), limit)
+        .await?;
+
+    let count = failures.len();
+    let entries: Vec<Value> = failures
+        .into_iter()
+        .map(|rec| {
+            // Surface the recorded error line: prefer output_json.error, then
+            // output_json.stderr's last line, then nothing (the status itself
+            // is already 'error').
+            let out = rec.output_json.as_ref();
+            let error = out
+                .and_then(|o| o.get("error"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    out.and_then(|o| o.get("stderr"))
+                        .and_then(Value::as_str)
+                        .and_then(|s| s.lines().find(|l| !l.trim().is_empty()))
+                        .map(str::to_string)
+                });
+            json!({
+                "id": rec.id,
+                "tool_name": rec.tool_name,
+                "exit_code": rec.exit_code,
+                "error": error,
+                "timestamp": rec.timestamp,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "count": count,
+        "failures": entries,
+        "hint": "call recall with a returned id to see that run's full output",
+    }))
+}
+
 /// Echo a stored output back to the model, preserving JSON structure when it
 /// fits and clipping to a string when it would bloat the context.
 fn clip_value(v: Option<Value>) -> Value {
@@ -637,6 +738,7 @@ mod tests {
         assert!(is_meta_tool("recall"));
         assert!(is_meta_tool("find_tools"));
         assert!(is_meta_tool("spawn_subagent"));
+        assert!(is_meta_tool("list_failures"));
         assert!(!is_meta_tool("file"));
         assert!(!is_meta_tool("peek_result"));
     }
@@ -680,8 +782,9 @@ mod tests {
         let defs = definitions();
         let by = |name: &str| defs.iter().find(|t| t.name == name).expect(name).clone();
 
-        // Read-only, no-approval: memory + discovery, and listing skills.
-        for name in ["recall", "find_tools", "list_skills"] {
+        // Read-only, no-approval: memory + discovery, listing skills, and
+        // listing failures (a pure read over durable memory).
+        for name in ["recall", "find_tools", "list_skills", "list_failures"] {
             let t = by(name);
             assert_eq!(t.permission_mode, PermissionMode::ReadOnly, "{name}");
             assert!(!t.requires_approval, "{name} must not need approval");
@@ -930,6 +1033,118 @@ mod tests {
         assert_eq!(out["matches"][0]["tool_name"], json!("file"));
         // Keyword matches carry no semantic score.
         assert!(out["matches"][0]["score"].is_null());
+    }
+
+    /// Seed a store with a mix of outcomes so list_failures has something to
+    /// filter. Returns the store; failures are written into `sess-fail`.
+    async fn failures_seeded_store() -> ProvenanceStore {
+        let store = ProvenanceStore::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        // Two failures, distinct exit codes (1 + the JAX-MD SIGSEGV shape -11).
+        let mut f1 = new_record(
+            "sess-fail",
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some("execute_python"),
+            None,
+            json!({ "code": "raise ValueError('boom')" }),
+        );
+        f1.output_json =
+            Some(json!({ "success": false, "exit_code": 1, "stderr": "ValueError: boom" }));
+        f1.status = Some("error".to_string());
+        f1.exit_code = Some(1);
+        f1.timestamp = "2026-01-01T00:00:00+00:00".to_string();
+        let mut f2 = new_record(
+            "sess-fail",
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some("execute_python"),
+            None,
+            json!({ "code": "import jax_md" }),
+        );
+        f2.output_json = Some(json!({
+            "success": false, "exit_code": -11, "stderr": "SIGSEGV in native lib"
+        }));
+        f2.status = Some("error".to_string());
+        f2.exit_code = Some(-11);
+        f2.timestamp = "2026-01-02T00:00:00+00:00".to_string();
+        // A success and a status-less row that must NOT appear.
+        let mut ok = new_record(
+            "sess-fail",
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some("execute_bash"),
+            None,
+            json!({ "cmd": "echo hi" }),
+        );
+        ok.output_json = Some(json!({ "success": true, "exit_code": 0 }));
+        ok.status = Some("ok".to_string());
+        ok.exit_code = Some(0);
+        for rec in [f1, f2, ok] {
+            store.record(&rec).await.unwrap();
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn list_failures_returns_only_errors_newest_first() {
+        let store = failures_seeded_store().await;
+        let out = list_failures(&json!({}), Some(&store), "sess-fail")
+            .await
+            .unwrap();
+        assert_eq!(out["count"], json!(2));
+        let fails = out["failures"].as_array().unwrap();
+        // Newest-first: f2 (Jan 2, exit -11) before f1 (Jan 1, exit 1).
+        assert_eq!(fails[0]["exit_code"], json!(-11));
+        assert_eq!(fails[0]["error"].as_str(), Some("SIGSEGV in native lib"));
+        assert_eq!(fails[1]["exit_code"], json!(1));
+        assert_eq!(fails[1]["error"].as_str(), Some("ValueError: boom"));
+        // Every entry is a failure with a tool name + timestamp.
+        for e in fails {
+            assert_eq!(
+                e["status"],
+                json!(null),
+                "status not echoed per-entry (it's implicit)"
+            );
+            assert!(e["tool_name"].as_str().is_some());
+            assert!(e["timestamp"].as_str().is_some());
+            assert!(e["id"].as_str().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_failures_respects_limit() {
+        let store = failures_seeded_store().await;
+        let out = list_failures(&json!({ "limit": 1 }), Some(&store), "sess-fail")
+            .await
+            .unwrap();
+        assert_eq!(out["count"], json!(1), "limit caps the returned failures");
+    }
+
+    #[tokio::test]
+    async fn list_failures_without_store_is_graceful() {
+        // Mirrors recall's "durable memory unavailable" contract — never panic.
+        let out = list_failures(&json!({}), None, "sess-fail").await.unwrap();
+        assert!(out["error"].as_str().unwrap().contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn list_failures_dispatches_via_execute_meta_tool() {
+        // The registration/dispatch layer (what the agent loop calls), not just
+        // the handler. Proves the META_TOOLS + definitions + match-arm wiring.
+        let store = failures_seeded_store().await;
+        let catalog = ToolCatalog::from_tool_server_json(&json!({ "tools": [] }));
+        let out = execute_meta_tool(
+            "list_failures",
+            &json!({}),
+            Some(&store),
+            "sess-fail",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["count"], json!(2));
     }
 
     /// VS1 fix-round #1: a stored skill can pass write-time verification yet

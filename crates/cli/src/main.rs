@@ -128,6 +128,15 @@ enum Commands {
     },
     /// Show runtime paths, endpoints, and auth status.
     Status,
+    /// Inspect the local provenance ledger (verified run history).
+    /// VS3: surfaces `stats()` (ok/error/other counts) and `query_failures()`
+    /// to a HUMAN — the store was queryable by code but no one could actually
+    /// ask "which runs failed?" from the command line. All queries are local
+    /// (`~/.prism/provenance.db`); no network.
+    Provenance {
+        #[command(subcommand)]
+        command: ProvenanceCommands,
+    },
     /// List, show, and run YAML-defined workflows.
     Workflow {
         #[command(subcommand)]
@@ -605,6 +614,21 @@ enum WorkflowCommands {
         pairs: Vec<String>,
         #[arg(long)]
         execute: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProvenanceCommands {
+    /// Print aggregate counts: total records and the ok/error/other breakdown.
+    Stats,
+    /// List failed tool runs (status='error'), newest first.
+    Failures {
+        /// Optional session id to scope to (defaults to all sessions).
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Max failures to list (default 20; the store caps at 1000).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
 }
 
@@ -1528,6 +1552,9 @@ async fn main() -> Result<()> {
                     }
                 }))?
             );
+        }
+        Commands::Provenance { command } => {
+            handle_provenance_command(command).await?;
         }
         Commands::Workflow { command } => {
             handle_workflow_command(command, &project_root, &paths).await?;
@@ -8427,6 +8454,73 @@ async fn open_campaign_provenance() -> Option<prism_provenance::ProvenanceStore>
             None
         }
     }
+}
+
+/// VS3: a human-facing inspection of the local provenance ledger. `stats`
+/// prints the ok/error/other breakdown (the failure rate is otherwise
+/// invisible); `failures` lists the actual failed runs. Local-only: opens
+/// `~/.prism/provenance.db`, no network. If the store can't be opened we say so
+/// plainly and exit non-zero rather than printing an empty/in misleading result.
+async fn handle_provenance_command(command: ProvenanceCommands) -> anyhow::Result<()> {
+    let Some(store) = open_campaign_provenance().await else {
+        eprintln!("provenance store unavailable (could not open ~/.prism/provenance.db)");
+        anyhow::bail!("provenance store unavailable");
+    };
+    match command {
+        ProvenanceCommands::Stats => {
+            let s = store.stats().await?;
+            // Pretty JSON so it's both human-skimmable and machine-parsable.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "total_records": s.total_records,
+                    "ok_records": s.ok_records,
+                    "error_records": s.error_records,
+                    "other_records": s.other_records,
+                    "note": "error_records counts tool runs recorded as status='error'; \
+                             use `prism provenance failures` to list them"
+                }))?
+            );
+        }
+        ProvenanceCommands::Failures { session_id, limit } => {
+            let failures = store.query_failures(session_id.as_deref(), limit).await?;
+            let entries: Vec<serde_json::Value> = failures
+                .into_iter()
+                .map(|rec| {
+                    let error = rec
+                        .output_json
+                        .as_ref()
+                        .and_then(|o| o.get("error"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            rec.output_json
+                                .as_ref()
+                                .and_then(|o| o.get("stderr"))
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|s| s.lines().find(|l| !l.trim().is_empty()))
+                                .map(str::to_string)
+                        });
+                    serde_json::json!({
+                        "id": rec.id,
+                        "session_id": rec.session_id,
+                        "tool_name": rec.tool_name,
+                        "exit_code": rec.exit_code,
+                        "error": error,
+                        "timestamp": rec.timestamp,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "count": entries.len(),
+                    "failures": entries,
+                }))?
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Spawn the detached background worker that owns a campaign loop:
