@@ -358,6 +358,31 @@ impl ChatService {
                 Ok(value) => value.clone(),
                 Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
             });
+            // VS3: populate the structured status/exit_code columns (not just
+            // the tags) so this externally-invoked tool run is answerable by
+            // `query_failures` and counted in `stats().error_records`. A hard
+            // dispatch Err is unambiguously an error; on Ok we defer to the
+            // SAME shared classifier the agent-loop gate and the provenance
+            // hook use, so a wrapped `{"result":{"success":false,...}}` (the
+            // common Python-tool failure shape) is flagged here too.
+            let (status, exit_code) = match &result {
+                Ok(value) => {
+                    if crate::tool_result::tool_result_is_error(value) {
+                        (
+                            Some("error".to_string()),
+                            crate::tool_result::tool_exit_code(value),
+                        )
+                    } else {
+                        (
+                            Some("ok".to_string()),
+                            crate::tool_result::tool_exit_code(value),
+                        )
+                    }
+                }
+                Err(_) => (Some("error".to_string()), None),
+            };
+            record.status = status;
+            record.exit_code = exit_code;
             record.tags = vec![
                 "single-tool-executor".to_string(),
                 format!("caller:{}", caller.unwrap_or("unspecified")),

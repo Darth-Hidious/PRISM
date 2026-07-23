@@ -467,6 +467,8 @@ async fn recall_with_backend(
                 "tool_name": rec.tool_name,
                 "input": rec.input_json,
                 "output": clip_value(rec.output_json),
+                "status": rec.status,
+                "exit_code": rec.exit_code,
             }),
             None => json!({ "error": format!("no record with id '{id}'") }),
         });
@@ -516,6 +518,8 @@ async fn recall_with_backend(
                                     "id": rec.id,
                                     "tool_name": rec.tool_name,
                                     "preview": clip_str(&output_str, RECALL_PREVIEW_CHARS),
+                                    "status": rec.status,
+                                    "exit_code": rec.exit_code,
                                     "score": format!("{score:.3}"),
                                 }));
                             }
@@ -556,6 +560,8 @@ async fn recall_with_backend(
                 "id": rec.id,
                 "tool_name": rec.tool_name,
                 "preview": clip_str(&output_str, RECALL_PREVIEW_CHARS),
+                "status": rec.status,
+                "exit_code": rec.exit_code,
             }));
         }
     }
@@ -753,6 +759,68 @@ mod tests {
             .unwrap();
         assert_eq!(out["count"], json!(1));
         assert_eq!(out["matches"][0]["tool_name"], json!("file"));
+    }
+
+    #[tokio::test]
+    async fn recall_by_id_surfaces_failed_run_status_and_exit_code() {
+        // VS3: recall must hand the model the OUTCOME of a prior run, not just
+        // its output text — otherwise "last time this failed with exit -11" is
+        // invisible. Seed a failed execute_python run and look it up by id.
+        let store = ProvenanceStore::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut failed = new_record(
+            "sess-fail",
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some("execute_python"),
+            None,
+            json!({ "code": "import jax_md" }),
+        );
+        failed.output_json = Some(json!({
+            "success": false, "exit_code": -11, "stderr": "SIGSEGV"
+        }));
+        failed.status = Some("error".to_string());
+        failed.exit_code = Some(-11);
+        store.record(&failed).await.unwrap();
+
+        let out = recall(
+            &json!({ "id": failed.id.clone() }),
+            Some(&store),
+            "sess-fail",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["status"], json!("error"));
+        assert_eq!(out["exit_code"], json!(-11));
+    }
+
+    #[tokio::test]
+    async fn recall_by_query_surfaces_status_in_match_list() {
+        // The keyword-pass match objects (and semantic, same shape) must also
+        // carry status/exit_code so the model sees outcome in a results list.
+        let store = ProvenanceStore::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut failed = new_record(
+            "sess-fail",
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some("execute_python"),
+            None,
+            json!({ "code": "raise ValueError('boom')" }),
+        );
+        failed.output_json = Some(json!({ "success": false, "exit_code": 1, "stderr": "boom" }));
+        failed.status = Some("error".to_string());
+        failed.exit_code = Some(1);
+        store.record(&failed).await.unwrap();
+
+        let out = recall(&json!({ "query": "boom" }), Some(&store), "sess-fail")
+            .await
+            .unwrap();
+        assert_eq!(out["count"], json!(1));
+        assert_eq!(out["matches"][0]["status"], json!("error"));
+        assert_eq!(out["matches"][0]["exit_code"], json!(1));
     }
 
     #[tokio::test]

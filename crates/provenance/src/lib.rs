@@ -423,28 +423,98 @@ impl ProvenanceStore {
         Ok(scored)
     }
 
+    /// Aggregate counts over the store, broken out by outcome.
+    ///
+    /// VS3: the whole point of the structured `status` field is that "which
+    /// runs failed" is a queryable question. `stats()` previously returned
+    /// only a flat `total_records`, so the failure rate was invisible. Now it
+    /// groups by `status` into the three buckets the record knows:
+    /// `"ok"`, `"error"`, and everything else (legacy rows or non-tool records
+    /// where the notion does not apply — `LlmCall`/`Ingest`/...). `total_records`
+    /// is preserved (== ok + error + other) so existing callers are unaffected.
     pub async fn stats(&self) -> Result<ProvenanceStats> {
+        let mut ok = 0usize;
+        let mut error = 0usize;
+        let mut other = 0usize;
         let mut rows = self
             .conn
-            .query("SELECT COUNT(*) FROM provenance_records", ())
+            .query(
+                "SELECT COALESCE(status, '') AS s, COUNT(*) FROM provenance_records GROUP BY s",
+                (),
+            )
             .await?;
-        let total = if let Some(row) = rows.next().await? {
-            row.get_value(0)
+        while let Some(row) = rows.next().await? {
+            let bucket = get_str(&row, 0)?;
+            let count = row
+                .get_value(1)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as usize
-        } else {
-            0
-        };
+                .unwrap_or(0) as usize;
+            match bucket.as_str() {
+                "ok" => ok += count,
+                "error" => error += count,
+                _ => other += count,
+            }
+        }
         Ok(ProvenanceStats {
-            total_records: total,
+            total_records: ok + error + other,
+            ok_records: ok,
+            error_records: error,
+            other_records: other,
         })
+    }
+
+    /// Return the records of failed runs — VS3's direct "which runs failed?"
+    /// query. Filters on the structured `status` column (set by
+    /// [`crate::hooks`] via `classify_for_provenance`), newest-first, bounded
+    /// by `limit`. Optionally scoped to a `session_id` (None = across all
+    /// sessions). Reuses [`row_to_record`] over the same 15-column `SELECT *`
+    /// ordering that the other readers use.
+    pub async fn query_failures(
+        &self,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ProvenanceRecord>> {
+        let mut records = Vec::new();
+        let mut rows = match session_id {
+            Some(sid) => {
+                self.conn
+                    .query(
+                        "SELECT * FROM provenance_records \
+                         WHERE status = 'error' AND session_id = ?1 \
+                         ORDER BY timestamp DESC LIMIT ?2",
+                        [Value::Text(sid.to_string()), Value::Integer(limit as i64)],
+                    )
+                    .await?
+            }
+            None => {
+                self.conn
+                    .query(
+                        "SELECT * FROM provenance_records WHERE status = 'error' \
+                         ORDER BY timestamp DESC LIMIT ?1",
+                        [Value::Integer(limit as i64)],
+                    )
+                    .await?
+            }
+        };
+        while let Some(row) = rows.next().await? {
+            records.push(row_to_record(&row)?);
+        }
+        Ok(records)
     }
 }
 
 #[derive(Debug, Serialize)]
 pub struct ProvenanceStats {
     pub total_records: usize,
+    /// VS3: rows whose structured `status` is `"ok"`.
+    pub ok_records: usize,
+    /// VS3: rows whose structured `status` is `"error"` — the answer to
+    /// "which runs failed". This is what `query_failures` enumerates.
+    pub error_records: usize,
+    /// Rows with no `status` (legacy, or non-tool records like `LlmCall`/`Ingest`
+    /// where pass/fail does not apply). `total == ok + error + other`.
+    pub other_records: usize,
 }
 
 fn get_str(row: &turso::Row, idx: usize) -> Result<String> {
@@ -901,5 +971,165 @@ mod tests {
         );
         store.record(&rec).await.unwrap();
         assert_eq!(store.query_by_session("sess-fresh").await.unwrap().len(), 1);
+    }
+
+    // ── VS3: queryable failures + outcome-aware stats ──────────────────
+
+    /// Helper: a tool-call record with an explicit outcome.
+    fn outcome_record(
+        session: &str,
+        tool: &str,
+        status: Option<&str>,
+        exit_code: Option<i64>,
+    ) -> ProvenanceRecord {
+        let mut rec = new_record(
+            session,
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some(tool),
+            None,
+            serde_json::json!({}),
+        );
+        rec.status = status.map(str::to_string);
+        rec.exit_code = exit_code;
+        rec
+    }
+
+    #[tokio::test]
+    async fn stats_counts_ok_error_and_unknown() {
+        // VS3: stats() must answer the failure-rate question, not just a flat
+        // total. 1 ok + 2 error + 1 status-less -> the three buckets.
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        store
+            .record(&outcome_record("s", "execute_bash", Some("ok"), Some(0)))
+            .await
+            .unwrap();
+        store
+            .record(&outcome_record(
+                "s",
+                "execute_python",
+                Some("error"),
+                Some(1),
+            ))
+            .await
+            .unwrap();
+        store
+            .record(&outcome_record(
+                "s",
+                "execute_python",
+                Some("error"),
+                Some(-11),
+            ))
+            .await
+            .unwrap();
+        // A legacy / non-tool row: no status.
+        let legacy = new_record(
+            "s",
+            ActionType::LlmCall,
+            Actor::Agent,
+            None,
+            None,
+            serde_json::json!({"prompt": "hi"}),
+        );
+        store.record(&legacy).await.unwrap();
+
+        let s = store.stats().await.unwrap();
+        assert_eq!(s.total_records, 4);
+        assert_eq!(s.ok_records, 1, "ok bucket");
+        assert_eq!(
+            s.error_records, 2,
+            "error bucket — the 'which runs failed' count"
+        );
+        assert_eq!(s.other_records, 1, "status-less rows land in other");
+        // Invariant: the buckets partition the total.
+        assert_eq!(
+            s.ok_records + s.error_records + s.other_records,
+            s.total_records
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_empty_store_is_all_zeros() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let s = store.stats().await.unwrap();
+        assert_eq!(s.total_records, 0);
+        assert_eq!(s.ok_records, 0);
+        assert_eq!(s.error_records, 0);
+        assert_eq!(s.other_records, 0);
+    }
+
+    #[tokio::test]
+    async fn query_failures_returns_only_errors_ordered_desc() {
+        // The direct "which runs failed?" query: only status='error' rows, and
+        // newest first so the most recent failure (the one to debug) leads.
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        // newest-first is by timestamp; give each an explicit, increasing ts.
+        let mut first = outcome_record("s", "execute_python", Some("error"), Some(1));
+        first.timestamp = "2026-01-01T00:00:00+00:00".to_string();
+        let mut ok = outcome_record("s", "execute_bash", Some("ok"), Some(0));
+        ok.timestamp = "2026-01-02T00:00:00+00:00".to_string();
+        let mut second = outcome_record("s", "execute_python", Some("error"), Some(-11));
+        second.timestamp = "2026-01-03T00:00:00+00:00".to_string();
+        for rec in [&first, &ok, &second] {
+            store.record(rec).await.unwrap();
+        }
+
+        let failures = store.query_failures(None, 100).await.unwrap();
+        assert_eq!(failures.len(), 2, "only the two error rows return");
+        assert!(
+            failures
+                .iter()
+                .all(|r| r.status.as_deref() == Some("error"))
+        );
+        // Descending by timestamp -> second (Jan 3) before first (Jan 1).
+        assert_eq!(failures[0].tool_name.as_deref(), Some("execute_python"));
+        assert_eq!(failures[0].exit_code, Some(-11));
+        assert_eq!(failures[1].exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn query_failures_scoped_to_session() {
+        // Scoped query must not leak another session's failures.
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        store
+            .record(&outcome_record(
+                "session-a",
+                "execute_python",
+                Some("error"),
+                Some(1),
+            ))
+            .await
+            .unwrap();
+        store
+            .record(&outcome_record(
+                "session-b",
+                "execute_python",
+                Some("error"),
+                Some(2),
+            ))
+            .await
+            .unwrap();
+
+        let a = store.query_failures(Some("session-a"), 100).await.unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].session_id, "session-a");
+        assert_eq!(a[0].exit_code, Some(1));
+
+        let all = store.query_failures(None, 100).await.unwrap();
+        assert_eq!(all.len(), 2, "None spans every session");
+    }
+
+    #[tokio::test]
+    async fn query_failures_respects_limit() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        for i in 0..5 {
+            let mut rec = outcome_record("s", "execute_python", Some("error"), Some(i));
+            // Distinct timestamps so ordering is deterministic; DESC keeps the
+            // last-written (latest ts) when limited to 2.
+            rec.timestamp = format!("2026-01-0{}T00:00:00+00:00", i + 1);
+            store.record(&rec).await.unwrap();
+        }
+        let top = store.query_failures(None, 2).await.unwrap();
+        assert_eq!(top.len(), 2, "limit caps the result");
     }
 }
