@@ -119,12 +119,21 @@ pub fn canonical_key(name: &str) -> String {
         .to_lowercase()
 }
 
-/// Label-qualified entity key ("{label}:{canonical name}"). Qualifying by
-/// label keeps one node per (label, name) — the same name extracted as e.g.
-/// both a Phase and a Matter stays two nodes instead of one label-churning
-/// row (mirrors core, which keeps a node per label).
-fn entity_key(label: &str, name: &str) -> String {
-    format!("{label}:{}", canonical_key(name))
+/// Tenant- and label-qualified entity key
+/// ("{tenant}|{label}:{canonical name}").
+///
+/// Qualifying by label keeps one node per (label, name) — the same name
+/// extracted as e.g. both a Phase and a Matter stays two nodes instead of
+/// one label-churning row (mirrors core, which keeps a node per label).
+///
+/// Qualifying by TENANT is what keeps tenants from destroying each other.
+/// Every read filters `WHERE tenant = ?`, and `upsert_entity` merges on
+/// this key, so a tenant-blind key meant whichever tenant wrote last owned
+/// the row and the other one's entity silently disappeared from its own
+/// view. `upsert_edge` has always qualified its id by tenant; entities
+/// were the outlier.
+fn entity_key(tenant: &str, label: &str, name: &str) -> String {
+    format!("{tenant}|{label}:{}", canonical_key(name))
 }
 
 /// Stable assertion id: SHA-256 of `canonical(subject)|predicate|canonical(object)`,
@@ -286,6 +295,49 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     )
     .await?;
 
+    migrate_keys_to_tenant_qualified(conn).await?;
+
+    Ok(())
+}
+
+/// Rewrite pre-existing `{label}:{name}` keys to `{tenant}|{label}:{name}`.
+///
+/// Entity keys used to omit the tenant, which let one tenant's write take
+/// ownership of another's row. Now that the tenant is part of the key, a
+/// legacy database would keep its old rows under the old keys: the next
+/// re-ingest would write a SECOND row for the same entity, and edges would
+/// split across the two key spaces. Rewriting them keeps one row per
+/// (tenant, label, name) across the change.
+///
+/// Idempotent: keys already containing `|` are left alone, so reopening a
+/// migrated database is a no-op. Rows whose tenant is NULL/empty are also
+/// left alone — there is no tenant to qualify them with, and inventing one
+/// would be a worse guess than leaving them where the old readers expect.
+async fn migrate_keys_to_tenant_qualified(conn: &turso::Connection) -> Result<()> {
+    // `instr(key, '|') = 0` ⇒ not yet qualified. Entities and vectors
+    // first, then the edge endpoints that reference them.
+    for sql in [
+        "UPDATE emmo_entity SET key = tenant || '|' || key
+           WHERE instr(key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+        "UPDATE emmo_embedding SET key = tenant || '|' || key
+           WHERE instr(key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+        "UPDATE emmo_edge SET source_key = tenant || '|' || source_key
+           WHERE instr(source_key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+        "UPDATE emmo_edge SET target_key = tenant || '|' || target_key
+           WHERE instr(target_key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+        // `emmo_edge.id` is derived from (tenant, source_key, rel_type,
+        // target_key), so rewriting the endpoints invalidates it — the
+        // next `upsert_edge` would compute a different id and insert a
+        // duplicate. Recompute it from its components, which is exactly
+        // what `upsert_edge` does and is therefore idempotent.
+        "UPDATE emmo_edge
+            SET id = tenant || '|' || source_key || '|' || rel_type || '|' || target_key
+          WHERE tenant IS NOT NULL AND tenant <> ''",
+    ] {
+        conn.execute(sql, ())
+            .await
+            .map_err(|e| anyhow::anyhow!(e).context("tenant-qualified key migration failed"))?;
+    }
     Ok(())
 }
 
@@ -305,7 +357,11 @@ impl ProvenanceStore {
         tenant: &str,
         props_json: Option<String>,
     ) -> Result<String> {
-        let key = entity_key(label, name);
+        let key = entity_key(tenant, label, name);
+        // `tenant` is deliberately NOT in the DO UPDATE set: the key now
+        // carries it, so a conflict can only ever be the same tenant
+        // re-ingesting. Reassigning it here is what let one tenant take
+        // ownership of another's row.
         self.conn
             .execute(
                 r#"INSERT INTO emmo_entity
@@ -315,7 +371,6 @@ impl ProvenanceStore {
                        name = excluded.name,
                        label = excluded.label,
                        entity_type = excluded.entity_type,
-                       tenant = excluded.tenant,
                        props_json = COALESCE(excluded.props_json, emmo_entity.props_json)"#,
                 [
                     Value::Text(key.clone()),
@@ -1326,7 +1381,7 @@ mod tests {
         assert_eq!(
             count(
                 &store,
-                "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Matter:alpha'"
+                "SELECT COUNT(*) FROM emmo_entity WHERE key = 't1|Matter:alpha'"
             )
             .await,
             1
@@ -1334,7 +1389,7 @@ mod tests {
         assert_eq!(
             count(
                 &store,
-                "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Phase:alpha'"
+                "SELECT COUNT(*) FROM emmo_entity WHERE key = 't1|Phase:alpha'"
             )
             .await,
             1
@@ -1373,7 +1428,7 @@ mod tests {
         assert_eq!(
             count(
                 &store,
-                "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Element:nb'"
+                "SELECT COUNT(*) FROM emmo_entity WHERE key = 't1|Element:nb'"
             )
             .await,
             1
@@ -1656,7 +1711,11 @@ mod tests {
             .unwrap();
 
         store
-            .store_entity_embedding(&entity_key("Matter", "Ti-6Al-4V"), "t1", &[1.0, 0.0, 0.0])
+            .store_entity_embedding(
+                &entity_key("t1", "Matter", "Ti-6Al-4V"),
+                "t1",
+                &[1.0, 0.0, 0.0],
+            )
             .await
             .unwrap();
 
@@ -1674,5 +1733,189 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "Ti-6Al-4V");
+    }
+
+    // ── Tenant isolation ───────────────────────────────────────────────
+
+    /// `crates/mesh/src/sync.rs` writes every peer-supplied entity under
+    /// the `"mesh"` tenant precisely "so peer-synced data never blends
+    /// with locally [ingested data]". A mesh peer chooses the entity
+    /// `name` verbatim, so if the entity primary key is not
+    /// tenant-qualified, naming an entity the user already has hands the
+    /// peer that row: the ON CONFLICT branch reassigns `tenant`, and
+    /// every local read filters `WHERE tenant = 'local'`, so the user's
+    /// own knowledge silently disappears.
+    #[tokio::test]
+    async fn peer_tenant_cannot_capture_a_local_entity() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        // The user ingests a paper locally.
+        let mut local = test_prov();
+        local.tenant = "local".into();
+        store
+            .write_fact(
+                &fact("phase", "Ti-6Al-4V", "has_phase", "alpha-beta"),
+                &local,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .graph_search("Ti-6Al-4V", "local", 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|n| n.name == "Ti-6Al-4V"),
+            "precondition: the local entity must exist before the peer syncs"
+        );
+
+        // A subscribed mesh peer returns a dataset row whose `name` is
+        // the same material, spelled its way. This is peer-controlled
+        // input: sync.rs takes `row["name"]` straight off the wire.
+        let mut mesh = test_prov();
+        mesh.tenant = "mesh".into();
+        store
+            .write_fact(
+                &LocalFact {
+                    subject: "TI-6AL-4V".into(),
+                    predicate: "SYNCED_FROM".into(),
+                    object: "peer-dataset".into(),
+                    value: None,
+                    unit: None,
+                    confidence: None,
+                    kind: None,
+                },
+                &mesh,
+            )
+            .await
+            .unwrap();
+
+        // The user's own entity must still be theirs.
+        let local_hits = store.graph_search("Ti-6Al-4V", "local", 10).await.unwrap();
+        assert!(
+            local_hits.iter().any(|n| n.name == "Ti-6Al-4V"),
+            "a mesh peer captured the local tenant's entity — the user's own \
+             ingested knowledge vanished from every `tenant = 'local'` read"
+        );
+    }
+
+    /// A database written before entity keys carried the tenant must be
+    /// rewritten on open, or the next re-ingest writes a SECOND row for
+    /// the same entity and edges split across two key spaces.
+    #[tokio::test]
+    async fn legacy_unqualified_keys_migrate_on_open() {
+        let db = TempDb::new();
+        {
+            let store = ProvenanceStore::open(&db.path).await.unwrap();
+            let mut prov = test_prov();
+            prov.tenant = "local".into();
+            store
+                .write_fact(
+                    &fact("phase", "Ti-6Al-4V", "has_phase", "alpha-beta"),
+                    &prov,
+                )
+                .await
+                .unwrap();
+            // Rewind to the pre-fix on-disk shape.
+            for sql in [
+                "UPDATE emmo_entity SET key = replace(key, 'local|', '')",
+                "UPDATE emmo_edge SET source_key = replace(source_key, 'local|', ''),
+                     target_key = replace(target_key, 'local|', ''),
+                     id = tenant || '|' || replace(source_key, 'local|', '') || '|'
+                          || rel_type || '|' || replace(target_key, 'local|', '')",
+            ] {
+                store.conn.execute(sql, ()).await.unwrap();
+            }
+            assert_eq!(
+                count(
+                    &store,
+                    "SELECT COUNT(*) FROM emmo_entity WHERE instr(key, '|') = 0",
+                )
+                .await,
+                2,
+                "precondition: the legacy shape must have unqualified keys"
+            );
+        }
+
+        // Reopening runs init_schema, which must migrate.
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE instr(key, '|') = 0",
+            )
+            .await,
+            0,
+            "legacy entity keys were not tenant-qualified on open"
+        );
+
+        // Re-ingesting the same fact must merge, not duplicate.
+        let mut prov = test_prov();
+        prov.tenant = "local".into();
+        store
+            .write_fact(
+                &fact("phase", "Ti-6Al-4V", "has_phase", "alpha-beta"),
+                &prov,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM emmo_entity").await,
+            2,
+            "re-ingest duplicated entities across the key-format change"
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM emmo_edge").await,
+            1,
+            "re-ingest duplicated the edge across the key-format change"
+        );
+    }
+
+    /// The same name under two tenants must be two rows, each keeping its
+    /// own owner. `emmo_embedding` is keyed by the entity key, so once the
+    /// entity key separates, entity vectors separate with it.
+    #[tokio::test]
+    async fn same_name_under_two_tenants_stays_two_owned_rows() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        let mut local = test_prov();
+        local.tenant = "local".into();
+        store
+            .write_fact(
+                &fact("phase", "Ti-6Al-4V", "has_phase", "alpha-beta"),
+                &local,
+            )
+            .await
+            .unwrap();
+        let mut mesh = test_prov();
+        mesh.tenant = "mesh".into();
+        store
+            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "beta"), &mesh)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE label = 'Matter' \
+                 AND tenant = 'local'",
+            )
+            .await,
+            1,
+            "the local tenant lost its Matter row to the peer"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE label = 'Matter' \
+                 AND tenant = 'mesh'",
+            )
+            .await,
+            1,
+            "the peer tenant has no Matter row of its own"
+        );
     }
 }
