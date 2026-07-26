@@ -409,6 +409,87 @@ class TestCompositionFeatureCorrectness:
         assert bid.startswith(get_feature_backend() + "/")
 
 
+class TestElasticPhysics:
+    """The one place under app/tools that implements physics itself rather
+    than delegating: Voigt-Reuss-Hill averaging of a stiffness tensor.
+    Verified against published single-crystal elastic constants."""
+
+    @staticmethod
+    def _cubic(c11, c12, c44):
+        C = np.zeros((6, 6))
+        C[0, 0] = C[1, 1] = C[2, 2] = c11
+        C[0, 1] = C[1, 0] = C[0, 2] = C[2, 0] = C[1, 2] = C[2, 1] = c12
+        C[3, 3] = C[4, 4] = C[5, 5] = c44
+        return C
+
+    @pytest.mark.parametrize(
+        "name,c11,c12,c44,lit_K,lit_G,lit_E,lit_nu",
+        [
+            # Single-crystal C_ij (Simmons & Wang) -> polycrystalline handbook
+            # values. 3% covers the spread between reported measurements.
+            ("Al", 107.3, 60.9, 28.3, 76.0, 26.0, 70.0, 0.35),
+            ("Cu", 168.4, 121.4, 75.4, 137.0, 48.0, 130.0, 0.34),
+            ("W", 522.4, 204.4, 160.8, 310.0, 161.0, 411.0, 0.28),
+        ],
+    )
+    def test_matches_published_moduli(self, name, c11, c12, c44,
+                                      lit_K, lit_G, lit_E, lit_nu):
+        from app.tools.simulation.mace.core.elastic import voigt_reuss_hill
+
+        K, G, E, nu, _ = voigt_reuss_hill(self._cubic(c11, c12, c44))
+        assert K == pytest.approx(lit_K, rel=0.03), f"{name} bulk modulus"
+        assert G == pytest.approx(lit_G, rel=0.03), f"{name} shear modulus"
+        assert E == pytest.approx(lit_E, rel=0.03), f"{name} Young's modulus"
+        assert nu == pytest.approx(lit_nu, abs=0.02), f"{name} Poisson ratio"
+
+    def test_isotropic_input_round_trips_exactly(self):
+        """For an isotropic C the Voigt and Reuss bounds coincide, so VRH must
+        return the K and G that built it — a units or factor error anywhere in
+        the averaging breaks this."""
+        from app.tools.simulation.mace.core.elastic import voigt_reuss_hill
+
+        K0, G0 = 100.0, 40.0
+        lam = K0 - 2 * G0 / 3
+        C = np.zeros((6, 6))
+        for i in range(3):
+            for j in range(3):
+                C[i, j] = lam + (2 * G0 if i == j else 0)
+        for i in range(3, 6):
+            C[i, i] = G0
+        K, G, E, nu, _ = voigt_reuss_hill(C)
+        assert K == pytest.approx(K0, rel=1e-12)
+        assert G == pytest.approx(G0, rel=1e-12)
+        assert E == pytest.approx(9 * K0 * G0 / (3 * K0 + G0), rel=1e-12)
+        assert nu == pytest.approx((3 * K0 - 2 * G0) / (2 * (3 * K0 + G0)), rel=1e-12)
+
+    def test_stress_unit_constant(self):
+        from app.tools.simulation.mace.core.elastic import EV_PER_A3_TO_GPA
+
+        # 1 eV/A^3 = e[C] / 1e-30 m^3 -> Pa, /1e9 -> GPa, with the SI-2019
+        # exact elementary charge.
+        exact = 1.602176634e-19 / 1e-30 / 1e9
+        assert EV_PER_A3_TO_GPA == pytest.approx(exact, rel=1e-8)
+
+    def test_failed_averaging_is_indeterminate_not_brittle(self):
+        """NaN < 0.57 is False, so a singular stiffness tensor used to come
+        back as a confident 'brittle' that also failed the AM
+        manufacturability gate. Neither claim had anything behind it."""
+        from app.tools.simulation.mace.core.elastic import summarize_elastic
+
+        r = summarize_elastic(np.zeros((6, 6)))
+        assert r.pugh_verdict == "indeterminate"
+        assert r.am_manufacturability_passed is None
+        assert "error" in r.extras
+
+    def test_real_tensor_still_gets_a_verdict(self):
+        from app.tools.simulation.mace.core.elastic import summarize_elastic
+
+        r = summarize_elastic(self._cubic(107.3, 60.9, 28.3))  # Al
+        assert r.pugh_verdict == "ductile"  # G/B ~ 0.34 < 0.57
+        assert r.am_manufacturability_passed is True
+        assert "error" not in r.extras
+
+
 class TestSelectionHonesty:
     def _store(self, monkeypatch):
         import pandas as pd
