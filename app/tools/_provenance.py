@@ -107,6 +107,28 @@ def file_ref(path: str | Path | None, role: str) -> dict[str, Any]:
     return ref
 
 
+def json_safe(o: Any) -> Any:
+    """Coerce a value into something ``json.dumps`` accepts.
+
+    A bundle that cannot be serialised is a bundle that never reaches the
+    agent or the disk, so one numpy scalar in a caller's parameters must not
+    cost the whole record. Same intent as ``mace/ids.py::_json_default``,
+    but total instead of raising — provenance degrades to a description of
+    the value rather than disappearing.
+    """
+    if o is None or isinstance(o, (bool, int, float, str)):
+        return o
+    if isinstance(o, dict):
+        return {str(k): json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple, set, frozenset)):
+        return [json_safe(v) for v in o]
+    if hasattr(o, "tolist"):  # numpy array / scalar
+        return json_safe(o.tolist())
+    if hasattr(o, "isoformat"):  # datetime
+        return o.isoformat()
+    return f"<{type(o).__name__}: {o}"[:200] + ">"
+
+
 def build(
     *,
     tool_name: str,
@@ -137,7 +159,7 @@ def build(
         "schema_version": PROVENANCE_SCHEMA_VERSION,
         "tool_name": tool_name,
         "created_at_iso8601": utc_now_iso(),
-        "input": inputs,
+        "input": json_safe(inputs),
         "units": units,
         "units_policy": UNITS_POLICY,
         "versions": versions,
@@ -147,7 +169,7 @@ def build(
             "engine": engine,
             "engine_version": engine_version,
         },
-        "wasDerivedFrom": list(derived_from),
+        "wasDerivedFrom": json_safe(list(derived_from)),
         "wasAttributedTo": {
             "agent": "PRISM",
             "agent_type": "SoftwareAgent",

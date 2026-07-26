@@ -23,17 +23,39 @@ from ..logging_cfg import get_logger
 
 log = get_logger("mace_mcp.provenance")
 
-#: MACE reports energies in eV and forces in eV/Angstrom (ase conventions);
-#: PRISM converts nothing (see prov_common.UNITS_POLICY).
-MACE_UNITS = {
-    "energy": "eV",
-    "energy_per_atom": "eV/atom",
-    "forces": "eV/Angstrom",
-    "stress": "eV/Angstrom^3",
-    "lattice": "Angstrom",
-    "temperature": "K",
-    "frequencies": "THz",
-}
+#: MACE result fields carry their unit in the field NAME (schemas.py:
+#: ``energy_per_atom_eV``, ``fmax_final_eV_per_A``, ``C_GPa``, ``mean_T_K``,
+#: ``phonon_dos_omega_THz``, ``rdf_r_A``). This table decodes those suffixes
+#: so `units` describes the keys a result actually has. A static map of
+#: invented key names would have looked authoritative while saying nothing
+#: about any number present.
+_UNIT_SUFFIXES: tuple[tuple[str, str], ...] = (
+    ("_eV_per_atom", "eV/atom"),
+    ("_eV_per_A", "eV/Angstrom"),
+    ("_per_atom_eV", "eV/atom"),
+    ("_GPa", "GPa"),
+    ("_THz", "THz"),
+    ("_A3", "Angstrom^3"),
+    ("_eV", "eV"),
+    ("_K", "K"),
+    ("_A", "Angstrom"),
+    ("_s", "s"),
+)
+
+
+def units_for(result_summary: dict[str, Any]) -> dict[str, str]:
+    """Unit per key of an actual MACE result, decoded from its field name."""
+    out: dict[str, str] = {}
+    for key in result_summary:
+        for suffix, unit in _UNIT_SUFFIXES:
+            if key.endswith(suffix):
+                out[key] = unit
+                break
+        else:
+            # Dimensionless (rdf_g, pugh_G_over_B, nu_Poisson) or genuinely
+            # not encoded — say which rather than assert a unit.
+            out[key] = "dimensionless or not encoded in the field name"
+    return out
 
 
 def collect_versions() -> dict[str, str]:
@@ -79,6 +101,7 @@ def build(
         "dtype": dtype,
     }
     versions = collect_versions()
+    summary = _sanitise(result_summary)
     return {
         "schema_version": prov_common.PROVENANCE_SCHEMA_VERSION,
         "tool_name": tool_name,
@@ -86,9 +109,9 @@ def build(
         "job_id": job_id,
         "cache_key": cache_key,
         "input": _sanitise(input_payload),
-        "result_summary": _sanitise(result_summary),
+        "result_summary": summary,
         "mace_model": mace_model,
-        "units": MACE_UNITS,
+        "units": units_for(summary),
         "units_policy": prov_common.UNITS_POLICY,
         "versions": versions,
         "host": collect_host(),

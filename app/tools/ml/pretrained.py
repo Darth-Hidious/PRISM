@@ -136,8 +136,23 @@ def predict_with_pretrained(
                 "model": model_name,
                 "model_id": info["model_id"],
             }
+            import hashlib
+            import json as _json
+
             from app.tools import _provenance as prov
 
+            # Lattice + reduced formula does NOT identify a structure —
+            # polymorphs and different site orderings share both, so the
+            # bundle would under-determine the very input the number came
+            # from. Hash the full structure and carry the exact call.
+            struct_dict = structure.as_dict()
+            struct_json = _json.dumps(struct_dict, sort_keys=True, default=str)
+            struct_sha = hashlib.sha256(struct_json.encode()).hexdigest()
+            explicit = {
+                "lattice": [list(r) for r in structure.lattice.matrix],
+                "species": [str(s) for s in structure.species],
+                "coords": [list(s.frac_coords) for s in structure],
+            }
             return prov.attach(result, prov.build(
                 tool_name="predict",
                 engine="matgl",
@@ -149,16 +164,26 @@ def predict_with_pretrained(
                     "n_sites": len(structure),
                     "lattice_abc_Angstrom": list(structure.lattice.abc),
                     "lattice_angles_deg": list(structure.lattice.angles),
+                    "structure_sha256": struct_sha,
+                    "structure": explicit,
                 },
                 units={"prediction": info["unit"]},
                 derived_from=[{
+                    "role": "input_structure",
+                    "sha256": struct_sha,
+                    "formula": structure.composition.reduced_formula,
+                    "n_sites": len(structure),
+                }, {
                     "role": "pretrained_model",
                     "model_id": info["model_id"],
                     "training_set": "Materials Project (see matgl model card)",
                 }],
+                # A runnable call, not a placeholder: `structure` is carried
+                # verbatim in `input.structure` above.
                 reproduce=(
                     f"predict(target='structure', model={model_name!r}, "
-                    "structure={...})"
+                    f"structure=<provenance.input.structure>)  "
+                    f"# structure sha256 {struct_sha[:16]}"
                 ),
             ))
         except Exception as e:

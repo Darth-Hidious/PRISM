@@ -93,6 +93,27 @@ class TestProvenanceBuilder:
         ))
         assert "provenance" not in failed
 
+    def test_bundle_survives_non_json_inputs(self):
+        """A bundle that cannot be serialised never reaches the agent or the
+        disk, so one numpy scalar in a caller's parameters must not cost the
+        whole record."""
+        b = prov.build(
+            tool_name="t", engine="e", engine_version="1", activity="a",
+            inputs={
+                "arr": np.array([1.0, 2.0]),
+                "scalar": np.float64(3.5),
+                "path": __import__("pathlib").Path("/tmp/x"),
+                "elements": {"Fe", "Ni"},
+                "none": None,
+            },
+            units={},
+        )
+        json.dumps(b)  # must not raise
+        assert b["input"]["arr"] == [1.0, 2.0]
+        assert b["input"]["scalar"] == 3.5
+        assert sorted(b["input"]["elements"]) == ["Fe", "Ni"]
+        assert b["input"]["none"] is None
+
     def test_versions_reports_absent_not_silence(self):
         v = prov.versions_of("definitely_not_a_real_module_xyz")
         assert v["definitely_not_a_real_module_xyz"] == "absent"
@@ -130,7 +151,37 @@ class TestCalphadProvenance:
         # re-verifying would silently relabel every downstream number.
         assert CALPHAD_UNITS["gibbs_energy"] == "J/mol-atom"
         assert CALPHAD_UNITS["temperature"] == "K"
-        assert CALPHAD_UNITS["pressure"] == "Pa"
+
+    def test_units_only_name_keys_results_actually_carry(self):
+        """A units map listing keys nothing writes reads as authoritative
+        while saying nothing about the numbers present."""
+        from app.tools.simulation.calphad_bridge import CALPHAD_UNITS
+
+        emitted = {
+            "gibbs_energy", "gibbs_energies", "phase_fractions", "phases_present",
+            "temperature", "phases", "database", "components", "n_points",
+            "n_failed_points", "data_points", "provenance", "error",
+        }
+        assert set(CALPHAD_UNITS) <= emitted, (
+            f"units names keys no result carries: {set(CALPHAD_UNITS) - emitted}"
+        )
+
+    def test_partial_extraction_is_an_error_not_a_note(self, tmp_path):
+        """A half-extracted result with no phases_present is a failure, and
+        attach() must not dress it in provenance."""
+        from app.tools.simulation import calphad_bridge as cb
+
+        class _Broken:
+            @property
+            def Phase(self):
+                raise RuntimeError("xarray shape not understood")
+
+        data = cb._serialize_eq_result(_Broken())
+        assert "error" in data
+        prov.attach(data, prov.build(
+            tool_name="t", engine="pycalphad", engine_version="0",
+            activity="a", inputs={}, units={}))
+        assert "provenance" not in data
 
 
 @pytest.mark.skipif(
@@ -308,7 +359,28 @@ class TestPredictorProvenance:
         res = predictor_mod.Predictor(registry=trained_registry).predict(
             "Fe2O3", "band_gap", "random_forest")
         assert "error" in res
-        assert "backend changed" in res["error"]
+        assert "backend mismatch" in res["error"].lower()
+        assert "basic/v999-from-the-future" in res["error"]
+
+    def test_refuses_a_legacy_model_with_no_recorded_featurizer(
+        self, trained_registry
+    ):
+        """Models saved before feature_backend_id existed are EXACTLY the ones
+        a featurizer change corrupts. Treating "absent" as "trust it" left the
+        guard unable to fire for its whole reason to exist."""
+        import json
+
+        from app.tools.ml.predictor import Predictor
+
+        meta_path = trained_registry.models_dir / "band_gap_random_forest.meta.json"
+        meta = json.loads(meta_path.read_text())
+        del meta["feature_backend_id"]  # a pre-v2 model on disk
+        meta_path.write_text(json.dumps(meta))
+
+        res = Predictor(registry=trained_registry).predict(
+            "Fe2O3", "band_gap", "random_forest")
+        assert "error" in res, f"legacy model silently scored: {res}"
+        assert "unrecorded" in res["error"]
 
     def test_registry_records_the_featurizer_identity(self, trained_registry):
         from app.tools.ml.features import feature_backend_id
@@ -353,6 +425,65 @@ class TestPredictPropertiesProvenance:
         assert_reconstructable(res["provenance"], engine="sklearn")
         assert res["provenance"]["units"]["predicted_band_gap"] == "eV"
 
+    def test_never_auto_targets_its_own_previous_predictions(self, tmp_path,
+                                                             monkeypatch):
+        """The result is saved back over the same dataset name, so a second
+        properties=None call (what the discovery skill passes) would fit a
+        model to the first call's guesses and label the output a prediction."""
+        import pandas as pd
+
+        from app.tools.data_collectors.store import DataStore
+        from app.tools.skills.prediction import _predict_properties
+
+        df = pd.DataFrame({
+            "formula": ["Fe2O3", "SiO2", "Al2O3", "TiO2", "MgO", "CaO", "NaCl"],
+            "band_gap": [2.0, 9.0, 8.8, 3.2, 7.8, 7.0, 8.5],
+            # Already written by a previous run.
+            "predicted_band_gap": [2.1, 8.9, 8.7, 3.3, 7.7, 7.1, 8.4],
+        })
+        monkeypatch.setattr(DataStore, "load", lambda self, name: df.copy())
+        monkeypatch.setattr(DataStore, "save", lambda self, d, name: None)
+        monkeypatch.setenv("PRISM_ML_MODELS_DIR", str(tmp_path))
+
+        res = _predict_properties(dataset_name="d", algorithm="random_forest")
+        assert "error" not in res, res
+        assert "predicted_band_gap" not in res["predictions"], (
+            "trained on its own previous predictions"
+        )
+        assert "band_gap" in res["predictions"]
+
+    def test_skips_and_names_a_model_from_a_different_featurizer(
+        self, tmp_path, monkeypatch
+    ):
+        """A whole column of plausible wrong numbers is worse than one."""
+        import json
+
+        import pandas as pd
+
+        from app.tools.data_collectors.store import DataStore
+        from app.tools.skills import prediction as skill
+
+        df = pd.DataFrame({
+            "formula": ["Fe2O3", "SiO2", "Al2O3", "TiO2", "MgO", "CaO", "NaCl"],
+            "band_gap": [2.0, 9.0, 8.8, 3.2, 7.8, 7.0, 8.5],
+        })
+        monkeypatch.setattr(DataStore, "load", lambda self, name: df.copy())
+        monkeypatch.setattr(DataStore, "save", lambda self, d, name: None)
+        monkeypatch.setenv("PRISM_ML_MODELS_DIR", str(tmp_path))
+
+        # First call trains and records the current featurizer.
+        assert "error" not in skill._predict_properties(
+            dataset_name="d", properties=["band_gap"], algorithm="random_forest")
+        meta_path = tmp_path / "band_gap_random_forest.meta.json"
+        meta = json.loads(meta_path.read_text())
+        meta["feature_backend_id"] = "basic/v0-ancient"
+        meta_path.write_text(json.dumps(meta))
+
+        res = skill._predict_properties(
+            dataset_name="d", properties=["band_gap"], algorithm="random_forest")
+        assert "band_gap" in res.get("skipped_models", {})
+        assert "mismatch" in res["skipped_models"]["band_gap"].lower()
+
 
 # ---------------------------------------------------------------------------
 # pyiron simulation results
@@ -366,6 +497,10 @@ class _FakeJob:
     def __getitem__(self, key):
         if key == "energy_tot":
             return -3.36
+        if key == "odd_value":
+            import pandas as pd
+
+            return pd.NA
         raise KeyError(key)
 
 
@@ -401,20 +536,80 @@ class TestSimJobProvenance:
         assert "as reported by pyiron" in b["units"]["energy_tot"]
         assert "no unit conversion" in b["units_policy"]
 
+    def test_result_survives_a_non_json_property_value(self, monkeypatch):
+        """tool_server.py json.dumps()es the result with no fallback, so one
+        pandas.NA from a pyiron property would kill the tool server for the
+        whole session."""
+        from app.tools import sim_tools
+        from app.tools.simulation import bridge as bridge_mod
+
+        monkeypatch.setattr(sim_tools, "_guard", lambda: None)
+
+        class _Jobs:
+            def get(self, jid):
+                return _FakeJob()
+
+        class _Bridge:
+            jobs = _Jobs()
+
+        monkeypatch.setattr(bridge_mod, "get_bridge", lambda: _Bridge())
+        res = sim_tools._get_job_results(
+            job_id="j1", properties=["energy_tot", "odd_value"])
+        json.dumps(res)  # must not raise
+        assert res["energy_tot"] == -3.36
+
+
+class TestWorkflowExtractorHonesty:
+    def test_unsupported_workflow_says_so_instead_of_returning_empty(self):
+        """phonons and thermal_expansion ARE declared and DO run in pyiron,
+        but nothing reads their output — so they returned results:{} with
+        status 'finished' on every call, not just on failure."""
+        from app.tools import sim_tools
+
+        declared = set(sim_tools._WORKFLOW_MAP)
+        extractable = {"elastic_constants", "equation_of_state"}
+        assert declared - extractable, "test is stale — update if all are wired"
+        src = __import__("inspect").getsource(sim_tools._run_workflow)
+        assert "no result extractor for workflow_type" in src
+
 
 # ---------------------------------------------------------------------------
 # Physics-correctness fixes that provenance alone would not catch
 # ---------------------------------------------------------------------------
 
 class TestCompositionFeatureCorrectness:
-    def test_nested_groups_are_parsed(self):
+    @pytest.mark.parametrize(
+        "formula,expected",
+        [
+            # Preserved from the old parser.
+            ("Fe2O3", {"Fe": 2, "O": 3}),
+            ("Si", {"Si": 1}),
+            ("NaCl", {"Na": 1, "Cl": 1}),
+            ("LiCoO2", {"Li": 1, "Co": 1, "O": 2}),
+            ("", {}),
+            # Nested groups — the old flat regex read Ca(OH)2 as Ca1 O1 H2.
+            ("Ca(OH)2", {"Ca": 1, "O": 2, "H": 2}),
+            ("Al2(SO4)3", {"Al": 2, "S": 3, "O": 12}),
+            ("((Fe)2O)3", {"Fe": 6, "O": 3}),
+            # Bracket coordination notation.
+            ("K4[Fe(CN)6]2", {"K": 4, "Fe": 2, "C": 12, "N": 12}),
+            # Hydrates — the free-standing multiplier used to be skipped as
+            # a separator, so six of MgSO4's seven waters vanished.
+            ("MgSO4·7H2O", {"Mg": 1, "S": 1, "O": 11, "H": 14}),
+            ("CaSO4·2H2O", {"Ca": 1, "S": 1, "O": 6, "H": 4}),
+            # Decimal stoichiometry must survive the hydrate handling.
+            ("Mg1.5Si0.5O4", {"Mg": 1.5, "Si": 0.5, "O": 4}),
+            ("La0.7Sr0.3MnO3", {"La": 0.7, "Sr": 0.3, "Mn": 1, "O": 3}),
+            # Malformed input must not RESCALE what was already parsed: a
+            # stray closer briefly turned Fe2O3 into Fe4O6.
+            ("Fe2O3)2", {"Fe": 2, "O": 3}),
+            ("Ca(OH", {"Ca": 1, "O": 1, "H": 1}),
+        ],
+    )
+    def test_formula_parsing(self, formula, expected):
         from app.tools.ml.features import _parse_formula
 
-        # The old flat regex read this as Ca1 O1 H2.
-        assert _parse_formula("Ca(OH)2") == {"Ca": 1.0, "O": 2.0, "H": 2.0}
-        assert _parse_formula("Al2(SO4)3") == {"Al": 2.0, "S": 3.0, "O": 12.0}
-        # Existing behaviour preserved.
-        assert _parse_formula("Fe2O3") == {"Fe": 2.0, "O": 3.0}
+        assert _parse_formula(formula) == {k: float(v) for k, v in expected.items()}
 
     def test_weighted_average_is_an_average(self):
         """La is not in the 44-element table. The mean over the elements that
@@ -439,6 +634,53 @@ class TestCompositionFeatureCorrectness:
 
         bid = feature_backend_id()
         assert bid.startswith(get_feature_backend() + "/")
+
+
+class TestMaceUnitsAreRealKeys:
+    def test_units_decode_actual_result_field_names(self):
+        """MACE encodes units in the field NAME. A static map of invented key
+        names described no number in any real result."""
+        from app.tools.simulation.mace.jobs.provenance import units_for
+
+        u = units_for({
+            "energy_per_atom_eV": -3.4,
+            "fmax_final_eV_per_A": 0.01,
+            "volume_per_atom_A3": 16.4,
+            "lattice_a_eff_A": 4.05,
+            "mean_T_K": 300.0,
+            "K_VRH_GPa": 76.0,
+            "phonon_dos_omega_THz": [1.0],
+            "wall_time_s": 12.0,
+            "rdf_g": [1.0],
+        })
+        assert u["energy_per_atom_eV"] == "eV/atom"
+        assert u["fmax_final_eV_per_A"] == "eV/Angstrom"
+        assert u["volume_per_atom_A3"] == "Angstrom^3"
+        assert u["lattice_a_eff_A"] == "Angstrom"
+        assert u["mean_T_K"] == "K"
+        assert u["K_VRH_GPa"] == "GPa"
+        assert u["phonon_dos_omega_THz"] == "THz"
+        assert u["wall_time_s"] == "s"
+        # Dimensionless is stated, not silently given a unit.
+        assert "not encoded" in u["rdf_g"]
+
+
+class TestValidationCoversPredictions:
+    def test_physical_constraints_apply_to_predicted_columns(self):
+        """A model predicting a negative band gap is exactly the case worth
+        catching; the rules used to look only at measured columns."""
+        import pandas as pd
+
+        from app.tools.validation.rules import check_physical_constraints
+
+        df = pd.DataFrame({
+            "band_gap": [1.0, 2.0],
+            "predicted_band_gap": [1.0, -0.5],
+            "predicted_density": [3.0, -1.0],
+        })
+        cols = {f["column"] for f in check_physical_constraints(df)}
+        assert "predicted_band_gap" in cols
+        assert "predicted_density" in cols
 
 
 class TestElasticPhysics:

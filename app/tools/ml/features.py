@@ -94,42 +94,90 @@ ELEMENT_DATA = {
 }
 
 
-def _parse_formula(formula: str) -> Dict[str, float]:
-    """Parse a chemical formula into an element:count dict.
+# Hydrate / adduct separators. ONLY the unambiguous middle dots: an ASCII "."
+# cannot be told apart from decimal stoichiometry ("CuSO4.5H2O" is either
+# copper sulfate pentahydrate or Cu S O4.5 H2 O), and decimal compositions
+# like Mg1.5Si0.5O4 are far more common in materials datasets than ASCII-dot
+# hydrate notation. Guessing either way would silently corrupt the other, so
+# an ASCII dot is left to the numeric parser.
+_ADDUCT_SEPARATORS = "·‧∙⋅"
 
-    Handles nested groups — ``Ca(OH)2`` is Ca1 O2 H2, not the Ca1 O1 H2 the
-    old flat regex produced. A silently wrong composition is a silently
-    wrong feature vector, so the parser has to see the parentheses.
-    """
-    import re
+_FORMULA_TOKEN = __import__("re").compile(
+    r"([A-Z][a-z]?)(\d*\.?\d*)"          # element + optional count
+    r"|([\(\[])"                          # group open
+    r"|([\)\]])(\d*\.?\d*)"               # group close + optional multiplier
+)
 
-    token = re.compile(r"([A-Z][a-z]?)(\d*\.?\d*)|(\()|(\)(\d*\.?\d*))")
+
+def _merge(into: Dict[str, float], other: Dict[str, float], mult: float) -> None:
+    for el, n in other.items():
+        into[el] = into.get(el, 0.0) + n * mult
+
+
+def _parse_segment(segment: str) -> Dict[str, float]:
+    """Parse one adduct-free segment, honouring ( ) and [ ] grouping."""
     stack: list[Dict[str, float]] = [{}]
     pos = 0
-    while pos < len(formula):
-        m = token.match(formula, pos)
+    while pos < len(segment):
+        m = _FORMULA_TOKEN.match(segment, pos)
         if m is None:
-            pos += 1  # skip separators (·, spaces, charges) as before
+            pos += 1  # skip charges, spaces, anything unrecognised
             continue
         pos = m.end()
-        if m.group(3):  # "("
+        if m.group(3):  # "(" or "["
             stack.append({})
-        elif m.group(4):  # ")" with optional multiplier
+        elif m.group(4):  # ")" or "]" with optional multiplier
+            # An UNMATCHED closer must not touch the accumulated composition.
+            # Popping the outer dict and re-adding it scaled turned a typo
+            # like "Fe2O3)2" into Fe4O6 — a plausible, wrong composition.
+            if len(stack) == 1:
+                continue
             mult = float(m.group(5)) if m.group(5) else 1.0
-            group = stack.pop()
-            if not stack:
-                stack = [{}]
-            for el, n in group.items():
-                stack[-1][el] = stack[-1].get(el, 0.0) + n * mult
+            _merge(stack[-2], stack.pop(), mult)
         elif m.group(1):  # element symbol
             n = float(m.group(2)) if m.group(2) else 1.0
             stack[-1][m.group(1)] = stack[-1].get(m.group(1), 0.0) + n
     # Unbalanced "(" — fold the open groups in rather than dropping atoms.
     while len(stack) > 1:
-        group = stack.pop()
-        for el, n in group.items():
-            stack[-1][el] = stack[-1].get(el, 0.0) + n
+        _merge(stack[-2], stack.pop(), 1.0)
     return stack[0]
+
+
+def _parse_formula(formula: str) -> Dict[str, float]:
+    """Parse a chemical formula into an element:count dict.
+
+    Handles the three groupings that silently corrupted a composition here
+    before, because a silently wrong composition is a silently wrong feature
+    vector and nothing downstream can tell:
+
+      * nested groups  — ``Ca(OH)2`` is Ca1 O2 H2, not Ca1 O1 H2
+      * bracket groups — ``K4[Fe(CN)6]2`` honours the outer 2
+      * hydrates       — ``MgSO4·7H2O`` keeps all seven waters; the free
+                         standing multiplier used to be skipped as a
+                         separator, so six of them vanished
+
+    Anything it still cannot read (charges, unmatched closers) is skipped
+    WITHOUT rescaling what was already parsed.
+    """
+    total: Dict[str, float] = {}
+    for raw in "".join(
+        "\n" if ch in _ADDUCT_SEPARATORS else ch for ch in formula
+    ).split("\n"):
+        segment = raw.strip()
+        if not segment:
+            continue
+        # A leading bare number multiplies the whole segment (the `5` of
+        # `5H2O`); it is never part of an element symbol.
+        mult, i = 1.0, 0
+        while i < len(segment) and (segment[i].isdigit() or segment[i] == "."):
+            i += 1
+        if i:
+            try:
+                mult = float(segment[:i])
+            except ValueError:
+                mult, i = 1.0, 0
+        _merge(total, _parse_segment(segment[i:]), mult)
+    return total
 
 
 def _composition_features_basic(formula: str) -> Dict[str, float]:

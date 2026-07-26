@@ -22,8 +22,34 @@ MP_PROPERTY_UNITS = {
 
 
 def property_unit(property_name: str) -> str:
-    """Unit for a predicted property, or an explicit 'unknown'."""
+    """Unit for a predicted property, or an explicit 'unknown'.
+
+    This is a unit, NOT a claim about the level of theory. A model trained
+    on a user's own `band_gap` column reports eV because that is the unit of
+    a band gap — it does not mean the values are DFT-GGA, or experimental,
+    or comparable to either. The training source is recorded separately in
+    the provenance bundle; read it before comparing across datasets.
+    """
     return MP_PROPERTY_UNITS.get(property_name, "unknown")
+
+
+#: Marker for a model saved before the featurizer identity was recorded.
+#: Treated as a MISMATCH, never as "assume it matches" — those are exactly
+#: the models a featurizer change would silently corrupt.
+UNRECORDED_BACKEND = "unrecorded (model predates feature_backend_id)"
+
+
+def backend_mismatch_error(
+    trained_backend: str, current_backend: str, property_name: str, algorithm: str
+) -> str:
+    """The one wording for 'these features do not mean the same thing'."""
+    return (
+        f"Feature backend mismatch: the model was built with "
+        f"{trained_backend!r}, this process computes {current_backend!r}. "
+        "The feature names match but the values do not mean the same thing, "
+        "so any prediction would look plausible and be wrong. Retrain with "
+        f"model_train(property_name={property_name!r}, algorithm={algorithm!r})."
+    )
 
 
 class Predictor:
@@ -69,19 +95,11 @@ class Predictor:
             }
         # Same feature NAMES can carry different NUMBERS after a featurizer
         # change. Refuse rather than return a plausible-looking wrong value.
-        trained_backend = meta.get("feature_backend_id")
+        trained_backend = meta.get("feature_backend_id", UNRECORDED_BACKEND)
         current_backend = feature_backend_id()
-        if trained_backend and trained_backend != current_backend:
-            return {
-                "error": (
-                    f"Feature backend changed since training: model was built "
-                    f"with {trained_backend!r}, this process computes "
-                    f"{current_backend!r}. The feature names match but the "
-                    "values do not mean the same thing. Retrain with "
-                    f"model_train(property_name={property_name!r}, "
-                    f"algorithm={algorithm!r})."
-                )
-            }
+        if trained_backend != current_backend:
+            return {"error": backend_mismatch_error(
+                trained_backend, current_backend, property_name, algorithm)}
         X = np.array([[features[k] for k in feature_names]])
 
         try:

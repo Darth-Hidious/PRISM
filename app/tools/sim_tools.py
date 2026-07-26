@@ -330,6 +330,11 @@ def _get_job_results(**kwargs) -> dict:
 
         from app.tools import _provenance as prov
 
+        # A pyiron property can be pandas.NA or any object without .tolist().
+        # tool_server.py json.dumps()es the result with no fallback, so one
+        # such value kills the tool server for the whole session.
+        results = {k: prov.json_safe(v) for k, v in results.items()}
+
         code = str(getattr(getattr(job, "server", None), "run_mode", "")) or "unknown"
         return prov.attach(results, prov.build(
             tool_name="sim_job",
@@ -625,6 +630,18 @@ def _run_workflow(**kwargs) -> dict:
 
         result_data = {}
         extraction_error = None
+        # Only two of the four declared workflows have an extractor here.
+        # `phonons` and `thermal_expansion` DID run in pyiron, but nothing
+        # below reads their output, so they used to return results:{} with
+        # status "finished" — a confident-looking empty answer on every
+        # single call, not just on failure.
+        if workflow_type not in ("elastic_constants", "equation_of_state"):
+            extraction_error = (
+                f"PRISM has no result extractor for workflow_type="
+                f"{workflow_type!r} yet — the pyiron job ran and its output "
+                f"is on disk under job_id {jid}, but this tool cannot read it "
+                "into `results`. Inspect the job directly in pyiron."
+            )
         try:
             if workflow_type == "elastic_constants" and hasattr(job, "elastic_matrix"):
                 em = job.elastic_matrix

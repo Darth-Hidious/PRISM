@@ -22,14 +22,17 @@ from typing import Any, Dict, List, Optional
 
 from app.tools import _provenance as prov
 
-#: Units as pycalphad reports them. PRISM converts nothing.
+#: Units as pycalphad reports them, keyed by the RESULT keys these methods
+#: actually emit. Listing a key nothing writes (`pressure`,
+#: `composition_conditions`) makes the block look authoritative while saying
+#: nothing about the numbers present, so it is kept honest to the output.
+#: Input units live in the provenance `input` block, suffixed there
+#: (`temperature_K`, `pressure_Pa`).
 CALPHAD_UNITS = {
     "gibbs_energy": "J/mol-atom",
     "gibbs_energies": "J/mol-atom",
     "phase_fractions": "mole fraction of total moles of phase (dimensionless)",
     "temperature": "K",
-    "pressure": "Pa",
-    "composition_conditions": "mole fraction (dimensionless)",
 }
 
 
@@ -181,7 +184,10 @@ def _serialize_eq_result(eq_result) -> dict:
             data["gibbs_energy"] = float(gm)
 
     except Exception as e:
-        data["serialization_note"] = f"Partial extraction: {e}"
+        # An "error" key, not a note: a half-extracted result with no
+        # phases_present / gibbs_energy is a failure, and prov.attach() must
+        # not dress it in provenance as though it were a measurement.
+        data["error"] = f"Result extraction failed (partial): {e}"
 
     return data
 
@@ -196,7 +202,10 @@ def _serialize_calc_result(calc_result) -> dict:
         else:
             data["gibbs_energies"] = float(gm)
     except Exception as e:
-        data["serialization_note"] = f"Partial extraction: {e}"
+        # An "error" key, not a note: a half-extracted result with no
+        # phases_present / gibbs_energy is a failure, and prov.attach() must
+        # not dress it in provenance as though it were a measurement.
+        data["error"] = f"Result extraction failed (partial): {e}"
     return data
 
 

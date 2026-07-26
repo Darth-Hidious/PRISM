@@ -18,8 +18,12 @@ def _predict_properties(**kwargs) -> dict:
 
     from app.tools import _provenance as prov
     from app.tools.data_collectors.store import DataStore
-    from app.tools.ml.features import composition_features
-    from app.tools.ml.predictor import property_unit
+    from app.tools.ml.features import composition_features, feature_backend_id
+    from app.tools.ml.predictor import (
+        UNRECORDED_BACKEND,
+        backend_mismatch_error,
+        property_unit,
+    )
     from app.tools.ml.registry import ModelRegistry
 
     store = DataStore()
@@ -39,6 +43,13 @@ def _predict_properties(**kwargs) -> dict:
             c for c in df.columns
             if df[c].dtype in ("float64", "float32", "int64", "int32")
             and c not in exclude
+            # NEVER auto-target a column this skill wrote. The result is
+            # saved back over the same dataset name, so a second call with
+            # properties=None (what the discovery skill passes) would fit a
+            # model to a previous model's guesses and call the output a
+            # prediction. Explicitly naming a predicted_* column still works
+            # — that is a deliberate choice, not an accident.
+            and not c.startswith("predicted_")
         ]
 
     if not target_cols:
@@ -56,6 +67,8 @@ def _predict_properties(**kwargs) -> dict:
     registry = ModelRegistry()
     predictions_made = {}
     models_used = {}
+    skipped_models: dict = {}
+    current_backend = feature_backend_id()
 
     for prop in target_cols:
         model = registry.load_model(prop, algorithm)
@@ -101,6 +114,15 @@ def _predict_properties(**kwargs) -> dict:
             meta = registry.load_meta(prop, algorithm) or {}
 
         if model is None:
+            continue
+
+        # Same gate as the single-formula predict(): a model whose features
+        # were computed by a different featurizer scores to a plausible
+        # wrong number, and here it would write a whole column of them.
+        trained_backend = meta.get("feature_backend_id", UNRECORDED_BACKEND)
+        if trained_backend != current_backend:
+            skipped_models[prop] = backend_mismatch_error(
+                trained_backend, current_backend, prop, algorithm)
             continue
 
         # ONE feature order for the whole column. The old code recomputed
@@ -150,7 +172,10 @@ def _predict_properties(**kwargs) -> dict:
         }
 
     if not predictions_made:
-        return {"error": "No predictions could be made (insufficient data or features)"}
+        return {
+            "error": "No predictions could be made (insufficient data or features)",
+            **({"skipped_models": skipped_models} if skipped_models else {}),
+        }
 
     # Save updated dataset
     store.save(df, dataset_name)
@@ -169,6 +194,9 @@ def _predict_properties(**kwargs) -> dict:
             "fit the model. Judge accuracy by each model's holdout_metrics, "
             "not by agreement with the measured column."
         ),
+        # A property whose model could not be used honestly is named, not
+        # quietly absent from `predictions`.
+        **({"skipped_models": skipped_models} if skipped_models else {}),
     }
     return prov.attach(result, prov.build(
         tool_name="predict_properties",
