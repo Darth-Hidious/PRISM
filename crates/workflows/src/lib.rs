@@ -2389,15 +2389,17 @@ fn ssrf_block_reason(url: &str) -> Option<&'static str> {
     // machine as the bare IPv4 address, but none of the Ipv6Addr
     // predicates say so. Unwrap it to its embedded v4 address FIRST so
     // the v4 rules below apply to both spellings of the same target.
-    let addr: Option<std::net::IpAddr> = ip_candidate.parse::<std::net::IpAddr>().ok().map(|ip| {
-        match ip {
-            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                Some(v4) => std::net::IpAddr::V4(v4),
-                None => std::net::IpAddr::V6(v6),
-            },
-            v4 => v4,
-        }
-    });
+    let addr: Option<std::net::IpAddr> =
+        ip_candidate
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| match ip {
+                std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                    Some(v4) => std::net::IpAddr::V4(v4),
+                    None => std::net::IpAddr::V6(v6),
+                },
+                v4 => v4,
+            });
 
     match addr {
         Some(std::net::IpAddr::V4(ipv4)) => {
@@ -3215,7 +3217,11 @@ tasks:
     /// equivalents of the RFC1918 / 169.254 ranges the v4 branch blocks.
     #[test]
     fn ssrf_blocks_private_ipv6_ranges() {
-        for url in ["http://[fd00::1]/", "http://[fc00::1]/", "http://[fe80::1]/"] {
+        for url in [
+            "http://[fd00::1]/",
+            "http://[fc00::1]/",
+            "http://[fe80::1]/",
+        ] {
             assert!(
                 ssrf_block_reason(url).is_some(),
                 "private IPv6 range allowed: {url}"
