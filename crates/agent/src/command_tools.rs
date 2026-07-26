@@ -3652,8 +3652,8 @@ const LOCAL_NODE_TOOLS: &[&str] = &["query", "query_local", "query_federated"];
 /// that nothing in the system prompt or catalog dangles (see the audit doc's
 /// fix plan F2/F5). The specs stay registered so old sessions keep working.
 const AGENT_SURFACE_EXCLUDED: &[&str] = &[
-    "agent",  // CLI-wrapper red herring → no typed sibling needed (mgmt shell)
-    "run",    // CLI-wrapper red herring → typed sibling `run_submit`
+    "agent",    // CLI-wrapper red herring → no typed sibling needed (mgmt shell)
+    "run",      // CLI-wrapper red herring → typed sibling `run_submit`
     "research", // CLI-wrapper red herring → typed sibling `research_query`
 ];
 
