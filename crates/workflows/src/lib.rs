@@ -376,7 +376,7 @@ pub async fn execute_workflow_with_policy(
         .and_then(|o| o.get("hooks"))
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let client = reqwest::Client::new();
+    let client = http_client();
     if let Some(on_start_steps) = hooks
         .get("on_start")
         .and_then(|v| serde_json::from_value::<Vec<WorkflowStep>>(v.clone()).ok())
@@ -2309,6 +2309,37 @@ fn resolve_path(
 /// host that an attacker controls and points at internal infra. Users
 /// running marketplace workflows against sensitive networks should add
 /// a hostname allowlist to their workflow runtime config.
+/// HTTP client for workflow `http` steps and hooks.
+///
+/// `reqwest::Client::new()` follows up to 10 redirects by default, and
+/// [`ssrf_block_reason`] only ever saw the URL written in the workflow.
+/// So a step pointing at an attacker-controlled public host that answers
+/// `302 Location: http://169.254.169.254/latest/meta-data/…` reached the
+/// metadata service with every literal-IP and hostname check bypassed —
+/// the initial URL is clean, and nothing re-checked the hop. Re-apply the
+/// guard to each redirect target and stop the chain when it fires.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if let Some(reason) = ssrf_block_reason(attempt.url().as_str()) {
+                tracing::warn!(
+                    url = %attempt.url(),
+                    reason,
+                    "workflow http step: redirect target rejected by SSRF guard"
+                );
+                return attempt.stop();
+            }
+            if attempt.previous().len() >= 10 {
+                return attempt.stop();
+            }
+            attempt.follow()
+        }))
+        .build()
+        // `build()` only fails on TLS backend init, which would break
+        // every HTTP step anyway; fall back rather than panic.
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 fn ssrf_block_reason(url: &str) -> Option<&'static str> {
     // reqwest::Url is the same `url::Url` from the url crate; using it
     // via reqwest avoids adding a top-level dependency just for parse.
@@ -2325,7 +2356,11 @@ fn ssrf_block_reason(url: &str) -> Option<&'static str> {
     let Some(host) = parsed.host_str() else {
         return Some("URL has no host");
     };
+    // A trailing dot makes a name fully qualified; `localhost.` resolves
+    // exactly like `localhost`. Without stripping it, every entry in the
+    // exact-match list below is bypassed by adding one character.
     let host = host.to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
 
     // 2. Literal hostnames that name local / metadata contexts.
     const BLOCKED_HOSTS: &[&str] = &[
@@ -2335,37 +2370,65 @@ fn ssrf_block_reason(url: &str) -> Option<&'static str> {
         "metadata",
         "metadata.google.internal",
     ];
-    if BLOCKED_HOSTS.contains(&host.as_str()) {
+    if BLOCKED_HOSTS.contains(&host) {
         return Some("hostname names a loopback or cloud-metadata service");
     }
 
     // 3. Reject literal IPs that fall into private / loopback / link-local
     // ranges. We don't do DNS lookup here — DNS rebinding still works.
     // The literal-IP check stops the obvious SSRF payloads.
-    if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
-        if ipv4.is_loopback()
-            || ipv4.is_private()
-            || ipv4.is_link_local()
-            || ipv4.is_unspecified()
-            || ipv4.is_broadcast()
-        {
-            return Some("IPv4 address is in a private / loopback / link-local range");
-        }
-        // 169.254.169.254 is link-local but call it out specifically.
-        if ipv4.octets() == [169, 254, 169, 254] {
-            return Some("address is the cloud instance metadata service");
-        }
-    }
+    //
     // url crate strips the [] from IPv6 hosts, but the host_str() form
     // returns it WITH the brackets. Strip them before parsing.
-    let ipv6_candidate = host
+    let ip_candidate = host
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(host.as_str());
-    if let Ok(ipv6) = ipv6_candidate.parse::<std::net::Ipv6Addr>()
-        && (ipv6.is_loopback() || ipv6.is_unspecified())
-    {
-        return Some("IPv6 address is loopback / unspecified");
+        .unwrap_or(host);
+
+    // An IPv4-mapped IPv6 literal (`::ffff:127.0.0.1`) reaches the same
+    // machine as the bare IPv4 address, but none of the Ipv6Addr
+    // predicates say so. Unwrap it to its embedded v4 address FIRST so
+    // the v4 rules below apply to both spellings of the same target.
+    let addr: Option<std::net::IpAddr> = ip_candidate.parse::<std::net::IpAddr>().ok().map(|ip| {
+        match ip {
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => std::net::IpAddr::V4(v4),
+                None => std::net::IpAddr::V6(v6),
+            },
+            v4 => v4,
+        }
+    });
+
+    match addr {
+        Some(std::net::IpAddr::V4(ipv4)) => {
+            if ipv4.is_loopback()
+                || ipv4.is_private()
+                || ipv4.is_link_local()
+                || ipv4.is_unspecified()
+                || ipv4.is_broadcast()
+            {
+                return Some("IPv4 address is in a private / loopback / link-local range");
+            }
+            // 169.254.169.254 is link-local but call it out specifically.
+            if ipv4.octets() == [169, 254, 169, 254] {
+                return Some("address is the cloud instance metadata service");
+            }
+        }
+        Some(std::net::IpAddr::V6(ipv6)) => {
+            if ipv6.is_loopback() || ipv6.is_unspecified() {
+                return Some("IPv6 address is loopback / unspecified");
+            }
+            // The v6 counterparts of RFC1918 and 169.254.0.0/16.
+            // `Ipv6Addr::is_unique_local` / `is_unicast_link_local` are
+            // still unstable, so test the prefixes directly:
+            //   fc00::/7  unique local
+            //   fe80::/10 link-local unicast
+            let first = ipv6.segments()[0];
+            if (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 {
+                return Some("IPv6 address is in a unique-local / link-local range");
+            }
+        }
+        None => {}
     }
 
     None
@@ -3124,6 +3187,126 @@ tasks:
     fn ssrf_blocks_unparseable_urls() {
         assert!(ssrf_block_reason("not a url").is_some());
         assert!(ssrf_block_reason("").is_some());
+    }
+
+    /// An IPv4-mapped IPv6 literal reaches the same machine as the bare
+    /// IPv4 address, but `Ipv6Addr::is_loopback()` is false for
+    /// `::ffff:127.0.0.1` — the v4 range checks were never applied to the
+    /// embedded address, so every v4 rule could be skipped by writing the
+    /// target in v6 form.
+    #[test]
+    fn ssrf_blocks_ipv4_mapped_ipv6() {
+        for url in [
+            "http://[::ffff:127.0.0.1]:7327/api/users",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://[0:0:0:0:0:ffff:7f00:1]/",
+            "http://[::ffff:10.0.0.1]/",
+            "http://[::ffff:192.168.1.1]/admin",
+            "http://[::ffff:c0a8:1]/",
+        ] {
+            assert!(
+                ssrf_block_reason(url).is_some(),
+                "IPv4-mapped IPv6 reached an internal address: {url}"
+            );
+        }
+    }
+
+    /// Unique-local (fc00::/7) and link-local (fe80::/10) are the IPv6
+    /// equivalents of the RFC1918 / 169.254 ranges the v4 branch blocks.
+    #[test]
+    fn ssrf_blocks_private_ipv6_ranges() {
+        for url in ["http://[fd00::1]/", "http://[fc00::1]/", "http://[fe80::1]/"] {
+            assert!(
+                ssrf_block_reason(url).is_some(),
+                "private IPv6 range allowed: {url}"
+            );
+        }
+    }
+
+    /// A trailing dot is a fully-qualified DNS name that resolves
+    /// identically, but it defeated the exact-match blocked-host list.
+    #[test]
+    fn ssrf_blocks_trailing_dot_hosts() {
+        for url in [
+            "http://localhost./",
+            "http://localhost.:7327/api/users",
+            "http://metadata./",
+            "http://metadata.google.internal./",
+        ] {
+            assert!(
+                ssrf_block_reason(url).is_some(),
+                "trailing-dot host bypassed the blocklist: {url}"
+            );
+        }
+    }
+
+    /// The guard only ever inspected the URL written in the workflow.
+    /// reqwest follows redirects by default, so a step aimed at a host
+    /// the attacker controls could be bounced onto an internal target
+    /// with every check already passed. Two real loopback servers: the
+    /// first 302s to the second, and the client must refuse the hop.
+    #[tokio::test]
+    async fn ssrf_guard_is_reapplied_to_redirect_targets() {
+        use axum::routing::get;
+
+        // Target: what the attacker wants reached.
+        let secret = axum::Router::new().route("/secret", get(|| async { "INTERNAL-SECRET" }));
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(target_listener, secret).await.unwrap() });
+
+        // Redirector: stands in for the attacker-controlled public host.
+        let location = format!("http://127.0.0.1:{target_port}/secret");
+        let redirector = axum::Router::new().route(
+            "/",
+            get(move || {
+                let location = location.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .status(302)
+                        .header("location", location)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+        let hop_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hop_port = hop_listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(hop_listener, redirector).await.unwrap() });
+
+        let response = http_client()
+            .get(format!("http://127.0.0.1:{hop_port}/"))
+            .send()
+            .await
+            .expect("request to the redirector itself should succeed");
+
+        assert_eq!(
+            response.status().as_u16(),
+            302,
+            "the redirect was followed instead of stopped at the guard"
+        );
+        let body = response.text().await.unwrap_or_default();
+        assert!(
+            !body.contains("INTERNAL-SECRET"),
+            "redirect reached the internal target: {body}"
+        );
+    }
+
+    /// Guard the fix against over-blocking: ordinary public hosts and
+    /// public IPv6 must still pass.
+    #[test]
+    fn ssrf_still_allows_public_targets() {
+        for url in [
+            "https://api.materialsproject.org/",
+            "http://example.com:8080/path",
+            "http://[2606:4700:4700::1111]/",
+            "http://[::ffff:93.184.216.34]/",
+        ] {
+            assert!(
+                ssrf_block_reason(url).is_none(),
+                "public target was blocked: {url}"
+            );
+        }
     }
 
     // ── llm step tests ──────────────────────────────────────────────
