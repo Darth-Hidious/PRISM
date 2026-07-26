@@ -28,9 +28,13 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
 
     let mut checks: Vec<BootCheck> = Vec::new();
 
-    // 1. llama-server (homebrew or PATH)
+    // 1. llama-server — OPTIONAL. Nothing in PRISM spawns it; it only
+    //    matters if the user has pointed chat at a local server with
+    //    `prism use local`. Reporting it as a plain missing dependency told
+    //    every fresh install to go and `brew install llama.cpp` for no
+    //    reason.
     checks.push(check_binary(
-        "llama-server",
+        "llama-server (optional)",
         &[
             "/opt/homebrew/bin/llama-server",
             "/usr/local/bin/llama-server",
@@ -49,13 +53,28 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
         });
     }
 
-    // 2. Embedder GGUF
-    let embed_gguf = prism_dir.join("models/embeddinggemma-300m.gguf");
-    checks.push(check_file(
-        "EmbeddingGemma model",
-        &embed_gguf,
-        "auto-downloads on first `prism`",
-    ));
+    // 2. Embedding model. This used to look for
+    //    `models/embeddinggemma-300m.gguf` and claim it "auto-downloads on
+    //    first `prism`" — nothing in the tree has ever written that file, so
+    //    the row was permanently red with a hint that was simply untrue.
+    //    The model PRISM actually uses is BGE-small-en-v1.5, cached by
+    //    `prism-embed` under `models/embed/` on first semantic search.
+    let embed_dir = prism_dir.join("models/embed");
+    let embed_cached =
+        embed_dir.exists() && std::fs::read_dir(&embed_dir).is_ok_and(|mut d| d.next().is_some());
+    checks.push(BootCheck {
+        name: "Embedding model".to_string(),
+        result: if embed_cached {
+            format!("cached at {}", embed_dir.display())
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            "unavailable on Intel macOS — set PRISM_EMBED_BACKEND=openai".to_string()
+        } else {
+            "downloads on first semantic search (~90 MB)".to_string()
+        },
+        ok: embed_cached,
+        dots: 4,
+        delay_ms: 0,
+    });
 
     // 3. FunctionGemma model — DEPRECATED. The Stage 2.2 local-routing
     //    path was removed because it caused silent failures (it picked a
@@ -76,7 +95,10 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
     //    alone proves nothing — [OK] means the PRISM tool platform actually
     //    imports. (Fresh boxes used to get an empty venv that a bare
     //    exists() check happily blessed.)
-    let venv_python = prism_dir.join("venv/bin/python3");
+    //    Path comes from the same helper `ensure_venv` uses, so this cannot
+    //    drift from where the venv is actually created (Windows puts the
+    //    interpreter in `Scripts\python.exe`, not `bin/python3`).
+    let (venv_python, _) = prism_python_bridge::venv::venv_layout(&prism_dir.join("venv"));
     checks.push(check_venv_tools(&venv_python));
 
     // 5. PRISM credentials (auth state) — newer prism uses cli-state.json,
@@ -102,19 +124,13 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
         "auto-generated on first `prism`",
     ));
 
-    // 7. Tool router index (rebuilt automatically; informational)
-    let index_dir = prism_dir.join("tool_router/index/catalog.jsonl");
-    checks.push(BootCheck {
-        name: "Tool router index".to_string(),
-        result: if index_dir.exists() {
-            format!("cached at {}", index_dir.display())
-        } else {
-            "no cache yet (built on first chat)".to_string()
-        },
-        ok: index_dir.exists(),
-        dots: 4,
-        delay_ms: 0,
-    });
+    // 7. (removed) "Tool router index" checked
+    //    `~/.prism/tool_router/index/catalog.jsonl`. Nothing in the codebase
+    //    writes that path — it was read here and mentioned in the hint text
+    //    below, and nowhere else — so the row was red on every machine
+    //    forever and told users a cache would appear "on first chat" that
+    //    never does. Tool selection works off the in-memory catalog built by
+    //    `ToolCatalog` each run; there is no on-disk index to report.
 
     // 8. Project root sanity (where prism is being run from)
     checks.push(BootCheck {
@@ -147,12 +163,15 @@ pub async fn run(project_root: &std::path::Path, python_bin: &std::path::Path) -
     print_check_lines(&platform_checks);
 
     println!();
-    println!("Anything marked [--] means: not yet present, but PRISM will set it up");
-    println!("on demand or via the documented one-liner.");
+    println!("[--] means not present yet. Each row above says whether that is");
+    println!("something PRISM fills in on demand or something you need to do.");
+    if !creds_path.exists() {
+        println!();
+        println!("Next step:  prism login");
+    }
     println!();
     println!("If chat is misbehaving in unexpected ways, also try:");
-    println!("  rm -rf ~/.prism/tool_router && prism    # rebuilds tool index");
-    println!("  rm  ~/.forge/.mcp.json && prism          # rewrites MCP config");
+    println!("  rm ~/.forge/.mcp.json && prism           # rewrites MCP config");
     Ok(())
 }
 
@@ -170,7 +189,7 @@ fn check_binary(name: &str, candidates: &[&str]) -> BootCheck {
     }
     BootCheck {
         name: name.to_string(),
-        result: "missing — install via `brew install llama.cpp`".to_string(),
+        result: "not installed — only needed for `prism use local`".to_string(),
         ok: false,
         dots: 4,
         delay_ms: 0,

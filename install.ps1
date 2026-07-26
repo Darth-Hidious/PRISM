@@ -63,6 +63,12 @@
             $version = $release.tag_name
         } catch {
             Write-Host "Error: failed to fetch the latest version from GitHub. $($_.Exception.Message)" -ForegroundColor Red
+            # 403 here is nearly always GitHub's 60-requests/hour cap for
+            # unauthenticated callers, which a whole institute behind one NAT
+            # can exhaust between them. Naming the workaround beats retrying.
+            Write-Host '  If this is a 403, the shared network has hit GitHub''s API rate limit.'
+            Write-Host '  Pin the version to skip the lookup entirely, e.g.:'
+            Write-Host '    $env:PRISM_VERSION = "v1.0.0"; irm https://prism.marc27.com/install.ps1 | iex'
             return
         }
         if (-not $version) {
@@ -71,17 +77,26 @@
         }
     }
 
+    if (-not $env:USERPROFILE) {
+        Write-Host 'Error: USERPROFILE is not set; cannot work out where to install.' -ForegroundColor Red
+        Write-Host '  Set PRISM_INSTALL_DIR to an absolute path and re-run.'
+        return
+    }
+    $prismHome = Join-Path $env:USERPROFILE '.prism'
     $installDir = $env:PRISM_INSTALL_DIR
-    if (-not $installDir) { $installDir = Join-Path $env:USERPROFILE '.prism\bin' }
+    if (-not $installDir) { $installDir = Join-Path $prismHome 'bin' }
+    # Normalise so a user-supplied trailing '\' doesn't defeat the
+    # already-on-PATH checks below and append a duplicate on every re-run.
+    $installDir = $installDir.TrimEnd('\')
 
     Write-Host "Installing PRISM $version for windows-$arch..."
 
     # --- Download ---------------------------------------------------------
     $url = "https://github.com/$Repo/releases/download/$version/$archive"
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("prism-install-" + [System.Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 
     try {
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
         $zipPath = Join-Path $tmp $archive
         Write-Host "Downloading $url..."
         # $ProgressPreference slows Invoke-WebRequest to a crawl on 5.1.
@@ -140,6 +155,12 @@
         foreach ($b in $extracted) {
             try { Unblock-File -Path (Join-Path $installDir $b) } catch { }
         }
+    } catch {
+        # Truncated download, disk full, unwritable install dir. Without this
+        # the exception escapes `& { }` as a raw PowerShell error dump.
+        Write-Host "Error: install failed. $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  Nothing was left behind; re-running is safe."
+        return
     } finally {
         Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -227,13 +248,23 @@ public static extern System.IntPtr SendMessageTimeout(
         }
     }
 
-    New-Item -ItemType Directory -Path (Join-Path $env:USERPROFILE '.prism') -Force | Out-Null
+    New-Item -ItemType Directory -Path $prismHome -Force | Out-Null
 
     # --- Stage 1 done: the app itself is installed and runnable -------------
     $exe = Join-Path $installDir 'prism.exe'
     Write-Host ''
-    $stamp = 'binary in place'
-    if (Test-Path $exe) { try { $stamp = (& $exe --version) } catch { } }
+    # We extracted prism.exe a moment ago, so if it is gone now something
+    # took it — endpoint protection quarantining a fresh unsigned binary is
+    # the realistic cause on a managed machine. Say that, rather than
+    # printing a green success line for a binary that is not there.
+    if (-not (Test-Path $exe)) {
+        Write-Host "[1/2] FAILED - $exe is missing right after extraction." -ForegroundColor Red
+        Write-Host '  Antivirus or endpoint protection most likely quarantined it.'
+        Write-Host '  Allow-list the file and re-run:  irm https://prism.marc27.com/install.ps1 | iex'
+        return
+    }
+    $stamp = 'installed'
+    try { $stamp = (& $exe --version) } catch { }
     Write-Host "[1/2] PRISM $version installed - $stamp" -ForegroundColor Green
 
     # --- Stage 2: the Python tool platform ----------------------------------
@@ -257,12 +288,18 @@ public static extern System.IntPtr SendMessageTimeout(
         Write-Host '  Then re-run:  irm https://prism.marc27.com/install.ps1 | iex'
     } elseif ($env:PRISM_SKIP_TOOLS -eq '1') {
         Write-Host '[2/2] SKIPPED - PRISM_SKIP_TOOLS=1. Tools install on your first `prism` run.'
-    } elseif (Test-Path $exe) {
-        Write-Host '[2/2] Setting up the Python tool platform (first run takes a few minutes)...'
+    } else {
+        Write-Host '[2/2] Setting up the Python tool platform (first run takes a few minutes).'
+        Write-Host '      Ctrl+C is safe - re-running the installer resumes where it stopped.'
         Write-Host ''
         # Never fail the install over this - the binary retries every launch.
-        try { & $exe doctor } catch { }
-        if ($LASTEXITCODE -ne 0) {
+        # Track the launch separately: if the process cannot start at all, the
+        # catch swallows it and $LASTEXITCODE still holds a stale 0 from the
+        # Python probe above, which would report success for a run that never
+        # happened.
+        $doctorRan = $true
+        try { & $exe doctor } catch { $doctorRan = $false }
+        if (-not $doctorRan -or $LASTEXITCODE -ne 0) {
             Write-Host ''
             Write-Host '  Note: setup did not finish cleanly. It retries automatically on your'
             Write-Host '  next `prism` run; `prism doctor` shows what is still missing.'

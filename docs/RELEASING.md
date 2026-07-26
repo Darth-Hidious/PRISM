@@ -78,6 +78,30 @@ up. Users there build from source.
 | `ubuntu-22.04` | 2027-04-17 |
 | `macos-15-intel` | Aug 2027, last x86_64 macOS image ever |
 
+### Windows is not finished
+
+`install.ps1` works and the `windows-x86_64` archive builds, but the binary
+itself was never ported. Two things were fixed here because they sit on the
+path every single subcommand takes:
+
+- `crates/python-bridge/src/venv.rs` hardcoded the Unix venv layout
+  (`bin/python3`, `bin/pip`). A Windows venv has `Scripts\python.exe` and no
+  `bin/` at all, so `ensure_venv` could never succeed — it would create the
+  venv, fail to find the interpreter it had just created, and return the
+  Debian "install python3-venv" error. It also shelled out to `sh` and `curl`
+  to bootstrap pip, and only looked for `python3.X` names, which Windows
+  installers do not create.
+- `crates/cli/src/main.rs` resolved the PRISM directory from `HOME`, unset on
+  stock Windows, falling back to `"."` — i.e. the venv would land in whatever
+  directory the user happened to `cd` into.
+
+**Both fixes compile for `x86_64-pc-windows-msvc` (clippy `-D warnings`
+clean) but have never been executed on Windows.** And eleven other
+`env::var("HOME")` call sites in `crates/cli/src/main.rs` are still Unix-only
+— campaigns, the tools directory, workflows, and the provenance DB among
+them. Windows should not be promised to anyone until someone runs the
+installer on a real Windows machine and works through what breaks.
+
 ### Intel macOS has no local embedding model
 
 `fastembed` pins `ort = "=2.0.0-rc.12"`, and pyke stopped publishing

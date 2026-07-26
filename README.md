@@ -45,13 +45,20 @@ what is and isn't ready. Re-running it resumes rather than starting over.
 
 ### Supported platforms
 
-| Platform | Archive | Notes |
-|----------|---------|-------|
-| Linux x86_64 | `prism-linux-x86_64.tar.gz` | |
-| Linux ARM64 | `prism-linux-aarch64.tar.gz` | |
-| macOS Apple Silicon | `prism-macos-aarch64.tar.gz` | macOS 11+ |
-| macOS Intel | `prism-macos-x86_64.tar.gz` | No local embedding model — see below |
-| Windows x86_64 | `prism-windows-x86_64.zip` | Also runs on ARM64 Windows under emulation |
+| Platform | Archive | Status |
+|----------|---------|--------|
+| macOS Apple Silicon | `prism-macos-aarch64.tar.gz` | Supported, macOS 11+ |
+| macOS Intel | `prism-macos-x86_64.tar.gz` | Supported; no local embedding model — see below |
+| Linux x86_64 | `prism-linux-x86_64.tar.gz` | Supported, glibc 2.35+ |
+| Linux ARM64 | `prism-linux-aarch64.tar.gz` | Supported, glibc 2.35+ |
+| Windows x86_64 | `prism-windows-x86_64.zip` | **Experimental** — see below |
+
+**Windows is experimental.** The installer and the binary are there, and
+ARM64 Windows works under x64 emulation, but PRISM resolves its data
+directory from `HOME`, which stock Windows does not set, in several places
+outside the install path. Expect rough edges beyond `prism --version`. If you
+need PRISM working today, use macOS or Linux — including WSL2, which is a
+fully supported Linux target.
 
 ### Downloading the archive directly
 
