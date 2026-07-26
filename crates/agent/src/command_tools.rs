@@ -1832,6 +1832,43 @@ fn spec_by_name(tool_name: &str) -> Option<&'static CommandToolSpec> {
     })
 }
 
+/// Options declared `global = true` on the PRISM CLI (`crates/cli/src/main.rs`).
+///
+/// clap accepts a global option AFTER the subcommand, and the last
+/// occurrence wins. `execute_cli_command` re-invokes the PRISM binary as
+/// `prism --project-root <trusted> --python <trusted> <root> <args…>`, so
+/// an `args` entry naming one of these silently replaces the trusted
+/// value that was passed first. `--python` decides which binary the child
+/// process executes, and `--project-root` decides its working directory
+/// (which `python -m` puts first on `sys.path`).
+///
+/// Keep this in lockstep with the `global = true` attributes in
+/// `crates/cli/src/main.rs`; `global = false` options are already
+/// rejected by clap after a subcommand and need no entry here.
+const PRISM_GLOBAL_FLAGS: &[&str] = &["--python", "--project-root"];
+
+/// Reject argv tokens that would re-specify one of PRISM's own global
+/// options. Matches both `--flag value` and `--flag=value`, case
+/// -insensitively (clap's long-flag matching is case-sensitive, but
+/// rejecting case variants too costs nothing and removes a class of
+/// near-miss reasoning about it).
+fn reject_global_flag_override(args: &[String]) -> Result<()> {
+    for arg in args {
+        let candidate = arg.split('=').next().unwrap_or(arg);
+        if PRISM_GLOBAL_FLAGS
+            .iter()
+            .any(|flag| candidate.eq_ignore_ascii_case(flag))
+        {
+            anyhow::bail!(
+                "`{arg}` is not allowed in `args`: {candidate} is a PRISM global \
+                 option and setting it here would override the runtime PRISM \
+                 passes to the command (including which interpreter it runs)"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn parse_args(input: &Value) -> Result<Vec<String>> {
     let Some(raw_args) = input.get("args") else {
         return Ok(Vec::new());
@@ -1842,14 +1879,17 @@ fn parse_args(input: &Value) -> Result<Vec<String>> {
     let args = raw_args
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("`args` must be an array of strings"))?;
-    args.iter()
+    let args: Vec<String> = args
+        .iter()
         .map(|value| {
             value
                 .as_str()
                 .map(str::to_string)
                 .ok_or_else(|| anyhow::anyhow!("`args` entries must be strings"))
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    reject_global_flag_override(&args)?;
+    Ok(args)
 }
 
 fn required_string(input: &Value, key: &str) -> Result<String> {
@@ -2991,6 +3031,13 @@ async fn execute_cli_command(
     args: &[String],
     invocation: &str,
 ) -> Result<Value> {
+    // Chokepoint: every `CommandExecution::Cli` lands here, including the
+    // ones whose args are assembled by the typed builders rather than
+    // taken from `args`. The trusted --project-root/--python are laid
+    // down immediately below, so this is the last place to be sure
+    // nothing downstream re-specifies them.
+    reject_global_flag_override(args)?;
+
     let mut cmd = TokioCommand::new(&runtime.current_exe);
     cmd.arg("--project-root")
         .arg(&runtime.project_root)
@@ -4202,6 +4249,54 @@ mod tests {
             CommandExecution::Cli { root, args } => {
                 assert_eq!(root, "marketplace");
                 assert_eq!(args, vec!["info".to_string(), "acme-model".to_string()]);
+            }
+            other => panic!("expected Cli, got {other:?}"),
+        }
+    }
+
+    // ── argv injection into PRISM's own global flags ───────────────────
+
+    /// `execute_cli_command` re-invokes the PRISM binary as
+    /// `prism --project-root <trusted> --python <trusted> <root> <args…>`,
+    /// where `<args…>` is whatever the model put in `args`. Both
+    /// `--python` and `--project-root` are declared `global = true` on the
+    /// CLI, so clap accepts them AFTER the subcommand and the last
+    /// occurrence wins. An `args` entry naming one of them therefore
+    /// overrides the trusted value — and `--python` decides which binary
+    /// the child process executes.
+    ///
+    /// The model's output is attacker-influenceable (prompt injection in
+    /// an ingested paper or fetched page), and these tools are declared
+    /// `ReadOnly` / `requires_approval: false`, so nothing else stops it.
+    #[test]
+    fn cli_args_cannot_override_prisms_global_flags() {
+        for (tool, input) in [
+            ("tools", json!({"args": ["--python", "/tmp/pwn"]})),
+            ("tools", json!({"args": ["--python=/tmp/pwn"]})),
+            ("status", json!({"args": ["--project-root", "/tmp/evil"]})),
+            ("doctor", json!({"args": ["--project-root=/tmp/evil"]})),
+            ("query", json!({"args": ["ok", "--PYTHON", "/tmp/pwn"]})),
+        ] {
+            let spec = spec_by_name(tool).expect("spec exists");
+            let result = build_execution(spec, &input);
+            assert!(
+                result.is_err(),
+                "`{tool}` accepted an arg that overrides a PRISM global flag: \
+                 {input} -> {result:?}"
+            );
+        }
+    }
+
+    /// The guard must not break ordinary flags — only PRISM's own globals
+    /// are off limits.
+    #[test]
+    fn cli_args_still_accept_ordinary_flags() {
+        let spec = spec_by_name("query").expect("spec exists");
+        let exec = build_execution(spec, &json!({"args": ["titanium", "--limit", "5"]}))
+            .expect("ordinary flags must still build");
+        match exec {
+            CommandExecution::Cli { args, .. } => {
+                assert_eq!(args, vec!["titanium", "--limit", "5"]);
             }
             other => panic!("expected Cli, got {other:?}"),
         }
