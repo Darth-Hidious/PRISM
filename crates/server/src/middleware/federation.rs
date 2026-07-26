@@ -79,6 +79,33 @@ fn action_roles() -> &'static ActionRoleTable {
     TABLE.get_or_init(ActionRoleTable::defaults)
 }
 
+/// What the action → role table says about a cross-org action verb.
+#[derive(Debug, PartialEq, Eq)]
+enum RoleGate {
+    /// The peer must hold this role.
+    Required(&'static str),
+    /// Registered as explicitly needing no role (e.g. `peer.heartbeat`).
+    NoneRequired,
+    /// Not in the table at all.
+    UnknownAction,
+}
+
+/// Resolve the role gate for `action`.
+///
+/// Uses [`ActionRoleTable::lookup`] (default-DENY), NOT `required_role`
+/// (default-ALLOW). `required_role` flattens "verb not in the table" and
+/// "verb registered as role-free" into the same `None`, and `verify_peer`
+/// reads `None` as "skip the role check entirely" — so resolving with it
+/// let a peer clear the authorization gate just by inventing a verb the
+/// table had never heard of. `lookup` keeps the two cases distinct.
+fn role_gate(action: &str) -> RoleGate {
+    match action_roles().lookup(action) {
+        Some(Some(role)) => RoleGate::Required(role),
+        Some(None) => RoleGate::NoneRequired,
+        None => RoleGate::UnknownAction,
+    }
+}
+
 /// Read the cached MARC27 platform pubkey directly from disk. The
 /// fetcher's full lazy refresh path needs a `PlatformClient`, which
 /// would require plumbing into `NodeState`. For Bug #33 wiring we just
@@ -200,7 +227,30 @@ pub async fn federation_layer(
         );
     };
 
-    let required_role = action_roles().required_role(&envelope.action);
+    // Resolve the role gate BEFORE trusting the envelope. An action verb
+    // that is not in the table is refused outright: we have no policy for
+    // it, and "no policy" must never read as "no role required".
+    let required_role = match role_gate(&envelope.action) {
+        RoleGate::Required(role) => Some(role),
+        RoleGate::NoneRequired => None,
+        RoleGate::UnknownAction => {
+            let reason = format!(
+                "cross-org action `{}` is not registered in the action→role \
+                 table, so no role can be required for it",
+                envelope.action
+            );
+            tracing::warn!(
+                action = %envelope.action,
+                source_org = %envelope.source.org_id,
+                source_node = %envelope.source.node_id,
+                "Federation request rejected: unregistered action"
+            );
+            if let Some(emitter) = &state.federation_audit {
+                emitter.emit(denied_spec(&envelope, reason.clone())).await;
+            }
+            return error(StatusCode::FORBIDDEN, "unknown_action", reason);
+        }
+    };
 
     if let Err(e) = verify_peer(
         &envelope,
@@ -265,6 +315,35 @@ pub async fn federation_layer(
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+
+    // ── The action → role gate ─────────────────────────────────────
+
+    #[test]
+    fn registered_actions_keep_their_roles() {
+        assert_eq!(
+            role_gate("inference.submit"),
+            RoleGate::Required("compute.invoke")
+        );
+        assert_eq!(role_gate("dataset.read"), RoleGate::Required("data.read"));
+        // Liveness is registered as explicitly role-free.
+        assert_eq!(role_gate("peer.heartbeat"), RoleGate::NoneRequired);
+    }
+
+    /// An action verb nobody registered must be REFUSED, not waved
+    /// through with the role check skipped. `verify_peer` treats a
+    /// `None` required-role as "no role gate at all", so resolving an
+    /// unknown verb to `NoneRequired` lets any peer holding a valid
+    /// platform-signed identity — including one with ZERO roles —
+    /// invent a verb and clear the authorization gate.
+    #[test]
+    fn unknown_action_is_refused_not_role_free() {
+        assert_eq!(
+            role_gate("attacker.invented.action"),
+            RoleGate::UnknownAction,
+            "an unregistered action resolved to `no role required`: the \
+             cross-org role gate is bypassed by inventing a verb"
+        );
+    }
 
     #[test]
     fn no_header_returns_none() {
