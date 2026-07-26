@@ -1058,9 +1058,13 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
 
     block.push_str("\n\
         ## IMPORTANT: When NOT to call tools\n\n\
-        For greetings, casual conversation, explanations, general knowledge questions, \
+        For greetings, casual conversation, conceptual explanations, \
         or anything that does not need live data — respond with plain text. \
-        Do NOT call tools for simple chat like \"hello\", \"what can you do?\", or \"explain X\".\n\n\
+        Do NOT call tools for simple chat like \"hello\", \"what can you do?\", or \"explain X\".\n\
+        This is NOT a licence to answer from memory: a question about a specific \
+        MATERIAL, a source, or platform/job state always needs live data. Retrieve \
+        it. If retrieval comes back empty, say it was not found — never fill the \
+        gap from memory.\n\n\
         ## How to call tools\n\n\
         ONLY when a task explicitly requires data retrieval, computation, search, or platform interaction, call a tool:\n\n\
         ```tool_call\n\
@@ -1756,6 +1760,36 @@ mod tests {
                 "long-horizon marker `{marker}` missing from prompt block ({why}). \
                  If you intentionally removed it, update this test. If not, \
                  you've silently regressed PR #109, #111, #114, or #115."
+            );
+        }
+    }
+
+    /// The "when NOT to call tools" carve-out must not become a licence to
+    /// answer materials questions from memory.
+    ///
+    /// This block is injected as a SECOND system message alongside the PRISM
+    /// agent prompt (`prism_agent::prompts`), which says "You may not answer a
+    /// scientific or platform question from memory". Before this pin the two
+    /// messages contradicted each other in the same request — this block
+    /// excused "general knowledge questions", and a materials question reads as
+    /// one. Two contradictory system messages resolve toward the cheaper
+    /// instruction, which is the fabrication.
+    #[test]
+    fn tool_carve_out_does_not_license_answering_from_memory() {
+        let block = build_tool_prompt_block(&[]);
+        assert!(
+            !block.contains("general knowledge questions"),
+            "the 'general knowledge questions' carve-out lets a materials \
+             question be answered from memory — contradicts the agent prompt"
+        );
+        for marker in [
+            "NOT a licence to answer from memory",
+            "never fill the \
+             gap from memory",
+        ] {
+            assert!(
+                block.contains(marker),
+                "retrieval-discipline marker `{marker}` missing from the tool block"
             );
         }
     }

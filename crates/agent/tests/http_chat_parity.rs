@@ -13,6 +13,10 @@
 //!    a `requires_approval` tool is NEVER executed without explicit
 //!    pre-approval (surfaced as an `approval_required` event), and runs
 //!    exactly once when the client re-sends with `approve: ["<tool>"]`.
+//! 3. `unsupported_execution_claim_cannot_finalize_a_turn` — the Agent
+//!    Execution Contract's structural half: a final answer claiming execution
+//!    while zero tools ran is rejected by `run_turn`, not merely discouraged
+//!    by prompt text.
 //!
 //! Requires `python3` on PATH; tests skip (with a note) when absent.
 
@@ -95,6 +99,10 @@ enum StubMode {
     /// "GATED_DONE". Keyed on the last message so resumed sessions that
     /// already contain old tool messages still trigger a fresh call.
     GatedTool,
+    /// Never calls a tool. Answers with a FABRICATED execution claim ("I ran
+    /// the test suite…") until the execution-contract reminder shows up in the
+    /// history, then answers honestly. Drives the finalization-gate test.
+    ClaimsWithoutTools,
 }
 
 fn sse_text(text: &str) -> String {
@@ -128,10 +136,26 @@ async fn start_stub_llm(mode: StubMode) -> String {
                     .and_then(|msgs| msgs.last())
                     .map(|m| m["role"] == "tool")
                     .unwrap_or(false);
+                let saw_contract_reminder = body["messages"]
+                    .as_array()
+                    .map(|msgs| {
+                        msgs.iter().any(|m| {
+                            m["content"]
+                                .as_str()
+                                .is_some_and(|c| c.contains("EXECUTION CONTRACT"))
+                        })
+                    })
+                    .unwrap_or(false);
                 let sse = match mode {
                     StubMode::PlainAnswer => sse_text("PARITY_OK"),
                     StubMode::GatedTool if last_is_tool => sse_text("GATED_DONE"),
                     StubMode::GatedTool => sse_tool_call("stub_gated"),
+                    StubMode::ClaimsWithoutTools if saw_contract_reminder => {
+                        sse_text("HONEST: I did not run anything.")
+                    }
+                    StubMode::ClaimsWithoutTools => {
+                        sse_text("I ran the test suite and everything passes.")
+                    }
                 };
                 axum::response::Response::builder()
                     .header("content-type", "text/event-stream")
@@ -439,4 +463,86 @@ async fn gated_tool_is_skipped_then_runs_when_approved() {
         .filter(|line| line.contains("stub_gated"))
         .count();
     assert_eq!(calls, 1, "approved tool executes exactly once");
+}
+
+/// STRUCTURAL PROOF for the Agent Execution Contract: an answer that claims
+/// execution while zero tools ran this turn must NOT be allowed to terminate
+/// the turn.
+///
+/// The stub LLM never calls a tool. Its first answer is a fabrication ("I ran
+/// the test suite and everything passes."). If the gate is wired, `run_turn`
+/// rejects that finalization, injects the contract reminder, and the model's
+/// second answer is what completes the turn. If the gate is missing or the
+/// tool counter is wrong, the fabrication ships and this fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn unsupported_execution_claim_cannot_finalize_a_turn() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let base_url = start_stub_llm(StubMode::ClaimsWithoutTools).await;
+
+    let seed = build_agent_seed(
+        &tool_server_config(project.path(), &python),
+        &llm_config(base_url.clone()),
+    )
+    .await
+    .expect("seed");
+    let AgentSeed {
+        mut tool_server,
+        command_tool_runtime,
+        tools,
+        config,
+        hooks,
+        permissions,
+    } = seed;
+
+    let llm = LlmClient::new(llm_config(base_url));
+    let mut history = Vec::new();
+    let mut transcript = prism_agent::transcript::TranscriptStore::new(None);
+    let mut scratchpad = prism_agent::scratchpad::Scratchpad::new();
+    let mut answer = String::new();
+    agent_loop::run_turn(
+        &llm,
+        &mut tool_server,
+        &command_tool_runtime,
+        &mut history,
+        tools.as_ref(),
+        config.as_ref(),
+        "run the test suite",
+        None,
+        &mut transcript,
+        hooks.as_ref(),
+        &permissions,
+        None,
+        &mut scratchpad,
+        &mut |event| {
+            if let AgentEvent::TurnComplete {
+                text: Some(text), ..
+            } = event
+                && !text.is_empty()
+            {
+                answer = text;
+            }
+        },
+        None,
+        None,
+    )
+    .await
+    .expect("turn");
+
+    assert_eq!(
+        answer, "HONEST: I did not run anything.",
+        "the gate must reject the unsupported claim and force a second pass"
+    );
+    assert!(
+        history
+            .iter()
+            .any(|m| m.content.as_deref().is_some_and(|c| {
+                c.contains("EXECUTION CONTRACT") && c.contains("finalization rejected")
+            })),
+        "the contract reminder must be injected into the turn history"
+    );
 }

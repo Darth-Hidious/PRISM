@@ -781,6 +781,11 @@ pub async fn run_turn(
     // FULL definitions stay in the request every later iteration. Without this,
     // find_tools returned names the model could never actually call.
     let mut pinned_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Execution-contract gate state: tools actually executed this turn, and
+    // whether the finalization gate has already fired once. Firing at most
+    // once bounds the cost of a false positive to one extra model turn.
+    let mut tool_calls_this_turn: usize = 0;
+    let mut contract_gate_fired = false;
 
     // ── 2. TAOR iteration loop ────────────────────────────────────
     for iteration in 0..config.max_iterations {
@@ -1068,7 +1073,49 @@ pub async fn run_turn(
         let tool_calls = match &response.message.tool_calls {
             Some(calls) if !calls.is_empty() => calls.clone(),
             _ => {
-                // No tool calls → turn complete
+                // No tool calls → turn complete.
+
+                // ── Execution-contract gate ───────────────────────
+                // Deterministic, no-LLM: an answer that claims execution while
+                // zero tools ran this turn has no evidence behind it. Reject
+                // the finalization ONCE and hand the model the fork (do it, or
+                // stop claiming it). See `execution_contract`.
+                //
+                // `iteration + 1 < max_iterations` is load-bearing: `continue`
+                // on the LAST iteration would fall through to the
+                // max-iterations arm, which emits `TurnComplete { text: None }`
+                // — the user would lose the answer entirely. Never trade a
+                // fabricated answer for no answer; on the last iteration the
+                // claim ships and the prompt is the only line of defence.
+                if !contract_gate_fired
+                    && iteration + 1 < config.max_iterations
+                    && let Some(claim) = crate::execution_contract::unsupported_execution_claim(
+                        response.message.content.as_deref().unwrap_or(""),
+                        tool_calls_this_turn,
+                    )
+                {
+                    contract_gate_fired = true;
+                    tracing::info!(
+                        claim = %claim,
+                        "execution-contract gate: rejected unsupported execution claim"
+                    );
+                    // The rejected text already streamed to the user. Say why a
+                    // second answer is coming rather than leaving two
+                    // contradictory answers on screen with no explanation.
+                    emit(AgentEvent::TextDelta {
+                        text: "\n\n[unverified claim — no tool ran this turn; re-checking]\n\n"
+                            .to_string(),
+                    });
+                    history.push(ChatMessage {
+                        role: "system".to_string(),
+                        content: Some(
+                            crate::execution_contract::UNSUPPORTED_CLAIM_REMINDER.to_string(),
+                        ),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                    continue;
+                }
 
                 // Auto-compact if needed
                 if transcript.should_compact()
@@ -1103,6 +1150,7 @@ pub async fn run_turn(
         };
 
         // ── 2h. Process each tool call ────────────────────────────
+        tool_calls_this_turn += tool_calls.len();
         for tc in &tool_calls {
             let tool_name = &tc.function.name;
             let call_id = &tc.id;
@@ -1448,8 +1496,10 @@ pub async fn run_turn(
                 if *streak >= EMPTY_RESULT_MAX {
                     let abort_msg = format!(
                         "{tool_name} returned empty results {streak} times in a row. \
-                         This tool isn't finding what you need — try a different tool, \
-                         rephrase the query, or answer from your own knowledge.",
+                         This tool isn't finding what you need — try a different tool \
+                         or rephrase the query. If nothing finds it, report that it \
+                         was not found and say which attempts you made. Do NOT fill \
+                         the gap from memory.",
                     );
                     emit(AgentEvent::ToolCallResult {
                         call_id: call_id.clone(),
