@@ -54,7 +54,9 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "Downloading ${URL}..."
-if ! curl -fSL "$URL" -o "${TMPDIR}/${ARCHIVE}"; then
+# --progress-bar instead of the default meter: the multi-column table
+# redraws over itself when piped through `| bash` and looks like breakage.
+if ! curl -fSL --progress-bar "$URL" -o "${TMPDIR}/${ARCHIVE}"; then
     echo "Error: Download failed." >&2
     echo "Check that ${VERSION} has a release for ${PLATFORM}-${ARCH}." >&2
     echo "Available at: https://github.com/${REPO}/releases" >&2
