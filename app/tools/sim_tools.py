@@ -310,6 +310,7 @@ def _get_job_results(**kwargs) -> dict:
             return {"error": f"Job {job_id} has not finished (status: {job.status})"}
 
         results = {"job_id": job_id}
+        unreadable = []
         for prop in properties:
             try:
                 val = job[prop]
@@ -317,10 +318,52 @@ def _get_job_results(**kwargs) -> dict:
                 if hasattr(val, "tolist"):
                     val = val.tolist()
                 results[prop] = val
-            except Exception:
+            except Exception as exc:
+                # None here used to be indistinguishable from "the code
+                # genuinely reported nothing". Name what failed.
                 results[prop] = None
+                unreadable.append(
+                    {"property": prop, "reason": f"{type(exc).__name__}: {exc}"}
+                )
+        if unreadable:
+            results["unreadable_properties"] = unreadable
 
-        return results
+        from app.tools import _provenance as prov
+
+        code = str(getattr(getattr(job, "server", None), "run_mode", "")) or "unknown"
+        return prov.attach(results, prov.build(
+            tool_name="sim_job",
+            engine="pyiron",
+            engine_version=prov.versions_of("pyiron_atomistics").get(
+                "pyiron_atomistics", "absent"),
+            activity=f"pyiron.{type(job).__name__}.results",
+            inputs={
+                "job_id": job_id,
+                "job_name": str(getattr(job, "job_name", job_id)),
+                "job_class": type(job).__name__,
+                "potential": str(getattr(job, "potential", None)),
+                "run_mode": code,
+                "properties_requested": list(properties),
+            },
+            # PRISM does not convert: these are whatever the calculator
+            # wrote into the pyiron HDF5. Unit conventions belong to the
+            # code (LAMMPS/VASP) and its pyiron adapter, so name the engine
+            # rather than assert a unit that was never verified here.
+            units={
+                p: "as reported by pyiron/" + type(job).__name__
+                for p in properties
+            },
+            derived_from=[{
+                "role": "simulation_job",
+                "job_id": job_id,
+                "job_class": type(job).__name__,
+                "potential": str(getattr(job, "potential", None)),
+            }],
+            reproduce=(
+                f"sim_job(action='results', job_id={job_id!r}, "
+                f"properties={list(properties)!r})"
+            ),
+        ))
     except Exception as e:
         return {"error": str(e)}
 
@@ -581,6 +624,7 @@ def _run_workflow(**kwargs) -> dict:
         jid = bridge.jobs.store(job, job_name)
 
         result_data = {}
+        extraction_error = None
         try:
             if workflow_type == "elastic_constants" and hasattr(job, "elastic_matrix"):
                 em = job.elastic_matrix
@@ -589,15 +633,48 @@ def _run_workflow(**kwargs) -> dict:
                 result_data["equilibrium_volume"] = float(job["equilibrium_volume"]) if "equilibrium_volume" in job else None
                 result_data["equilibrium_energy"] = float(job["equilibrium_energy"]) if "equilibrium_energy" in job else None
                 result_data["bulk_modulus"] = float(job["equilibrium_bulk_modulus"]) if "equilibrium_bulk_modulus" in job else None
-        except Exception:
-            pass
+        except Exception as exc:
+            # `pass` here made a failed extraction look like a workflow that
+            # simply produced nothing. An empty result is a defect to report.
+            extraction_error = f"{type(exc).__name__}: {exc}"
 
-        return {
+        from app.tools import _provenance as prov
+
+        out = {
             "job_id": jid,
             "workflow_type": workflow_type,
             "status": str(job.status),
             "results": result_data,
         }
+        if extraction_error:
+            out["result_extraction_error"] = extraction_error
+        return prov.attach(out, prov.build(
+            tool_name="sim_run",
+            engine="pyiron",
+            engine_version=prov.versions_of("pyiron_atomistics").get(
+                "pyiron_atomistics", "absent"),
+            activity=f"pyiron.{wf_class_name}",
+            inputs={
+                "workflow_type": workflow_type,
+                "structure_id": structure_id,
+                "reference_code": ref_code,
+                "reference_job_class": ref_class_name,
+                "potential": parameters.get("potential"),
+                "parameters": parameters,
+            },
+            units={k: f"as reported by pyiron/{wf_class_name}" for k in result_data},
+            derived_from=[
+                {"role": "input_structure", "structure_id": structure_id,
+                 "formula": atoms.get_chemical_formula(), "n_atoms": len(atoms)},
+                {"role": "interatomic_potential",
+                 "potential": parameters.get("potential"),
+                 "code": ref_code},
+            ],
+            reproduce=(
+                f"sim_run(workflow_type={workflow_type!r}, "
+                f"structure_id={structure_id!r}, parameters={parameters!r})"
+            ),
+        ))
     except Exception as e:
         return {"error": str(e)}
 

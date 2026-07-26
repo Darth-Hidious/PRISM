@@ -10,12 +10,11 @@ the tool result from being returned to the LLM.
 from __future__ import annotations
 
 import json
-import platform
-import socket
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from app.tools import _provenance as prov_common
 
 from .. import __version__ as MACE_MCP_VERSION
 from ..auth import get_hf_token, get_results_repo, scrub_token
@@ -24,29 +23,28 @@ from ..logging_cfg import get_logger
 
 log = get_logger("mace_mcp.provenance")
 
+#: MACE reports energies in eV and forces in eV/Angstrom (ase conventions);
+#: PRISM converts nothing (see prov_common.UNITS_POLICY).
+MACE_UNITS = {
+    "energy": "eV",
+    "energy_per_atom": "eV/atom",
+    "forces": "eV/Angstrom",
+    "stress": "eV/Angstrom^3",
+    "lattice": "Angstrom",
+    "temperature": "K",
+    "frequencies": "THz",
+}
+
 
 def collect_versions() -> dict[str, str]:
     """Detect installed versions of the physics stack. Best-effort."""
-    out: dict[str, str] = {
-        "mace_mcp": MACE_MCP_VERSION,
-        "python": platform.python_version(),
-    }
-    for mod in ("numpy", "ase", "torch", "mace", "phonopy", "scipy"):
-        try:
-            m = __import__(mod)
-            ver = getattr(m, "__version__", "unknown")
-            out[mod] = ver
-        except Exception:
-            out[mod] = "absent"
+    out = prov_common.versions_of("numpy", "ase", "torch", "mace", "phonopy", "scipy")
+    out["mace_mcp"] = MACE_MCP_VERSION
     return out
 
 
 def collect_host() -> dict[str, str]:
-    info: dict[str, str] = {
-        "platform": sys.platform,
-        "hostname": socket.gethostname(),
-        "python_impl": platform.python_implementation(),
-    }
+    info = prov_common.collect_host()
     try:
         import torch  # type: ignore
 
@@ -74,20 +72,25 @@ def build(
     quality_flags: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the provenance dict (not yet written to disk)."""
+    mace_model = {
+        "repo_id": "mace-foundations/mace-mh-1",
+        "filename": "mace-mh-1.model",
+        "head": head,
+        "dtype": dtype,
+    }
+    versions = collect_versions()
     return {
+        "schema_version": prov_common.PROVENANCE_SCHEMA_VERSION,
         "tool_name": tool_name,
         "tool_version": tool_version,
         "job_id": job_id,
         "cache_key": cache_key,
         "input": _sanitise(input_payload),
         "result_summary": _sanitise(result_summary),
-        "mace_model": {
-            "repo_id": "mace-foundations/mace-mh-1",
-            "filename": "mace-mh-1.model",
-            "head": head,
-            "dtype": dtype,
-        },
-        "versions": collect_versions(),
+        "mace_model": mace_model,
+        "units": MACE_UNITS,
+        "units_policy": prov_common.UNITS_POLICY,
+        "versions": versions,
         "host": collect_host(),
         "git": {
             "mace_mcp_sha": git_sha(),
@@ -99,6 +102,28 @@ def build(
         "quality_flags": quality_flags or {},
         "results_dataset": get_results_repo(),
         "created_at_iso8601": datetime.now(timezone.utc).isoformat(),
+        # PROV-O relations — same three keys every PRISM tool emits
+        # (app/tools/_provenance.py), so one reader handles every bundle.
+        "wasGeneratedBy": {
+            "activity": f"mace.{tool_name}",
+            "engine": "mace-torch",
+            "engine_version": versions.get("mace", "absent"),
+            "backend": backend,
+        },
+        "wasDerivedFrom": [
+            {"role": "interatomic_potential", **mace_model},
+            {"role": "input_structure", "cache_key": cache_key},
+        ],
+        "wasAttributedTo": {
+            "agent": "PRISM",
+            "agent_type": "SoftwareAgent",
+            "prism_version": MACE_MCP_VERSION,
+            "host": collect_host().get("hostname", "unknown"),
+        },
+        "reproduce": (
+            f"cache_key={cache_key} "
+            f"(mace_get_cached_structure / rerun {tool_name})"
+        ),
     }
 
 

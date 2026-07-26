@@ -95,15 +95,41 @@ ELEMENT_DATA = {
 
 
 def _parse_formula(formula: str) -> Dict[str, float]:
-    """Parse a simple chemical formula into element:count dict."""
+    """Parse a chemical formula into an element:count dict.
+
+    Handles nested groups — ``Ca(OH)2`` is Ca1 O2 H2, not the Ca1 O1 H2 the
+    old flat regex produced. A silently wrong composition is a silently
+    wrong feature vector, so the parser has to see the parentheses.
+    """
     import re
-    pattern = r'([A-Z][a-z]?)(\d*\.?\d*)'
-    matches = re.findall(pattern, formula)
-    composition = {}
-    for elem, count in matches:
-        if elem:
-            composition[elem] = float(count) if count else 1.0
-    return composition
+
+    token = re.compile(r"([A-Z][a-z]?)(\d*\.?\d*)|(\()|(\)(\d*\.?\d*))")
+    stack: list[Dict[str, float]] = [{}]
+    pos = 0
+    while pos < len(formula):
+        m = token.match(formula, pos)
+        if m is None:
+            pos += 1  # skip separators (·, spaces, charges) as before
+            continue
+        pos = m.end()
+        if m.group(3):  # "("
+            stack.append({})
+        elif m.group(4):  # ")" with optional multiplier
+            mult = float(m.group(5)) if m.group(5) else 1.0
+            group = stack.pop()
+            if not stack:
+                stack = [{}]
+            for el, n in group.items():
+                stack[-1][el] = stack[-1].get(el, 0.0) + n * mult
+        elif m.group(1):  # element symbol
+            n = float(m.group(2)) if m.group(2) else 1.0
+            stack[-1][m.group(1)] = stack[-1].get(m.group(1), 0.0) + n
+    # Unbalanced "(" — fold the open groups in rather than dropping atoms.
+    while len(stack) > 1:
+        group = stack.pop()
+        for el, n in group.items():
+            stack[-1][el] = stack[-1].get(el, 0.0) + n
+    return stack[0]
 
 
 def _composition_features_basic(formula: str) -> Dict[str, float]:
@@ -131,7 +157,17 @@ def _composition_features_basic(formula: str) -> Dict[str, float]:
             continue
 
         import statistics
-        weighted_avg = sum(v * w for v, w in zip(values, weights))
+        # Renormalise over the elements ELEMENT_DATA actually covers. The
+        # weights are fractions of the WHOLE formula, so when an element is
+        # missing from the 44-element table they no longer sum to 1 and the
+        # "weighted average" is biased low by exactly the missing fraction —
+        # e.g. LaFeO3 (La absent) gave avg_electronegativity 2.43 instead of
+        # the 3.04 the covered Fe/O subset actually averages to. A number
+        # labelled `avg_electronegativity` has to be one.
+        weight_sum = sum(weights)
+        if weight_sum <= 0:
+            continue
+        weighted_avg = sum(v * w for v, w in zip(values, weights)) / weight_sum
         features[f"avg_{prop_name}"] = weighted_avg
         features[f"min_{prop_name}"] = min(values)
         features[f"max_{prop_name}"] = max(values)
@@ -150,6 +186,12 @@ def _composition_features_basic(formula: str) -> Dict[str, float]:
 
 _USE_MATMINER = _check_matminer_available()
 
+#: Bump whenever the NUMBERS a backend produces change while the feature
+#: NAMES stay the same — otherwise a model trained before the change keeps
+#: predicting from silently different inputs. v2: `avg_*` renormalised over
+#: the covered elements and the formula parser learned nested groups.
+_BASIC_BACKEND_VERSION = "v2"
+
 
 def composition_features(formula: str) -> Dict[str, float]:
     """Generate composition-based features from a chemical formula.
@@ -167,3 +209,19 @@ def composition_features(formula: str) -> Dict[str, float]:
 def get_feature_backend() -> str:
     """Return which feature backend is active."""
     return "matminer" if _USE_MATMINER else "basic"
+
+
+def feature_backend_id() -> str:
+    """Backend identity INCLUDING its version, for model provenance.
+
+    ``get_feature_backend()`` answers "which library"; this answers "which
+    numbers", which is what a stored model has to be matched against.
+    """
+    if _USE_MATMINER:
+        try:
+            import matminer
+
+            return f"matminer/{getattr(matminer, '__version__', 'unknown')}"
+        except Exception:
+            return "matminer/unknown"
+    return f"basic/{_BASIC_BACKEND_VERSION}"

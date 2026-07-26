@@ -197,7 +197,11 @@ def _model_train(**kw) -> dict:
 
         # 2. Featurize (matminer Magpie when installed, basic fallback else).
         import numpy as np
-        from app.tools.ml.features import composition_features, get_feature_backend
+        from app.tools.ml.features import (
+            composition_features,
+            feature_backend_id,
+            get_feature_backend,
+        )
 
         feature_names = None
         X_rows, y, skipped = [], [], 0
@@ -242,6 +246,9 @@ def _model_train(**kw) -> dict:
             "n_skipped": skipped,
             "n_features": len(feature_names or []),
             "feature_backend": get_feature_backend(),
+            # Versioned identity — predict() refuses to score a model whose
+            # featurizer produced different numbers under the same names.
+            "feature_backend_id": feature_backend_id(),
             "source": source,
             "model_path": str(model_path),
             "next": f"predict(target='formula', formula='...', property_name='{property_name}', algorithm='{algorithm}')",
@@ -292,7 +299,12 @@ _PREDICT_DESCRIPTION = (
     "Use target='formula' when you only know the chemistry; use target='structure' "
     "when you have actual atomic coordinates. NOT for batch dataset prediction "
     "(use the predict_properties skill) and NOT for property selection "
-    "(use list_predictable_properties)."
+    "(use list_predictable_properties).\n"
+    "Results carry `unit` and a `provenance` block (model file SHA-256, "
+    "training holdout metrics, featurizer identity, `reproduce` string). "
+    "A predicted value is only as good as those metrics — report them with "
+    "the number. `unit: 'unknown'` means the model was trained on a column "
+    "whose unit PRISM was never told; do not invent one."
 )
 
 _PREDICT_SCHEMA = {

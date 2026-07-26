@@ -129,13 +129,38 @@ def predict_with_pretrained(
             prediction = model.predict_structure(structure)
             # matgl returns a tensor or float
             value = float(prediction)
-            return {
+            result = {
                 "prediction": value,
                 "property": info["property"],
                 "unit": info["unit"],
                 "model": model_name,
                 "model_id": info["model_id"],
             }
+            from app.tools import _provenance as prov
+
+            return prov.attach(result, prov.build(
+                tool_name="predict",
+                engine="matgl",
+                engine_version=prov.versions_of("matgl").get("matgl", "absent"),
+                activity=f"matgl.{info['model_id']}.predict_structure",
+                inputs={
+                    "model": model_name,
+                    "formula": structure.composition.reduced_formula,
+                    "n_sites": len(structure),
+                    "lattice_abc_Angstrom": list(structure.lattice.abc),
+                    "lattice_angles_deg": list(structure.lattice.angles),
+                },
+                units={"prediction": info["unit"]},
+                derived_from=[{
+                    "role": "pretrained_model",
+                    "model_id": info["model_id"],
+                    "training_set": "Materials Project (see matgl model card)",
+                }],
+                reproduce=(
+                    f"predict(target='structure', model={model_name!r}, "
+                    "structure={...})"
+                ),
+            ))
         except Exception as e:
             return {"error": f"Prediction failed: {e}"}
 
