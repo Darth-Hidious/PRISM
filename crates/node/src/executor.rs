@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use prism_proto::ResourceRequest;
 use serde::Serialize;
 use tokio::process::Command;
 use uuid::Uuid;
@@ -55,17 +56,118 @@ impl ContainerRuntime {
     }
 }
 
+/// What `docker run` / `podman run` is actually given — the resolution of a
+/// job's [`ResourceRequest`] against this container node.
+///
+/// Produced only by [`resolve_container_resources`], so there is exactly one
+/// place where "what the hub asked for" becomes "what the container gets".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerLimits {
+    /// `--cpus`. `None` = no cap (the runtime's default).
+    pub cpus: Option<u32>,
+    /// `--memory`, in GB. `None` = the 75%-of-system-RAM fallback below.
+    pub memory_gb: Option<u32>,
+    /// Value for `--gpus`. `None` = emit no GPU flag at all (CPU-only).
+    pub gpus: Option<String>,
+}
+
+/// Resolve a job's [`ResourceRequest`] for this container node, or fail loud.
+///
+/// `None` reproduces the pre-`resource_request` behaviour exactly: `--gpus all`
+/// iff `gpu_type` was set, no CPU cap, the default memory limit. That is what
+/// makes an OLD hub (which never sends the field) and this node interoperate.
+///
+/// With a request present, it wins on every axis it names — including
+/// `accelerator: None`, which means CPU-ONLY and suppresses the GPU flag even
+/// when `gpu_type` is set, because an explicit "no accelerator" must beat an
+/// inferred one.
+///
+/// Anything this node cannot render is REFUSED here, before the job runs:
+///
+/// * A **scheduler** requirement. This node's job runner launches containers
+///   directly; it has no `sbatch` path. Running the work some other way would
+///   return a result the requester cannot reproduce.
+/// * A **partition**. A container runtime has no queues, so there is no honest
+///   way to run a job that asked for one.
+/// * **More accelerators than exist.** Unlike SLURM, a container node's GPU
+///   count is locally authoritative, so this is genuinely unsatisfiable and is
+///   refused here rather than handed to docker to fail confusingly later.
+///
+/// `time_limit_secs` is deliberately NOT an error: it is a queue-priority hint
+/// with no queue to apply it to, and the hub's `timeout_secs` already bounds
+/// the run, so ignoring it changes nothing about the resources the job gets.
+///
+/// `advertised_scheduler` is used only to make a refusal name the
+/// contradiction when this node advertises a scheduler it cannot dispatch
+/// through.
+pub fn resolve_container_resources(
+    req: Option<&ResourceRequest>,
+    gpu_type: Option<&str>,
+    total_gpus: u32,
+    advertised_scheduler: Option<&str>,
+) -> Result<ContainerLimits, String> {
+    let Some(req) = req else {
+        return Ok(ContainerLimits {
+            cpus: None,
+            memory_gb: None,
+            gpus: gpu_type.map(|_| "all".to_string()),
+        });
+    };
+
+    req.validate()?;
+
+    if let Some(wanted) = &req.scheduler {
+        let contradiction = match advertised_scheduler {
+            Some(s) if s.eq_ignore_ascii_case(wanted) => format!(
+                " — note this node ADVERTISES '{s}' because the client binaries are installed, \
+                 but its job runner only launches containers, so the advertisement is what is \
+                 wrong here, not the request"
+            ),
+            _ => String::new(),
+        };
+        return Err(format!(
+            "job requires scheduler '{wanted}' but this node dispatches containers directly and \
+             has no scheduler runner — refusing rather than running the job a different \
+             way{contradiction}"
+        ));
+    }
+
+    if let Some(p) = &req.partition {
+        return Err(format!(
+            "job requests partition '{p}' but this node runs containers directly and has no \
+             queues — refusing rather than running it outside the requested partition"
+        ));
+    }
+
+    let gpus = match &req.accelerator {
+        Some(a) if a.count > total_gpus => {
+            return Err(format!(
+                "job requests {} x '{}' but this node has {total_gpus} GPU(s) — unsatisfiable",
+                a.count, a.class
+            ));
+        }
+        Some(a) => Some(a.count.to_string()),
+        // Explicit CPU-only: no GPU flag, even on a GPU-bearing node.
+        None => None,
+    };
+
+    Ok(ContainerLimits {
+        cpus: req.cpus,
+        memory_gb: req.memory_gb,
+        gpus,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ContainerJobSpec {
     pub job_id: Uuid,
     pub image: String,
     pub env_vars: BTreeMap<String, String>,
-    pub gpu_type: Option<String>,
     pub timeout_secs: u64,
     pub allow_network: bool,
     pub workspace_dir: PathBuf,
-    /// Memory limit for the container (e.g. "8g", "16g"). If None, uses 75% of system RAM.
-    pub memory_limit: Option<String>,
+    /// Resolved resource limits — see [`resolve_container_resources`].
+    pub limits: ContainerLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -211,17 +313,25 @@ pub async fn execute_container_job(
         args.push("none".to_string());
     }
 
-    if spec.gpu_type.is_some() {
-        args.push("--gpus".to_string());
-        args.push("all".to_string());
+    if let Some(cpus) = spec.limits.cpus {
+        args.push(format!("--cpus={cpus}"));
     }
 
-    let mem_limit = spec.memory_limit.clone().unwrap_or_else(|| {
-        let sys = sysinfo::System::new_all();
-        let total_gb = sys.total_memory() / 1024 / 1024 / 1024;
-        let limit_gb = (total_gb * 3 / 4).max(2); // 75% of system RAM, minimum 2 GB
-        format!("{limit_gb}g")
-    });
+    if let Some(gpus) = &spec.limits.gpus {
+        args.push("--gpus".to_string());
+        args.push(gpus.clone());
+    }
+
+    let mem_limit = spec
+        .limits
+        .memory_gb
+        .map(|gb| format!("{gb}g"))
+        .unwrap_or_else(|| {
+            let sys = sysinfo::System::new_all();
+            let total_gb = sys.total_memory() / 1024 / 1024 / 1024;
+            let limit_gb = (total_gb * 3 / 4).max(2); // 75% of system RAM, minimum 2 GB
+            format!("{limit_gb}g")
+        });
     args.push("--memory".to_string());
     args.push(mem_limit);
 
@@ -619,5 +729,116 @@ mod tests {
     fn runtime_handle_is_stable() {
         let job_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
         assert!(runtime_handle(job_id).starts_with("prism-job-"));
+    }
+
+    // ── resolve_container_resources ─────────────────────────────────────
+
+    /// BACKWARD COMPATIBILITY. A hub that predates `resource_request` sends
+    /// nothing, and the node must behave exactly as it did before the field
+    /// existed: `--gpus all` iff `gpu_type` was set, no CPU cap, default memory.
+    #[test]
+    fn no_resource_request_reproduces_the_legacy_behaviour() {
+        let with_gpu = resolve_container_resources(None, Some("A100-80GB"), 4, None).unwrap();
+        assert_eq!(
+            with_gpu,
+            ContainerLimits {
+                cpus: None,
+                memory_gb: None,
+                gpus: Some("all".to_string()),
+            }
+        );
+
+        let without_gpu = resolve_container_resources(None, None, 0, None).unwrap();
+        assert_eq!(without_gpu, ContainerLimits::default());
+    }
+
+    /// A satisfiable request is honoured on every axis it names — this is the
+    /// whole point: 64 cores asked for is 64 cores allocated.
+    #[test]
+    fn a_satisfiable_request_is_honoured_verbatim() {
+        let req = ResourceRequest {
+            cpus: Some(64),
+            memory_gb: Some(128),
+            // A walltime hint with no queue to apply it to — ignored on
+            // purpose, and explicitly NOT an error.
+            time_limit_secs: Some(14400),
+            accelerator: Some(prism_proto::Accelerator {
+                class: "A100-80GB".into(),
+                count: 2,
+            }),
+            ..Default::default()
+        };
+        let limits = resolve_container_resources(Some(&req), Some("A100-80GB"), 4, None).unwrap();
+        assert_eq!(
+            limits,
+            ContainerLimits {
+                cpus: Some(64),
+                memory_gb: Some(128),
+                gpus: Some("2".to_string()),
+            }
+        );
+    }
+
+    /// An explicit CPU-only ask beats the inferred `gpu_type` rule: no GPU flag
+    /// at all, even on a node that has four of them.
+    #[test]
+    fn explicit_cpu_only_suppresses_the_inferred_gpu() {
+        let req = ResourceRequest {
+            cpus: Some(8),
+            accelerator: None,
+            ..Default::default()
+        };
+        let limits = resolve_container_resources(Some(&req), Some("A100-80GB"), 4, None).unwrap();
+        assert_eq!(limits.gpus, None);
+        assert_eq!(limits.cpus, Some(8));
+    }
+
+    #[test]
+    fn unsatisfiable_asks_are_refused_not_approximated() {
+        let scheduler = ResourceRequest {
+            scheduler: Some("slurm".into()),
+            ..Default::default()
+        };
+        let err =
+            resolve_container_resources(Some(&scheduler), None, 0, Some("slurm")).unwrap_err();
+        assert!(err.contains("requires scheduler 'slurm'"), "{err}");
+        assert!(err.contains("ADVERTISES 'slurm'"), "{err}");
+
+        // Same ask on a node that never claimed slurm: still refused, but with
+        // no contradiction to point at.
+        let err = resolve_container_resources(Some(&scheduler), None, 0, None).unwrap_err();
+        assert!(err.contains("requires scheduler 'slurm'"), "{err}");
+        assert!(!err.contains("ADVERTISES"), "{err}");
+
+        let partition = ResourceRequest {
+            partition: Some("gpu".into()),
+            ..Default::default()
+        };
+        assert!(
+            resolve_container_resources(Some(&partition), None, 0, None)
+                .unwrap_err()
+                .contains("no queues")
+        );
+
+        let too_many_gpus = ResourceRequest {
+            accelerator: Some(prism_proto::Accelerator {
+                class: "A100-80GB".into(),
+                count: 8,
+            }),
+            ..Default::default()
+        };
+        let err = resolve_container_resources(Some(&too_many_gpus), None, 2, None).unwrap_err();
+        assert!(err.contains("unsatisfiable"), "{err}");
+
+        // A malformed request never reaches the runtime either.
+        let zero_cores = ResourceRequest {
+            cpus: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            resolve_container_resources(Some(&zero_cores), None, 0, None)
+                .unwrap_err()
+                .contains("0 CPU cores")
+        );
     }
 }

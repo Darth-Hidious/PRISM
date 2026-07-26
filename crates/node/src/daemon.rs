@@ -660,6 +660,7 @@ async fn connect_and_run(
                             &running_deployments,
                             tool_invoker,
                             audit_emitter,
+                            capabilities,
                         ).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -720,6 +721,9 @@ async fn handle_platform_message(
     running_deployments: &RunningDeployments,
     tool_invoker: Option<&mpsc::Sender<ToolInvocationRequest>>,
     audit_emitter: Option<&Arc<prism_audit::AuditEmitter>>,
+    // `node_caps` is what this node advertised at registration — the truth a
+    // `SubmitJob`'s `prism_proto::ResourceRequest` is checked against.
+    node_caps: &NodeCapabilities,
 ) {
     let msg: PlatformMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -751,8 +755,68 @@ async fn handle_platform_message(
             env_vars,
             gpu_type,
             timeout_secs,
+            resource_request,
         } => {
             tracing::info!(%job_id, %image, timeout = timeout_secs, "received job");
+
+            // WIRE-DRIFT GUARD. The hub half of this protocol lives in another
+            // repository and can run ahead of this node. Deserialization drops
+            // keys it does not know WITHOUT AN ERROR, so the raw frame is
+            // checked instead: an instruction this build cannot even see is one
+            // it certainly cannot honour, and running the job anyway would
+            // burn a real allocation on resources nobody asked for.
+            let unknown = serde_json::from_str::<serde_json::Value>(text)
+                .map(|raw| prism_proto::unknown_submit_job_fields(&raw))
+                .unwrap_or_default();
+            if !unknown.is_empty() {
+                let error = format!(
+                    "platform sent submit_job field(s) this node does not understand: {} — \
+                     refusing rather than running the job with them silently dropped (node \
+                     protocol v{}); upgrade the node",
+                    unknown.join(", "),
+                    prism_proto::NODE_PROTOCOL_VERSION,
+                );
+                tracing::error!(%job_id, fields = %unknown.join(", "), "protocol drift: refusing job");
+                send_msg(
+                    outgoing_tx,
+                    &NodeMessage::JobFailed {
+                        job_id,
+                        error,
+                        output: None,
+                        duration_secs: 0,
+                    },
+                )
+                .await;
+                return;
+            }
+
+            // Honour the resource request or say so — never silently ignore it.
+            // Checked BEFORE the runtime probe because an ask this node can
+            // never satisfy is a fact about the job, not about whether docker
+            // happens to be installed right now.
+            let total_gpus: u32 = node_caps.gpus.iter().map(|g| g.count).sum();
+            let limits = match executor::resolve_container_resources(
+                resource_request.as_ref(),
+                gpu_type.as_deref(),
+                total_gpus,
+                node_caps.scheduler.as_deref(),
+            ) {
+                Ok(limits) => limits,
+                Err(error) => {
+                    tracing::error!(%job_id, %error, "refusing job: resource request cannot be honoured");
+                    send_msg(
+                        outgoing_tx,
+                        &NodeMessage::JobFailed {
+                            job_id,
+                            error,
+                            output: None,
+                            duration_secs: 0,
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
 
             let Some(runtime) = executor::resolve_container_runtime(
                 std::env::var("PRISM_NODE_CONTAINER_RUNTIME")
@@ -855,11 +919,10 @@ async fn handle_platform_message(
                     job_id,
                     image: image.clone(),
                     env_vars: env_vars.clone().into_iter().collect(),
-                    gpu_type: gpu_type.clone(),
                     timeout_secs,
                     allow_network: false,
                     workspace_dir: workspace_dir.clone(),
-                    memory_limit: None, // auto-detect from system RAM
+                    limits,
                 };
 
                 let execute = executor::execute_container_job(runtime, &spec, |progress, msg| {
@@ -2461,6 +2524,29 @@ mod tests {
         }
     }
 
+    /// A plain CPU-only node: no GPUs, no scheduler. The baseline the
+    /// resource-request tests vary one axis at a time from.
+    fn test_capabilities() -> NodeCapabilities {
+        NodeCapabilities {
+            gpus: vec![],
+            cpu_cores: 8,
+            ram_gb: 32,
+            disk_gb: 512,
+            software: vec![],
+            container_runtime: Some("docker".to_string()),
+            docker: true,
+            scheduler: None,
+            labels: std::collections::BTreeMap::new(),
+            storage_available_gb: 256,
+            datasets: vec![],
+            models: vec![],
+            services: vec![],
+            visibility: "private".to_string(),
+            price_per_hour_usd: None,
+            public_key: None,
+        }
+    }
+
     /// Relay happy path: an `InvokeTool` message is forwarded to the executor
     /// channel, and the executor's reply comes back as a `ToolInvokeResult`
     /// carrying the real result — verified against a distinctive value so a
@@ -2516,6 +2602,7 @@ mod tests {
             &running_deployments,
             Some(&inv_tx),
             Some(&emitter),
+            &test_capabilities(),
         )
         .await;
 
@@ -2595,6 +2682,7 @@ mod tests {
             &running_deployments,
             None, // no executor wired
             Some(&emitter),
+            &test_capabilities(),
         )
         .await;
 
@@ -2707,6 +2795,7 @@ mod tests {
             &running_deployments,
             None,
             None,
+            &test_capabilities(),
         )
         .await;
 
@@ -2789,6 +2878,7 @@ mod tests {
             &running_deployments,
             None,
             None,
+            &test_capabilities(),
         )
         .await;
 
@@ -2847,6 +2937,7 @@ mod tests {
             &running_deployments,
             None,
             None,
+            &test_capabilities(),
         )
         .await;
 
@@ -2870,5 +2961,136 @@ mod tests {
             }
             other => panic!("expected DeploymentInvokeResult, got {other:?}"),
         }
+    }
+
+    // ── Resource requests: honour it or say so ──────────────────────────
+    //
+    // The hub half of this protocol lives in another repository and can add
+    // fields this node has never seen. `#[serde(tag = "type")]` discards
+    // unknown keys WITHOUT AN ERROR, so a job that asked for 64 cores and a
+    // 4-hour walltime would otherwise run on whatever the node felt like
+    // allocating, and nothing anywhere would say a word. These tests pin the
+    // two ways that is now impossible: refuse what cannot be honoured, and
+    // refuse what cannot even be understood.
+
+    /// Drive one `submit_job` frame through the daemon and return the reply.
+    async fn submit_and_capture(frame: serde_json::Value, caps: &NodeCapabilities) -> NodeMessage {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let active_jobs = Arc::new(AtomicU32::new(0));
+        let running_jobs: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        let running_deployments: RunningDeployments = Arc::new(Mutex::new(HashMap::new()));
+
+        handle_platform_message(
+            &paths,
+            &frame.to_string(),
+            &tx,
+            &active_jobs,
+            &running_jobs,
+            &running_deployments,
+            None,
+            None,
+            caps,
+        )
+        .await;
+
+        serde_json::from_str(&rx.recv().await.expect("a reply must be sent")).unwrap()
+    }
+
+    fn submit_job_frame(job_id: Uuid, resource_request: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "submit_job",
+            "job_id": job_id,
+            "image": "marc27/vasp:latest",
+            "inputs": {},
+            "env_vars": {},
+            "gpu_type": null,
+            "timeout_secs": 7200,
+            "resource_request": resource_request,
+        })
+    }
+
+    fn failure_reason(reply: NodeMessage, job_id: Uuid) -> String {
+        match reply {
+            NodeMessage::JobFailed {
+                job_id: id,
+                error,
+                duration_secs,
+                ..
+            } => {
+                assert_eq!(id, job_id);
+                assert_eq!(duration_secs, 0, "nothing ran, so nothing was spent");
+                error
+            }
+            other => panic!("expected the job to be refused, got {other:?}"),
+        }
+    }
+
+    /// A job that REQUIRES SLURM must be refused by a node whose runner only
+    /// launches containers — and the refusal must name the contradiction,
+    /// because this node advertises "slurm" purely on the presence of `sbatch`.
+    #[tokio::test]
+    async fn submit_job_refuses_a_scheduler_it_cannot_dispatch_through() {
+        let job_id = Uuid::new_v4();
+        let caps = NodeCapabilities {
+            scheduler: Some("slurm".to_string()),
+            ..test_capabilities()
+        };
+        let frame = submit_job_frame(
+            job_id,
+            serde_json::json!({"cpus": 64, "time_limit_secs": 14400, "scheduler": "slurm"}),
+        );
+
+        let error = failure_reason(submit_and_capture(frame, &caps).await, job_id);
+        assert!(error.contains("requires scheduler 'slurm'"), "{error}");
+        assert!(error.contains("no scheduler runner"), "{error}");
+        assert!(error.contains("ADVERTISES 'slurm'"), "{error}");
+    }
+
+    /// A queue on a machine with no queues, and more GPUs than exist: both are
+    /// unsatisfiable, and both must come back as refusals rather than as a job
+    /// that ran somewhere else on something else.
+    #[tokio::test]
+    async fn submit_job_refuses_unsatisfiable_resources() {
+        let job_id = Uuid::new_v4();
+        let caps = test_capabilities(); // no GPUs
+
+        let partition = submit_job_frame(job_id, serde_json::json!({"partition": "gpu"}));
+        let error = failure_reason(submit_and_capture(partition, &caps).await, job_id);
+        assert!(error.contains("partition 'gpu'"), "{error}");
+        assert!(error.contains("no queues"), "{error}");
+
+        let gpus = submit_job_frame(
+            job_id,
+            serde_json::json!({"accelerator": {"class": "A100-80GB", "count": 4}}),
+        );
+        let error = failure_reason(submit_and_capture(gpus, &caps).await, job_id);
+        assert!(error.contains("4 x 'A100-80GB'"), "{error}");
+        assert!(error.contains("0 GPU(s)"), "{error}");
+    }
+
+    /// THE DRIFT GUARD, end to end. A hub running ahead of this node sends a
+    /// field this build has never heard of. Deserialization would drop it in
+    /// silence; the node refuses the job and names it instead.
+    #[tokio::test]
+    async fn submit_job_refuses_protocol_fields_it_does_not_understand() {
+        let job_id = Uuid::new_v4();
+        let mut frame = submit_job_frame(job_id, serde_json::Value::Null);
+        frame["node_placement"] = serde_json::json!({"rack": "b12"});
+
+        let error = failure_reason(
+            submit_and_capture(frame, &test_capabilities()).await,
+            job_id,
+        );
+        assert!(
+            error.contains("does not understand: node_placement"),
+            "{error}"
+        );
+        assert!(error.contains("silently dropped"), "{error}");
+        assert!(
+            error.contains(&format!("v{}", prism_proto::NODE_PROTOCOL_VERSION)),
+            "the refusal must state the protocol version the node speaks: {error}"
+        );
     }
 }

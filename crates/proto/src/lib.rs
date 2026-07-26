@@ -7,8 +7,20 @@
 //! - The `prism-node` daemon and the MARC27 platform ([`NodeMessage`], [`PlatformMessage`]).
 //! - Node capability advertisement ([`NodeCapabilities`], [`GpuInfo`], [`NodeService`]).
 //!
-//! All types derive `Serialize`/`Deserialize` for JSON transport. This crate has
-//! zero business logic — it is purely a type definition boundary.
+//! All types derive `Serialize`/`Deserialize` for JSON transport. The crate
+//! carries no business logic; the only behaviour it owns is what the wire
+//! contract itself defines and both sides must agree on — [`ResourceRequest::validate`],
+//! [`NodeCapabilities::has_scheduler`], and the drift guard
+//! ([`SUBMIT_JOB_FIELDS`] / [`unknown_submit_job_fields`]).
+//!
+//! # Two-repo protocol
+//!
+//! The hub half of the node protocol lives in a separate, private repository
+//! (marc27-core `crates/protocol`, crate `marc27-protocol`) which this public
+//! crate cannot depend on. The node types below are therefore a deliberate,
+//! *guarded* mirror rather than a shared crate: see the "Wire-drift guard"
+//! section near [`unknown_submit_job_fields`] for how a hub that runs ahead of
+//! this node is made to fail loudly instead of silently.
 
 use std::collections::BTreeMap;
 
@@ -95,6 +107,25 @@ pub struct NodeCapabilities {
     pub public_key: Option<String>,
 }
 
+impl NodeCapabilities {
+    /// Does this node dispatch work through the `wanted` scheduler?
+    ///
+    /// THE canonical scheduler match — the hub's node selection and the node's
+    /// own request validation must agree on what "slurm" means, so neither
+    /// compares the strings itself. Case-insensitive because `scheduler` is
+    /// populated from a probe of the local binaries (`sbatch` → "slurm") on one
+    /// side and from a job's [`ResourceRequest::scheduler`] on the other.
+    ///
+    /// A node that advertises no scheduler matches nothing: "I run containers
+    /// directly" is not a weaker form of "I have SLURM".
+    #[must_use]
+    pub fn has_scheduler(&self, wanted: &str) -> bool {
+        self.scheduler
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(wanted))
+    }
+}
+
 fn default_visibility() -> String {
     "private".to_string()
 }
@@ -136,6 +167,144 @@ pub struct NodeService {
     pub endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+// ── Resource requests ───────────────────────────────────────────────
+
+/// How much of what accelerator ONE unit of work needs.
+///
+/// A request for ZERO devices is a config error, not a CPU-only workload —
+/// CPU-only is the enclosing `Option` being `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Accelerator {
+    /// Normalized accelerator class matched against a provider catalog or a
+    /// scheduler's GRES name (e.g. "A100-80GB"); mirrors `SubmitJob::gpu_type`.
+    pub class: String,
+    /// How many of `class` one unit of work needs.
+    pub count: u32,
+}
+
+/// What a facility scheduler (SLURM today) is asked to allocate for ONE job.
+///
+/// Every field is optional and means "the submitter did not say" when absent —
+/// the runner then omits the corresponding directive and lets the site default
+/// apply, rather than inventing a number. Zero is NEVER "unspecified": a
+/// request for zero cores, zero memory, zero seconds, or zero accelerators is
+/// malformed and [`Self::validate`] rejects it.
+///
+/// ## Compatibility contract
+///
+/// * **Old hub → this node.** The hub omits `resource_request` entirely; serde
+///   fills `None` and the node reproduces its pre-existing behaviour exactly.
+/// * **New hub → this node.** The ask arrives populated and the node either
+///   honours it or REFUSES the job — it is never dropped. A directive this node
+///   cannot render (a queue on a machine with no queues, more accelerators than
+///   exist, a scheduler it does not dispatch through) is an error, because a
+///   job that quietly runs with resources other than the ones asked for burns a
+///   real allocation and returns a result nobody can reproduce.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRequest {
+    /// CPU cores for the job's single task (`--cpus-per-task`).
+    #[serde(default)]
+    pub cpus: Option<u32>,
+    /// Memory for the whole job in GB (`--mem`).
+    #[serde(default)]
+    pub memory_gb: Option<u32>,
+    /// Walltime to REQUEST FROM THE SCHEDULER, in seconds (`--time`).
+    ///
+    /// Deliberately distinct from `SubmitJob::timeout_secs`: the scheduler
+    /// walltime drives queue priority and backfill (ask for 30 minutes, get
+    /// scheduled sooner), while `timeout_secs` is how long the hub waits before
+    /// giving up.
+    #[serde(default)]
+    pub time_limit_secs: Option<u64>,
+    /// Partition / queue to submit to (`--partition`).
+    #[serde(default)]
+    pub partition: Option<String>,
+    /// Scheduler this job REQUIRES (e.g. "slurm"), matched against
+    /// [`NodeCapabilities::scheduler`] via [`NodeCapabilities::has_scheduler`].
+    /// A runner that does not dispatch through this scheduler refuses the job
+    /// instead of quietly running it some other way.
+    #[serde(default)]
+    pub scheduler: Option<String>,
+    /// Accelerator request, or `None` for a CPU-ONLY job — the runner then
+    /// emits no GPU directive at all, even when `SubmitJob::gpu_type` is set.
+    #[serde(default)]
+    pub accelerator: Option<Accelerator>,
+}
+
+impl ResourceRequest {
+    /// Reject a request that cannot be rendered into a truthful scheduler or
+    /// container directive, so the caller fails loud BEFORE anything runs.
+    ///
+    /// A zero quantity, an empty name, or a name carrying characters that are
+    /// not legal in an `#SBATCH` value is an error here rather than something
+    /// to silently clamp or strip.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cpus == Some(0) {
+            return Err(
+                "resource request asks for 0 CPU cores — omit `cpus` to accept the site \
+                 default instead"
+                    .into(),
+            );
+        }
+        if self.memory_gb == Some(0) {
+            return Err(
+                "resource request asks for 0 GB of memory — omit `memory_gb` to accept the \
+                 site default instead"
+                    .into(),
+            );
+        }
+        if self.time_limit_secs == Some(0) {
+            return Err(
+                "resource request asks for a 0s time limit — omit `time_limit_secs` to \
+                 derive the walltime from the job timeout instead"
+                    .into(),
+            );
+        }
+        if let Some(p) = &self.partition {
+            validate_scheduler_token(p, "partition")?;
+        }
+        if let Some(s) = &self.scheduler {
+            validate_scheduler_token(s, "scheduler")?;
+        }
+        if let Some(a) = &self.accelerator {
+            if a.count == 0 {
+                return Err(
+                    "resource request asks for 0 accelerators — omit `accelerator` entirely \
+                     for a CPU-only job"
+                        .into(),
+                );
+            }
+            validate_scheduler_token(&a.class, "accelerator class")?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether `v` is safe to place verbatim in an `#SBATCH` directive value.
+///
+/// The directive lines are line-oriented `#`-comments, so whitespace or a
+/// newline in a value would break out of the directive and become an
+/// executable script line. Restricting to the character set SLURM partition,
+/// QOS and GRES names actually use makes that impossible without having to
+/// quote (quoting is not portable inside `#SBATCH`).
+fn validate_scheduler_token(v: &str, field: &str) -> Result<(), String> {
+    if v.is_empty() {
+        return Err(format!(
+            "resource request {field} is empty — omit the field instead"
+        ));
+    }
+    if !v
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "resource request {field} '{v}' contains characters that are not valid in an \
+             #SBATCH directive (allowed: letters, digits, '.', '_', '-')"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -231,7 +400,19 @@ pub enum PlatformMessage {
         #[serde(default)]
         env_vars: BTreeMap<String, String>,
         gpu_type: Option<String>,
+        /// Max duration in seconds the PLATFORM will wait before it gives up on
+        /// this job and cancels it. This is the hub's patience, NOT the walltime
+        /// the facility scheduler is asked for — see
+        /// [`ResourceRequest::time_limit_secs`].
         timeout_secs: u64,
+        /// What the facility scheduler (or container runtime) should allocate.
+        ///
+        /// `None` means "the submitter said nothing", and the node MUST then
+        /// behave exactly as it did before this field existed. `Some` is an
+        /// instruction the node either honours or refuses — see
+        /// [`ResourceRequest`].
+        #[serde(default)]
+        resource_request: Option<ResourceRequest>,
     },
     CancelJob {
         job_id: Uuid,
@@ -288,6 +469,57 @@ pub enum PlatformMessage {
         code: String,
         message: String,
     },
+}
+
+// ── Wire-drift guard ────────────────────────────────────────────────
+//
+// `prism-proto` is the NODE half of a two-repo wire protocol whose HUB half
+// lives in a separate, private repository (marc27-core `crates/protocol`). The
+// node can only ever *receive* [`PlatformMessage`], so every drift risk points
+// one way: the hub gains a field, this node's `#[serde(tag = "type")]`
+// deserializer ignores the unknown key, and the job runs with the instruction
+// silently discarded. That is the worst failure shape — no exception, no log,
+// no signal, a real allocation burned on the wrong resources.
+//
+// These two items close it for `submit_job`, the one message where a dropped
+// key changes what actually runs. The node compares the raw frame against the
+// keys this build understands and REFUSES the job when they do not match,
+// naming the fields, over `JobFailed` — a channel the hub already surfaces. So
+// the hub finds out, instead of believing the ask was honoured.
+
+/// Every key a `submit_job` frame may legally carry, including the `type` tag.
+///
+/// Not documentation: [`unknown_submit_job_fields`] enforces it at runtime, and
+/// the `submit_job_field_list_matches_the_type` test enforces that this list
+/// still describes [`PlatformMessage::SubmitJob`] exactly — add a field to the
+/// variant without adding it here and the build fails.
+pub const SUBMIT_JOB_FIELDS: &[&str] = &[
+    "type",
+    "job_id",
+    "image",
+    "inputs",
+    "env_vars",
+    "gpu_type",
+    "timeout_secs",
+    "resource_request",
+];
+
+/// Keys in a raw `submit_job` frame that this build of the protocol does not
+/// understand — i.e. instructions that deserialization is about to throw away.
+///
+/// A non-empty result means the hub is speaking a newer protocol than this
+/// node. The caller must refuse the job and report these names rather than run
+/// it: an instruction the node cannot even see is one it certainly cannot
+/// honour.
+#[must_use]
+pub fn unknown_submit_job_fields(frame: &serde_json::Value) -> Vec<String> {
+    let Some(obj) = frame.as_object() else {
+        return Vec::new();
+    };
+    obj.keys()
+        .filter(|k| !SUBMIT_JOB_FIELDS.contains(&k.as_str()))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -420,6 +652,31 @@ mod tests {
         let json = serde_json::to_string(&notif).unwrap();
         let back: BackendNotification = serde_json::from_str(&json).unwrap();
         assert_eq!(back, notif);
+    }
+
+    /// The smallest legal capability profile — a machine that advertises
+    /// nothing beyond having a CPU. Deliberately not a `Default` derive:
+    /// `visibility` defaults to `"private"` through serde, and a derived
+    /// `Default` would silently disagree with the wire by producing `""`.
+    fn minimal_capabilities() -> NodeCapabilities {
+        NodeCapabilities {
+            gpus: vec![],
+            cpu_cores: 1,
+            ram_gb: 1,
+            disk_gb: 1,
+            software: vec![],
+            container_runtime: None,
+            docker: false,
+            scheduler: None,
+            labels: BTreeMap::new(),
+            storage_available_gb: 0,
+            datasets: vec![],
+            models: vec![],
+            services: vec![],
+            visibility: default_visibility(),
+            price_per_hour_usd: None,
+            public_key: None,
+        }
     }
 
     fn full_capabilities() -> NodeCapabilities {
@@ -596,6 +853,7 @@ mod tests {
             env_vars,
             gpu_type: Some("A100".into()),
             timeout_secs: 3600,
+            resource_request: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: PlatformMessage = serde_json::from_str(&json).unwrap();
@@ -605,6 +863,263 @@ mod tests {
         } else {
             panic!("expected SubmitJob");
         }
+    }
+
+    // ── Resource requests: cross-repo wire parity + drift guard ─────────
+    //
+    // The hub (marc27-core `crates/protocol`) is the source of truth for
+    // `submit_job`. These vectors are its own test payloads, verbatim, so a
+    // rename or reshape on either side shows up here as a failure rather than
+    // as a job that quietly runs on the wrong hardware.
+
+    /// THE REGRESSION TEST for the silent-drop defect. The hub asks for 64
+    /// cores, 128 GB, a 4-hour scheduler walltime, a named partition and 4
+    /// A100s; before `resource_request` existed on this side, every one of
+    /// those vanished during deserialization without an error.
+    #[test]
+    fn submit_job_carries_the_hub_resource_request_intact() {
+        let hub_wire = r#"{
+            "type": "submit_job",
+            "job_id": "00000000-0000-0000-0000-000000000000",
+            "image": "marc27/vasp:latest",
+            "inputs": {},
+            "env_vars": {},
+            "gpu_type": null,
+            "timeout_secs": 7200,
+            "resource_request": {
+                "cpus": 64,
+                "memory_gb": 128,
+                "time_limit_secs": 14400,
+                "partition": "gpu",
+                "scheduler": "slurm",
+                "accelerator": {"class": "A100-80GB", "count": 4}
+            }
+        }"#;
+
+        let parsed: PlatformMessage = serde_json::from_str(hub_wire).unwrap();
+        let PlatformMessage::SubmitJob {
+            resource_request: Some(rr),
+            timeout_secs,
+            ..
+        } = &parsed
+        else {
+            panic!("expected a submit_job carrying a resource request, got {parsed:?}");
+        };
+        assert_eq!(rr.cpus, Some(64));
+        assert_eq!(rr.memory_gb, Some(128));
+        // The scheduler walltime is the job's OWN 4 hours, not the hub's
+        // 2-hour patience — the whole point of the split.
+        assert_eq!(rr.time_limit_secs, Some(14400));
+        assert_eq!(*timeout_secs, 7200);
+        assert_eq!(rr.partition.as_deref(), Some("gpu"));
+        assert_eq!(rr.scheduler.as_deref(), Some("slurm"));
+        assert_eq!(
+            rr.accelerator,
+            Some(Accelerator {
+                class: "A100-80GB".into(),
+                count: 4
+            })
+        );
+
+        // And it survives back onto the wire unchanged.
+        let back: PlatformMessage =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(back, parsed);
+    }
+
+    /// BACKWARD COMPATIBILITY, old hub → this node: a `submit_job` produced
+    /// before `resource_request` existed still parses and lands as `None` —
+    /// the value that means "behave exactly as before".
+    #[test]
+    fn submit_job_without_resource_request_parses_as_none() {
+        let legacy = r#"{
+            "type": "submit_job",
+            "job_id": "00000000-0000-0000-0000-000000000000",
+            "image": "marc27/lammps:latest",
+            "inputs": {},
+            "gpu_type": "A100-80GB",
+            "timeout_secs": 3600
+        }"#;
+
+        let parsed: PlatformMessage = serde_json::from_str(legacy).unwrap();
+        let PlatformMessage::SubmitJob {
+            resource_request,
+            gpu_type,
+            timeout_secs,
+            ..
+        } = parsed
+        else {
+            panic!("wrong variant");
+        };
+        assert!(resource_request.is_none());
+        assert_eq!(gpu_type.as_deref(), Some("A100-80GB"));
+        assert_eq!(timeout_secs, 3600);
+    }
+
+    /// CPU-only is `accelerator: None`, and it must survive the wire as such —
+    /// if it round-tripped into "unspecified" the node would fall back to the
+    /// legacy `gpu_type`-implies-a-GPU rule and allocate hardware nobody asked
+    /// for.
+    #[test]
+    fn cpu_only_resource_request_round_trips() {
+        let rr = ResourceRequest {
+            cpus: Some(8),
+            memory_gb: Some(16),
+            accelerator: None,
+            ..Default::default()
+        };
+        let parsed: ResourceRequest =
+            serde_json::from_str(&serde_json::to_string(&rr).unwrap()).unwrap();
+        assert!(parsed.accelerator.is_none());
+        assert_eq!(parsed.cpus, Some(8));
+        assert!(parsed.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_quantities() {
+        let zero_gpu = ResourceRequest {
+            accelerator: Some(Accelerator {
+                class: "A100-80GB".into(),
+                count: 0,
+            }),
+            ..Default::default()
+        };
+        assert!(zero_gpu.validate().unwrap_err().contains("0 accelerators"));
+
+        for (rr, needle) in [
+            (
+                ResourceRequest {
+                    cpus: Some(0),
+                    ..Default::default()
+                },
+                "0 CPU cores",
+            ),
+            (
+                ResourceRequest {
+                    memory_gb: Some(0),
+                    ..Default::default()
+                },
+                "0 GB",
+            ),
+            (
+                ResourceRequest {
+                    time_limit_secs: Some(0),
+                    ..Default::default()
+                },
+                "0s time limit",
+            ),
+        ] {
+            let err = rr.validate().unwrap_err();
+            assert!(err.contains(needle), "expected {needle:?} in {err:?}");
+        }
+    }
+
+    /// A partition name carrying a newline would break out of an `#SBATCH`
+    /// comment line into an executable script line. It is REFUSED, not silently
+    /// stripped: a job that lands on a different queue than the one requested
+    /// is a wrong answer, not a recovered one.
+    #[test]
+    fn validate_rejects_unsafe_directive_values() {
+        let injected = ResourceRequest {
+            partition: Some("gpu\n#SBATCH --account=victim".into()),
+            ..Default::default()
+        };
+        assert!(injected.validate().unwrap_err().contains("not valid in an"));
+
+        let empty = ResourceRequest {
+            partition: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(empty.validate().unwrap_err().contains("is empty"));
+
+        let ok = ResourceRequest {
+            partition: Some("gpu-a100.2".into()),
+            scheduler: Some("slurm".into()),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn has_scheduler_matches_case_insensitively_and_never_guesses() {
+        let slurm = NodeCapabilities {
+            scheduler: Some("slurm".into()),
+            ..minimal_capabilities()
+        };
+        assert!(slurm.has_scheduler("slurm"));
+        assert!(slurm.has_scheduler("SLURM"));
+        assert!(!slurm.has_scheduler("pbs"));
+
+        // No advertised scheduler matches nothing at all.
+        let plain = minimal_capabilities();
+        assert!(!plain.has_scheduler("slurm"));
+        assert!(!plain.has_scheduler(""));
+    }
+
+    /// THE DRIFT GUARD's own guard. `SUBMIT_JOB_FIELDS` is what the node checks
+    /// incoming frames against, so it must describe the variant *exactly*. Add
+    /// a field to `PlatformMessage::SubmitJob` and forget this list and the
+    /// build stops here — instead of the node rejecting its own hub's frames at
+    /// runtime.
+    #[test]
+    fn submit_job_field_list_matches_the_type() {
+        let full = PlatformMessage::SubmitJob {
+            job_id: Uuid::nil(),
+            image: "img".into(),
+            inputs: serde_json::json!({}),
+            env_vars: BTreeMap::new(),
+            gpu_type: Some("A100".into()),
+            timeout_secs: 1,
+            resource_request: Some(ResourceRequest::default()),
+        };
+        let serialized = serde_json::to_value(&full).unwrap();
+        let mut actual: Vec<&str> = serialized
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        actual.sort_unstable();
+        let mut expected = SUBMIT_JOB_FIELDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "SUBMIT_JOB_FIELDS no longer describes PlatformMessage::SubmitJob"
+        );
+
+        // A frame this build fully understands has nothing unknown in it.
+        assert!(unknown_submit_job_fields(&serialized).is_empty());
+    }
+
+    /// The next divergence, caught. A hub running ahead of this node adds a
+    /// field; deserialization would discard it without a murmur, so the raw
+    /// frame is checked instead and the extra keys are named.
+    #[test]
+    fn unknown_submit_job_fields_names_a_future_hub_field() {
+        let future_hub_wire = serde_json::json!({
+            "type": "submit_job",
+            "job_id": Uuid::nil(),
+            "image": "marc27/vasp:latest",
+            "inputs": {},
+            "env_vars": {},
+            "gpu_type": null,
+            "timeout_secs": 60,
+            "resource_request": null,
+            // Not in this build's protocol — exactly the shape `resource_request`
+            // itself had on the day it appeared.
+            "node_placement": {"rack": "b12"},
+            "budget_ceiling_eur": 40
+        });
+
+        // It still deserializes without error — that is the defect this guard
+        // exists to catch.
+        let parsed: PlatformMessage =
+            serde_json::from_value(future_hub_wire.clone()).expect("silently parses");
+        assert!(matches!(parsed, PlatformMessage::SubmitJob { .. }));
+
+        let mut unknown = unknown_submit_job_fields(&future_hub_wire);
+        unknown.sort();
+        assert_eq!(unknown, vec!["budget_ceiling_eur", "node_placement"]);
     }
 
     #[test]
