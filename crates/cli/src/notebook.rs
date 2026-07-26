@@ -108,55 +108,6 @@ fn gen_token() -> String {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    /// The Jupyter token is the ONLY thing standing between a caller and
-    /// arbitrary code execution in the notebook kernel. It must be an
-    /// unguessable secret, not a value anybody can recompute.
-    #[test]
-    fn token_is_not_recoverable_from_the_wall_clock() {
-        let before = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let token = gen_token();
-        let after = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-
-        // Reconstruct the attacker's guess: read the token as a hex
-        // nanosecond timestamp. If it lands inside the window we just
-        // measured, the "secret" is simply the clock.
-        let hex = token.strip_prefix("prism-").unwrap_or(&token);
-        if let Ok(nanos) = u128::from_str_radix(hex, 16) {
-            assert!(
-                !(before..=after).contains(&nanos),
-                "notebook token is the wall clock in hex ({token}): anyone who \
-                 knows when the notebook started can recompute it"
-            );
-        }
-    }
-
-    /// Sanity floor on entropy: distinct calls must not collide, and the
-    /// token must be long enough to resist online guessing.
-    #[test]
-    fn token_is_long_and_unique() {
-        let a = gen_token();
-        let b = gen_token();
-        assert_ne!(a, b, "two tokens collided: {a}");
-        let secret = a.strip_prefix("prism-").unwrap_or(&a);
-        assert!(
-            secret.len() >= 32,
-            "token secret too short ({} chars): {a}",
-            secret.len()
-        );
-    }
-}
-
 /// Launch a Jupyter Lab server in the PRISM venv.
 pub fn start(port: Option<u16>, _notebook: Option<&str>) -> Result<NotebookSession> {
     let python = std::env::var("HOME")
@@ -257,4 +208,53 @@ pub fn stop(target: &str) -> Result<usize> {
 
     write_sessions(&sessions)?;
     Ok(before - sessions.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The Jupyter token is the ONLY thing standing between a caller and
+    /// arbitrary code execution in the notebook kernel. It must be an
+    /// unguessable secret, not a value anybody can recompute.
+    #[test]
+    fn token_is_not_recoverable_from_the_wall_clock() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let token = gen_token();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        // Reconstruct the attacker's guess: read the token as a hex
+        // nanosecond timestamp. If it lands inside the window we just
+        // measured, the "secret" is simply the clock.
+        let hex = token.strip_prefix("prism-").unwrap_or(&token);
+        if let Ok(nanos) = u128::from_str_radix(hex, 16) {
+            assert!(
+                !(before..=after).contains(&nanos),
+                "notebook token is the wall clock in hex ({token}): anyone who \
+                 knows when the notebook started can recompute it"
+            );
+        }
+    }
+
+    /// Sanity floor on entropy: distinct calls must not collide, and the
+    /// token must be long enough to resist online guessing.
+    #[test]
+    fn token_is_long_and_unique() {
+        let a = gen_token();
+        let b = gen_token();
+        assert_ne!(a, b, "two tokens collided: {a}");
+        let secret = a.strip_prefix("prism-").unwrap_or(&a);
+        assert!(
+            secret.len() >= 32,
+            "token secret too short ({} chars): {a}",
+            secret.len()
+        );
+    }
 }
