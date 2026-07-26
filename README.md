@@ -19,27 +19,80 @@ prism billing            # Check credit balance
 
 ## Install
 
+**macOS / Linux**
+
 ```bash
 curl -fsSL https://prism.marc27.com/install.sh | bash
 ```
 
-Or download from [GitHub Releases](../../releases):
+**Windows** (PowerShell — not Command Prompt)
 
-| Platform | Archive |
-|----------|---------|
-| Linux x86_64 | `prism-linux-x86_64.tar.gz` |
-| Linux ARM64 | `prism-linux-aarch64.tar.gz` |
-| macOS Apple Silicon | `prism-macos-aarch64.tar.gz` |
-| macOS Intel | `prism-macos-x86_64.tar.gz` |
-| Windows x86_64 | `prism-windows-x86_64.zip` |
+```powershell
+irm https://prism.marc27.com/install.ps1 | iex
+```
 
-Or from source:
+The installer runs in two stages: it puts the binary on your `PATH`, then
+triggers `prism doctor`, which provisions the Python tool platform and prints
+what is and isn't ready. Re-running it resumes rather than starting over.
+
+### Requirements
+
+| | |
+|---|---|
+| **Python 3.11 or newer** | Required, not optional. The agent runs its tools in a Python worker; without 3.11+ `prism` exits immediately with `No Python 3.11+ found`. macOS's built-in `python3` is 3.9 — `brew install python@3.12`. |
+| **Linux: glibc 2.35+** | Ubuntu 22.04+, Debian 12+, SLES 15 SP6+. RHEL/Rocky 9 ship glibc 2.34 and are **not** supported by the prebuilt binaries — build from source there. |
+| **Disk** | ~250 MB for the binary and ~400 MB for the Python environment. |
+
+### Supported platforms
+
+| Platform | Archive | Notes |
+|----------|---------|-------|
+| Linux x86_64 | `prism-linux-x86_64.tar.gz` | |
+| Linux ARM64 | `prism-linux-aarch64.tar.gz` | |
+| macOS Apple Silicon | `prism-macos-aarch64.tar.gz` | macOS 11+ |
+| macOS Intel | `prism-macos-x86_64.tar.gz` | No local embedding model — see below |
+| Windows x86_64 | `prism-windows-x86_64.zip` | Also runs on ARM64 Windows under emulation |
+
+### Downloading the archive directly
+
+Use the installer if you can — it handles the platform quirks below. If you
+download from [GitHub Releases](../../releases) by hand:
+
+**macOS.** The binaries are ad-hoc signed but *not* notarized with an Apple
+Developer ID, so Gatekeeper blocks them with *"Apple could not verify this app
+is free of malware"*. Clear the quarantine flag after extracting:
+
+```bash
+tar -xzf prism-macos-aarch64.tar.gz
+xattr -d com.apple.quarantine prism prism-node
+./prism --version
+```
+
+**Windows.** The `.exe` is unsigned. Launched from PowerShell or Command
+Prompt it runs without a prompt; double-clicking it in Explorer shows a
+SmartScreen *"Windows protected your PC"* warning, where you would click
+**More info → Run anyway**.
+
+**Linux.** Extract and run — no signing involved.
+
+### From source
+
+Needs `protoc` and Node 22 (for the bundled dashboard):
 
 ```bash
 git clone https://github.com/Darth-Hidious/PRISM.git
-cd PRISM && cargo build --release
-cp target/release/prism ~/.local/bin/
+cd PRISM && (cd dashboard && npm ci && npm run build)
+cargo build --release --bin prism --bin prism-node
+cp target/release/prism target/release/prism-node ~/.local/bin/
 ```
+
+### Known platform limits
+
+- **Intel Macs** have no local embedding model: ONNX Runtime publishes no
+  `x86_64-apple-darwin` build, so semantic search falls back to keyword-only
+  unless you point `PRISM_EMBED_BACKEND=openai` at an embeddings endpoint.
+  Everything else is identical.
+- **Homebrew** is not currently a supported install route.
 
 ## Interactive chat
 
