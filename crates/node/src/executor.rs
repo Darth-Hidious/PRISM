@@ -488,22 +488,49 @@ async fn collect_output(
     runtime: ContainerRuntime,
     container_id: &str,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    let stdout = Command::new(runtime.binary())
-        .args(["logs", "--stdout", "--no-stderr", container_id])
+    // Single invocation. The per-stream `--stdout`/`--stderr`/`--no-stdout`/
+    // `--no-stderr` flags do not exist on real Docker (exit 125 "unknown
+    // flag") or Podman; the previous two-call form therefore silently yielded
+    // empty output. Plain `logs --tail <N> <c>` demuxes the container's output
+    // to the child's fds, so `o.stdout` = container stdout and `o.stderr` =
+    // container stderr (the old code read `stderr.stdout`, i.e. nothing).
+    //
+    // `--tail` bounds how much the runtime buffers: without it
+    // `Command::output()` buffers the ENTIRE child output into a Vec before
+    // our `MAX_OUTPUT_BYTES` truncation runs — a chatty container could buffer
+    // gigabytes first.
+    let output = Command::new(runtime.binary())
+        .args(["logs", "--tail", NODE_LOG_TAIL_LINE_STR, container_id])
         .output()
         .await
-        .context("failed to collect stdout")?;
+        .context("failed to run `docker logs`")?;
 
-    let stderr = Command::new(runtime.binary())
-        .args(["logs", "--stderr", "--no-stdout", container_id])
-        .output()
-        .await
-        .context("failed to collect stderr")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`{} logs` failed (status {}): {}",
+            runtime.binary(),
+            output.status,
+            stderr.trim()
+        );
+    }
 
     Ok((
-        truncate_bytes(&stdout.stdout, MAX_OUTPUT_BYTES),
-        truncate_bytes(&stderr.stdout, MAX_OUTPUT_BYTES),
+        truncate_bytes(&output.stdout, MAX_OUTPUT_BYTES),
+        truncate_bytes(&output.stderr, MAX_OUTPUT_BYTES),
     ))
+}
+
+/// Canonical string form of the `--tail` line count used by [`collect_output`].
+const NODE_LOG_TAIL_LINE_STR: &str = "10000";
+
+/// Build the argv (after the runtime binary) for a `docker logs` invocation.
+/// Pure so the arg construction is unit-testable without Docker; mirrors
+/// prism-compute's `logs_args`. Test-only: production `collect_output` inlines
+/// the args.
+#[cfg(test)]
+fn logs_args(container_id: &str) -> [&str; 4] {
+    ["logs", "--tail", NODE_LOG_TAIL_LINE_STR, container_id]
 }
 
 fn truncate_bytes(bytes: &[u8], limit: usize) -> Vec<u8> {
@@ -619,5 +646,29 @@ mod tests {
     fn runtime_handle_is_stable() {
         let job_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
         assert!(runtime_handle(job_id).starts_with("prism-job-"));
+    }
+
+    #[test]
+    fn logs_args_uses_single_invocation_with_no_per_stream_flags() {
+        // Regression guard: collect_output previously used the non-existent
+        // `--stdout/--stderr/--no-stdout/--no-stderr` flags (Docker exit 125
+        // "unknown flag"), silently yielding empty output. Plain
+        // `logs --tail <N> <c>` is correct for both docker and podman.
+        let args = logs_args("prism-job-deadbeef");
+        assert_eq!(args[0], "logs");
+        assert_eq!(args[1], "--tail");
+        assert_eq!(args[2], NODE_LOG_TAIL_LINE_STR);
+        assert_eq!(args[3], "prism-job-deadbeef");
+    }
+
+    #[test]
+    fn logs_args_must_not_contain_per_stream_flags() {
+        for banned in ["--stdout", "--stderr", "--no-stdout", "--no-stderr"] {
+            let args = logs_args("c");
+            assert!(
+                !args.contains(&banned),
+                "`{banned}` must never appear in logs args (not a real docker flag): {args:?}"
+            );
+        }
     }
 }

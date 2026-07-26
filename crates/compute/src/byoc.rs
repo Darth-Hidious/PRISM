@@ -243,18 +243,21 @@ impl ComputeBackend for ByocBackend {
                 port,
             } => {
                 let mut cmd = Self::ssh_cmd(host, user, key_path, *port);
+                // Ask for the exit code too. Reporting a container that exited
+                // 137 (OOM-killed) as `Completed` — the old behaviour, which
+                // only read `.State.Status` — told the user their job
+                // succeeded when it had died.
                 cmd.arg(format!(
-                    "docker inspect --format '{{{{.State.Status}}}}' prism-job-{job_id}"
+                    "docker inspect --format '{{{{.State.Status}}}}:{{{{.State.ExitCode}}}}' \
+                     prism-job-{job_id}"
                 ));
                 let output = cmd.output().await?;
-                let status_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                match status_str.as_str() {
-                    "running" => Ok(JobStatus::Running { progress: 0.0 }),
-                    "exited" => Ok(JobStatus::Completed),
-                    _ => Ok(JobStatus::Failed {
-                        error: format!("container status: {status_str}"),
-                    }),
-                }
+                interpret_remote_inspect(
+                    job_id,
+                    output.status.success(),
+                    &output.stdout,
+                    &output.stderr,
+                )
             }
             ByocTarget::Kubernetes { context, namespace } => {
                 let mut cmd = tokio::process::Command::new("kubectl");
@@ -315,11 +318,28 @@ impl ComputeBackend for ByocBackend {
                 let mut cmd = Self::ssh_cmd(host, user, key_path, *port);
                 cmd.arg(format!("docker logs prism-job-{job_id}"));
                 let output = cmd.output().await?;
-                let logs = String::from_utf8_lossy(&output.stdout).to_string();
-                // Try to parse as JSON, fall back to raw text
-                match serde_json::from_str(&logs) {
+                // A failed `ssh … docker logs` used to yield `{"output": ""}` —
+                // indistinguishable from a container that legitimately printed
+                // nothing. With no result.json the logs ARE the result, so a
+                // collection failure must be an error, not empty-as-success.
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    bail!(
+                        "could not fetch remote logs for job {job_id} from {user}@{host}:{port}: {}",
+                        stderr.trim()
+                    );
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                // `docker logs` demuxes to our fds, so container stdout and
+                // stderr arrive separately. Try structured JSON first (an image
+                // may print a result document), else report both streams.
+                match serde_json::from_str(stdout.trim()) {
                     Ok(v) => Ok(v),
-                    Err(_) => Ok(serde_json::json!({"output": logs})),
+                    Err(_) => Ok(serde_json::json!({
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    })),
                 }
             }
             ByocTarget::Kubernetes { context, namespace } => {
@@ -425,6 +445,60 @@ fn sh_single_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Interpret a remote `docker inspect --format '{{.State.Status}}:{{.State.ExitCode}}'`
+/// into a [`JobStatus`]. Pure, so the honesty rules are testable without SSH.
+///
+/// Two lies this replaces:
+///
+/// 1. `exited` was mapped to `Completed` regardless of exit code, so a crashed
+///    remote container reported success.
+/// 2. When SSH itself failed (host down, key rejected, `docker` not installed)
+///    stdout was empty, and the empty string fell through to
+///    `Failed { "container status: " }` — reporting the user's JOB as failed
+///    when in truth we never reached the machine. Now that is an `Err`: a loud
+///    "could not reach the box", which the poll loop retries and the CLI
+///    surfaces with the real stderr.
+fn interpret_remote_inspect(
+    job_id: Uuid,
+    ssh_ok: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<JobStatus> {
+    let raw = String::from_utf8_lossy(stdout);
+    let raw = raw.trim();
+
+    if !ssh_ok || raw.is_empty() {
+        let stderr = String::from_utf8_lossy(stderr);
+        bail!(
+            "could not inspect remote container for job {job_id}: {}",
+            if stderr.trim().is_empty() {
+                "ssh produced no output (host unreachable, auth refused, or docker missing)"
+            } else {
+                stderr.trim()
+            }
+        );
+    }
+
+    let (status, exit_code) = raw.split_once(':').unwrap_or((raw, "1"));
+    Ok(match status {
+        "running" | "created" | "restarting" => JobStatus::Running { progress: 0.0 },
+        "paused" => JobStatus::Running { progress: 0.0 },
+        "exited" | "dead" => {
+            let code: i32 = exit_code.trim().parse().unwrap_or(1);
+            if code == 0 {
+                JobStatus::Completed
+            } else {
+                JobStatus::Failed {
+                    error: format!("remote container exited with code {code}"),
+                }
+            }
+        }
+        other => JobStatus::Failed {
+            error: format!("unexpected remote container status: {other}"),
+        },
+    })
 }
 
 /// Validate a Docker image reference. Permissive enough to accept all
@@ -540,6 +614,58 @@ mod tests {
             "gcr.io/proj/img@sha256:abcdef0123456789"
         ));
         assert!(is_valid_docker_image("registry.local:5000/img:v1"));
+    }
+
+    // --- Remote status honesty (no SSH needed) ---
+
+    #[test]
+    fn remote_inspect_exit_zero_is_completed() {
+        let status = interpret_remote_inspect(Uuid::new_v4(), true, b"exited:0\n", b"").unwrap();
+        assert!(matches!(status, JobStatus::Completed));
+    }
+
+    #[test]
+    fn remote_inspect_nonzero_exit_is_failed_not_completed() {
+        // The lie this replaces: `.State.Status == "exited"` alone was mapped
+        // to Completed, so an OOM-killed (137) remote job reported success.
+        let status = interpret_remote_inspect(Uuid::new_v4(), true, b"exited:137\n", b"").unwrap();
+        match status {
+            JobStatus::Failed { error } => assert!(error.contains("137"), "got: {error}"),
+            other => panic!("a non-zero remote exit must be Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_inspect_running_is_running() {
+        let status = interpret_remote_inspect(Uuid::new_v4(), true, b"running:0\n", b"").unwrap();
+        assert!(matches!(status, JobStatus::Running { .. }));
+    }
+
+    #[test]
+    fn unreachable_host_is_an_error_not_a_failed_job() {
+        // The second lie: when ssh failed, stdout was empty and the empty
+        // string fell through to Failed{"container status: "} — blaming the
+        // user's job for our inability to reach the machine.
+        let result = interpret_remote_inspect(
+            Uuid::new_v4(),
+            false,
+            b"",
+            b"ssh: connect to host gpu-box.lab port 22: Connection refused",
+        );
+        assert!(
+            result.is_err(),
+            "an unreachable host must be Err, not Ok(Failed) — the job did not fail, we did"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Connection refused"), "got: {msg}");
+    }
+
+    #[test]
+    fn empty_ssh_output_with_success_status_is_still_an_error() {
+        // Some ssh configurations exit 0 while producing nothing. Empty output
+        // is not evidence of a container state, so it must not be guessed at.
+        let result = interpret_remote_inspect(Uuid::new_v4(), true, b"   \n", b"");
+        assert!(result.is_err(), "empty inspect output must not be guessed");
     }
 
     #[test]

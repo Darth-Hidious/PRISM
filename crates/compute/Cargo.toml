@@ -16,6 +16,11 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+# Durable job records live in the SAME local Turso spine as provenance
+# (~/.prism/provenance.db) — no second store.
+turso = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Proves the job table coexists with the provenance schema in one file.
+prism-provenance = { path = "../provenance" }

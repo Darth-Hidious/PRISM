@@ -298,11 +298,16 @@ enum Commands {
         /// SLURM partition.
         #[arg(long, default_value = "default")]
         slurm_partition: String,
+        /// Maximum seconds to wait for the job to reach a terminal state (poll
+        /// deadline). 0 is treated as 1. After expiry the run fails honestly
+        /// and — for local/marc27 — points you at `prism job-status`.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
         /// Emit machine-readable JSON instead of human-readable status lines.
         #[arg(long)]
         json: bool,
     },
-    /// Check status of a compute job.
+    /// Check status of a compute job (any backend: local, byoc, or marc27).
     JobStatus {
         /// Job UUID.
         job_id: String,
@@ -3119,6 +3124,7 @@ async fn main() -> Result<()> {
             k8s_namespace,
             slurm,
             slurm_partition,
+            timeout,
             json,
         } => {
             handle_run(
@@ -3134,6 +3140,7 @@ async fn main() -> Result<()> {
                 &k8s_namespace,
                 slurm.as_deref(),
                 &slurm_partition,
+                timeout,
                 json,
             )
             .await?;
@@ -9653,6 +9660,7 @@ async fn handle_run(
     k8s_namespace: &str,
     slurm: Option<&str>,
     slurm_partition: &str,
+    timeout: u64,
     json: bool,
 ) -> Result<()> {
     use prism_compute::ExperimentPlan;
@@ -9766,6 +9774,22 @@ async fn handle_run(
         }
     };
 
+    // Attach the durable job store so the record outlives THIS process. Without
+    // it a dispatched job is fire-and-forget: it really runs, but nothing
+    // remembers which machine it went to, so `prism job-status` cannot answer.
+    // A store that cannot be opened is a loud warning, not a failed run — the
+    // dispatch itself is still valid.
+    let router = match prism_compute::JobStore::open_default().await {
+        Ok(store) => router.with_job_store(std::sync::Arc::new(store)),
+        Err(error) => {
+            eprintln!(
+                "warning: could not open the local job store ({error}); this job will run \
+                 but `prism job-status {name}` will not be able to answer for it later"
+            );
+            router
+        }
+    };
+
     if !json {
         println!("Submitting job '{name}' (image: {image}, backend: {resolved_backend})...");
     }
@@ -9777,68 +9801,320 @@ async fn handle_run(
             anyhow::anyhow!("Job submission timed out after 120s (image pull may be slow)")
         })??;
 
-    // Brief poll for initial status
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let status_result = router.status(job_id).await;
-
-    if json {
-        let mut payload = serde_json::json!({
-            "job_id": job_id,
-            "name": name,
-            "image": image,
-            "backend": resolved_backend,
-            "target": target,
-            "inputs": inputs_json,
-        });
-        if let Some(object) = payload.as_object_mut() {
-            match status_result {
-                Ok(status) => {
-                    object.insert("initial_status".to_string(), serde_json::to_value(status)?);
-                }
-                Err(error) => {
-                    object.insert(
-                        "status_error".to_string(),
-                        serde_json::Value::String(error.to_string()),
-                    );
+    if resolved_backend == "marc27" {
+        // DESIGN: the marc27 broker is the ASYNC backend — it supports re-query
+        // (`prism job-status <id>`), and real platform jobs (GPU training, etc.)
+        // legitimately run far longer than any sensible CLI poll window.
+        // Forcing it to block-to-terminal at a 600s default would exit non-zero
+        // for healthy long jobs. So marc27 submits and returns.
+        let initial_status = router.status(job_id).await;
+        if json {
+            let mut payload = serde_json::json!({
+                "job_id": job_id,
+                "name": name,
+                "image": image,
+                "backend": resolved_backend,
+                "target": target,
+                "inputs": inputs_json,
+                "status": "submitted",
+            });
+            if let Some(object) = payload.as_object_mut() {
+                match initial_status {
+                    Ok(status) => {
+                        object.insert("initial_status".to_string(), serde_json::to_value(status)?);
+                    }
+                    Err(error) => {
+                        object.insert(
+                            "status_error".to_string(),
+                            serde_json::Value::String(error.to_string()),
+                        );
+                    }
                 }
             }
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!("Job submitted: {job_id}");
+            println!("Check status:  prism job-status {job_id}");
+            match initial_status {
+                Ok(status) => println!("Status: {status:?}"),
+                Err(e) => println!("Status check: {e}"),
+            }
         }
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        println!("Job submitted: {job_id}");
+        return Ok(());
+    }
+
+    if !json {
+        println!("Job submitted: {job_id} (polling to terminal, timeout {timeout}s)...");
         println!("Check status:  prism job-status {job_id}");
-        match status_result {
-            Ok(status) => println!("Status: {:?}", status),
-            Err(e) => println!("Status check: {e}"),
+    }
+
+    // Local / BYOC: poll to a terminal state, then fetch results. `--timeout`
+    // bounds the poll window (0 is floored to 1s inside the helper); the submit
+    // phase keeps its own 120s budget above. A Failed/Cancelled/timeout outcome
+    // is surfaced as an error below — never a fabricated success.
+    let outcome = prism_compute::poll::poll_to_terminal(
+        &router,
+        job_id,
+        timeout,
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+
+    // Record the terminal verdict durably before returning, so a later
+    // `prism job-status` tells the truth even once the container is gone.
+    let tracker = router.tracker();
+    match &outcome {
+        Ok(prism_compute::poll::PollOutcome::Completed(result)) => {
+            tracker
+                .update_status(
+                    job_id,
+                    prism_compute::TrackedStatus::Completed { duration_secs: 0 },
+                )
+                .await;
+            tracker.set_output(job_id, result.to_string()).await;
+        }
+        Ok(prism_compute::poll::PollOutcome::CompletedNoOutput) => {
+            tracker
+                .update_status(
+                    job_id,
+                    prism_compute::TrackedStatus::Completed { duration_secs: 0 },
+                )
+                .await;
+        }
+        Err(error) => {
+            // A poll-deadline expiry is NOT a failed job — the job is still
+            // running. Recording it as Failed would be a lie; leave the record
+            // as-is so `prism job-status` re-queries the live backend.
+            if !error.to_string().contains("still running") {
+                tracker
+                    .update_status(
+                        job_id,
+                        prism_compute::TrackedStatus::Failed {
+                            error: error.to_string(),
+                        },
+                    )
+                    .await;
+            }
         }
     }
 
-    Ok(())
+    match outcome {
+        Ok(prism_compute::poll::PollOutcome::Completed(result)) => {
+            if json {
+                let payload = serde_json::json!({
+                    "job_id": job_id,
+                    "name": name,
+                    "image": image,
+                    "backend": resolved_backend,
+                    "target": target,
+                    "inputs": inputs_json,
+                    "status": "completed",
+                    "result": result,
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                println!("Status: completed");
+                println!("Output: {result}");
+            }
+            Ok(())
+        }
+        Ok(prism_compute::poll::PollOutcome::CompletedNoOutput) => {
+            if json {
+                let payload = serde_json::json!({
+                    "job_id": job_id,
+                    "name": name,
+                    "image": image,
+                    "backend": resolved_backend,
+                    "target": target,
+                    "inputs": inputs_json,
+                    "status": "completed",
+                    "result": serde_json::Value::Null,
+                    "note": "completed; no output captured",
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                println!("Status: completed (no output captured)");
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // DESIGN (orphan container): on a LOCAL failure — especially a poll
+            // deadline timeout — the detached container would otherwise be left
+            // running and dropped from the in-process `active` map when the CLI
+            // exits (a leak on this machine). Best-effort cancel first; errors
+            // from cancel itself are swallowed so they can't mask the real one.
+            //
+            // BYOC is deliberately NOT cancelled. That container is running on a
+            // machine the user owns; killing their job because our CLI's poll
+            // window expired is destructive, and now that the record is durable
+            // they can simply ask `prism job-status <id>` later.
+            if resolved_backend == "local" {
+                let _ = router.cancel(job_id).await;
+            } else if !json {
+                println!(
+                    "Note: the remote job was NOT cancelled — it may still be running on your \
+                     machine. Ask: prism job-status {job_id}"
+                );
+            }
+
+            if json {
+                // JSON mode: emit the failure payload to STDOUT and return Err
+                // for the non-zero exit. anyhow then prints `Error: {error}` to
+                // STDERR, so stdout stays a clean JSON document for machine
+                // consumers while the process still exits non-zero.
+                let payload = serde_json::json!({
+                    "job_id": job_id,
+                    "name": name,
+                    "image": image,
+                    "backend": resolved_backend,
+                    "target": target,
+                    "inputs": inputs_json,
+                    "status": "failed",
+                    "error": error.to_string(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            }
+            // Non-JSON mode: do NOT eprintln here — `main` already prints
+            // `Error: {error}` to stderr on Err, so that would duplicate it.
+            Err(error)
+        }
+    }
+}
+
+/// Rebuild the backend that owns a persisted job, from its stored descriptor.
+///
+/// This is what un-hardcodes `job-status`: the backend comes from the RECORD,
+/// not from an assumption that every job is a cloud job. Credentials are never
+/// read from the record — the marc27 arm re-resolves auth from the caller's
+/// environment, which is also why an unauthenticated shell gets a loud error
+/// instead of a silent wrong answer.
+async fn backend_for_record(
+    record: &prism_compute::JobRecord,
+) -> Result<Box<dyn prism_compute::ComputeBackend>> {
+    match record.backend.as_str() {
+        "byoc" => {
+            let target: prism_compute::byoc::ByocTarget =
+                serde_json::from_value(record.target.clone()).with_context(|| {
+                    format!(
+                        "job {} is recorded as byoc but its stored target is unreadable: {}",
+                        record.job_id, record.target
+                    )
+                })?;
+            Ok(Box::new(prism_compute::byoc::ByocBackend::new(target)))
+        }
+        "local" => {
+            // A fresh process has an empty `active` map; adopt the job so the
+            // backend can address the container it already knows the name of.
+            let backend = prism_compute::LocalBackend::new();
+            backend.adopt(record.job_id).await;
+            Ok(Box::new(backend))
+        }
+        "marc27" => {
+            let (api_base, platform_auth) = resolve_agent_auth()?;
+            Ok(Box::new(prism_compute::Marc27Backend::new(
+                &api_base,
+                marc27_auth_from(platform_auth),
+            )))
+        }
+        other => anyhow::bail!(
+            "job {} has an unknown recorded backend {other:?}; cannot resolve where it ran",
+            record.job_id
+        ),
+    }
 }
 
 async fn handle_job_status(job_id_str: &str) -> Result<()> {
+    use prism_compute::ComputeBackend as _;
+
     let job_id: uuid::Uuid = job_id_str
         .parse()
         .with_context(|| format!("invalid job UUID: {job_id_str}"))?;
 
-    // Jobs submitted via `prism run --backend marc27` (and the run/run_submit
-    // agent tools) live on the MARC27 compute broker, so query the live API.
-    // The local JobTracker is in-memory only and empty in a fresh process, so
-    // it cannot answer for a platform job.
-    let (api_base, platform_auth) = resolve_agent_auth()?;
-    let backend = prism_compute::Marc27Backend::new(&api_base, marc27_auth_from(platform_auth));
-    use prism_compute::ComputeBackend as _;
+    // Resolve WHERE this job ran from the durable record written at submit
+    // time. A store that will not open is reported honestly rather than
+    // silently degrading to "it must have been a cloud job".
+    let store = prism_compute::JobStore::open_default()
+        .await
+        .context("could not open the local job store to look up this job")?;
+    let record = store.load(job_id).await?;
+
+    let Some(mut record) = record else {
+        // No record. Historically this path ASSUMED the marc27 broker. Keep
+        // that as an explicit, labelled fallback — an agent tool or an older
+        // PRISM may have submitted a platform job before job records existed —
+        // but say plainly that we are guessing.
+        println!("Job: {job_id}");
+        println!(
+            "No local record of this job (it was not submitted by this machine's \
+             `prism run`, or predates durable job records)."
+        );
+        println!("Falling back to the MARC27 platform broker...");
+        let (api_base, platform_auth) = resolve_agent_auth()?;
+        let backend = prism_compute::Marc27Backend::new(&api_base, marc27_auth_from(platform_auth));
+        let status = backend.status(job_id).await?;
+        println!("Status: {status:?}");
+        if matches!(status, prism_compute::JobStatus::Completed) {
+            match backend.results(job_id).await {
+                Ok(output) => println!("Output: {output}"),
+                Err(e) => println!("Output: unavailable ({e})"),
+            }
+        }
+        return Ok(());
+    };
 
     println!("Job: {job_id}");
-    let status = backend.status(job_id).await?;
+    println!("Name: {}", record.name);
+    println!("Image: {}", record.image);
+    println!("Backend: {} {}", record.backend, record.target);
+    println!("Submitted: {}", record.submitted_at.to_rfc3339());
+
+    // Already terminal AND we captured the output: answer from the record.
+    // The container is very likely gone by now, so re-querying would only
+    // manufacture a misleading "unreachable".
+    if record.status.is_terminal()
+        && let Some(output) = &record.output
+    {
+        println!("Status: {:?} (recorded)", record.status);
+        println!("Output: {output}");
+        return Ok(());
+    }
+
+    let backend = backend_for_record(&record).await?;
+
+    // Re-query the live backend. A transport failure here (SSH refused, kubectl
+    // missing, no platform credentials) must be LOUD: reporting the last known
+    // state as if it were current would be exactly the silent lie this command
+    // exists to eliminate.
+    let status = backend.status(job_id).await.with_context(|| {
+        format!(
+            "could not reach the {} backend that ran job {job_id} (target {}); \
+             last recorded state was {:?}",
+            record.backend, record.target, record.status
+        )
+    })?;
+
     println!("Status: {status:?}");
-    // Surface the output inline when the job is done, so `prism job-status`
-    // works end-to-end (status + result) the way the run hint promises.
+
+    let mut fetched_output: Option<String> = None;
     if matches!(status, prism_compute::JobStatus::Completed) {
         match backend.results(job_id).await {
-            Ok(output) => println!("Output: {output}"),
+            Ok(output) => {
+                println!("Output: {output}");
+                fetched_output = Some(output.to_string());
+            }
             Err(e) => println!("Output: unavailable ({e})"),
         }
+    } else if !matches!(status, prism_compute::JobStatus::Failed { .. }) {
+        println!("(still running — ask again with `prism job-status {job_id}`)");
+    }
+
+    // Persist what we just learned so the answer survives the container being
+    // reaped, and so a repeat query is cheap.
+    record.status = prism_compute::TrackedStatus::from(&status);
+    record.output = fetched_output.or(record.output);
+    record.updated_at = chrono::Utc::now();
+    if let Err(error) = store.save(&record).await {
+        eprintln!("warning: could not update the stored job record: {error}");
     }
 
     Ok(())
@@ -10635,6 +10911,69 @@ mod tests {
                 assert!(schema_only);
             }
             _ => panic!("expected Ingest command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_run_command_with_default_timeout() {
+        // `--timeout` defaults to 600s; verify the flag and default survive
+        // clap wiring (the value becomes the poll deadline).
+        let cli =
+            Cli::try_parse_from(["prism", "run", "--backend", "local", "python:3.11"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Run {
+                image,
+                backend,
+                timeout,
+                ..
+            } => {
+                assert_eq!(image, "python:3.11");
+                assert_eq!(backend, "local");
+                assert_eq!(timeout, 600, "default poll timeout must be 600s");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_run_command_with_custom_timeout() {
+        let cli = Cli::try_parse_from(["prism", "run", "--timeout", "30", "alpine:3.20"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Run { image, timeout, .. } => {
+                assert_eq!(image, "alpine:3.20");
+                assert_eq!(timeout, 30, "--timeout must override the default");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_run_with_ssh_byoc_target() {
+        // The BYOC dispatch surface this work exists to make usable.
+        let cli = Cli::try_parse_from([
+            "prism",
+            "run",
+            "--ssh",
+            "me@gpu-box.lab",
+            "--ssh-port",
+            "2222",
+            "--ssh-key",
+            "/keys/id_ed25519",
+            "alpine:3.20",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Run {
+                ssh,
+                ssh_port,
+                ssh_key,
+                ..
+            } => {
+                assert_eq!(ssh.as_deref(), Some("me@gpu-box.lab"));
+                assert_eq!(ssh_port, 2222);
+                assert_eq!(ssh_key, "/keys/id_ed25519");
+            }
+            _ => panic!("expected Run command"),
         }
     }
 

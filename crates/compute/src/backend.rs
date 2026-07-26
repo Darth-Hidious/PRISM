@@ -65,9 +65,37 @@ impl ComputeRouter {
         self
     }
 
+    /// Persist every routed job to the durable store, so `prism job-status`
+    /// can answer after this process exits. Without this the tracker is
+    /// in-memory only and a dispatched job is effectively fire-and-forget.
+    pub fn with_job_store(mut self, store: std::sync::Arc<crate::job_store::JobStore>) -> Self {
+        self.tracker = JobTracker::with_store(store);
+        self
+    }
+
     /// Get the job tracker for status queries.
     pub fn tracker(&self) -> &JobTracker {
         &self.tracker
+    }
+
+    /// Credential-free description of where a job routed to `backend_name`
+    /// actually went — enough for a later process to rebuild the backend.
+    ///
+    /// Deliberately excludes secrets: the marc27 arm emits only the API base
+    /// (the bearer/API token is re-resolved from the caller's environment at
+    /// query time), and the BYOC arm emits the SSH *key path*, never the key.
+    fn target_descriptor(&self, backend_name: &str) -> serde_json::Value {
+        match (backend_name, &self.default_backend) {
+            ("byoc", BackendKind::Byoc(target)) => {
+                serde_json::to_value(target).unwrap_or(serde_json::Value::Null)
+            }
+            ("marc27", BackendKind::Marc27 { api_base, .. }) => serde_json::json!({
+                "kind": "marc27",
+                "api_base": api_base,
+            }),
+            ("marc27", _) => serde_json::json!({ "kind": "marc27" }),
+            _ => serde_json::json!({ "kind": "local" }),
+        }
     }
 
     /// Resolve which backend to use for a plan.
@@ -128,7 +156,13 @@ impl ComputeRouter {
         let job_id = backend.submit(plan).await?;
 
         self.tracker
-            .register(job_id, &plan.name, &plan.image, backend_name)
+            .register(
+                job_id,
+                &plan.name,
+                &plan.image,
+                backend_name,
+                self.target_descriptor(backend_name),
+            )
             .await;
 
         tracing::info!(%job_id, backend = backend_name, "job routed");
@@ -204,6 +238,29 @@ impl ComputeRouter {
                 .await;
         }
         Ok(())
+    }
+}
+
+/// Thin `ComputeBackend` delegation so a `ComputeRouter` can be driven through
+/// the trait (e.g. by `poll::poll_to_terminal(&router, ..)`), letting the poll
+/// loop be unit-tested against any `&dyn ComputeBackend` — including a fake.
+///
+/// Each method forwards to the inherent method of the same name defined above
+/// via fully-qualified syntax (`ComputeRouter::method(self, ..)`), which names
+/// the inherent method directly and so cannot recurse through this trait impl.
+#[async_trait::async_trait]
+impl ComputeBackend for ComputeRouter {
+    async fn submit(&self, plan: &ExperimentPlan) -> Result<Uuid> {
+        ComputeRouter::submit(self, plan).await
+    }
+    async fn status(&self, job_id: Uuid) -> Result<JobStatus> {
+        ComputeRouter::status(self, job_id).await
+    }
+    async fn results(&self, job_id: Uuid) -> Result<serde_json::Value> {
+        ComputeRouter::results(self, job_id).await
+    }
+    async fn cancel(&self, job_id: Uuid) -> Result<()> {
+        ComputeRouter::cancel(self, job_id).await
     }
 }
 

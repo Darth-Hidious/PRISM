@@ -13,8 +13,10 @@
 pub mod backend;
 pub mod byoc;
 pub mod job;
+pub mod job_store;
 pub mod local;
 pub mod marc27;
+pub mod poll;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -23,7 +25,8 @@ use uuid::Uuid;
 
 // Re-exports for convenience.
 pub use backend::ComputeRouter;
-pub use job::JobTracker;
+pub use job::{JobRecord, JobTracker, TrackedStatus};
+pub use job_store::JobStore;
 pub use local::LocalBackend;
 pub use marc27::Marc27Auth;
 pub use marc27::Marc27Backend;

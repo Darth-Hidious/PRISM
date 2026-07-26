@@ -4701,11 +4701,13 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "prism-provenance",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "turso",
  "uuid",
 ]
 
