@@ -125,6 +125,14 @@ def build(
     maps each numeric key of the result to its unit as the engine reports it
     (use ``"unknown"`` when it genuinely is — never guess a unit).
     """
+    # One host probe, reused: `host` describes where it ran, and the agent
+    # record names the same machine.
+    host = collect_host()
+    versions = versions_of()
+    # Record the engine version under the engine's own name rather than
+    # re-probing an import that may not match (pyiron ships as
+    # `pyiron_atomistics`, matgl's models are not `matgl.__version__`).
+    versions[engine] = engine_version
     return {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
         "tool_name": tool_name,
@@ -132,8 +140,8 @@ def build(
         "input": inputs,
         "units": units,
         "units_policy": UNITS_POLICY,
-        "versions": versions_of(engine.split(".")[0]) if engine else versions_of(),
-        "host": collect_host(),
+        "versions": versions,
+        "host": host,
         "wasGeneratedBy": {
             "activity": activity,
             "engine": engine,
@@ -144,7 +152,7 @@ def build(
             "agent": "PRISM",
             "agent_type": "SoftwareAgent",
             "prism_version": PRISM_VERSION,
-            "host": collect_host().get("hostname", "unknown"),
+            "host": host.get("hostname", "unknown"),
         },
         "reproduce": reproduce,
         **(extra or {}),

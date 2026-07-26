@@ -12,6 +12,7 @@ shared builder lives in app/tools/_provenance.py; both emit the same keys.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import numpy as np
 import pytest
@@ -153,6 +154,37 @@ class TestCalphadLive:
         # The auto-added vacancy is a real change to what was computed.
         assert res["provenance"]["input"]["vacancy_added"] is True
         assert "VA" in res["provenance"]["input"]["components_used"]
+
+    def test_phase_fractions_obey_the_lever_rule(self, tmp_path):
+        """Al-30Fe at 1000 K sits in the Al5Fe2 + Al2Fe two-phase field.
+        The lever rule fixes the fractions exactly, so this checks phase
+        identification, the X(FE) condition mapping and the NP
+        serialisation in one shot — none of which a units test reaches."""
+        import shutil
+
+        import pycalphad
+
+        from app.tools.simulation.calphad_bridge import CalphadBridge
+
+        src = (
+            pathlib.Path(pycalphad.__file__).parent
+            / "tests" / "databases" / "alfe.tdb"
+        )
+        if not src.exists():
+            pytest.skip("pycalphad test databases not installed")
+        shutil.copy2(src, tmp_path / "alfe.tdb")
+
+        res = CalphadBridge(base_dir=tmp_path).calculate_equilibrium(
+            database_name="alfe", components=["AL", "FE"], phases=None,
+            conditions={"T": 1000, "P": 101325, "X(FE)": 0.3},
+        )
+        assert "error" not in res, res
+        assert set(res["phases_present"]) == {"AL5FE2", "AL2FE"}
+        # x_Fe: Al5Fe2 = 2/7, Al2Fe = 1/3. Lever rule at x_Fe = 0.30.
+        x, x_a, x_b = 0.30, 2 / 7, 1 / 3
+        f_al2fe = (x - x_a) / (x_b - x_a)
+        assert res["phase_fractions"]["AL2FE"] == pytest.approx(f_al2fe, abs=1e-3)
+        assert res["phase_fractions"]["AL5FE2"] == pytest.approx(1 - f_al2fe, abs=1e-3)
 
     def test_gibbs_energy_is_joules_per_mole_atom(self, tmp_path):
         """Known value: an ideal binary with zero end-member energies has
