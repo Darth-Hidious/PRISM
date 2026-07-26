@@ -15,8 +15,9 @@
 //!    exactly once when the client re-sends with `approve: ["<tool>"]`.
 //! 3. `unsupported_execution_claim_cannot_finalize_a_turn` — the Agent
 //!    Execution Contract's structural half: a final answer claiming execution
-//!    while zero tools ran is rejected by `run_turn`, not merely discouraged
-//!    by prompt text.
+//!    that no matching tool performed is rejected by `run_turn`, not merely
+//!    discouraged by prompt text. Asserts the streamed transcript and the
+//!    system message the stub LLM actually received, not just the final string.
 //!
 //! Requires `python3` on PATH; tests skip (with a note) when absent.
 
@@ -123,14 +124,37 @@ fn sse_tool_call(tool: &str) -> String {
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
 }
 
+/// Every system message the stub LLM was actually sent, in arrival order.
+type SystemMessageLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
 /// Serve `/v1/chat/completions` on an ephemeral port; returns the base_url
 /// (`http://127.0.0.1:<port>/v1`) for `LlmConfig`.
 async fn start_stub_llm(mode: StubMode) -> String {
+    start_stub_llm_recording(mode).await.0
+}
+
+/// Same, but also hands back a log of the system messages the stub received —
+/// the only way to prove what the model was ACTUALLY sent, rather than
+/// re-deriving it from the prompt-assembly functions.
+async fn start_stub_llm_recording(mode: StubMode) -> (String, SystemMessageLog) {
     use axum::routing::post;
+    let systems: SystemMessageLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = systems.clone();
     let app = axum::Router::new().route(
         "/v1/chat/completions",
-        post(
-            move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let sink = sink.clone();
+            async move {
+                if let Some(msgs) = body["messages"].as_array() {
+                    let mut log = sink.lock().expect("system log");
+                    for m in msgs {
+                        if m["role"] == "system"
+                            && let Some(c) = m["content"].as_str()
+                        {
+                            log.push(c.to_string());
+                        }
+                    }
+                }
                 let last_is_tool = body["messages"]
                     .as_array()
                     .and_then(|msgs| msgs.last())
@@ -161,8 +185,8 @@ async fn start_stub_llm(mode: StubMode) -> String {
                     .header("content-type", "text/event-stream")
                     .body(axum::body::Body::from(sse))
                     .expect("stub response")
-            },
-        ),
+            }
+        }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -171,7 +195,7 @@ async fn start_stub_llm(mode: StubMode) -> String {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    format!("http://{addr}/v1")
+    (format!("http://{addr}/v1"), systems)
 }
 
 fn llm_config(base_url: String) -> LlmConfig {
@@ -466,14 +490,25 @@ async fn gated_tool_is_skipped_then_runs_when_approved() {
 }
 
 /// STRUCTURAL PROOF for the Agent Execution Contract: an answer that claims
-/// execution while zero tools ran this turn must NOT be allowed to terminate
-/// the turn.
+/// execution while no tool of the matching class ran must NOT be allowed to
+/// terminate the turn.
 ///
 /// The stub LLM never calls a tool. Its first answer is a fabrication ("I ran
 /// the test suite and everything passes."). If the gate is wired, `run_turn`
 /// rejects that finalization, injects the contract reminder, and the model's
 /// second answer is what completes the turn. If the gate is missing or the
-/// tool counter is wrong, the fabrication ships and this fails.
+/// evidence tracking is wrong, the fabrication ships and this fails.
+///
+/// This also asserts on the STREAMED transcript, not only the final string. The
+/// rejected text has already reached the user by the time the gate runs (2e
+/// streams before the tool-call check), so without a separating marker the
+/// retry lands glued onto the fabrication as one self-contradicting message —
+/// a worse outcome than no gate at all. A final-string-only assertion is blind
+/// to that, which is exactly how this test read in its first draft.
+///
+/// It further asserts that the contract text is present in the system message
+/// the stub LLM ACTUALLY RECEIVED — end-to-end injection proof, as opposed to
+/// the `protocol.rs` unit test that re-walks the assembly functions.
 #[tokio::test(flavor = "multi_thread")]
 async fn unsupported_execution_claim_cannot_finalize_a_turn() {
     let Some(python) = find_python() else {
@@ -482,7 +517,7 @@ async fn unsupported_execution_claim_cannot_finalize_a_turn() {
     };
     let project = tempfile::tempdir().expect("tempdir");
     write_stub_project(project.path());
-    let base_url = start_stub_llm(StubMode::ClaimsWithoutTools).await;
+    let (base_url, system_messages) = start_stub_llm_recording(StubMode::ClaimsWithoutTools).await;
 
     let seed = build_agent_seed(
         &tool_server_config(project.path(), &python),
@@ -504,6 +539,7 @@ async fn unsupported_execution_claim_cannot_finalize_a_turn() {
     let mut transcript = prism_agent::transcript::TranscriptStore::new(None);
     let mut scratchpad = prism_agent::scratchpad::Scratchpad::new();
     let mut answer = String::new();
+    let mut streamed = String::new();
     agent_loop::run_turn(
         &llm,
         &mut tool_server,
@@ -518,14 +554,12 @@ async fn unsupported_execution_claim_cannot_finalize_a_turn() {
         &permissions,
         None,
         &mut scratchpad,
-        &mut |event| {
-            if let AgentEvent::TurnComplete {
+        &mut |event| match event {
+            AgentEvent::TextDelta { text } => streamed.push_str(&text),
+            AgentEvent::TurnComplete {
                 text: Some(text), ..
-            } = event
-                && !text.is_empty()
-            {
-                answer = text;
-            }
+            } if !text.is_empty() => answer = text,
+            _ => {}
         },
         None,
         None,
@@ -538,11 +572,37 @@ async fn unsupported_execution_claim_cannot_finalize_a_turn() {
         "the gate must reject the unsupported claim and force a second pass"
     );
     assert!(
-        history
-            .iter()
-            .any(|m| m.content.as_deref().is_some_and(|c| {
-                c.contains("EXECUTION CONTRACT") && c.contains("finalization rejected")
-            })),
-        "the contract reminder must be injected into the turn history"
+        history.iter().all(|m| m.content.as_deref()
+            != Some(prism_agent::execution_contract::UNSUPPORTED_CLAIM_REMINDER)),
+        "the reminder is per-finalization scaffolding and must be stripped from \
+         history before the turn ends — `history` outlives the turn on the TUI path"
+    );
+
+    // What the user actually saw. The rejected text streams before the gate can
+    // run, so the marker between the two answers is the only thing preventing
+    // one glued, self-contradicting message.
+    let fabrication = streamed
+        .find("I ran the test suite")
+        .expect("the rejected answer did stream to the user");
+    let marker = streamed
+        .find("unverified claim")
+        .expect("the retraction marker must separate the rejected answer from the retry");
+    let retry = streamed
+        .find("HONEST:")
+        .expect("the corrected answer must stream too");
+    assert!(
+        fabrication < marker && marker < retry,
+        "streamed order must be: rejected answer, retraction marker, corrected answer — got {streamed:?}"
+    );
+
+    // End-to-end injection proof: the contract is in the system message the
+    // model was actually sent, not merely in a constant or a re-derived string.
+    let systems = system_messages.lock().expect("system log");
+    assert!(
+        systems.iter().any(|s| {
+            s.contains("execution agent, not an advice-only assistant")
+                && s.contains("unless a tool result for it exists in THIS run")
+        }),
+        "the Execution Contract must be in a system message the model received"
     );
 }

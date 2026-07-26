@@ -15,6 +15,18 @@ use crate::prompt_profile::{LengthBudget, PromptProfile, ReasoningMode, Structur
 use crate::tool_catalog::ToolCatalog;
 
 /// Build the full base system prompt for either interactive or autonomous mode.
+///
+/// REACHABILITY, verified 2026-07-27: only `interactive = true` is reachable in
+/// production. `protocol::build_agent_seed` — the single constructor of
+/// `AgentConfig` for every transport (the stdio backend the TUI spawns, the
+/// HTTP `ChatService`, and subagents, which clone the parent config) —
+/// hardcodes `true`, so [`AUTONOMOUS_PROMPT`] is DEAD and has been since it was
+/// introduced. It is kept contract-complete and pinned by
+/// `both_prompts_carry_every_contract_clause` rather than silently deleted:
+/// whether PRISM ships a headless/autonomous mode is a product decision, and a
+/// dead prompt that has silently diverged is worse than one that is merely
+/// unused. DELETING it — along with this function's `interactive` parameter —
+/// is the owner's call, not a side effect of a prompt edit.
 #[must_use]
 pub fn build_system_prompt(interactive: bool) -> String {
     if interactive {
@@ -236,6 +248,7 @@ const INTERACTIVE_PROMPT: &str = r#"You are PRISM, an interactive agent for mate
 - BUDGET: an empty or failed result is not a stopping point. Reformulate, drop a constraint, go straight to an authoritative source, try adjacent terminology. Report failure only after at least three materially different attempts, and say what each one was.
 - You may not stop because the task looks straightforward, because you think you already know the answer, because a tool call is extra work, because the first attempt failed, or because you could tell the user how to do it themselves.
 - TOOL RISK IS NOT UNIFORM: read-only tools (search, read, inspect, list, status, calculate, sandbox test) — use them aggressively, without asking. Reversible writes (workspace edits, local branches, drafts) — do them and keep them revertible. Irreversible or external actions (deploy, publish, delete, spend, send) — confirm first. Hesitating on a read-only tool is a failure, not caution.
+- FIXED SEQUENCES, no skipped steps: for a bug — inspect, reproduce, localize, patch, test, review the diff. For research — decompose, search primary sources, extract claims, cross-check, synthesize, cite. For data — inspect the schema, validate, compute, sanity-check, summarize. You choose the content of each step; you do not get to drop one.
 
 # System
 - All text you output outside of tool use is shown directly to the user.
@@ -306,6 +319,7 @@ const AUTONOMOUS_PROMPT: &str = r#"You are PRISM, an autonomous agent for materi
 - BUDGET: an empty or failed result is not a stopping point. Reformulate, drop a constraint, go straight to an authoritative source, try adjacent terminology. Report failure only after at least three materially different attempts, and say what each one was.
 - You may not stop because the task looks straightforward, because you think you already know the answer, because a tool call is extra work, because the first attempt failed, or because you could tell the user how to do it themselves.
 - TOOL RISK IS NOT UNIFORM: read-only tools (search, read, inspect, list, status, calculate, sandbox test) — use them aggressively, without asking. Reversible writes (workspace edits, local branches, drafts) — do them and keep them revertible. Irreversible or external actions (deploy, publish, delete, spend, send) — confirm first. Hesitating on a read-only tool is a failure, not caution.
+- FIXED SEQUENCES, no skipped steps: for a bug — inspect, reproduce, localize, patch, test, review the diff. For research — decompose, search primary sources, extract claims, cross-check, synthesize, cite. For data — inspect the schema, validate, compute, sanity-check, summarize. You choose the content of each step; you do not get to drop one.
 
 # System
 - All text you output outside of tool use becomes part of the run log or user-visible result.
@@ -619,6 +633,10 @@ mod tests {
         (
             "TOOL RISK IS NOT UNIFORM",
             "read-only / reversible / irreversible tool policy",
+        ),
+        (
+            "FIXED SEQUENCES, no skipped steps",
+            "deterministic workflows — the model fills the steps, it does not drop them",
         ),
         (
             "Hesitating on a read-only tool is a failure",

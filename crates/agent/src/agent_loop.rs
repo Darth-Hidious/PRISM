@@ -45,6 +45,10 @@ const MAX_TOOL_RESULT_CHARS: usize = 30_000;
 const DOOM_LOOP_WINDOW: usize = 3;
 /// How many consecutive empty results from the same tool before we stop
 const EMPTY_RESULT_MAX: usize = 2;
+/// How many times the execution-contract gate may reject a finalization in one
+/// turn. A cost bound on false positives, NOT a completeness guarantee: past
+/// this the claim ships and the system prompt is the only remaining defence.
+const MAX_CONTRACT_GATE_FIRINGS: usize = 2;
 
 // ── Large-result handling ─────────────────────────────────────────
 
@@ -781,11 +785,13 @@ pub async fn run_turn(
     // FULL definitions stay in the request every later iteration. Without this,
     // find_tools returned names the model could never actually call.
     let mut pinned_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Execution-contract gate state: tools actually executed this turn, and
-    // whether the finalization gate has already fired once. Firing at most
-    // once bounds the cost of a false positive to one extra model turn.
-    let mut tool_calls_this_turn: usize = 0;
-    let mut contract_gate_fired = false;
+    // Execution-contract gate state: names of tools that ACTUALLY EXECUTED
+    // this turn (recorded at h5, after the permission / policy / approval
+    // gates — a blocked call produced no evidence and must not count), and how
+    // many times the finalization gate has fired. Capping the firings bounds
+    // the cost of a false positive; it is not a completeness guarantee.
+    let mut tools_used_this_turn: Vec<String> = Vec::new();
+    let mut contract_gate_firings: usize = 0;
 
     // ── 2. TAOR iteration loop ────────────────────────────────────
     for iteration in 0..config.max_iterations {
@@ -1076,10 +1082,11 @@ pub async fn run_turn(
                 // No tool calls → turn complete.
 
                 // ── Execution-contract gate ───────────────────────
-                // Deterministic, no-LLM: an answer that claims execution while
-                // zero tools ran this turn has no evidence behind it. Reject
-                // the finalization ONCE and hand the model the fork (do it, or
-                // stop claiming it). See `execution_contract`.
+                // Deterministic, no-LLM: an answer claiming an action that no
+                // tool of the matching class performed this turn has no
+                // evidence behind it. Reject the finalization and hand the
+                // model the fork (do it, or stop claiming it). See
+                // `execution_contract`.
                 //
                 // `iteration + 1 < max_iterations` is load-bearing: `continue`
                 // on the LAST iteration would fall through to the
@@ -1087,24 +1094,27 @@ pub async fn run_turn(
                 // — the user would lose the answer entirely. Never trade a
                 // fabricated answer for no answer; on the last iteration the
                 // claim ships and the prompt is the only line of defence.
-                if !contract_gate_fired
+                if contract_gate_firings < MAX_CONTRACT_GATE_FIRINGS
                     && iteration + 1 < config.max_iterations
                     && let Some(claim) = crate::execution_contract::unsupported_execution_claim(
                         response.message.content.as_deref().unwrap_or(""),
-                        tool_calls_this_turn,
+                        &tools_used_this_turn,
                     )
                 {
-                    contract_gate_fired = true;
+                    contract_gate_firings += 1;
                     tracing::info!(
                         claim = %claim,
+                        firing = contract_gate_firings,
                         "execution-contract gate: rejected unsupported execution claim"
                     );
-                    // The rejected text already streamed to the user. Say why a
-                    // second answer is coming rather than leaving two
-                    // contradictory answers on screen with no explanation.
+                    // The rejected text has ALREADY streamed to the user (2e
+                    // runs before this check). Without this marker the retry
+                    // would be appended straight onto the rejected text as one
+                    // self-contradicting message.
                     emit(AgentEvent::TextDelta {
-                        text: "\n\n[unverified claim — no tool ran this turn; re-checking]\n\n"
-                            .to_string(),
+                        text: format!(
+                            "\n\n[unverified claim \"{claim}…\" — no matching tool ran this turn; re-checking]\n\n"
+                        ),
                     });
                     history.push(ChatMessage {
                         role: "system".to_string(),
@@ -1115,6 +1125,17 @@ pub async fn run_turn(
                         tool_call_id: None,
                     });
                     continue;
+                }
+
+                // The reminder is harness scaffolding for ONE finalization, not
+                // conversation. `history` outlives the turn on the TUI path
+                // (`ServerRuntime::history`), so leaving it in would resend a
+                // stale scolding on every later turn of the session.
+                if contract_gate_firings > 0 {
+                    history.retain(|m| {
+                        m.content.as_deref()
+                            != Some(crate::execution_contract::UNSUPPORTED_CLAIM_REMINDER)
+                    });
                 }
 
                 // Auto-compact if needed
@@ -1150,7 +1171,6 @@ pub async fn run_turn(
         };
 
         // ── 2h. Process each tool call ────────────────────────────
-        tool_calls_this_turn += tool_calls.len();
         for tc in &tool_calls {
             let tool_name = &tc.function.name;
             let call_id = &tc.id;
@@ -1325,6 +1345,11 @@ pub async fn run_turn(
             }
 
             // ── h5. Execute tool ──────────────────────────────────
+            // Evidence for the execution-contract gate is recorded HERE, not
+            // where the model requested the call: h2-h5 above all `continue`
+            // on hook abort / permission block / policy deny / approval deny,
+            // and a call that never ran is not evidence of anything.
+            tools_used_this_turn.push(tool_name.clone());
             let start = Instant::now();
             let result: Result<Value> = if tool_name == crate::subagent::SPAWN_SUBAGENT_TOOL {
                 // spawn_subagent is a meta-tool by name, but unlike

@@ -1601,7 +1601,7 @@ fn system_prompt_for_mode(
             }
         }
         SessionMode::Plan => format!(
-            "{base_prompt}\n\nYou are in plan mode. Focus on analysis, constraints, sequencing, and concrete implementation planning. Do not edit files or rely on write/execute tools; those actions are blocked in this mode. Produce clear planning output that can guide later execution."
+            "{base_prompt}\n\nYou are in plan mode. Focus on analysis, constraints, sequencing, and concrete implementation planning. Do not edit files or rely on write/execute tools; those actions are blocked in this mode. Produce clear planning output that can guide later execution.\n\nThis narrows the Execution Contract, it does not suspend it: in plan mode THE PLAN IS the deliverable, so describing the work is not task substitution. Everything else still holds — read-only investigation before planning, no claim without a tool result, no answering from memory."
         ),
     }
 }
