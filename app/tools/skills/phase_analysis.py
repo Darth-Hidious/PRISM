@@ -59,7 +59,11 @@ def _analyze_phases(**kwargs) -> dict:
         )
         results["phase_diagram"] = {
             "n_points": diagram.get("n_points", 0),
+            # A scan that quietly dropped half its temperatures used to look
+            # identical to one that converged everywhere.
+            "n_failed_points": diagram.get("n_failed_points"),
             "temperature_range": [300, 2000, 100],
+            "provenance": diagram.get("provenance"),
         }
     except Exception as e:
         results["phase_diagram"] = {"error": str(e)}
@@ -71,6 +75,9 @@ def _analyze_phases(**kwargs) -> dict:
         "conditions": conditions,
         "available_phases": len(phases),
         "results": results,
+        # Lift the equilibrium bundle to the top so the summary itself is
+        # traceable, not only the nested step it came from.
+        "provenance": (results.get("equilibrium") or {}).get("provenance"),
     }
 
     # Add stable phases from equilibrium if available

@@ -8,6 +8,7 @@ def _select_materials(**kwargs) -> dict:
     dataset_name = kwargs["dataset_name"]
     criteria = kwargs.get("criteria", {})
     sort_by = kwargs.get("sort_by")
+    descending = bool(kwargs.get("descending", False))
     top_n = kwargs.get("top_n", 10)
     output_name = kwargs.get("output_name")
 
@@ -19,23 +20,53 @@ def _select_materials(**kwargs) -> dict:
     except FileNotFoundError:
         return {"error": f"Dataset '{dataset_name}' not found"}
 
+    n_before = len(df)
+
     # Apply criteria filters: {col}_min, {col}_max
+    ignored_criteria = []
     for key, value in criteria.items():
         if key.endswith("_min"):
             col = key[:-4]
             if col in df.columns:
                 df = df[df[col] >= value]
+            else:
+                ignored_criteria.append(key)
         elif key.endswith("_max"):
             col = key[:-4]
             if col in df.columns:
                 df = df[df[col] <= value]
+            else:
+                ignored_criteria.append(key)
+        else:
+            ignored_criteria.append(key)
+    # A dropped filter silently returns candidates that do not meet the
+    # stated criteria — refuse instead.
+    if ignored_criteria:
+        return {
+            "error": (
+                f"Criteria {ignored_criteria} do not match any column in "
+                f"'{dataset_name}' (expected '<column>_min' / '<column>_max'). "
+                f"Available columns: {list(df.columns)}"
+            )
+        }
 
     if df.empty:
         return {"error": "No materials match the given criteria"}
 
-    # Sort
-    if sort_by and sort_by in df.columns:
-        df = df.sort_values(sort_by, ascending=True).reset_index(drop=True)
+    # Sort. A sort_by naming a column that isn't there used to be ignored,
+    # so "top 10 by band_gap" quietly returned the first 10 rows in file
+    # order — ranked-looking output with no ranking in it.
+    if sort_by:
+        if sort_by not in df.columns:
+            return {
+                "error": (
+                    f"Cannot sort by '{sort_by}' — no such column in "
+                    f"'{dataset_name}'. Available: {list(df.columns)}"
+                )
+            }
+        df = df.sort_values(sort_by, ascending=not descending).reset_index(drop=True)
+
+    n_matching = len(df)
 
     # Take top N
     selected = df.head(top_n)
@@ -48,7 +79,13 @@ def _select_materials(**kwargs) -> dict:
     return {
         "dataset_name": output_name,
         "selected_count": len(selected),
-        "original_count": len(df),
+        # Was len(df) AFTER filtering, so "original" equalled "matching"
+        # whenever top_n exceeded the match count.
+        "original_count": n_before,
+        "matching_count": n_matching,
+        "sorted_by": sort_by,
+        "sort_order": "descending" if descending else "ascending",
+        "ranked": bool(sort_by),
         "columns": list(selected.columns),
     }
 
@@ -82,7 +119,17 @@ SELECT_SKILL = Skill(
             },
             "sort_by": {
                 "type": "string",
-                "description": "Column to sort results by",
+                "description": (
+                    "Column to rank by. Must exist in the dataset — an "
+                    "unknown column is an error, not an unranked result."
+                ),
+            },
+            "descending": {
+                "type": "boolean",
+                "description": (
+                    "Rank highest-first (default false = lowest-first). "
+                    "'Top N' is ambiguous, so state which end you want."
+                ),
             },
             "top_n": {
                 "type": "integer",

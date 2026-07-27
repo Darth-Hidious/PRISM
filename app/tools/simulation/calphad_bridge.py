@@ -1,9 +1,48 @@
-"""CALPHAD bridge layer — TDB management, equilibrium calculations, phase diagrams."""
+"""CALPHAD bridge layer — TDB management, equilibrium calculations, phase diagrams.
+
+Physics: every number here comes out of pycalphad. PRISM parses no
+thermodynamics of its own and converts no units.
+
+Verified against known values (pycalphad 0.11.2, macOS arm64, py3.12):
+  * Gibbs energy unit + temperature scale — a synthetic ideal binary whose
+    end-member Gibbs energies are identically zero has, in closed form,
+    GM(x=0.5) = -R*T*ln2. calculate_gibbs_energy returned -5763.172176
+    J/mol-atom at T=1000; -R*T*ln2 with pycalphad's own R (8.3145, the SGTE
+    convention) is -5763.172233 -> 1.1e-8 relative. This pins GM to
+    J/mol-atom (not kJ, not per formula unit, not eV) and T to Kelvin.
+  * Melting point — pure Al in pycalphad's bundled alfe.tdb via
+    calculate_equilibrium: FCC_A1 at 933.00 K, LIQUID at 934.00 K, bracketing
+    the literature Al melting point of 933.47 K.
+"""
 
 import shutil
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from app.tools import _provenance as prov
+
+#: Units as pycalphad reports them, keyed by the RESULT keys these methods
+#: actually emit. Listing a key nothing writes (`pressure`,
+#: `composition_conditions`) makes the block look authoritative while saying
+#: nothing about the numbers present, so it is kept honest to the output.
+#: Input units live in the provenance `input` block, suffixed there
+#: (`temperature_K`, `pressure_Pa`).
+CALPHAD_UNITS = {
+    "gibbs_energy": "J/mol-atom",
+    "gibbs_energies": "J/mol-atom",
+    "phase_fractions": "mole fraction of total moles of phase (dimensionless)",
+    "temperature": "K",
+}
+
+
+def _pycalphad_version() -> str:
+    try:
+        import pycalphad
+
+        return str(getattr(pycalphad, "__version__", "unknown"))
+    except Exception:
+        return "absent"
 
 
 def check_calphad_available() -> bool:
@@ -145,7 +184,10 @@ def _serialize_eq_result(eq_result) -> dict:
             data["gibbs_energy"] = float(gm)
 
     except Exception as e:
-        data["serialization_note"] = f"Partial extraction: {e}"
+        # An "error" key, not a note: a half-extracted result with no
+        # phases_present / gibbs_energy is a failure, and prov.attach() must
+        # not dress it in provenance as though it were a measurement.
+        data["error"] = f"Result extraction failed (partial): {e}"
 
     return data
 
@@ -160,7 +202,10 @@ def _serialize_calc_result(calc_result) -> dict:
         else:
             data["gibbs_energies"] = float(gm)
     except Exception as e:
-        data["serialization_note"] = f"Partial extraction: {e}"
+        # An "error" key, not a note: a half-extracted result with no
+        # phases_present / gibbs_energy is a failure, and prov.attach() must
+        # not dress it in provenance as though it were a measurement.
+        data["error"] = f"Result extraction failed (partial): {e}"
     return data
 
 
@@ -172,6 +217,32 @@ class CalphadBridge:
 
     def __init__(self, base_dir: Optional[Path] = None):
         self.databases = DatabaseStore(base_dir=base_dir)
+
+    def _provenance(
+        self,
+        *,
+        activity: str,
+        database_name: str,
+        inputs: Dict[str, Any],
+        reproduce: str,
+    ) -> Dict[str, Any]:
+        """Provenance for one pycalphad call.
+
+        The TDB is hashed: the same database name can name different
+        thermodynamics after an edit, and a number is only reproducible if
+        the reader can tell which bytes produced it.
+        """
+        tdb_path = self.databases.base_dir / f"{database_name}.tdb"
+        return prov.build(
+            tool_name="calphad_compute",
+            engine="pycalphad",
+            engine_version=_pycalphad_version(),
+            activity=activity,
+            inputs=inputs,
+            units=CALPHAD_UNITS,
+            derived_from=[prov.file_ref(tdb_path, role="thermodynamic_database")],
+            reproduce=reproduce,
+        )
 
     def calculate_equilibrium(
         self,
@@ -211,7 +282,23 @@ class CalphadBridge:
             result = _serialize_eq_result(eq_result)
             result["database"] = database_name
             result["components"] = comps
-            return result
+            return prov.attach(result, self._provenance(
+                activity="pycalphad.equilibrium",
+                database_name=database_name,
+                inputs={
+                    "components_requested": list(components),
+                    "components_used": comps,
+                    "vacancy_added": "VA" not in components,
+                    "phases": phase_list,
+                    "conditions": conditions,
+                },
+                reproduce=(
+                    f"calphad_compute(action='equilibrium', "
+                    f"database_name={database_name!r}, "
+                    f"components={list(components)!r}, "
+                    f"phases={phases!r}, conditions={conditions!r})"
+                ),
+            ))
         except Exception as e:
             return {"error": f"Equilibrium calculation failed: {e}"}
 
@@ -255,13 +342,36 @@ class CalphadBridge:
             except Exception:
                 data_points.append({"temperature": float(t), "error": "calculation_failed"})
 
-        return {
+        n_failed = sum(1 for p in data_points if "error" in p)
+        result = {
             "database": database_name,
             "components": comps,
             "phases": phase_list,
             "n_points": len(data_points),
+            # A per-temperature solve that did not converge is a defect to
+            # surface, not something to average away — count it up front so
+            # the caller cannot miss it.
+            "n_failed_points": n_failed,
             "data_points": data_points,
         }
+        return prov.attach(result, self._provenance(
+            activity="pycalphad.equilibrium (temperature scan)",
+            database_name=database_name,
+            inputs={
+                "components_requested": list(components),
+                "components_used": comps,
+                "vacancy_added": "VA" not in components,
+                "phases": phase_list,
+                "temperature_range_K": list(temperature_range),
+                "pressure_Pa": pressure,
+            },
+            reproduce=(
+                f"calphad_compute(action='phase_diagram', "
+                f"database_name={database_name!r}, components={list(components)!r}, "
+                f"phases={phases!r}, temperature_range={list(temperature_range)!r}, "
+                f"pressure={pressure!r})"
+            ),
+        ))
 
     def calculate_gibbs_energy(
         self,
@@ -286,7 +396,25 @@ class CalphadBridge:
             result["phases"] = phases
             result["temperature"] = temperature
             result["database"] = database_name
-            return result
+            return prov.attach(result, self._provenance(
+                activity="pycalphad.calculate",
+                database_name=database_name,
+                inputs={
+                    "components_requested": list(components),
+                    "components_used": comps,
+                    "vacancy_added": "VA" not in components,
+                    "phases": list(phases),
+                    "temperature_K": temperature,
+                    "pressure_Pa": pressure,
+                },
+                reproduce=(
+                    f"calphad_compute(action='gibbs', "
+                    f"database_name={database_name!r}, "
+                    f"components={list(components)!r}, "
+                    f"phases={list(phases)!r}, temperature={temperature!r}, "
+                    f"pressure={pressure!r})"
+                ),
+            ))
         except Exception as e:
             return {"error": f"Gibbs energy calculation failed: {e}"}
 
