@@ -41,7 +41,20 @@ def _acquire_materials(**kwargs) -> dict:
         except KeyError:
             continue
         try:
-            if src == "optimade" and filter_string:
+            if src == "optimade":
+                # OPTIMADE cannot be queried without a filter. Falling through
+                # to the parameterless `else` branch below called collect()
+                # with no arguments and turned a usage error into
+                # "TypeError: missing 1 required positional argument".
+                if not filter_string:
+                    skipped.append({
+                        "source": src,
+                        "reason": (
+                            "optimade needs a query: pass `elements` (a filter "
+                            "is built from them) or an explicit `filter_string`"
+                        ),
+                    })
+                    continue
                 records = collector.collect(
                     filter_string=filter_string, max_per_provider=max_results
                 )

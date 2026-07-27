@@ -388,8 +388,8 @@
     "cancel_background_research": "Platform agent-run control wrapper; meaningless without a MARC27 login.",
     "labs": "Browses THIS marketplace's premium lab services; publishing the browser as a marketplace item is circular. Job submission is additionally not live for any service.",
     "web": "Generic web search/fetch (Firecrawl + DuckDuckGo fallback) — not a materials-informatics capability, and a commodity elsewhere.",
-    "prior_art_search": "HOLD — could not be verified returning results. On 2026-07-27 both upstreams failed (arXiv ReadTimeout then HTTP 429, Semantic Scholar HTTP 429); the tool reported per-source status honestly but returned zero papers/patents on every attempt. Publish once a run returns real hits.",
-    "acquire_materials": "BROKEN — verified 2026-07-27: every source is skipped with 'TypeError: OPTIMADECollector.collect() missing 1 required positional argument: filter_string'. Must not be published while it collects nothing.",
-    "materials_discovery": "BROKEN by dependency — its first step is acquire_materials, which is broken (see above), and the skill returns 'Acquisition failed' before reaching prediction."
+    "prior_art_search": "NOT BROKEN — the 2026-07-27 zero-result runs were upstream rate limiting, not a defect. Re-verified live 2026-07-27: arXiv returned real papers ('tungsten rhodium alloy' -> 3 hits), J-STAGE and Internet Archive returned real hits via source='both'. Semantic Scholar still answers HTTP 429 on the unauthenticated endpoint and Lens patents need LENS_API_TOKEN; both are reported by name in source_status rather than silently dropped. Stays bundled pending the owner's publish decision, not a fix.",
+    "acquire_materials": "FIXED, still bundled pending the owner's publish decision. The 2026-07-27 TypeError came from calls carrying neither `elements` nor `filter_string`: the optimade branch fell through to the parameterless collect() and crashed. The collector signature was right; the caller now records an actionable skip. Verified live 2026-07-27: elements=['W','Rh'] over the 51 OPTIMADE providers returned 84 real records.",
+    "materials_discovery": "Unblocked with acquire_materials (see above) — its first step now completes. Stays bundled pending the owner's publish decision; the later ML/report steps have not been verified end-to-end here."
   }
 }

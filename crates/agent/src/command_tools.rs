@@ -438,9 +438,13 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "agent",
         aliases: &["prism_agent"],
         kind: CommandToolKind::RootArgs,
-        description: "Run `prism agent ...` for PRISM agent management commands. Use this for PRISM-native orchestration flows rather than `execute_bash`.",
-        permission_mode: PermissionMode::FullAccess,
-        requires_approval: true,
+        // The old description ("PRISM agent management commands") promised an
+        // orchestration surface that does not exist. `prism agent` takes NO
+        // arguments and only prints a static cheat-sheet (print_agent_guide) —
+        // so leave `args` empty, and it is a read-only print, not FullAccess.
+        description: "Print PRISM's grep-friendly command index: the canonical query / compute / ingest / node / workflow invocations with one-line explanations, grouped by task. Read-only, takes no arguments, changes nothing. Use it to recall which capability handles a job; then call that capability's own typed tool rather than shelling out.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
     },
     CommandToolSpec {
         name: "run",
@@ -3367,7 +3371,53 @@ async fn execute_workflow_command(
 /// are only listed in the default catalog when the node is reachable. The
 /// specs stay registered — `execute_command_tool` still resolves them — so
 /// nothing breaks if an older transcript or client calls one by name.
+///
+/// `query` is kept in this list for intent even though
+/// [`REDUNDANT_UMBRELLA_TOOLS`] already hides it in every state — it says what
+/// would happen if the umbrella were ever offered again.
 const LOCAL_NODE_TOOLS: &[&str] = &["query", "query_local", "query_federated"];
+
+/// Umbrella roots whose EVERY offered verb already has a typed sibling tool.
+///
+/// They are not deleted — `spec_by_name` still resolves them, so
+/// `execute_command_tool`, the MCP `tools/call` path, the single-tool
+/// executor and any older transcript keep working (hidden ≠ unexecutable,
+/// same contract as [`LOCAL_NODE_TOOLS`]). They are only removed from the
+/// OFFERED catalog, because an `args: array<string>` escape hatch next to a
+/// typed sibling invites the model to guess argv instead of filling a schema —
+/// a correctness problem before it is a token-budget one.
+///
+/// Coverage verified verb-by-verb against the clap definitions in
+/// `crates/cli/src/main.rs` (see `dropped_umbrella_verbs_have_typed_siblings`):
+///   query      -> query_local / query_platform / query_federated
+///   job-status -> job_status_lookup
+///   workflow   -> workflow_list / workflow_show / workflow_run
+///   mesh       -> mesh_{discover,peers,publish,subscribe,unsubscribe,
+///                        subscriptions,health}
+///   deploy     -> deploy_{create,list,status,stop,health}
+///   models     -> models_{list,search,info}  (the umbrella never offered
+///                 `register`; that verb is CLI-only either way)
+///   discourse  -> discourse_{create,list,show,run,status,turns}
+///   run        -> run_submit
+///   research   -> research_query
+///   publish    -> publish_artifact
+///
+/// Deliberately NOT here — each still reaches a verb no typed tool covers:
+///   marketplace (`update`, `publish`), node (`up`, `down`, `key`),
+///   billing (`topup`), ingest (`--status`), and the four with no typed
+///   sibling at all: status, doctor, tools, agent.
+const REDUNDANT_UMBRELLA_TOOLS: &[&str] = &[
+    "query",
+    "job-status",
+    "workflow",
+    "mesh",
+    "deploy",
+    "models",
+    "discourse",
+    "run",
+    "research",
+    "publish",
+];
 
 /// Cheap connectivity probe for the local node dashboard — the same
 /// `127.0.0.1:7327` endpoint the boot checks use. TCP-level only: a refused
@@ -3380,7 +3430,8 @@ fn local_node_reachable() -> bool {
 }
 
 /// Default tool catalog entries: local-store tools appear only when the
-/// local node is actually running.
+/// local node is actually running, and umbrellas fully covered by typed
+/// siblings are never offered at all.
 pub fn command_tools() -> Vec<LoadedTool> {
     command_tools_filtered(local_node_reachable())
 }
@@ -3391,17 +3442,22 @@ pub fn command_tools() -> Vec<LoadedTool> {
 pub fn command_tools_filtered(local_node_online: bool) -> Vec<LoadedTool> {
     COMMAND_TOOLS
         .iter()
+        .filter(|spec| !REDUNDANT_UMBRELLA_TOOLS.contains(&spec.name))
         .filter(|spec| local_node_online || !LOCAL_NODE_TOOLS.contains(&spec.name))
-        .map(|spec| LoadedTool {
-            name: spec.name.to_string(),
-            description: spec.description.to_string(),
-            input_schema: schema_for_spec(spec),
-            requires_approval: spec.requires_approval,
-            permission_mode: spec.permission_mode,
-            source: Some("prism-command".to_string()),
-            source_detail: None,
-        })
+        .map(loaded_tool)
         .collect()
+}
+
+fn loaded_tool(spec: &CommandToolSpec) -> LoadedTool {
+    LoadedTool {
+        name: spec.name.to_string(),
+        description: spec.description.to_string(),
+        input_schema: schema_for_spec(spec),
+        requires_approval: spec.requires_approval,
+        permission_mode: spec.permission_mode,
+        source: Some("prism-command".to_string()),
+        source_detail: None,
+    }
 }
 
 pub fn is_command_tool(tool_name: &str) -> bool {
@@ -3684,10 +3740,12 @@ mod tests {
             .iter()
             .find(|tool| tool.name == "workflow_run")
             .expect("workflow_run should exist");
+        // The raw `query` umbrella is no longer offered (see
+        // REDUNDANT_UMBRELLA_TOOLS); `query_local` is its typed replacement.
         let query = tools
             .iter()
-            .find(|tool| tool.name == "query")
-            .expect("query should exist");
+            .find(|tool| tool.name == "query_local")
+            .expect("query_local should exist");
 
         assert!(tools.len() >= 30);
         assert_eq!(query.permission_mode, PermissionMode::ReadOnly);
@@ -3752,7 +3810,7 @@ mod tests {
         let tools = command_tools_filtered(false);
         // Only the local-node tools are gated offline; query_platform hits the
         // remote API and stays offered (see offline_catalog_offers_platform_knowledge_path).
-        for name in ["query", "query_local", "query_federated"] {
+        for name in ["query_local", "query_federated"] {
             assert!(
                 tools.iter().all(|tool| tool.name != name),
                 "{name} must not be offered while the local node is offline"
@@ -3768,7 +3826,9 @@ mod tests {
     #[test]
     fn local_store_tools_offered_when_node_online() {
         let tools = command_tools_filtered(true);
-        for name in ["query", "query_local", "query_federated"] {
+        // `query` itself is never offered any more — it is a raw-argv umbrella
+        // fully covered by these typed siblings.
+        for name in ["query_local", "query_federated"] {
             assert!(
                 tools.iter().any(|tool| tool.name == name),
                 "{name} should be offered when the local node is running"
@@ -3776,6 +3836,167 @@ mod tests {
         }
         // query_platform hits the remote API, so it is offered in both states.
         assert!(tools.iter().any(|tool| tool.name == "query_platform"));
+    }
+
+    // ── Redundant umbrellas: hidden, but not removed ─────────────────────
+
+    fn offered_names(local_node_online: bool) -> std::collections::BTreeSet<String> {
+        command_tools_filtered(local_node_online)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    }
+
+    #[test]
+    fn redundant_umbrellas_are_not_offered() {
+        let offered = offered_names(true);
+        for name in REDUNDANT_UMBRELLA_TOOLS {
+            assert!(
+                !offered.contains(*name),
+                "`{name}` is fully covered by typed siblings and must not be \
+                 offered to the model"
+            );
+        }
+    }
+
+    #[test]
+    fn redundant_umbrellas_stay_executable() {
+        // Hidden ≠ unexecutable. Each one must still resolve by name, still
+        // answer the approval lookup, and still build a real CLI invocation.
+        for name in REDUNDANT_UMBRELLA_TOOLS {
+            assert!(is_command_tool(name), "`{name}` must remain dispatchable");
+            assert!(
+                command_tool_requires_approval(name).is_some(),
+                "`{name}` must still answer the approval lookup"
+            );
+            let spec = spec_by_name(name).expect("spec resolves");
+            let args = match spec.kind {
+                CommandToolKind::RootSubcommand { subcommands } => {
+                    json!({ "subcommand": subcommands[0] })
+                }
+                _ => json!({ "args": ["--help"] }),
+            };
+            let preview = command_tool_preview(name, &args)
+                .unwrap_or_else(|| panic!("`{name}` must still build an invocation"));
+            assert!(
+                preview.starts_with(&format!("prism {}", spec.root)),
+                "`{name}` preview should invoke its real root: {preview}"
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_umbrella_verbs_have_typed_siblings() {
+        // The capability gate: nothing may be dropped that the typed surface
+        // cannot reach. For a RootSubcommand umbrella the verb set is declared
+        // on the spec itself, so this check maintains itself.
+        let offered = offered_names(true);
+        for name in REDUNDANT_UMBRELLA_TOOLS {
+            let spec = spec_by_name(name).expect("spec resolves");
+            if let CommandToolKind::RootSubcommand { subcommands } = spec.kind {
+                for verb in subcommands {
+                    let sibling = format!("{}_{verb}", spec.root);
+                    assert!(
+                        offered.contains(&sibling),
+                        "`{name} {verb}` has no offered typed sibling \
+                         (`{sibling}`) — keep the umbrella instead"
+                    );
+                }
+            }
+        }
+
+        // RootArgs umbrellas declare no verb set, so name the replacements
+        // explicitly. Checked against the clap definitions in
+        // crates/cli/src/main.rs: Query{text,--semantic,--platform,--federated,
+        // --limit,--llm-url,--model,--api-key,--dashboard-url},
+        // JobStatus{job_id}, WorkflowCommands{List,Show,Run},
+        // Run{image,...}, Research{query,--depth,--json},
+        // Publish{path,--to,--repo,--private}.
+        for (umbrella, siblings) in [
+            (
+                "query",
+                &["query_local", "query_platform", "query_federated"][..],
+            ),
+            ("job-status", &["job_status_lookup"][..]),
+            (
+                "workflow",
+                &["workflow_list", "workflow_show", "workflow_run"][..],
+            ),
+            ("run", &["run_submit"][..]),
+            ("research", &["research_query"][..]),
+            ("publish", &["publish_artifact"][..]),
+        ] {
+            assert!(
+                REDUNDANT_UMBRELLA_TOOLS.contains(&umbrella),
+                "`{umbrella}` should be in the dropped set"
+            );
+            for sibling in siblings {
+                assert!(
+                    offered.contains(*sibling),
+                    "`{umbrella}` was dropped but its replacement `{sibling}` \
+                     is not offered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn umbrellas_with_an_uncovered_verb_stay_offered() {
+        // The other half of the gate: an umbrella that still reaches a verb no
+        // typed tool covers must NOT be dropped. Verified against
+        // crates/cli/src/main.rs.
+        let offered = offered_names(true);
+        for (umbrella, uncovered) in [
+            ("marketplace", "update, publish"),
+            ("node", "up, down, key"),
+            ("billing", "topup"),
+            ("ingest", "--status"),
+        ] {
+            assert!(
+                !REDUNDANT_UMBRELLA_TOOLS.contains(&umbrella),
+                "`{umbrella}` still reaches {uncovered} — it is not redundant"
+            );
+            assert!(
+                offered.contains(umbrella),
+                "`{umbrella}` must stay offered: {uncovered} has no typed tool"
+            );
+        }
+        // No typed sibling of any kind.
+        for umbrella in ["status", "doctor", "tools", "agent"] {
+            assert!(offered.contains(umbrella), "`{umbrella}` must stay offered");
+        }
+    }
+
+    #[test]
+    fn hiding_redundant_umbrellas_reclaims_the_measured_token_cost() {
+        use crate::tool_catalog::definition_tokens;
+
+        let reclaimed: usize = REDUNDANT_UMBRELLA_TOOLS
+            .iter()
+            .map(|name| {
+                let spec = spec_by_name(name).expect("spec resolves");
+                definition_tokens(&loaded_tool(spec).to_definition())
+            })
+            .sum();
+        let offered: usize = command_tools_filtered(true)
+            .iter()
+            .map(|tool| definition_tokens(&tool.to_definition()))
+            .sum();
+
+        // Measured on integration/prism-hardening before the change: the 14
+        // candidate umbrellas cost 2,398 charged tokens, of which these 10 are
+        // the ones with full typed coverage. Guard the floor so a future edit
+        // cannot quietly re-inflate the offered surface.
+        assert!(
+            reclaimed >= 1_500,
+            "expected to reclaim ≥1500 tokens, got {reclaimed}"
+        );
+        assert!(
+            reclaimed * 100 / (offered + reclaimed) >= 5,
+            "expected ≥5% of the pre-change offered surface, got \
+             {reclaimed} of {} tokens",
+            offered + reclaimed
+        );
     }
 
     #[test]
@@ -4319,20 +4540,12 @@ mod tests {
     /// This is the audited gap; the list MUST only shrink over time. Batch 1
     /// converted the 7 highest-overlap umbrellas (billing, deploy, discourse,
     /// marketplace, mesh, models, node) to typed `RootSubcommand` schemas;
-    /// the remaining entries are genuine few-purpose roots with low overlap.
-    const ROOTARGS_ALLOWLIST: &[&str] = &[
-        "agent",
-        "doctor",
-        "ingest",
-        "job-status",
-        "publish",
-        "query",
-        "research",
-        "run",
-        "status",
-        "tools",
-        "workflow",
-    ];
+    /// Batch 2 stopped OFFERING the six raw-argv umbrellas whose every verb
+    /// already had a typed sibling (job-status, publish, query, research, run,
+    /// workflow — see REDUNDANT_UMBRELLA_TOOLS). What is left is offered:
+    /// `ingest` (its `--status` mode has no typed tool) and the three
+    /// argument-less roots plus `agent`.
+    const ROOTARGS_ALLOWLIST: &[&str] = &["agent", "doctor", "ingest", "status", "tools"];
 
     #[test]
     fn every_command_tool_has_a_real_schema_or_is_known_rootargs() {
