@@ -456,6 +456,13 @@ impl GoalResumer for WorkerResumer {
 /// Durable schedule registry — embedded libSQL, one file, no server.
 pub struct ScheduleStore {
     conn: turso::Connection,
+    /// Sibling lock file guarding [`tick_once`]. Two overlapping ticks would
+    /// each read the same due schedule and each start a worker for it; the
+    /// `worker_alive` check narrows that to a race, and this closes it.
+    /// launchd and systemd will not run two copies of one unit, but plain
+    /// `cron` will, and so will a human running `prism schedule tick` while
+    /// the timer fires.
+    lock_path: PathBuf,
 }
 
 impl ScheduleStore {
@@ -498,7 +505,14 @@ impl ScheduleStore {
             (),
         )
         .await?;
-        Ok(Self { conn })
+        // An in-memory store has no file to sit a lock next to (and two of
+        // them are genuinely independent), so give it a private one.
+        let lock_path = if path_str == ":memory:" {
+            std::env::temp_dir().join(format!("prism-sched-{}.tick.lock", uuid::Uuid::new_v4()))
+        } else {
+            path.with_extension("tick.lock")
+        };
+        Ok(Self { conn, lock_path })
     }
 
     /// Open the default pod-local store.
@@ -666,17 +680,65 @@ fn row_to_schedule(row: &turso::Row) -> Result<Schedule> {
 
 // ── The tick engine ─────────────────────────────────────────────────
 
+/// Held for the duration of a tick so two ticks cannot both resume the same
+/// goal. The kernel releases the `flock` when the process exits, including on
+/// SIGKILL, so this can never go stale.
+struct TickLock(
+    /// The lock is the open descriptor itself — the value is never read, it
+    /// is held. Dropping the file releases the `flock`.
+    #[allow(dead_code)]
+    std::fs::File,
+);
+
+impl TickLock {
+    /// `None` when another tick already holds it — the caller reports that
+    /// and does nothing, which is the correct outcome for a duplicate tick.
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open tick lock {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `file` owns the fd for the whole call.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                return match err.kind() {
+                    std::io::ErrorKind::WouldBlock => Ok(None),
+                    // Any other failure means we cannot prove exclusivity;
+                    // refusing to tick is safer than risking a double resume.
+                    _ => Err(anyhow::anyhow!("tick lock unavailable: {err}")),
+                };
+            }
+        }
+        Ok(Some(Self(file)))
+    }
+}
+
 /// Evaluate every active schedule once and act on the due ones.
 ///
 /// This is what `prism schedule tick` runs, and what the daemon loop calls on
 /// each pass. Pure with respect to the clock (`now` is injected) and to
 /// process spawning (via [`GoalResumer`]), so the full gate ladder is
 /// unit-testable.
+///
+/// Returns `Err` when another tick is already in flight, so the caller says
+/// so rather than reporting an empty, successful-looking pass.
 pub async fn tick_once(
     store: &ScheduleStore,
     resumer: &dyn GoalResumer,
     now: i64,
 ) -> Result<Vec<(String, Decision)>> {
+    let Some(_lock) = TickLock::try_acquire(&store.lock_path)? else {
+        bail!(
+            "another `prism schedule tick` is already running — skipping this one so a goal \
+             is not resumed twice"
+        );
+    };
     let mut out = Vec::new();
     for mut sched in store.list().await? {
         if sched.state != ScheduleState::Active {
@@ -1390,6 +1452,37 @@ mod tests {
         assert_eq!(back.max_fires, 7);
         assert_eq!(back.max_no_progress, 4);
         assert_eq!(back.trigger, Trigger::Every { seconds: 3_600 });
+    }
+
+    #[tokio::test]
+    async fn overlapping_ticks_refuse_rather_than_double_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("schedules.db");
+        let store = ScheduleStore::open(&db).await.unwrap();
+        let r = FakeResumer::new(snapshot(GoalStatus::Running, 1, 10));
+        let s = store
+            .create("goal-race", Trigger::Every { seconds: 60 }, 10, 3)
+            .await
+            .unwrap();
+
+        // Stand in for a tick that is still in flight (cron overlapping
+        // itself, or a human running `tick` while the timer fires).
+        let held = TickLock::try_acquire(&store.lock_path).unwrap();
+        assert!(held.is_some(), "first holder must get the lock");
+
+        let err = tick_once(&store, &r, s.next_due_at.unwrap())
+            .await
+            .expect_err("a second tick must refuse, not silently do nothing");
+        assert!(
+            err.to_string().contains("already running"),
+            "the refusal must say why: {err}"
+        );
+        assert_eq!(r.resume_count(), 0, "no goal may be resumed twice");
+
+        // Once the first tick finishes, the next one proceeds normally.
+        drop(held);
+        let out = tick_once(&store, &r, s.next_due_at.unwrap()).await.unwrap();
+        assert!(matches!(out[0].1, Decision::Fired(_)), "{out:?}");
     }
 
     #[test]

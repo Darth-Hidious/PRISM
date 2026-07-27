@@ -8690,7 +8690,20 @@ async fn handle_schedule_command(command: ScheduleCommands) -> Result<()> {
             let exe = std::env::current_exe()?;
             let unit_path = heartbeat_unit_path();
             let (contents, activate) = if cfg!(target_os = "macos") {
-                (launchd_plist(&exe, interval), "launchctl load -w")
+                // launchd opens StandardOutPath itself and refuses to spawn
+                // the job if the directory is missing — the unit would sit
+                // installed and never fire. Create it before writing.
+                if write {
+                    std::fs::create_dir_all(
+                        PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                            .join(".prism")
+                            .join("logs"),
+                    )?;
+                }
+                (
+                    launchd_plist(&exe, interval),
+                    "launchctl bootstrap gui/$(id -u)".to_string(),
+                )
             } else {
                 let (service, timer) = systemd_units(&exe, interval);
                 if write && let Some(dir) = unit_path.parent() {
@@ -8698,7 +8711,14 @@ async fn handle_schedule_command(command: ScheduleCommands) -> Result<()> {
                     std::fs::write(dir.join("prism-schedule.service"), &service)?;
                     println!("Wrote {}", dir.join("prism-schedule.service").display());
                 }
-                (timer, "systemctl --user enable --now")
+                // systemd wants the unit NAME once the file is in the user
+                // unit directory; a path works but is the awkward form.
+                (
+                    timer,
+                    "systemctl --user daemon-reload && systemctl --user enable --now \
+                     prism-schedule.timer #"
+                        .to_string(),
+                )
             };
             if write {
                 if let Some(parent) = unit_path.parent() {
