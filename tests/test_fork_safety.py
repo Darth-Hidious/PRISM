@@ -352,25 +352,27 @@ class TestSpawnHelperCannotSilentlyRegress:
 # ---------------------------------------------------------------------------
 
 
-def _fake_hf_cli(tmp_path: Path, monkeypatch) -> Path:
-    """Put a stub `hf` first on PATH. Returns the file it records argv into.
+def _fake_on_path(tmp_path: Path, monkeypatch, name: str, body: str = "") -> Path:
+    """Put an executable stub first on PATH. Returns the file it records argv into.
 
-    It answers in the shape the two parsers expect: a status word for
-    `_parse_status`, and a job URL on the last line for `_parse_job_id`.
+    The recorded argv is what most of these exercises assert on. It is the one
+    thing only a spawn that actually reached exec can produce: a fork that dies
+    in the atfork handler, and a fork the no_fork fixture refuses, both leave
+    this file absent.
     """
     bindir = tmp_path / "bin"
     bindir.mkdir(parents=True, exist_ok=True)
-    calls = tmp_path / "hf-calls.log"
-    script = bindir / "hf"
-    script.write_text(
-        "#!/bin/sh\n"
-        f'echo "$@" >> "{calls}"\n'
-        "echo completed\n"
-        "echo https://huggingface.co/jobs/fakejob123\n"
-    )
-    script.chmod(0o755)
+    calls = tmp_path / f"{name}-calls.log"
+    stub = bindir / name
+    stub.write_text(f'#!/bin/sh\necho "$@" >> "{calls}"\n{body}')
+    stub.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
     return calls
+
+
+# What the stub `hf` prints: a status word for _parse_status, and a job URL on
+# the last line for _parse_job_id.
+_FAKE_HF_OUTPUT = "echo completed\necho https://huggingface.co/jobs/fakejob123\n"
 
 
 def _exercise_git_provenance(tmp_path, monkeypatch) -> None:
@@ -457,7 +459,7 @@ def _exercise_hf_launch_and_poll(tmp_path, monkeypatch) -> None:
     """mace/backends/hf_jobs.py — `hf jobs uv run` (launch) and `hf jobs status` (poll)."""
     from app.tools.simulation.mace.backends import hf_jobs
 
-    calls = _fake_hf_cli(tmp_path, monkeypatch)
+    calls = _fake_on_path(tmp_path, monkeypatch, "hf", _FAKE_HF_OUTPUT)
     monkeypatch.setattr(hf_jobs, "get_hf_token", lambda: "not-a-real-token")
     # An empty results repo stops execute() on a deterministic error the moment
     # both spawns are done, so this needs no HF account and no network.
@@ -502,7 +504,7 @@ def _exercise_hf_cancel_and_logs(tmp_path, monkeypatch) -> None:
     """mace/backends/hf_jobs.py — `hf jobs cancel` and `hf jobs logs`."""
     from app.tools.simulation.mace.backends import hf_jobs
 
-    calls = _fake_hf_cli(tmp_path, monkeypatch)
+    calls = _fake_on_path(tmp_path, monkeypatch, "hf", _FAKE_HF_OUTPUT)
 
     backend = hf_jobs.HfJobsBackend()
     backend._active["cache-key"] = "fakejob123"
@@ -524,17 +526,20 @@ def _exercise_update_install_detection(tmp_path, monkeypatch) -> None:
     """app/update.py — `uv tool list` behind detect_install_method()."""
     from app import update
 
-    bindir = tmp_path / "bin"
-    bindir.mkdir(parents=True, exist_ok=True)
-    fake_uv = bindir / "uv"
-    fake_uv.write_text("#!/bin/sh\necho prism-platform\n")
-    fake_uv.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    calls = _fake_on_path(tmp_path, monkeypatch, "uv", "echo prism-platform\n")
 
-    assert update.detect_install_method() == "uv", (
-        "the `uv tool list` spawn failed and was swallowed, so PRISM falls "
-        "through to a different install method and prints an upgrade command "
-        "that will not work. (`pipx list` at line 95 is the same shape.)"
+    update.detect_install_method()
+
+    # Assert the command REACHED exec, not that detect_install_method returned
+    # "uv". The return value is gated on a production timeout=5 this test does
+    # not own: on a loaded machine a slow-but-successful spawn also returns
+    # something else, and then a timing problem would be reported as a fork
+    # death. What only a fork death can do is leave this file unwritten.
+    assert calls.exists() and "tool list" in calls.read_text(), (
+        "`uv tool list` never reached the shell. detect_install_method "
+        "swallows that and falls through to another install method, printing "
+        "an upgrade command that will not work. (`pipx list` is the same "
+        "shape and the same spawn.)"
     )
 
 
@@ -546,12 +551,18 @@ def _exercise_update_run_upgrade(tmp_path, monkeypatch) -> None:
     # Not an absolute path: subprocess.py:1860 refuses posix_spawn for an
     # executable with no dirname, so an absolute path here would be an easier
     # case than production ever is.
-    monkeypatch.setattr(update, "upgrade_command", lambda method=None: "echo upgraded")
-
-    assert update.run_upgrade(method="pip") is True, (
-        "the upgrade spawn never completed; run_upgrade reports False, which "
-        "is indistinguishable from an upgrade that ran and failed."
+    calls = _fake_on_path(tmp_path, monkeypatch, "prism-fake-upgrade")
+    monkeypatch.setattr(
+        update, "upgrade_command", lambda method=None: "prism-fake-upgrade --self"
     )
+
+    ok = update.run_upgrade(method="pip")
+
+    assert calls.exists(), (
+        "the upgrade spawn never reached exec. run_upgrade reports False for "
+        "that, which is indistinguishable from an upgrade that ran and failed."
+    )
+    assert ok is True, f"upgrade spawn ran but reported failure; argv was {calls.read_text()!r}"
 
 
 _MIGRATED_SITES = [
