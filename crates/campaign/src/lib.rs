@@ -914,11 +914,27 @@ impl Campaign {
                 info!(campaign = %self.state.campaign_id, "research campaign hit budget limit");
                 break;
             }
-            // Approval gate.
+            // Approval gate. Recorded exactly like the materials loop's:
+            // `transition` sets `status` (not just the legacy `paused` flag),
+            // writes the provenance event, and checkpoints; `gates_hit` stops
+            // the same gate re-pausing a resumed campaign forever. Setting
+            // only `paused` left the checkpoint claiming `status: submitted`
+            // while the goal sat at a gate — a scheduler reading `status`
+            // would have seen a resumable goal and walked straight through
+            // the approval.
             let iter = self.state.current_iteration;
-            if self.state.config.approval_gate_at.contains(&iter) && iter > 0 {
-                self.state.paused = true;
-                self.checkpoint()?;
+            if self.state.config.approval_gate_at.contains(&iter)
+                && iter > 0
+                && !self.state.gates_hit.contains(&iter)
+            {
+                self.state.gates_hit.push(iter);
+                info!(
+                    campaign = %self.state.campaign_id,
+                    iteration = iter,
+                    "research campaign paused at approval gate"
+                );
+                self.transition(GoalStatus::Paused, |_| serde_json::json!({ "gate": iter }))
+                    .await?;
                 break;
             }
 
@@ -1982,6 +1998,43 @@ mod tests {
         assert!(result.state.completed);
         assert_eq!(result.state.completion_reason, "iteration_limit");
         assert_eq!(result.state.research_outcomes.len(), 2);
+    }
+
+    #[test]
+    fn run_research_records_its_approval_gate_like_the_materials_loop() {
+        // The gate used to set only the legacy `paused` flag: the checkpoint
+        // said `status: submitted` while the goal sat waiting for a human, and
+        // `gates_hit` stayed empty so a resume would re-pause at the same gate
+        // forever.
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut config = CampaignConfig {
+            max_iterations: 100,
+            checkpoint_every: 0,
+            approval_gate_at: vec![2],
+            ..Default::default()
+        };
+        config.checkpoint_dir = Some(temp.path().parent().unwrap().to_path_buf());
+        let mut campaign =
+            Campaign::new_research(research_goal_for_run(), config, "test-research-gate".into());
+        let executor = PhasedExecutor {
+            complete_at: 100,
+            cost_per_iteration: 0.0,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt
+            .block_on(campaign.run_research(&executor))
+            .expect("pauses at the gate");
+
+        assert_eq!(result.state.status, GoalStatus::Paused);
+        assert!(result.state.paused);
+        assert!(!result.state.completed);
+        assert_eq!(result.state.current_iteration, 2);
+        assert_eq!(
+            result.state.gates_hit,
+            vec![2],
+            "the gate must be recorded so a resume does not re-pause forever"
+        );
     }
 
     #[test]

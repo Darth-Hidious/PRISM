@@ -291,9 +291,20 @@ pub struct GoalSnapshot {
     pub work_done: usize,
     pub spent_usd: f64,
     pub budget_usd: Option<f64>,
-    /// True when the goal is paused *at an approval gate* — the one pause
-    /// cause a scheduler must never resume past.
-    pub paused_at_gate: bool,
+    /// True when the goal is paused and therefore waiting on a person.
+    ///
+    /// Every pause the campaign engine can produce is an approval gate — the
+    /// materials loop pauses only at `approval_gate_at`, and so does
+    /// `run_research`. So "paused" *is* "waiting for a human", and this is
+    /// derived from the pause itself rather than from `gates_hit`.
+    ///
+    /// Deriving it from `gates_hit` looked more precise and was wrong:
+    /// `run_research` pauses without recording a gate, so a research goal
+    /// stopped at an approval gate would have read as "not a gate pause" and
+    /// been resumed by the scheduler. A wake-up must never stand in for an
+    /// approval. If a non-approval pause cause is ever introduced, this is
+    /// the line that has to change with it.
+    pub paused_for_approval: bool,
     pub completion_reason: String,
 }
 
@@ -406,10 +417,10 @@ impl GoalResumer for WorkerResumer {
             work_done: s.total_evaluated() + s.research_outcomes.len(),
             spent_usd: s.total_cost_usd,
             budget_usd: s.config.budget_usd,
-            // A gate pause is recorded in `gates_hit`; any other Paused state
-            // is a stop the scheduler is allowed to continue past.
-            paused_at_gate: s.status == GoalStatus::Paused
-                && s.gates_hit.contains(&s.current_iteration),
+            // The legacy `paused` flag is checked alongside `status` because
+            // `run_research` sets only the flag: reading `status` alone would
+            // let a research goal stopped at an approval gate look resumable.
+            paused_for_approval: s.status == GoalStatus::Paused || s.paused,
             completion_reason: s.completion_reason.clone(),
         })
     }
@@ -759,7 +770,7 @@ async fn evaluate(sched: &mut Schedule, resumer: &dyn GoalResumer, now: i64) -> 
     }
 
     // ── Approval gate: the one thing a schedule must never launder ──
-    if snap.paused_at_gate {
+    if snap.paused_for_approval {
         // Stay active: once a human approves, the goal leaves Paused and the
         // next tick picks it up normally.
         advance_clock(sched, now);
@@ -917,7 +928,7 @@ mod tests {
             work_done: work,
             spent_usd: 0.0,
             budget_usd: None,
-            paused_at_gate: false,
+            paused_for_approval: false,
             completion_reason: String::new(),
         }
     }
@@ -1021,7 +1032,7 @@ mod tests {
     async fn approval_gate_is_never_laundered_by_a_wakeup() {
         let store = store().await;
         let mut snap = snapshot(GoalStatus::Paused, 10, 100);
-        snap.paused_at_gate = true;
+        snap.paused_for_approval = true;
         let r = FakeResumer::new(snap);
         let s = store
             .create("goal-gate", Trigger::Every { seconds: 60 }, 10, 3)
@@ -1040,6 +1051,61 @@ mod tests {
         // Still active — a human approving it later must be picked up.
         let after = store.get(&s.id).await.unwrap().unwrap();
         assert_eq!(after.state, ScheduleState::Active);
+    }
+
+    /// The gate guard reads the real checkpoint, not a hand-built snapshot.
+    /// A research checkpoint pauses by setting the legacy `paused` flag, so a
+    /// guard keyed on `gates_hit` (or on `status` alone) would have read that
+    /// goal as resumable and walked through the approval.
+    #[tokio::test]
+    async fn a_paused_checkpoint_on_disk_is_read_as_needing_a_human() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test setup before any campaign dir read.
+        unsafe { std::env::set_var("PRISM_CAMPAIGNS_DIR", dir.path()) };
+
+        for (id, extra) in [
+            // Materials shape: status + gates_hit both recorded.
+            (
+                "mat-gate",
+                serde_json::json!({"status": "paused", "gates_hit": [3]}),
+            ),
+            // Research shape: only the legacy flag, empty gates_hit.
+            (
+                "res-gate",
+                serde_json::json!({"status": "submitted", "gates_hit": []}),
+            ),
+        ] {
+            let mut checkpoint = serde_json::json!({
+                "campaign_id": id,
+                "goal": {"description": "gated", "elements": [], "objective": "",
+                         "constraints": [], "seeds": []},
+                "config": {"max_iterations": 50, "batch_size": 2, "checkpoint_every": 1,
+                           "approval_gate_at": [3], "llm_model": "", "llm_temperature": 0.7,
+                           "reward_weights": {}},
+                "candidates": [], "current_iteration": 3, "total_cost_usd": 0.0,
+                "paused": true, "completed": false, "completion_reason": "",
+                "started_at": "2026-07-27T00:00:00Z", "last_checkpoint_at": ""
+            });
+            let obj = checkpoint.as_object_mut().unwrap();
+            for (k, v) in extra.as_object().unwrap() {
+                obj.insert(k.clone(), v.clone());
+            }
+            std::fs::write(
+                dir.path().join(format!("{id}.json")),
+                serde_json::to_string(&checkpoint).unwrap(),
+            )
+            .unwrap();
+
+            let resumer = WorkerResumer {
+                exe: PathBuf::from("/nonexistent"),
+            };
+            let snap = resumer.snapshot(id).expect("checkpoint reads");
+            assert!(
+                snap.paused_for_approval,
+                "'{id}' is paused at an approval gate — the scheduler must see that"
+            );
+        }
+        unsafe { std::env::remove_var("PRISM_CAMPAIGNS_DIR") };
     }
 
     #[tokio::test]
