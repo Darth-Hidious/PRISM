@@ -792,6 +792,91 @@ pub async fn run_turn(
     transcript.append(TranscriptEntry::new("user", user_message));
 
     let mut total_usage = UsageInfo::default();
+
+    // ── 1b. Pre-flight reprompt ───────────────────────────────────
+    // Deterministic triage FIRST (pure function, no I/O): a well-formed expert
+    // query returns Proceed here having spent nothing — no classifier call, no
+    // added latency, no added tokens. Only a message carrying positive evidence
+    // of misrouting, or an opening directive that names nothing, reaches the one
+    // cheap LLM call. See `reprompt`.
+    //
+    // A stale routing hint is stripped BEFORE anything else: the strip has to be
+    // unconditional and at the START of the turn, because `run_turn` can also
+    // leave via `?`, budget exhaustion, or the max-iterations arm, and a hint
+    // that survived one of those would silently misroute every later turn.
+    history.retain(|m| {
+        !m.content
+            .as_deref()
+            .is_some_and(|c| c.starts_with(crate::reprompt::ROUTE_HINT_PREFIX))
+    });
+    // Only an attended turn may ask. A subagent or a research task step has no
+    // human on the other end, so its question would land as a dead tool result
+    // — those get the routing hint, which carries the same honesty.
+    let can_ask = task.is_none() && config.subagent_depth == 0;
+    // An exhausted budget must not pay for a classifier call either.
+    let preflight = if transcript.budget_exhausted() {
+        (crate::reprompt::Preflight::Proceed, None)
+    } else {
+        crate::reprompt::preflight(llm, config, user_message, history, can_ask).await
+    };
+    // The classifier is a real billed call. Fold it into the turn's usage and
+    // the cost ledger like any other — an LLM call nobody accounts for is how a
+    // bill becomes a surprise.
+    if let Some(usage) = preflight.1 {
+        total_usage += UsageInfo {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            ..Default::default()
+        };
+        transcript.record_cost(
+            "reprompt_classifier",
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        );
+    }
+    match preflight.0 {
+        crate::reprompt::Preflight::Proceed => {}
+        crate::reprompt::Preflight::Route { hint } => {
+            // Intent resolved and servable — do not interrogate. Hand the model
+            // the capability that serves it (and, for an intent PRISM cannot
+            // serve, the plain statement that it cannot) so the turn is routed
+            // rather than guessed.
+            history.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(hint),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        crate::reprompt::Preflight::Ask { question, key } => {
+            // ONE consolidated question, and the turn ends. No agent loop runs,
+            // so this path is cheaper than the confidently-irrelevant answer it
+            // replaces. The question itself is the never-ask-twice ledger: it
+            // lands in `history` verbatim, which is what resume restores.
+            tracing::info!(intent = %key, "pre-flight reprompt: asked instead of answering");
+            emit(AgentEvent::TextDelta {
+                text: question.clone(),
+            });
+            emit(AgentEvent::TextFlush);
+            history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(question.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            transcript.append(TranscriptEntry::new("assistant", question.as_str()));
+            let estimated_cost = estimate_cost(&total_usage, &get_model_config(&config.model));
+            emit(AgentEvent::TurnComplete {
+                text: Some(question),
+                has_more: false,
+                usage: None,
+                total_usage: Some(total_usage),
+                estimated_cost: Some(estimated_cost),
+            });
+            return Ok(());
+        }
+    }
+
     let mut result_store: HashMap<String, String> = HashMap::new();
     // One line per executed tool step — feeds the deterministic TRAJECTORY
     // block injected into every iteration's context.
@@ -1209,6 +1294,9 @@ pub async fn run_turn(
                             .is_some_and(|c| c.starts_with(CAPABILITY_GAP_NOTE))
                     });
                 }
+                // The pre-flight routing hint is stripped at the START of every
+                // turn instead (1b) — unconditionally, so no exit path can leak
+                // it. Nothing to do here.
 
                 // Auto-compact if needed
                 if transcript.should_compact()
@@ -1563,7 +1651,8 @@ pub async fn run_turn(
             if check_doom_loop(&recent_sigs, &sig) {
                 let abort_msg = format!(
                     "DOOM LOOP DETECTED: {tool_name} called {} times with identical arguments. \
-                     Try a different approach or ask the user for help.",
+                     Try a materially different approach, or stop and report plainly what you \
+                     could not do and why.",
                     DOOM_LOOP_WINDOW
                 );
                 emit(AgentEvent::ToolCallResult {

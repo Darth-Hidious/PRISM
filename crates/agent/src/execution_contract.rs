@@ -398,9 +398,10 @@ mod tests {
     }
 
     /// Idioms that share a verb with a claim but assert nothing about work
-    /// done. `"I ran into confusion — could you clarify?"` is exactly the
-    /// clarifying behaviour the surrounding prompt wants; punishing it would
-    /// make the agent worse, not more honest.
+    /// done. Asking is now the pre-flight's job (`crate::reprompt`), not the
+    /// model's, but an honest "I ran into confusion" must still not be
+    /// mistaken for a fabricated execution claim — that would punish accurate
+    /// narration and teach the model to write around the gate.
     #[test]
     fn idioms_and_non_artifact_objects_are_not_claims() {
         for answer in [

@@ -263,7 +263,9 @@ const INTERACTIVE_PROMPT: &str = r#"You are PRISM, an interactive agent for mate
 - Diagnose failures before switching tactics.
 
 # Planning And Clarification
-- Ask only when an essential input cannot be inferred or retrieved. When you must ask, ask one concrete question at a time.
+- DO NOT ASK CLARIFYING QUESTIONS. A deterministic pre-flight already screened this message; the cases it catches — a misrouted request, or an opening directive that names nothing — never reach you. It does not catch everything, and it is not meant to: when an input is still missing, proceed on the safest assumption and state it in one line. That is the owner's documented preference, and a second round of questions on top of the pre-flight is what makes the product unusable for experts.
+- The single exception is an irreversible or external action (deploy, publish, delete, spend, send) with an ambiguous target: confirm that, and nothing else.
+- If the runtime hands you a PRE-FLIGHT ROUTING line, it is the classified intent of this request. Honour it. When it says a capability does not exist, say so plainly — never substitute a web search presented as a materials-science answer.
 - For multi-step work, give a short plan after the first read-only observation, not before it, and wait for approval when the user is steering interactively.
 - In plan mode, focus on sequencing, constraints, and implementation shape rather than execution.
 
@@ -335,7 +337,8 @@ const AUTONOMOUS_PROMPT: &str = r#"You are PRISM, an autonomous agent for materi
 
 # Planning And Execution
 - For multi-step work, state a short plan after the first read-only observation, not before it.
-- If the request is underspecified, make reasonable assumptions and state them explicitly before proceeding.
+- If the request is underspecified, make reasonable assumptions and state them explicitly before proceeding. There is nobody to ask on this path, and a deterministic pre-flight already screened the request.
+- If the runtime hands you a PRE-FLIGHT ROUTING line, it is the classified intent of this request. Honour it. When it says a capability does not exist, say so plainly — never substitute a web search presented as a materials-science answer.
 - In plan mode, focus on sequencing, constraints, and implementation shape rather than execution.
 
 # Coding Workflow
@@ -715,8 +718,30 @@ mod tests {
     fn interactive_prompt_contains_interactive_guidance() {
         let prompt = build_system_prompt(true);
         assert!(prompt.contains("interactive agent"));
-        assert!(prompt.contains("ask one concrete question at a time"));
         assert!(prompt.contains("wait for approval"));
+    }
+
+    /// One clarification policy, not two. Asking is owned by the deterministic
+    /// pre-flight (`crate::reprompt`); the prompt's job is to stop the model
+    /// adding a SECOND round of questions on top of it. If this ever reverts to
+    /// "ask one concrete question at a time", the two policies are back in
+    /// conflict and experts get interrogated after the pre-flight let them
+    /// through.
+    #[test]
+    fn neither_prompt_invites_the_model_to_ask_its_own_questions() {
+        for interactive in [true, false] {
+            let prompt = build_system_prompt(interactive);
+            assert!(
+                !prompt.contains("ask one concrete question at a time"),
+                "prompt reinstated a second clarification policy (interactive={interactive})"
+            );
+            assert!(
+                prompt.contains("PRE-FLIGHT ROUTING"),
+                "prompt must tell the model what to do with the routing hint \
+                 (interactive={interactive})"
+            );
+        }
+        assert!(build_system_prompt(true).contains("DO NOT ASK CLARIFYING QUESTIONS"));
     }
 
     #[test]
