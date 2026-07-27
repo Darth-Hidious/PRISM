@@ -19,12 +19,29 @@ WHY THIS FILE OWNS ITS OWN SEARCH
     Every test here triggers the poison itself, in-process, through a
     module-scoped fixture. There is no ordering under which it can pass
     vacuously.
+
+THE TWO PROOFS, AND WHAT EACH IS WORTH
+    `poisoned_process` reproduces the real thing: a real search, then the real
+    call site, in one process. It is only meaningful on macOS -- the atfork
+    handler is Network.framework's -- and only when the search can actually
+    reach the network, so it skips rather than lie.
+
+    `no_fork` proves the same call sites a second way, without a network and
+    on any platform: it replaces CPython's fork+exec entry point
+    (subprocess._fork_exec) so that "this site would have forked" becomes a
+    deterministic exception instead of a platform-dependent crash. That is
+    what makes this file worth running on the Linux CI runner, where the
+    macOS-only crash cannot happen at all.
 """
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +50,36 @@ from app.tools.bash import _execute_bash, _read_bash_task, _stop_bash_task
 from app.tools.code import _execute_python
 
 _SEGV = -11
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class ForkAttempted(RuntimeError):
+    """Raised in place of the fork() a migrated call site must never reach."""
+
+
+@pytest.fixture
+def no_fork():
+    """Make any fork()-based spawn inside the test fail loudly.
+
+    CPython reaches fork() only through `subprocess._fork_exec`; the
+    posix_spawn fast path never touches it (subprocess.py:1874 vs 1919).
+    Replacing it therefore separates the two paths exactly, with no reliance
+    on the macOS-only crash -- see `test_the_fork_detector_is_not_vacuous`,
+    which fails this fixture's own premise if the hook ever stops working.
+    """
+    if not hasattr(subprocess, "_fork_exec"):
+        pytest.skip("CPython build has no subprocess._fork_exec to intercept")
+
+    real = subprocess._fork_exec
+
+    def _refuse(args, *rest, **kwargs):
+        raise ForkAttempted(f"this call site forked: {args!r}")
+
+    subprocess._fork_exec = _refuse
+    try:
+        yield
+    finally:
+        subprocess._fork_exec = real
 
 
 @pytest.fixture(scope="module")
@@ -200,6 +247,34 @@ class TestSpawnHelperCannotSilentlyRegress:
         assert "/bin/does-not-exist" in result.stderr
         assert "Traceback" not in result.stderr
 
+    def test_the_trampoline_never_appears_in_a_callers_error(self):
+        """Callers report failures by interpolating the exception -- _sidecar
+        answers {"error": f"...: {exc}"}. If `cmd` still named the trampoline,
+        "the venv died with SIGSEGV" would be replaced by 600 characters of
+        this module's own bootstrap source, which is the same kind of
+        undiagnosable output the whole file exists to eliminate."""
+        real = ["/bin/sh", "-c", "exit 3"]
+
+        with pytest.raises(subprocess.CalledProcessError) as failed:
+            spawn.run(real, check=True, capture_output=True)
+        assert failed.value.cmd == real
+        assert "os.execvp" not in str(failed.value)
+
+        with pytest.raises(subprocess.TimeoutExpired) as timed_out:
+            spawn.run(["/bin/sleep", "5"], timeout=0.2, capture_output=True)
+        assert timed_out.value.cmd == ["/bin/sleep", "5"]
+        assert "os.execvp" not in str(timed_out.value)
+
+        ok = spawn.run(real[:2] + ["exit 0"], capture_output=True)
+        assert ok.args == real[:2] + ["exit 0"]
+
+        proc = spawn.popen(["/bin/sleep", "5"], stdout=subprocess.DEVNULL)
+        try:
+            assert proc.args == ["/bin/sleep", "5"]
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
     def test_process_group_wait_kills_rather_than_abandons(self):
         """If the group never appears, the caller gets an error and PRISM is
         left holding no untracked, unkillable child."""
@@ -248,3 +323,262 @@ class TestSpawnHelperCannotSilentlyRegress:
         assert result["stdout"].strip() == "[]", (
             f"descriptors leaked into model-authored code: {result['stdout']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The rest of app/: every other place PRISM starts a process.
+#
+# Each exercise below drives ONE migrated call site through its real public
+# entry point and asserts on something the site actually produces. That matters
+# because all of these sites swallow their own failures -- a crashed spawn
+# comes back as "unknown", False, "" or a plausible-looking error string, never
+# as an exception. Asserting "it did not raise" would pass on every one of
+# them while they were still broken.
+# ---------------------------------------------------------------------------
+
+
+def _fake_hf_cli(tmp_path: Path, monkeypatch) -> Path:
+    """Put a stub `hf` first on PATH. Returns the file it records argv into.
+
+    It answers in the shape the two parsers expect: a status word for
+    `_parse_status`, and a job URL on the last line for `_parse_job_id`.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    calls = tmp_path / "hf-calls.log"
+    script = bindir / "hf"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> "{calls}"\n'
+        "echo completed\n"
+        "echo https://huggingface.co/jobs/fakejob123\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    return calls
+
+
+def _exercise_git_provenance(tmp_path, monkeypatch) -> None:
+    """app/tools/simulation/mace/ids.py — the commit stamped on every MACE job."""
+    from app.tools.simulation.mace import ids
+
+    ids.git_sha.cache_clear()
+    sha = ids.git_sha(str(_REPO_ROOT))
+
+    assert re.fullmatch(r"[0-9a-f]{7,40}", sha), (
+        f"git_sha() answered {sha!r}. git never ran, and this function turns "
+        f"that into the string 'unknown', so the failure lands in the "
+        f"provenance record looking like an answer instead of an error."
+    )
+    # git_dirty shares ids._git with git_sha, so the assertion above covers
+    # both spawns; call it anyway to keep the second entry point exercised.
+    assert isinstance(ids.git_dirty(str(_REPO_ROOT)), bool)
+
+
+def _exercise_sidecar_provisioning(tmp_path, monkeypatch) -> None:
+    """app/tools/_sidecar.py — `python -m venv` then `pip install` for the science venv."""
+    from app.tools import _sidecar
+
+    monkeypatch.setattr(_sidecar, "SIDECAR_VENV", tmp_path / "venv-sci")
+    monkeypatch.setattr(_sidecar, "find_base_python", lambda: sys.executable)
+    # Nothing to install, so pip refuses in its own words. Keeps this offline
+    # and ~1s while still running both real spawns end to end.
+    monkeypatch.setattr(_sidecar, "SIDECAR_PACKAGES", [])
+
+    err = _sidecar.ensure_sidecar(install=True)
+
+    assert (tmp_path / "venv-sci" / "bin" / "python3").exists(), (
+        f"`python -m venv` never ran, so the first spawn died; ensure_sidecar "
+        f"reported it as {err!r}"
+    )
+    assert err and "requirement" in err.lower(), (
+        f"expected pip's own complaint about an empty install list, got {err!r}"
+    )
+
+
+def _exercise_sidecar_server(tmp_path, monkeypatch) -> None:
+    """app/tools/_sidecar.py — the long-lived `app.sidecar_server` process."""
+    from app.tools import _sidecar
+
+    monkeypatch.setattr(_sidecar, "_sidecar_python", lambda: Path(sys.executable))
+    handle = _sidecar._SidecarProcess()
+
+    err = handle._spawn()
+    assert err is None, err
+    proc = handle._proc
+    assert proc is not None
+
+    try:
+        deadline = time.time() + 2.0
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.05)
+        assert proc.poll() != _SEGV, (
+            "the sidecar server died at SIGSEGV. Every proxied pyiron/pycalphad "
+            "tool call then reports 'science sidecar timed out', which names "
+            "the wrong cause entirely."
+        )
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def _exercise_pyiron_auto_provision(tmp_path, monkeypatch) -> None:
+    """app/tools/simulation/bridge.py — pip install pyiron on the first sim tool call."""
+    from app.tools.simulation import bridge
+
+    monkeypatch.setattr(bridge, "_AUTO_PROVISION_ATTEMPTED", False)
+    # `pip install --help` exits 0 and touches no network. What is under test
+    # is that the spawn completes and its status comes back, not what pip does.
+    monkeypatch.setattr(bridge, "_PYIRON_SPEC", ["--help"])
+
+    assert bridge._try_auto_provision() is True, (
+        "the pip spawn never completed. _try_auto_provision swallows that and "
+        "returns False, which the caller reports to the model as "
+        "'automatic installation failed (offline?)' — the wrong diagnosis."
+    )
+
+
+def _exercise_hf_launch_and_poll(tmp_path, monkeypatch) -> None:
+    """mace/backends/hf_jobs.py — `hf jobs uv run` (launch) and `hf jobs status` (poll)."""
+    from app.tools.simulation.mace.backends import hf_jobs
+
+    calls = _fake_hf_cli(tmp_path, monkeypatch)
+    monkeypatch.setattr(hf_jobs, "get_hf_token", lambda: "not-a-real-token")
+    # An empty results repo stops execute() on a deterministic error the moment
+    # both spawns are done, so this needs no HF account and no network.
+    monkeypatch.setattr(hf_jobs, "get_results_repo", lambda: "")
+
+    # SEPARATE, PRE-EXISTING BUG, not this branch's to fix: PAYLOAD_MODULES
+    # still names `mace_mcp.payloads.*`, but those files were vendored to
+    # app/tools/simulation/mace/payloads/ and the map was never re-pointed. So
+    # _materialise_payload raises ModuleNotFoundError and execute() dies before
+    # it reaches either spawn -- which also means the launch spawn is currently
+    # unreachable in production. Stub that one call so the spawns under test
+    # still run. The assert makes the stub self-deleting: it fails the day the
+    # drift is fixed, so this workaround cannot quietly outlive the bug.
+    assert hf_jobs.PAYLOAD_MODULES["relax_structure"].startswith("mace_mcp."), (
+        "PAYLOAD_MODULES no longer points at the absent `mace_mcp` package, so "
+        "the drift this stub works around is fixed — delete the stub."
+    )
+
+    def _stub_payload(self, tool: str, tmpd: Path) -> Path:
+        path = tmpd / f"{tool}.py"
+        path.write_text("# stub; the fake `hf` CLI never runs it\n")
+        return path
+
+    monkeypatch.setattr(hf_jobs.HfJobsBackend, "_materialise_payload", _stub_payload)
+
+    backend = hf_jobs.HfJobsBackend(poll_interval_s=0.01)
+    job = hf_jobs.BackendJob(
+        tool_name="relax_structure",
+        input_payload={"composition": {"atoms": {"Ti": 1.0}}},
+        cache_key="fork-safety-probe",
+    )
+
+    with pytest.raises(RuntimeError, match="MACE_MCP_RESULTS_REPO"):
+        backend.execute(job)
+
+    log = calls.read_text()
+    assert "jobs uv run" in log, f"the launch spawn never reached `hf`: {log!r}"
+    assert "jobs status fakejob123" in log, f"the poll spawn never reached `hf`: {log!r}"
+
+
+def _exercise_hf_cancel_and_logs(tmp_path, monkeypatch) -> None:
+    """mace/backends/hf_jobs.py — `hf jobs cancel` and `hf jobs logs`."""
+    from app.tools.simulation.mace.backends import hf_jobs
+
+    calls = _fake_hf_cli(tmp_path, monkeypatch)
+
+    backend = hf_jobs.HfJobsBackend()
+    backend._active["cache-key"] = "fakejob123"
+    backend.cancel("cache-key")
+    assert "jobs cancel fakejob123" in calls.read_text(), (
+        "cancel never reached `hf`, and it swallows the failure, so a GPU job "
+        "the user asked to stop keeps billing with nothing reported."
+    )
+
+    tail = hf_jobs._fetch_logs("fakejob123")
+    assert "completed" in tail, (
+        f"`hf jobs logs` produced nothing: {tail!r}. _fetch_logs answers '' on "
+        f"failure, so a dead job is explained with an empty tail and no hint "
+        f"that fetching the log is what actually broke."
+    )
+
+
+def _exercise_update_install_detection(tmp_path, monkeypatch) -> None:
+    """app/update.py — `uv tool list` behind detect_install_method()."""
+    from app import update
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    fake_uv = bindir / "uv"
+    fake_uv.write_text("#!/bin/sh\necho prism-platform\n")
+    fake_uv.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+    assert update.detect_install_method() == "uv", (
+        "the `uv tool list` spawn failed and was swallowed, so PRISM falls "
+        "through to a different install method and prints an upgrade command "
+        "that will not work. (`pipx list` at line 95 is the same shape.)"
+    )
+
+
+def _exercise_update_run_upgrade(tmp_path, monkeypatch) -> None:
+    """app/update.py — the spawn that actually runs the upgrade."""
+    from app import update
+
+    monkeypatch.setattr(update, "upgrade_command", lambda method=None: "/bin/echo upgraded")
+
+    assert update.run_upgrade(method="pip") is True, (
+        "the upgrade spawn never completed; run_upgrade reports False, which "
+        "is indistinguishable from an upgrade that ran and failed."
+    )
+
+
+_MIGRATED_SITES = [
+    ("mace/ids.py:git_sha+git_dirty", _exercise_git_provenance),
+    ("_sidecar.py:ensure_sidecar", _exercise_sidecar_provisioning),
+    ("_sidecar.py:_SidecarProcess._spawn", _exercise_sidecar_server),
+    ("simulation/bridge.py:_try_auto_provision", _exercise_pyiron_auto_provision),
+    ("hf_jobs.py:execute+_poll", _exercise_hf_launch_and_poll),
+    ("hf_jobs.py:cancel+_fetch_logs", _exercise_hf_cancel_and_logs),
+    ("update.py:detect_install_method", _exercise_update_install_detection),
+    ("update.py:run_upgrade", _exercise_update_run_upgrade),
+]
+
+
+@pytest.mark.parametrize(
+    "exercise", [site for _, site in _MIGRATED_SITES], ids=[n for n, _ in _MIGRATED_SITES]
+)
+class TestEveryOtherSpawnSiteInApp:
+    def test_survives_a_materials_search(
+        self, exercise, poisoned_process, tmp_path, monkeypatch
+    ):
+        """The real reproduction: macOS, real search, real call site, one process."""
+        exercise(tmp_path, monkeypatch)
+
+    def test_never_forks(self, exercise, no_fork, tmp_path, monkeypatch):
+        """The portable half: no network, no macOS, no fork() reached."""
+        exercise(tmp_path, monkeypatch)
+
+
+class TestTheForkDetectorItself:
+    """A guard that reports OK when the thing is broken is worse than none.
+    These two say what `no_fork` is worth, in both directions."""
+
+    def test_the_fork_detector_is_not_vacuous(self, no_fork):
+        """cwd= rules out posix_spawn on every platform (subprocess.py:1859),
+        so this spawn MUST trip the hook. If it stops doing so, every
+        `test_never_forks` above is passing for no reason."""
+        with pytest.raises(ForkAttempted):
+            subprocess.run([sys.executable, "-c", "pass"], cwd=str(_REPO_ROOT))
+
+    def test_spawn_run_clears_the_same_bar(self, no_fork):
+        result = spawn.run(
+            [sys.executable, "-c", "print('ok')"],
+            cwd=str(_REPO_ROOT),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "ok"

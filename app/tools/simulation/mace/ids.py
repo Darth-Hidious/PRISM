@@ -11,6 +11,8 @@ from pathlib import Path
 
 from ulid import ULID
 
+from app.tools import spawn
+
 
 def new_job_id() -> str:
     """Return a fresh ULID string."""
@@ -41,21 +43,33 @@ def sha256_of(obj: object) -> str:
     return hashlib.sha256(canonical_json(obj)).hexdigest()
 
 
+def _git(root: Path, *args: str) -> str:
+    """stdout of a read-only git command, or ``""`` if it could not run.
+
+    Goes through app.tools.spawn: this is provenance, and it runs in the same
+    process as the agent's materials search. A fork() there SIGSEGVs, git dies
+    at -11, and the recorded commit silently degrades to "unknown" — a
+    provenance record that looks complete and is wrong. See app/tools/spawn.py.
+    """
+    try:
+        result = spawn.run(
+            ["git", "-C", str(root), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception:
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
 @lru_cache(maxsize=1)
 def git_sha(repo_root: str | None = None) -> str:
     """Best-effort short SHA of the current commit. Falls back to ``"unknown"``."""
     root = Path(repo_root) if repo_root else Path(__file__).resolve().parents[2]
     if not (root / ".git").exists():
         return "unknown"
-    try:
-        out = subprocess.check_output(
-            ["git", "-C", str(root), "rev-parse", "--short=12", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        return out or "unknown"
-    except Exception:
-        return "unknown"
+    return _git(root, "rev-parse", "--short=12", "HEAD").strip() or "unknown"
 
 
 def git_dirty(repo_root: str | None = None) -> bool:
@@ -63,12 +77,4 @@ def git_dirty(repo_root: str | None = None) -> bool:
     root = Path(repo_root) if repo_root else Path(__file__).resolve().parents[2]
     if not (root / ".git").exists():
         return False
-    try:
-        out = subprocess.check_output(
-            ["git", "-C", str(root), "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        return bool(out.strip())
-    except Exception:
-        return False
+    return bool(_git(root, "status", "--porcelain").strip())

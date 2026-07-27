@@ -66,15 +66,21 @@ _AUTO_PROVISION_ATTEMPTED = False
 
 
 def _try_auto_provision() -> bool:
-    """Best-effort pip install into the running interpreter. NEVER raises."""
+    """Best-effort pip install into the running interpreter. NEVER raises.
+
+    Runs through app.tools.spawn, not bare subprocess: this fires from a
+    simulation TOOL CALL, in the process that has already served the agent's
+    materials search, and a fork() after that SIGSEGVs (app/tools/spawn.py).
+    """
     global _AUTO_PROVISION_ATTEMPTED
     if _AUTO_PROVISION_ATTEMPTED:
         return False
     _AUTO_PROVISION_ATTEMPTED = True
     try:
-        import subprocess
         import sys
-        result = subprocess.run(
+
+        from app.tools import spawn
+        result = spawn.run(
             [sys.executable, "-m", "pip", "install", *_PYIRON_SPEC],
             capture_output=True,
             timeout=600,

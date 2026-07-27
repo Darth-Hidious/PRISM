@@ -178,6 +178,7 @@ def popen(
     if _IS_WINDOWS:  # no fork, no posix_spawn, no setsid -- nothing to work around
         return subprocess.Popen(argv, cwd=cwd, **kwargs)
     proc = subprocess.Popen(_argv(argv, cwd, new_session), close_fds=False, **kwargs)
+    proc.args = argv  # see the note in run(); Popen.args is only ever displayed
     if new_session:
         _await_own_process_group(proc)
     return proc
@@ -199,4 +200,16 @@ def run(
     _check(kwargs)
     if _IS_WINDOWS:
         return subprocess.run(argv, cwd=cwd, **kwargs)
-    return subprocess.run(_argv(argv, cwd, False), close_fds=False, **kwargs)
+    try:
+        result = subprocess.run(_argv(argv, cwd, False), close_fds=False, **kwargs)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        # The trampoline is ours, not the caller's. `cmd` here would otherwise
+        # be 600 characters of our own bootstrap source, and callers put
+        # str(exc) straight into agent-visible errors -- app/tools/_sidecar.py
+        # returns it as {"error": ...} -- so "venv died with SIGSEGV" would
+        # become a page of Python. Nothing in CPython reads `cmd` back; it
+        # exists to be shown.
+        exc.cmd = argv
+        raise
+    result.args = argv
+    return result

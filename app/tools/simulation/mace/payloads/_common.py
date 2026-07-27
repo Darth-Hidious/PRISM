@@ -79,6 +79,12 @@ def ensure_mace_core() -> None:
     except ImportError:
         pass
     url = os.environ.get("MACE_MCP_DEV_INSTALL_URL") or "mace-mcp"
+    # Bare subprocess on purpose. This file is copied into the HF Jobs container
+    # by HfJobsBackend._materialise_payload and executed there by `hf jobs uv
+    # run` — a fresh Linux process that has never touched PRISM's tool server,
+    # so it carries none of the fork() hazard app/tools/spawn.py exists for.
+    # It must also stay importable with nothing but its PEP 723 inline deps:
+    # reaching for app.tools.spawn would drag PRISM into the container.
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", url])
 
 
