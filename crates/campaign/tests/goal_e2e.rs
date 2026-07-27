@@ -27,6 +27,10 @@ struct Boundary {
     llm_calls: Arc<AtomicUsize>,
     eval_calls: Arc<AtomicUsize>,
     eval_fails: bool,
+    /// USD the evaluator reports per candidate. The proposal LLM has no
+    /// equivalent — `LlmClient::chat` returns `Result<String>` — which is the
+    /// whole point of `ceiling_declares_the_proposal_calls_it_cannot_price`.
+    eval_cost_usd: f64,
 }
 
 async fn llm_chat(State(b): State<Boundary>, Json(_body): Json<Value>) -> Json<Value> {
@@ -53,22 +57,24 @@ async fn evaluate_material(
     }
     let composition = body["inputs"]["composition"].as_str().unwrap_or("");
     // Deterministic but call-varying physics so ranking is meaningful.
-    (
-        StatusCode::OK,
-        Json(json!({
-            "composition": composition,
-            "mixing_entropy": 1.0 + 0.1 * n as f64,
-            "density": 10.0 - 0.5 * n as f64,
-        })),
-    )
+    let mut properties = json!({
+        "composition": composition,
+        "mixing_entropy": 1.0 + 0.1 * n as f64,
+        "density": 10.0 - 0.5 * n as f64,
+    });
+    if b.eval_cost_usd > 0.0 {
+        properties["cost_usd"] = json!(b.eval_cost_usd);
+    }
+    (StatusCode::OK, Json(properties))
 }
 
 /// Serve the two external boundaries on an ephemeral port; return the base URL.
-async fn spawn_boundary(eval_fails: bool) -> (String, Boundary) {
+async fn spawn_boundary(eval_fails: bool, eval_cost_usd: f64) -> (String, Boundary) {
     let boundary = Boundary {
         llm_calls: Arc::new(AtomicUsize::new(0)),
         eval_calls: Arc::new(AtomicUsize::new(0)),
         eval_fails,
+        eval_cost_usd,
     };
     let app = axum::Router::new()
         .route("/v1/chat/completions", post(llm_chat))
@@ -113,7 +119,7 @@ fn checkpoint_json(dir: &std::path::Path, id: &str) -> Value {
 /// progress transition to the store, and stores a real terminal result.
 #[tokio::test]
 async fn goal_executes_steps_persists_trail_and_result() {
-    let (base, boundary) = spawn_boundary(false).await;
+    let (base, boundary) = spawn_boundary(false, 0.0).await;
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("provenance.db");
     let store = ProvenanceStore::open(&db).await.unwrap();
@@ -199,7 +205,7 @@ async fn goal_executes_steps_persists_trail_and_result() {
 /// end Failed with the error persisted, never "completed".
 #[tokio::test]
 async fn goal_must_not_complete_when_steps_cannot_run() {
-    let (base, boundary) = spawn_boundary(true).await;
+    let (base, boundary) = spawn_boundary(true, 0.0).await;
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("provenance.db");
     let store = ProvenanceStore::open(&db).await.unwrap();
@@ -254,7 +260,7 @@ async fn goal_must_not_complete_when_steps_cannot_run() {
 /// the gate to real completion.
 #[tokio::test]
 async fn goal_pauses_at_gate_and_resumes_to_completion() {
-    let (base, boundary) = spawn_boundary(false).await;
+    let (base, boundary) = spawn_boundary(false, 0.0).await;
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("provenance.db");
 
@@ -303,4 +309,73 @@ async fn goal_pauses_at_gate_and_resumes_to_completion() {
     assert_eq!(count("campaign.iteration"), 2);
     assert_eq!(count("campaign.status.completed"), 1);
     assert_eq!(events.last(), Some(&"campaign.status.completed"));
+}
+
+/// DEFECT (budget honesty): every iteration past seed exhaustion makes a real
+/// completion call through `prism_llm::LlmClient::chat`, whose signature is
+/// `-> Result<String>` — no usage, no cost. On a billed backend (the campaign
+/// honours `LLM_BASE_URL` / `LLM_API_KEY` / `MARC27_TOKEN`) that is money the
+/// `budget_usd` ceiling structurally cannot see, while the evaluator's own
+/// `cost_usd` accrues normally. Reporting only the half it can see would make
+/// "$0.20 spent of $25.00 ceiling" read as headroom the goal does not have.
+///
+/// There is no price table this crate could apply — `prism-agent` depends on
+/// `prism-campaign`, not the reverse, and the campaign points at whatever
+/// `LLM_BASE_URL` names — so the ceiling declares the gap instead of
+/// inventing a number, and the iteration cap is the limit that actually
+/// stops the loop.
+#[tokio::test]
+async fn ceiling_declares_the_proposal_calls_it_cannot_price() {
+    let (base, boundary) = spawn_boundary(false, 0.05).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let store = ProvenanceStore::open(&tmp.path().join("provenance.db"))
+        .await
+        .unwrap();
+
+    let id = "goal-e2e-budget-honesty";
+    let mut cfg = config(&base, tmp.path());
+    // A ceiling far above anything this run reports, so nothing stops early
+    // and the ONLY question is what the ceiling says about what it saw.
+    cfg.budget_usd = Some(25.0);
+    let mut campaign = Campaign::new(test_goal(), cfg, id.into()).with_provenance(store);
+    let result = campaign.run().await.expect("goal runs to completion");
+    drop(campaign);
+
+    // The proposal calls really happened at the boundary: 2 iterations.
+    assert_eq!(boundary.llm_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(result.state.uncosted_llm_calls, 2);
+
+    // The evaluator's spend accrued; the proposal spend could not.
+    assert_eq!(result.state.total_cost_usd, 0.2); // 4 evaluations × $0.05
+
+    // The ceiling must not present that as the whole bill.
+    let budget = result.state.budget_status();
+    assert_eq!(
+        budget,
+        prism_campaign::BudgetStatus::PartiallyMeasured {
+            spent: 0.2,
+            ceiling: 25.0,
+            uncosted_llm_calls: 2
+        }
+    );
+    let shown = budget.to_string();
+    assert!(shown.contains("2 LLM proposal calls"), "{shown}");
+    assert!(shown.contains("NOT in that figure"), "{shown}");
+    assert!(shown.contains("iteration cap"), "{shown}");
+    // The summary the user actually reads carries the same sentence.
+    assert!(
+        result.summary.contains("NOT in that figure"),
+        "{}",
+        result.summary
+    );
+
+    // And the cap that DOES stop the loop is the iteration cap, not the USD
+    // ceiling — which is what the message tells the user to rely on.
+    assert_eq!(result.state.completion_reason, "iteration_limit");
+
+    // The count survives a checkpoint round-trip, so a resumed goal does not
+    // silently forget the calls it already made.
+    let cp = tmp.path().join(format!("{id}.json"));
+    let resumed = Campaign::from_checkpoint(&cp).unwrap();
+    assert_eq!(resumed.state().uncosted_llm_calls, 2);
 }

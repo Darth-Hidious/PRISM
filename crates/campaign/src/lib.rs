@@ -201,17 +201,50 @@ impl GoalStatus {
 }
 
 /// What the USD budget ceiling can honestly say about a goal.
+///
+/// `uncosted_llm_calls` is the count of completion calls this goal made whose
+/// price nothing reported. [`Campaign::propose_candidates`] makes one such
+/// call per iteration past seed exhaustion, through [`prism_llm::LlmClient`],
+/// which honours `LLM_BASE_URL` / `LLM_API_KEY` / `MARC27_TOKEN` — so on a
+/// billed backend that is real money the ceiling never sees. There is no
+/// price table this crate could apply (`prism-agent` depends on
+/// `prism-campaign`, not the other way round, and the campaign points at
+/// whatever `LLM_BASE_URL` names), and inventing one would make the ceiling a
+/// fiction. So the ceiling says out loud what it does not cover instead of
+/// under-counting in silence.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BudgetStatus {
     /// No ceiling was configured. The iteration cap and the scheduler's
     /// wake-up ceiling are the limits.
     NoCeiling,
-    /// A ceiling is configured and real spend has been reported against it.
+    /// A ceiling is configured, real spend has been reported against it, and
+    /// every billable step this goal took reported its price.
     Measured { spent: f64, ceiling: f64 },
+    /// A ceiling is configured and spend has been reported, but
+    /// `uncosted_llm_calls` completion calls also billed and reported no
+    /// price — the ceiling under-counts by an unknown amount.
+    PartiallyMeasured {
+        spent: f64,
+        ceiling: f64,
+        uncosted_llm_calls: usize,
+    },
     /// A ceiling is configured, iterations have run, and not one of them
     /// reported a cost — so the ceiling cannot fire. A defect to surface,
     /// not a green light.
-    Unmeasured { ceiling: f64 },
+    Unmeasured {
+        ceiling: f64,
+        uncosted_llm_calls: usize,
+    },
+}
+
+/// The clause every "…but the ceiling does not cover it" message ends with.
+fn uncosted_clause(calls: usize) -> String {
+    let (plural, verb) = if calls == 1 { ("", "is") } else { ("s", "are") };
+    format!(
+        "{calls} LLM proposal call{plural} billed with no reported price and {verb} NOT in that \
+         figure — the completion API returns no cost, so this ceiling cannot cover them; the \
+         iteration cap and the schedule's wake-up ceiling are the limits that do"
+    )
 }
 
 impl std::fmt::Display for BudgetStatus {
@@ -221,11 +254,32 @@ impl std::fmt::Display for BudgetStatus {
             Self::Measured { spent, ceiling } => {
                 write!(f, "${spent:.4} spent of ${ceiling:.4} ceiling")
             }
-            Self::Unmeasured { ceiling } => write!(
+            Self::PartiallyMeasured {
+                spent,
+                ceiling,
+                uncosted_llm_calls,
+            } => write!(
+                f,
+                "${spent:.4} spent of ${ceiling:.4} ceiling, but {}",
+                uncosted_clause(*uncosted_llm_calls)
+            ),
+            Self::Unmeasured {
+                ceiling,
+                uncosted_llm_calls: 0,
+            } => write!(
                 f,
                 "${ceiling:.4} ceiling set but NO step has reported a cost — the USD ceiling \
                  CANNOT stop this goal; the iteration cap and the schedule's wake-up ceiling are \
                  the only real limits"
+            ),
+            Self::Unmeasured {
+                ceiling,
+                uncosted_llm_calls,
+            } => write!(
+                f,
+                "${ceiling:.4} ceiling set but NO step has reported a cost — the USD ceiling \
+                 CANNOT stop this goal; {}",
+                uncosted_clause(*uncosted_llm_calls)
             ),
         }
     }
@@ -275,8 +329,17 @@ pub struct CampaignState {
     pub candidates: Vec<Candidate>,
     /// Current iteration number (0-based).
     pub current_iteration: usize,
-    /// Cumulative compute cost in USD.
+    /// Cumulative compute cost in USD, as reported by the steps that billed.
+    /// It does NOT include the proposal completion calls — see
+    /// `uncosted_llm_calls` and [`CampaignState::budget_status`].
     pub total_cost_usd: f64,
+    /// How many completion calls this goal has made that reported no price.
+    /// One per [`Campaign::propose_candidates`] call that actually reached
+    /// the LLM (the seed path makes none). `#[serde(default)]` so checkpoints
+    /// written before this field existed still load — they resume as 0, which
+    /// under-reports the pre-upgrade calls and is the only honest default.
+    #[serde(default)]
+    pub uncosted_llm_calls: usize,
     /// Whether the campaign is paused at an approval gate.
     /// Kept in sync with `status` for older checkpoint readers.
     pub paused: bool,
@@ -315,6 +378,7 @@ impl CampaignState {
             candidates: Vec::new(),
             current_iteration: 0,
             total_cost_usd: 0.0,
+            uncosted_llm_calls: 0,
             paused: false,
             completed: false,
             status: GoalStatus::Submitted,
@@ -351,6 +415,7 @@ impl CampaignState {
             candidates: Vec::new(),
             current_iteration: 0,
             total_cost_usd: 0.0,
+            uncosted_llm_calls: 0,
             paused: false,
             completed: false,
             status: GoalStatus::Submitted,
@@ -384,14 +449,29 @@ impl CampaignState {
     /// ceiling is configured and work has run yet nothing has ever billed,
     /// the ceiling is **unenforceable** — reporting that as "under budget"
     /// would be a check that says OK about an unusable thing.
+    ///
+    /// The same rule applies one level down: a goal whose proposal calls
+    /// billed money nothing priced has a ceiling that under-counts, and
+    /// "$0.42 spent of $50 ceiling" would read as headroom it does not have.
     #[must_use]
     pub fn budget_status(&self) -> BudgetStatus {
         let Some(ceiling) = self.config.budget_usd else {
             return BudgetStatus::NoCeiling;
         };
+        let uncosted_llm_calls = self.uncosted_llm_calls;
         let did_work = self.current_iteration > 0;
         if did_work && self.total_cost_usd <= 0.0 {
-            return BudgetStatus::Unmeasured { ceiling };
+            return BudgetStatus::Unmeasured {
+                ceiling,
+                uncosted_llm_calls,
+            };
+        }
+        if uncosted_llm_calls > 0 {
+            return BudgetStatus::PartiallyMeasured {
+                spent: self.total_cost_usd,
+                ceiling,
+                uncosted_llm_calls,
+            };
         }
         BudgetStatus::Measured {
             spent: self.total_cost_usd,
@@ -1137,6 +1217,11 @@ impl Campaign {
 
         // Accrue whatever the evaluator actually reported spending. Read, do
         // not estimate: a made-up price would make the ceiling a fiction.
+        //
+        // This is the EVALUATOR's spend only. Step 1 above also billed a
+        // completion call whose price nothing reports; that one is counted in
+        // `state.uncosted_llm_calls` and disclosed by `budget_status` rather
+        // than folded in here at an invented rate.
         let iteration_cost: f64 = evaluated.iter().map(|c| reported_cost(&c.properties)).sum();
         self.state.total_cost_usd += iteration_cost;
 
@@ -1235,6 +1320,15 @@ impl Campaign {
                       Respond with ONLY a JSON array of composition strings, \
                       no explanation. Example: [\"W0.3 Mo0.2 Ta0.3 Nb0.2\", \"Cr0.4 V0.3 Ti0.3\"]";
 
+        // Counted BEFORE the await: a call that errors mid-flight may still
+        // have been billed, and a ceiling that only counts successes
+        // under-reports in exactly the case worth reporting.
+        //
+        // `LlmClient::chat` returns `Result<String>` — no usage, no cost — so
+        // this spend cannot be added to `total_cost_usd`. It is not an
+        // estimate withheld; there is nothing to estimate from that would not
+        // be invented. `budget_status` reports the gap instead.
+        self.state.uncosted_llm_calls += 1;
         let response = client
             .chat(system, &prompt)
             .await
@@ -1246,6 +1340,7 @@ impl Campaign {
                 "iteration": iter,
                 "prompt": prompt,
                 "response": &response,
+                "uncosted_llm_calls": self.state.uncosted_llm_calls,
             }),
         )
         .await;
@@ -1587,7 +1682,10 @@ mod tests {
         state.current_iteration = 4;
         assert_eq!(
             state.budget_status(),
-            BudgetStatus::Unmeasured { ceiling: 25.0 }
+            BudgetStatus::Unmeasured {
+                ceiling: 25.0,
+                uncosted_llm_calls: 0
+            }
         );
         assert!(
             state.budget_status().to_string().contains("CANNOT stop"),
@@ -1603,6 +1701,93 @@ mod tests {
                 ceiling: 25.0
             }
         );
+    }
+
+    #[test]
+    fn ceiling_declares_the_proposal_spend_it_cannot_see() {
+        // Every iteration past seed exhaustion makes one `LlmClient::chat`
+        // call. That signature is `-> Result<String>`: no usage, no cost, so
+        // the spend can never reach `total_cost_usd`. On a billed backend
+        // (`LLM_BASE_URL` / `LLM_API_KEY` / `MARC27_TOKEN`) that is real
+        // money. "$3.25 spent of $25.00 ceiling" would read as headroom the
+        // goal does not have, so the ceiling must name what it excludes.
+        let config = CampaignConfig {
+            budget_usd: Some(25.0),
+            ..Default::default()
+        };
+        let mut state = CampaignState::new("c1".into(), test_goal(), config);
+        state.current_iteration = 3;
+        state.total_cost_usd = 3.25;
+        state.uncosted_llm_calls = 3;
+
+        assert_eq!(
+            state.budget_status(),
+            BudgetStatus::PartiallyMeasured {
+                spent: 3.25,
+                ceiling: 25.0,
+                uncosted_llm_calls: 3
+            }
+        );
+        let shown = state.budget_status().to_string();
+        assert!(
+            shown.contains("$3.2500 spent of $25.0000 ceiling"),
+            "{shown}"
+        );
+        assert!(shown.contains("3 LLM proposal calls"), "{shown}");
+        assert!(shown.contains("NOT in that figure"), "{shown}");
+        assert!(shown.contains("cannot cover them"), "{shown}");
+        // The summary the user reads carries it too.
+        assert!(state.summary(&[]).contains("NOT in that figure"));
+
+        // Nothing billed at all AND proposals ran: still unmeasured, but now
+        // it says how many calls went unpriced instead of just "no step".
+        state.total_cost_usd = 0.0;
+        let shown = state.budget_status().to_string();
+        assert!(shown.contains("CANNOT stop"), "{shown}");
+        assert!(shown.contains("3 LLM proposal calls"), "{shown}");
+
+        // Singular reads correctly.
+        state.uncosted_llm_calls = 1;
+        state.total_cost_usd = 1.0;
+        assert!(
+            state
+                .budget_status()
+                .to_string()
+                .contains("1 LLM proposal call billed"),
+            "{}",
+            state.budget_status()
+        );
+
+        // A goal whose proposals never ran (all seeds) is fully measured.
+        state.uncosted_llm_calls = 0;
+        assert_eq!(
+            state.budget_status(),
+            BudgetStatus::Measured {
+                spent: 1.0,
+                ceiling: 25.0
+            }
+        );
+    }
+
+    #[test]
+    fn uncosted_call_count_survives_a_pre_upgrade_checkpoint() {
+        // Checkpoints written before the field existed must still load.
+        let legacy = json!({
+            "campaign_id": "c1",
+            "goal": test_goal(),
+            "config": CampaignConfig::default(),
+            "candidates": [],
+            "current_iteration": 2,
+            "total_cost_usd": 0.0,
+            "paused": false,
+            "gates_hit": [],
+            "completed": false,
+            "completion_reason": "",
+            "started_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        });
+        let state: CampaignState = serde_json::from_value(legacy).expect("legacy checkpoint loads");
+        assert_eq!(state.uncosted_llm_calls, 0);
     }
 
     #[test]
