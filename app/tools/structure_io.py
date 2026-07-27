@@ -68,10 +68,12 @@ def _structure_import(**kwargs) -> dict:
     try:
         import ase  # noqa: F401
     except ImportError:
-        return {
-            "error": "structure_import needs ase (Atomic Simulation Environment)",
-            "install_hint": "pip install ase  (or the 'prism-platform[mace]' extra)",
-        }
+        from app.tools._extras import missing_extra_error
+
+        return missing_extra_error(
+            "mace",
+            "structure_import needs ase (Atomic Simulation Environment)",
+        )
 
     try:
         from ase.io import write as ase_write

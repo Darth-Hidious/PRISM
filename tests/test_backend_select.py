@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app.tools.simulation.mace.backends import FakeBackend, LocalBackend
 from app.tools.simulation.mace.backends.base import select_backend
 
@@ -71,11 +73,28 @@ def test_auto_large_n_prefers_hf(monkeypatch):
     assert b.name == "hf_jobs"
 
 
-def test_fallback_to_fake(monkeypatch):
+def test_auto_never_falls_back_to_fake(monkeypatch):
+    """`fake` returns fabricated physics, so it is NEVER an automatic
+    fallback — with no real backend registered, selection must fail loudly.
+    The only route to `fake` is the explicit MACE_MCP_BACKEND override
+    (see `test_env_override_wins`)."""
     monkeypatch.delenv("MACE_MCP_BACKEND", raising=False)
     from app.tools.simulation.mace import auth
 
     auth.reset_cache_for_tests()
     backends = _backends("fake")
-    b = select_backend("relax_structure", n_atoms=100, requested="auto", backends=backends)
+    with pytest.raises(RuntimeError, match="No MACE backend available"):
+        select_backend("relax_structure", n_atoms=100, requested="auto", backends=backends)
+
+
+def test_env_override_reaches_fake_when_only_backend(monkeypatch):
+    """The deliberate fake path still works: an explicit override wins even
+    when nothing else is registered."""
+    monkeypatch.setenv("MACE_MCP_BACKEND", "fake")
+    from app.tools.simulation.mace import auth
+
+    auth.reset_cache_for_tests()
+    b = select_backend(
+        "relax_structure", n_atoms=100, requested="auto", backends=_backends("fake")
+    )
     assert b.name == "fake"

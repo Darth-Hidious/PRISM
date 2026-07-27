@@ -381,6 +381,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+ "gloo-timers",
+ "tokio",
+]
+
+[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1020,6 +1031,18 @@ name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
+
+[[package]]
+name = "cron"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5dcd6f69605c2956916ce24e8af637b754964c9a83f4662d3a2361654cdba09"
+dependencies = [
+ "chrono",
+ "once_cell",
+ "phf 0.11.3",
+ "winnow 0.7.15",
+]
 
 [[package]]
 name = "crossbeam-channel"
@@ -2052,6 +2075,18 @@ dependencies = [
  "bstr",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -4624,6 +4659,8 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "cron",
+ "libc",
  "prism-llm",
  "prism-provenance",
  "prism-workflows",
@@ -4634,6 +4671,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "turso",
  "uuid",
 ]
 
@@ -4646,6 +4684,7 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "libc",
  "mockito",
  "prism-agent",
  "prism-audit",
@@ -4686,6 +4725,9 @@ name = "prism-client"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "mockito",
+ "prism-runtime",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -4701,6 +4743,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "prism-client",
  "reqwest",
  "serde",
  "serde_json",
@@ -4782,6 +4825,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "prism-runtime",
  "reqwest",
  "serde",
  "serde_json",
@@ -4923,11 +4967,16 @@ dependencies = [
 name = "prism-runtime"
 version = "1.0.0"
 dependencies = [
+ "anyhow",
+ "backon",
  "chrono",
  "directories",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4975,6 +5024,7 @@ dependencies = [
  "insta",
  "libc",
  "prism-client",
+ "prism-runtime",
  "ratatui",
  "ratatui-textarea",
  "serde",

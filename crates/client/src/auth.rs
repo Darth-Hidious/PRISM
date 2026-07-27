@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
+use prism_runtime::retry;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::debug;
+
+use crate::platform_error::{PlatformError, PlatformResponseExt};
 
 /// Response from the device-code initiation endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,8 +88,8 @@ impl DeviceFlowAuth {
             .send()
             .await
             .context("failed to start device flow")?
-            .error_for_status()
-            .context("device flow start returned error status")?;
+            .platform_error_for_status()
+            .await?;
 
         resp.json::<DeviceCodeResponse>()
             .await
@@ -154,6 +157,11 @@ impl DeviceFlowAuth {
     /// Refresh an access token using a refresh token.
     ///
     /// Calls `POST {base_url}/auth/refresh`.
+    ///
+    /// Retried on transient failure. This runs unattended whenever a token
+    /// ages out, so one dropped packet used to present to the user as "PRISM
+    /// logged me out". A *rejected* refresh token (401) still fails on the
+    /// first attempt — that one really does mean log in again.
     pub async fn refresh_token(
         client: &reqwest::Client,
         base_url: &str,
@@ -162,14 +170,30 @@ impl DeviceFlowAuth {
         let url = format!("{base_url}/auth/refresh");
         debug!(%url, "refreshing token");
 
-        let resp = client
-            .post(&url)
-            .json(&serde_json::json!({ "refresh_token": refresh_token }))
-            .send()
-            .await
-            .context("failed to refresh token")?
-            .error_for_status()
-            .context("token refresh returned error status")?;
+        // Billable in the "must not be duplicated" sense rather than the
+        // money sense: the platform rotates the refresh token, so replaying a
+        // request that may already have landed burns a rotation and logs the
+        // user out for real.
+        let resp = retry::retrying("auth.refresh", retry::Idempotency::Billable, || async {
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "refresh_token": refresh_token }))
+                .send()
+                .await
+                .context("failed to refresh token")?;
+            if !resp.status().is_success() {
+                // Classify off the borrow before the body read consumes the
+                // response, then keep the platform's own reason on top: a
+                // rejected refresh token has to say `prism login`, not
+                // "returned error status 401". Same shape, and the same
+                // reasoning, as `PlatformClient::send_retrying`.
+                let classified = retry::HttpStatus::from_response(&resp);
+                let reason = PlatformError::from_response(resp).await;
+                return Err(classified).context(reason);
+            }
+            Ok(resp)
+        })
+        .await?;
 
         resp.json::<TokenResponse>()
             .await

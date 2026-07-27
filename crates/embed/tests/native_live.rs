@@ -7,6 +7,10 @@
 //! ```sh
 //! cargo test -p prism-embed --test native_live -- --ignored --nocapture
 //! ```
+//!
+//! Not compiled on Intel macOS — the native backend does not exist there
+//! (no ONNX Runtime build for `x86_64-apple-darwin`).
+#![cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 
 use prism_embed::{EmbedBackend, NativeOnnx, cosine_similarity};
 

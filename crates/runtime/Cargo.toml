@@ -1,14 +1,25 @@
 [package]
 name = "prism-runtime"
-description = "Shared runtime primitives — XDG path discovery, credential storage, and platform endpoint resolution."
+description = "Shared runtime primitives — XDG path discovery, credential storage, platform endpoint resolution, and the shared retry policy."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+# Bounded exponential backoff with jitter, so no crate has to hand-roll (and
+# get wrong) its own retry loop.
+backon.workspace = true
 chrono.workspace = true
 directories.workspace = true
+# Used only to classify failures (status codes, transport errors). Every crate
+# that depends on prism-runtime already pulls reqwest transitively.
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

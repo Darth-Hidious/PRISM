@@ -9,6 +9,7 @@
 //! MARC27 platform, and any OpenAI-compatible endpoint.
 
 use anyhow::{Context, Result, bail};
+use prism_runtime::retry;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::debug;
@@ -184,6 +185,82 @@ pub struct UsageInfo {
     pub total_tokens: u64,
 }
 
+/// Assembles OpenAI-style streamed `tool_calls` deltas into whole calls.
+///
+/// Providers split one call across many chunks: the first carries `id` and
+/// `function.name`, later ones append `function.arguments` fragments, all
+/// keyed by `index`. BOTH streaming paths feed this — the OpenAI
+/// `/v1/chat/completions` stream and the MARC27 `/stream` SSE (which forwards
+/// the upstream provider's deltas verbatim on `tool_calls`). Sharing it is
+/// what keeps a tool call assembled identically whichever backend answered;
+/// the two paths having separate parsers is how the MARC27 path went years
+/// without native tool calling at all.
+#[derive(Default)]
+struct ToolCallAccumulator {
+    /// index -> (id, name, arguments-so-far)
+    by_index: std::collections::HashMap<u32, (String, String, String)>,
+}
+
+impl ToolCallAccumulator {
+    /// Fold one chunk's `tool_calls` array into the accumulator.
+    fn push_deltas(&mut self, deltas: &[serde_json::Value]) {
+        for tc in deltas {
+            let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+            let entry = self.by_index.entry(idx).or_default();
+            // `id` / `name` may arrive on any chunk (not always the first) —
+            // take the first non-empty value seen and never overwrite it.
+            if entry.0.is_empty()
+                && let Some(id) = tc.get("id").and_then(|i| i.as_str())
+            {
+                entry.0.push_str(id);
+            }
+            if entry.1.is_empty()
+                && let Some(name) = tc.pointer("/function/name").and_then(|n| n.as_str())
+            {
+                entry.1.push_str(name);
+            }
+            if let Some(args) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                entry.2.push_str(args);
+            }
+        }
+    }
+
+    /// The assembled calls in `index` order, or `None` when the turn carried
+    /// no native tool calls.
+    ///
+    /// An entry whose name never arrived is KEPT, not dropped: the dispatcher
+    /// answers it with "unknown tool", which the model can see and recover
+    /// from. Dropping it would turn a diagnosable error into an empty turn.
+    fn finish(self) -> Option<Vec<ToolCallResponse>> {
+        let mut calls: Vec<(u32, ToolCallResponse)> = self
+            .by_index
+            .into_iter()
+            .map(|(idx, (id, name, args))| {
+                (
+                    idx,
+                    ToolCallResponse {
+                        id,
+                        call_type: "function".to_string(),
+                        function: FunctionCall {
+                            name,
+                            arguments: if args.is_empty() {
+                                "{}".to_string()
+                            } else {
+                                args
+                            },
+                        },
+                    },
+                )
+            })
+            .collect();
+        if calls.is_empty() {
+            return None;
+        }
+        calls.sort_by_key(|(idx, _)| *idx);
+        Some(calls.into_iter().map(|(_, tc)| tc).collect())
+    }
+}
+
 /// Unified LLM client — all backends via OpenAI-compatible API.
 ///
 /// Works with:
@@ -312,15 +389,22 @@ impl LlmClient {
         Ok(result)
     }
 
-    /// Chat with tool-calling support.
-    /// Sends full message history + tool definitions, returns response
-    /// which may contain tool_calls.
+    /// Chat with tool-calling support, non-streaming.
+    ///
+    /// Sends full message history + tool definitions and returns a response
+    /// that may contain tool_calls — on the OpenAI path. On the MARC27 path it
+    /// drops `tools` (see below). Nothing in the workspace calls this today;
+    /// the agent loop uses [`Self::chat_with_tools_streaming`], which sends
+    /// tools on both.
     pub async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<ChatResponse> {
-        // MARC27 platform proxy: use /stream, collect text (no tool-calling support yet)
+        // MARC27 platform proxy: use /stream, collect text. This branch DROPS
+        // `tools` — unlike `chat_with_tools_streaming`, which sends them
+        // natively. Nothing in the workspace calls this method today; use the
+        // streaming variant, which is the agent loop's only entry point.
         if self.is_marc27() {
             let msgs = serde_json::to_value(messages)?;
             let text = self.chat_marc27_simple(&msgs).await?;
@@ -534,39 +618,28 @@ impl LlmClient {
         mut on_delta: impl FnMut(&str, bool),
     ) -> Result<ChatResponse> {
         // MARC27 platform: use /stream with SSE.
-        // The platform proxy doesn't support OpenAI-style tool_calls in the response,
-        // so we inject tool definitions into the messages and parse structured tool
-        // calls from the response text.
+        // The platform forwards `tools` verbatim to the upstream provider and
+        // streams OpenAI-style `tool_calls` deltas back, so this path sends the
+        // SAME tool definitions as the OpenAI path (see the module docs). What
+        // is injected as text here is behavioural guidance ONLY — never a tool
+        // inventory.
         if self.is_marc27() {
             let url = format!("{}/stream", self.config.base_url);
 
-            // Inject tool definitions as a system message so the LLM knows what's available
             let mut aug_messages: Vec<serde_json::Value> = serde_json::to_value(messages)?
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
 
-            if !tools.is_empty() {
-                let tool_block = build_tool_prompt_block(tools);
-                // Append after the system prompt as a system message
-                let inject_idx = if aug_messages
+            // Where a synthetic system message goes: after the caller's own
+            // system prompt, if there is one.
+            let inject_idx = usize::from(
+                aug_messages
                     .first()
                     .and_then(|m| m.get("role"))
                     .and_then(|r| r.as_str())
-                    == Some("system")
-                {
-                    1
-                } else {
-                    0
-                };
-                aug_messages.insert(
-                    inject_idx,
-                    serde_json::json!({
-                        "role": "system",
-                        "content": tool_block,
-                    }),
-                );
-            }
+                    == Some("system"),
+            );
 
             // Convert OpenAI-format messages to what MARC27 accepts.
             // MARC27 only understands system/user/assistant with string content.
@@ -601,38 +674,84 @@ impl LlmClient {
                 }
             }
 
-            // Estimate before the body moves `aug_messages` into the request.
-            let est: u64 = aug_messages
-                .iter()
-                .map(|m| m.to_string().len() as u64)
-                .sum::<u64>()
-                / 4;
-            let body = serde_json::json!({
-                "model": self.config.model,
-                "messages": aug_messages,
-                // Same fix as chat_marc27_simple: this path previously sent
-                // no cap at all, so a tool-calling turn could generate an
-                // unbounded (and unbounded-billed) response.
-                "max_tokens": self.effective_max_tokens(est),
-            });
-            // Use a direct request (not the retry-wrapper post()) so we control headers
-            let mut req = self
-                .client
-                .post(&url)
-                .json(&body)
-                .header("Accept", "text/event-stream");
-            if let Some((name, value)) = self.auth_header() {
-                req = req.header(name, value);
-            }
-            let resp = req
-                .send()
+            // Build the request for a given tool mode. `native` = real `tools`
+            // array (what every OpenAI-shaped upstream provider accepts);
+            // otherwise the selected tools are rendered as text and no `tools`
+            // key is sent at all.
+            let build = |native: bool| -> Result<serde_json::Value> {
+                let mut msgs = aug_messages.clone();
+                if !tools.is_empty() {
+                    let mut block = TOOL_GUIDANCE_BLOCK.to_string();
+                    if !native {
+                        block.push_str(&render_tools_as_text(tools));
+                    }
+                    msgs.insert(
+                        inject_idx,
+                        serde_json::json!({"role": "system", "content": block}),
+                    );
+                }
+                let est = msgs.iter().map(|m| m.to_string().len() as u64).sum::<u64>() / 4
+                    + if native {
+                        Self::estimate_tokens(&serde_json::to_value(tools)?)
+                    } else {
+                        0
+                    };
+                let mut body = serde_json::json!({
+                    "model": self.config.model,
+                    "messages": msgs,
+                    // Same fix as chat_marc27_simple: this path previously sent
+                    // no cap at all, so a tool-calling turn could generate an
+                    // unbounded (and unbounded-billed) response.
+                    "max_tokens": self.effective_max_tokens(est),
+                });
+                // The tool surface, identical to the OpenAI path below: the
+                // caller's already-token-bounded selection, with FULL schemas.
+                if native && !tools.is_empty() {
+                    body["tools"] = serde_json::to_value(tools)?;
+                }
+                Ok(body)
+            };
+
+            // Retry only the *establishment* of the stream. Once a byte has
+            // been handed to the caller, a retry would replay visible output
+            // and bill the turn twice — so everything below this line stays
+            // fatal on first failure.
+            //
+            // One extra establishment attempt exists for tool schemas: the
+            // platform forwards `tools` verbatim, so an upstream provider that
+            // does not speak the OpenAI tool shape rejects the request outright
+            // (measured: its direct Anthropic provider answers `tools.0: Input
+            // tag 'function' … does not match any of the expected tags`). A
+            // rejected request bills nothing, so fall back to the text protocol
+            // for that turn rather than failing it. Any other error is returned
+            // as-is — this must never mask a 401/402/429.
+            let resp = match self
+                .send_retrying("llm.stream.marc27", &url, &build(true)?, true)
                 .await
-                .with_context(|| format!("MARC27 stream request to {url} failed"))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                bail!("MARC27 LLM returned HTTP {status}: {text}");
-            }
+            {
+                Ok(resp) => resp,
+                Err(e) if !tools.is_empty() && error_rejects_tool_schemas(&e) => {
+                    tracing::warn!(
+                        "MARC27 upstream rejected OpenAI-shaped tool schemas ({e:#}) — \
+                         retrying this turn with the text tool-call protocol"
+                    );
+                    match self
+                        .send_retrying("llm.stream.marc27", &url, &build(false)?, true)
+                        .await
+                    {
+                        Ok(resp) => resp,
+                        // Surface the FIRST error — it says what the provider
+                        // actually refused. The fallback's own failure rides
+                        // along as context instead of replacing it.
+                        Err(fallback_err) => {
+                            return Err(e.context(format!(
+                                "retry without tool schemas also failed: {fallback_err:#}"
+                            )));
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            };
             debug!("MARC27 stream response received, reading chunks...");
 
             // Read SSE stream incrementally — don't use resp.text() which
@@ -643,6 +762,10 @@ impl LlmClient {
             let mut full_text = String::new();
             let mut usage_info = None;
             let mut done = false;
+            // Native tool_calls, assembled by the SAME accumulator the OpenAI
+            // path uses — the platform forwards the provider's OpenAI-style
+            // deltas verbatim on `StreamChunk.tool_calls`.
+            let mut native_calls = ToolCallAccumulator::default();
 
             while let Some(chunk) = stream.next().await {
                 let bytes = chunk.context("error reading SSE chunk")?;
@@ -667,6 +790,9 @@ impl LlmClient {
                             // We collect full_text, strip tool calls, then emit clean
                             // content_text after the response completes. This prevents
                             // partial tool call JSON from leaking into visible text.
+                        }
+                        if let Some(tcs) = chunk.get("tool_calls").and_then(|t| t.as_array()) {
+                            native_calls.push_deltas(tcs);
                         }
                         if let Some(u) = chunk.get("usage") {
                             let pt = u
@@ -698,17 +824,32 @@ impl LlmClient {
                 }
             }
 
-            // Parse tool calls — only take the FIRST batch (before any "Results:" hallucination)
-            let tool_calls = parse_text_tool_calls(&full_text);
-            // Only unique tool calls (LLM sometimes duplicates)
-            let tool_calls = dedup_tool_calls(tool_calls);
-            let mut content_text = strip_tool_call_blocks(&full_text);
+            // Native tool_calls win. The text parser stays as a fallback for
+            // any upstream provider the platform can't yet forward tool_calls
+            // for (today: the direct Anthropic provider) and for models that
+            // narrate a call instead of emitting one.
+            let native = native_calls.finish();
+            let from_native = native.is_some();
+            let tool_calls = match native {
+                Some(calls) => calls,
+                // Only take the FIRST batch (before any "Results:" hallucination),
+                // deduped (the LLM sometimes repeats a call).
+                None => dedup_tool_calls(parse_text_tool_calls(&full_text)),
+            };
+            let mut content_text = if from_native {
+                full_text.trim().to_string()
+            } else {
+                strip_tool_call_blocks(&full_text)
+            };
 
-            // If we found tool calls, suppress any JSON/code artifacts in content.
-            // Gemini often leaks partial tool call JSON or closing ``` into the
-            // content when it outputs a tool call. Only keep content that looks
-            // like actual natural language prose.
-            if !tool_calls.is_empty() && !content_text.is_empty() {
+            // If we found tool calls IN THE TEXT, suppress any JSON/code
+            // artifacts in content. Gemini often leaks partial tool call JSON
+            // or closing ``` into the content when it outputs a fenced call.
+            // Only keep content that looks like actual natural language prose.
+            // Native tool_calls arrive on their own channel and cannot leak
+            // into the text, so this heuristic must NOT run for them — it
+            // would delete a legitimate answer that merely ends in a fence.
+            if !from_native && !tool_calls.is_empty() && !content_text.is_empty() {
                 let trimmed = content_text.trim();
                 let looks_like_json = trimmed.contains("}}")
                     || trimmed.contains("\"name\":")
@@ -756,26 +897,14 @@ impl LlmClient {
             body["tools"] = serde_json::to_value(tools)?;
         }
 
-        let mut req = self.client.post(&url).json(&body);
-        if let Some((name, value)) = self.auth_header() {
-            req = req.header(name, value);
-        }
-
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("LLM streaming request to {url} failed"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("LLM returned HTTP {status}: {text}");
-        }
+        // As above: retry only until the stream is open. A mid-stream failure
+        // stays fatal, because replaying it would duplicate what the user has
+        // already seen and pay for the turn twice.
+        let resp = self.send_retrying("llm.stream", &url, &body, false).await?;
 
         // Parse SSE stream
         let mut full_content = String::new();
-        let mut tool_calls_map: std::collections::HashMap<u32, (String, String, String)> =
-            std::collections::HashMap::new(); // index -> (id, name, args)
+        let mut native_calls = ToolCallAccumulator::default();
         let mut usage_info: Option<UsageInfo> = None;
 
         use futures_util::StreamExt;
@@ -826,28 +955,7 @@ impl LlmClient {
                         .pointer("/choices/0/delta/tool_calls")
                         .and_then(|t| t.as_array())
                     {
-                        for tc in tcs {
-                            let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
-                            let entry = tool_calls_map.entry(idx).or_insert_with(|| {
-                                let id = tc
-                                    .get("id")
-                                    .and_then(|i| i.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let name = tc
-                                    .pointer("/function/name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                (id, name, String::new())
-                            });
-                            // Append argument chunks
-                            if let Some(args_chunk) =
-                                tc.pointer("/function/arguments").and_then(|a| a.as_str())
-                            {
-                                entry.2.push_str(args_chunk);
-                            }
-                        }
+                        native_calls.push_deltas(tcs);
                     }
 
                     // Extract usage from final chunk
@@ -858,29 +966,7 @@ impl LlmClient {
             }
         }
 
-        // Assemble tool calls
-        let tool_calls = if tool_calls_map.is_empty() {
-            None
-        } else {
-            let mut calls: Vec<(u32, ToolCallResponse)> = tool_calls_map
-                .into_iter()
-                .map(|(idx, (id, name, args))| {
-                    (
-                        idx,
-                        ToolCallResponse {
-                            id,
-                            call_type: "function".to_string(),
-                            function: FunctionCall {
-                                name,
-                                arguments: args,
-                            },
-                        },
-                    )
-                })
-                .collect();
-            calls.sort_by_key(|(idx, _)| *idx);
-            Some(calls.into_iter().map(|(_, tc)| tc).collect())
-        };
+        let tool_calls = native_calls.finish();
 
         Ok(ChatResponse {
             message: ChatMessage {
@@ -936,8 +1022,33 @@ impl LlmClient {
 
     async fn post(&self, url: &str, body: &serde_json::Value) -> Result<reqwest::Response> {
         debug!(%url, "LLM request");
-        for attempt in 0..3u32 {
+        self.send_retrying("llm.post", url, body, false).await
+    }
+
+    /// Issue an LLM request, retrying only transient failures.
+    ///
+    /// This replaced a hand-rolled loop that retried 429 and *nothing else* —
+    /// a reset socket or a 503 from the proxy was terminal mid-conversation.
+    /// The shared policy keeps that loop's `Retry-After` handling (see
+    /// [`retry::HttpStatus::from_response`]) and adds transport failures,
+    /// while still failing a 400/401/402 on the first attempt.
+    ///
+    /// `sse` adds `Accept: text/event-stream` for the streaming callers.
+    async fn send_retrying(
+        &self,
+        label: &str,
+        url: &str,
+        body: &serde_json::Value,
+        sse: bool,
+    ) -> Result<reqwest::Response> {
+        // Every call here bills tokens, so only an outright refusal (429,
+        // 503) or a connection that never opened is replayed. A read timeout
+        // is NOT — see `retry::Idempotency`.
+        retry::retrying(label, retry::Idempotency::Billable, || async {
             let mut req = self.client.post(url).json(body);
+            if sse {
+                req = req.header("Accept", "text/event-stream");
+            }
             if let Some((name, value)) = self.auth_header() {
                 req = req.header(name, value);
             }
@@ -945,135 +1056,101 @@ impl LlmClient {
                 .send()
                 .await
                 .with_context(|| format!("LLM request to {url} failed"))?;
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                let wait = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(2u64.pow(attempt));
-                debug!(attempt, wait_secs = wait, "429 — retrying after backoff");
-                tokio::time::sleep(Duration::from_secs(wait)).await;
-                continue;
-            }
             if !resp.status().is_success() {
                 let status = resp.status();
+                let http = retry::HttpStatus::from_response(&resp);
                 let text = resp.text().await.unwrap_or_default();
-                bail!("LLM returned HTTP {status}: {text}");
+                return Err(http).with_context(|| format!("LLM returned HTTP {status}: {text}"));
             }
-            return Ok(resp);
-        }
-        bail!("LLM request to {url} failed after 3 retries (429 rate limit)");
+            Ok(resp)
+        })
+        .await
     }
 }
 
-// ── MARC27 text-based tool calling helpers ──────────────────────────
+// ── MARC27 tool-calling helpers ─────────────────────────────────────
 
-/// Build a lightweight tool catalog for the system prompt.
+/// Whether an LLM error is the upstream provider refusing OpenAI-shaped tool
+/// schemas, as opposed to anything else that can fail a request.
 ///
-/// Instead of dumping all 108 tool definitions (11K+ tokens), we give the model:
-/// 1. A categorized summary of what's available
-/// 2. Instructions to call `find_tools` for specifics
-/// 3. The tool calling syntax
-///
-/// Full tool definitions are injected only after find_tools returns.
-fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
-    // Categorize tools by prefix/name patterns
-    let mut categories: std::collections::BTreeMap<&str, Vec<&str>> =
-        std::collections::BTreeMap::new();
-    for tool in tools {
-        let name = tool.function.name.as_str();
-        let cat = if name.starts_with("knowledge_")
-            || name.starts_with("semantic_")
-            || name == "list_corpora"
-        {
-            "Knowledge Graph"
-        } else if name.starts_with("search_") || name.starts_with("query_") {
-            "Search & Query"
-        } else if name.starts_with("predict_")
-            || name.starts_with("list_models")
-            || name.starts_with("list_predictable")
-        {
-            "ML Prediction"
-        } else if name.starts_with("compute_")
-            || name.starts_with("run")
-            || name.starts_with("job")
-            || name.starts_with("deploy")
-        {
-            "Compute & Deploy"
-        } else if name.starts_with("mesh_") || name.starts_with("node_") {
-            "Mesh & Nodes"
-        } else if name.starts_with("workflow") || name.starts_with("forge") {
-            "Workflows"
-        } else if name.starts_with("marketplace") {
-            "Marketplace"
-        } else if name.starts_with("ingest")
-            || name.starts_with("import")
-            || name.starts_with("export")
-        {
-            "Data & Ingest"
-        } else if name.starts_with("execute_")
-            || name.starts_with("read_")
-            || name.starts_with("write_")
-            || name.starts_with("edit_")
-        {
-            "Code & Files"
-        } else if name.starts_with("plot_") || name.starts_with("visualize") {
-            "Visualization"
-        } else if name.starts_with("literature_")
-            || name.starts_with("patent_")
-            || name.starts_with("web_")
-        {
-            "Literature & Web"
-        } else if name.starts_with("discourse") || name.starts_with("research") {
-            "Research & Discourse"
-        } else {
-            "Other"
-        };
-        categories.entry(cat).or_default().push(name);
+/// Deliberately narrow, on two axes. The fallback it gates costs one extra
+/// (unbilled, already-failed) round-trip, but retrying a 401/402/429 without
+/// tools would hide the real problem behind a second, less informative
+/// failure — so the error must BOTH carry a request-shape status AND name the
+/// tools field. A body that merely mentions credits or a plan does not match.
+fn error_rejects_tool_schemas(err: &anyhow::Error) -> bool {
+    // 400/422 = the provider rejected the request; 500 = the platform's own
+    // wrapper around an upstream 400 (measured shape). Auth (401/403),
+    // billing (402) and capacity (429/503) are never a schema problem.
+    let request_shape = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<retry::HttpStatus>())
+        .is_some_and(|h| matches!(h.status, 400 | 422 | 500));
+    if !request_shape {
+        return false;
     }
+    let text = format!("{err:#}").to_ascii_lowercase();
+    ["tools.", "tools[", "\"tools\"", "tool_choice"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
 
-    let mut block = format!(
-        "# Tool Calling\n\n\
-         You have {} tools available across these categories:\n\n",
-        tools.len()
-    );
-
-    for (category, tool_names) in &categories {
-        block.push_str(&format!(
-            "- **{}** ({} tools): {}\n",
-            category,
-            tool_names.len(),
-            tool_names
-                .iter()
-                .take(4)
-                .copied()
-                .collect::<Vec<_>>()
-                .join(", "),
+/// Render the SELECTED tools as text, for the fallback path only.
+///
+/// Every tool the selection layer chose, with its description and its
+/// parameter names — the same set the `tools` array would have carried, not a
+/// sample of it. (The categorised summary this replaces showed 4 names per
+/// category and no parameters at all.)
+fn render_tools_as_text(tools: &[ToolDefinition]) -> String {
+    let mut out = String::from("\n\n## Tools available to you\n\n");
+    for t in tools {
+        let params = t
+            .function
+            .parameters
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "- `{}({})` — {}\n",
+            t.function.name, params, t.function.description
         ));
-        if tool_names.len() > 4 {
-            block.push_str(&format!("  ... and {} more\n", tool_names.len() - 4));
-        }
     }
+    out.push_str(
+        "\n## How to call a tool\n\n\
+         ```tool_call\n\
+         {\"name\": \"tool_name\", \"arguments\": {\"arg\": \"value\"}}\n\
+         ```\n\n\
+         Output ONE ```tool_call block, then STOP — the system executes it and \
+         returns the result in your next message. Call `find_tools` if you need \
+         a capability that is not listed above.\n",
+    );
+    out
+}
 
-    block.push_str("\n\
+/// Behavioural guidance injected as a second system message alongside the
+/// agent prompt on the MARC27 path.
+///
+/// This is NOT a tool surface. The tool surface is the real `tools` array on
+/// the request — the caller's already-token-bounded selection, with FULL
+/// schemas, identical to the OpenAI path. What used to stand in for it here
+/// was a categorised NAME SUMMARY (4 names per category, no descriptions, no
+/// parameters): on a 135-tool catalog the model saw ~40 bare names, so every
+/// other tool was only reachable via a `find_tools` hop. That summary is gone.
+///
+/// What remains has no other code path: the retrieval-discipline carve-out and
+/// the domain guidance from PRs #109/#111/#114/#115 — where materials data
+/// actually lives, which hosts the `web` tool cannot reach, the composition
+/// patterns, and long-horizon discipline.
+const TOOL_GUIDANCE_BLOCK: &str = "\
         ## IMPORTANT: When NOT to call tools\n\n\
-        For greetings, casual conversation, explanations, general knowledge questions, \
+        For greetings, casual conversation, conceptual explanations, \
         or anything that does not need live data — respond with plain text. \
-        Do NOT call tools for simple chat like \"hello\", \"what can you do?\", or \"explain X\".\n\n\
-        ## How to call tools\n\n\
-        ONLY when a task explicitly requires data retrieval, computation, search, or platform interaction, call a tool:\n\n\
-        ```tool_call\n\
-        {\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n\
-        ```\n\n\
-        **CRITICAL rules:**\n\
-        - Call `find_tools` (with a `query`) first if you need to discover what tools exist\n\
-        - Output ONE ```tool_call block, then STOP IMMEDIATELY. Do not write anything after it.\n\
-        - Do NOT output multiple tool_call blocks in one response.\n\
-        - Do NOT guess, fabricate, or hallucinate tool results. EVER.\n\
-        - After your ```tool_call block, the system executes it and returns the result.\n\
-        - You will see the result in your next message, then you can respond or call another tool.\n\
-        - If you need multiple tools, call them one at a time across multiple turns.\n\n\
+        Do NOT call tools for simple chat like \"hello\", \"what can you do?\", or \"explain X\".\n\
+        This is NOT a licence to answer from memory: a question about a specific \
+        MATERIAL, a source, or platform/job state always needs live data. Retrieve \
+        it. If retrieval comes back empty, say it was not found — never fill the \
+        gap from memory.\n\n\
         **When a tool fails (recovery rules — DO NOT GIVE UP):**\n\
         - A tool returning an error is NORMAL. It is NOT a signal to stop.\n\
         - If a tool returns a missing-API-key error (e.g. \"MP_API_KEY not set\"), \
@@ -1087,17 +1164,6 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         - NEVER respond with empty content + no tool call after a tool error. Either \
         try a different tool, or explicitly tell the user which tools you tried and \
         why none of them worked.\n\n\
-        ## Quick reference (most common tools)\n\n\
-        - `find_tools` — discover tools by capability/keyword (progressive tool discovery)\n\
-        - `query_platform` — search the MARC27 knowledge graph (plain text = graph, semantic=true = vector)\n\
-        - `materials_search` — federated search across 20+ materials databases (OPTIMADE)\n\
-        - `predict` — predict a material property from composition (ML)\n\
-        - `execute_python` — run Python code for analysis\n\
-        - `web` — fetch a URL or search the open web (action='read' / 'search')\n\
-        - `prior_art_search` — search arXiv, Semantic Scholar, and patents (Lens.org)\n\
-        - `research` — iterative research loop via the MARC27 platform\n\n\
-        Names above MUST match the actual registry. If a tool you'd expect \
-        isn't in this list, call `find_tools` instead of guessing.\n\n\
         ## Tool-composition patterns (USE THESE for the common tasks)\n\n\
         PRISM is a materials-discovery strategy engine, not just a chat model. \
         For non-trivial questions you should COMPOSE multiple tools instead of \
@@ -1141,9 +1207,11 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         `prior_art_search` first (does anyone publish on this?), then \
         `materials_search` for compositional alternatives, then `web` only \
         for industry / regulatory context that isn't in academic papers.\n\
-        - **Knowledge-graph queries**: `knowledge` for MARC27-internal \
-        provenance. Use BEFORE `materials_search` if the user is asking \
-        about a specific project / dataset rather than a general material.\n\n\
+        - **Knowledge-graph queries**: `query_platform` (term or semantic \
+        search) and `knowledge_entity` (one entity + its neighbours) for \
+        MARC27-internal provenance. Use them BEFORE `materials_search` if the \
+        user is asking about a specific project / dataset rather than a \
+        general material.\n\n\
         For ANY recommendation you give the user: cite the source. \
         \"Composition X has property Y\" must come with a tool result reference \
         (DB id, paper DOI, predict() output id). \"It's a known refractory \
@@ -1185,10 +1253,7 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         Long horizon is the product. The compaction system, the research \
         tool, and the recovery rules above all exist so you can sustain \
         20+ tool calls on one question without losing the thread. Use them.\n\
-    ");
-
-    block
-}
+    ";
 
 /// Parse ```tool_call blocks from response text.
 /// Return the byte index just past the `}` that closes the JSON object
@@ -1640,39 +1705,56 @@ mod tests {
         );
     }
 
-    /// Pin the curated tool names in the system-prompt quick-reference.
+    /// Pin the tool names the guidance block still names verbatim.
     ///
     /// Each name below MUST be a real tool registered in `app/tools/*.py`
     /// (`registry.register(Tool(name=...))`). When a tool is renamed,
-    /// update both this list AND `build_tool_prompt_block` together —
+    /// update both this list AND [`TOOL_GUIDANCE_BLOCK`] together —
     /// otherwise the LLM gets a stale name in its system prompt and
     /// hallucinates calls to it (we shipped this exact bug: the old
     /// `search_materials` line stayed in the prompt for ~2 rounds after
     /// the tool was renamed to `materials_search`, and gemini-3.1 dutifully
     /// called the dead name on every materials request).
     ///
-    /// This test only proves the strings render into the prompt block.
-    /// A future `boot_checks` entry can run the actual cross-check
-    /// against `tool_server.list_tools()` at startup.
-    const QUICK_REFERENCE_TOOL_NAMES: &[&str] = &[
+    /// Shorter than it used to be: the "quick reference" list of 8 names was
+    /// deleted along with the rest of the name-only surrogate — the request
+    /// now carries real schemas, so a prose name list is both redundant and
+    /// the only remaining way to ship a stale name.
+    const GUIDANCE_TOOL_NAMES: &[&str] = &[
         "find_tools",
-        "query_platform",
         "materials_search",
         "predict",
-        "execute_python",
-        "web",
         "prior_art_search",
         "research",
+        "query_platform",
+        "knowledge_entity",
+        "web",
     ];
 
     #[test]
-    fn quick_reference_names_appear_in_prompt() {
-        let block = build_tool_prompt_block(&[]);
-        for name in QUICK_REFERENCE_TOOL_NAMES {
+    fn guidance_tool_names_appear_in_prompt() {
+        for name in GUIDANCE_TOOL_NAMES {
             assert!(
-                block.contains(&format!("`{name}`")),
-                "tool `{name}` missing from quick-reference block — \
-                 either restore it or remove it from QUICK_REFERENCE_TOOL_NAMES"
+                TOOL_GUIDANCE_BLOCK.contains(&format!("`{name}`")),
+                "tool `{name}` missing from the guidance block — \
+                 either restore it or remove it from GUIDANCE_TOOL_NAMES"
+            );
+        }
+    }
+
+    /// The guidance block must never re-grow a tool inventory: that summary
+    /// (names only, 4 per category) is the defect this change removed.
+    #[test]
+    fn guidance_block_carries_no_tool_inventory() {
+        for banned in [
+            "tools available across these categories",
+            "... and ",
+            "```tool_call",
+        ] {
+            assert!(
+                !TOOL_GUIDANCE_BLOCK.contains(banned),
+                "`{banned}` is back in the guidance block — the tool surface is \
+                 the request's `tools` array, not prose"
             );
         }
     }
@@ -1692,7 +1774,7 @@ mod tests {
     /// arxiv 2605.02572 (empirical horizon-length study).
     #[test]
     fn long_horizon_orchestration_markers_present() {
-        let block = build_tool_prompt_block(&[]);
+        let block = TOOL_GUIDANCE_BLOCK;
         let required_markers: &[(&str, &str)] = &[
             ("DO NOT GIVE UP", "recovery-rules header from #109"),
             (
@@ -1760,11 +1842,41 @@ mod tests {
         }
     }
 
+    /// The "when NOT to call tools" carve-out must not become a licence to
+    /// answer materials questions from memory.
+    ///
+    /// This block is injected as a SECOND system message alongside the PRISM
+    /// agent prompt (`prism_agent::prompts`), which says "You may not answer a
+    /// scientific or platform question from memory". Before this pin the two
+    /// messages contradicted each other in the same request — this block
+    /// excused "general knowledge questions", and a materials question reads as
+    /// one. Two contradictory system messages resolve toward the cheaper
+    /// instruction, which is the fabrication.
     #[test]
-    fn quick_reference_does_not_mention_renamed_tools() {
+    fn tool_carve_out_does_not_license_answering_from_memory() {
+        let block = TOOL_GUIDANCE_BLOCK;
+        assert!(
+            !block.contains("general knowledge questions"),
+            "the 'general knowledge questions' carve-out lets a materials \
+             question be answered from memory — contradicts the agent prompt"
+        );
+        for marker in [
+            "NOT a licence to answer from memory",
+            "never fill the \
+             gap from memory",
+        ] {
+            assert!(
+                block.contains(marker),
+                "retrieval-discipline marker `{marker}` missing from the tool block"
+            );
+        }
+    }
+
+    #[test]
+    fn guidance_block_does_not_mention_renamed_tools() {
         // Belt-and-braces: explicit deny-list of names we've previously
         // renamed and don't want sneaking back into the prompt.
-        let block = build_tool_prompt_block(&[]);
+        let block = TOOL_GUIDANCE_BLOCK;
         for stale in &[
             "search_materials",
             "knowledge_search",
@@ -1777,7 +1889,7 @@ mod tests {
         ] {
             assert!(
                 !block.contains(&format!("`{stale}`")),
-                "stale tool name `{stale}` reappeared in quick-reference block"
+                "stale tool name `{stale}` reappeared in the guidance block"
             );
         }
     }
@@ -1792,14 +1904,14 @@ mod tests {
     /// bug shipped.
     ///
     /// This test reads `app/tools/*.py` directly and confirms every name in
-    /// `QUICK_REFERENCE_TOOL_NAMES` appears as a `name="..."` registration.
+    /// `GUIDANCE_TOOL_NAMES` appears as a `name="..."` registration.
     /// No Python subprocess, no runtime cost — just file IO at test time.
     ///
     /// If `app/tools/` is missing (e.g., someone runs the test outside a
     /// full PRISM checkout), the test soft-skips so it doesn't break
     /// downstream builds of the crate in isolation.
     #[test]
-    fn quick_reference_names_are_registered_in_python() {
+    fn guidance_tool_names_are_registered_in_python() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let tools_dir = std::path::Path::new(manifest_dir)
             .parent() // crates/
@@ -1879,9 +1991,14 @@ mod tests {
         // that replaced retired Python tools (knowledge.py / research.py). They
         // are real, just not Python-registered — exempt them from the Python
         // cross-check (the anti-dead-tool intent still covers the rest).
-        const RUST_NATIVE: &[&str] = &["find_tools", "query_platform", "research"];
+        const RUST_NATIVE: &[&str] = &[
+            "find_tools",
+            "query_platform",
+            "knowledge_entity",
+            "research",
+        ];
 
-        let missing: Vec<&str> = QUICK_REFERENCE_TOOL_NAMES
+        let missing: Vec<&str> = GUIDANCE_TOOL_NAMES
             .iter()
             .copied()
             .filter(|n| !RUST_NATIVE.contains(n))
@@ -1890,11 +2007,11 @@ mod tests {
 
         assert!(
             missing.is_empty(),
-            "tool name(s) in quick-reference are NOT registered in app/tools/ or RUST_NATIVE: {:?}\n\
+            "tool name(s) in the guidance block are NOT registered in app/tools/ or RUST_NATIVE: {:?}\n\
              registered names found: {:?}\n\
              Either restore the registration in Python, add it to RUST_NATIVE if it is a \
              Rust command/meta tool, or remove the name from both \
-             QUICK_REFERENCE_TOOL_NAMES and build_tool_prompt_block.",
+             GUIDANCE_TOOL_NAMES and TOOL_GUIDANCE_BLOCK.",
             missing,
             registered.iter().take(20).collect::<Vec<_>>()
         );

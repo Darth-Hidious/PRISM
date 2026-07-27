@@ -47,12 +47,26 @@ fn write_sessions(sessions: &[NotebookSession]) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(sessions)?;
-    fs::write(&path, json)?;
-    // Restrict permissions.
+    // This file holds live notebook tokens, i.e. kernel-exec credentials.
+    // Create it 0600 rather than writing at the umask default and
+    // chmod'ing after — the latter leaves a window in which the tokens
+    // are world-readable, and on a 0022 umask that window is every
+    // first write.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(json.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&path, json)?;
     }
     Ok(())
 }
@@ -80,13 +94,18 @@ fn free_port() -> Result<u16> {
 }
 
 /// Generate a random token.
+///
+/// This token is the ONLY authentication on the Jupyter server, and a
+/// valid token means arbitrary code execution in the kernel. It must be
+/// unguessable, so it comes from the OS CSPRNG (two v4 UUIDs, 244 bits)
+/// — never from the clock. A clock-derived token is recomputable by
+/// anyone who knows roughly when the notebook started.
 fn gen_token() -> String {
-    use std::time::SystemTime;
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("prism-{:x}", seed)
+    format!(
+        "prism-{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 /// Launch a Jupyter Lab server in the PRISM venv.
@@ -110,6 +129,18 @@ pub fn start(port: Option<u16>, _notebook: Option<&str>) -> Result<NotebookSessi
     let token = gen_token();
 
     // Spawn jupyter lab headless.
+    //
+    // The token goes through the environment, NOT argv: a process's
+    // command line is world-readable (`ps`, /proc/<pid>/cmdline), so
+    // `--ServerApp.token=<secret>` would hand the kernel to any other
+    // local user. `/proc/<pid>/environ` is owner-only. jupyter_server
+    // reads `JUPYTER_TOKEN` as the env fallback for `ServerApp.token`.
+    //
+    // `--ServerApp.allow_origin=*` is deliberately NOT set: it let any
+    // website the user visited make credentialed cross-origin calls to
+    // this kernel. Jupyter's same-origin default is correct here — the
+    // session URL we hand out is same-origin, and non-browser clients
+    // (IDEs) don't send Origin at all, so nothing legitimate needs it.
     let child = Command::new(&python)
         .args([
             "-m",
@@ -117,9 +148,8 @@ pub fn start(port: Option<u16>, _notebook: Option<&str>) -> Result<NotebookSessi
             "--no-browser",
             "--port",
             &port.to_string(),
-            &format!("--ServerApp.token={token}"),
-            "--ServerApp.allow_origin=*",
         ])
+        .env("JUPYTER_TOKEN", &token)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -178,4 +208,53 @@ pub fn stop(target: &str) -> Result<usize> {
 
     write_sessions(&sessions)?;
     Ok(before - sessions.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The Jupyter token is the ONLY thing standing between a caller and
+    /// arbitrary code execution in the notebook kernel. It must be an
+    /// unguessable secret, not a value anybody can recompute.
+    #[test]
+    fn token_is_not_recoverable_from_the_wall_clock() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let token = gen_token();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        // Reconstruct the attacker's guess: read the token as a hex
+        // nanosecond timestamp. If it lands inside the window we just
+        // measured, the "secret" is simply the clock.
+        let hex = token.strip_prefix("prism-").unwrap_or(&token);
+        if let Ok(nanos) = u128::from_str_radix(hex, 16) {
+            assert!(
+                !(before..=after).contains(&nanos),
+                "notebook token is the wall clock in hex ({token}): anyone who \
+                 knows when the notebook started can recompute it"
+            );
+        }
+    }
+
+    /// Sanity floor on entropy: distinct calls must not collide, and the
+    /// token must be long enough to resist online guessing.
+    #[test]
+    fn token_is_long_and_unique() {
+        let a = gen_token();
+        let b = gen_token();
+        assert_ne!(a, b, "two tokens collided: {a}");
+        let secret = a.strip_prefix("prism-").unwrap_or(&a);
+        assert!(
+            secret.len() >= 32,
+            "token secret too short ({} chars): {a}",
+            secret.len()
+        );
+    }
 }

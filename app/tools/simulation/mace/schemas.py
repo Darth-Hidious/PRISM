@@ -204,8 +204,11 @@ class ComputeElasticResult(_Base):
     nu_Poisson: float
     pugh_G_over_B: float
     cauchy_pressure_GPa: float
-    pugh_verdict: Literal["ductile", "brittle"]
-    am_manufacturability_passed: bool
+    # "indeterminate" when the VRH averaging did not produce a finite G/B,
+    # with am_manufacturability_passed=None. A failed calculation must not
+    # report as "assessed and failed" — see core/elastic.summarize_elastic.
+    pugh_verdict: Literal["ductile", "brittle", "indeterminate"]
+    am_manufacturability_passed: bool | None
     wall_time_s: float
     provenance_ref: str
 

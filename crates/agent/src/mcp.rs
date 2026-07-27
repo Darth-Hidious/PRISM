@@ -30,6 +30,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use prism_runtime::retry;
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
@@ -46,6 +47,17 @@ pub const MCP_TOOL_PREFIX: &str = "mcp__";
 /// Per-server budget for spawn + initialize handshake and for list_tools —
 /// a hung server must not wedge agent startup.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Extra connect attempts per server. One, deliberately.
+const CONNECT_RETRIES: usize = 1;
+/// Total wall-clock a single server may consume across all its attempts.
+///
+/// [`CONNECT_TIMEOUT`] applies *twice* per attempt (handshake, then
+/// `tools/list`), so retrying without this cap would take the worst case for
+/// one broken server from 30 s to 60 s — startup would get slower for
+/// everyone in exchange for helping the slow-npx case. The cap keeps the
+/// worst case exactly where it was while still letting a fast first failure
+/// (a spawn race, a server that dies in 200 ms) have its second chance.
+const CONNECT_BUDGET: Duration = Duration::from_secs(30);
 /// Budget for a single tool call round-trip.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -199,6 +211,11 @@ impl McpManager {
 
     /// Call a namespaced MCP tool on its owning server. Returns the same
     /// `{"result": …}` / `{"error": …}` shape the agent loop already parses.
+    ///
+    /// **Deliberately not retried.** An MCP tool is arbitrary third-party
+    /// code that may write files, send messages, or spend money; a timeout
+    /// here does not mean the work did not happen. Retrying the *connection*
+    /// is safe, retrying the *call* is not.
     pub async fn call_tool(&self, namespaced: &str, args: &Value) -> Result<Value> {
         let (server, remote) = self
             .routes
@@ -246,7 +263,18 @@ impl McpManager {
     }
 }
 
-/// Spawn + initialize one stdio server and list its tools.
+/// Spawn + initialize one stdio server and list its tools, with one retry.
+///
+/// The common first-run failure is a race, not a misconfiguration: `npx`
+/// cold-fetching a server package blows through [`CONNECT_TIMEOUT`], the
+/// server gets skipped for the whole session, and the user silently loses
+/// every tool it would have contributed. One extra attempt covers that
+/// (the package is cached by then), and [`CONNECT_BUDGET`] keeps the worst
+/// case for a broken server exactly where it was before the retry existed.
+///
+/// A missing binary, an unsupported transport, or a malformed config all
+/// fail on the first attempt: the shared classifier does not treat them as
+/// transient, so nothing is retried into a wall.
 async fn connect_one(
     cfg: &McpServerConfig,
 ) -> Result<(RunningService<RoleClient, ()>, Vec<rmcp::model::Tool>)> {
@@ -259,6 +287,24 @@ async fn connect_one(
     if cfg.command.is_empty() {
         bail!("stdio MCP server '{}' needs a 'command'", cfg.name);
     }
+    let backoff = retry::backoff().with_max_times(CONNECT_RETRIES);
+    let label = format!("mcp.connect.{}", cfg.name);
+    let attempts = retry::retrying_with(&label, retry::Idempotency::Safe, backoff, || {
+        connect_one_attempt(cfg)
+    });
+    tokio::time::timeout(CONNECT_BUDGET, attempts)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "gave up after {}s of connect attempts",
+                CONNECT_BUDGET.as_secs()
+            )
+        })?
+}
+
+async fn connect_one_attempt(
+    cfg: &McpServerConfig,
+) -> Result<(RunningService<RoleClient, ()>, Vec<rmcp::model::Tool>)> {
     let mut command = tokio::process::Command::new(&cfg.command);
     command.args(&cfg.args).envs(&cfg.env);
     let transport = TokioChildProcess::new(command)
@@ -266,13 +312,20 @@ async fn connect_one(
 
     let service = tokio::time::timeout(CONNECT_TIMEOUT, ().serve(transport))
         .await
-        .map_err(|_| anyhow!("initialize handshake timed out"))?
+        .map_err(|_| timed_out("initialize handshake timed out"))?
         .context("MCP initialize handshake failed")?;
     let tools = tokio::time::timeout(CONNECT_TIMEOUT, service.list_all_tools())
         .await
-        .map_err(|_| anyhow!("tools/list timed out"))?
+        .map_err(|_| timed_out("tools/list timed out"))?
         .context("tools/list failed")?;
     Ok((service, tools))
+}
+
+/// A timeout, typed so [`retry::is_retryable`] can recognise it. A plain
+/// `anyhow!("… timed out")` string is unclassifiable and would be treated as
+/// fatal — which is exactly the failure this retry exists to cover.
+fn timed_out(msg: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, msg)
 }
 
 /// Convert one remote MCP tool into catalog metadata. The namespaced name

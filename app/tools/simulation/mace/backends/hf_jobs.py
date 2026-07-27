@@ -11,6 +11,9 @@ This backend:
     HF CLI injects it into the runtime container).
   - Polls ``hf jobs status`` every 5 s until the job terminates.
   - Pulls the artifact directory back from the dataset on success.
+  - Reaches the ``hf`` CLI through ``app.tools.spawn``, never bare subprocess:
+    this runs in the tool-server process, where a fork() after a materials
+    search SIGSEGVs. See app/tools/spawn.py.
 """
 
 from __future__ import annotations
@@ -23,6 +26,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+from app.tools import spawn
 
 from ..auth import get_hf_token, get_results_repo, scrub_token
 from ..logging_cfg import get_logger
@@ -67,7 +72,7 @@ class HfJobsBackend(Backend):
         if not hf_id:
             return
         try:
-            subprocess.run(
+            spawn.run(
                 ["hf", "jobs", "cancel", hf_id],
                 check=False,
                 stdout=subprocess.DEVNULL,
@@ -124,7 +129,7 @@ class HfJobsBackend(Backend):
             ]
             log.info("hf_jobs_launch", tool=job.tool_name, flavor=self.flavor, timeout_s=timeout_s)
             try:
-                out = subprocess.run(
+                out = spawn.run(
                     cmd, capture_output=True, text=True, check=True, timeout=60
                 )
             except subprocess.CalledProcessError as ex:
@@ -195,7 +200,7 @@ class HfJobsBackend(Backend):
         deadline = time.time() + DEFAULT_TIMEOUTS_S.get(job.tool_name, 3600) + 300
         while time.time() < deadline:
             try:
-                r = subprocess.run(
+                r = spawn.run(
                     ["hf", "jobs", "status", hf_job_id],
                     capture_output=True,
                     text=True,
@@ -252,7 +257,7 @@ def _status_to_pct(status: str) -> float:
 
 def _fetch_logs(hf_job_id: str) -> str:
     try:
-        r = subprocess.run(
+        r = spawn.run(
             ["hf", "jobs", "logs", hf_job_id, "--tail", "200"],
             capture_output=True,
             text=True,

@@ -14,6 +14,22 @@ models on demand, distinct from the atomic predictors.
 from app.tools.base import Tool, ToolRegistry
 
 
+def _ml_guard() -> dict | None:
+    """Honest `[ml]` gate: the install hint, not `No module named 'sklearn'`.
+
+    Same shape as the MACE/CALPHAD/pyiron gates — see `app/tools/_extras.py`.
+    """
+    from app.tools._extras import missing_extra_error, missing_imports
+
+    missing = missing_imports("ml")
+    if not missing:
+        return None
+    return missing_extra_error(
+        "ml",
+        f"Composition-based ML prediction needs {', '.join(missing)}.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Per-target handlers
 # ---------------------------------------------------------------------------
@@ -23,6 +39,9 @@ def _predict_formula(**kw) -> dict:
     formula = kw.get("formula")
     if not formula:
         return {"error": "Action target='formula' requires `formula`"}
+    err = _ml_guard()
+    if err:
+        return err
     try:
         from app.tools.ml.predictor import Predictor
         predictor = Predictor()
@@ -150,6 +169,9 @@ def _model_train(**kw) -> dict:
     if not property_name:
         return {"error": "model_train requires `property_name` (e.g. 'band_gap')"}
     property_name = _PROPERTY_ALIASES.get(property_name, property_name)
+    err = _ml_guard()
+    if err:
+        return err
     algorithm = kw.get("algorithm", "random_forest")
     try:
         max_samples = max(20, min(int(kw.get("max_samples", 400)), 2000))
@@ -197,7 +219,11 @@ def _model_train(**kw) -> dict:
 
         # 2. Featurize (matminer Magpie when installed, basic fallback else).
         import numpy as np
-        from app.tools.ml.features import composition_features, get_feature_backend
+        from app.tools.ml.features import (
+            composition_features,
+            feature_backend_id,
+            get_feature_backend,
+        )
 
         feature_names = None
         X_rows, y, skipped = [], [], 0
@@ -242,6 +268,9 @@ def _model_train(**kw) -> dict:
             "n_skipped": skipped,
             "n_features": len(feature_names or []),
             "feature_backend": get_feature_backend(),
+            # Versioned identity — predict() refuses to score a model whose
+            # featurizer produced different numbers under the same names.
+            "feature_backend_id": feature_backend_id(),
             "source": source,
             "model_path": str(model_path),
             "next": f"predict(target='formula', formula='...', property_name='{property_name}', algorithm='{algorithm}')",
@@ -292,7 +321,12 @@ _PREDICT_DESCRIPTION = (
     "Use target='formula' when you only know the chemistry; use target='structure' "
     "when you have actual atomic coordinates. NOT for batch dataset prediction "
     "(use the predict_properties skill) and NOT for property selection "
-    "(use list_predictable_properties)."
+    "(use list_predictable_properties).\n"
+    "Results carry `unit` and a `provenance` block (model file SHA-256, "
+    "training holdout metrics, featurizer identity, `reproduce` string). "
+    "A predicted value is only as good as those metrics — report them with "
+    "the number. `unit: 'unknown'` means the model was trained on a column "
+    "whose unit PRISM was never told; do not invent one."
 )
 
 _PREDICT_SCHEMA = {

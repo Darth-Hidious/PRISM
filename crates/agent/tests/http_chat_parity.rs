@@ -13,6 +13,11 @@
 //!    a `requires_approval` tool is NEVER executed without explicit
 //!    pre-approval (surfaced as an `approval_required` event), and runs
 //!    exactly once when the client re-sends with `approve: ["<tool>"]`.
+//! 3. `unsupported_execution_claim_cannot_finalize_a_turn` — the Agent
+//!    Execution Contract's structural half: a final answer claiming execution
+//!    that no matching tool performed is rejected by `run_turn`, not merely
+//!    discouraged by prompt text. Asserts the streamed transcript and the
+//!    system message the stub LLM actually received, not just the final string.
 //!
 //! Requires `python3` on PATH; tests skip (with a note) when absent.
 
@@ -95,6 +100,10 @@ enum StubMode {
     /// "GATED_DONE". Keyed on the last message so resumed sessions that
     /// already contain old tool messages still trigger a fresh call.
     GatedTool,
+    /// Never calls a tool. Answers with a FABRICATED execution claim ("I ran
+    /// the test suite…") until the execution-contract reminder shows up in the
+    /// history, then answers honestly. Drives the finalization-gate test.
+    ClaimsWithoutTools,
 }
 
 fn sse_text(text: &str) -> String {
@@ -115,30 +124,69 @@ fn sse_tool_call(tool: &str) -> String {
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
 }
 
+/// Every system message the stub LLM was actually sent, in arrival order.
+type SystemMessageLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
 /// Serve `/v1/chat/completions` on an ephemeral port; returns the base_url
 /// (`http://127.0.0.1:<port>/v1`) for `LlmConfig`.
 async fn start_stub_llm(mode: StubMode) -> String {
+    start_stub_llm_recording(mode).await.0
+}
+
+/// Same, but also hands back a log of the system messages the stub received —
+/// the only way to prove what the model was ACTUALLY sent, rather than
+/// re-deriving it from the prompt-assembly functions.
+async fn start_stub_llm_recording(mode: StubMode) -> (String, SystemMessageLog) {
     use axum::routing::post;
+    let systems: SystemMessageLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = systems.clone();
     let app = axum::Router::new().route(
         "/v1/chat/completions",
-        post(
-            move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let sink = sink.clone();
+            async move {
+                if let Some(msgs) = body["messages"].as_array() {
+                    let mut log = sink.lock().expect("system log");
+                    for m in msgs {
+                        if m["role"] == "system"
+                            && let Some(c) = m["content"].as_str()
+                        {
+                            log.push(c.to_string());
+                        }
+                    }
+                }
                 let last_is_tool = body["messages"]
                     .as_array()
                     .and_then(|msgs| msgs.last())
                     .map(|m| m["role"] == "tool")
                     .unwrap_or(false);
+                let saw_contract_reminder = body["messages"]
+                    .as_array()
+                    .map(|msgs| {
+                        msgs.iter().any(|m| {
+                            m["content"]
+                                .as_str()
+                                .is_some_and(|c| c.contains("EXECUTION CONTRACT"))
+                        })
+                    })
+                    .unwrap_or(false);
                 let sse = match mode {
                     StubMode::PlainAnswer => sse_text("PARITY_OK"),
                     StubMode::GatedTool if last_is_tool => sse_text("GATED_DONE"),
                     StubMode::GatedTool => sse_tool_call("stub_gated"),
+                    StubMode::ClaimsWithoutTools if saw_contract_reminder => {
+                        sse_text("HONEST: I did not run anything.")
+                    }
+                    StubMode::ClaimsWithoutTools => {
+                        sse_text("I ran the test suite and everything passes.")
+                    }
                 };
                 axum::response::Response::builder()
                     .header("content-type", "text/event-stream")
                     .body(axum::body::Body::from(sse))
                     .expect("stub response")
-            },
-        ),
+            }
+        }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -147,7 +195,7 @@ async fn start_stub_llm(mode: StubMode) -> String {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    format!("http://{addr}/v1")
+    (format!("http://{addr}/v1"), systems)
 }
 
 fn llm_config(base_url: String) -> LlmConfig {
@@ -439,4 +487,122 @@ async fn gated_tool_is_skipped_then_runs_when_approved() {
         .filter(|line| line.contains("stub_gated"))
         .count();
     assert_eq!(calls, 1, "approved tool executes exactly once");
+}
+
+/// STRUCTURAL PROOF for the Agent Execution Contract: an answer that claims
+/// execution while no tool of the matching class ran must NOT be allowed to
+/// terminate the turn.
+///
+/// The stub LLM never calls a tool. Its first answer is a fabrication ("I ran
+/// the test suite and everything passes."). If the gate is wired, `run_turn`
+/// rejects that finalization, injects the contract reminder, and the model's
+/// second answer is what completes the turn. If the gate is missing or the
+/// evidence tracking is wrong, the fabrication ships and this fails.
+///
+/// This also asserts on the STREAMED transcript, not only the final string. The
+/// rejected text has already reached the user by the time the gate runs (2e
+/// streams before the tool-call check), so without a separating marker the
+/// retry lands glued onto the fabrication as one self-contradicting message —
+/// a worse outcome than no gate at all. A final-string-only assertion is blind
+/// to that, which is exactly how this test read in its first draft.
+///
+/// It further asserts that the contract text is present in the system message
+/// the stub LLM ACTUALLY RECEIVED — end-to-end injection proof, as opposed to
+/// the `protocol.rs` unit test that re-walks the assembly functions.
+#[tokio::test(flavor = "multi_thread")]
+async fn unsupported_execution_claim_cannot_finalize_a_turn() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let (base_url, system_messages) = start_stub_llm_recording(StubMode::ClaimsWithoutTools).await;
+
+    let seed = build_agent_seed(
+        &tool_server_config(project.path(), &python),
+        &llm_config(base_url.clone()),
+    )
+    .await
+    .expect("seed");
+    let AgentSeed {
+        mut tool_server,
+        command_tool_runtime,
+        tools,
+        config,
+        hooks,
+        permissions,
+    } = seed;
+
+    let llm = LlmClient::new(llm_config(base_url));
+    let mut history = Vec::new();
+    let mut transcript = prism_agent::transcript::TranscriptStore::new(None);
+    let mut scratchpad = prism_agent::scratchpad::Scratchpad::new();
+    let mut answer = String::new();
+    let mut streamed = String::new();
+    agent_loop::run_turn(
+        &llm,
+        &mut tool_server,
+        &command_tool_runtime,
+        &mut history,
+        tools.as_ref(),
+        config.as_ref(),
+        "run the test suite",
+        None,
+        &mut transcript,
+        hooks.as_ref(),
+        &permissions,
+        None,
+        &mut scratchpad,
+        &mut |event| match event {
+            AgentEvent::TextDelta { text } => streamed.push_str(&text),
+            AgentEvent::TurnComplete {
+                text: Some(text), ..
+            } if !text.is_empty() => answer = text,
+            _ => {}
+        },
+        None,
+        None,
+    )
+    .await
+    .expect("turn");
+
+    assert_eq!(
+        answer, "HONEST: I did not run anything.",
+        "the gate must reject the unsupported claim and force a second pass"
+    );
+    assert!(
+        history.iter().all(|m| m.content.as_deref()
+            != Some(prism_agent::execution_contract::UNSUPPORTED_CLAIM_REMINDER)),
+        "the reminder is per-finalization scaffolding and must be stripped from \
+         history before the turn ends — `history` outlives the turn on the TUI path"
+    );
+
+    // What the user actually saw. The rejected text streams before the gate can
+    // run, so the marker between the two answers is the only thing preventing
+    // one glued, self-contradicting message.
+    let fabrication = streamed
+        .find("I ran the test suite")
+        .expect("the rejected answer did stream to the user");
+    let marker = streamed
+        .find("unverified claim")
+        .expect("the retraction marker must separate the rejected answer from the retry");
+    let retry = streamed
+        .find("HONEST:")
+        .expect("the corrected answer must stream too");
+    assert!(
+        fabrication < marker && marker < retry,
+        "streamed order must be: rejected answer, retraction marker, corrected answer — got {streamed:?}"
+    );
+
+    // End-to-end injection proof: the contract is in the system message the
+    // model was actually sent, not merely in a constant or a re-derived string.
+    let systems = system_messages.lock().expect("system log");
+    assert!(
+        systems.iter().any(|s| {
+            s.contains("execution agent, not an advice-only assistant")
+                && s.contains("unless a tool result for it exists in THIS run")
+        }),
+        "the Execution Contract must be in a system message the model received"
+    );
 }

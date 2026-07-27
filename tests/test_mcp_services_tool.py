@@ -7,12 +7,13 @@ approval gate.
 `project_id` is required for all four actions and is auto-resolved from
 explicit-arg → MARC27_PROJECT_ID env var → ~/.prism/credentials.json.
 
-Network-dependent behavior is mocked at the `requests` level; the
-underlying platform routes are tested in marc27-core's own suite.
+Network-dependent behavior is stubbed at the socket under
+`PlatformClient` (the shared `platform_http` fixture); the underlying
+platform routes are tested in marc27-core's own suite.
 """
-from unittest.mock import patch
-
 import pytest
+
+from tests.conftest import assert_not_connected
 
 from app.tools.base import ToolRegistry
 from app.tools.mcp_services import (
@@ -30,6 +31,13 @@ def _no_credentials_env(monkeypatch, tmp_path):
     monkeypatch.delenv("MARC27_API_URL", raising=False)
     monkeypatch.delenv("MARC27_PROJECT_ID", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+
+
+def _creds(monkeypatch, project_id="proj-1"):
+    """Credentials + project id present, so the tools reach the HTTP layer."""
+    monkeypatch.setenv("MARC27_API_KEY", "fake-token")
+    monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
+    monkeypatch.setenv("MARC27_PROJECT_ID", project_id)
 
 
 class TestRegistration:
@@ -87,77 +95,35 @@ class TestMcpServicesDispatcher:
         # project_id resolves but token doesn't.
         monkeypatch.setenv("MARC27_PROJECT_ID", "00000000-0000-4000-8000-000000000001")
         result = _mcp_services(action="list")
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
-        assert "prism login" in result.get("hint", "")
+        assert_not_connected(result)
 
-    def test_list_action_hits_correct_url(self, monkeypatch):
-        called = []
-
-        class _StubResp:
-            status_code = 200
-
-            def json(self):
-                return [{"id": "i-1"}]
-
-        def _stub_get(url, **_kwargs):
-            called.append(url)
-            return _StubResp()
-
-        monkeypatch.setenv("MARC27_API_KEY", "fake-token")
-        monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
-        monkeypatch.setenv("MARC27_PROJECT_ID", "proj-1")
-        monkeypatch.setattr("app.tools.mcp_services.requests.get", _stub_get)
+    def test_list_action_hits_correct_url(self, monkeypatch, platform_http):
+        _creds(monkeypatch)
+        platform_http.payload = [{"id": "i-1"}]
 
         result = _mcp_services(action="list")
         assert result == [{"id": "i-1"}]
-        assert called == ["https://example.invalid/api/v1/projects/proj-1/mcp-services"]
+        assert platform_http.urls_for("GET") == [
+            "https://example.invalid/api/v1/projects/proj-1/mcp-services"
+        ]
 
-    def test_get_action_hits_correct_url(self, monkeypatch):
-        called = []
-
-        class _StubResp:
-            status_code = 200
-
-            def json(self):
-                return {"id": "inst-1"}
-
-        def _stub_get(url, **_kwargs):
-            called.append(url)
-            return _StubResp()
-
-        monkeypatch.setenv("MARC27_API_KEY", "fake-token")
-        monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
-        monkeypatch.setenv("MARC27_PROJECT_ID", "proj-1")
-        monkeypatch.setattr("app.tools.mcp_services.requests.get", _stub_get)
+    def test_get_action_hits_correct_url(self, monkeypatch, platform_http):
+        _creds(monkeypatch)
+        platform_http.payload = {"id": "inst-1"}
 
         result = _mcp_services(action="get", instance_id="inst-1")
         assert result == {"id": "inst-1"}
-        assert called == [
+        assert platform_http.urls_for("GET") == [
             "https://example.invalid/api/v1/projects/proj-1/mcp-services/inst-1"
         ]
 
-    def test_explicit_project_id_overrides_env(self, monkeypatch):
-        called = []
-
-        class _StubResp:
-            status_code = 200
-
-            def json(self):
-                return []
-
-        def _stub_get(url, **_kwargs):
-            called.append(url)
-            return _StubResp()
-
-        monkeypatch.setenv("MARC27_API_KEY", "fake-token")
-        monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
-        monkeypatch.setenv("MARC27_PROJECT_ID", "env-proj")
-        monkeypatch.setattr("app.tools.mcp_services.requests.get", _stub_get)
+    def test_explicit_project_id_overrides_env(self, monkeypatch, platform_http):
+        _creds(monkeypatch, project_id="env-proj")
+        platform_http.payload = []
 
         _mcp_services(action="list", project_id="explicit-proj")
         # Explicit beats env
-        assert called == [
+        assert platform_http.urls_for("GET") == [
             "https://example.invalid/api/v1/projects/explicit-proj/mcp-services"
         ]
 
@@ -204,25 +170,9 @@ class TestMcpServicesInvoke:
         assert "error" in result
         assert "0 or 1" in result["error"]
 
-    def test_proxy_action_hits_correct_url(self, monkeypatch):
-        called = []
-        sent_bodies = []
-
-        class _StubResp:
-            status_code = 200
-
-            def json(self):
-                return {"status_code": 200, "body": {"ok": True}, "headers": {}}
-
-        def _stub_post(url, **kwargs):
-            called.append(url)
-            sent_bodies.append(kwargs.get("json"))
-            return _StubResp()
-
-        monkeypatch.setenv("MARC27_API_KEY", "fake-token")
-        monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
-        monkeypatch.setenv("MARC27_PROJECT_ID", "proj-1")
-        monkeypatch.setattr("app.tools.mcp_services.requests.post", _stub_post)
+    def test_proxy_action_hits_correct_url(self, monkeypatch, platform_http):
+        _creds(monkeypatch)
+        platform_http.payload = {"status_code": 200, "body": {"ok": True}, "headers": {}}
 
         result = _mcp_services_invoke(
             action="proxy",
@@ -231,31 +181,15 @@ class TestMcpServicesInvoke:
             method="GET",
         )
         assert result["status_code"] == 200
-        assert called == [
+        assert platform_http.urls_for("POST") == [
             "https://example.invalid/api/v1/projects/proj-1/mcp-services/inst-1/proxy"
         ]
-        assert sent_bodies[0]["path"] == "/tools/list"
-        assert sent_bodies[0]["method"] == "GET"
+        assert platform_http.bodies[0]["path"] == "/tools/list"
+        assert platform_http.bodies[0]["method"] == "GET"
 
-    def test_scale_action_hits_correct_url(self, monkeypatch):
-        called = []
-        sent_bodies = []
-
-        class _StubResp:
-            status_code = 200
-
-            def json(self):
-                return {"instance_id": "inst-1", "replicas": 0}
-
-        def _stub_post(url, **kwargs):
-            called.append(url)
-            sent_bodies.append(kwargs.get("json"))
-            return _StubResp()
-
-        monkeypatch.setenv("MARC27_API_KEY", "fake-token")
-        monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
-        monkeypatch.setenv("MARC27_PROJECT_ID", "proj-1")
-        monkeypatch.setattr("app.tools.mcp_services.requests.post", _stub_post)
+    def test_scale_action_hits_correct_url(self, monkeypatch, platform_http):
+        _creds(monkeypatch)
+        platform_http.payload = {"instance_id": "inst-1", "replicas": 0}
 
         result = _mcp_services_invoke(
             action="scale",
@@ -263,7 +197,7 @@ class TestMcpServicesInvoke:
             replicas=0,
         )
         assert result == {"instance_id": "inst-1", "replicas": 0}
-        assert called == [
+        assert platform_http.urls_for("POST") == [
             "https://example.invalid/api/v1/projects/proj-1/mcp-services/inst-1/scale"
         ]
-        assert sent_bodies[0] == {"replicas": 0}
+        assert platform_http.bodies[0] == {"replicas": 0}

@@ -2,8 +2,11 @@
 //! Shared runtime primitives for PRISM Rust binaries.
 //!
 //! Provides [`PrismPaths`] (XDG-based directory discovery), [`PrismCliState`]
-//! (credential persistence), and [`PlatformEndpoints`] (URL derivation for
-//! the MARC27 platform API, WebSocket, and dashboard).
+//! (credential persistence), [`PlatformEndpoints`] (URL derivation for the
+//! MARC27 platform API, WebSocket, and dashboard), and [`retry`] — the shared
+//! "is this failure worth another attempt?" policy every network path uses.
+
+pub mod retry;
 
 use std::env;
 use std::fs;

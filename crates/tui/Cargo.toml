@@ -21,6 +21,8 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 arboard = "3"
 prism-client = { path = "../client" }
+# Shared retry policy — see `prism_runtime::retry`.
+prism-runtime = { path = "../runtime" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

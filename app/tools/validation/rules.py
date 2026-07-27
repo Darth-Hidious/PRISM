@@ -49,12 +49,23 @@ _CONSTRAINTS: list[dict] = [
 
 
 def check_physical_constraints(df: pd.DataFrame) -> list[dict]:
-    """Check materials science constraints on known columns."""
+    """Check materials science constraints on known columns.
+
+    Each rule is applied to the measured column AND to any
+    ``predicted_<column>`` written by the predict_properties skill — physics
+    does not stop applying because a number came from a model, and a model
+    predicting a negative band gap is exactly the case worth catching.
+    """
     findings: list[dict] = []
     for rule in _CONSTRAINTS:
-        col = rule["column"]
-        if col not in df.columns:
-            continue
+        for col in (rule["column"], f"predicted_{rule['column']}"):
+            findings.extend(_check_one(df, col, rule))
+    return findings
+
+
+def _check_one(df: pd.DataFrame, col: str, rule: dict) -> list[dict]:
+    findings: list[dict] = []
+    if col in df.columns:
         series = df[col].dropna()
         for idx in series.index:
             val = series[idx]

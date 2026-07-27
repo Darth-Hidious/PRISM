@@ -259,7 +259,12 @@ _CALPHAD_COMPUTE_DESCRIPTION = (
     "`temperature`. Optional: `pressure`.\n"
     "Use `calphad(action='list_databases')` first to discover what's "
     "available, then `calphad(action='list_phases')` to see what phases "
-    "the database covers."
+    "the database covers.\n"
+    "Every successful result carries a `provenance` block: pycalphad "
+    "version, the SHA-256 of the TDB file used, the exact conditions, the "
+    "units (Gibbs energy J/mol-atom, T in K, P in Pa) and a `reproduce` "
+    "string. Quote it when reporting a number — it is what makes the "
+    "number checkable."
 )
 
 

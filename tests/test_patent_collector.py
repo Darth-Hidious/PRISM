@@ -1,6 +1,7 @@
 """Tests for PatentCollector."""
 import pytest
 from unittest.mock import patch, MagicMock
+from app.tools.data_collectors.base_collector import CollectorConfigError
 from app.tools.data_collectors.patent_collector import PatentCollector
 
 
@@ -56,9 +57,14 @@ class TestPatentCollector:
         assert c.collect(query="") == []
 
     @patch.dict("os.environ", {}, clear=True)
-    def test_collect_no_token(self):
+    def test_collect_no_token_raises(self):
+        """A missing LENS_API_TOKEN is a misconfiguration, not "no patents
+        found". Returning [] made a skipped source indistinguishable from a
+        genuinely empty search; raising lets `prior_art_search` report
+        `patents_error` so the agent knows the source never ran."""
         c = PatentCollector()
-        assert c.collect(query="alloy") == []
+        with pytest.raises(CollectorConfigError, match="LENS_API_TOKEN"):
+            c.collect(query="alloy")
 
     @patch("app.tools.data_collectors.patent_collector.requests")
     @patch.dict("os.environ", {"LENS_API_TOKEN": "test-token"})

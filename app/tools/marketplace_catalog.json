@@ -1,0 +1,395 @@
+{
+  "schema": 1,
+  "surface": "app.plugins.bootstrap.build_full_registry(enable_mcp=False, enable_plugins=False)",
+  "surface_note": "Catalogued from the Python agent tool registry, not from `prism tools`. `prism tools` merges this registry with the Rust command-tools (crates/agent/src/command_tools.rs) and any MCP servers found at runtime; those Rust tools are thin wrappers over `prism <subcommand>` and cannot exist without the PRISM binary, so they are not separately installable and have nothing to publish. Only the Python registry holds tools with their own pip dependencies. The registry is 54 tools by default and 51 with PRISM_DISABLE_MEMORY=1 (the three artifact-store tools register only when the memory subsystem is on); every one of the 54 is judged here.",
+  "verified_on": "2026-07-27",
+  "entries": [
+    {
+      "slug": "prism",
+      "name": "PRISM",
+      "resource_type": "cli_tool",
+      "description": "PRISM itself — the agentic materials-discovery workspace: a terminal UI and CLI that plans and runs materials campaigns, calls the tools listed elsewhere in this catalog, records every call in a local provenance ledger, and connects to a MARC27 node for compute, knowledge and billing. Installs as a single self-contained binary (macOS arm64, Linux x86_64/aarch64, Windows x86_64) plus a Python tool layer. Read `known_issues` before downloading: the currently published release is v1.0.0 from 2026-07-03 and has real platform limits.",
+      "tags": ["prism", "cli", "tui", "agent", "materials", "workspace"],
+      "license": "LicenseRef-MARC27-Dual",
+      "author": "MARC27",
+      "version": "1.0.0",
+      "requires_extras": [],
+      "tools": [],
+      "modules": [],
+      "metadata": {
+        "provider": "prism",
+        "kind": "product",
+        "tools": [],
+        "requires_extras": [],
+        "repository": "https://github.com/Darth-Hidious/PRISM",
+        "install": {
+          "method": "installer",
+          "package": "prism",
+          "command": "curl -fsSL https://prism.marc27.com/install.sh | bash",
+          "note": "install.sh resolves the latest GitHub release for your uname -s/-m and unpacks the matching archive. Check `platforms` and `known_issues` first — on an unsupported platform the installer will fetch an archive that does not run.",
+          "alternatives": [
+            {"method": "python_wheel", "command": "pip install https://github.com/Darth-Hidious/PRISM/releases/download/v1.0.0/prism_platform-1.0.0-py3-none-any.whl", "note": "Python tool layer only — no TUI binary."},
+            {"method": "source", "command": "git clone https://github.com/Darth-Hidious/PRISM && cargo build --release", "note": "The only path that gets you current code; the published release is stale (see known_issues)."}
+          ]
+        },
+        "platforms": {
+          "verified_from": "GitHub release v1.0.0 asset list, read 2026-07-27",
+          "available": ["prism-macos-aarch64.tar.gz", "prism-linux-x86_64.tar.gz", "prism-linux-aarch64.tar.gz", "prism-windows-x86_64.zip", "prism_platform-1.0.0-py3-none-any.whl"],
+          "missing": ["prism-macos-x86_64.tar.gz — the release workflow declares a macos-15-intel matrix leg but no such asset exists in v1.0.0, so Intel Macs have no binary and install.sh will 404 for them"]
+        },
+        "known_issues": [
+          "STALE RELEASE: the only published release is v1.0.0 (2026-07-03). Development has continued well past it; anything installed from that tag is months behind.",
+          "RETIRED BACKEND: v1.0.0's `prism query` still defaults --neo4j-url to http://localhost:7474 and --qdrant-url to http://localhost:6333. Neo4j and Qdrant were dropped in favour of Turso, so that path in the shipped binary points at services PRISM no longer runs.",
+          "LINUX GLIBC FLOOR: the Linux archives are built on GitHub's ubuntu-latest / ubuntu-24.04-arm runners (glibc 2.39), so they do not run on Ubuntu 22.04 LTS (glibc 2.35) or older. Build from source on those systems."
+        ],
+        "release_status": "stale",
+        "dependency_licenses": {
+          "prism (app/tools/**, app/mcp_*.py, app/plugins/**, app/workflows/**, tests/**)": "MIT",
+          "prism (crates/**, install.sh, docs/**)": "MARC27 Source-Available License v1.0",
+          "vendored ForgeCode (crates/forge_*)": "Apache-2.0"
+        },
+        "verification": {
+          "level": "gate_only",
+          "date": "2026-07-27",
+          "note": "The published artifacts were NOT downloaded or executed for this entry. What was verified: the v1.0.0 release exists with the five assets listed under `platforms.available` (GitHub API); the release build matrix in .github/workflows/native-release.yml at tag v1.0.0 uses ubuntu-latest and ubuntu-24.04-arm for the Linux legs, which is the basis for the glibc claim; and `git show v1.0.0:crates/cli/src/main.rs` still carries the Neo4j/Qdrant defaults. This entry is published with those constraints stated rather than gated, so the hub is not empty — but it must be replaced by a fresh release entry once one is cut."
+        }
+      }
+    },
+    {
+      "slug": "prism-mcp-server",
+      "name": "PRISM MCP Server",
+      "resource_type": "mcp_server",
+      "description": "PRISM's whole materials tool layer exposed over the Model Context Protocol on stdio, so any MCP client (Claude Desktop, Claude Code, an SDK agent) can call the same search, prediction, CALPHAD, simulation and dataset tools the PRISM TUI calls. Each tool keeps its own dependency gate: a tool whose extra is absent returns an install hint rather than failing the session.",
+      "tags": ["prism", "mcp", "model-context-protocol", "materials", "tools", "stdio"],
+      "license": "MIT",
+      "author": "MARC27 (PRISM)",
+      "version": "1.0.0",
+      "requires_extras": [],
+      "optional_extras": ["ml", "calphad", "simulation", "mace", "data", "reports"],
+      "tools": [],
+      "modules": ["app.mcp_server"],
+      "metadata": {
+        "provider": "prism",
+        "kind": "mcp_server",
+        "tools": [],
+        "requires_extras": [],
+        "optional_extras": ["ml", "calphad", "simulation", "mace", "data", "reports"],
+        "transport": "stdio",
+        "command": ["python3", "-m", "app.mcp_server"],
+        "install": {
+          "method": "bundled",
+          "package": "prism-platform",
+          "command": "pip install prism-platform",
+          "note": "Ships inside PRISM; run `python3 -m app.mcp_server` from a PRISM checkout or venv and point your MCP client's stdio transport at it. prism-platform is NOT on PyPI as of 2026-07-27 — use the wheel from the GitHub release or a source checkout."
+        },
+        "dependency_licenses": {
+          "fastmcp": "Apache-2.0"
+        },
+        "verification": {
+          "level": "end_to_end",
+          "date": "2026-07-27",
+          "note": "scripts/smoke-mcp-direct.py --server python --filter materials_search drove `python3 -m app.mcp_server` over JSON-RPC stdio: the server advertised 51 tools and materials_search returned a 383 KB real payload in 9.52 s (PASS 1 / FAIL 0 / SKIP 0)."
+        }
+      }
+    },
+    {
+      "slug": "prism-materials-search",
+      "name": "PRISM Materials Search",
+      "resource_type": "cli_tool",
+      "description": "Federated structure and property search across public materials databases. `materials_search` fans out over the keyless OPTIMADE federation (COD, Alexandria, OQMD, ...) and normalises hits to one schema with per-source attribution; `query_materials_project` queries Materials Project directly via MP_API_KEY or, when logged in, the MARC27 platform proxy. No extra required — both dependencies ship in a default PRISM install.",
+      "tags": ["materials", "optimade", "materials-project", "search", "structures", "prism-tool"],
+      "license": "MIT",
+      "author": "MARC27 (PRISM)",
+      "version": "1.0.0",
+      "requires_extras": [],
+      "tools": [
+        {"name": "materials_search", "requires_extras": []},
+        {"name": "query_materials_project", "requires_extras": []}
+      ],
+      "modules": ["app.tools.search_engine.tools", "app.tools.data"],
+      "metadata": {
+        "provider": "prism",
+        "kind": "agent_tools",
+        "tools": ["materials_search", "query_materials_project"],
+        "requires_extras": [],
+        "install": {
+          "method": "bundled",
+          "package": "prism-platform",
+          "command": "pip install prism-platform",
+          "note": "Ships with every PRISM install; no additional extra needed."
+        },
+        "dependency_licenses": {
+          "optimade": "MIT",
+          "mp-api": "BSD-3-Clause-LBNL"
+        },
+        "verification": {
+          "level": "end_to_end",
+          "date": "2026-07-27",
+          "note": "materials_search(query='TiO2', limit=2) returned a real COD structure (id 1000000, C5H17AlN2O8P2) with lattice vectors and source attribution; two OPTIMADE providers (alexandria pbe/pbesol) returned HTTP 500 and were reported per-source rather than hidden. query_materials_project(formula='TiO2') returned MP entries with band_gap/formation_energy via the MARC27 platform proxy after the local MP_API_KEY path reported it was unset."
+        }
+      }
+    },
+    {
+      "slug": "prism-property-prediction",
+      "name": "PRISM Property Prediction",
+      "resource_type": "cli_tool",
+      "description": "Composition-to-property machine learning for materials. `model_train` pulls training rows from Materials Project (or a local dataset), featurises formulas with matminer Magpie descriptors and fits a scikit-learn / XGBoost / LightGBM regressor; `predict` applies a trained model to a new formula, or runs a pre-trained matgl GNN on a crystal structure. Every prediction carries a provenance block naming the feature backend and model. Requires the `[ml]` extra.",
+      "tags": ["machine-learning", "property-prediction", "matminer", "scikit-learn", "materials", "prism-tool"],
+      "license": "MIT",
+      "author": "MARC27 (PRISM)",
+      "version": "1.0.0",
+      "requires_extras": ["ml"],
+      "tools": [
+        {"name": "predict", "requires_extras": ["ml"]},
+        {"name": "model_train", "requires_extras": ["ml"]},
+        {"name": "predict_properties", "requires_extras": ["ml"]},
+        {"name": "list_models", "requires_extras": []},
+        {"name": "list_predictable_properties", "requires_extras": []}
+      ],
+      "modules": ["app.tools.prediction", "app.tools.property_selection", "app.tools.skills.prediction"],
+      "metadata": {
+        "provider": "prism",
+        "kind": "agent_tools",
+        "tools": ["predict", "model_train", "predict_properties", "list_models", "list_predictable_properties"],
+        "requires_extras": ["ml"],
+        "install": {
+          "method": "python_extra",
+          "package": "prism-platform",
+          "extra": "ml",
+          "command": "pip install scikit-learn xgboost lightgbm optuna pymatgen matminer matgl matplotlib pyarrow joblib",
+          "extra_command": "pip install 'prism-platform[ml]'",
+          "note": "prism-platform is NOT on PyPI (verified 2026-07-27, HTTP 404), so `command` names the distributions directly — that always works inside an existing PRISM venv. `extra_command` resolves only from a source checkout or the wheel attached to the GitHub release. Without these, `predict` and `model_train` return {\"error\", \"install_hint\", \"requires_extra\"} instead of an ImportError; `list_models` and `list_predictable_properties` work on a default install."
+        },
+        "dependency_licenses": {
+          "scikit-learn": "BSD-3-Clause",
+          "xgboost": "Apache-2.0",
+          "lightgbm": "MIT",
+          "pymatgen": "MIT",
+          "matminer": "BSD-3-Clause (LBNL modified BSD, from the LICENSE shipped in matminer 0.10.1)",
+          "matgl": "BSD-3-Clause",
+          "optuna": "MIT",
+          "pyarrow": "Apache-2.0"
+        },
+        "verification": {
+          "level": "end_to_end",
+          "date": "2026-07-27",
+          "note": "model_train(property_name='band_gap', algorithm='random_forest', max_samples=200) trained on 200 real Materials Project rows with 134 matminer/0.10.1 Magpie features (MAE 0.709 eV, R2 -0.036 at that sample size — the tool reports the metrics, it does not claim they are good) and wrote ~/.prism/ml_models/band_gap_random_forest.joblib. predict(target='formula', formula='LiCoO2') then returned 1.635 eV with a full provenance block. predict(target='structure', ...) reported the honest matgl install hint because matgl is absent here. predict_properties was exercised only on a 3-row dataset and correctly refused with 'insufficient data or features'."
+        }
+      }
+    },
+    {
+      "slug": "prism-calphad",
+      "name": "PRISM CALPHAD Thermodynamics",
+      "resource_type": "cli_tool",
+      "description": "CALPHAD phase equilibria on TDB thermodynamic databases. `calphad` manages the TDB store in ~/.prism/databases and lists phases; `calphad_compute` runs equilibrium, phase-diagram and Gibbs-energy calculations through pycalphad; `analyze_phases` chains load-phases-equilibrium into one phase-stability summary. Every number comes out of pycalphad — PRISM parses no thermodynamics of its own and converts no units. Requires the `[calphad]` extra.",
+      "tags": ["calphad", "thermodynamics", "phase-diagram", "equilibrium", "pycalphad", "materials", "prism-tool"],
+      "license": "MIT",
+      "author": "MARC27 (PRISM)",
+      "version": "1.0.0",
+      "requires_extras": ["calphad"],
+      "tools": [
+        {"name": "calphad", "requires_extras": ["calphad"]},
+        {"name": "calphad_compute", "requires_extras": ["calphad"]},
+        {"name": "analyze_phases", "requires_extras": ["calphad"]}
+      ],
+      "modules": ["app.tools.calphad", "app.tools.skills.phase_analysis"],
+      "metadata": {
+        "provider": "prism",
+        "kind": "agent_tools",
+        "tools": ["calphad", "calphad_compute", "analyze_phases"],
+        "requires_extras": ["calphad"],
+        "install": {
+          "method": "python_extra",
+          "package": "prism-platform",
+          "extra": "calphad",
+          "command": "pip install pycalphad",
+          "extra_command": "pip install 'prism-platform[calphad]'",
+          "note": "prism-platform is NOT on PyPI (verified 2026-07-27, HTTP 404) — `command` is the form that works inside an existing PRISM venv. pycalphad caps at Python 3.14; on a newer interpreter PRISM proxies these tools into an auto-provisioned Python 3.12 science sidecar (~/.prism/venv-sci). User data (TDB files) lives in ~/.prism/databases and is not supplied by this entry."
+        },
+        "dependency_licenses": {
+          "pycalphad": "MIT"
+        },
+        "verification": {
+          "level": "gate_only",
+          "date": "2026-07-27",
+          "note": "pycalphad is NOT installed on the verification host, so the equilibrium path was not executed. What was verified: calphad(action='list_databases') returns {'databases': [], 'count': 0} without pycalphad; calphad(action='list_phases', ...), calphad_compute(action='equilibrium', ...) and analyze_phases all return the honest {error, install_hint: \"pip install 'prism-platform[calphad]'\", requires_extra: 'calphad'} dict rather than raising ImportError. Numerical correctness of the calculations is asserted by the pycalphad-verified constants documented in app/tools/simulation/calphad_bridge.py, not by this catalogue."
+        }
+      }
+    },
+    {
+      "slug": "prism-atomistic-simulation",
+      "name": "PRISM Atomistic Simulation",
+      "resource_type": "cli_tool",
+      "description": "pyiron-backed atomistic simulation control plane: build and inspect structures (`structure`), submit and poll relaxation / MD jobs (`sim_run`, `sim_job`), enumerate available interatomic potentials (`list_potentials`), run k-point and cutoff convergence sweeps (`run_convergence_test`), read the HPC queue (`check_hpc_queue`) and execute multi-step pyiron workflows (`run_workflow`). Requires the `[simulation]` extra.",
+      "tags": ["simulation", "pyiron", "molecular-dynamics", "relaxation", "convergence", "hpc", "prism-tool"],
+      "license": "MIT",
+      "author": "MARC27 (PRISM)",
+      "version": "1.0.0",
+      "requires_extras": ["simulation"],
+      "tools": [
+        {"name": "structure", "requires_extras": ["simulation"]},
+        {"name": "sim_run", "requires_extras": ["simulation"]},
+        {"name": "sim_job", "requires_extras": ["simulation"]},
+        {"name": "list_potentials", "requires_extras": ["simulation"]},
+        {"name": "run_convergence_test", "requires_extras": ["simulation"]},
+        {"name": "check_hpc_queue", "requires_extras": ["simulation"]},
+        {"name": "run_workflow", "requires_extras": ["simulation"]}
+      ],
+      "modules": ["app.tools.sim_tools"],
+      "metadata": {
+        "provider": "prism",
+        "kind": "agent_tools",
+        "tools": ["structure", "sim_run", "sim_job", "list_potentials", "run_convergence_test", "check_hpc_queue", "run_workflow"],
+        "requires_extras": ["simulation"],
+        "install": {
+          "method": "python_extra",
+          "package": "prism-platform",
+          "extra": "simulation",
+          "command": "pip install pyiron-base pyiron-atomistics",
+          "extra_command": "pip install 'prism-platform[simulation]'",
+          "note": "prism-platform is NOT on PyPI (verified 2026-07-27, HTTP 404) — `command` is the form that works inside an existing PRISM venv. pyiron caps at Python 3.14; on a newer interpreter PRISM proxies these tools into an auto-provisioned Python 3.12 science sidecar (~/.prism/venv-sci), which pins pyiron_atomistics>=0.5,<0.6 rather than the >=0.6 the extra declares."
+        },
+        "dependency_licenses": {
+          "pyiron-atomistics": "BSD-3-Clause",
+          "pyiron-base": "BSD-3-Clause"
+        },
+        "verification": {
+          "level": "gate_only",
+          "date": "2026-07-27",
+          "note": "pyiron_atomistics is NOT installed on the verification host and the science sidecar was NOT provisioned, so no simulation was executed end-to-end. What was verified: sim_run and list_potentials return the honest {error, install_hint: \"pip install 'prism-platform[simulation]'\", requires_extra: 'simulation'} dict rather than raising. Do not read this entry as a claim that pyiron runs on this build — PRISM's own tool catalogue records the pyiron install as blocked on an HDF5 build failure."
+        }
+      }
+    },
+    {
+      "slug": "prism-dataset-workbench",
+      "name": "PRISM Dataset Workbench",
+      "resource_type": "cli_tool",
+      "description": "The tabular half of a materials campaign: import/export and validate datasets (`dataset`), filter and rank candidates against numeric criteria (`select_materials`), plot property distributions and correlation matrices (`plot`), write a markdown campaign report (`generate_report`) and turn a candidate table into a per-material simulation job plan (`plan_simulations`). Refuses silently-wrong answers — an unmatched filter column or an unsortable rank key is an error, not a quietly unranked list. No extra required.",
+      "tags": ["datasets", "screening", "visualization", "reporting", "materials", "prism-tool"],
+      "license": "MIT",
+      "author": "MARC27 (PRISM)",
+      "version": "1.0.0",
+      "requires_extras": [],
+      "optional_extras": ["reports"],
+      "tools": [
+        {"name": "dataset", "requires_extras": []},
+        {"name": "select_materials", "requires_extras": []},
+        {"name": "plot", "requires_extras": []},
+        {"name": "generate_report", "requires_extras": []},
+        {"name": "plan_simulations", "requires_extras": []}
+      ],
+      "modules": ["app.tools.dataset", "app.tools.visualization", "app.tools.skills.selection", "app.tools.skills.reporting", "app.tools.skills.simulation_plan"],
+      "metadata": {
+        "provider": "prism",
+        "kind": "agent_tools",
+        "tools": ["dataset", "select_materials", "plot", "generate_report", "plan_simulations"],
+        "requires_extras": [],
+        "optional_extras": ["reports"],
+        "install": {
+          "method": "bundled",
+          "package": "prism-platform",
+          "command": "pip install prism-platform",
+          "note": "pandas and matplotlib are default dependencies. PDF report output additionally needs the `[reports]` extra (markdown, weasyprint); without it generate_report writes Markdown and says so in `pdf_skipped` + `install_hint`.",
+          "optional": [
+            {"extra": "reports", "command": "pip install markdown weasyprint", "unlocks": "generate_report(format='pdf')"}
+          ]
+        },
+        "dependency_licenses": {
+          "pandas": "BSD-3-Clause",
+          "matplotlib": "matplotlib license (PSF-based, BSD-compatible)",
+          "numpy": "BSD-3-Clause",
+          "markdown": "BSD-3-Clause",
+          "weasyprint": "BSD-3-Clause"
+        },
+        "verification": {
+          "level": "end_to_end",
+          "date": "2026-07-27",
+          "note": "Ran as a chain on a 3-row CSV: dataset(action='import') -> 3 rows/3 columns; dataset(action='validate') -> completeness 1.0, no findings; select_materials(criteria={'band_gap_min': 2.5}, sort_by='band_gap', top_n=2) -> 2 of 3 selected, ranked=true; plot(kind='correlation_matrix') -> wrote catdemo_correlation.png with a real -0.9589 band_gap/density correlation; generate_report -> wrote output/catdemo_report.md; plan_simulations -> 3 planned jobs. plot() called without `kind` returns the valid-kind list rather than raising."
+        }
+      }
+    },
+    {
+      "slug": "prism-structure-io",
+      "name": "PRISM Structure Import",
+      "resource_type": "cli_tool",
+      "description": "Bridges 'found a structure in Materials Project or a paper' to 'run a simulation on it': parses CIF text or a lattice/species/coords dict via ASE and lands it in both the MACE structure cache (returning a cache_ref) and, when pyiron is present, the pyiron StructureStore (returning a structure_id). Requires ASE, which PRISM ships in the `[mace]` extra.",
+      "tags": ["structures", "cif", "ase", "interoperability", "materials", "prism-tool"],
+      "license": "MIT",
+      "author": "MARC27 (PRISM)",
+      "version": "1.0.0",
+      "requires_extras": ["mace"],
+      "optional_extras": ["simulation"],
+      "tools": [
+        {"name": "structure_import", "requires_extras": ["mace"]}
+      ],
+      "modules": ["app.tools.structure_io"],
+      "metadata": {
+        "provider": "prism",
+        "kind": "agent_tools",
+        "tools": ["structure_import"],
+        "requires_extras": ["mace"],
+        "optional_extras": ["simulation"],
+        "install": {
+          "method": "python_extra",
+          "package": "prism-platform",
+          "extra": "mace",
+          "command": "pip install mace-torch torch ase numpy huggingface-hub phonopy",
+          "extra_command": "pip install 'prism-platform[mace]'",
+          "note": "prism-platform is NOT on PyPI (verified 2026-07-27, HTTP 404) — `command` is the form that works inside an existing PRISM venv. structure_import itself only needs ASE (`pip install ase`); the full `[mace]` set above is what the MACE primitives need, including huggingface-hub and phonopy, which were undeclared until 2026-07-27.",
+          "optional": [
+            {"extra": "simulation", "command": "pip install pyiron-base pyiron-atomistics", "unlocks": "also lands the structure in the pyiron StructureStore and returns a structure_id; without it the result carries a pyiron_note saying so and still returns a cache_ref"}
+          ]
+        },
+        "dependency_licenses": {
+          "ase": "LGPL-2.1-or-later",
+          "mace-torch": "MIT",
+          "huggingface-hub": "Apache-2.0",
+          "phonopy": "BSD-3-Clause",
+          "pyiron-atomistics": "BSD-3-Clause"
+        },
+        "license_notes": [
+          "ASE is LGPL-2.1-or-later — weak copyleft. It is imported, not vendored, and PRISM's own tool code stays MIT; redistributors bundling ASE must honour the LGPL.",
+          "The `[mace]` extra installs mace-torch (MIT code). The MACE-MH-1 *weights* are licensed ASL and are NON-COMMERCIAL — see the separate `mace-mh-1` model entry in this marketplace. structure_import itself loads no weights."
+        ],
+        "verification": {
+          "level": "gate_only",
+          "date": "2026-07-27",
+          "note": "ASE is NOT installed on the verification host, so no CIF was parsed. What was verified: structure_import returns {error: 'structure_import needs ase (Atomic Simulation Environment)', install_hint: \"pip install 'prism-platform[mace]'\", requires_extra: 'mace'} rather than raising ImportError."
+        }
+      }
+    }
+  ],
+  "bundled": {
+    "execute_bash": "SECURITY: arbitrary shell execution. Publishing shell execution as an installable marketplace item would be a security defect.",
+    "bash_task": "SECURITY: arbitrary shell execution (background variant of execute_bash).",
+    "stop_bash_task": "SECURITY: control plane for arbitrary shell execution.",
+    "execute_python": "SECURITY: arbitrary Python execution in the agent process.",
+    "file": "SECURITY: unrestricted local filesystem read/write.",
+    "show_scratchpad": "Agent runtime internal — reads the session scratchpad; no standalone value outside a running PRISM agent.",
+    "session_context": "Agent runtime internal — the KAG session-context builder that survives compaction.",
+    "search_artifacts": "Agent runtime internal — reads the local artifact store (~/.prism). Registered only when the memory subsystem is on (PRISM_DISABLE_MEMORY unset); nothing to install.",
+    "fetch_artifact": "Agent runtime internal — reads one artifact out of the local store. Registered only when the memory subsystem is on.",
+    "list_artifacts": "Agent runtime internal — lists the local artifact store. Registered only when the memory subsystem is on.",
+    "tool_reasoning": "Agent runtime internal — plans tool sequences for the agent itself.",
+    "agent_capabilities": "Platform read wrapper (GET /agent/capabilities); meaningless without a MARC27 login and a running PRISM.",
+    "policy_evaluate": "Platform read wrapper (policy engine); meaningless without a MARC27 login.",
+    "usage_status": "Platform/billing read wrapper; meaningless without a MARC27 login.",
+    "billing_balance": "Platform/billing read wrapper; meaningless without a MARC27 login.",
+    "platform_jobs": "Platform job control plane; meaningless without a MARC27 login.",
+    "platform_jobs_submit": "Platform job submission — money-spending; belongs behind the platform's own auth and approval gate, not an installable item.",
+    "platform_workflows": "Platform workflow control plane; meaningless without a MARC27 login.",
+    "platform_workflows_run": "Platform workflow execution — money-spending; belongs behind the platform's own auth and approval gate.",
+    "mcp_services": "Platform-hosted MCP service discovery; meaningless without a MARC27 login.",
+    "mcp_services_invoke": "Platform-hosted MCP proxy/scale control; belongs behind the platform's own auth.",
+    "knowledge_write": "Knowledge-graph write path into the MARC27 platform; meaningless without a MARC27 login and tenant.",
+    "start_background_research": "Platform agent-run submission — money-spending; belongs behind the platform's own auth and approval gate.",
+    "check_background_research": "Platform agent-run read wrapper; meaningless without a MARC27 login.",
+    "list_background_research": "Platform agent-run read wrapper; meaningless without a MARC27 login.",
+    "cancel_background_research": "Platform agent-run control wrapper; meaningless without a MARC27 login.",
+    "labs": "Browses THIS marketplace's premium lab services; publishing the browser as a marketplace item is circular. Job submission is additionally not live for any service.",
+    "web": "Generic web search/fetch (Firecrawl + DuckDuckGo fallback) — not a materials-informatics capability, and a commodity elsewhere.",
+    "prior_art_search": "NOT BROKEN — the 2026-07-27 zero-result runs were upstream rate limiting, not a defect. Re-verified live 2026-07-27: arXiv returned real papers ('tungsten rhodium alloy' -> 3 hits), J-STAGE and Internet Archive returned real hits via source='both'. Semantic Scholar still answers HTTP 429 on the unauthenticated endpoint and Lens patents need LENS_API_TOKEN; both are reported by name in source_status rather than silently dropped. Stays bundled pending the owner's publish decision, not a fix.",
+    "acquire_materials": "FIXED, still bundled pending the owner's publish decision. The 2026-07-27 TypeError came from calls carrying neither `elements` nor `filter_string`: the optimade branch fell through to the parameterless collect() and crashed. The collector signature was right; the caller now records an actionable skip. Verified live 2026-07-27: elements=['W','Rh'] over the 51 OPTIMADE providers returned 84 real records.",
+    "materials_discovery": "Unblocked with acquire_materials (see above) — its first step now completes. Stays bundled pending the owner's publish decision; the later ML/report steps have not been verified end-to-end here."
+  }
+}

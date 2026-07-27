@@ -21,6 +21,32 @@ def mock_prefs(monkeypatch):
 
 
 @pytest.fixture
+def mock_meta(monkeypatch):
+    """Metadata for a properly-saved model.
+
+    These tests mock ``load_model`` but not ``load_meta``, so the registry
+    looked like a model with NO recorded featurizer. ``save_model`` now
+    always records ``feature_backend_id``, and the skill refuses to score
+    against an unrecorded one — a column of plausible numbers computed from
+    features that may mean something different is worse than no column. So
+    the faithful mock has to supply it.
+    """
+    from app.tools.ml.features import feature_backend_id
+    from app.tools.ml.registry import ModelRegistry
+
+    monkeypatch.setattr(
+        ModelRegistry, "load_meta",
+        lambda self, prop, algo: {
+            "property": prop,
+            "algorithm": algo,
+            "metrics": {"mae": 0.1},
+            "saved_at": "2026-07-27T00:00:00",
+            "feature_backend_id": feature_backend_id(),
+        },
+    )
+
+
+@pytest.fixture
 def sample_df():
     return pd.DataFrame(
         {
@@ -43,7 +69,8 @@ class TestPredictSkill:
     @patch("app.tools.data_collectors.store.DataStore.save")
     @patch("app.tools.data_collectors.store.DataStore.load")
     def test_predict_with_existing_model(
-        self, mock_load, mock_save, mock_load_model, mock_prefs, sample_df
+        self, mock_load, mock_save, mock_load_model, mock_prefs, mock_meta,
+        sample_df
     ):
         mock_load.return_value = sample_df
 
@@ -86,7 +113,7 @@ class TestPredictSkill:
     @patch("app.tools.data_collectors.store.DataStore.load")
     def test_train_if_missing(
         self, mock_load, mock_save, mock_load_model, mock_save_model,
-        mock_train, mock_prefs, sample_df
+        mock_train, mock_prefs, mock_meta, sample_df
     ):
         mock_load.return_value = sample_df
 
