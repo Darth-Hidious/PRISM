@@ -4,12 +4,15 @@ The submit action is broken out as a standalone tool with
 `requires_approval=True`; the read/cancel/events actions live in the
 unified `platform_jobs` tool with no approval gate.
 
-Network-dependent behavior is mocked at the `requests` level; the
-underlying platform routes are tested in marc27-core's own suite.
+Network is stubbed at the socket under `PlatformClient` (the shared
+`platform_http` fixture). The SSE `events` action is the one path that
+still calls `requests.get` directly — it needs streaming — so that test
+stubs the module-level `requests`. The underlying platform routes are
+tested in marc27-core's own suite.
 """
-from unittest.mock import patch
-
 import pytest
+
+from tests.conftest import assert_not_connected
 
 from app.tools.base import ToolRegistry
 from app.tools.platform_jobs import (
@@ -83,55 +86,29 @@ class TestPlatformJobsDispatcher:
 
     def test_no_credentials_returns_login_hint(self):
         result = _platform_jobs(action="status", job_id="11111111-1111-4111-8111-111111111111")
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
-        assert "prism login" in result.get("hint", "")
+        assert_not_connected(result)
 
-    def test_status_action_hits_correct_url(self, monkeypatch):
-        called_paths = []
-
-        class _StubResp:
-            status_code = 200
-
-            def json(self):
-                return {"id": "abc", "status": "running"}
-
-        def _stub_get(url, **_kwargs):
-            called_paths.append(url)
-            return _StubResp()
-
+    def test_status_action_hits_correct_url(self, monkeypatch, platform_http):
         monkeypatch.setenv("MARC27_API_KEY", "fake-token")
         monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
-        monkeypatch.setattr("app.tools.platform_jobs.requests.get", _stub_get)
+        platform_http.payload = {"id": "abc", "status": "running"}
 
         result = _platform_jobs(action="status", job_id="job-xyz")
         assert result == {"id": "abc", "status": "running"}
-        assert called_paths == ["https://example.invalid/api/v1/jobs/job-xyz"]
+        assert platform_http.urls_for("GET") == [
+            "https://example.invalid/api/v1/jobs/job-xyz"
+        ]
 
-    def test_cancel_action_hits_correct_url(self, monkeypatch):
-        called = []
-
-        class _StubResp:
-            status_code = 200
-
-            @property
-            def content(self):
-                return b'{"status": "cancelled"}'
-
-            def json(self):
-                return {"status": "cancelled"}
-
-        def _stub_post(url, **_kwargs):
-            called.append(url)
-            return _StubResp()
-
+    def test_cancel_action_hits_correct_url(self, monkeypatch, platform_http):
         monkeypatch.setenv("MARC27_API_KEY", "fake-token")
         monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
-        monkeypatch.setattr("app.tools.platform_jobs.requests.post", _stub_post)
+        platform_http.payload = {"status": "cancelled"}
 
         result = _platform_jobs(action="cancel", job_id="job-xyz")
         assert result == {"status": "cancelled"}
-        assert called == ["https://example.invalid/api/v1/jobs/job-xyz/cancel"]
+        assert platform_http.urls_for("POST") == [
+            "https://example.invalid/api/v1/jobs/job-xyz/cancel"
+        ]
 
     def test_events_action_reads_sse_frames(self, monkeypatch):
         called = []
@@ -193,31 +170,13 @@ class TestPlatformJobsSubmit:
             project_id="11111111-1111-4111-8111-111111111111",
             payload={},
         )
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
+        assert_not_connected(result)
 
-    def test_happy_path_hits_jobs_root(self, monkeypatch):
-        called = []
-        sent_bodies = []
-
-        class _StubResp:
-            status_code = 201
-
-            @property
-            def content(self):
-                return b'{"id": "job-1"}'
-
-            def json(self):
-                return {"id": "job-1", "status": "queued"}
-
-        def _stub_post(url, **kwargs):
-            called.append(url)
-            sent_bodies.append(kwargs.get("json"))
-            return _StubResp()
-
+    def test_happy_path_hits_jobs_root(self, monkeypatch, platform_http):
         monkeypatch.setenv("MARC27_API_KEY", "fake-token")
         monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
-        monkeypatch.setattr("app.tools.platform_jobs.requests.post", _stub_post)
+        platform_http.status_code = 201
+        platform_http.payload = {"id": "job-1", "status": "queued"}
 
         result = _platform_jobs_submit(
             job_type="compute.simulation",
@@ -226,7 +185,10 @@ class TestPlatformJobsSubmit:
             priority=5,
         )
         assert result == {"id": "job-1", "status": "queued"}
-        assert called == ["https://example.invalid/api/v1/jobs"]
-        assert sent_bodies[0]["job_type"] == "compute.simulation"
-        assert sent_bodies[0]["priority"] == 5
-        assert sent_bodies[0]["payload"] == {"input": "..."}
+        assert platform_http.urls_for("POST") == [
+            "https://example.invalid/api/v1/jobs"
+        ]
+        body = platform_http.bodies[0]
+        assert body["job_type"] == "compute.simulation"
+        assert body["priority"] == 5
+        assert body["payload"] == {"input": "..."}

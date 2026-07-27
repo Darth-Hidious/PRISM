@@ -78,7 +78,12 @@ def select_backend(
        - else                                     -> ``local`` if available,
                                                       else ``platform`` if available,
                                                       else ``hf_jobs``
-       - fallback                                 -> ``fake``
+       - nothing usable                           -> raise. ``fake`` is NEVER
+                                                      an automatic fallback;
+                                                      it is reachable only via
+                                                      the explicit
+                                                      ``MACE_MCP_BACKEND``
+                                                      override in rule 1.
 
     The ``platform`` backend is preferred over ``hf_jobs`` for GPU-bound work
     when the user has a marc27 account configured (`PRISM_PROJECT_ID` set in

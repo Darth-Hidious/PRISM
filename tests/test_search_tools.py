@@ -5,8 +5,7 @@ removed. Both functionalities live behind prior_art_search(source=…). The
 private _literature_search / _patent_search helpers are preserved for
 direct testing because prior_art_search dispatches into them.
 """
-import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from app.tools.base import ToolRegistry
 from app.tools.search import create_search_tools, _literature_search, _patent_search
 
@@ -33,20 +32,37 @@ class TestCreateSearchTools:
 
 
 class TestLiteratureSearchFunc:
-    @patch("app.tools.data_collectors.literature_collector.LiteratureCollector.collect")
+    """`_literature_search` goes through `collect_with_status`, not `collect`
+    — stubbing `collect` left these tests hitting arXiv and Semantic Scholar
+    for real, which is both slow and non-deterministic."""
+
+    @patch(
+        "app.tools.data_collectors.literature_collector"
+        ".LiteratureCollector.collect_with_status"
+    )
     def test_returns_results(self, mock_collect):
-        mock_collect.return_value = [
-            {"source": "arxiv", "title": "Paper 1"},
-            {"source": "semantic_scholar", "title": "Paper 2"},
-        ]
+        mock_collect.return_value = {
+            "results": [
+                {"source": "arxiv", "title": "Paper 1"},
+                {"source": "semantic_scholar", "title": "Paper 2"},
+            ],
+            "source_status": {"arxiv": "ok (1 results)",
+                              "semantic_scholar": "ok (1 results)"},
+        }
         result = _literature_search(query="tungsten alloy")
         assert result["count"] == 2
         assert result["source"] == "literature"
         assert len(result["results"]) == 2
+        # Per-source outcomes must reach the caller — a thin result set with
+        # a failed source is a different fact from a genuinely empty one.
+        assert result["source_status"]["arxiv"] == "ok (1 results)"
 
-    @patch("app.tools.data_collectors.literature_collector.LiteratureCollector.collect")
+    @patch(
+        "app.tools.data_collectors.literature_collector"
+        ".LiteratureCollector.collect_with_status"
+    )
     def test_empty_results(self, mock_collect):
-        mock_collect.return_value = []
+        mock_collect.return_value = {"results": [], "source_status": {}}
         result = _literature_search(query="")
         assert result["count"] == 0
         assert result["results"] == []

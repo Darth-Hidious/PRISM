@@ -3,14 +3,17 @@
 Covers the WRITE side of the MARC27 Knowledge Service. Mirrors
 `tests/test_platform_status_tools.py` — registration shape, the
 not-authenticated branch, action validation, and per-action endpoint
-URL routing (with `requests.post` stubbed).
+URL routing.
 
-Network-dependent behavior is mocked at the `requests` level; the
-underlying platform routes are tested in marc27-core's own suite.
+Network-dependent behavior is stubbed at the socket under
+`PlatformClient` (the shared `platform_http` fixture); the underlying
+platform routes are tested in marc27-core's own suite.
 """
 from unittest.mock import patch
 
 import pytest
+
+from tests.conftest import assert_not_connected
 
 from app.tools.base import ToolRegistry
 from app.tools.knowledge_write import (
@@ -97,9 +100,7 @@ class TestNoCredentials:
         result = _knowledge_write(
             action="embed", doc_id="d1", content="hello world"
         )
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
-        assert "prism login" in result.get("hint", "")
+        assert_not_connected(result)
 
     def test_embed_bulk_no_credentials(self):
         result = _knowledge_write(
@@ -107,8 +108,7 @@ class TestNoCredentials:
             corpus_id="00000000-0000-4000-8000-000000000001",
             documents=[{"doc_id": "d1", "content": "x"}],
         )
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
+        assert_not_connected(result)
 
     def test_graph_seed_no_credentials(self):
         result = _knowledge_write(
@@ -116,20 +116,17 @@ class TestNoCredentials:
             nodes_url="https://example.invalid/nodes.csv",
             edges_url="https://example.invalid/edges.csv",
         )
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
+        assert_not_connected(result)
 
     def test_graph_ingest_no_credentials(self):
         result = _knowledge_write(
             action="graph_ingest", entities=[], relationships=[]
         )
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
+        assert_not_connected(result)
 
     def test_research_web_search_no_credentials(self):
         result = _knowledge_write(action="research_web_search", query="alloy")
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
+        assert_not_connected(result)
 
 
 # ---------------------------------------------------------------------------
@@ -139,31 +136,16 @@ class TestNoCredentials:
 class TestEndpointRouting:
     """Each valid action should POST to a distinct endpoint URL."""
 
-    def _stub(self, monkeypatch):
-        """Install a fake credentials env + capture every POST call."""
-        called = []
-
-        class _StubResp:
-            status_code = 200
-
-            def json(self):
-                return {"ok": True}
-
-        def _stub_post(url, **kwargs):
-            called.append({"url": url, "json": kwargs.get("json")})
-            return _StubResp()
-
+    def _stub(self, monkeypatch, platform_http):
+        """Install a fake credentials env; return the recorded call list."""
         monkeypatch.setenv("MARC27_API_KEY", "fake-token")
         monkeypatch.setenv(
             "MARC27_API_URL", "https://example.invalid/api/v1"
         )
-        monkeypatch.setattr(
-            "app.tools.knowledge_write.requests.post", _stub_post
-        )
-        return called
+        return platform_http.calls
 
-    def test_embed_hits_knowledge_embed(self, monkeypatch):
-        called = self._stub(monkeypatch)
+    def test_embed_hits_knowledge_embed(self, monkeypatch, platform_http):
+        called = self._stub(monkeypatch, platform_http)
         result = _knowledge_write(
             action="embed", doc_id="d1", content="hello"
         )
@@ -175,8 +157,8 @@ class TestEndpointRouting:
         assert called[0]["json"]["doc_id"] == "d1"
         assert called[0]["json"]["content"] == "hello"
 
-    def test_embed_bulk_hits_knowledge_embed_bulk(self, monkeypatch):
-        called = self._stub(monkeypatch)
+    def test_embed_bulk_hits_knowledge_embed_bulk(self, monkeypatch, platform_http):
+        called = self._stub(monkeypatch, platform_http)
         result = _knowledge_write(
             action="embed_bulk",
             corpus_id="00000000-0000-4000-8000-000000000001",
@@ -193,8 +175,8 @@ class TestEndpointRouting:
             {"doc_id": "a", "content": "x"}
         ]
 
-    def test_graph_seed_hits_knowledge_graph_seed(self, monkeypatch):
-        called = self._stub(monkeypatch)
+    def test_graph_seed_hits_knowledge_graph_seed(self, monkeypatch, platform_http):
+        called = self._stub(monkeypatch, platform_http)
         result = _knowledge_write(
             action="graph_seed",
             nodes_url="https://example.invalid/nodes.csv",
@@ -209,8 +191,8 @@ class TestEndpointRouting:
             "edges_url": "https://example.invalid/edges.csv",
         }
 
-    def test_graph_ingest_hits_knowledge_graph_ingest(self, monkeypatch):
-        called = self._stub(monkeypatch)
+    def test_graph_ingest_hits_knowledge_graph_ingest(self, monkeypatch, platform_http):
+        called = self._stub(monkeypatch, platform_http)
         entities = [
             {"name": "Ti6Al4V", "entity_type": "Material", "label": "Material"}
         ]
@@ -228,9 +210,9 @@ class TestEndpointRouting:
         assert called[0]["json"]["relationships"] == relationships
 
     def test_research_web_search_hits_knowledge_research_web_search(
-        self, monkeypatch
+        self, monkeypatch, platform_http
     ):
-        called = self._stub(monkeypatch)
+        called = self._stub(monkeypatch, platform_http)
         result = _knowledge_write(
             action="research_web_search", query="titanium aluminide", limit=10
         )

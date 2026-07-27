@@ -4,12 +4,15 @@ These tools wrap MARC27 platform read endpoints. The tests verify
 registration shape + that each dispatcher fails cleanly when no
 auth is configured (the most likely runtime error in development).
 
-Network-dependent behavior is mocked at the `requests` level; the
-underlying platform routes are tested in marc27-core's own suite.
+Network-dependent behavior is stubbed at the socket under
+`PlatformClient` (the shared `platform_http` fixture); the underlying
+platform routes are tested in marc27-core's own suite.
 """
 from unittest.mock import patch
 
 import pytest
+
+from tests.conftest import assert_not_connected
 
 from app.tools.base import ToolRegistry
 from app.tools.platform_status import (
@@ -56,30 +59,25 @@ class TestPolicyEvaluate:
 
     def test_no_credentials_returns_login_hint(self):
         result = _policy_evaluate(action="compute.submit")
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
-        assert "prism login" in result.get("hint", "")
+        assert_not_connected(result)
 
 
 class TestUsageStatus:
     def test_no_credentials_returns_login_hint(self):
         result = _usage_status()
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
+        assert_not_connected(result)
 
     def test_project_id_no_credentials(self):
         # Same path; just exercises the project_id branch.
         result = _usage_status(project_id="00000000-0000-4000-8000-000000000001")
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
+        assert_not_connected(result)
 
 
 class TestBillingBalance:
     def test_default_action_balance(self):
         # No credentials → still hits the error path (auth check before HTTP).
         result = _billing_balance()
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
+        assert_not_connected(result)
 
     def test_unknown_action_clear_error(self):
         # Provide credentials so we get past the auth check, hit the
@@ -90,31 +88,16 @@ class TestBillingBalance:
             assert "Unknown action" in result["error"]
             assert "balance" in result["error"]
 
-    def test_valid_actions_call_correct_endpoint(self, monkeypatch):
-        """The three valid actions should hit distinct endpoints. Mock
-        `requests.get` so we don't depend on platform network reachability,
-        and inspect the URL each action targets."""
-        called_paths = []
-
-        class _StubResp:
-            status_code = 200
-
-            def json(self):
-                return {"ok": True}
-
-        def _stub_get(url, **_kwargs):
-            called_paths.append(url)
-            return _StubResp()
-
+    def test_valid_actions_call_correct_endpoint(self, monkeypatch, platform_http):
+        """The three valid actions should hit distinct endpoints."""
         monkeypatch.setenv("MARC27_API_KEY", "fake-token")
         monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
-        monkeypatch.setattr("app.tools.platform_status.requests.get", _stub_get)
 
         for action in ("balance", "usage", "prices"):
             result = _billing_balance(action=action)
             assert result == {"ok": True}, f"action={action} returned {result}"
 
-        assert called_paths == [
+        assert platform_http.urls_for("GET") == [
             "https://example.invalid/api/v1/billing/balance",
             "https://example.invalid/api/v1/billing/usage",
             "https://example.invalid/api/v1/billing/prices",
