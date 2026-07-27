@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use prism_runtime::retry;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
@@ -112,6 +113,36 @@ impl PlatformClient {
         Ok(())
     }
 
+    /// Send a request, retrying only transient failures.
+    ///
+    /// Every platform call in PRISM funnels through here, so this is the one
+    /// place that has to get "worth another attempt?" right. The request is
+    /// rebuilt per attempt (`send` consumes the builder) and
+    /// [`prism_runtime::retry`] owns the verdict: a 503 or a reset socket
+    /// comes back, a 401 or a 402 does not.
+    async fn send_retrying(
+        &self,
+        method: &str,
+        url: &str,
+        idem: retry::Idempotency,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        retry::retrying(&format!("platform.{method}"), idem, || async {
+            let resp = build()
+                .headers(self.auth_headers()?)
+                .send()
+                .await
+                .with_context(|| format!("{method} {url} failed"))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                return Err(retry::HttpStatus::from_response(&resp))
+                    .with_context(|| format!("{method} {url} returned error status {status}"));
+            }
+            Ok(resp)
+        })
+        .await
+    }
+
     /// Perform an authenticated GET request and deserialise the JSON response.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         self.offline_guard("GET", path)?;
@@ -119,14 +150,10 @@ impl PlatformClient {
         debug!(%url, "GET");
 
         let resp = self
-            .client
-            .get(&url)
-            .headers(self.auth_headers()?)
-            .send()
-            .await
-            .with_context(|| format!("GET {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url} returned error status"))?;
+            .send_retrying("GET", &url, retry::Idempotency::Safe, || {
+                self.client.get(&url)
+            })
+            .await?;
 
         resp.json::<T>()
             .await
@@ -140,15 +167,16 @@ impl PlatformClient {
         debug!(%url, "POST");
 
         let resp = self
-            .client
-            .post(&url)
-            .headers(self.auth_headers()?)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("POST {url} returned error status"))?;
+            .send_retrying(
+                "POST",
+                &url,
+                // A platform POST creates something (a project, a node
+                // registration, a key exchange). Replaying one that may
+                // already have landed is how you get two of everything.
+                retry::Idempotency::Billable,
+                || self.client.post(&url).json(body),
+            )
+            .await?;
 
         resp.json::<T>()
             .await
@@ -161,14 +189,10 @@ impl PlatformClient {
         let url = format!("{}{path}", self.base_url);
         debug!(%url, "DELETE");
 
-        self.client
-            .delete(&url)
-            .headers(self.auth_headers()?)
-            .send()
-            .await
-            .with_context(|| format!("DELETE {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("DELETE {url} returned error status"))?;
+        self.send_retrying("DELETE", &url, retry::Idempotency::Safe, || {
+            self.client.delete(&url)
+        })
+        .await?;
 
         Ok(())
     }
@@ -191,24 +215,13 @@ impl PlatformClient {
     }
 
     /// List projects filtered by organisation.
+    ///
+    /// Goes through [`Self::get`] rather than hand-rolling the request, so it
+    /// inherits the same offline guard and the same retry policy as every
+    /// other platform call.
     pub async fn list_projects_for_org(&self, org_id: &str) -> Result<Vec<ProjectInfo>> {
-        let url = format!("{}/projects", self.base_url);
-        debug!(%url, org_id, "GET (filtered)");
-
-        let resp = self
-            .client
-            .get(&url)
-            .query(&[("org_id", org_id)])
-            .headers(self.auth_headers()?)
-            .send()
+        self.get(&format!("/projects?org_id={}", urlencoding::encode(org_id)))
             .await
-            .with_context(|| format!("GET {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url} returned error status"))?;
-
-        resp.json::<Vec<ProjectInfo>>()
-            .await
-            .with_context(|| format!("failed to parse JSON from GET {url}"))
     }
 
     /// Get a project by ID.

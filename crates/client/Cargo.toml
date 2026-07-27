@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# Shared retry policy — see `prism_runtime::retry`.
+prism-runtime = { path = "../runtime" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -14,3 +16,6 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 urlencoding = "2"
+
+[dev-dependencies]
+mockito.workspace = true

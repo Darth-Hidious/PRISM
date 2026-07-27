@@ -9,6 +9,7 @@
 //! MARC27 platform, and any OpenAI-compatible endpoint.
 
 use anyhow::{Context, Result, bail};
+use prism_runtime::retry;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::debug;
@@ -615,24 +616,13 @@ impl LlmClient {
                 // unbounded (and unbounded-billed) response.
                 "max_tokens": self.effective_max_tokens(est),
             });
-            // Use a direct request (not the retry-wrapper post()) so we control headers
-            let mut req = self
-                .client
-                .post(&url)
-                .json(&body)
-                .header("Accept", "text/event-stream");
-            if let Some((name, value)) = self.auth_header() {
-                req = req.header(name, value);
-            }
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("MARC27 stream request to {url} failed"))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                bail!("MARC27 LLM returned HTTP {status}: {text}");
-            }
+            // Retry only the *establishment* of the stream. Once a byte has
+            // been handed to the caller, a retry would replay visible output
+            // and bill the turn twice — so everything below this line stays
+            // fatal on first failure.
+            let resp = self
+                .send_retrying("llm.stream.marc27", &url, &body, true)
+                .await?;
             debug!("MARC27 stream response received, reading chunks...");
 
             // Read SSE stream incrementally — don't use resp.text() which
@@ -756,21 +746,10 @@ impl LlmClient {
             body["tools"] = serde_json::to_value(tools)?;
         }
 
-        let mut req = self.client.post(&url).json(&body);
-        if let Some((name, value)) = self.auth_header() {
-            req = req.header(name, value);
-        }
-
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("LLM streaming request to {url} failed"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("LLM returned HTTP {status}: {text}");
-        }
+        // As above: retry only until the stream is open. A mid-stream failure
+        // stays fatal, because replaying it would duplicate what the user has
+        // already seen and pay for the turn twice.
+        let resp = self.send_retrying("llm.stream", &url, &body, false).await?;
 
         // Parse SSE stream
         let mut full_content = String::new();
@@ -936,8 +915,33 @@ impl LlmClient {
 
     async fn post(&self, url: &str, body: &serde_json::Value) -> Result<reqwest::Response> {
         debug!(%url, "LLM request");
-        for attempt in 0..3u32 {
+        self.send_retrying("llm.post", url, body, false).await
+    }
+
+    /// Issue an LLM request, retrying only transient failures.
+    ///
+    /// This replaced a hand-rolled loop that retried 429 and *nothing else* —
+    /// a reset socket or a 503 from the proxy was terminal mid-conversation.
+    /// The shared policy keeps that loop's `Retry-After` handling (see
+    /// [`retry::HttpStatus::from_response`]) and adds transport failures,
+    /// while still failing a 400/401/402 on the first attempt.
+    ///
+    /// `sse` adds `Accept: text/event-stream` for the streaming callers.
+    async fn send_retrying(
+        &self,
+        label: &str,
+        url: &str,
+        body: &serde_json::Value,
+        sse: bool,
+    ) -> Result<reqwest::Response> {
+        // Every call here bills tokens, so only an outright refusal (429,
+        // 503) or a connection that never opened is replayed. A read timeout
+        // is NOT — see `retry::Idempotency`.
+        retry::retrying(label, retry::Idempotency::Billable, || async {
             let mut req = self.client.post(url).json(body);
+            if sse {
+                req = req.header("Accept", "text/event-stream");
+            }
             if let Some((name, value)) = self.auth_header() {
                 req = req.header(name, value);
             }
@@ -945,25 +949,15 @@ impl LlmClient {
                 .send()
                 .await
                 .with_context(|| format!("LLM request to {url} failed"))?;
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                let wait = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(2u64.pow(attempt));
-                debug!(attempt, wait_secs = wait, "429 — retrying after backoff");
-                tokio::time::sleep(Duration::from_secs(wait)).await;
-                continue;
-            }
             if !resp.status().is_success() {
                 let status = resp.status();
+                let http = retry::HttpStatus::from_response(&resp);
                 let text = resp.text().await.unwrap_or_default();
-                bail!("LLM returned HTTP {status}: {text}");
+                return Err(http).with_context(|| format!("LLM returned HTTP {status}: {text}"));
             }
-            return Ok(resp);
-        }
-        bail!("LLM request to {url} failed after 3 retries (429 rate limit)");
+            Ok(resp)
+        })
+        .await
     }
 }
 
