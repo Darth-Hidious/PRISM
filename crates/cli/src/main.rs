@@ -26,6 +26,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use prism_client::DeviceFlowAuth;
+use prism_client::PlatformResponseExt;
 use prism_client::api::PlatformClient;
 use prism_client::auth::{DeviceCodeResponse, TokenResponse};
 use prism_proto::NodeCapabilities;
@@ -2872,7 +2873,8 @@ async fn main() -> Result<()> {
                         .apply(client.get(format!("{api_base}/nodes/{node_id}/public-key")))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     if json {
@@ -2911,7 +2913,8 @@ async fn main() -> Result<()> {
                         }))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     if json {
@@ -3301,7 +3304,8 @@ async fn main() -> Result<()> {
                 .json(&serde_json::json!({ "question": query, "depth": depth }))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
             let run_id = created
@@ -3321,7 +3325,8 @@ async fn main() -> Result<()> {
                     .apply(client.get(format!("{api_base}/agent-runs/{run_id}")))
                     .send()
                     .await?
-                    .error_for_status()?
+                    .platform_error_for_status()
+                    .await?
                     .json()
                     .await?;
                 // Read the terminal state from `state` (primary) or `status`
@@ -3913,7 +3918,7 @@ async fn main() -> Result<()> {
                         .send()
                         .await?;
                     let resp: serde_json::Value =
-                        friendly_status(raw, "view billing balance")?.json().await?;
+                        raw.platform_error_for_status().await?.json().await?;
                     println!("\nMARC27 Credits");
                     println!(
                         "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}"
@@ -3936,7 +3941,8 @@ async fn main() -> Result<()> {
                         .apply(client.get(format!("{api_base}/billing/usage?period=monthly")))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     println!("\nUsage (current period)\n");
@@ -3960,7 +3966,8 @@ async fn main() -> Result<()> {
                         .apply(client.get(format!("{api_base}/billing/history?page=1&per_page=20")))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     println!("\nTransaction History\n");
@@ -3984,7 +3991,8 @@ async fn main() -> Result<()> {
                         .get(format!("{api_base}/billing/prices"))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     println!("\nCredit Prices\n");
@@ -4007,7 +4015,8 @@ async fn main() -> Result<()> {
                         .get(format!("{api_base}/billing/packages"))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     println!("\nAvailable credit packs:\n");
@@ -4036,7 +4045,8 @@ async fn main() -> Result<()> {
                         .json(&serde_json::json!({"package": package}))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
 
@@ -5140,11 +5150,7 @@ async fn submit_platform_ingest_chunk(
         .send()
         .await?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!("platform ingest job submission failed ({status}): {body}");
-    }
+    let response = response.platform_error_for_status().await?;
 
     Ok(response.json().await?)
 }
@@ -5567,7 +5573,8 @@ async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> 
         .apply(client.get(format!("{api_base}/knowledge/graph/stats")))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
 
@@ -5575,7 +5582,8 @@ async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> 
         .apply(client.get(format!("{api_base}/knowledge/embeddings/stats")))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
 
@@ -5583,7 +5591,8 @@ async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> 
         .apply(client.get(format!("{api_base}/knowledge/ingest-jobs")))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
 
@@ -5599,7 +5608,8 @@ async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> 
             .query(&[("limit", "200")])
             .send()
             .await?
-            .error_for_status()?
+            .platform_error_for_status()
+            .await?
             .json()
             .await?;
 
@@ -6044,31 +6054,6 @@ impl PlatformAuth {
     }
 }
 
-/// Friendlier replacement for `.error_for_status()` on platform calls.
-///
-/// Default reqwest error on 401 reads "HTTP status client error (401
-/// Unauthorized) for url ...", which leaves the user wondering what
-/// to do. This wrapper replaces that with an actionable message
-/// pointing at `prism login` and `prism status`. Other non-2xx
-/// responses fall through to the normal reqwest error.
-fn friendly_status(resp: reqwest::Response, action: &str) -> Result<reqwest::Response> {
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        let url = resp.url().to_string();
-        bail!(
-            "Not authorized to {action}.\n\
-             \n\
-             Your platform token may be expired or missing the required \
-             scope for this endpoint. Try:\n\
-             \x20 prism login              # refresh your platform session\n\
-             \x20 prism status             # check current auth state\n\
-             \n\
-             Endpoint: {url}"
-        );
-    }
-    Ok(resp.error_for_status()?)
-}
-
 /// Default `--platform-url` for `prism run --backend marc27`. Kept as a const so
 /// `handle_run` can tell an explicit override from the default and pick the
 /// agent-resolved base otherwise.
@@ -6158,7 +6143,8 @@ async fn handle_node_token_mint(paths: &PrismPaths, project: Option<&str>) -> Re
         }))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
 
@@ -6618,7 +6604,8 @@ async fn handle_predict(
         .apply(client.get(format!("{api_base}/compute/deployments")))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
     let running = list
@@ -6667,7 +6654,8 @@ async fn handle_predict(
             .json(&body)
             .send()
             .await?
-            .error_for_status()?
+            .platform_error_for_status()
+            .await?
             .json()
             .await?;
         let id = created["id"]
@@ -6685,7 +6673,8 @@ async fn handle_predict(
                 .apply(client.get(format!("{api_base}/compute/deployments/{id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
             let state = status["status"].as_str().unwrap_or("unknown");
@@ -6898,7 +6887,8 @@ async fn run_deploy_and_invoke(
         .json(&serde_json::Value::Object(body))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
     let deployment_id = created["id"]
@@ -6916,7 +6906,8 @@ async fn run_deploy_and_invoke(
             .apply(client.get(format!("{api_base}/compute/deployments/{deployment_id}")))
             .send()
             .await?
-            .error_for_status()?
+            .platform_error_for_status()
+            .await?
             .json()
             .await?;
         let state = status["status"].as_str().unwrap_or("unknown");
@@ -7064,7 +7055,8 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 .json(&serde_json::Value::Object(body))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -7080,10 +7072,13 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
             if let Some(status) = status.as_deref() {
                 request = request.query(&[("status", status)]);
             }
-            let response: serde_json::Value =
-                friendly_status(request.send().await?, "list compute deployments")?
-                    .json()
-                    .await?;
+            let response: serde_json::Value = request
+                .send()
+                .await?
+                .platform_error_for_status()
+                .await?
+                .json()
+                .await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -7096,7 +7091,8 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/compute/deployments/{id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -7111,7 +7107,8 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 .apply(client.delete(format!("{api_base}/compute/deployments/{id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .text()
                 .await?;
 
@@ -7137,7 +7134,8 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/compute/deployments/{id}/health")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -7222,7 +7220,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             auth.apply(client.get(format!("{api_base}/compute/gpus")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7230,7 +7229,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             auth.apply(client.get(format!("{api_base}/compute/providers")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7252,7 +7252,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                 .json(&serde_json::Value::Object(body))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7260,7 +7261,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             auth.apply(client.get(format!("{api_base}/compute/{job_id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7268,7 +7270,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             auth.apply(client.post(format!("{api_base}/compute/{job_id}/cancel")))
                 .send()
                 .await?
-                .error_for_status()?;
+                .platform_error_for_status()
+                .await?;
             serde_json::json!({ "job_id": job_id, "status": "cancel_requested" })
         }
         ComputeCommands::Submit {
@@ -7310,7 +7313,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                 .json(&serde_json::Value::Object(body))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7417,7 +7421,8 @@ async fn run_compute_job(
         .json(&serde_json::Value::Object(body))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
     let job_id = value_string(&submitted, &["job_id", "id"])
@@ -7431,7 +7436,8 @@ async fn run_compute_job(
             .apply(client.get(format!("{api_base}/compute/{job_id}")))
             .send()
             .await?
-            .error_for_status()?
+            .platform_error_for_status()
+            .await?
             .json()
             .await?;
         let state = value_string(&status, &["status", "state"]).unwrap_or("unknown");
@@ -7532,7 +7538,8 @@ async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
                 .query(&[("limit", limit.to_string())])
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7545,7 +7552,8 @@ async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
                 ])
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7565,7 +7573,8 @@ async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
                 .query(&params)
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7580,7 +7589,8 @@ async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
                 .json(&body)
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7648,7 +7658,8 @@ async fn run_ingest_job(
         .json(&body)
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
     let job_id = value_string(&submitted, &["job_id", "id"])
@@ -7662,7 +7673,8 @@ async fn run_ingest_job(
             .apply(client.get(format!("{api_base}/knowledge/ingest-jobs")))
             .send()
             .await?
-            .error_for_status()?
+            .platform_error_for_status()
+            .await?
             .json()
             .await?;
         let job_entry = value_array(&jobs, &["jobs", "items", "data"]).and_then(|list| {
@@ -7725,7 +7737,8 @@ async fn fetch_platform_catalog_live(paths: &PrismPaths) -> Result<Vec<serde_jso
         .apply(client.get(format!("{api_base}/projects/{project_id}/llm/models")))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
 
@@ -7935,9 +7948,7 @@ async fn fetch_gpu_catalog() -> Result<serde_json::Value> {
         .header("Authorization", auth_header)
         .send()
         .await?;
-    let value = friendly_status(response, "list GPU compute offers")?
-        .json()
-        .await?;
+    let value = response.platform_error_for_status().await?.json().await?;
     Ok(value)
 }
 
@@ -8033,7 +8044,8 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 }))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -8057,8 +8069,7 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/discourse/specs")))
                 .send()
                 .await?;
-            let response: serde_json::Value =
-                friendly_status(raw, "list discourse specs")?.json().await?;
+            let response: serde_json::Value = raw.platform_error_for_status().await?.json().await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -8071,7 +8082,8 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/discourse/specs/{spec_id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
             // YAML-backed specs are easier to inspect as pretty JSON than a lossy summary.
@@ -8090,7 +8102,8 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .json(&body)
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .text()
                 .await?;
             let events = normalize_stream_events(parse_sse_json_events(&response)?);
@@ -8128,7 +8141,8 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/discourse/{instance_id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -8143,7 +8157,8 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/discourse/{instance_id}/turns")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -8467,11 +8482,9 @@ async fn handle_platform_query(
             .apply(client.post(format!("{api_base}/knowledge/search")))
             .json(&serde_json::json!({"query": text, "limit": limit}))
             .send()
+            .await?
+            .platform_error_for_status()
             .await?;
-
-        if !resp.status().is_success() {
-            bail!("Platform API error: {}", resp.status());
-        }
 
         let results: Vec<serde_json::Value> = resp.json().await?;
         if json_output {
@@ -8501,11 +8514,9 @@ async fn handle_platform_query(
             .apply(client.get(format!("{api_base}/knowledge/graph/search")))
             .query(&[("q", text), ("limit", &limit.to_string())])
             .send()
+            .await?
+            .platform_error_for_status()
             .await?;
-
-        if !resp.status().is_success() {
-            bail!("Platform API error: {}", resp.status());
-        }
 
         let results: Vec<serde_json::Value> = resp.json().await?;
         if json_output {

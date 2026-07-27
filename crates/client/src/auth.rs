@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::debug;
 
+use crate::platform_error::{PlatformError, PlatformResponseExt};
+
 /// Response from the device-code initiation endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceCodeResponse {
@@ -86,8 +88,8 @@ impl DeviceFlowAuth {
             .send()
             .await
             .context("failed to start device flow")?
-            .error_for_status()
-            .context("device flow start returned error status")?;
+            .platform_error_for_status()
+            .await?;
 
         resp.json::<DeviceCodeResponse>()
             .await
@@ -180,9 +182,14 @@ impl DeviceFlowAuth {
                 .await
                 .context("failed to refresh token")?;
             if !resp.status().is_success() {
-                let status = resp.status();
-                return Err(retry::HttpStatus::from_response(&resp))
-                    .with_context(|| format!("token refresh returned error status {status}"));
+                // Classify off the borrow before the body read consumes the
+                // response, then keep the platform's own reason on top: a
+                // rejected refresh token has to say `prism login`, not
+                // "returned error status 401". Same shape, and the same
+                // reasoning, as `PlatformClient::send_retrying`.
+                let classified = retry::HttpStatus::from_response(&resp);
+                let reason = PlatformError::from_response(resp).await;
+                return Err(classified).context(reason);
             }
             Ok(resp)
         })

@@ -12,10 +12,12 @@ pub mod knowledge;
 pub mod marketplace;
 pub mod node_registry;
 pub mod node_session;
+pub mod platform_error;
 
 pub use api::PlatformClient;
 pub use auth::DeviceFlowAuth;
 pub use knowledge::KnowledgeExt;
+pub use platform_error::{PlatformError, PlatformResponseExt};
 
 #[cfg(test)]
 mod tests {

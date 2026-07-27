@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use tracing::debug;
 
+// Platform failures are translated inside `send_retrying`, which needs the
+// typed error rather than the `platform_error_for_status` convenience: it has
+// to take the retry verdict off the response *before* the body read consumes
+// it, and it treats any non-2xx as a failure.
+use crate::platform_error::PlatformError;
+
 /// Response type for the current user endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
@@ -120,6 +126,26 @@ impl PlatformClient {
     /// rebuilt per attempt (`send` consumes the builder) and
     /// [`prism_runtime::retry`] owns the verdict: a 503 or a reset socket
     /// comes back, a 401 or a 402 does not.
+    ///
+    /// A failed response has to answer two different questions, and ownership
+    /// forces the order:
+    ///
+    /// 1. **Is it worth another attempt?** [`retry::HttpStatus::from_response`]
+    ///    borrows, so it must run *first* — reading the body consumes the
+    ///    response, and the status and `Retry-After` go with it.
+    /// 2. **What does the user need to know?** Only the body carries the
+    ///    platform's own `code`, `message` and `help`, so answering this
+    ///    consumes the response.
+    ///
+    /// The two are then combined the way [`prism_runtime::retry`] documents:
+    /// the human-readable [`PlatformError`] on top, [`retry::HttpStatus`]
+    /// attached as its cause. That ordering is load-bearing in both
+    /// directions. `retry::is_retryable` walks the cause chain and takes the
+    /// verdict of the first link it recognises; `PlatformError` is not one of
+    /// the types it knows, so classification still reaches the `HttpStatus`
+    /// underneath and a 401 keeps failing on the first attempt. Meanwhile the
+    /// message the user sees is the platform's own words instead of a bare
+    /// "returned error status 401".
     async fn send_retrying(
         &self,
         method: &str,
@@ -134,9 +160,11 @@ impl PlatformClient {
                 .await
                 .with_context(|| format!("{method} {url} failed"))?;
             if !resp.status().is_success() {
-                let status = resp.status();
-                return Err(retry::HttpStatus::from_response(&resp))
-                    .with_context(|| format!("{method} {url} returned error status {status}"));
+                // Borrow for the retry verdict…
+                let classified = retry::HttpStatus::from_response(&resp);
+                // …then consume for the platform's own reason.
+                let reason = PlatformError::from_response(resp).await;
+                return Err(classified).context(reason);
             }
             Ok(resp)
         })

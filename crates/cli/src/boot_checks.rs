@@ -10,9 +10,44 @@
 
 use std::time::Duration;
 
+use prism_client::PlatformError;
 use prism_runtime::{PlatformEndpoints, StoredCredentials};
 
 use crate::boot;
+
+/// One boot-banner line for a rejected credential: the platform's own
+/// `error.code` plus the action that code implies.
+///
+/// Three states must stay distinguishable, because conflating them is how a
+/// boot screen lies: the platform named a reason, the platform named none, and
+/// we never got to read the response at all.
+async fn rejection_line(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let url = resp.url().to_string();
+    let body = match resp.text().await {
+        Ok(b) => b,
+        // Not a platform verdict — we simply never read one. Say that.
+        Err(e) => return format!("HTTP {} — response unreadable: {e}", status.as_u16()),
+    };
+    let err = PlatformError::parse(status, &url, &body);
+
+    // "unauthorized" is itself a code the platform emits, so a missing code
+    // must NOT fall back to the status reason phrase — that would render
+    // identically to a real one. Show the bare status instead.
+    let reason = err
+        .code
+        .clone()
+        .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+
+    // Derive the advice from the same mapping the full error uses, so a 403
+    // carrying an expiry code can never be labelled a permissions problem.
+    let action = match err.action() {
+        Some(a) if a.contains("prism login") => "run prism login",
+        Some(_) => "credential not permitted here",
+        None => "see prism doctor",
+    };
+    format!("{reason} — {action}")
+}
 
 /// Run the live platform-connectivity checks.
 ///
@@ -72,15 +107,20 @@ pub async fn run_boot_checks(
                     .unwrap_or("authenticated");
                 (true, name.to_string())
             }
-            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                (false, "token rejected — run prism login".into())
+            // The platform names the reason (`token_expired`, `token_invalid`,
+            // …). Show its word, not our guess — the boot line is one line, so
+            // the code plus the implied action is the most that fits.
+            Ok(r) if r.status().is_client_error() || r.status().is_server_error() => {
+                (false, rejection_line(r).await)
             }
-            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => {
-                (false, "token lacks user scope (agent key?)".into())
-            }
+            // Only 3xx can reach here now; redirects are followed by default,
+            // so one arriving is unexpected rather than an "error".
             Ok(r) => (
                 false,
-                format!("platform error (HTTP {})", r.status().as_u16()),
+                format!(
+                    "unexpected HTTP {} from {api}/users/me",
+                    r.status().as_u16()
+                ),
             ),
             Err(e) if e.is_timeout() => (false, "platform unreachable (timeout)".into()),
             Err(_) => (false, "platform unreachable".into()),

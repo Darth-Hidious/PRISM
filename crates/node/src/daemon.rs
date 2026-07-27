@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use prism_client::PlatformResponseExt;
 use prism_proto::{NodeCapabilities, NodeMessage, PlatformMessage};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use serde::Serialize;
@@ -2015,8 +2016,8 @@ async fn refresh_token(
         .send()
         .await
         .context("failed to refresh token")?
-        .error_for_status()
-        .context("token refresh returned error")?;
+        .platform_error_for_status()
+        .await?;
 
     #[derive(serde::Deserialize)]
     struct RefreshResponse {
