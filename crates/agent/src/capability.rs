@@ -3,10 +3,12 @@
 //! `docs/CAPABILITY_REGISTRY_DESIGN.md`, Phases 0-2:
 //! - **P0**: [`CapabilityIndex`] — embed-once, cosine top-K retrieval primitive.
 //! - **P1**: [`global_index`] caches the embedded index; `agent_loop` uses
-//!   `CapabilityIndex::retrieve` instead of keyword `definitions_for_query`,
-//!   with the keyword path kept as fallback.
+//!   `CapabilityIndex::retrieve` instead of keyword `ToolCatalog::names_by_relevance`,
+//!   with the keyword path kept as fallback. Either way the ranking covers the
+//!   WHOLE catalog; how far down it the request can afford to go is the token
+//!   budget's call (`tool_catalog::tool_token_budget`).
 //! - **P2**: [`capability_menu`] builds the L1 progressive-disclosure menu so the
-//!   model is AWARE of capabilities beyond the callable top-K.
+//!   model is AWARE of capabilities the budget could not afford.
 //!
 //! Neural selection is **on by default**; `PRISM_NEURAL_TOOLS=0/false/off`
 //! forces the legacy keyword path. It degrades gracefully (cold turn or no embed
