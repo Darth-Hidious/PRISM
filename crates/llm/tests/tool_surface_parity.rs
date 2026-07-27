@@ -63,8 +63,12 @@ async fn serve_one(
     let body: serde_json::Value =
         serde_json::from_slice(&raw[head_end..head_end + content_len]).expect("request is JSON");
 
+    // `Connection: close` is load-bearing: without it the client may pool the
+    // socket and reuse it for the next request, while this server is blocked
+    // in `accept()` waiting for a NEW connection — a hang, not a failure.
     let resp = format!(
-        "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nConnection: close\r\n\
+         Content-Length: {}\r\n\r\n{}",
         payload.len(),
         payload
     );
@@ -405,6 +409,81 @@ async fn marc27_does_not_fall_back_on_a_payment_error() {
     );
     let bodies = server.await.unwrap();
     assert_eq!(bodies.len(), 1, "a 402 must not trigger a second request");
+}
+
+/// The fallback needs BOTH a request-shape status AND the tools field named.
+/// A credit failure whose body happens to mention tools must still fail —
+/// otherwise the second attempt's error replaces the one that said "top up".
+#[tokio::test]
+async fn marc27_does_not_fall_back_on_a_402_that_mentions_tools() {
+    let tools = wide_selection();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(serve_many(
+        listener,
+        vec![(
+            402,
+            "{\"error\":{\"code\":\"insufficient_credits\",\"message\":\
+             \"your plan does not include \\\"tools\\\". top up to continue\"}}"
+                .to_string(),
+        )],
+    ));
+    let client = LlmClient::new(config(format!("http://127.0.0.1:{port}/llm")));
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.chat_with_tools_streaming(&user("hi"), &tools, |_, _| {}),
+    )
+    .await
+    .expect("timed out")
+    .expect_err("a 402 must fail the turn");
+    assert!(
+        format!("{err:#}").contains("insufficient_credits"),
+        "the billing error was masked: {err:#}"
+    );
+    let bodies = server.await.unwrap();
+    assert_eq!(bodies.len(), 1, "a 402 must not trigger a second request");
+}
+
+/// When the fallback ALSO fails, the caller must still see what the provider
+/// originally refused — not just the second, less informative failure.
+#[tokio::test]
+async fn marc27_surfaces_the_original_error_when_the_fallback_also_fails() {
+    let tools = wide_selection();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(serve_many(
+        listener,
+        vec![
+            (
+                500,
+                "{\"error\":{\"message\":\"internal: Anthropic API returned 400: \
+                 tools.0: Input tag 'function' does not match\"}}"
+                    .to_string(),
+            ),
+            (
+                500,
+                "{\"error\":{\"message\":\"upstream connection reset\"}}".to_string(),
+            ),
+        ],
+    ));
+    let client = LlmClient::new(config(format!("http://127.0.0.1:{port}/llm")));
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.chat_with_tools_streaming(&user("hi"), &tools, |_, _| {}),
+    )
+    .await
+    .expect("timed out")
+    .expect_err("both attempts failed");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("Input tag 'function'"),
+        "the original refusal was replaced by the fallback's error: {text}"
+    );
+    assert!(
+        text.contains("upstream connection reset"),
+        "the fallback's error was dropped instead of attached: {text}"
+    );
+    assert_eq!(server.await.unwrap().len(), 2);
 }
 
 /// Text-fenced tool calls stay parseable: the platform cannot yet forward

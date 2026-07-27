@@ -226,13 +226,15 @@ impl ToolCallAccumulator {
     }
 
     /// The assembled calls in `index` order, or `None` when the turn carried
-    /// no native tool calls. Entries that never received a name are dropped:
-    /// a nameless call is not dispatchable and would surface as "unknown tool".
+    /// no native tool calls.
+    ///
+    /// An entry whose name never arrived is KEPT, not dropped: the dispatcher
+    /// answers it with "unknown tool", which the model can see and recover
+    /// from. Dropping it would turn a diagnosable error into an empty turn.
     fn finish(self) -> Option<Vec<ToolCallResponse>> {
         let mut calls: Vec<(u32, ToolCallResponse)> = self
             .by_index
             .into_iter()
-            .filter(|(_, (_, name, _))| !name.is_empty())
             .map(|(idx, (id, name, args))| {
                 (
                     idx,
@@ -387,9 +389,13 @@ impl LlmClient {
         Ok(result)
     }
 
-    /// Chat with tool-calling support.
-    /// Sends full message history + tool definitions, returns response
-    /// which may contain tool_calls.
+    /// Chat with tool-calling support, non-streaming.
+    ///
+    /// Sends full message history + tool definitions and returns a response
+    /// that may contain tool_calls — on the OpenAI path. On the MARC27 path it
+    /// drops `tools` (see below). Nothing in the workspace calls this today;
+    /// the agent loop uses [`Self::chat_with_tools_streaming`], which sends
+    /// tools on both.
     pub async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -729,8 +735,20 @@ impl LlmClient {
                         "MARC27 upstream rejected OpenAI-shaped tool schemas ({e:#}) — \
                          retrying this turn with the text tool-call protocol"
                     );
-                    self.send_retrying("llm.stream.marc27", &url, &build(false)?, true)
-                        .await?
+                    match self
+                        .send_retrying("llm.stream.marc27", &url, &build(false)?, true)
+                        .await
+                    {
+                        Ok(resp) => resp,
+                        // Surface the FIRST error — it says what the provider
+                        // actually refused. The fallback's own failure rides
+                        // along as context instead of replacing it.
+                        Err(fallback_err) => {
+                            return Err(e.context(format!(
+                                "retry without tool schemas also failed: {fallback_err:#}"
+                            )));
+                        }
+                    }
                 }
                 Err(e) => return Err(e),
             };
@@ -1055,12 +1073,26 @@ impl LlmClient {
 /// Whether an LLM error is the upstream provider refusing OpenAI-shaped tool
 /// schemas, as opposed to anything else that can fail a request.
 ///
-/// Deliberately narrow. The fallback it gates costs one extra (unbilled,
-/// already-failed) round-trip, but retrying a 401/402/429 without tools would
-/// hide the real problem behind a second, less informative failure.
+/// Deliberately narrow, on two axes. The fallback it gates costs one extra
+/// (unbilled, already-failed) round-trip, but retrying a 401/402/429 without
+/// tools would hide the real problem behind a second, less informative
+/// failure — so the error must BOTH carry a request-shape status AND name the
+/// tools field. A body that merely mentions credits or a plan does not match.
 fn error_rejects_tool_schemas(err: &anyhow::Error) -> bool {
+    // 400/422 = the provider rejected the request; 500 = the platform's own
+    // wrapper around an upstream 400 (measured shape). Auth (401/403),
+    // billing (402) and capacity (429/503) are never a schema problem.
+    let request_shape = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<retry::HttpStatus>())
+        .is_some_and(|h| matches!(h.status, 400 | 422 | 500));
+    if !request_shape {
+        return false;
+    }
     let text = format!("{err:#}").to_ascii_lowercase();
-    text.contains("tools.") || text.contains("\"tools\"") || text.contains("tool_choice")
+    ["tools.", "tools[", "\"tools\"", "tool_choice"]
+        .iter()
+        .any(|needle| text.contains(needle))
 }
 
 /// Render the SELECTED tools as text, for the fallback path only.
