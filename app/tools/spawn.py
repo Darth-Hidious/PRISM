@@ -119,8 +119,9 @@ def _check(kwargs: dict[str, Any]) -> None:
         if name in kwargs:
             raise TypeError(
                 f"{name}= would force subprocess back onto the fork() path, "
-                f"which SIGSEGVs after a materials search; use the cwd= / "
-                f"new_session= arguments of app.tools.spawn instead"
+                f"which SIGSEGVs after a materials search; use this module's "
+                f"own cwd= argument, and popen(new_session=True) for a process "
+                f"group"
             )
 
 
@@ -147,7 +148,10 @@ def _await_own_process_group(proc: subprocess.Popen, timeout: float = 5.0) -> No
             # nothing holds a handle to is worse than the error being raised.
             # Kill the one pid we do have, and reap it.
             proc.kill()
-            proc.wait()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass  # unreapable after SIGKILL; still better than not trying
             raise RuntimeError(
                 f"spawned pid {proc.pid} did not enter its own process group "
                 f"within {timeout}s, so it could not be stopped by group kill; "

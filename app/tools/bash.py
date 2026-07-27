@@ -305,6 +305,12 @@ def _spawn_background_bash(command: str, description: str = "", timeout: int | N
             env=env,
             new_session=True,
         )
+    except Exception as exc:
+        # The foreground path already answers a failed spawn in this shape.
+        # Without this, the background path answered with the generic
+        # {"error": ...} that Tool.execute builds, which carries no `success`
+        # key and so reads differently from every other result here.
+        return {"success": False, "error": f"Failed to start background command: {exc}"}
     finally:
         stdout_handle.close()
         stderr_handle.close()
