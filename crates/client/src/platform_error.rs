@@ -22,7 +22,9 @@
 //! body excerpt rather than guessing.
 
 use std::fmt;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use reqwest::{Response, StatusCode};
 use serde_json::Value;
 
@@ -66,13 +68,18 @@ impl PlatformError {
             None
         };
 
+        // Everything below is server-controlled text we are about to print.
+        // Mask credential-shaped values before they can reach a terminal.
         Self {
             status,
             url: url.to_string(),
             code,
-            message,
-            help,
-            body_excerpt,
+            message: message.as_deref().map(redact_secrets),
+            help: help
+                .into_iter()
+                .map(|(k, v)| (k, redact_secrets(&v)))
+                .collect(),
+            body_excerpt: body_excerpt.as_deref().map(redact_secrets),
         }
     }
 
@@ -231,6 +238,27 @@ fn excerpt(body: &str) -> String {
     }
     let truncated: String = collapsed.chars().take(BODY_EXCERPT_LIMIT).collect();
     format!("{truncated}…")
+}
+
+/// Mask anything that looks like a live credential before we print it.
+///
+/// This module's whole design is to echo the server's words, and `/auth/refresh`
+/// and `/auth/device/*` are called with a secret in the request body. If the
+/// platform ever quotes that value back in an error, the old `.error_for_status()`
+/// would have dropped it and we would now print it into a terminal, a scrollback,
+/// or a pasted support ticket. Masking here costs nothing and closes that door.
+///
+/// Only long, real-looking values are masked: the platform's own help text
+/// contains the literal placeholder `m27r_...`, which must survive intact.
+/// Platform API keys (`m27_`), refresh tokens (`m27r_`) and JWTs (`eyJ…`).
+/// The `{12,}` tail is what keeps the platform's literal `m27r_...` placeholder
+/// out of the match — it has three characters after the prefix, not twelve.
+static SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(m27r_|m27_|eyJ)[A-Za-z0-9_.-]{12,}").expect("literal regex is valid")
+});
+
+fn redact_secrets(text: &str) -> String {
+    SECRET.replace_all(text, "${1}<redacted>").into_owned()
 }
 
 /// `.error_for_status()`, but it keeps the reason the platform gave.
@@ -490,12 +518,70 @@ mod tests {
     }
 
     #[test]
-    fn success_statuses_are_not_translated() {
-        // Guard for the trait's early return: only 4xx/5xx become errors.
-        for code in [200_u16, 201, 204, 302] {
-            let s = StatusCode::from_u16(code).unwrap();
-            assert!(!s.is_client_error() && !s.is_server_error());
-        }
+    fn rate_limit_names_the_limit_not_a_login_problem() {
+        let rendered = render(
+            429,
+            r#"{"error":{"code":"rate_limited","message":"too many requests for this key"}}"#,
+        );
+        assert!(rendered.contains("too many requests for this key"));
+        assert!(rendered.contains("rate-limiting"), "{rendered}");
+        assert!(
+            !rendered.contains("prism login") && !rendered.contains("not permitted"),
+            "429 misdiagnosed as auth/permissions: {rendered}"
+        );
+    }
+
+    #[test]
+    fn smart_404_adds_no_advice_of_its_own() {
+        // The platform's hint+suggestions are more specific than anything we
+        // could invent, so `action()` must stay silent for 404.
+        let e = PlatformError::parse(
+            StatusCode::NOT_FOUND,
+            BALANCE_URL,
+            r#"{"error":{"code":"not_found","message":"nope"},"hint":"Did you mean: GET /?"}"#,
+        );
+        assert!(e.action().is_none(), "404 editorialised: {:?}", e.action());
+        assert!(!e.to_string().contains("what to do:"));
+    }
+
+    #[test]
+    fn a_credential_echoed_back_by_the_server_is_masked() {
+        // We now print bodies that `.error_for_status()` used to discard, and
+        // /auth/refresh is called WITH a secret in the request body.
+        let rendered = render(
+            401,
+            r#"{"error":{"code":"token_invalid","message":"refresh_token m27r_a7e9c1d4b8f206e35a9c not found"}}"#,
+        );
+        assert!(
+            !rendered.contains("m27r_a7e9c1d4b8f206e35a9c"),
+            "credential leaked into the error: {rendered}"
+        );
+        assert!(rendered.contains("m27r_<redacted>"), "{rendered}");
+        // The rest of the server's sentence must survive.
+        assert!(rendered.contains("not found"), "{rendered}");
+    }
+
+    #[test]
+    fn the_platforms_own_placeholder_survives_redaction() {
+        // Live `help.refresh` literally contains `m27r_...` — masking that
+        // would destroy the instructions the user needs.
+        let rendered = render(401, LIVE_TOKEN_EXPIRED);
+        assert!(
+            rendered.contains(r#"{"refresh_token": "m27r_..."}"#),
+            "help placeholder mangled: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_jwt_in_an_unstructured_body_is_masked() {
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payloadpayload.sigsig";
+        let rendered = render(500, &format!("upstream rejected {jwt} — retry"));
+        assert!(
+            !rendered.contains("payloadpayload"),
+            "JWT leaked: {rendered}"
+        );
+        assert!(rendered.contains("eyJ<redacted>"), "{rendered}");
+        assert!(rendered.contains("upstream rejected"), "{rendered}");
     }
 
     // ── over the wire ──────────────────────────────────────────────
@@ -552,5 +638,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, r#"{"credits":1.5}"#);
+    }
+
+    #[tokio::test]
+    async fn wire_matches_error_for_status_on_the_4xx_5xx_boundary() {
+        // This is a DROP-IN replacement for reqwest's `.error_for_status()`,
+        // so it must error on exactly the same statuses and no others. A
+        // "simplification" to `>= 300` would break 55 call sites silently.
+        let mut server = mockito::Server::new_async().await;
+        for (code, path) in [
+            (204_u16, "/no-content"),
+            (304, "/not-modified"),
+            (399, "/odd-3xx"),
+            (400, "/bad-request"),
+            (500, "/boom"),
+        ] {
+            server
+                .mock("GET", path)
+                .with_status(code.into())
+                .create_async()
+                .await;
+
+            let resp = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap()
+                .get(format!("{}{path}", server.url()))
+                .send()
+                .await
+                .unwrap();
+            let reqwest_errs = resp.error_for_status_ref().is_err();
+            let ours_errs = resp.platform_error_for_status().await.is_err();
+            assert_eq!(
+                ours_errs, reqwest_errs,
+                "HTTP {code}: ours={ours_errs} reqwest={reqwest_errs}"
+            );
+        }
     }
 }

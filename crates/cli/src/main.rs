@@ -3893,12 +3893,8 @@ async fn main() -> Result<()> {
                         .apply(client.get(format!("{api_base}/billing/balance")))
                         .send()
                         .await?;
-                    let resp: serde_json::Value = raw
-                        .platform_error_for_status()
-                        .await
-                        .context("could not view billing balance")?
-                        .json()
-                        .await?;
+                    let resp: serde_json::Value =
+                        raw.platform_error_for_status().await?.json().await?;
                     println!("\nMARC27 Credits");
                     println!(
                         "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}"
@@ -5130,10 +5126,7 @@ async fn submit_platform_ingest_chunk(
         .send()
         .await?;
 
-    let response = response
-        .platform_error_for_status()
-        .await
-        .context("platform ingest job submission failed")?;
+    let response = response.platform_error_for_status().await?;
 
     Ok(response.json().await?)
 }
@@ -7059,8 +7052,7 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 .send()
                 .await?
                 .platform_error_for_status()
-                .await
-                .context("could not list compute deployments")?
+                .await?
                 .json()
                 .await?;
 
@@ -7932,12 +7924,7 @@ async fn fetch_gpu_catalog() -> Result<serde_json::Value> {
         .header("Authorization", auth_header)
         .send()
         .await?;
-    let value = response
-        .platform_error_for_status()
-        .await
-        .context("could not list GPU compute offers")?
-        .json()
-        .await?;
+    let value = response.platform_error_for_status().await?.json().await?;
     Ok(value)
 }
 
@@ -8058,12 +8045,7 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/discourse/specs")))
                 .send()
                 .await?;
-            let response: serde_json::Value = raw
-                .platform_error_for_status()
-                .await
-                .context("could not list discourse specs")?
-                .json()
-                .await?;
+            let response: serde_json::Value = raw.platform_error_for_status().await?.json().await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -8478,8 +8460,7 @@ async fn handle_platform_query(
             .send()
             .await?
             .platform_error_for_status()
-            .await
-            .context("semantic search failed")?;
+            .await?;
 
         let results: Vec<serde_json::Value> = resp.json().await?;
         if json_output {
@@ -8511,8 +8492,7 @@ async fn handle_platform_query(
             .send()
             .await?
             .platform_error_for_status()
-            .await
-            .context("graph search failed")?;
+            .await?;
 
         let results: Vec<serde_json::Value> = resp.json().await?;
         if json_output {

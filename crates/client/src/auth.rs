@@ -88,8 +88,7 @@ impl DeviceFlowAuth {
             .await
             .context("failed to start device flow")?
             .platform_error_for_status()
-            .await
-            .context("device flow start failed")?;
+            .await?;
 
         resp.json::<DeviceCodeResponse>()
             .await
@@ -172,8 +171,7 @@ impl DeviceFlowAuth {
             .await
             .context("failed to refresh token")?
             .platform_error_for_status()
-            .await
-            .context("token refresh failed")?;
+            .await?;
 
         resp.json::<TokenResponse>()
             .await

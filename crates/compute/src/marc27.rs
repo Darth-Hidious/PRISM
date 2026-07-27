@@ -143,8 +143,7 @@ impl ComputeBackend for Marc27Backend {
             .await
             .context("failed to submit job to MARC27 platform")?
             .platform_error_for_status()
-            .await
-            .context("MARC27 submit failed")?;
+            .await?;
 
         let result: SubmitResponse = resp.json().await.context("bad submit response")?;
         tracing::info!(job_id = %result.job_id, "job submitted to MARC27 platform");
@@ -159,8 +158,7 @@ impl ComputeBackend for Marc27Backend {
             .await
             .context("failed to query job status")?
             .platform_error_for_status()
-            .await
-            .context("MARC27 status query failed")?;
+            .await?;
 
         let job: JobResponse = resp.json().await?;
         Ok(map_status(job))
@@ -176,8 +174,7 @@ impl ComputeBackend for Marc27Backend {
             .await
             .context("failed to fetch job results")?
             .platform_error_for_status()
-            .await
-            .context("MARC27 results query failed")?;
+            .await?;
 
         let job: JobResponse = resp.json().await?;
         Ok(job.output.unwrap_or(serde_json::Value::Null))
@@ -190,8 +187,7 @@ impl ComputeBackend for Marc27Backend {
             .await
             .context("failed to cancel job")?
             .platform_error_for_status()
-            .await
-            .context("MARC27 cancel failed")?;
+            .await?;
 
         tracing::info!(%job_id, "job cancelled on MARC27 platform");
         Ok(())

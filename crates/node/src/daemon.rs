@@ -2017,8 +2017,7 @@ async fn refresh_token(
         .await
         .context("failed to refresh token")?
         .platform_error_for_status()
-        .await
-        .context("token refresh failed")?;
+        .await?;
 
     #[derive(serde::Deserialize)]
     struct RefreshResponse {
