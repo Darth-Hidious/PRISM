@@ -66,20 +66,35 @@ def no_fork():
     Replacing it therefore separates the two paths exactly, with no reliance
     on the macOS-only crash -- see `test_the_fork_detector_is_not_vacuous`,
     which fails this fixture's own premise if the hook ever stops working.
+
+    It also pins _HAVE_POSIX_SPAWN_CLOSEFROM False, because otherwise this
+    would prove LESS on Linux than on macOS and quietly look the same. macOS
+    has no posix_spawn_file_actions_addclosefrom_np, so close_fds=True (the
+    default, and what capture_output=True implies) rules out posix_spawn
+    there; glibc >= 2.34 has it, so on Linux those same call sites would
+    posix_spawn even unmigrated and three of the exercises below would pass
+    while still broken. Pinning it reproduces the macOS constraint set exactly.
+    The migrated sites are unaffected -- spawn.run passes close_fds=False.
+
+    Sites invoking a bare command name (`git`, `hf`, `uv`) fork on every
+    platform regardless: subprocess.py:1860 requires os.path.dirname(executable).
     """
     if not hasattr(subprocess, "_fork_exec"):
         pytest.skip("CPython build has no subprocess._fork_exec to intercept")
 
-    real = subprocess._fork_exec
+    real_fork_exec = subprocess._fork_exec
+    real_closefrom = subprocess._HAVE_POSIX_SPAWN_CLOSEFROM
 
     def _refuse(args, *rest, **kwargs):
         raise ForkAttempted(f"this call site forked: {args!r}")
 
     subprocess._fork_exec = _refuse
+    subprocess._HAVE_POSIX_SPAWN_CLOSEFROM = False
     try:
         yield
     finally:
-        subprocess._fork_exec = real
+        subprocess._fork_exec = real_fork_exec
+        subprocess._HAVE_POSIX_SPAWN_CLOSEFROM = real_closefrom
 
 
 @pytest.fixture(scope="module")
@@ -527,7 +542,11 @@ def _exercise_update_run_upgrade(tmp_path, monkeypatch) -> None:
     """app/update.py — the spawn that actually runs the upgrade."""
     from app import update
 
-    monkeypatch.setattr(update, "upgrade_command", lambda method=None: "/bin/echo upgraded")
+    # A bare command name, like the real `uv` / `pipx` / `pip` this splits.
+    # Not an absolute path: subprocess.py:1860 refuses posix_spawn for an
+    # executable with no dirname, so an absolute path here would be an easier
+    # case than production ever is.
+    monkeypatch.setattr(update, "upgrade_command", lambda method=None: "echo upgraded")
 
     assert update.run_upgrade(method="pip") is True, (
         "the upgrade spawn never completed; run_upgrade reports False, which "
