@@ -8618,61 +8618,67 @@ async fn local_ontology_lookup(
     })
 }
 
-/// Semantic entity search over the bundled Turso store using the offline
-/// `prism-embed` backend (no Qdrant, no cloud) — the vectors that local
+/// Semantic entity search over the bundled Turso store, ranked by Turso's
+/// native `vector_distance_cos()`, using the offline `prism-embed` backend
+/// for the query vector (no Qdrant, no cloud) — the vectors that local
 /// ingest writes via `embed_entities_best_effort`.
 ///
-/// Never errors: an unopenable store, an empty store, an unavailable
-/// embedding backend, or zero hits all degrade to `None`, which the
-/// caller renders as "no results". The store is checked BEFORE the
-/// backend is built, so a fresh install never pays the embedding-model
-/// init just to return nothing.
+/// # Honesty contract
+///
+/// `Ok(vec![])` means **nothing is embedded locally yet**, and nothing
+/// else. Anything that makes the index unusable — an unopenable store, a
+/// missing embedding backend, a dimension mismatch — is an `Err` whose
+/// message names the problem, so a broken index is never printed as "no
+/// results". The store is counted BEFORE the backend is built, so a fresh
+/// install never pays the embedding-model init just to return nothing.
 async fn local_semantic_lookup(
     db_path: &Path,
     text: &str,
     limit: usize,
-) -> Option<Vec<(String, f32)>> {
-    let store = match prism_provenance::ProvenanceStore::open(db_path).await {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::debug!("local semantic store open failed: {e:#}");
-            return None;
-        }
-    };
-    match store.entity_embedding_count(LOCAL_ONTOLOGY_TENANT).await {
-        Ok(0) => return None,
-        Ok(_) => {}
-        Err(e) => {
-            tracing::debug!("local semantic embedding count failed: {e:#}");
-            return None;
-        }
+) -> Result<Vec<(String, f32)>> {
+    // No store file at all ⇒ nothing was ever ingested. That is an empty
+    // index, not a broken one, so it must not raise the alarm a fresh
+    // install would otherwise trip on (opening a path under a missing
+    // `~/.prism` fails outright).
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = prism_provenance::ProvenanceStore::open(db_path)
+        .await
+        .with_context(|| {
+            format!(
+                "local semantic store {} could not be opened",
+                db_path.display()
+            )
+        })?;
+    let embedded = store
+        .entity_embedding_count(LOCAL_ONTOLOGY_TENANT)
+        .await
+        .context("local semantic index could not be counted")?;
+    if embedded == 0 {
+        return Ok(Vec::new()); // nothing ingested yet — a real empty answer
     }
 
     // First ever native init may download the model — blocking pool.
     let backend = tokio::task::spawn_blocking(prism_embed::from_config)
         .await
-        .ok()
-        .flatten()?;
-    let query_vec = match backend.embed(std::slice::from_ref(&text.to_string())).await {
-        Ok(mut vecs) if !vecs.is_empty() => vecs.remove(0),
-        Ok(_) => return None,
-        Err(e) => {
-            tracing::debug!("local semantic query embedding failed: {e:#}");
-            return None;
-        }
-    };
+        .context("embedding backend initialization panicked")?
+        .context(
+            "no embedding backend available, so the query cannot be embedded — set \
+             PRISM_EMBED_BACKEND=native (the default) or =openai with \
+             PRISM_EMBED_ENDPOINT_URL",
+        )?;
+    let query_vec = backend
+        .embed(std::slice::from_ref(&text.to_string()))
+        .await
+        .context("embedding the query failed")?
+        .into_iter()
+        .next()
+        .context("embedding backend returned no vector for the query")?;
 
-    match store
+    store
         .semantic_search_entities(&query_vec, LOCAL_ONTOLOGY_TENANT, limit)
         .await
-    {
-        Ok(hits) if !hits.is_empty() => Some(hits),
-        Ok(_) => None,
-        Err(e) => {
-            tracing::debug!("local semantic search failed: {e:#}");
-            None
-        }
-    }
 }
 
 /// Render local-ontology matches in the same shape the retired Neo4j path
@@ -8719,17 +8725,20 @@ async fn handle_query(text: &str, semantic: bool, limit: usize) -> Result<()> {
     let turso_db = PathBuf::from(home).join(".prism/provenance.db");
 
     if semantic {
-        // Bundled Turso entity vectors written by local ingest (offline
-        // prism-embed query embedding — no services needed).
-        let results = local_semantic_lookup(&turso_db, text, limit)
-            .await
-            .unwrap_or_default();
+        // Bundled Turso entity vectors written by local ingest, ranked by
+        // the native `vector_distance_cos()` (offline prism-embed query
+        // embedding — no services needed). An unusable index errors out
+        // here rather than printing an empty, reassuring list.
+        let results = local_semantic_lookup(&turso_db, text, limit).await?;
         println!("\nSemantic search results ({} matches):\n", results.len());
         for (i, (id, score)) in results.iter().enumerate() {
             println!("  {}. {id}  (score: {score:.4})", i + 1);
         }
         if results.is_empty() {
-            println!("  (no results — ingest data first with: prism ingest <path>)");
+            println!(
+                "  (the local semantic index is empty — ingest data first with: \
+                 prism ingest <path>)"
+            );
         }
     } else {
         // Graph traversal over the bundled Turso provenance store
