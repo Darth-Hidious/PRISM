@@ -318,6 +318,9 @@ const CLI_BACKED_ROOTS: &[&str] = &[
     // not a config-only subprocess that the running session would ignore.
     "compute",
     "campaign",
+    // Durable wake-ups for long-running goals — reachable as `/schedule …`
+    // inside the TUI, never "go run the CLI" (memory prism-no-exit-to-cli).
+    "schedule",
     "notebook",
     "pyiron",
     "billing",
@@ -351,6 +354,8 @@ pub fn builtin_help_text() -> String {
     lines.push("  /discourse list".to_string());
     lines.push("  /campaign start --goal \"...\" [--budget 5]".to_string());
     lines.push("  /campaign status <id>".to_string());
+    lines.push("  /schedule create --goal <id> --every 6h   (wake a goal back up)".to_string());
+    lines.push("  /schedule list | cancel <id> | tick".to_string());
     lines.push("  /skills list".to_string());
     lines.push("  /node up [--name x] | stop | status  (supervised in-app)".to_string());
 
@@ -376,6 +381,9 @@ mod tests {
         assert!(help.contains("/billing"));
         assert!(help.contains("/use show"));
         assert!(help.contains("/campaign start"));
+        // A goal that runs for months needs its wake-ups reachable INSIDE
+        // the TUI — never "go run the prism CLI".
+        assert!(help.contains("/schedule create"));
     }
 
     #[test]
@@ -383,6 +391,7 @@ mod tests {
         assert!(is_cli_backed_slash_root("workflow"));
         assert!(is_cli_backed_slash_root("status"));
         assert!(is_cli_backed_slash_root("gpus"));
+        assert!(is_cli_backed_slash_root("schedule"));
         assert!(!is_cli_backed_slash_root("session"));
         assert!(!is_cli_backed_slash_root("permissions"));
     }

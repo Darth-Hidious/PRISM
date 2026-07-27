@@ -9,11 +9,18 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+# Recurring wake-ups in standard crontab syntax. Its transitive deps
+# (winnow, phf, once_cell, chrono) are all already in the lockfile.
+cron = "0.17"
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# Pod-local embedded libSQL for the durable schedule registry — a file, never
+# a co-located database server.
+turso.workspace = true
 uuid = { workspace = true }
 
 prism-workflows = { path = "../workflows" }

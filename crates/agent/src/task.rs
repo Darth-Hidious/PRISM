@@ -369,12 +369,14 @@ pub fn research_outcome_from_turn(
     turn_text: &str,
     new_artifact_refs: Vec<String>,
     new_notes: Vec<String>,
+    cost_usd: f64,
 ) -> prism_campaign::ResearchIterationOutcome {
     prism_campaign::ResearchIterationOutcome {
         progress: assess_research_progress(goal, turn_text),
         summary,
         artifact_refs: new_artifact_refs,
         notes: new_notes,
+        cost_usd,
     }
 }
 
@@ -406,6 +408,14 @@ pub struct TurnOutcome {
     pub new_artifacts: Vec<ArtifactHandle>,
     /// Working notes the model emitted this turn (if any).
     pub new_notes: Vec<String>,
+    /// What this turn actually cost in USD, as reported by whatever billed
+    /// it. `0.0` means "nothing reported a cost", NOT "this was free" —
+    /// `CampaignState::budget_status` tells those apart and says so out loud,
+    /// so a USD ceiling is never mistaken for enforced when nothing is
+    /// measuring spend. PRISM's local research loop has no price table, so
+    /// this stays 0.0 until a billing surface reports per-turn spend; the
+    /// schedule's wake-up ceiling is the guard that does not depend on it.
+    pub cost_usd: f64,
 }
 
 /// Run one task-driven turn against the agent loop. Implemented at the call
@@ -481,6 +491,7 @@ impl<R: TurnRunner + 'static> prism_campaign::ResearchIterationExecutor
                 &turn.text,
                 turn.new_artifacts.into_iter().map(|h| h.id).collect(),
                 turn.new_notes,
+                turn.cost_usd,
             ))
         })
     }
@@ -778,6 +789,7 @@ mod tests {
             "All criteria met",
             vec!["prov:paper1".into()],
             vec!["Ti-W-Mo >2000K promising".into()],
+            0.75,
         );
         assert_eq!(
             outcome.summary,
@@ -786,6 +798,9 @@ mod tests {
         assert_eq!(outcome.artifact_refs, vec!["prov:paper1".to_string()]);
         assert_eq!(outcome.notes, vec!["Ti-W-Mo >2000K promising".to_string()]);
         assert_eq!(outcome.progress, 1.0); // "All criteria met" detected
+        // The cost the caller reported reaches the checkpoint verbatim — this
+        // is the only path by which a research goal's USD ceiling can fire.
+        assert_eq!(outcome.cost_usd, 0.75);
     }
 
     // ── AgentResearchExecutor tests (via a stub TurnRunner) ─────────────
@@ -795,6 +810,7 @@ mod tests {
     /// correct independent of a live LLM.
     struct StubTurnRunner {
         reply: String,
+        cost_usd: f64,
     }
 
     impl TurnRunner for StubTurnRunner {
@@ -815,6 +831,7 @@ mod tests {
                         bytes: 99,
                     }],
                     new_notes: vec!["stub note".into()],
+                    cost_usd: self.cost_usd,
                 })
             })
         }
@@ -830,6 +847,7 @@ mod tests {
         };
         let executor = AgentResearchExecutor::new(StubTurnRunner {
             reply: "All criteria met: survey complete with 4 corroborated sources.".into(),
+            cost_usd: 0.31,
         });
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -844,6 +862,9 @@ mod tests {
         assert_eq!(outcome.progress, 1.0);
         // Summary is the first line of the reply.
         assert!(outcome.summary.starts_with("All criteria met"));
+        // The turn's reported spend reaches the campaign checkpoint, which is
+        // what makes the goal's USD ceiling enforceable at all.
+        assert_eq!(outcome.cost_usd, 0.31);
     }
 
     #[test]
@@ -855,6 +876,7 @@ mod tests {
         let ctx = prism_campaign::ResearchIterationContext::default();
         let executor = AgentResearchExecutor::new(StubTurnRunner {
             reply: String::new(),
+            cost_usd: 0.0,
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let outcome = rt

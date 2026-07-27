@@ -53,6 +53,23 @@ use tracing::{debug, info, warn};
 
 use prism_provenance::{ActionType, Actor, ProvenanceRecord, ProvenanceStore, new_record};
 
+/// Durable schedules and watchers — what wakes a paused or crashed goal back
+/// up without a human. See [`schedule`] for the design rationale.
+pub mod schedule;
+
+/// The USD a tool result says it cost, or 0.0 when it says nothing. Accepts
+/// the two names tools in this workspace actually emit. Never estimates: an
+/// invented price would turn the budget ceiling into a fiction, and
+/// [`CampaignState::budget_status`] reports "nothing ever billed" honestly
+/// rather than letting 0.0 read as "safely under budget".
+fn reported_cost(value: &serde_json::Value) -> f64 {
+    ["cost_usd", "cost"]
+        .iter()
+        .find_map(|k| value.get(*k).and_then(serde_json::Value::as_f64))
+        .unwrap_or(0.0)
+        .max(0.0)
+}
+
 // ── Configuration ───────────────────────────────────────────────────
 
 /// The user's discovery goal — what the campaign is trying to find.
@@ -179,6 +196,37 @@ impl GoalStatus {
             Self::Paused => "paused",
             Self::Completed => "completed",
             Self::Failed => "failed",
+        }
+    }
+}
+
+/// What the USD budget ceiling can honestly say about a goal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BudgetStatus {
+    /// No ceiling was configured. The iteration cap and the scheduler's
+    /// wake-up ceiling are the limits.
+    NoCeiling,
+    /// A ceiling is configured and real spend has been reported against it.
+    Measured { spent: f64, ceiling: f64 },
+    /// A ceiling is configured, iterations have run, and not one of them
+    /// reported a cost — so the ceiling cannot fire. A defect to surface,
+    /// not a green light.
+    Unmeasured { ceiling: f64 },
+}
+
+impl std::fmt::Display for BudgetStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCeiling => write!(f, "no USD ceiling set (iteration cap is the limit)"),
+            Self::Measured { spent, ceiling } => {
+                write!(f, "${spent:.4} spent of ${ceiling:.4} ceiling")
+            }
+            Self::Unmeasured { ceiling } => write!(
+                f,
+                "${ceiling:.4} ceiling set but NO step has reported a cost — the USD ceiling \
+                 CANNOT stop this goal; the iteration cap and the schedule's wake-up ceiling are \
+                 the only real limits"
+            ),
         }
     }
 }
@@ -329,6 +377,28 @@ impl CampaignState {
         self.candidates.len()
     }
 
+    /// Honest account of the USD ceiling.
+    ///
+    /// The loop stops when `total_cost_usd >= budget_usd`, but that check is
+    /// only meaningful if something is actually reporting costs. When a
+    /// ceiling is configured and work has run yet nothing has ever billed,
+    /// the ceiling is **unenforceable** — reporting that as "under budget"
+    /// would be a check that says OK about an unusable thing.
+    #[must_use]
+    pub fn budget_status(&self) -> BudgetStatus {
+        let Some(ceiling) = self.config.budget_usd else {
+            return BudgetStatus::NoCeiling;
+        };
+        let did_work = self.current_iteration > 0;
+        if did_work && self.total_cost_usd <= 0.0 {
+            return BudgetStatus::Unmeasured { ceiling };
+        }
+        BudgetStatus::Measured {
+            spent: self.total_cost_usd,
+            ceiling,
+        }
+    }
+
     /// Average reward across all candidates.
     pub fn avg_reward(&self) -> f64 {
         if self.candidates.is_empty() {
@@ -360,6 +430,7 @@ impl CampaignState {
             "Candidates evaluated: {}\n",
             self.total_evaluated()
         ));
+        s.push_str(&format!("Budget: {}\n", self.budget_status()));
         s.push_str(&format!("Avg reward: {:.4}\n", self.avg_reward()));
         if let Some(best) = self.best() {
             s.push_str(&format!(
@@ -462,6 +533,13 @@ pub struct ResearchIterationOutcome {
     /// Optional notes to fold into the task's working memory next iteration.
     #[serde(default)]
     pub notes: Vec<String>,
+    /// What this iteration actually cost, in USD, as reported by whatever
+    /// billed it. This is the ONLY way a research campaign's USD ceiling can
+    /// be enforced — an executor that never reports a cost leaves the
+    /// ceiling unmeasurable, which [`CampaignState::budget_status`] reports
+    /// rather than passing off as "under budget".
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// Executor seam for research campaigns. Implemented by the agent layer
@@ -836,11 +914,27 @@ impl Campaign {
                 info!(campaign = %self.state.campaign_id, "research campaign hit budget limit");
                 break;
             }
-            // Approval gate.
+            // Approval gate. Recorded exactly like the materials loop's:
+            // `transition` sets `status` (not just the legacy `paused` flag),
+            // writes the provenance event, and checkpoints; `gates_hit` stops
+            // the same gate re-pausing a resumed campaign forever. Setting
+            // only `paused` left the checkpoint claiming `status: submitted`
+            // while the goal sat at a gate — a scheduler reading `status`
+            // would have seen a resumable goal and walked straight through
+            // the approval.
             let iter = self.state.current_iteration;
-            if self.state.config.approval_gate_at.contains(&iter) && iter > 0 {
-                self.state.paused = true;
-                self.checkpoint()?;
+            if self.state.config.approval_gate_at.contains(&iter)
+                && iter > 0
+                && !self.state.gates_hit.contains(&iter)
+            {
+                self.state.gates_hit.push(iter);
+                info!(
+                    campaign = %self.state.campaign_id,
+                    iteration = iter,
+                    "research campaign paused at approval gate"
+                );
+                self.transition(GoalStatus::Paused, |_| serde_json::json!({ "gate": iter }))
+                    .await?;
                 break;
             }
 
@@ -862,6 +956,10 @@ impl Campaign {
                 "research iteration complete"
             );
 
+            // Spend accrues BEFORE the next budget check at the loop top, so
+            // the ceiling is tested against what has really been billed.
+            self.state.total_cost_usd += outcome.cost_usd.max(0.0);
+
             self.record_event(
                 "campaign.research.iter",
                 serde_json::json!({
@@ -870,6 +968,8 @@ impl Campaign {
                     "progress": outcome.progress,
                     "artifacts": outcome.artifact_refs,
                     "notes": outcome.notes,
+                    "cost_usd": outcome.cost_usd,
+                    "total_cost_usd": self.state.total_cost_usd,
                 }),
             )
             .await;
@@ -906,9 +1006,23 @@ impl Campaign {
                 }),
             )
             .await;
+            // Write the terminal STATUS, not just the legacy `completed`
+            // flag. `from_checkpoint`'s flag→status fixup only fires while
+            // status is still `Submitted`, so a research goal that had ever
+            // paused at a gate (which now sets `status: paused` for real)
+            // would otherwise stay "paused" forever after finishing — every
+            // reader, this scheduler included, would treat a done goal as
+            // still waiting on a human.
+            self.transition(GoalStatus::Completed, |state| {
+                serde_json::json!({
+                    "reason": state.completion_reason,
+                    "research_steps": state.research_outcomes.len(),
+                })
+            })
+            .await?;
+        } else {
+            self.checkpoint()?;
         }
-
-        self.checkpoint()?;
 
         // Build a research-shaped result. winners/candidates are empty (those
         // are materials concepts); the research summary + artifact refs live
@@ -1020,6 +1134,11 @@ impl Campaign {
             );
         }
         let n_evaluated = evaluated.len();
+
+        // Accrue whatever the evaluator actually reported spending. Read, do
+        // not estimate: a made-up price would make the ceiling a fiction.
+        let iteration_cost: f64 = evaluated.iter().map(|c| reported_cost(&c.properties)).sum();
+        self.state.total_cost_usd += iteration_cost;
 
         // ── 3. Rank by reward (descending) ───────────────────────────
         evaluated.sort_by(|a, b| {
@@ -1359,13 +1478,36 @@ impl Campaign {
     /// background process — the goal id must exist on disk (and thus at
     /// `GET /api/goals`) the moment `--detach` returns, not only after the
     /// first `checkpoint_every` iterations.
+    /// The write is atomic — a temp file in the same directory, then a
+    /// rename. `std::fs::write` truncates first, so a crash mid-write (the
+    /// exact event this checkpoint exists to survive) left a half-written
+    /// file that `from_checkpoint` could not parse: the goal, its budget and
+    /// all its accumulated work, gone. A rename either happens or does not.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.state.last_checkpoint_at = Utc::now().to_rfc3339();
         if let Some(parent) = self.checkpoint_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(&self.state)?;
-        std::fs::write(&self.checkpoint_path, text)?;
+        let tmp = self
+            .checkpoint_path
+            .with_extension(format!("tmp-{}", std::process::id()));
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)
+                .with_context(|| format!("failed to open temp checkpoint {}", tmp.display()))?;
+            file.write_all(text.as_bytes())?;
+            // Durability of the CONTENT before the rename publishes it —
+            // without this the rename can land ahead of the bytes and a
+            // power loss leaves a valid name pointing at an empty file.
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.checkpoint_path).with_context(|| {
+            format!(
+                "failed to publish checkpoint {}",
+                self.checkpoint_path.display()
+            )
+        })?;
         debug!(
             campaign = %self.state.campaign_id,
             path = %self.checkpoint_path.display(),
@@ -1423,6 +1565,68 @@ mod tests {
         assert!(!state.completed);
         assert!(!state.paused);
         assert_eq!(state.total_evaluated(), 0);
+    }
+
+    #[test]
+    fn budget_ceiling_reports_unmeasured_instead_of_pretending_to_be_under() {
+        let config = CampaignConfig {
+            budget_usd: Some(25.0),
+            ..Default::default()
+        };
+        let mut state = CampaignState::new("c1".into(), test_goal(), config);
+        // Nothing has run yet — a ceiling with no spend is simply untouched.
+        assert_eq!(
+            state.budget_status(),
+            BudgetStatus::Measured {
+                spent: 0.0,
+                ceiling: 25.0
+            }
+        );
+        // Iterations ran and nothing billed: the ceiling cannot fire, and the
+        // status must say so rather than read as "$0.00 of $25.00, fine".
+        state.current_iteration = 4;
+        assert_eq!(
+            state.budget_status(),
+            BudgetStatus::Unmeasured { ceiling: 25.0 }
+        );
+        assert!(
+            state.budget_status().to_string().contains("CANNOT stop"),
+            "the unmeasured case must name the defect: {}",
+            state.budget_status()
+        );
+        // Once something bills, it becomes a real measurement again.
+        state.total_cost_usd = 3.25;
+        assert_eq!(
+            state.budget_status(),
+            BudgetStatus::Measured {
+                spent: 3.25,
+                ceiling: 25.0
+            }
+        );
+    }
+
+    #[test]
+    fn no_ceiling_says_so() {
+        let state = CampaignState::new("c1".into(), test_goal(), CampaignConfig::default());
+        assert_eq!(state.budget_status(), BudgetStatus::NoCeiling);
+    }
+
+    #[test]
+    fn reported_cost_reads_what_the_tool_said_and_never_invents() {
+        assert_eq!(reported_cost(&json!({"cost_usd": 0.42})), 0.42);
+        assert_eq!(reported_cost(&json!({"cost": 1.5})), 1.5);
+        // Silence is 0.0 — surfaced by budget_status, never estimated here.
+        assert_eq!(reported_cost(&json!({"density": 8.1})), 0.0);
+        // A negative price is nonsense; clamp rather than credit the goal.
+        assert_eq!(reported_cost(&json!({"cost_usd": -5.0})), 0.0);
+    }
+
+    #[test]
+    fn research_outcome_cost_defaults_to_zero_on_legacy_checkpoints() {
+        // Checkpoints written before cost_usd existed must still load.
+        let legacy = json!({"summary": "s", "progress": 0.5});
+        let outcome: ResearchIterationOutcome = serde_json::from_value(legacy).unwrap();
+        assert_eq!(outcome.cost_usd, 0.0);
     }
 
     #[test]
@@ -1710,6 +1914,7 @@ mod tests {
                         artifact_refs: Vec::new(),
                         progress: 0.5,
                         notes: Vec::new(),
+                        cost_usd: 0.0,
                     })
                 })
             }
@@ -1739,6 +1944,9 @@ mod tests {
     /// findings over several turns then declares success.
     struct PhasedExecutor {
         complete_at: usize,
+        /// USD this executor reports per iteration — the seam the real
+        /// budget ceiling is enforced through.
+        cost_per_iteration: f64,
     }
     impl ResearchIterationExecutor for PhasedExecutor {
         fn execute_iteration<'a>(
@@ -1756,6 +1964,7 @@ mod tests {
                     artifact_refs: vec![format!("prov:step{iter}")],
                     progress: if done { 1.0 } else { 0.3 },
                     notes: vec![format!("note from step {}", iter + 1)],
+                    cost_usd: self.cost_per_iteration,
                 })
             })
         }
@@ -1781,7 +1990,10 @@ mod tests {
         let mut campaign =
             Campaign::new_research(research_goal_for_run(), config, "test-research-1".into());
         // Completes at iteration 3 (0-indexed: iters 0,1,2,3 where 3 is done).
-        let executor = PhasedExecutor { complete_at: 3 };
+        let executor = PhasedExecutor {
+            complete_at: 3,
+            cost_per_iteration: 0.0,
+        };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt
@@ -1810,7 +2022,10 @@ mod tests {
         let mut campaign =
             Campaign::new_research(research_goal_for_run(), config, "test-research-cap".into());
         // Never completes — progress stays at 0.3 forever.
-        let executor = PhasedExecutor { complete_at: 100 };
+        let executor = PhasedExecutor {
+            complete_at: 100,
+            cost_per_iteration: 0.0,
+        };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt
@@ -1820,6 +2035,93 @@ mod tests {
         assert!(result.state.completed);
         assert_eq!(result.state.completion_reason, "iteration_limit");
         assert_eq!(result.state.research_outcomes.len(), 2);
+    }
+
+    #[test]
+    fn run_research_records_its_approval_gate_like_the_materials_loop() {
+        // The gate used to set only the legacy `paused` flag: the checkpoint
+        // said `status: submitted` while the goal sat waiting for a human, and
+        // `gates_hit` stayed empty so a resume would re-pause at the same gate
+        // forever.
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut config = CampaignConfig {
+            max_iterations: 100,
+            checkpoint_every: 0,
+            approval_gate_at: vec![2],
+            ..Default::default()
+        };
+        config.checkpoint_dir = Some(temp.path().parent().unwrap().to_path_buf());
+        let mut campaign =
+            Campaign::new_research(research_goal_for_run(), config, "test-research-gate".into());
+        let executor = PhasedExecutor {
+            complete_at: 100,
+            cost_per_iteration: 0.0,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt
+            .block_on(campaign.run_research(&executor))
+            .expect("pauses at the gate");
+
+        assert_eq!(result.state.status, GoalStatus::Paused);
+        assert!(result.state.paused);
+        assert!(!result.state.completed);
+        assert_eq!(result.state.current_iteration, 2);
+        assert_eq!(
+            result.state.gates_hit,
+            vec![2],
+            "the gate must be recorded so a resume does not re-pause forever"
+        );
+    }
+
+    #[test]
+    fn run_research_stops_at_the_budget_ceiling_and_says_why() {
+        // Before executor-reported cost existed, `total_cost_usd` was never
+        // written and this ceiling could not fire at any spend — the goal ran
+        // to its iteration cap regardless of `budget_usd`.
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut config = CampaignConfig {
+            max_iterations: 100,
+            checkpoint_every: 0,
+            budget_usd: Some(2.5),
+            ..Default::default()
+        };
+        config.checkpoint_dir = Some(temp.path().parent().unwrap().to_path_buf());
+        let mut campaign = Campaign::new_research(
+            research_goal_for_run(),
+            config,
+            "test-research-budget".into(),
+        );
+        // Never finishes on its own; bills $1 per iteration.
+        let executor = PhasedExecutor {
+            complete_at: 100,
+            cost_per_iteration: 1.0,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt
+            .block_on(campaign.run_research(&executor))
+            .expect("runs to the ceiling");
+
+        assert_eq!(
+            result.state.completion_reason, "budget_exhausted",
+            "the ceiling must stop the loop, not the iteration cap"
+        );
+        // Stopped as soon as spend reached the ceiling — 3 iterations to go
+        // from $0 to $3, checked at the top of the 4th.
+        assert_eq!(result.state.research_outcomes.len(), 3);
+        assert_eq!(result.state.total_cost_usd, 3.0);
+        assert!(
+            result.state.current_iteration < 100,
+            "must not run to the iteration cap"
+        );
+        assert_eq!(
+            result.state.budget_status(),
+            BudgetStatus::Measured {
+                spent: 3.0,
+                ceiling: 2.5
+            }
+        );
     }
 
     #[test]
@@ -1861,6 +2163,7 @@ mod tests {
                         artifact_refs: vec![format!("prov:i{}", ctx.iteration)],
                         progress: if ctx.iteration >= 2 { 1.0 } else { 0.2 },
                         notes: vec![format!("note {}", ctx.iteration)],
+                        cost_usd: 0.0,
                     })
                 })
             }
@@ -1886,7 +2189,10 @@ mod tests {
         config.checkpoint_dir = Some(dir.clone());
         let mut campaign =
             Campaign::new_research(research_goal_for_run(), config, "test-research-cp".into());
-        let executor = PhasedExecutor { complete_at: 2 };
+        let executor = PhasedExecutor {
+            complete_at: 2,
+            cost_per_iteration: 0.0,
+        };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _ = rt.block_on(campaign.run_research(&executor)).expect("runs");
 
