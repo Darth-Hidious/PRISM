@@ -59,15 +59,27 @@ const FREE_SESSIONS: &[(&str, &[&str])] = &[
     ("terse software — improve", &["improve my code"]),
     ("terse software — performance", &["make it faster"]),
     (
+        "terse software — perf, possessive",
+        &["make my code faster"],
+    ),
+    (
         "anaphora after a real turn",
         &[EXPERT_QUERY, "now make it stronger"],
     ),
 ];
 
-/// The control. This one is SUPPOSED to cost a classifier call: a non-expert
+/// The controls. These are SUPPOSED to cost a classifier call: a non-expert
 /// naming no material and no direction is exactly what the feature exists for.
-/// Without it, "make everything free" would pass this file.
-const PAID_SESSION: (&str, &[&str]) = ("materials vagueness", &["Make my alloy better"]);
+/// Without them, "make everything free" would pass this file.
+///
+/// The second one is the blast-radius guard. Narrowing the software case by
+/// deleting `faster` from `BARE_COMPARATIVES` also stopped "make my process
+/// faster" escalating — a real regression, invisible to `FREE_SESSIONS` because
+/// a wrongly-free session and a rightly-free session look identical there.
+const PAID_SESSIONS: &[(&str, &[&str])] = &[
+    ("materials vagueness", &["Make my alloy better"]),
+    ("process vagueness — speed", &["make my process faster"]),
+];
 
 type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
 
@@ -245,8 +257,10 @@ async fn the_pass_through_path_is_byte_identical_with_and_without_the_reprompter
             "[{label}] must reach the model, not be interrogated"
         );
     }
-    let (paid_on, paid_answer_on, _) =
-        session_traffic(project.path(), &python, PAID_SESSION.1).await;
+    let mut paid_on = Vec::new();
+    for (_, messages) in PAID_SESSIONS {
+        paid_on.push(session_traffic(project.path(), &python, messages).await);
+    }
 
     // Reprompter OFF — the pre-feature baseline.
     unsafe { std::env::set_var("PRISM_REPROMPT", "0") };
@@ -254,8 +268,10 @@ async fn the_pass_through_path_is_byte_identical_with_and_without_the_reprompter
     for (_, messages) in FREE_SESSIONS {
         off.push(session_traffic(project.path(), &python, messages).await);
     }
-    let (paid_off, paid_answer_off, _) =
-        session_traffic(project.path(), &python, PAID_SESSION.1).await;
+    let mut paid_off = Vec::new();
+    for (_, messages) in PAID_SESSIONS {
+        paid_off.push(session_traffic(project.path(), &python, messages).await);
+    }
     unsafe { std::env::remove_var("PRISM_REPROMPT") };
 
     for (i, (label, _)) in FREE_SESSIONS.iter().enumerate() {
@@ -289,26 +305,29 @@ async fn the_pass_through_path_is_byte_identical_with_and_without_the_reprompter
         );
     }
 
-    // The control: this one MUST cost, or the parity above was bought by
-    // disabling the feature.
-    let (label, _) = PAID_SESSION;
-    assert!(
-        paid_on.iter().any(is_classifier_request),
-        "[{label}] the reprompter no longer fires on the case it exists for"
-    );
-    assert!(
-        !paid_off.iter().any(is_classifier_request),
-        "[{label}] the kill switch did not switch it off"
-    );
-    assert_ne!(
-        paid_answer_on, paid_answer_off,
-        "[{label}] with the reprompter on, the vague request must be answered \
-         with a question rather than run as if it were specified"
-    );
-    assert_eq!(paid_answer_off, "AGENT_ANSWER");
-    eprintln!(
-        "[{label}] PAID as designed: {} request(s) on vs {} off",
-        paid_on.len(),
-        paid_off.len(),
-    );
+    // The controls: these MUST cost, or the parity above was bought by
+    // disabling the feature (or by narrowing it too far).
+    for (i, (label, _)) in PAID_SESSIONS.iter().enumerate() {
+        let (requests_on, answer_on, _) = &paid_on[i];
+        let (requests_off, answer_off, _) = &paid_off[i];
+        assert!(
+            requests_on.iter().any(is_classifier_request),
+            "[{label}] the reprompter no longer fires on a case it exists for"
+        );
+        assert!(
+            !requests_off.iter().any(is_classifier_request),
+            "[{label}] the kill switch did not switch it off"
+        );
+        assert_ne!(
+            answer_on, answer_off,
+            "[{label}] with the reprompter on, the vague request must be answered \
+             with a question rather than run as if it were specified"
+        );
+        assert_eq!(answer_off, "AGENT_ANSWER");
+        eprintln!(
+            "[{label}] PAID as designed: {} request(s) on vs {} off",
+            requests_on.len(),
+            requests_off.len(),
+        );
+    }
 }
