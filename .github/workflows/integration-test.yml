@@ -7,6 +7,7 @@ on:
       - "app/**"
       - "dashboard/**"
       - "tests/**"
+      - "pyproject.toml"
       - ".github/workflows/integration-test.yml"
   push:
     branches:
@@ -15,6 +16,7 @@ on:
       - "crates/**"
       - "app/**"
       - "tests/**"
+      - "pyproject.toml"
       - ".github/workflows/integration-test.yml"
 
 concurrency:
@@ -122,6 +124,62 @@ jobs:
       - name: Lint tool schemas + descriptions (TOOL_SURFACE_SPEC D1-D4)
         run: PRISM_DISABLE_MEMORY=1 python3 scripts/lint_tool_schemas.py
 
+  python-suite:
+    name: Python Test Suite
+    # Until this job existed, NOTHING in .github/workflows ran pytest — every
+    # job here and in rust-backbone.yml is cargo, npm or a one-off python -c.
+    # That is how a defect that broke every execute_bash after a search
+    # survived a release with a test suite sitting in tests/.
+    #
+    # WHAT THIS JOB CANNOT PROVE. The runner is ARM64 Linux. The fork hazard
+    # tests/test_fork_safety.py exists for is Apple Network.framework's atfork
+    # handler, which does not exist here, so the "survives a materials search"
+    # half of that file is meaningless on this runner even when it passes.
+    # Its "never forks" half is not: that one intercepts CPython's fork+exec
+    # entry point directly and holds on any platform. Read a green here as
+    # "no call site reaches fork()", never as "the macOS crash is fixed" —
+    # only a macOS run can say that.
+    runs-on: [self-hosted, linux, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install PRISM + test dependencies
+        # Deliberately no `|| true`. If the install fails there is nothing to
+        # test, and continuing would report a green on an empty run.
+        #
+        # `[dev]` only, not `[ml]`: matgl/torch is several GB on a 15G runner
+        # already shared with two cargo target dirs. The 12 tests that need
+        # scikit-learn, the 3 that need pycalphad and the pexpect-based TUI
+        # e2e file skip with that reason printed by `-rs` below, so the log
+        # says what went unrun instead of implying full coverage.
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e ".[dev]"
+      - name: pytest tests/
+        run: python3 -m pytest tests/ -q -rs
+      - name: pytest tests/ in reversed file order
+        # Alphabetical order is exactly what hid the fork-safety defect: the
+        # file that poisoned the process happened to sort after the files it
+        # broke, so `pytest tests/` was green while the same files reversed
+        # were 19 red. A forward-only run would have caught nothing.
+        #
+        # No pipe into `tail`/`tee` here: a shell pipeline exits with the LAST
+        # command's status, so `pytest | tail` reports tail's 0 and turns a red
+        # run green. The step is the bare pytest, and `bash -e` fails the job.
+        run: |
+          # Splitting the substitution is the mechanism, not an accident: one
+          # shell word per test file. The names are `test_*.py`, so there is
+          # nothing here to split badly on.
+          # shellcheck disable=SC2046
+          set -- $(printf '%s\n' tests/test_*.py | sort -r)
+          # An unmatched glob hands back the literal pattern; say so rather
+          # than let pytest's "no tests collected" read as a pass.
+          test -e "$1" || { echo "no tests/test_*.py matched"; exit 1; }
+          echo "reversed order: $# files, first is $1"
+          python3 -m pytest -q -rs "$@"
+
   ingest-pipeline:
     name: Ingest Pipeline (bundled Turso store)
     runs-on: [self-hosted, linux, ARM64]
@@ -198,7 +256,13 @@ jobs:
           "
 
       - name: Test workflow list
-        run: "$CARGO_TARGET_DIR"/debug/prism workflow list 2>&1 | grep "forge"
+        # Block scalar, not a bare `run:`. A plain value that STARTS with a
+        # quote is a quoted YAML scalar, so everything after the closing quote
+        # is a parse error — and GitHub rejects the whole FILE, not the step:
+        # every run of this workflow from ecedc1b8 (2026-07-10) until this
+        # commit ended in 0s with "workflow file issue" and ran no jobs at all.
+        run: |
+          "$CARGO_TARGET_DIR"/debug/prism workflow list 2>&1 | grep "forge"
 
       - name: Test error handling
         run: |
