@@ -39,6 +39,12 @@ def check_mace_available() -> bool:
 
     Each is gated by its own try/except so the error message can point the
     user at the right missing piece if they only installed a subset.
+
+    `ulid` is a core dependency (see `[project] dependencies` in
+    pyproject.toml), so on a provisioned install only the first two legs can
+    fail. The third stays because it is still reachable in a hand-assembled
+    environment, and because it keeps the reported missing-piece list a fact
+    rather than an assumption.
     """
     missing: list[str] = []
     try:
@@ -67,7 +73,7 @@ def _mace_missing_error() -> dict[str, Any]:
         "rationale": (
             "MACE-MH-1 is PyTorch-only as of 2026 (mace-jax does not yet support "
             "the multi-head MH-1 architecture). Installing the `[mace]` extra adds "
-            "mace-torch + torch + ase + python-ulid. PRISM's broader stack remains "
+            "mace-torch + torch + ase. PRISM's broader stack remains "
             "JAX-native; MACE is an explicit PyTorch holdout pinned by upstream."
         ),
     }

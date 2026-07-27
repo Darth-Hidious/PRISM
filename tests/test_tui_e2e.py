@@ -26,11 +26,27 @@ import signal
 import pathlib
 import traceback
 
-import pexpect
+import pytest
+
+# Two things this file cannot run without, and neither is a PRISM dependency:
+# a PTY client, and a release build of the binary it drives. Import-time
+# `import pexpect` turned both into a collection error, which aborts the whole
+# suite before a single test runs. Skipping with the reason stated is the
+# honest form: it says what is absent and how to supply it.
+pexpect = pytest.importorskip(
+    "pexpect",
+    reason="drives the TUI through a real PTY; pexpect is not a PRISM "
+    "dependency — install it to run this file: pip install pexpect",
+)
 
 # ── Config ──────────────────────────────────────────────────────────
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PRISM_BIN = str(PROJECT_ROOT / "target" / "release" / "prism")
+
+pytestmark = pytest.mark.skipif(
+    not pathlib.Path(PRISM_BIN).exists(),
+    reason=f"no release binary at {PRISM_BIN} — build it first: cargo build --release",
+)
 PYTHON_BIN = str(PROJECT_ROOT / ".venv" / "bin" / "python")
 TIMEOUT_SHORT = 5   # seconds for quick interactions
 TIMEOUT_MEDIUM = 15 # seconds for backend startup + first response

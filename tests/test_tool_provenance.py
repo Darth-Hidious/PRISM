@@ -15,9 +15,20 @@ import json
 import pathlib
 
 import numpy as np
+import importlib.util
+
 import pytest
 
 from app.tools import _provenance as prov
+
+#: scikit-learn ships in the `[ml]` extra, not in a default provision, so a
+#: normally-installed box has to say "skipped, and here is why" rather than
+#: fail. A red suite nobody can run teaches everyone to ignore the suite.
+requires_sklearn = pytest.mark.skipif(
+    importlib.util.find_spec("sklearn") is None,
+    reason="needs scikit-learn from the `[ml]` extra: "
+    "pip install 'prism-platform[ml]'",
+)
 
 
 #: What every bundle must carry, whatever produced it.
@@ -307,6 +318,7 @@ def trained_registry(tmp_path):
     return reg
 
 
+@requires_sklearn
 class TestPredictorProvenance:
     def test_prediction_is_reconstructable(self, trained_registry):
         from app.tools.ml.predictor import Predictor
@@ -393,6 +405,7 @@ class TestPredictorProvenance:
 # Dataset-wide prediction skill
 # ---------------------------------------------------------------------------
 
+@requires_sklearn
 class TestPredictPropertiesProvenance:
     def test_result_carries_provenance_and_names_the_in_sample_caveat(
         self, tmp_path, monkeypatch
