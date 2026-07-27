@@ -89,4 +89,11 @@ def get_default_collector_registry() -> CollectorRegistry:
         reg.register(PatentCollector())
     except Exception:
         pass
+    try:
+        from app.tools.data_collectors.eastern_literature_collector import (
+            EasternLiteratureCollector,
+        )
+        reg.register(EasternLiteratureCollector())
+    except Exception:
+        pass
     return reg

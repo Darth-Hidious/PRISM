@@ -55,7 +55,7 @@ def _acquire_materials(**kwargs) -> dict:
                     elements=elements if elements else None,
                     max_results=max_results,
                 )
-            elif src in ("literature", "patents"):
+            elif src in ("literature", "patents", "eastern_literature"):
                 query = kwargs.get("query", "")
                 if not query and elements:
                     query = " ".join(elements) + " alloy"
@@ -140,7 +140,7 @@ ACQUIRE_SKILL = Skill(
             "sources": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Data sources to query: optimade, mp, omat24, literature, patents (default from preferences)",
+                "description": "Data sources to query: optimade, mp, omat24, literature, patents, eastern_literature (default from preferences)",
             },
             "max_results": {
                 "type": "integer",

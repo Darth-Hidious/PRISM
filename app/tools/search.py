@@ -51,6 +51,29 @@ def _literature_search_impl(**kwargs) -> dict:
     }
 
 
+def _eastern_search_impl(**kwargs) -> dict:
+    """Run the EasternLiteratureCollector — Soviet/Russian, Chinese and
+    Japanese sources that arXiv/Semantic Scholar do not index."""
+    from app.tools.data_collectors.eastern_literature_collector import (
+        EasternLiteratureCollector,
+    )
+    collector = EasternLiteratureCollector()
+    out = collector.collect_with_status(
+        query=kwargs.get("query", ""),
+        max_results=kwargs.get("max_results", 20),
+        sources=kwargs.get("sources"),
+    )
+    results = out["results"]
+    for r in results:
+        r["abstract"] = _compact_abstract(r.get("abstract"))
+    return {
+        "results": results,
+        "count": len(results),
+        "source": "eastern_literature",
+        "source_status": out["source_status"],
+    }
+
+
 def _patent_search_impl(**kwargs) -> dict:
     """Run the PatentCollector. Internal helper for both the unified tool
     and the legacy `patent_search` alias."""
@@ -67,15 +90,16 @@ def _patent_search_impl(**kwargs) -> dict:
 def _prior_art_search(**kwargs) -> dict:
     """Federated prior-art lookup.
 
-    `source`: "papers" (default), "patents", or "both".
+    `source`: "papers" (default), "patents", "eastern", or "both".
 
-    For "both", we run literature + patents in sequence (sequential is
-    fine here — neither call is heavy enough to need parallelism, and
-    keeping the two implementations independent means a Lens API
-    failure doesn't prevent literature results from flowing).
+    For "both", we run the backends in sequence (sequential is fine here —
+    no call is heavy enough to need parallelism, and keeping the
+    implementations independent means a Lens API failure doesn't prevent
+    literature results from flowing).
 
     Result shape stays uniform regardless of source:
-      { "papers": [...], "patents": [...], "counts": {"papers": N, "patents": M} }
+      { "papers": [...], "patents": [...], "eastern": [...],
+        "counts": {"papers": N, "patents": M, "eastern": K} }
     Empty arrays for unrequested sources so consumers don't have to
     null-check.
     """
@@ -86,9 +110,25 @@ def _prior_art_search(**kwargs) -> dict:
     out: dict = {
         "papers": [],
         "patents": [],
-        "counts": {"papers": 0, "patents": 0},
+        "eastern": [],
+        "counts": {"papers": 0, "patents": 0, "eastern": 0},
         "query": query,
     }
+
+    if source in ("eastern", "both"):
+        try:
+            east = _eastern_search_impl(
+                query=query,
+                max_results=max_results,
+                sources=kwargs.get("eastern_sources"),
+            )
+            out["eastern"] = east.get("results", [])
+            out["counts"]["eastern"] = east.get("count", 0)
+            # Gated sources (CNKI, eLIBRARY, Wanfang) report here by name so
+            # "no Chinese results" is never mistaken for "nothing published".
+            out["eastern_source_status"] = east.get("source_status", {})
+        except Exception as exc:
+            out["eastern_error"] = str(exc)
 
     if source in ("papers", "both"):
         try:
@@ -138,14 +178,19 @@ def create_search_tools(registry: ToolRegistry) -> None:
         name="prior_art_search",
         description=(
             "Federated prior-art search across scientific literature "
-            "(arXiv, Semantic Scholar) AND patents (Lens.org). Use this "
-            "for any 'what has been published / patented about X?' "
+            "(arXiv, Semantic Scholar), patents (Lens.org), AND non-Western "
+            "sources (CyberLeninka's Russian aerospace-materials journals, "
+            "NASA Technical Translations of Soviet work, J-STAGE Japanese "
+            "metallurgy, scanned Soviet handbooks on Internet Archive). Use "
+            "this for any 'what has been published / patented about X?' "
             "question. The `source` flag selects 'papers' (default), "
-            "'patents', or 'both'. Returns a uniform shape "
-            "{ papers, patents, counts } — empty arrays for unrequested "
-            "sources. Per-source failures (e.g. Lens auth missing) are "
-            "reported in `papers_error` / `patents_error` without "
-            "failing the whole call, so the agent gets partial results."
+            "'patents', 'eastern', or 'both'. Returns a uniform shape "
+            "{ papers, patents, eastern, counts } — empty arrays for "
+            "unrequested sources. Per-source failures (e.g. Lens auth "
+            "missing, CNKI licence required) are reported in `papers_error` "
+            "/ `patents_error` / `eastern_source_status` without failing the "
+            "whole call, so the agent gets partial results and knows which "
+            "source was skipped rather than genuinely empty."
         ),
         input_schema={
             "type": "object",
@@ -159,12 +204,28 @@ def create_search_tools(registry: ToolRegistry) -> None:
                 },
                 "source": {
                     "type": "string",
-                    "enum": ["papers", "patents", "both"],
+                    "enum": ["papers", "patents", "eastern", "both"],
                     "default": "papers",
                     "description": (
                         "What to search. 'papers' = arXiv + Semantic Scholar; "
                         "'patents' = Lens.org (needs LENS_API_TOKEN env); "
-                        "'both' = run both sequentially and merge."
+                        "'eastern' = Soviet/Russian, Japanese and scanned-"
+                        "handbook sources (CyberLeninka OAI, NASA Technical "
+                        "Translations, J-STAGE, Internet Archive) that the "
+                        "Western indexes do not cover — use it for Soviet-era "
+                        "alloy, rocket-engine and qualification literature; "
+                        "'both' = run all of them sequentially and merge."
+                    ),
+                },
+                "eastern_sources": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional override for the `eastern` backend list "
+                        "(default: cyberleninka, ntrs_translations, jstage, "
+                        "internet_archive). Naming a gated source (elibrary, "
+                        "cnki, wanfang) returns the credential it needs rather "
+                        "than an empty list."
                     ),
                 },
                 "max_results": {
