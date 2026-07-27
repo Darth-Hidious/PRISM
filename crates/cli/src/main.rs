@@ -1274,7 +1274,16 @@ async fn main() -> Result<()> {
     } else if let Some(p) = std::env::var_os("PRISM_PYTHON").filter(|p| !p.is_empty()) {
         PathBuf::from(p)
     } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        // HOME is not set on stock Windows, where the equivalent is
+        // USERPROFILE. Falling through to "." would silently put the venv in
+        // whatever directory the user happened to be in — and this runs
+        // before EVERY subcommand, so it is the one home-dir lookup that
+        // cannot be allowed to guess wrong.
+        // NOTE: the other `env::var("HOME")` sites in this file are still
+        // Unix-only; Windows support is not complete until they are too.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
         let prism_dir = PathBuf::from(&home).join(".prism");
         ensure_venv(&prism_dir, &project_root).await?
     };

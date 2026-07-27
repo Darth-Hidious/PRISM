@@ -327,6 +327,8 @@ mod tests {
     ///   `cargo test -p prism-agent --lib -- --ignored real_embedding`
     /// Proves neural retrieval ranks the right capability on real vectors from
     /// paraphrased queries with no literal keyword overlap.
+    // No native backend on Intel macOS (no ONNX Runtime for x86_64-apple-darwin).
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     #[tokio::test]
     #[ignore = "requires the local ONNX embed model; run with --ignored"]
     async fn real_embedding_backend_ranks_the_right_capability() {

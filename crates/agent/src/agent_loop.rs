@@ -1831,6 +1831,8 @@ mod tests {
     ///
     /// Ignored by default (needs the ~128 MB model). Run with:
     ///   `cargo test -p prism-agent --lib -- --ignored real_backend_wired`
+    // No native backend on Intel macOS (no ONNX Runtime for x86_64-apple-darwin).
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     #[tokio::test]
     #[ignore = "requires the local ONNX embed model; run with --ignored"]
     async fn real_backend_wired_selection_drops_from_keyword_survives_neural() {

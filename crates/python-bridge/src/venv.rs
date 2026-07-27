@@ -12,6 +12,7 @@ const MIN_MAJOR: u8 = 3;
 const MIN_MINOR: u8 = 11;
 
 /// Candidates to try, newest first.
+#[cfg(not(windows))]
 const PYTHON_CANDIDATES: &[&str] = &[
     "python3.14",
     "python3.13",
@@ -19,6 +20,31 @@ const PYTHON_CANDIDATES: &[&str] = &[
     "python3.11",
     "python3",
 ];
+
+/// Windows installers put `python.exe` on PATH, not `python3.X`. `python3`
+/// usually resolves to the Microsoft Store stub, which exits non-zero on
+/// `--version` — `check_python` rejects it on that basis, so it stays last
+/// rather than being special-cased.
+#[cfg(windows)]
+const PYTHON_CANDIDATES: &[&str] = &["python", "python3"];
+
+/// A venv's interpreter and pip live in different places per platform:
+/// `bin/python3` + `bin/pip` on Unix, `Scripts\python.exe` + `Scripts\pip.exe`
+/// on Windows. There is no `bin/` and no `python3.exe` in a Windows venv, so
+/// hardcoding the Unix layout made `ensure_venv` unable to ever succeed
+/// there — it would create the venv, fail to find `bin/python3`, and return
+/// the Debian "install python3-venv" error on a machine where venv creation
+/// had actually worked.
+pub fn venv_layout(venv_dir: &Path) -> (PathBuf, PathBuf) {
+    if cfg!(windows) {
+        (
+            venv_dir.join("Scripts").join("python.exe"),
+            venv_dir.join("Scripts").join("pip.exe"),
+        )
+    } else {
+        (venv_dir.join("bin/python3"), venv_dir.join("bin/pip"))
+    }
+}
 
 /// Ensure a managed venv exists at `{prism_dir}/venv/` and return the path to
 /// its `python3` binary.  Creates the venv (and pip-installs PRISM) on first
@@ -28,7 +54,7 @@ pub async fn ensure_venv(
     project_root: &Path,
 ) -> Result<PathBuf, PythonBridgeError> {
     let venv_dir = prism_dir.join("venv");
-    let venv_python = venv_dir.join("bin/python3");
+    let (venv_python, pip) = venv_layout(&venv_dir);
 
     // Fast path — venv exists AND actually has the PRISM tools. A venv
     // directory alone proves nothing (fresh boxes used to end up with an
@@ -58,14 +84,18 @@ pub async fn ensure_venv(
         }
         if !venv_python.exists() {
             return Err(PythonBridgeError::Spawn(std::io::Error::other(
-                "python -m venv failed — on Debian/Ubuntu run: sudo apt-get install -y python3-venv",
+                if cfg!(windows) {
+                    "python -m venv failed — reinstall Python from python.org with the \
+                     \"pip\" and \"py launcher\" options enabled"
+                } else {
+                    "python -m venv failed — on Debian/Ubuntu run: sudo apt-get install -y python3-venv"
+                },
             )));
         }
     }
 
     // 2. Self-heal a pipless venv: ensurepip, then pypa's get-pip bootstrap
     // (works without python3-venv and without sudo).
-    let pip = venv_dir.join("bin/pip");
     if !pip.exists() {
         let _ = Command::new(&venv_python)
             .args(["-m", "ensurepip", "--upgrade"])
@@ -74,7 +104,10 @@ pub async fn ensure_venv(
             .status()
             .await;
     }
-    if !pip.exists() {
+    // `sh` and `curl` are Unix assumptions; on Windows ensurepip above is the
+    // only bootstrap (python.org installers ship it), so skip rather than
+    // spawn a shell that does not exist.
+    if !pip.exists() && !cfg!(windows) {
         eprintln!("[prism] Bootstrapping pip (get-pip.py)…");
         let _ = Command::new("sh")
             .args([
@@ -98,8 +131,13 @@ pub async fn ensure_venv(
         .unwrap_or(false);
     if !pip_works {
         return Err(PythonBridgeError::Spawn(std::io::Error::other(
-            "venv has no working pip — on Debian/Ubuntu run: sudo apt-get install -y python3-venv, \
-             then delete ~/.prism/venv and relaunch prism",
+            if cfg!(windows) {
+                "venv has no working pip — reinstall Python from python.org with the \"pip\" \
+                 option enabled, then delete %USERPROFILE%\\.prism\\venv and relaunch prism"
+            } else {
+                "venv has no working pip — on Debian/Ubuntu run: sudo apt-get install -y \
+                 python3-venv, then delete ~/.prism/venv and relaunch prism"
+            },
         )));
     }
 
@@ -137,7 +175,8 @@ pub async fn ensure_venv(
     if !installed || !python_has_app(&venv_python).await {
         return Err(PythonBridgeError::Spawn(std::io::Error::other(format!(
             "could not install PRISM tools — retry manually: \
-             ~/.prism/venv/bin/pip install \"{wheel_spec}\""
+             {} install \"{wheel_spec}\"",
+            pip.display()
         ))));
     }
 
