@@ -340,12 +340,27 @@ const VAGUE_OBJECTS: &[&str] = &[
 ];
 
 /// Comparatives that assert a direction without naming one.
+///
+/// Deliberately EXCLUDED: `faster`. Unlike the rest, it is the canonical terse
+/// SOFTWARE ask ("make it faster") on an agent that reads code, runs builds and
+/// profiles — work PRISM does directly, and which the classifier resolves to
+/// [`Intent::Other`] (→ silent Proceed). The user never saw a question; they
+/// only paid for the round-trip. The materials-domain comparatives that this
+/// rule exists for — `stronger`, `better`, `cheaper` — all stay.
 const BARE_COMPARATIVES: &[&str] = &[
-    "better", "best", "good", "great", "improved", "faster", "cheaper", "stronger", "nicer", "more",
+    "better", "best", "good", "great", "improved", "cheaper", "stronger", "nicer", "more",
 ];
 
 /// Category nouns that stand in for a subject without being one. "My alloy" is
 /// not a material; "Hastelloy" is.
+///
+/// Deliberately EXCLUDED: `code`. It is not a materials/process category noun —
+/// it is the object of the most ordinary terse request a coding-capable agent
+/// gets ("fix my code"), which PRISM serves by reading the repo, not by asking
+/// which property the user meant. Every entry below still stands in for a
+/// materials, process or artefact subject, so `make my alloy better` and
+/// `optimize my material` are unaffected. (`system` and `model` stay: an alloy
+/// SYSTEM and a thermodynamic MODEL are real metallurgy subjects.)
 const GENERIC_NOUNS: &[&str] = &[
     "alloy",
     "alloys",
@@ -364,7 +379,6 @@ const GENERIC_NOUNS: &[&str] = &[
     "setup",
     "system",
     "model",
-    "code",
     "thing",
     "things",
     "stuff",
@@ -788,6 +802,50 @@ mod tests {
             "help me make this better",
         ] {
             assert_eq!(triage(q, false), Triage::Classify, "not escalated: {q}");
+        }
+    }
+
+    /// DEFECT (adversarial review): the vagueness rule taxed terse SOFTWARE
+    /// requests. PRISM is a coding-capable agent — its own tests assert that
+    /// "Why does my Rust build fail with E0507?" must Proceed — so these are
+    /// ordinary, not vague. When the classifier answers `other` the cost is one
+    /// silent round-trip the module's own doc calls "net negative"; when it
+    /// answers anything else it is worse, and `reprompt_cost_parity` measured
+    /// that worse case: "fix my code" was answered with "Which material, and
+    /// which property?" instead of reaching the model at all.
+    ///
+    /// The cause was vocabulary, not structure: `code` sat in `GENERIC_NOUNS`
+    /// (a list meant for "my alloy" / "my material") and `faster` sat in
+    /// `BARE_COMPARATIVES`.
+    #[test]
+    fn terse_software_requests_are_not_taxed() {
+        for q in [
+            "fix my code",
+            "improve my code",
+            "optimize my code",
+            "make it faster",
+            "make my code faster",
+        ] {
+            assert_eq!(triage(q, false), Triage::Proceed, "over-escalated: {q}");
+        }
+    }
+
+    /// …and the materials-domain rule this feature exists for is untouched.
+    /// Both edits were domain-neutral vocabulary: every remaining generic noun
+    /// still stands in for a materials/process subject, and every remaining
+    /// bare comparative still asserts a materials-ish direction with no
+    /// dimension named.
+    #[test]
+    fn narrowing_the_software_case_did_not_disarm_the_materials_case() {
+        for q in [
+            "Make my alloy better",
+            "optimize my material",
+            "make the design better",
+            "can you improve this",
+            "make it stronger",
+            "make my part cheaper",
+        ] {
+            assert_eq!(triage(q, false), Triage::Classify, "no longer caught: {q}");
         }
     }
 

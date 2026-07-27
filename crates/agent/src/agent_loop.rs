@@ -581,11 +581,18 @@ fn routing_query(user_message: &str, history: &[ChatMessage]) -> String {
 /// Shared by the keyword and neural selection paths so the meta/pinned contract
 /// is identical either way.
 ///
-/// `token_budget` bounds the SELECTED tools only. Meta-tools and pinned
-/// (discovered) tools are mandatory and are charged against the budget first:
-/// the escape hatch and the model's own working set are never the thing that
-/// gets dropped. Selection then fills the remainder in relevance order and
+/// `token_budget` bounds the WHOLE request, not just selection. Meta-tools are
+/// the only unconditional entry — `recall` and `find_tools` are the escape hatch
+/// and must survive every eviction path — so they are charged first. Pinned
+/// (discovered) tools are charged next, in relevance order, and are admitted
+/// only while the budget can carry them; selection then fills the remainder and
 /// stops at the first tool it cannot afford.
+///
+/// The pinned cap is a BACKSTOP. Pins are admitted within budget where they are
+/// created ([`pin_within_budget`]), which is also where the model is TOLD what
+/// did not fit — a silently dropped tool the model asked for is exactly how the
+/// old 15-tool cap misled it. This loop exists so the budget holds whatever put
+/// a name in `pinned`.
 fn finalize_tools(
     catalog: &ToolCatalog,
     selected: &[String],
@@ -594,17 +601,26 @@ fn finalize_tools(
 ) -> Vec<ToolDefinition> {
     let mut defs = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Mandatory cost first, so a big meta/pinned set eats into selection rather
-    // than silently pushing the request over budget.
-    let mut spent: usize = crate::meta_tools::definitions()
-        .iter()
-        .map(|t| crate::tool_catalog::definition_tokens(&t.to_definition()))
-        .chain(pinned.iter().filter_map(|name| {
-            catalog
-                .find(name)
-                .map(|t| crate::tool_catalog::definition_tokens(&t.to_definition()))
-        }))
-        .sum();
+    let mut spent: usize = meta_tools_tokens();
+    let mut pinned_defs = Vec::new();
+    for name in pinned_by_relevance(pinned, selected) {
+        // Meta names are offered (and charged) by the meta loop below; pinning
+        // one must never charge it twice.
+        if crate::meta_tools::is_meta_tool(name) {
+            continue;
+        }
+        let Some(tool) = catalog.find(name) else {
+            continue;
+        };
+        let def = tool.to_definition();
+        let cost = crate::tool_catalog::definition_tokens(&def);
+        if spent + cost > token_budget {
+            break;
+        }
+        spent += cost;
+        seen.insert(name.clone());
+        pinned_defs.push(def);
+    }
     for name in selected {
         // Meta-tool names (e.g. `recall`) are executed by the native meta-tool
         // layer, which intercepts BEFORE the Python dispatch. If the Python
@@ -640,15 +656,91 @@ fn finalize_tools(
             defs.push(def);
         }
     }
-    for name in pinned {
-        if !seen.contains(name)
-            && let Some(tool) = catalog.find(name)
-        {
-            seen.insert(name.clone());
-            defs.push(tool.to_definition());
-        }
-    }
+    defs.extend(pinned_defs);
     defs
+}
+
+/// Charged cost of the always-on meta-tools. They are mandatory, so every
+/// budget computation starts by subtracting this.
+fn meta_tools_tokens() -> usize {
+    crate::meta_tools::definitions()
+        .iter()
+        .map(|t| crate::tool_catalog::definition_tokens(&t.to_definition()))
+        .sum()
+}
+
+/// `pinned` in relevance order (`selected` is the ranking already used for
+/// selection), unranked names last, ties broken by name. `pinned` is a HashSet:
+/// without this the budget cap above would drop a DIFFERENT tool on every run.
+fn pinned_by_relevance<'a>(
+    pinned: &'a std::collections::HashSet<String>,
+    selected: &[String],
+) -> Vec<&'a String> {
+    let rank: std::collections::HashMap<&str, usize> = selected
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    let mut ordered: Vec<&String> = pinned.iter().collect();
+    ordered.sort_by(|a, b| {
+        let ra = rank.get(a.as_str()).copied().unwrap_or(usize::MAX);
+        let rb = rank.get(b.as_str()).copied().unwrap_or(usize::MAX);
+        ra.cmp(&rb).then_with(|| a.cmp(b))
+    });
+    ordered
+}
+
+/// Tokens of pinned-tool definitions a request may carry. Meta-tools are
+/// mandatory and never evicted, so pins may only spend what is left after them.
+fn pin_token_budget(token_budget: usize) -> usize {
+    token_budget.saturating_sub(meta_tools_tokens())
+}
+
+/// Admit `candidates` into `pinned` while the pinned set still fits
+/// [`pin_token_budget`]. Returns, in order, the names that did NOT fit.
+///
+/// A pin is not free: its FULL definition rides in every later request this
+/// turn. `find_tools`'s `limit` is model-controlled, so one call could pin the
+/// whole catalog: 33,410 charged tokens as measured by the adversarial review
+/// against the live catalog, 37,960 as measured by
+/// `one_unbounded_find_tools_call_cannot_blow_the_tool_budget` against its
+/// 130-tool stand-in — versus an 8k model's ENTIRE 2,048-token budget, before a
+/// single word of prompt or history. Candidates arrive in relevance order and
+/// are admitted greedily until the first one that does not fit; the rest are
+/// returned so the CALLER can tell the model what is not callable, instead of
+/// dropping it silently.
+fn pin_within_budget(
+    catalog: &ToolCatalog,
+    pinned: &mut std::collections::HashSet<String>,
+    candidates: impl IntoIterator<Item = String>,
+    token_budget: usize,
+) -> Vec<String> {
+    let budget = pin_token_budget(token_budget);
+    let cost_of = |name: &str| {
+        catalog
+            .find(name)
+            .map(|t| crate::tool_catalog::definition_tokens(&t.to_definition()))
+    };
+    let mut spent: usize = pinned.iter().filter_map(|n| cost_of(n)).sum();
+    let mut rejected = Vec::new();
+    let mut full = false;
+    for name in candidates {
+        // Already callable, or served unconditionally by the meta layer.
+        if pinned.contains(&name) || crate::meta_tools::is_meta_tool(&name) {
+            continue;
+        }
+        let Some(cost) = cost_of(&name) else {
+            continue; // not in the catalog: nothing to pin, nothing to report
+        };
+        if full || spent + cost > budget {
+            full = true;
+            rejected.push(name);
+            continue;
+        }
+        spent += cost;
+        pinned.insert(name);
+    }
+    rejected
 }
 
 /// Restrict a selected tool list to the curated [`CORE_TOOL_SET`], always
@@ -1257,16 +1349,29 @@ pub async fn run_turn(
                         .into_iter()
                         .map(|tool| tool.name.clone())
                         .collect();
+                    // Bounded by the same tool budget as find_tools' pins, and
+                    // only what actually fits is announced: claiming a tool is
+                    // retrieved when its definition never reaches the request is
+                    // the silent-truncation failure this budget exists to stop.
+                    let rejected = pin_within_budget(
+                        tool_catalog,
+                        &mut pinned_tools,
+                        found.clone(),
+                        tool_token_budget,
+                    );
+                    let admitted: Vec<String> = found
+                        .into_iter()
+                        .filter(|name| !rejected.contains(name))
+                        .collect();
                     // Nothing to offer ⇒ nothing to retry. The model's answer
                     // stands and the turn ends normally.
-                    if !found.is_empty() {
+                    if !admitted.is_empty() {
                         capability_gap_retried = true;
-                        let names = found.join(", ");
+                        let names = admitted.join(", ");
                         tracing::info!(gap = %gap, tools = %names, "capability-gap re-retrieval");
                         emit(AgentEvent::TextDelta {
                             text: format!("\n\n[retrieved for \"{gap}\": {names}]\n\n"),
                         });
-                        pinned_tools.extend(found);
                         history.push(ChatMessage {
                             role: "system".to_string(),
                             content: Some(format!("{CAPABILITY_GAP_NOTE}{names}")),
@@ -1511,7 +1616,7 @@ pub async fn run_turn(
             // and a call that never ran is not evidence of anything.
             tools_used_this_turn.push(tool_name.clone());
             let start = Instant::now();
-            let result: Result<Value> = if tool_name == crate::subagent::SPAWN_SUBAGENT_TOOL {
+            let mut result: Result<Value> = if tool_name == crate::subagent::SPAWN_SUBAGENT_TOOL {
                 // spawn_subagent is a meta-tool by name, but unlike
                 // recall/find_tools it needs the LIVE turn machinery (LLM
                 // client, tool server, approval channel, policy engine) that
@@ -1590,17 +1695,52 @@ pub async fn run_turn(
             // Auto-pin tools surfaced by find_tools so their full definitions
             // become callable next iteration (the "now available" hint used to
             // be false — names came back but were never wired into the request).
+            // Bounded by the turn's tool budget: a pinned definition rides in
+            // EVERY later request, so an unbounded pin set turns the budget into
+            // decoration. What does not fit is reported back in this very tool
+            // result — the model must never be told a tool is "now available"
+            // when it is not.
             if tool_name == "find_tools"
-                && let Ok(v) = &result
-                && let Some(matches) = v
+                && let Ok(v) = &mut result
+            {
+                let candidates: Vec<String> = v
                     .get("result")
                     .and_then(|r| r.get("matches"))
                     .and_then(|m| m.as_array())
-            {
-                for m in matches {
-                    if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
-                        pinned_tools.insert(name.to_string());
-                    }
+                    .map(|matches| {
+                        matches
+                            .iter()
+                            .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let rejected = pin_within_budget(
+                    tool_catalog,
+                    &mut pinned_tools,
+                    candidates,
+                    tool_token_budget,
+                );
+                if !rejected.is_empty()
+                    && let Some(obj) = v.get_mut("result").and_then(Value::as_object_mut)
+                {
+                    tracing::info!(
+                        dropped = rejected.len(),
+                        budget = tool_token_budget,
+                        "find_tools: pins exceeded the tool budget"
+                    );
+                    obj.insert("not_available".to_string(), serde_json::json!(rejected));
+                    obj.insert(
+                        "hint".to_string(),
+                        serde_json::json!(format!(
+                            "these tools are now available — call one by name to use it. \
+                             {} did NOT fit this model's tool-definition budget and are NOT \
+                             callable: {}. Narrow the query (or pass a smaller `limit`) and \
+                             call find_tools again if you need one of them.",
+                            rejected.len(),
+                            rejected.join(", ")
+                        )),
+                    );
                 }
             }
             let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -1848,9 +1988,13 @@ mod tests {
         }));
         let mut pinned = std::collections::HashSet::new();
         pinned.insert("mace_compute_elastic".to_string());
-        // A 2-token budget affords nothing; the query matches nothing either.
-        // Pinned + meta are mandatory and must survive both.
-        let defs = assemble_request_tools(&catalog, "hello there friend", &pinned, 2);
+        // The query matches nothing, so selection would never offer this tool;
+        // being pinned is the only reason it is callable. The budget is the real
+        // one for the smallest model PRISM supports — a pin outranks selection,
+        // but it is not exempt from the budget (see
+        // `one_unbounded_find_tools_call_cannot_blow_the_tool_budget`).
+        let budget = crate::tool_catalog::MIN_TOOL_TOKENS;
+        let defs = assemble_request_tools(&catalog, "hello there friend", &pinned, budget);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(
             names.contains(&"mace_compute_elastic"),
@@ -1981,24 +2125,257 @@ mod tests {
         );
     }
 
-    /// Meta-tools and pinned tools are mandatory: they are charged first and
-    /// survive a budget too small for anything else.
+    /// Priority order under pressure: meta-tools are unconditional, a pinned
+    /// tool outranks every SELECTED tool, and selection is what gets squeezed.
+    ///
+    /// This used to assert the pinned tool survived a **1-token** budget, i.e.
+    /// that pins were exempt from the budget entirely. That exemption was the
+    /// defect — with a model-controlled `find_tools(limit)` it let one call
+    /// spend 18x the budget. A pin now outranks selection but is still charged;
+    /// what it must never do is push the request over the bound, and what must
+    /// never be evicted is the escape hatch.
     #[test]
-    fn budget_never_evicts_meta_or_pinned_tools() {
+    fn budget_never_evicts_meta_and_pins_outrank_selection() {
         let catalog = catalog_of_54();
         let mut pinned = std::collections::HashSet::new();
         pinned.insert("tool_42".to_string());
+        // The smallest budget PRISM ever hands a model: meta (~984) plus room
+        // for a tool or two. The route matches nothing, so nothing but the pin
+        // has any claim on the remainder.
+        let budget = crate::tool_catalog::MIN_TOOL_TOKENS;
 
+        let defs = assemble_request_tools(&catalog, "unrelated chatter", &pinned, budget);
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(names.contains(&"find_tools"), "{names:?}");
+        assert!(names.contains(&"recall"), "{names:?}");
+        assert!(
+            names.contains(&"tool_42"),
+            "a pin outranks selection: {names:?}"
+        );
+        let spent: usize = defs
+            .iter()
+            .map(crate::tool_catalog::definition_tokens)
+            .sum();
+        assert!(spent <= budget, "budget blown: {spent} > {budget}");
+
+        // Squeezed to nothing, only the escape hatch remains — and the request
+        // is still inside the bound rather than 260 tokens over it.
         let defs = assemble_request_tools(&catalog, "unrelated chatter", &pinned, 1);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert!(names.contains(&"find_tools"), "{names:?}");
         assert!(names.contains(&"recall"), "{names:?}");
-        assert!(names.contains(&"tool_42"), "pinned survives: {names:?}");
         assert_eq!(
             names.len(),
-            crate::meta_tools::definitions().len() + 1,
-            "nothing else fits in a 1-token budget: {names:?}"
+            crate::meta_tools::definitions().len(),
+            "nothing but the meta-tools fits in a 1-token budget: {names:?}"
         );
+    }
+
+    /// A catalog the size of the LIVE one — 130 tools (54 Python + 77 command +
+    /// meta, as loaded today) — with definitions the same order of magnitude as
+    /// production. `catalog_of_54` is the same shape; this one is big enough to
+    /// reproduce the pinning defect.
+    fn catalog_of_130() -> crate::tool_catalog::ToolCatalog {
+        let filler = "x".repeat(900);
+        let tools: Vec<serde_json::Value> = (0..130)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("tool_{i:03}"),
+                    "description": format!("capability number {i}: {filler}"),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "target": { "type": "string", "description": "what to act on" },
+                            "mode":   { "type": "string", "description": "how to act" }
+                        },
+                        "required": ["target"]
+                    }
+                })
+            })
+            .collect();
+        crate::tool_catalog::ToolCatalog::from_tool_server_json(&serde_json::json!({
+            "tools": tools
+        }))
+    }
+
+    /// THE DEFECT (adversarial review, reproduced by execution). `find_tools`'
+    /// `limit` is MODEL-controlled, had no schema `maximum` and was not clamped
+    /// server-side; every match auto-pins; and the pinned loop added every pin's
+    /// FULL definition with no budget check at all. One
+    /// `find_tools(query, limit=130)` against a 130-tool catalog therefore put
+    /// the whole catalog into every later request — measured below against an
+    /// 8k-context model whose ENTIRE tool budget is `MIN_TOOL_TOKENS` (2,048).
+    ///
+    /// The budget must bound the REQUEST, not merely the selection step.
+    #[test]
+    fn one_unbounded_find_tools_call_cannot_blow_the_tool_budget() {
+        let catalog = catalog_of_130();
+        // An 8k-context model: 8192/4 = 2048, i.e. exactly the floor.
+        let budget = crate::tool_catalog::tool_token_budget(8_192);
+        assert_eq!(budget, crate::tool_catalog::MIN_TOOL_TOKENS);
+
+        // Exactly what the model asked for: find_tools(query, limit=130).
+        let found: Vec<String> = catalog
+            .search("capability", 130)
+            .into_iter()
+            .map(|t| t.name.clone())
+            .collect();
+        assert_eq!(
+            found.len(),
+            130,
+            "the whole catalog matched, as it did live"
+        );
+
+        // MEASURED, not asserted in prose: what pinning all of them costs.
+        let unbounded: usize = found
+            .iter()
+            .filter_map(|n| catalog.find(n))
+            .map(|t| crate::tool_catalog::definition_tokens(&t.to_definition()))
+            .sum();
+        println!(
+            "unbounded pin cost: {unbounded} charged tokens vs a {budget}-token budget ({}x over)",
+            unbounded / budget
+        );
+        assert!(
+            unbounded > 16 * budget,
+            "the defect's premise: {unbounded} must dwarf {budget}"
+        );
+
+        // Every match auto-pins (agent_loop h5) and stays pinned for the turn.
+        let pinned: std::collections::HashSet<String> = found.into_iter().collect();
+        let defs = assemble_request_tools(&catalog, "capability", &pinned, budget);
+        let spent: usize = defs
+            .iter()
+            .map(crate::tool_catalog::definition_tokens)
+            .sum();
+        println!(
+            "assembled request: {} tools, {spent} charged tokens (budget {budget})",
+            defs.len()
+        );
+        assert!(
+            spent <= budget,
+            "pinned tools blew the budget: {spent} > {budget} — the budget is not a budget"
+        );
+        // …and the escape hatch is still there, so the rest stays reachable.
+        let names: std::collections::HashSet<&str> =
+            defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(names.contains("find_tools"), "{names:?}");
+        assert!(names.contains("recall"), "{names:?}");
+    }
+
+    /// Silent truncation is how the original 15-tool cap misled the model. A
+    /// pin the model asked for and did not get must come back as a NAME, so the
+    /// caller can say which tools are not callable and why.
+    #[test]
+    fn pins_beyond_the_budget_are_reported_not_silently_dropped() {
+        let catalog = catalog_of_130();
+        let budget = crate::tool_catalog::tool_token_budget(8_192);
+        let found: Vec<String> = catalog
+            .search("capability", 130)
+            .into_iter()
+            .map(|t| t.name.clone())
+            .collect();
+
+        let mut pinned = std::collections::HashSet::new();
+        let rejected = pin_within_budget(&catalog, &mut pinned, found.clone(), budget);
+
+        assert!(
+            !pinned.is_empty(),
+            "the budget must still afford SOME of what the model asked for"
+        );
+        assert!(!rejected.is_empty(), "130 tools cannot fit a 2,048 budget");
+        assert_eq!(
+            pinned.len() + rejected.len(),
+            found.len(),
+            "every requested tool is either callable or reported: \
+             {} pinned + {} reported != {} asked for",
+            pinned.len(),
+            rejected.len(),
+            found.len()
+        );
+        for name in &rejected {
+            assert!(!pinned.contains(name), "{name} reported AND pinned");
+        }
+        println!(
+            "budget {budget}: {} of {} pinned, {} reported back to the model",
+            pinned.len(),
+            found.len(),
+            rejected.len()
+        );
+
+        // A second call cannot sneak past the cap: the already-pinned cost is
+        // charged, so the bound holds across the whole turn.
+        let more = pin_within_budget(&catalog, &mut pinned, found.clone(), budget);
+        assert_eq!(
+            more.len(),
+            rejected.len(),
+            "the cap held on the second call"
+        );
+        let defs = assemble_request_tools(&catalog, "capability", &pinned, budget);
+        let spent: usize = defs
+            .iter()
+            .map(crate::tool_catalog::definition_tokens)
+            .sum();
+        assert!(
+            spent <= budget,
+            "budget blown after two pin rounds: {spent}"
+        );
+    }
+
+    /// Meta-tools are offered unconditionally by the meta loop, so pinning must
+    /// never spend budget on one nor report one as dropped.
+    #[test]
+    fn pinning_never_touches_meta_tools() {
+        let catalog = catalog_of_130();
+        let mut pinned = std::collections::HashSet::new();
+        let rejected = pin_within_budget(
+            &catalog,
+            &mut pinned,
+            ["recall".to_string(), "find_tools".to_string()],
+            0,
+        );
+        assert!(
+            pinned.is_empty(),
+            "meta-tools must not be pinned: {pinned:?}"
+        );
+        assert!(
+            rejected.is_empty(),
+            "meta-tools are always offered — never reported as dropped: {rejected:?}"
+        );
+    }
+
+    /// The meta-tools are the escape hatch: `recall` and `find_tools` must
+    /// survive EVERY eviction path, whatever the budget and whatever is pinned.
+    #[test]
+    fn meta_tools_survive_every_eviction_path() {
+        let catalog = catalog_of_130();
+        let all: std::collections::HashSet<String> =
+            catalog.iter().map(|t| t.name.clone()).collect();
+        let empty = std::collections::HashSet::new();
+
+        for (label, pinned) in [("nothing pinned", &empty), ("whole catalog pinned", &all)] {
+            for budget in [0, 1, crate::tool_catalog::MIN_TOOL_TOKENS] {
+                let defs = assemble_request_tools(&catalog, "capability", pinned, budget);
+                let names: std::collections::HashSet<&str> =
+                    defs.iter().map(|d| d.function.name.as_str()).collect();
+                for meta in ["recall", "find_tools"] {
+                    assert!(
+                        names.contains(meta),
+                        "{meta} evicted at budget {budget} with {label}: {names:?}"
+                    );
+                }
+                // Core-set tiering is an eviction path too.
+                let tiered = tier_to_core(defs, pinned);
+                let tiered_names: std::collections::HashSet<&str> =
+                    tiered.iter().map(|d| d.function.name.as_str()).collect();
+                for meta in ["recall", "find_tools"] {
+                    assert!(
+                        tiered_names.contains(meta),
+                        "{meta} evicted by core tiering at budget {budget} with {label}"
+                    );
+                }
+            }
+        }
     }
 
     /// The whole point of the capability-gap retry: the harness re-retrieves on
@@ -2037,9 +2414,16 @@ mod tests {
             found.contains(&"simulate_xrd".to_string()),
             "retrieved: {found:?}"
         );
-        pinned.extend(found);
+        // Pin exactly the way the loop does now — through the budget, so the
+        // retry can never claim a tool whose definition never reaches the model.
+        let budget = crate::tool_catalog::MIN_TOOL_TOKENS;
+        let rejected = pin_within_budget(&catalog, &mut pinned, found, budget);
+        assert!(
+            !rejected.contains(&"simulate_xrd".to_string()),
+            "the retrieved tool fits the budget: rejected {rejected:?}"
+        );
 
-        let after = assemble_request_tools(&catalog, route, &pinned, 1);
+        let after = assemble_request_tools(&catalog, route, &pinned, budget);
         let after_names: Vec<&str> = after.iter().map(|d| d.function.name.as_str()).collect();
         assert!(
             after_names.contains(&"simulate_xrd"),
