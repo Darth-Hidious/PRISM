@@ -171,29 +171,24 @@ impl fmt::Display for PlatformError {
 
 impl std::error::Error for PlatformError {}
 
+/// A non-blank string field, or nothing. `""` is not a reason — treating it as
+/// one would render a confident, empty error line, which is the same defect
+/// this module exists to remove.
+fn field(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Pull `error.code` / `error.message` out of either shape the fleet emits:
 /// the platform's nested `{"error":{"code","message"}}` and the PRISM node
 /// server's flat `{"error":"code","message":"..."}`.
 fn extract_code_message(json: &Value) -> (Option<String>, Option<String>) {
     match json.get("error") {
-        Some(Value::Object(err)) => (
-            err.get("code").and_then(Value::as_str).map(str::to_string),
-            err.get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        ),
-        Some(Value::String(code)) => (
-            Some(code.clone()),
-            json.get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        ),
-        _ => (
-            None,
-            json.get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        ),
+        Some(Value::Object(err)) => (field(err.get("code")), field(err.get("message"))),
+        Some(code @ Value::String(_)) => (field(Some(code)), field(json.get("message"))),
+        _ => (None, field(json.get("message"))),
     }
 }
 
@@ -445,6 +440,34 @@ mod tests {
         assert_eq!(e.code.as_deref(), Some("unauthorized"));
         assert_eq!(e.message.as_deref(), Some("Session expired or invalid."));
         assert!(e.body_excerpt.is_none(), "duplicated the body needlessly");
+    }
+
+    #[test]
+    fn blank_code_and_message_are_not_treated_as_a_reason() {
+        // A confident, empty error line is the same defect in a new place.
+        // Blank fields must fall through to the status + body path.
+        let e = PlatformError::parse(
+            StatusCode::UNAUTHORIZED,
+            BALANCE_URL,
+            r#"{"error":{"code":"","message":"   "}}"#,
+        );
+        assert!(e.code.is_none(), "empty code kept: {:?}", e.code);
+        assert!(e.message.is_none(), "blank message kept: {:?}", e.message);
+
+        let rendered = e.to_string();
+        assert!(
+            rendered.contains("HTTP 401 Unauthorized"),
+            "no status headline: {rendered}"
+        );
+        assert!(
+            rendered.contains("no structured error"),
+            "did not admit there was no reason: {rendered}"
+        );
+        // Nothing renders as a bare "reported by the platform as: " with a gap.
+        assert!(
+            !rendered.contains("reported by the platform as: ("),
+            "blank code rendered: {rendered}"
+        );
     }
 
     #[test]
