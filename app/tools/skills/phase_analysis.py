@@ -5,15 +5,13 @@ from app.tools.skills.base import Skill, SkillStep
 
 def _analyze_phases(**kwargs) -> dict:
     """Analyze phase stability: load TDB, compute equilibrium, summarize."""
-    from app.tools.simulation.calphad_bridge import check_calphad_available
+    from app.tools.simulation.calphad_bridge import (
+        _calphad_missing_error,
+        check_calphad_available,
+    )
 
     if not check_calphad_available():
-        return {
-            "error": (
-                "pycalphad is not installed. "
-                "Install CALPHAD extras with: pip install prism-platform[calphad]"
-            )
-        }
+        return _calphad_missing_error()
 
     database_name = kwargs["database_name"]
     components = kwargs["components"]

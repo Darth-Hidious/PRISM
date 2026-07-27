@@ -124,13 +124,14 @@ def check_pyiron_available(auto_provision: bool = False) -> bool:
 
 def _pyiron_missing_error() -> dict:
     """Standard error dict when pyiron is not installed."""
-    return {
-        "error": (
-            "pyiron_atomistics is not installed and automatic installation "
-            "failed (offline?). Run `prism pyiron install`, or "
-            "`pip install prism-platform[simulation]`."
-        )
-    }
+    from app.tools._extras import missing_extra_error
+
+    return missing_extra_error(
+        "simulation",
+        "pyiron_atomistics is not installed and automatic installation "
+        "failed (offline?). Run `prism pyiron install`, or "
+        "`pip install prism-platform[simulation]`.",
+    )
 
 
 class StructureStore:
