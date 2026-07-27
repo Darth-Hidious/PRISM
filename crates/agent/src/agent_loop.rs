@@ -57,6 +57,20 @@ const CAPABILITY_GAP_RETRIEVE: usize = 5;
 const CAPABILITY_GAP_NOTE: &str =
     "You said you lacked a capability. These matching tools are now available to call: ";
 
+/// Intent tags the pre-flight reprompter has already asked about in this
+/// session, read back out of the scratchpad. The scratchpad outlives the turn
+/// on both the TUI (`ServerRuntime::scratchpad`) and service paths, so it is
+/// the session ledger that enforces "never ask twice for the same thing" —
+/// with no new state threaded through the signature.
+fn asked_reprompt_keys(scratchpad: &Scratchpad) -> Vec<String> {
+    scratchpad
+        .entries()
+        .iter()
+        .filter(|e| e.step_type == crate::reprompt::LEDGER_STEP)
+        .map(|e| e.summary.clone())
+        .collect()
+}
+
 // ── Large-result handling ─────────────────────────────────────────
 
 fn uuid_hex8() -> String {
@@ -791,6 +805,67 @@ pub async fn run_turn(
     });
     transcript.append(TranscriptEntry::new("user", user_message));
 
+    // ── 1b. Pre-flight reprompt ───────────────────────────────────
+    // Deterministic triage FIRST (pure function, no I/O): a well-formed expert
+    // query returns Proceed here having spent nothing — no classifier call, no
+    // added latency, no added tokens. Only a message carrying positive evidence
+    // of misrouting or a bare vague directive reaches the one cheap LLM call.
+    // See `reprompt`.
+    // Only an attended turn may ask. A subagent or a research task step has no
+    // human on the other end, so its question would land as a dead tool result
+    // — those get the routing hint, which carries the same honesty.
+    let can_ask = task.is_none() && config.subagent_depth == 0;
+    let asked_before = asked_reprompt_keys(scratchpad);
+    let mut routed_by_preflight = false;
+    match crate::reprompt::preflight(llm, config, user_message, &asked_before, can_ask).await {
+        crate::reprompt::Preflight::Proceed => {}
+        crate::reprompt::Preflight::Route { hint } => {
+            // Intent resolved but servable — do not interrogate. Hand the model
+            // the capability that serves it (and, for an intent PRISM cannot
+            // serve, the plain statement that it cannot) so the turn is routed
+            // rather than guessed. Stripped again at finalization.
+            routed_by_preflight = true;
+            history.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(hint),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        crate::reprompt::Preflight::Ask { question, key } => {
+            // ONE consolidated question, and the turn ends. No agent loop runs,
+            // so this path is cheaper than the confidently-irrelevant answer it
+            // replaces. The key goes in the scratchpad ledger so the same slot
+            // is never asked twice in this session.
+            tracing::info!(intent = %key, "pre-flight reprompt: asked instead of answering");
+            scratchpad.log(
+                crate::reprompt::LEDGER_STEP,
+                None,
+                key,
+                Some(serde_json::json!({ "question": question })),
+            );
+            emit(AgentEvent::TextDelta {
+                text: question.clone(),
+            });
+            emit(AgentEvent::TextFlush);
+            history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(question.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            transcript.append(TranscriptEntry::new("assistant", question.as_str()));
+            emit(AgentEvent::TurnComplete {
+                text: Some(question),
+                has_more: false,
+                usage: None,
+                total_usage: None,
+                estimated_cost: None,
+            });
+            return Ok(());
+        }
+    }
+
     let mut total_usage = UsageInfo::default();
     let mut result_store: HashMap<String, String> = HashMap::new();
     // One line per executed tool step — feeds the deterministic TRAJECTORY
@@ -1207,6 +1282,13 @@ pub async fn run_turn(
                         !m.content
                             .as_deref()
                             .is_some_and(|c| c.starts_with(CAPABILITY_GAP_NOTE))
+                    });
+                }
+                if routed_by_preflight {
+                    history.retain(|m| {
+                        !m.content
+                            .as_deref()
+                            .is_some_and(|c| c.starts_with(crate::reprompt::ROUTE_HINT_PREFIX))
                     });
                 }
 
