@@ -355,6 +355,11 @@ pub enum FormTarget {
     MarketplaceFind,
     /// Install a marketplace item (palette `marketplace.install`).
     MarketplaceInstall,
+    /// Review or publish PRISM's own tool catalog (palette
+    /// `marketplace.publish`). Dry-run is on by default so opening the form
+    /// only ever *shows* the catalog — licences and required extras included
+    /// — until the user deliberately turns it off.
+    MarketplacePublish,
     /// Bring this machine online as a node (palette `node.up`). Submit
     /// dispatches `/node up ...`; the backend supervises the daemon as a
     /// managed child, so `node.stop` can stop it later — no CLI required.
@@ -1381,6 +1386,10 @@ impl App {
                 let cmd = marketplace_search_command(&pane.form);
                 let _ = self.backend.send_command(&cmd);
             }
+            FormTarget::MarketplacePublish => {
+                let cmd = marketplace_publish_command(&pane.form);
+                let _ = self.backend.send_command(&cmd);
+            }
             FormTarget::MarketplaceFind => match marketplace_find_command(&pane.form) {
                 Ok(cmd) => {
                     let _ = self.backend.send_command(&cmd);
@@ -1569,6 +1578,23 @@ impl App {
             ],
         );
         self.open_form(form, FormTarget::MarketplaceInstall);
+    }
+
+    /// Palette `marketplace.publish` — PRISM's own tool catalog: which of
+    /// its materials tools are offered to the marketplace, under what
+    /// licence, and which pip extra each needs. Dry-run defaults ON, so
+    /// this is a viewer until the user turns it off.
+    pub fn open_marketplace_publish_form(&mut self) {
+        let form = Form::new(
+            "PRISM tool catalog — review & publish",
+            "run",
+            vec![
+                FormField::toggle("dry_run", "Dry run", true)
+                    .with_note("on = just show the catalog; off = publish for review"),
+                FormField::text("slug", "Only this slug", "").with_note("empty covers every entry"),
+            ],
+        );
+        self.open_form(form, FormTarget::MarketplacePublish);
     }
 
     /// Palette `node.up` — bring this machine online as a compute node.
@@ -3008,6 +3034,7 @@ impl App {
             "marketplace.search" => self.open_marketplace_search_form(),
             "marketplace.find" => self.open_marketplace_find_form(),
             "marketplace.install" => self.open_marketplace_install_form(),
+            "marketplace.publish" => self.open_marketplace_publish_form(),
             "skills.list" => {
                 let _ = self.backend.send_command("/skills list");
             }
@@ -3981,6 +4008,22 @@ fn marketplace_search_command(form: &crate::form::Form) -> String {
     let mut args = vec!["marketplace".to_string(), "search".to_string()];
     if !query.is_empty() {
         args.push(query);
+    }
+    build_slash_command(&args)
+}
+
+/// Build `/marketplace publish [--dry-run] [--slug <s>]` from the
+/// `marketplace.publish` form. Dry-run defaults on, so an accidental submit
+/// lists the catalog instead of publishing it.
+fn marketplace_publish_command(form: &crate::form::Form) -> String {
+    let mut args = vec!["marketplace".to_string(), "publish".to_string()];
+    if form.toggle_value("dry_run") {
+        args.push("--dry-run".to_string());
+    }
+    let slug = form.text_value("slug").trim().to_string();
+    if !slug.is_empty() {
+        args.push("--slug".to_string());
+        args.push(slug);
     }
     build_slash_command(&args)
 }

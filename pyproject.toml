@@ -110,6 +110,18 @@ mace = [
     # numpy is already a transitive dep but pin it explicitly so mace
     # primitive code has a known floor.
     "numpy>=1.26,<3.0",
+    # Undeclared until 2026-07-27, when the marketplace dependency-drift
+    # test caught them: both are hard function-scope imports that raise
+    # ModuleNotFoundError on an otherwise-complete `[mace]` install.
+    #   huggingface_hub — app/tools/simulation/mace/core/calculator.py and
+    #     .../backends/hf_jobs.py fetch the MACE weights with it. It is NOT
+    #     a mace-torch dependency (mace-torch 0.3.16 requires_dist has no
+    #     huggingface-hub), so it has to be declared here.
+    #   phonopy — app/tools/simulation/mace/core/phonons.py needs it for
+    #     the harmonic phonon primitive.
+    # Left unpinned deliberately: no floor is claimed that has been tested.
+    "huggingface-hub",
+    "phonopy",
 ]
 data = [
     "datasets>=3.0.0",

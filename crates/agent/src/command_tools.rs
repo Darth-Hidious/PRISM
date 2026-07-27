@@ -244,9 +244,9 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "marketplace",
         aliases: &["prism_marketplace"],
         kind: CommandToolKind::RootSubcommand {
-            subcommands: &["search", "install", "info", "find", "update"],
+            subcommands: &["search", "install", "info", "find", "update", "publish"],
         },
-        description: "Run `prism marketplace <subcommand>` for marketplace resources (workflows, tools, models). Prefer the typed siblings marketplace_search / marketplace_find / marketplace_info / marketplace_install for those verbs; this umbrella covers `update` and any verb without a typed tool. Returns the CLI output (list, details, or install result).",
+        description: "Run `prism marketplace <subcommand>` for marketplace resources (workflows, tools, models). Prefer the typed siblings marketplace_search / marketplace_find / marketplace_info / marketplace_install for those verbs; this umbrella covers `update`, `publish` (PRISM's own catalog — `publish --dry-run` lists what PRISM offers with licences and required extras without calling the platform) and any verb without a typed tool. Returns the CLI output (list, details, or install result).",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
     },

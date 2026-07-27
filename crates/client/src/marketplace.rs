@@ -53,6 +53,31 @@ pub struct MarketplaceTool {
     /// endpoint 422s for such resources, so sync must skip them.
     #[serde(default)]
     pub storage_path: Option<String>,
+    /// Publisher-supplied metadata blob. PRISM's own tool entries carry an
+    /// `install` object here saying what the user must `pip install`; see
+    /// [`MarketplaceTool::install_instructions`].
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub metadata: serde_json::Value,
+}
+
+impl MarketplaceTool {
+    /// The command a user runs to make this resource usable, when the
+    /// resource has no downloadable artifact but says how to install itself.
+    ///
+    /// Resources whose capability ships inside PRISM (the materials tools)
+    /// have nothing to download — `GET /{slug}/install` 422s for them. An
+    /// entry that only 422'd would be worse than no entry, so it declares
+    /// `metadata.install.command` instead and the CLI prints that.
+    #[must_use]
+    pub fn install_instructions(&self) -> Option<(String, Option<String>)> {
+        let install = self.metadata.get("install")?;
+        let command = install.get("command")?.as_str()?.to_string();
+        let note = install
+            .get("note")
+            .and_then(|n| n.as_str())
+            .map(str::to_string);
+        Some((command, note))
+    }
 }
 
 /// A single hit from the semantic find_resource search. Mirrors the
@@ -185,6 +210,106 @@ impl<'a> MarketplaceClient<'a> {
             })
             .collect())
     }
+
+    /// Publish one catalog entry: create it, then set the fields the create
+    /// route does not accept, then submit it for review.
+    ///
+    /// `POST /marketplace` takes only name/slug/type/description/metadata and
+    /// lands the resource in `draft`; tags and license go through
+    /// `PATCH /marketplace/{slug}`; `POST /marketplace/{slug}/submit` moves
+    /// draft → pending_review. Nothing here approves anything — a reviewer
+    /// with rights on the platform still has to, or the entry stays invisible
+    /// to the public listing.
+    pub async fn publish_entry(&self, entry: &CatalogEntry) -> Result<()> {
+        #[derive(Serialize)]
+        struct Create<'a> {
+            name: &'a str,
+            slug: &'a str,
+            resource_type: &'a str,
+            description: &'a str,
+            metadata: &'a serde_json::Value,
+        }
+        #[derive(Serialize)]
+        struct Patch<'a> {
+            tags: &'a [String],
+            license: &'a str,
+            metadata: &'a serde_json::Value,
+        }
+
+        let created: serde_json::Value = self
+            .platform
+            .post(
+                "/marketplace",
+                &Create {
+                    name: &entry.name,
+                    slug: &entry.slug,
+                    resource_type: &entry.resource_type,
+                    description: &entry.description,
+                    metadata: &entry.metadata,
+                },
+            )
+            .await
+            .with_context(|| format!("publishing {}", entry.slug))?;
+        debug!(slug = %entry.slug, ?created, "resource created (draft)");
+
+        let _: serde_json::Value = self
+            .platform
+            .patch(
+                &format!("/marketplace/{}", entry.slug),
+                &Patch {
+                    tags: &entry.tags,
+                    license: &entry.license,
+                    metadata: &entry.metadata,
+                },
+            )
+            .await
+            .with_context(|| format!("setting tags/license on {}", entry.slug))?;
+
+        let _: serde_json::Value = self
+            .platform
+            .post(&format!("/marketplace/{}/submit", entry.slug), &())
+            .await
+            .with_context(|| format!("submitting {} for review", entry.slug))?;
+        Ok(())
+    }
+}
+
+/// One publishable entry from `app/tools/marketplace_catalog.json`.
+///
+/// The JSON is the single source of truth — `app/tools/marketplace_catalog.py`
+/// and `tests/test_marketplace_catalog.py` hold it to account against the live
+/// Python tool registry and the imports those tools actually perform, so an
+/// entry cannot promise an install that fails on import. This struct only
+/// carries it to the platform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogEntry {
+    pub slug: String,
+    pub name: String,
+    pub resource_type: String,
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub license: String,
+    #[serde(default)]
+    pub requires_extras: Vec<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// The catalog compiled into the binary.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Catalog {
+    pub entries: Vec<CatalogEntry>,
+    /// tool name → why it is deliberately NOT published.
+    pub bundled: std::collections::BTreeMap<String, String>,
+}
+
+const CATALOG_JSON: &str = include_str!("../../../app/tools/marketplace_catalog.json");
+
+/// PRISM's own publishable tool catalog. Parsed once per call — it is a few
+/// KB of static JSON and publishing is not a hot path.
+pub fn builtin_catalog() -> Result<Catalog> {
+    serde_json::from_str(CATALOG_JSON).context("app/tools/marketplace_catalog.json is malformed")
 }
 
 /// Minimal percent-encoding for query parameter values.
@@ -264,5 +389,94 @@ mod tests {
         assert_eq!(hit.canonical_name, "predict.elastic_moduli.mace");
         assert_eq!(hit.display_name, "");
         assert_eq!(hit.score, 0.0);
+    }
+
+    #[test]
+    fn builtin_catalog_parses_and_is_not_empty() {
+        let catalog = builtin_catalog().expect("catalog must parse");
+        assert!(!catalog.entries.is_empty());
+        assert!(!catalog.bundled.is_empty());
+        // `resource_type` must be one the platform enum accepts AND one the
+        // hub already renders a tab for — inventing a kind the UI cannot
+        // display is how a listing becomes invisible.
+        const KINDS: &[&str] = &[
+            "plugin",
+            "model",
+            "mcp_server",
+            "cli_tool",
+            "hpc_cluster",
+            "robot_lab",
+            "test_facility",
+            "dataset",
+            "procedural_skill",
+        ];
+        for entry in &catalog.entries {
+            assert!(
+                KINDS.contains(&entry.resource_type.as_str()),
+                "{}",
+                entry.slug
+            );
+            assert!(matches!(
+                entry.license.as_str(),
+                "MIT" | "LicenseRef-MARC27-Dual"
+            ));
+            assert!(!entry.slug.is_empty() && !entry.description.is_empty());
+            // Shell execution must never become an installable listing.
+            let tools = entry.metadata["tools"].as_array().expect("metadata.tools");
+            for tool in tools {
+                let name = tool.as_str().unwrap();
+                assert!(
+                    !matches!(
+                        name,
+                        "execute_bash" | "execute_python" | "bash_task" | "file"
+                    ),
+                    "{name} must stay bundled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_entry_round_trips_through_the_marketplace_model() {
+        // What we publish must come back as the listing type the rest of
+        // PRISM reads — otherwise `marketplace search` renders the entries
+        // we just created as blanks.
+        for entry in builtin_catalog().unwrap().entries {
+            let wire = serde_json::json!({
+                "name": entry.name,
+                "slug": entry.slug,
+                "resource_type": entry.resource_type,
+                "description": entry.description,
+                "tags": entry.tags,
+                "license": entry.license,
+                "metadata": entry.metadata,
+                "pricing": "free",
+                "status": "pending_review",
+                "hosting": "on_demand",
+                "storage_path": null,
+            });
+            let tool: MarketplaceTool =
+                serde_json::from_value(wire).expect("entry must deserialise as a listing");
+            assert_eq!(tool.slug, entry.slug);
+            assert_eq!(tool.tags, entry.tags);
+            assert_eq!(tool.license.as_deref(), Some(entry.license.as_str()));
+            // No artifact: the sync path must skip it, and the install path
+            // must have something honest to say instead of a 422.
+            assert!(tool.storage_path.is_none());
+            let (command, _note) = tool
+                .install_instructions()
+                .expect("an artifact-less entry must declare how to install");
+            assert!(
+                command.starts_with("pip install") || command.starts_with("curl "),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_instructions_absent_without_metadata() {
+        let tool: MarketplaceTool =
+            serde_json::from_str(r#"{"name":"x","metadata":null}"#).unwrap();
+        assert!(tool.install_instructions().is_none());
     }
 }

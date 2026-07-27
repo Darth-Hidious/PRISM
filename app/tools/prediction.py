@@ -14,6 +14,22 @@ models on demand, distinct from the atomic predictors.
 from app.tools.base import Tool, ToolRegistry
 
 
+def _ml_guard() -> dict | None:
+    """Honest `[ml]` gate: the install hint, not `No module named 'sklearn'`.
+
+    Same shape as the MACE/CALPHAD/pyiron gates — see `app/tools/_extras.py`.
+    """
+    from app.tools._extras import missing_extra_error, missing_imports
+
+    missing = missing_imports("ml")
+    if not missing:
+        return None
+    return missing_extra_error(
+        "ml",
+        f"Composition-based ML prediction needs {', '.join(missing)}.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Per-target handlers
 # ---------------------------------------------------------------------------
@@ -23,6 +39,9 @@ def _predict_formula(**kw) -> dict:
     formula = kw.get("formula")
     if not formula:
         return {"error": "Action target='formula' requires `formula`"}
+    err = _ml_guard()
+    if err:
+        return err
     try:
         from app.tools.ml.predictor import Predictor
         predictor = Predictor()
@@ -150,6 +169,9 @@ def _model_train(**kw) -> dict:
     if not property_name:
         return {"error": "model_train requires `property_name` (e.g. 'band_gap')"}
     property_name = _PROPERTY_ALIASES.get(property_name, property_name)
+    err = _ml_guard()
+    if err:
+        return err
     algorithm = kw.get("algorithm", "random_forest")
     try:
         max_samples = max(20, min(int(kw.get("max_samples", 400)), 2000))

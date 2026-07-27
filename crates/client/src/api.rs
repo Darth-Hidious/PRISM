@@ -211,6 +211,31 @@ impl PlatformClient {
             .with_context(|| format!("failed to parse JSON from POST {url}"))
     }
 
+    /// Perform an authenticated PATCH request with a JSON body and
+    /// deserialise the response.
+    ///
+    /// `Safe` idempotency: PATCH bodies here carry the full desired value of
+    /// each field they set, so replaying one lands the same state.
+    pub async fn patch<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.offline_guard("PATCH", path)?;
+        let url = format!("{}{path}", self.base_url);
+        debug!(%url, "PATCH");
+
+        let resp = self
+            .send_retrying("PATCH", &url, retry::Idempotency::Safe, || {
+                self.client.patch(&url).json(body)
+            })
+            .await?;
+
+        resp.json::<T>()
+            .await
+            .with_context(|| format!("failed to parse JSON from PATCH {url}"))
+    }
+
     /// Perform an authenticated DELETE request. Returns `Ok(())` on success.
     pub async fn delete(&self, path: &str) -> Result<()> {
         self.offline_guard("DELETE", path)?;

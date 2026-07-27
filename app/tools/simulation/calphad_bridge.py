@@ -56,12 +56,14 @@ def check_calphad_available() -> bool:
 
 def _calphad_missing_error() -> dict:
     """Standard error dict when pycalphad is not installed."""
-    return {
-        "error": (
-            "pycalphad is not installed. "
-            "Install CALPHAD extras with: pip install prism-platform[calphad]"
-        )
-    }
+    from app.tools._extras import install_command, missing_extra_error
+
+    return missing_extra_error(
+        "calphad",
+        "pycalphad is not installed. Install CALPHAD support with `"
+        + install_command("calphad")
+        + "`.",
+    )
 
 
 class DatabaseStore:

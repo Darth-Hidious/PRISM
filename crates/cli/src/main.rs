@@ -1068,6 +1068,22 @@ enum MarketplaceCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Publish PRISM's own materials tools to the MARC27 marketplace so
+    /// they are discoverable without installing all of PRISM.
+    ///
+    /// The catalog is `app/tools/marketplace_catalog.json`, held to account
+    /// against the live tool registry by `tests/test_marketplace_catalog.py`.
+    /// Each entry is created as a draft, has its tags/license set, then is
+    /// submitted for review — a platform reviewer still has to approve it
+    /// before it appears in the public listing.
+    Publish {
+        /// Show what would be published without calling the platform.
+        #[arg(long)]
+        dry_run: bool,
+        /// Publish only this slug (default: every entry in the catalog).
+        #[arg(long)]
+        slug: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3245,6 +3261,22 @@ async fn main() -> Result<()> {
                         );
                     }
 
+                    // Resources whose capability ships inside PRISM (the
+                    // materials tools) hold no artifact — `/install` 422s for
+                    // them. Say what to `pip install` instead of failing with
+                    // the platform's 422; an entry that only 422'd would be
+                    // worse than no entry at all.
+                    if let Ok(resource) = marketplace.get_tool(&name).await
+                        && let Some((command, note)) = resource.install_instructions()
+                    {
+                        println!("'{name}' ships inside PRISM — there is no artifact to download.");
+                        println!("\n    {command}\n");
+                        if let Some(note) = note {
+                            println!("{note}");
+                        }
+                        return Ok(());
+                    }
+
                     let url = marketplace.install_url(&name).await?;
                     let client = reqwest::Client::new();
                     // error_for_status() converts 4xx/5xx into Err so a 404
@@ -3384,6 +3416,58 @@ async fn main() -> Result<()> {
                         }
                         let report = crate::tool_sync::sync_tools(&marketplace).await?;
                         crate::tool_sync::print_report(&report);
+                    }
+                }
+                MarketplaceCommands::Publish { dry_run, slug } => {
+                    let catalog = prism_client::marketplace::builtin_catalog()?;
+                    let selected: Vec<_> = catalog
+                        .entries
+                        .iter()
+                        .filter(|e| slug.as_ref().is_none_or(|s| *s == e.slug))
+                        .collect();
+                    if selected.is_empty() {
+                        anyhow::bail!(
+                            "no catalog entry matches '{}'. Known slugs: {}",
+                            slug.unwrap_or_default(),
+                            catalog
+                                .entries
+                                .iter()
+                                .map(|e| e.slug.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    for entry in &selected {
+                        let extras = if entry.requires_extras.is_empty() {
+                            "no extra required".to_string()
+                        } else {
+                            format!("needs [{}]", entry.requires_extras.join(", "))
+                        };
+                        println!(
+                            "  {} [{}]  {} — {}",
+                            entry.name, entry.slug, entry.license, extras
+                        );
+                    }
+                    if dry_run {
+                        println!(
+                            "\n{} entr(ies) would be published. \
+                             {} tool(s) stay bundled on purpose (see the catalog).",
+                            selected.len(),
+                            catalog.bundled.len()
+                        );
+                    } else {
+                        if token.is_none() {
+                            anyhow::bail!("publishing needs a login — run `prism login` first");
+                        }
+                        for entry in &selected {
+                            marketplace.publish_entry(entry).await?;
+                            println!("published {} (draft → pending_review)", entry.slug);
+                        }
+                        println!(
+                            "\n{} entr(ies) submitted. They stay invisible to the public \
+                             listing until a platform reviewer approves them.",
+                            selected.len()
+                        );
                     }
                 }
             }

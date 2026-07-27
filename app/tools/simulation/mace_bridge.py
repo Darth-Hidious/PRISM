@@ -67,16 +67,18 @@ def check_mace_available() -> bool:
 
 def _mace_missing_error() -> dict[str, Any]:
     """Stable, agent-readable error dict for use when MACE isn't installed."""
-    return {
-        "error": "MACE foundation interatomic potential not available in this PRISM install.",
-        "install_hint": "pip install 'prism-platform[mace]'",
-        "rationale": (
+    from app.tools._extras import missing_extra_error
+
+    return missing_extra_error(
+        "mace",
+        "MACE foundation interatomic potential not available in this PRISM install.",
+        rationale=(
             "MACE-MH-1 is PyTorch-only as of 2026 (mace-jax does not yet support "
             "the multi-head MH-1 architecture). Installing the `[mace]` extra adds "
             "mace-torch + torch + ase. PRISM's broader stack remains "
             "JAX-native; MACE is an explicit PyTorch holdout pinned by upstream."
         ),
-    }
+    )
 
 
 # ---------------------------------------------------------------------------

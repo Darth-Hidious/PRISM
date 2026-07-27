@@ -122,7 +122,13 @@ def predict_with_pretrained(
 
     if package == "matgl":
         if not check_matgl_available():
-            return {"error": "matgl not installed. Install with: pip install matgl"}
+            from app.tools._extras import missing_extra_error
+
+            return missing_extra_error(
+                "ml",
+                "matgl is not installed — pre-trained GNN structure prediction "
+                "needs it.",
+            )
         try:
             import matgl
             model = matgl.load_model(info["model_id"])
