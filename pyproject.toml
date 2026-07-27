@@ -141,6 +141,7 @@ asyncio_mode = "auto"
 markers = [
     "live: requires HF_TOKEN and real HF Jobs (skipped unless MACE_MCP_LIVE=1)",
     "needs_mace: requires mace-torch installed (skipped if missing)",
+    "network: hits real third-party sources (skipped unless PRISM_LIVE_SOURCES=1)",
 ]
 
 [project.urls]
