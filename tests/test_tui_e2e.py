@@ -47,6 +47,30 @@ pytestmark = pytest.mark.skipif(
     not pathlib.Path(PRISM_BIN).exists(),
     reason=f"no release binary at {PRISM_BIN} — build it first: cargo build --release",
 )
+
+# KNOWN RED, and deliberately NOT skipped: with the release binary present,
+# `test_fake_backend_shutdown` fails under the full suite while passing in
+# isolation. Do NOT paper this over with a skip — the cause is real and the
+# stack trace names it:
+#
+#     fork  ->  _pthread_atfork_child_handlers
+#           ->  nw_settings_child_has_forked   (Network.framework)
+#           ->  nw_path_release_globals
+#           ->  NEFlowDirectorDestroy          (libnetworkextension.dylib)
+#           ->  SIGSEGV
+#
+# A PRISM materials search loads Apple's Network.framework, which registers a
+# pthread_atfork child handler. From then on ANY fork() in this process
+# crashes in that handler — `pexpect.spawn` uses `pty.fork()`, so it dies.
+# posix_spawn is unaffected because it does not run atfork handlers.
+# The same defect breaks the `execute_bash` / `execute_python` tools on macOS
+# (see app/tools/bash.py and app/tools/code.py, both still on the fork path).
+# Reproduce: pytest tests/test_materials_discovery_flow.py tests/test_tui_e2e.py
+#
+# Note also that the other seven tests here `return t.report()` instead of
+# asserting. pytest ignores a test's return value (PytestReturnNotNoneWarning),
+# so those seven pass unconditionally — they record failures via `t.check` and
+# then throw the result away. Only this file's bare `assert` can go red.
 PYTHON_BIN = str(PROJECT_ROOT / ".venv" / "bin" / "python")
 TIMEOUT_SHORT = 5   # seconds for quick interactions
 TIMEOUT_MEDIUM = 15 # seconds for backend startup + first response
