@@ -45,6 +45,10 @@ const MAX_TOOL_RESULT_CHARS: usize = 30_000;
 const DOOM_LOOP_WINDOW: usize = 3;
 /// How many consecutive empty results from the same tool before we stop
 const EMPTY_RESULT_MAX: usize = 2;
+/// How many times the execution-contract gate may reject a finalization in one
+/// turn. A cost bound on false positives, NOT a completeness guarantee: past
+/// this the claim ships and the system prompt is the only remaining defence.
+const MAX_CONTRACT_GATE_FIRINGS: usize = 2;
 
 // ── Large-result handling ─────────────────────────────────────────
 
@@ -781,6 +785,13 @@ pub async fn run_turn(
     // FULL definitions stay in the request every later iteration. Without this,
     // find_tools returned names the model could never actually call.
     let mut pinned_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Execution-contract gate state: names of tools that ACTUALLY EXECUTED
+    // this turn (recorded at h5, after the permission / policy / approval
+    // gates — a blocked call produced no evidence and must not count), and how
+    // many times the finalization gate has fired. Capping the firings bounds
+    // the cost of a false positive; it is not a completeness guarantee.
+    let mut tools_used_this_turn: Vec<String> = Vec::new();
+    let mut contract_gate_firings: usize = 0;
 
     // ── 2. TAOR iteration loop ────────────────────────────────────
     for iteration in 0..config.max_iterations {
@@ -1068,7 +1079,64 @@ pub async fn run_turn(
         let tool_calls = match &response.message.tool_calls {
             Some(calls) if !calls.is_empty() => calls.clone(),
             _ => {
-                // No tool calls → turn complete
+                // No tool calls → turn complete.
+
+                // ── Execution-contract gate ───────────────────────
+                // Deterministic, no-LLM: an answer claiming an action that no
+                // tool of the matching class performed this turn has no
+                // evidence behind it. Reject the finalization and hand the
+                // model the fork (do it, or stop claiming it). See
+                // `execution_contract`.
+                //
+                // `iteration + 1 < max_iterations` is load-bearing: `continue`
+                // on the LAST iteration would fall through to the
+                // max-iterations arm, which emits `TurnComplete { text: None }`
+                // — the user would lose the answer entirely. Never trade a
+                // fabricated answer for no answer; on the last iteration the
+                // claim ships and the prompt is the only line of defence.
+                if contract_gate_firings < MAX_CONTRACT_GATE_FIRINGS
+                    && iteration + 1 < config.max_iterations
+                    && let Some(claim) = crate::execution_contract::unsupported_execution_claim(
+                        response.message.content.as_deref().unwrap_or(""),
+                        &tools_used_this_turn,
+                    )
+                {
+                    contract_gate_firings += 1;
+                    tracing::info!(
+                        claim = %claim,
+                        firing = contract_gate_firings,
+                        "execution-contract gate: rejected unsupported execution claim"
+                    );
+                    // The rejected text has ALREADY streamed to the user (2e
+                    // runs before this check). Without this marker the retry
+                    // would be appended straight onto the rejected text as one
+                    // self-contradicting message.
+                    emit(AgentEvent::TextDelta {
+                        text: format!(
+                            "\n\n[unverified claim \"{claim}…\" — no matching tool ran this turn; re-checking]\n\n"
+                        ),
+                    });
+                    history.push(ChatMessage {
+                        role: "system".to_string(),
+                        content: Some(
+                            crate::execution_contract::UNSUPPORTED_CLAIM_REMINDER.to_string(),
+                        ),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                    continue;
+                }
+
+                // The reminder is harness scaffolding for ONE finalization, not
+                // conversation. `history` outlives the turn on the TUI path
+                // (`ServerRuntime::history`), so leaving it in would resend a
+                // stale scolding on every later turn of the session.
+                if contract_gate_firings > 0 {
+                    history.retain(|m| {
+                        m.content.as_deref()
+                            != Some(crate::execution_contract::UNSUPPORTED_CLAIM_REMINDER)
+                    });
+                }
 
                 // Auto-compact if needed
                 if transcript.should_compact()
@@ -1277,6 +1345,11 @@ pub async fn run_turn(
             }
 
             // ── h5. Execute tool ──────────────────────────────────
+            // Evidence for the execution-contract gate is recorded HERE, not
+            // where the model requested the call: h2-h5 above all `continue`
+            // on hook abort / permission block / policy deny / approval deny,
+            // and a call that never ran is not evidence of anything.
+            tools_used_this_turn.push(tool_name.clone());
             let start = Instant::now();
             let result: Result<Value> = if tool_name == crate::subagent::SPAWN_SUBAGENT_TOOL {
                 // spawn_subagent is a meta-tool by name, but unlike
@@ -1448,8 +1521,10 @@ pub async fn run_turn(
                 if *streak >= EMPTY_RESULT_MAX {
                     let abort_msg = format!(
                         "{tool_name} returned empty results {streak} times in a row. \
-                         This tool isn't finding what you need — try a different tool, \
-                         rephrase the query, or answer from your own knowledge.",
+                         This tool isn't finding what you need — try a different tool \
+                         or rephrase the query. If nothing finds it, report that it \
+                         was not found and say which attempts you made. Do NOT fill \
+                         the gap from memory.",
                     );
                     emit(AgentEvent::ToolCallResult {
                         call_id: call_id.clone(),

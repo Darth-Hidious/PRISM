@@ -1601,7 +1601,7 @@ fn system_prompt_for_mode(
             }
         }
         SessionMode::Plan => format!(
-            "{base_prompt}\n\nYou are in plan mode. Focus on analysis, constraints, sequencing, and concrete implementation planning. Do not edit files or rely on write/execute tools; those actions are blocked in this mode. Produce clear planning output that can guide later execution."
+            "{base_prompt}\n\nYou are in plan mode. Focus on analysis, constraints, sequencing, and concrete implementation planning. Do not edit files or rely on write/execute tools; those actions are blocked in this mode. Produce clear planning output that can guide later execution.\n\nThis narrows the Execution Contract, it does not suspend it: in plan mode THE PLAN IS the deliverable, so describing the work is not task substitution. Everything else still holds — read-only investigation before planning, no claim without a tool result, no answering from memory."
         ),
     }
 }
@@ -7908,8 +7908,8 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
 #[cfg(test)]
 mod tests {
     use super::{
-        BashSlashAction, DiffSlashAction, EditSlashAction, PythonSlashAction, SessionMode,
-        SlashCommandContext, WriteSlashAction, assemble_workflow_run_values,
+        BashSlashAction, DiffSlashAction, EditSlashAction, PlanRuntimeState, PythonSlashAction,
+        SessionMode, SlashCommandContext, WriteSlashAction, assemble_workflow_run_values,
         build_effective_permission_context, build_tool_card_payload, format_skill_create,
         format_skill_run, format_skills_list, handle_skills_slash_command, humanize_tool_verb,
         inline_list, load_plan_snapshot, parse_bash_slash_action, parse_command_tail,
@@ -7917,7 +7917,7 @@ mod tests {
         parse_python_slash_action, parse_read_slash_path, parse_skill_create_args,
         parse_slash_command, parse_write_slash_action, persist_plan_snapshot, pick_organization,
         pick_project, plan_snapshot_path, project_api_history, shell_command_join,
-        summarize_api_view, truncate_for_ui,
+        summarize_api_view, system_prompt_for_mode, truncate_for_ui,
     };
     use prism_ingest::LlmConfig;
     use std::collections::BTreeMap;
@@ -7935,6 +7935,40 @@ mod tests {
     use crate::tool_catalog::ToolCatalog;
     use prism_client::api::{OrgInfo, ProjectInfo};
     use prism_ingest::llm::{ChatMessage, FunctionCall, ToolCallResponse};
+
+    /// TRACE TEST — proves the Agent Execution Contract is in the system
+    /// message that actually reaches the model, not merely present in a
+    /// constant somewhere.
+    ///
+    /// The wire path is: `build_agent_seed` sets
+    /// `AgentConfig::system_prompt = prompts::build_system_prompt(true)`; every
+    /// turn reshapes that through `system_prompt_for_mode` (profile render +
+    /// tool guidance + mode suffix); `agent_loop::run_turn` sends the result as
+    /// `messages[0]`. This walks the first two hops with the real functions, so
+    /// a prompt that carries the contract but never gets injected fails here.
+    #[test]
+    fn execution_contract_reaches_the_wire_prompt() {
+        let base = crate::prompts::build_system_prompt(true);
+        let tools = ToolCatalog::default();
+        let profile = crate::prompt_profile::profile_for_model("claude-sonnet-5");
+        for mode in [SessionMode::Chat, SessionMode::Plan] {
+            let sent =
+                system_prompt_for_mode(mode, &base, &PlanRuntimeState::default(), &tools, &profile);
+            for clause in [
+                "execution agent, not an advice-only assistant",
+                "fix is not explain-the-fix",
+                "unless a tool result for it exists in THIS run",
+                "three materially different attempts",
+                "TOOL RISK IS NOT UNIFORM",
+                "EMPTY RETRIEVAL IS AN ANSWER",
+            ] {
+                assert!(
+                    sent.contains(clause),
+                    "{mode:?} wire prompt is missing contract clause `{clause}`"
+                );
+            }
+        }
+    }
     use prism_runtime::StoredCredentials;
     use tempfile::TempDir;
 

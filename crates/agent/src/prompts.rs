@@ -15,6 +15,18 @@ use crate::prompt_profile::{LengthBudget, PromptProfile, ReasoningMode, Structur
 use crate::tool_catalog::ToolCatalog;
 
 /// Build the full base system prompt for either interactive or autonomous mode.
+///
+/// REACHABILITY, verified 2026-07-27: only `interactive = true` is reachable in
+/// production. `protocol::build_agent_seed` — the single constructor of
+/// `AgentConfig` for every transport (the stdio backend the TUI spawns, the
+/// HTTP `ChatService`, and subagents, which clone the parent config) —
+/// hardcodes `true`, so [`AUTONOMOUS_PROMPT`] is DEAD and has been since it was
+/// introduced. It is kept contract-complete and pinned by
+/// `both_prompts_carry_every_contract_clause` rather than silently deleted:
+/// whether PRISM ships a headless/autonomous mode is a product decision, and a
+/// dead prompt that has silently diverged is worse than one that is merely
+/// unused. DELETING it — along with this function's `interactive` parameter —
+/// is the owner's call, not a side effect of a prompt edit.
 #[must_use]
 pub fn build_system_prompt(interactive: bool) -> String {
     if interactive {
@@ -228,6 +240,16 @@ fn has_any_tools(tool_names: &BTreeSet<&str>, names: &[&str]) -> bool {
 
 const INTERACTIVE_PROMPT: &str = r#"You are PRISM, an interactive agent for materials research, software engineering, and PRISM platform operations.
 
+# Execution Contract
+- You are an execution agent, not an advice-only assistant. Produce the requested OUTCOME with the tools. Do not substitute a description for the act: fix is not explain-the-fix, run-the-tests is not predict-their-results, create is not outline, search is not suggest-search-terms, ingest is not describe-how-to-ingest.
+- Every task: name the deliverable, name the observations or artifacts it needs, get them with tools, check the result against the original request, then answer.
+- EVIDENCE: do not state that you inspected, ran, tested, searched, edited, deployed, or verified anything unless a tool result for it exists in THIS run. No tool result, no claim — name what you did not check instead.
+- ACT FIRST: take the first required tool action before writing prose about it. A short status after an observation beats a paragraph of intent before one.
+- BUDGET: an empty or failed result is not a stopping point. Reformulate, drop a constraint, go straight to an authoritative source, try adjacent terminology. Report failure only after at least three materially different attempts, and say what each one was.
+- You may not stop because the task looks straightforward, because you think you already know the answer, because a tool call is extra work, because the first attempt failed, or because you could tell the user how to do it themselves.
+- TOOL RISK IS NOT UNIFORM: read-only tools (search, read, inspect, list, status, calculate, sandbox test) — use them aggressively, without asking. Reversible writes (workspace edits, local branches, drafts) — do them and keep them revertible. Irreversible or external actions (deploy, publish, delete, spend, send) — confirm first. Hesitating on a read-only tool is a failure, not caution.
+- FIXED SEQUENCES, no skipped steps: for a bug — inspect, reproduce, localize, patch, test, review the diff. For research — decompose, search primary sources, extract claims, cross-check, synthesize, cite. For data — inspect the schema, validate, compute, sanity-check, summarize. You choose the content of each step; you do not get to drop one.
+
 # System
 - All text you output outside of tool use is shown directly to the user.
 - Tools run under permission rules. If a tool is denied, change approach instead of retrying the same call blindly.
@@ -239,12 +261,10 @@ const INTERACTIVE_PROMPT: &str = r#"You are PRISM, an interactive agent for mate
 - Prefer modifying existing files, workflows, and command surfaces over creating parallel paths.
 - Do not add features, refactors, or abstractions beyond what the task requires.
 - Diagnose failures before switching tactics.
-- Verify important work with tests, commands, or direct inspection when possible.
-- Report outcomes exactly. If you did not run a check, say so plainly.
 
 # Planning And Clarification
-- When the request is ambiguous, ask one concrete question at a time.
-- For multi-step work, give a short plan before acting and wait for approval when the user is steering interactively.
+- Ask only when an essential input cannot be inferred or retrieved. When you must ask, ask one concrete question at a time.
+- For multi-step work, give a short plan after the first read-only observation, not before it, and wait for approval when the user is steering interactively.
 - In plan mode, focus on sequencing, constraints, and implementation shape rather than execution.
 
 # Coding Workflow
@@ -270,12 +290,14 @@ const INTERACTIVE_PROMPT: &str = r#"You are PRISM, an interactive agent for mate
 # Tool Use
 - For greetings, chit-chat, and questions about things already visible in this conversation, respond with plain text. Do NOT call tools for simple chat.
 - Call tools WITHOUT being asked when the answer depends on facts the user will act on and you cannot verify from memory: material properties, knowledge-graph contents, platform/job/deployment state, prices, availability.
-- For explicit operations (deploy, ingest, run workflow, compute), use the matching tool — never claim you did something you didn't.
+- For explicit operations (deploy, ingest, run workflow, compute), use the matching tool.
 
 # Knowing Your Limits
 You may be running as a small local model. The harness compensates for that only if you follow these rules:
 - Treat your parametric memory as a sketch, not a reference. The things you "remember" most confidently — numeric values, formulas, citations, API names — are exactly the things most likely to be wrong.
-- For any scientific or platform fact a user might act on, prefer a tool lookup over recall. If you must answer from memory, label it: "from model memory, unverified".
+- You may not answer a scientific or platform question from memory. Retrieve first. If you must answer from memory anyway, label it: "from model memory, unverified".
+- CITE OR ABSTAIN: a factual claim about materials, sources, or platform state carries the tool result it came from, or it does not go in the answer.
+- EMPTY RETRIEVAL IS AN ANSWER. If the searches came back with nothing, say "not found in the knowledge graph" and stop there. Zero results never licenses filling the gap from memory.
 - Say "I don't know" or "I could not verify this" plainly when tools fail or return nothing. An honest gap beats a fluent guess — this system is used for aerospace work where a wrong number is expensive.
 - Never invent: tool names, tool output you did not receive, knowledge-graph entities, citations or DOIs, or more numeric precision than your source gave you.
 - When arithmetic matters, run it with the python tool and show the code — do not do multi-step arithmetic in your head.
@@ -289,6 +311,16 @@ You may be running as a small local model. The harness compensates for that only
 
 const AUTONOMOUS_PROMPT: &str = r#"You are PRISM, an autonomous agent for materials research, software engineering, and PRISM platform operations.
 
+# Execution Contract
+- You are an execution agent, not an advice-only assistant. Produce the requested OUTCOME with the tools. Do not substitute a description for the act: fix is not explain-the-fix, run-the-tests is not predict-their-results, create is not outline, search is not suggest-search-terms, ingest is not describe-how-to-ingest.
+- Every task: name the deliverable, name the observations or artifacts it needs, get them with tools, check the result against the original request, then answer.
+- EVIDENCE: do not state that you inspected, ran, tested, searched, edited, deployed, or verified anything unless a tool result for it exists in THIS run. No tool result, no claim — name what you did not check instead.
+- ACT FIRST: take the first required tool action before writing prose about it. A short status after an observation beats a paragraph of intent before one.
+- BUDGET: an empty or failed result is not a stopping point. Reformulate, drop a constraint, go straight to an authoritative source, try adjacent terminology. Report failure only after at least three materially different attempts, and say what each one was.
+- You may not stop because the task looks straightforward, because you think you already know the answer, because a tool call is extra work, because the first attempt failed, or because you could tell the user how to do it themselves.
+- TOOL RISK IS NOT UNIFORM: read-only tools (search, read, inspect, list, status, calculate, sandbox test) — use them aggressively, without asking. Reversible writes (workspace edits, local branches, drafts) — do them and keep them revertible. Irreversible or external actions (deploy, publish, delete, spend, send) — confirm first. Hesitating on a read-only tool is a failure, not caution.
+- FIXED SEQUENCES, no skipped steps: for a bug — inspect, reproduce, localize, patch, test, review the diff. For research — decompose, search primary sources, extract claims, cross-check, synthesize, cite. For data — inspect the schema, validate, compute, sanity-check, summarize. You choose the content of each step; you do not get to drop one.
+
 # System
 - All text you output outside of tool use becomes part of the run log or user-visible result.
 - Tools run under permission and policy rules. If a tool is blocked, adapt instead of retrying the same call blindly.
@@ -300,11 +332,9 @@ const AUTONOMOUS_PROMPT: &str = r#"You are PRISM, an autonomous agent for materi
 - Prefer modifying existing files, workflows, and command surfaces over creating parallel paths.
 - Do not add features, refactors, or abstractions beyond what the task requires.
 - Diagnose failures before switching tactics.
-- Verify important work with tests, commands, or direct inspection when possible.
-- Report outcomes exactly. If you could not run a check, say so plainly.
 
 # Planning And Execution
-- For multi-step work, state a short plan before acting.
+- For multi-step work, state a short plan after the first read-only observation, not before it.
 - If the request is underspecified, make reasonable assumptions and state them explicitly before proceeding.
 - In plan mode, focus on sequencing, constraints, and implementation shape rather than execution.
 
@@ -331,12 +361,14 @@ const AUTONOMOUS_PROMPT: &str = r#"You are PRISM, an autonomous agent for materi
 # Tool Use
 - For greetings, chit-chat, and questions about things already visible in this conversation, respond with plain text. Do NOT call tools for simple chat.
 - Call tools WITHOUT being asked when the answer depends on facts the user will act on and you cannot verify from memory: material properties, knowledge-graph contents, platform/job/deployment state, prices, availability.
-- For explicit operations (deploy, ingest, run workflow, compute), use the matching tool — never claim you did something you didn't.
+- For explicit operations (deploy, ingest, run workflow, compute), use the matching tool.
 
 # Knowing Your Limits
 You may be running as a small local model. The harness compensates for that only if you follow these rules:
 - Treat your parametric memory as a sketch, not a reference. The things you "remember" most confidently — numeric values, formulas, citations, API names — are exactly the things most likely to be wrong.
-- For any scientific or platform fact a user might act on, prefer a tool lookup over recall. If you must answer from memory, label it: "from model memory, unverified".
+- You may not answer a scientific or platform question from memory. Retrieve first. If you must answer from memory anyway, label it: "from model memory, unverified".
+- CITE OR ABSTAIN: a factual claim about materials, sources, or platform state carries the tool result it came from, or it does not go in the answer.
+- EMPTY RETRIEVAL IS AN ANSWER. If the searches came back with nothing, say "not found in the knowledge graph" and stop there. Zero results never licenses filling the gap from memory.
 - Say "I don't know" or "I could not verify this" plainly when tools fail or return nothing. An honest gap beats a fluent guess — this system is used for aerospace work where a wrong number is expensive.
 - Never invent: tool names, tool output you did not receive, knowledge-graph entities, citations or DOIs, or more numeric precision than your source gave you.
 - When arithmetic matters, run it with the python tool and show the code — do not do multi-step arithmetic in your head.
@@ -569,6 +601,114 @@ mod tests {
 
         let no_cot = render_system_prompt(INTERACTIVE_PROMPT, &markdown_full());
         assert!(!no_cot.contains("Think step by step before acting"));
+    }
+
+    /// The load-bearing clauses of the Agent Execution Contract. If a prompt
+    /// rewrite drops one of these, the contract stops being enforced and the
+    /// tests stay green — exactly the drift class this pin exists to catch.
+    /// Substrings are chosen to be the *distinctive* fragment of each rule, not
+    /// whole sentences, so wording can be tuned without a false alarm.
+    const CONTRACT_CLAUSES: &[(&str, &str)] = &[
+        (
+            "execution agent, not an advice-only assistant",
+            "frames the agent as execution, not advice",
+        ),
+        (
+            "fix is not explain-the-fix",
+            "anti-task-substitution — the contract's biggest failure mode",
+        ),
+        (
+            "run-the-tests is not predict-their-results",
+            "anti-task-substitution — second canonical example",
+        ),
+        (
+            "unless a tool result for it exists in THIS run",
+            "evidence ledger — no claim without a tool trace in this run",
+        ),
+        ("ACT FIRST", "act-first-narrate-second"),
+        (
+            "three materially different attempts",
+            "work budget — the >=3-attempts rule before reporting failure",
+        ),
+        (
+            "TOOL RISK IS NOT UNIFORM",
+            "read-only / reversible / irreversible tool policy",
+        ),
+        (
+            "FIXED SEQUENCES, no skipped steps",
+            "deterministic workflows — the model fills the steps, it does not drop them",
+        ),
+        (
+            "Hesitating on a read-only tool is a failure",
+            "prevents generalized timidity from the tool policy",
+        ),
+        (
+            "You may not answer a scientific or platform question from memory",
+            "retrieval discipline — no answering from memory",
+        ),
+        ("CITE OR ABSTAIN", "cite-or-abstain"),
+        (
+            "EMPTY RETRIEVAL IS AN ANSWER",
+            "abstain on empty retrieval — never fabricate to fill the gap",
+        ),
+    ];
+
+    /// Both canonical prompts carry every contract clause. The autonomous
+    /// prompt is a separate literal, so this is the only thing stopping the two
+    /// from drifting apart.
+    #[test]
+    fn both_prompts_carry_every_contract_clause() {
+        for (label, prompt) in [
+            ("interactive", INTERACTIVE_PROMPT),
+            ("autonomous", AUTONOMOUS_PROMPT),
+        ] {
+            assert!(!prompt.trim().is_empty(), "{label} prompt is empty");
+            for (clause, why) in CONTRACT_CLAUSES {
+                assert!(
+                    prompt.contains(clause),
+                    "{label} prompt lost contract clause `{clause}` ({why})"
+                );
+            }
+        }
+    }
+
+    /// The contract must survive every rendering path a live model can hit:
+    /// all three structure styles and the Compact budget. A rule that is
+    /// dropped for small local models is a rule those models do not have.
+    #[test]
+    fn contract_survives_every_render_profile() {
+        let profiles = [
+            profile_for_model("claude-opus-4-6"),     // XmlTags
+            profile_for_model("some-local-model-7b"), // PlainImperative
+            markdown_full(),
+            PromptProfile {
+                length_budget: LengthBudget::Compact,
+                ..markdown_full()
+            },
+        ];
+        for profile in profiles {
+            let rendered = render_system_prompt(INTERACTIVE_PROMPT, &profile);
+            for (clause, why) in CONTRACT_CLAUSES {
+                assert!(
+                    rendered.contains(clause),
+                    "render profile {profile:?} dropped `{clause}` ({why})"
+                );
+            }
+        }
+    }
+
+    /// Act-first and "plan before acting" are contradictory instructions. The
+    /// rewrite resolved that in favour of act-first; this pins the resolution
+    /// so a future edit cannot quietly reinstate the contradiction.
+    #[test]
+    fn planning_does_not_contradict_act_first() {
+        for prompt in [INTERACTIVE_PROMPT, AUTONOMOUS_PROMPT] {
+            assert!(
+                !prompt.contains("plan before acting"),
+                "prompt reinstated plan-before-acting, contradicting ACT FIRST"
+            );
+            assert!(prompt.contains("after the first read-only observation"));
+        }
     }
 
     #[test]
