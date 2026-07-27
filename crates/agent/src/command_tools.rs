@@ -93,6 +93,9 @@ enum CommandToolKind {
     GoalStatus,
     GoalList,
     GoalResume,
+    ScheduleCreate,
+    ScheduleList,
+    ScheduleCancel,
     KnowledgeEntity,
     KnowledgePaths,
     KnowledgeCorpora,
@@ -629,6 +632,33 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         description: "Resume a paused long-running goal from its checkpoint (BILLABLE — iterations continue spending). Goals pause at approval gates or on budget/iteration caps.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "schedule_create",
+        root: "schedule",
+        aliases: &["cron_create", "watch_create"],
+        kind: CommandToolKind::ScheduleCreate,
+        description: "Set up a durable wake-up for a long-running goal so it keeps going for weeks/months without anyone restarting it (BILLABLE — each wake-up resumes billable iterations). Give `goal_id` plus exactly ONE trigger: `every` ('6h'), `cron` ('0 */6 * * *'), `watch_file` (fire when a path appears), `watch_goal` (fire when another goal finishes), or `watch_corpus_db` + `corpus_at_least` (fire when a corpus has grown). Survives reboots and crashes: if the goal's process died, the next wake-up restarts it. `max_fires` hard-caps how many times it may resume. It will NOT resume a goal paused at an approval gate — that still needs a human.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "schedule_list",
+        root: "schedule",
+        aliases: &["cron_list", "list_schedules"],
+        kind: CommandToolKind::ScheduleList,
+        description: "List every wake-up schedule and watcher on this node with its state (active/wedged/done/cancelled), fire count, and the reason for its last decision. Use this to find out why a goal is or isn't being woken up.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "schedule_cancel",
+        root: "schedule",
+        aliases: &["cron_cancel"],
+        kind: CommandToolKind::ScheduleCancel,
+        description: "Cancel a wake-up schedule by id so it never fires again (idempotent-safe; stops further spend). Find ids with schedule_list.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: false,
     },
     CommandToolSpec {
         name: "knowledge_entity",
@@ -1424,6 +1454,26 @@ fn goal_start_schema() -> Value {
     })
 }
 
+fn schedule_create_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "goal_id": { "type": "string", "description": "Goal (campaign) id to wake up, from goal_list or goal_start." },
+            "every": { "type": "string", "description": "Recurring interval: 30s, 15m, 6h, 2d. Use this OR cron OR one of the watch_* fields." },
+            "cron": { "type": "string", "description": "Cron expression, e.g. '0 */6 * * *' (every 6 hours) or '30 3 * * *' (03:30 daily). 5-field crontab syntax." },
+            "watch_file": { "type": "string", "description": "Fire when this path appears (a job dropping an output file, a flag being written)." },
+            "watch_goal": { "type": "string", "description": "Fire when ANOTHER goal reaches watch_goal_status — chain a goal onto a job finishing." },
+            "watch_goal_status": { "type": "string", "description": "Status the watched goal must reach: completed (default), failed, paused." },
+            "watch_corpus_db": { "type": "string", "description": "Path to a local graph database; fire when it holds at least corpus_at_least entities (a corpus growing)." },
+            "corpus_at_least": { "type": "integer", "description": "Entity count the watched corpus must reach. Required with watch_corpus_db." },
+            "max_fires": { "type": "integer", "description": "Hard cap on wake-ups (default 100). This is the spend guard that works even when nothing reports a USD cost." },
+            "max_no_progress": { "type": "integer", "description": "Stop and report after this many consecutive wake-ups that produced no progress (default 3)." }
+        },
+        "required": ["goal_id"],
+        "additionalProperties": false
+    })
+}
+
 fn goal_id_schema(description: &str) -> Value {
     json!({
         "type": "object",
@@ -1792,6 +1842,11 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::GoalList => empty_schema(),
         CommandToolKind::GoalResume => {
             goal_id_schema("Goal (campaign) id to resume from its checkpoint.")
+        }
+        CommandToolKind::ScheduleCreate => schedule_create_schema(),
+        CommandToolKind::ScheduleList => empty_schema(),
+        CommandToolKind::ScheduleCancel => {
+            goal_id_schema("Schedule id from schedule_list (e.g. 'sched-…').")
         }
         CommandToolKind::KnowledgeEntity => knowledge_entity_schema(),
         CommandToolKind::KnowledgePaths => knowledge_paths_schema(),
@@ -2714,6 +2769,75 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 // the tool call on a resumed multi-hour loop.
                 "--detach".to_string(),
             ],
+        }),
+        CommandToolKind::ScheduleCreate => {
+            let mut args = vec![
+                "create".to_string(),
+                "--goal".to_string(),
+                required_string(input, "goal_id")?,
+            ];
+            // Exactly one trigger. Ambiguity is refused here rather than
+            // silently resolved by precedence — a schedule that fires on a
+            // different trigger than the agent asked for is worse than an error.
+            let triggers: Vec<(&str, String)> = [
+                ("--every", optional_string(input, "every")),
+                ("--cron", optional_string(input, "cron")),
+                ("--watch-file", optional_string(input, "watch_file")),
+                ("--watch-goal", optional_string(input, "watch_goal")),
+                ("--watch-corpus", optional_string(input, "watch_corpus_db")),
+            ]
+            .into_iter()
+            .filter_map(|(flag, v)| v.map(|v| (flag, v)))
+            .collect();
+            match triggers.len() {
+                1 => {
+                    args.push(triggers[0].0.to_string());
+                    args.push(triggers[0].1.clone());
+                }
+                0 => anyhow::bail!(
+                    "schedule_create needs exactly one trigger: every, cron, watch_file, \
+                     watch_goal, or watch_corpus_db"
+                ),
+                n => anyhow::bail!(
+                    "schedule_create got {n} triggers ({}) — give exactly one",
+                    triggers
+                        .iter()
+                        .map(|(f, _)| f.trim_start_matches("--"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+            if triggers[0].0 == "--watch-corpus" {
+                let at_least = optional_usize(input, "corpus_at_least").ok_or_else(|| {
+                    anyhow::anyhow!("watch_corpus_db needs corpus_at_least (entity count)")
+                })?;
+                args.push("--corpus-at-least".to_string());
+                args.push(at_least.to_string());
+            }
+            if let Some(status) = optional_string(input, "watch_goal_status") {
+                args.push("--watch-goal-status".to_string());
+                args.push(status);
+            }
+            if let Some(n) = optional_usize(input, "max_fires") {
+                args.push("--max-fires".to_string());
+                args.push(n.to_string());
+            }
+            if let Some(n) = optional_usize(input, "max_no_progress") {
+                args.push("--max-no-progress".to_string());
+                args.push(n.to_string());
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::ScheduleList => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["list".to_string()],
+        }),
+        CommandToolKind::ScheduleCancel => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["cancel".to_string(), required_string(input, "id")?],
         }),
         CommandToolKind::BillingBalance => Ok(CommandExecution::Cli {
             root: spec.root,
@@ -3750,6 +3874,83 @@ mod tests {
 
         // Missing goal → honest arg error, no execution.
         assert!(build_execution(spec_by_name("goal_start").unwrap(), &json!({})).is_err());
+    }
+
+    #[test]
+    fn schedule_tools_let_the_agent_set_up_its_own_wakeups() {
+        // Scheduling is a first-class agent capability, not a human-only CLI
+        // flag: the agent creates, lists and cancels its own wake-ups.
+        assert!(is_command_tool("schedule_create"));
+        assert!(is_command_tool("cron_create"), "alias must resolve");
+        assert!(is_command_tool("schedule_list"));
+        assert!(is_command_tool("schedule_cancel"));
+        // Creating a schedule commits to autonomous billable resumes → the
+        // human approves once. Listing is free. Cancelling only reduces
+        // spend, so it is never gated behind an approval the human might
+        // not be around to give.
+        assert_eq!(
+            command_tool_requires_approval("schedule_create"),
+            Some(true)
+        );
+        assert_eq!(command_tool_requires_approval("schedule_list"), Some(false));
+        assert_eq!(
+            command_tool_requires_approval("schedule_cancel"),
+            Some(false)
+        );
+
+        let every = command_tool_preview(
+            "schedule_create",
+            &json!({"goal_id": "camp_abc", "every": "6h", "max_fires": 40}),
+        )
+        .expect("interval preview renders");
+        assert_eq!(
+            every,
+            "prism schedule create --goal camp_abc --every 6h --max-fires 40"
+        );
+
+        let cron = command_tool_preview(
+            "schedule_create",
+            &json!({"goal_id": "camp_abc", "cron": "0 */6 * * *"}),
+        )
+        .expect("cron preview renders");
+        assert!(cron.contains("--cron"), "{cron}");
+
+        let watch = command_tool_preview(
+            "schedule_create",
+            &json!({"goal_id": "camp_abc", "watch_file": "/tmp/job.done"}),
+        )
+        .expect("watcher preview renders");
+        assert!(watch.contains("--watch-file /tmp/job.done"), "{watch}");
+
+        let corpus = command_tool_preview(
+            "schedule_create",
+            &json!({"goal_id": "c", "watch_corpus_db": "/tmp/g.db", "corpus_at_least": 5000}),
+        )
+        .expect("corpus preview renders");
+        assert!(corpus.contains("--corpus-at-least 5000"), "{corpus}");
+
+        assert_eq!(
+            command_tool_preview("schedule_list", &json!({})).unwrap(),
+            "prism schedule list"
+        );
+        assert_eq!(
+            command_tool_preview("schedule_cancel", &json!({"id": "sched-1"})).unwrap(),
+            "prism schedule cancel sched-1"
+        );
+
+        // No trigger, two triggers, and a corpus watcher without a threshold
+        // are all refused outright — never silently resolved by precedence.
+        let spec = spec_by_name("schedule_create").unwrap();
+        assert!(build_execution(spec, &json!({"goal_id": "c"})).is_err());
+        assert!(
+            build_execution(
+                spec,
+                &json!({"goal_id": "c", "every": "1h", "cron": "* * * * *"})
+            )
+            .is_err()
+        );
+        assert!(build_execution(spec, &json!({"goal_id": "c", "watch_corpus_db": "/x"})).is_err());
+        assert!(build_execution(spec, &json!({"every": "1h"})).is_err());
     }
 
     #[test]

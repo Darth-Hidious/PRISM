@@ -318,6 +318,9 @@ const CLI_BACKED_ROOTS: &[&str] = &[
     // not a config-only subprocess that the running session would ignore.
     "compute",
     "campaign",
+    // Durable wake-ups for long-running goals — reachable as `/schedule …`
+    // inside the TUI, never "go run the CLI" (memory prism-no-exit-to-cli).
+    "schedule",
     "notebook",
     "pyiron",
     "billing",

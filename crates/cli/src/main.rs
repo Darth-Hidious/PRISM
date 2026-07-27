@@ -141,6 +141,13 @@ enum Commands {
         #[command(subcommand)]
         command: CampaignCommands,
     },
+    /// Durable schedules and watchers that wake a long-running goal back up —
+    /// on a clock, on a cron expression, or when a condition becomes true —
+    /// so a goal survives reboots and crashes without a human restarting it.
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommands,
+    },
     /// Start the agent backend (JSON-RPC server for TUI frontend).
     Backend {
         #[arg(long, default_value = ".")]
@@ -673,6 +680,78 @@ enum CampaignCommands {
     },
     /// List all campaign checkpoints on this machine.
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum ScheduleCommands {
+    /// Create a schedule that wakes a goal back up. Exactly one trigger.
+    Create {
+        /// Goal (campaign) id to wake up.
+        #[arg(long)]
+        goal: String,
+        /// Recurring interval, e.g. 30s, 15m, 6h, 2d.
+        #[arg(long, group = "trigger")]
+        every: Option<String>,
+        /// Cron expression. 5-field crontab ("0 */6 * * *") or 6-field
+        /// seconds-first.
+        #[arg(long, group = "trigger")]
+        cron: Option<String>,
+        /// One-shot: fire once at this unix timestamp.
+        #[arg(long, group = "trigger")]
+        at: Option<i64>,
+        /// Watcher: fire when this path appears.
+        #[arg(long, group = "trigger")]
+        watch_file: Option<PathBuf>,
+        /// Watcher: fire when another goal reaches --watch-goal-status.
+        #[arg(long, group = "trigger")]
+        watch_goal: Option<String>,
+        /// Status the watched goal must reach (default: completed).
+        #[arg(long, default_value = "completed")]
+        watch_goal_status: String,
+        /// Watcher: fire when this local graph database has grown to
+        /// --corpus-at-least entities.
+        #[arg(long, group = "trigger")]
+        watch_corpus: Option<PathBuf>,
+        /// Entity count the watched corpus must reach.
+        #[arg(long)]
+        corpus_at_least: Option<i64>,
+        /// Hard ceiling on how many times this schedule may resume the goal.
+        /// The one spend guard that works even when nothing reports a cost.
+        #[arg(long, default_value_t = 100)]
+        max_fires: u32,
+        /// Stop and report after this many consecutive wake-ups that produced
+        /// no progress.
+        #[arg(long, default_value_t = 3)]
+        max_no_progress: u32,
+    },
+    /// List every schedule with its state and last outcome.
+    List,
+    /// Cancel a schedule (it never fires again).
+    Cancel {
+        /// Schedule id from `schedule list`.
+        id: String,
+    },
+    /// Evaluate every schedule once and resume whatever is due. This is the
+    /// command an OS timer (launchd / systemd / cron) runs.
+    Tick,
+    /// Run `tick` in a loop in the foreground — for containers and pods where
+    /// the runtime's restart policy is the supervisor. Dies with this
+    /// process; on a normal host prefer `schedule install` + `tick`.
+    Daemon {
+        /// Seconds between ticks.
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+    },
+    /// Print (or write) the OS unit that owns the tick heartbeat.
+    Install {
+        /// Seconds between ticks.
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+        /// Write the unit to the user's agent/unit directory instead of
+        /// printing it, and print the command that activates it.
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1699,6 +1778,12 @@ async fn main() -> Result<()> {
                             campaign.state().completion_reason
                         );
                     } else {
+                        // Whoever is actually running the loop registers
+                        // itself, so the scheduler can distinguish "still
+                        // working" from "its process died" and never spawns a
+                        // second worker over a healthy one. Cleared on exit so
+                        // a recycled pid can't masquerade as this worker.
+                        let _worker_guard = WorkerPidGuard::register(&id);
                         if let Some(store) = open_campaign_provenance().await {
                             campaign = campaign.with_provenance(store);
                         }
@@ -1779,6 +1864,9 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        Commands::Schedule { command } => {
+            handle_schedule_command(command).await?;
         }
         Commands::Notebook { command } => match command {
             NotebookCommands::Start { port } => {
@@ -8416,6 +8504,239 @@ async fn open_campaign_provenance() -> Option<prism_provenance::ProvenanceStore>
     }
 }
 
+/// Registers this process as the live worker for a goal and clears the
+/// registration on drop. Without the clear, a goal that finished would keep a
+/// stale pid on disk; once the OS recycled that pid the scheduler would read
+/// "still running" forever and never wake the goal again.
+struct WorkerPidGuard(String);
+
+impl WorkerPidGuard {
+    fn register(goal_id: &str) -> Self {
+        if let Err(e) =
+            prism_campaign::schedule::WorkerResumer::write_worker_pid(goal_id, std::process::id())
+        {
+            tracing::warn!(goal_id, error = %e, "could not register campaign worker pid — the scheduler may spawn a duplicate worker");
+        }
+        Self(goal_id.to_string())
+    }
+}
+
+impl Drop for WorkerPidGuard {
+    fn drop(&mut self) {
+        let path = prism_campaign::schedule::WorkerResumer::worker_pid_path(&self.0);
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(goal = %self.0, error = %e, "could not clear campaign worker pid file");
+        }
+    }
+}
+
+/// `prism schedule …` — the durable wake-up surface for long-running goals.
+///
+/// The registry lives in pod-local embedded libSQL; the heartbeat lives in
+/// whatever already supervises processes on this host. See
+/// `prism_campaign::schedule` for why the ticking is delegated rather than
+/// run in-process.
+async fn handle_schedule_command(command: ScheduleCommands) -> Result<()> {
+    use prism_campaign::schedule::{
+        Decision, ScheduleStore, Trigger, WorkerResumer, launchd_plist, parse_duration,
+        systemd_units, tick_once,
+    };
+
+    let store = ScheduleStore::open_default().await?;
+    let resumer = WorkerResumer {
+        exe: std::env::current_exe().context("failed to locate the prism executable")?,
+    };
+
+    match command {
+        ScheduleCommands::Create {
+            goal,
+            every,
+            cron,
+            at,
+            watch_file,
+            watch_goal,
+            watch_goal_status,
+            watch_corpus,
+            corpus_at_least,
+            max_fires,
+            max_no_progress,
+        } => {
+            let trigger = if let Some(spec) = every {
+                Trigger::Every {
+                    seconds: parse_duration(&spec)?,
+                }
+            } else if let Some(expr) = cron {
+                Trigger::Cron { expr }
+            } else if let Some(unix_secs) = at {
+                Trigger::At { unix_secs }
+            } else if let Some(path) = watch_file {
+                Trigger::WatchFile { path }
+            } else if let Some(goal_id) = watch_goal {
+                Trigger::WatchGoal {
+                    goal_id,
+                    status: watch_goal_status,
+                }
+            } else if let Some(db) = watch_corpus {
+                let at_least = corpus_at_least.ok_or_else(|| {
+                    anyhow::anyhow!("--watch-corpus needs --corpus-at-least <entity count>")
+                })?;
+                Trigger::WatchCorpus { db, at_least }
+            } else {
+                anyhow::bail!(
+                    "a schedule needs a trigger: --every, --cron, --at, --watch-file, \
+                     --watch-goal, or --watch-corpus"
+                );
+            };
+            // Refuse to schedule a goal that does not exist — an id typo
+            // would otherwise create a schedule that wedges on its first tick.
+            let snapshot =
+                <WorkerResumer as prism_campaign::schedule::GoalResumer>::snapshot(&resumer, &goal)
+                    .with_context(|| format!("cannot schedule goal '{goal}'"))?;
+            let sched = store
+                .create(&goal, trigger, max_fires, max_no_progress)
+                .await?;
+            println!("Schedule created: {}", sched.id);
+            println!(
+                "  goal:      {} ({})",
+                sched.goal_id,
+                snapshot.status.as_str()
+            );
+            println!("  trigger:   {}", serde_json::to_string(&sched.trigger)?);
+            if let Some(due) = sched.next_due_at {
+                println!("  next due:  {due} (unix)");
+            } else {
+                println!("  next due:  on the watched condition becoming true");
+            }
+            println!(
+                "  ceilings:  {max_fires} wake-ups, wedged after {max_no_progress} with no progress"
+            );
+            if !schedule_heartbeat_installed() {
+                println!();
+                println!(
+                    "  NOTE: nothing is running `prism schedule tick` on this host yet, so this \
+                     schedule will not fire. Install the heartbeat with `prism schedule install \
+                     --write`, or run `prism schedule daemon` inside a supervised container."
+                );
+            }
+        }
+        ScheduleCommands::List => {
+            let all = store.list().await?;
+            if all.is_empty() {
+                println!("No schedules.");
+                return Ok(());
+            }
+            for s in all {
+                println!(
+                    "  {} — {} — goal {} — {} fires/{} — {}",
+                    s.id,
+                    s.state.as_str(),
+                    s.goal_id,
+                    s.fires,
+                    s.max_fires,
+                    serde_json::to_string(&s.trigger)?
+                );
+                if !s.last_outcome.is_empty() {
+                    println!("      last: {}", s.last_outcome);
+                }
+            }
+        }
+        ScheduleCommands::Cancel { id } => {
+            if store.cancel(&id).await? {
+                println!("Cancelled {id}");
+            } else {
+                anyhow::bail!("no schedule '{id}' — nothing to cancel");
+            }
+        }
+        ScheduleCommands::Tick => {
+            let decisions = tick_once(&store, &resumer, chrono::Utc::now().timestamp()).await?;
+            if decisions.is_empty() {
+                println!("Nothing due.");
+            }
+            for (id, decision) in decisions {
+                let tag = match decision {
+                    Decision::Fired(_) => "FIRED",
+                    Decision::Skipped(_) => "skip",
+                    Decision::Stopped(_) => "STOP",
+                };
+                println!("{tag} {id}: {}", decision.reason());
+            }
+        }
+        ScheduleCommands::Daemon { interval } => {
+            if interval == 0 {
+                anyhow::bail!("--interval must be greater than zero");
+            }
+            println!(
+                "Schedule daemon running (tick every {interval}s). This loop dies with this \
+                 process — it is meant for a supervised container. On a normal host use \
+                 `prism schedule install`."
+            );
+            loop {
+                match tick_once(&store, &resumer, chrono::Utc::now().timestamp()).await {
+                    Ok(decisions) => {
+                        for (id, decision) in decisions {
+                            println!("{id}: {}", decision.reason());
+                        }
+                    }
+                    // A failing tick must be loud and must not kill the loop —
+                    // the next tick may well succeed.
+                    Err(e) => eprintln!("tick failed: {e:#}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            }
+        }
+        ScheduleCommands::Install { interval, write } => {
+            let exe = std::env::current_exe()?;
+            let unit_path = heartbeat_unit_path();
+            let (contents, activate) = if cfg!(target_os = "macos") {
+                (launchd_plist(&exe, interval), "launchctl load -w")
+            } else {
+                let (service, timer) = systemd_units(&exe, interval);
+                if write && let Some(dir) = unit_path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                    std::fs::write(dir.join("prism-schedule.service"), &service)?;
+                    println!("Wrote {}", dir.join("prism-schedule.service").display());
+                }
+                (timer, "systemctl --user enable --now")
+            };
+            if write {
+                if let Some(parent) = unit_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&unit_path, &contents)?;
+                println!("Wrote {}", unit_path.display());
+                println!("Activate it with:\n  {activate} {}", unit_path.display());
+            } else {
+                println!("# {}", unit_path.display());
+                print!("{contents}");
+                println!("# Activate with: {activate} {}", unit_path.display());
+                println!("# Or re-run with --write to install it.");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Where this host's tick heartbeat unit lives.
+fn heartbeat_unit_path() -> PathBuf {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    if cfg!(target_os = "macos") {
+        home.join("Library/LaunchAgents/com.marc27.prism.schedule.plist")
+    } else {
+        home.join(".config/systemd/user/prism-schedule.timer")
+    }
+}
+
+/// Whether something on this host is actually running `prism schedule tick`.
+/// A schedule created with no heartbeat behind it would sit there looking
+/// healthy and never fire — exactly the "check that reports OK about an
+/// unusable thing" this codebase keeps getting bitten by, so `create` says so
+/// out loud instead of quietly producing a schedule that cannot work.
+fn schedule_heartbeat_installed() -> bool {
+    heartbeat_unit_path().exists() || std::env::var_os("PRISM_SCHEDULE_DAEMON").is_some()
+}
+
 /// Spawn the detached background worker that owns a campaign loop:
 /// `prism campaign continue <id>` with stdio detached, in its own process
 /// group so it survives the parent CLI (or an agent tool call) exiting. The
@@ -8437,6 +8758,15 @@ fn spawn_campaign_worker(campaign_id: &str) -> Result<()> {
     let child = cmd
         .spawn()
         .context("failed to spawn detached campaign worker")?;
+    // Record the live worker so the scheduler can tell "still running" from
+    // "its process died" without spawning a duplicate. Every spawn site must
+    // write this, or a scheduled tick would start a second worker alongside a
+    // healthy one.
+    if let Err(e) =
+        prism_campaign::schedule::WorkerResumer::write_worker_pid(campaign_id, child.id())
+    {
+        tracing::warn!(campaign_id, error = %e, "could not record campaign worker pid — the scheduler may spawn a duplicate worker");
+    }
     tracing::info!(
         campaign_id,
         worker_pid = child.id(),
