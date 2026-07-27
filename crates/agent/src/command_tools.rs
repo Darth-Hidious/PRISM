@@ -920,7 +920,16 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "billing",
         aliases: &["prism_billing"],
         kind: CommandToolKind::RootSubcommand {
-            subcommands: &["usage", "history", "prices", "topup", "balance"],
+            // Exactly the variants of clap's `BillingCommands` (cli/src/main.rs:597)
+            // and nothing else. `balance` was listed here but is NOT a clap
+            // variant — the balance is what bare `prism billing` prints — so an
+            // agent taking this list at its word got `error: unrecognized
+            // subcommand 'balance'`. Offering a verb that does not exist is the
+            // same defect class as a check that reports OK for something
+            // unusable: the declaration has to match reality, not intent.
+            // The balance IS reachable, via the typed `billing_balance` sibling
+            // below, which is read-only and needs no approval.
+            subcommands: &["usage", "history", "prices", "topup"],
             flags: FlagPolicy::AnyBehindApproval,
         },
         description: "Run `prism billing <subcommand>` for MARC27 credits. Prefer the typed siblings billing_balance / billing_usage / billing_history / billing_prices for the common read-only checks; use this umbrella for `topup` (opens a real Stripe checkout and spends money — approval-gated) or any billing verb without a typed tool.",
