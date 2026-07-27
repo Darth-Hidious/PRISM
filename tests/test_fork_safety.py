@@ -40,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -485,15 +486,46 @@ def _exercise_hf_launch_and_poll(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(hf_jobs.HfJobsBackend, "_materialise_payload", _stub_payload)
 
-    backend = hf_jobs.HfJobsBackend(poll_interval_s=0.01)
+    # A healthy _poll returns on its FIRST status read, before it ever sleeps,
+    # so a long interval costs the green path nothing. It costs the RED path a
+    # great deal: the thread abandoned below would otherwise re-spawn `hf`
+    # every 10ms for the rest of the session.
+    backend = hf_jobs.HfJobsBackend(poll_interval_s=5.0)
     job = hf_jobs.BackendJob(
         tool_name="relax_structure",
         input_payload={"composition": {"atoms": {"Ti": 1.0}}},
         cache_key="fork-safety-probe",
     )
 
-    with pytest.raises(RuntimeError, match="MACE_MCP_RESULTS_REPO"):
-        backend.execute(job)
+    # Bounded, because _poll cannot fail fast on its own: `except Exception:
+    # status = "unknown"` swallows both a SIGSEGV and the no_fork fixture's
+    # refusal, and "unknown" is not a terminal status, so a regression here
+    # spins to _poll's own deadline -- tool timeout + 300s, over 2100s -- before
+    # raising anything. That is half an hour of a shared two-slot runner per
+    # test to learn what this bound reports in seconds.
+    outcome: list[BaseException | None] = []
+
+    def _execute() -> None:
+        try:
+            backend.execute(job)
+            outcome.append(None)
+        except BaseException as exc:  # noqa: BLE001 - inspected below, not swallowed
+            outcome.append(exc)
+
+    worker = threading.Thread(target=_execute, daemon=True)
+    worker.start()
+    worker.join(60)
+    assert not worker.is_alive(), (
+        "execute() had not returned after 60s. Either the launch spawn never "
+        "produced a job id, or _poll is reading 'unknown' forever because its "
+        "status spawn is dying."
+    )
+
+    failure = outcome[0]
+    assert isinstance(failure, RuntimeError) and "MACE_MCP_RESULTS_REPO" in str(failure), (
+        f"expected execute() to stop at the results-repo check, which is the "
+        f"first thing past both spawns; got {failure!r}"
+    )
 
     log = calls.read_text()
     assert "jobs uv run" in log, f"the launch spawn never reached `hf`: {log!r}"
@@ -523,23 +555,32 @@ def _exercise_hf_cancel_and_logs(tmp_path, monkeypatch) -> None:
 
 
 def _exercise_update_install_detection(tmp_path, monkeypatch) -> None:
-    """app/update.py — `uv tool list` behind detect_install_method()."""
+    """app/update.py — `uv tool list` AND `pipx list` behind detect_install_method()."""
     from app import update
 
-    calls = _fake_on_path(tmp_path, monkeypatch, "uv", "echo prism-platform\n")
+    # detect_install_method returns on the first branch that matches, so a `uv`
+    # reporting prism-platform would leave the pipx spawn unexercised and this
+    # test would pass with that line reverted to bare subprocess. Have `uv`
+    # answer WITHOUT prism-platform: detection falls through, and one call
+    # drives both spawns.
+    uv_calls = _fake_on_path(tmp_path, monkeypatch, "uv", "echo some-other-tool\n")
+    pipx_calls = _fake_on_path(tmp_path, monkeypatch, "pipx", "echo prism-platform\n")
 
     update.detect_install_method()
 
-    # Assert the command REACHED exec, not that detect_install_method returned
-    # "uv". The return value is gated on a production timeout=5 this test does
-    # not own: on a loaded machine a slow-but-successful spawn also returns
+    # Assert the commands REACHED exec, not what detect_install_method returned.
+    # The return value is gated on a production timeout=5 this test does not
+    # own: on a loaded machine a slow-but-successful spawn also returns
     # something else, and then a timing problem would be reported as a fork
-    # death. What only a fork death can do is leave this file unwritten.
-    assert calls.exists() and "tool list" in calls.read_text(), (
+    # death. What only a fork death can do is leave these files unwritten.
+    assert uv_calls.exists() and "tool list" in uv_calls.read_text(), (
         "`uv tool list` never reached the shell. detect_install_method "
         "swallows that and falls through to another install method, printing "
-        "an upgrade command that will not work. (`pipx list` is the same "
-        "shape and the same spawn.)"
+        "an upgrade command that will not work."
+    )
+    assert pipx_calls.exists() and "list --short" in pipx_calls.read_text(), (
+        "`pipx list` never reached the shell — same swallow, same wrong "
+        "upgrade command."
     )
 
 

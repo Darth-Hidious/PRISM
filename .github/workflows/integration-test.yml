@@ -140,6 +140,9 @@ jobs:
     # "no call site reaches fork()", never as "the macOS crash is fixed" —
     # only a macOS run can say that.
     runs-on: [self-hosted, linux, ARM64]
+    # Two runner slots serve three repos, so nothing here may hang unbounded.
+    # The suite is ~35s plus install; this is a cap on a stuck job, not a budget.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -150,10 +153,11 @@ jobs:
         # test, and continuing would report a green on an empty run.
         #
         # `[dev]` only, not `[ml]`: matgl/torch is several GB on a 15G runner
-        # already shared with two cargo target dirs. The 12 tests that need
-        # scikit-learn, the 3 that need pycalphad and the pexpect-based TUI
-        # e2e file skip with that reason printed by `-rs` below, so the log
-        # says what went unrun instead of implying full coverage.
+        # already shared with two cargo target dirs. Measured against this
+        # exact install: 912 pass, 18 skip — 14 needing scikit-learn, 3
+        # pycalphad, 1 the pexpect TUI file. Every one names its own reason and
+        # `-rs` below prints them, so the log says what went unrun instead of
+        # implying full coverage.
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -e ".[dev]"
