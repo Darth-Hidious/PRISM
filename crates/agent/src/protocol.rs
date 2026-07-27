@@ -7543,11 +7543,15 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
                     "version": env!("CARGO_PKG_VERSION"),
                     "tool_count": tools.len(),
                     "session_id": runtime.session_store.current_id().unwrap_or(""),
-                    // Contract for clients/smokes: the model is offered the
-                    // top-K relevant tools per request (not the full catalog);
-                    // the rest stay discoverable via the find_tools meta-tool.
+                    // Contract for clients/smokes: tools are offered per request
+                    // up to a TOKEN BUDGET derived from the model's context
+                    // window (not a fixed count), ranked by relevance; anything
+                    // that does not fit stays discoverable via find_tools.
                     "model_tool_selection": {
-                        "max_per_request": crate::tool_catalog::MAX_TOOLS_PER_REQUEST,
+                        "token_budget": crate::tool_catalog::tool_token_budget(
+                            crate::models::get_model_config(&runtime.llm_config.model)
+                                .context_window,
+                        ),
                         "meta_tools": ["recall", "find_tools"],
                     },
                 });

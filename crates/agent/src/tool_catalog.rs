@@ -3,13 +3,54 @@ use serde_json::{Value, json};
 
 use crate::permissions::{PermissionMode, get_tool_permission};
 
-/// How many tool definitions are offered to the model per LLM request
-/// (top-K by relevance to the user message, plus the meta-tools and any
-/// tools already called this session). The full catalog stays reachable
-/// through the `find_tools` meta-tool. Advertised in `ui.welcome` as
-/// `model_tool_selection.max_per_request` so clients and smokes can pin
-/// the contract.
-pub const MAX_TOOLS_PER_REQUEST: usize = 15;
+/// Bytes of serialized OpenAI tool JSON per model token.
+///
+/// MEASURED on the real catalog, not guessed: the 54 Python tool definitions
+/// serialize to 71,577 bytes, which tokenize to 17,758 tokens on Mistral's
+/// tokenizer (4.03 B/tok), 16,577 on `o200k_base` (4.32) and 16,249 on
+/// `cl100k_base` (4.41). Charging 4 over-estimates against every one of those,
+/// so the budget can be under-spent but never blown. Re-measure and update this
+/// number if the catalog's shape changes materially.
+const BYTES_PER_TOKEN: usize = 4;
+
+/// Ceiling on tool-definition tokens per request, whatever the context window.
+/// The whole live catalog (54 Python + 77 command + 6 meta = 119,554 bytes)
+/// charges 29,889 here, so today everything fits with ~10% headroom; past that
+/// the escape hatch (`find_tools`) starts mattering again.
+pub const MAX_TOOL_TOKENS: usize = 32_768;
+
+/// Floor, so a small-context model still gets the meta-tools plus a couple of
+/// real ones rather than meta-tools alone (the meta-tools alone charge 984).
+pub const MIN_TOOL_TOKENS: usize = 2_048;
+
+/// Share of the model's context window spendable on tool definitions (1/N).
+/// At 1/4 the whole catalog reaches every 128k-or-larger model — including
+/// `ministral-3b` (131k) — while [`MAX_TOOL_TOKENS`] keeps a 262k model at
+/// 12.5%. Smaller models spend a quarter of their window on tools and truncate
+/// by relevance, which beats being blind to capability they have.
+const CONTEXT_TOOL_SHARE: usize = 4;
+
+/// Token budget for tool definitions on a model with `context_window` tokens.
+///
+/// Replaces the old fixed `MAX_TOOLS_PER_REQUEST = 15` count cap. A count cap
+/// sized for the worst case starves every normal case: 15 of 131 tools left the
+/// model blind to capability it had, and "call `find_tools` if you need
+/// something else" is an instruction models reliably ignore — not looking is
+/// free and nothing catches it. A budget lets the whole catalog through when it
+/// fits and degrades by relevance only when it genuinely cannot.
+#[must_use]
+pub fn tool_token_budget(context_window: usize) -> usize {
+    (context_window / CONTEXT_TOOL_SHARE).clamp(MIN_TOOL_TOKENS, MAX_TOOL_TOKENS)
+}
+
+/// Token cost of one tool definition as the provider will see it: the exact
+/// JSON bytes sent on the wire, divided by the measured [`BYTES_PER_TOKEN`].
+#[must_use]
+pub fn definition_tokens(def: &ToolDefinition) -> usize {
+    serde_json::to_string(def)
+        .map_or(0, |s| s.len())
+        .div_ceil(BYTES_PER_TOKEN)
+}
 
 /// Full metadata for one loaded tool. Rust keeps this alongside the OpenAI
 /// function definition so command views, permission logic, and approval UI all
@@ -228,17 +269,16 @@ impl ToolCatalog {
         rejected
     }
 
-    /// Return tool definitions filtered to the top-K most relevant for
-    /// the user's query. Uses lightweight keyword matching on tool name
-    /// and description — no embedding server required.
+    /// Rank the WHOLE catalog by keyword relevance to `query`, most relevant
+    /// first. Lightweight name/description matching — no embedding server.
     ///
-    /// This prevents "tool stuffing" (sending all 99 tools = 21K tokens
-    /// to the LLM every turn). Falls back to all definitions if the
-    /// query is empty or matches nothing.
+    /// Ranking only; nothing is dropped here. Truncation is the token budget's
+    /// job (`agent_loop::finalize_tools`), so a tool is excluded because the
+    /// request genuinely cannot afford it — never because of an arbitrary count.
     #[must_use]
-    pub fn definitions_for_query(&self, query: &str, top_k: usize) -> Vec<ToolDefinition> {
-        if query.trim().is_empty() || self.tools.len() <= top_k {
-            return self.definitions.clone();
+    pub fn names_by_relevance(&self, query: &str) -> Vec<String> {
+        if query.trim().is_empty() {
+            return self.tools.iter().map(|t| t.name.clone()).collect();
         }
 
         let query_lower = query.to_lowercase();
@@ -287,28 +327,71 @@ impl ToolCatalog {
             })
             .collect();
 
-        // Sort by score descending, take top_k
+        // Stable sort by score descending: equal-scoring (including zero-scoring)
+        // tools keep catalog order, so the tail is deterministic.
         scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-
-        let selected: Vec<&LoadedTool> = scored
+        scored
             .into_iter()
-            .filter(|(score, tool)| *score > 0 || ALWAYS_INCLUDE.contains(&tool.name.as_str()))
-            .take(top_k)
-            .map(|(_, tool)| tool)
-            .collect();
-
-        if selected.is_empty() {
-            // No keyword matches — fall back to a sensible default set
-            self.tools
-                .iter()
-                .filter(|t| ALWAYS_INCLUDE.contains(&t.name.as_str()))
-                .take(top_k)
-                .map(|t| t.to_definition())
-                .collect()
-        } else {
-            selected.iter().map(|t| t.to_definition()).collect()
-        }
+            .map(|(_, tool)| tool.name.clone())
+            .collect()
     }
+}
+
+/// First-person incapacity markers. Paired with [`CAPABILITY_MARKERS`] below.
+const INCAPACITY_MARKERS: &[&str] = &[
+    "can't",
+    "cannot",
+    "can not",
+    "unable",
+    "don't have",
+    "do not have",
+    "no access",
+    "lack",
+    "no way to",
+];
+
+/// Words that make an incapacity statement about TOOLING rather than about the
+/// subject matter. "I can't tell from the abstract" is a hedge; "I don't have a
+/// tool for that" is a capability gap.
+const CAPABILITY_MARKERS: &[&str] = &[
+    "tool",
+    "access",
+    "capability",
+    "capabilities",
+    "function",
+    "api",
+];
+
+/// Extract the sentence in which the model admitted a CAPABILITY gap, to be
+/// used verbatim as a re-retrieval query. `None` for ordinary turns.
+///
+/// Structural, not prompted: "call `find_tools` if you need something else" is
+/// an instruction models ignore, because not-looking is free and nothing
+/// catches it. This is the thing that catches it — the harness re-retrieves on
+/// the model's own words instead of asking it to.
+///
+/// A sentence qualifies only when all three hold, which is what keeps it off
+/// ordinary conversational turns:
+///  1. it is FIRST PERSON (`i `/`i'`/`my `) — "you can't heat-treat above 900 °C"
+///     is subject-matter talk, not a gap;
+///  2. it contains an incapacity marker; and
+///  3. it contains a capability/tooling marker — "I can't tell from the abstract
+///     whether it was homogenised" is a hedge about evidence, not about tools.
+#[must_use]
+pub fn capability_gap_query(text: &str) -> Option<String> {
+    text.split_terminator(['.', '!', '?', '\n'])
+        .map(str::trim)
+        .find(|sentence| {
+            let s = sentence.to_lowercase();
+            let first_person = s.starts_with("i ")
+                || s.starts_with("i'")
+                || s.contains(" i ")
+                || s.contains(" i'");
+            first_person
+                && INCAPACITY_MARKERS.iter().any(|m| s.contains(m))
+                && CAPABILITY_MARKERS.iter().any(|m| s.contains(m))
+        })
+        .map(ToOwned::to_owned)
 }
 
 /// Sources considered UNTRUSTED for anti-spoofing: external MCP servers and
@@ -397,6 +480,111 @@ mod tests {
             catalog.len(),
             3,
             "two builtins + one novel MCP tool; the two spoofers are dropped"
+        );
+    }
+
+    #[test]
+    fn budget_scales_with_context_and_is_clamped_both_ways() {
+        // Big models: the ceiling binds, so tool spend can never run away.
+        assert_eq!(tool_token_budget(262_144), MAX_TOOL_TOKENS);
+        assert_eq!(tool_token_budget(1_000_000), MAX_TOOL_TOKENS);
+        // 128k-class models (incl. ministral-3b at 131_072) still clear the
+        // whole live catalog.
+        assert_eq!(tool_token_budget(131_072), 32_768);
+        // Mid-size: the share binds and the request truncates by relevance.
+        assert_eq!(tool_token_budget(32_768), 8_192);
+        // Tiny models get the floor, never zero.
+        assert_eq!(tool_token_budget(4_096), MIN_TOOL_TOKENS);
+        assert_eq!(tool_token_budget(0), MIN_TOOL_TOKENS);
+    }
+
+    #[test]
+    fn definition_tokens_never_under_charges_a_real_tokenizer() {
+        // The measurement behind BYTES_PER_TOKEN: 71,577 bytes of real tool
+        // JSON tokenized to 17,758 tokens on Mistral's tokenizer — the densest
+        // of the three measured (o200k 16,577; cl100k 16,249). Our charge for
+        // the same bytes must be >= the worst case, or the budget is a lie.
+        assert!(
+            71_577usize.div_ceil(BYTES_PER_TOKEN) >= 17_758,
+            "BYTES_PER_TOKEN={BYTES_PER_TOKEN} under-charges the measured worst case"
+        );
+    }
+
+    #[test]
+    fn names_by_relevance_ranks_but_never_drops() {
+        let catalog = ToolCatalog::from_tool_server_json(&json!({
+            "tools": [
+                { "name": "web", "description": "fetch a url", "input_schema": { "type": "object" } },
+                { "name": "predict", "description": "predict a property", "input_schema": { "type": "object" } },
+                { "name": "notebook_exec", "description": "run a notebook cell", "input_schema": { "type": "object" } },
+            ]
+        }));
+        let ranked = catalog.names_by_relevance("run a notebook cell please");
+        assert_eq!(
+            ranked[0], "notebook_exec",
+            "best match ranks first: {ranked:?}"
+        );
+        assert_eq!(
+            ranked.len(),
+            3,
+            "ranking must not drop anything — truncation is the budget's job"
+        );
+        // Empty query: still the whole catalog, in catalog order.
+        assert_eq!(catalog.names_by_relevance("   ").len(), 3);
+    }
+
+    // ── capability-gap trigger ────────────────────────────────────
+
+    #[test]
+    fn capability_gap_fires_on_a_tooling_admission() {
+        for text in [
+            "I checked, but I don't have a tool that fetches a crystal structure by Materials Project id.",
+            "I'm unable to access the platform billing API from here.",
+            "Sorry — I lack the capability to run a CALPHAD equilibrium.",
+            "I cannot access the knowledge graph directly.",
+        ] {
+            assert!(
+                capability_gap_query(text).is_some(),
+                "should read as a capability gap: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_gap_stays_quiet_on_ordinary_turns() {
+        for text in [
+            // Plain answer.
+            "Inconel 718 is a precipitation-hardened nickel superalloy.",
+            // Subject-matter hedge, not a tooling gap.
+            "I can't tell from the abstract alone whether the sample was homogenised.",
+            // Second person: advice about the material, not about our tools.
+            "You can't heat-treat it above 900 C without grain growth.",
+            // Third-party incapacity discussed as content.
+            "The paper notes that XRD cannot resolve the ordering transition.",
+            // Capability word present but no incapacity.
+            "I used the web tool and the API returned the datasheet.",
+            "",
+        ] {
+            assert!(
+                capability_gap_query(text).is_none(),
+                "must NOT fire on an ordinary turn: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_gap_returns_the_admitting_sentence_as_the_query() {
+        let text = "Here is what I know about the alloy. \
+                    I don't have a tool for X-ray diffraction pattern simulation. \
+                    Let me know how else I can help.";
+        let q = capability_gap_query(text).expect("gap detected");
+        assert!(
+            q.contains("X-ray diffraction pattern simulation"),
+            "the query must be the model's own words: {q}"
+        );
+        assert!(
+            !q.contains("Let me know"),
+            "only the admitting sentence, not the whole message: {q}"
         );
     }
 
