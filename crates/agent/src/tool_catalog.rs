@@ -338,10 +338,17 @@ impl ToolCatalog {
 }
 
 /// First-person incapacity markers. Paired with [`CAPABILITY_MARKERS`] below.
+/// The past-tense forms are here because that is how the failure actually reads
+/// in the wild — the live capped run produced "I couldn't find any graphics card
+/// rental tools", not a tidy "I don't have a tool".
 const INCAPACITY_MARKERS: &[&str] = &[
     "can't",
     "cannot",
     "can not",
+    "couldn't",
+    "could not",
+    "didn't find",
+    "did not find",
     "unable",
     "don't have",
     "do not have",
@@ -500,14 +507,18 @@ mod tests {
 
     #[test]
     fn definition_tokens_never_under_charges_a_real_tokenizer() {
-        // The measurement behind BYTES_PER_TOKEN: 71,577 bytes of real tool
-        // JSON tokenized to 17,758 tokens on Mistral's tokenizer — the densest
-        // of the three measured (o200k 16,577; cl100k 16,249). Our charge for
-        // the same bytes must be >= the worst case, or the budget is a lie.
-        assert!(
-            71_577usize.div_ceil(BYTES_PER_TOKEN) >= 17_758,
-            "BYTES_PER_TOKEN={BYTES_PER_TOKEN} under-charges the measured worst case"
-        );
+        // Two measurements of real wire bytes vs a real tokenizer, both of
+        // which our charge must cover or the budget is a lie:
+        //   54 Python defs   71,577 B -> 17,758 Mistral tok (o200k 16,577)
+        //  135 offered defs 118,091 B -> 28,300 Mistral tok (o200k 26,415)
+        // — the second captured off an actual `prism backend` request.
+        for (bytes, worst_case_tokens) in [(71_577usize, 17_758usize), (118_091, 28_300)] {
+            assert!(
+                bytes.div_ceil(BYTES_PER_TOKEN) >= worst_case_tokens,
+                "BYTES_PER_TOKEN={BYTES_PER_TOKEN} under-charges {bytes} B \
+                 (measured {worst_case_tokens} tokens)"
+            );
+        }
     }
 
     #[test]
@@ -542,6 +553,10 @@ mod tests {
             "I'm unable to access the platform billing API from here.",
             "Sorry — I lack the capability to run a CALPHAD equilibrium.",
             "I cannot access the knowledge graph directly.",
+            // VERBATIM from the live capped run (`prism backend`, 15-tool cap,
+            // local qwen2.5-3b): this is what the failure really looks like.
+            "I couldn't find any graphics card rental tools directly related to \
+             your query.",
         ] {
             assert!(
                 capability_gap_query(text).is_some(),
@@ -563,6 +578,8 @@ mod tests {
             "The paper notes that XRD cannot resolve the ordering transition.",
             // Capability word present but no incapacity.
             "I used the web tool and the API returned the datasheet.",
+            // Past-tense incapacity about the SUBJECT, not about tooling.
+            "I couldn't find any mention of creep rupture in that paper.",
             "",
         ] {
             assert!(
