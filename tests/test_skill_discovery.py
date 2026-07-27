@@ -102,3 +102,34 @@ class TestDiscoverySkill:
         # Should NOT have top-level error
         assert "error" not in result
         assert "error" in result["results"]["prediction"]
+
+    @patch("app.tools.skills.reporting._generate_report")
+    @patch("app.tools.skills.visualization._visualize_dataset")
+    @patch("app.tools.skills.prediction._predict_properties")
+    @patch("app.tools.data_collectors.store.DataStore.save")
+    @patch(
+        "app.tools.data_collectors.collector.OPTIMADECollector.collect",
+        autospec=True,
+    )
+    def test_first_step_completes_against_the_real_collector_signature(
+        self, mock_collect, mock_save, mock_predict, mock_viz, mock_report, mock_prefs
+    ):
+        """Regression: acquisition — the FIRST step — used to fail with the
+        OPTIMADE signature TypeError, so the skill returned "Acquisition
+        failed" before reaching prediction. `autospec=True` means the real
+        collector signature is enforced here."""
+        mock_collect.return_value = [
+            {"source_id": "cod:1523678", "formula": "Rh3W", "elements": ["Rh", "W"]},
+        ]
+        mock_save.return_value = "/tmp/w_rh_discovery.parquet"
+        mock_predict.return_value = {"predictions": {}}
+        mock_viz.return_value = {"plots": []}
+        mock_report.return_value = {"report_path": "/tmp/r.md", "format": "markdown"}
+
+        result = _materials_discovery(elements=["W", "Rh"])
+
+        assert "error" not in result
+        acq = result["results"]["acquisition"]
+        assert acq["total_records"] == 1
+        assert acq["skipped"] == []
+        mock_predict.assert_called_once()
