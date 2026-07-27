@@ -54,6 +54,16 @@ dependencies = [
     "ddgs>=9.0.0",
     "duckduckgo-search>=7.0.0",
     "beautifulsoup4>=4.12.0",
+    # CORE, not a `[mace]` extra. `app/tools/simulation/mace/ids.py` imports
+    # ULID at module scope, and that module is pulled in by the parts of the
+    # MACE subpackage that are explicitly torch-free — `cache/hashing.py`
+    # (canonical_json) and `backends/fake.py`, whose own docstring says "for
+    # tests — no torch required". Leaving python-ulid in the extra made those
+    # paths unimportable on a default install, which is what broke `pytest`
+    # collection for seven test modules. python-ulid is pure Python with no
+    # dependencies (~15 KB), so it costs a default install nothing — unlike
+    # torch/mace-torch, which the `[mace]` extra still gates.
+    "python-ulid>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -96,7 +106,7 @@ mace = [
     "mace-torch>=0.3.12",
     "torch>=2.5.0",
     "ase>=3.23.0",
-    "python-ulid>=2.0.0",
+    # python-ulid moved to core `dependencies` — see the note there.
     # numpy is already a transitive dep but pin it explicitly so mace
     # primitive code has a known floor.
     "numpy>=1.26,<3.0",

@@ -1,9 +1,20 @@
 """Tests for predictor module."""
 import tempfile
+import importlib.util
+
 import pytest
 import numpy as np
 from app.tools.ml.predictor import Predictor
 from app.tools.ml.registry import ModelRegistry
+
+#: scikit-learn ships in the `[ml]` extra, not in a default provision, so a
+#: normally-installed box has to say "skipped, and here is why" rather than
+#: fail. A red suite nobody can run teaches everyone to ignore the suite.
+requires_sklearn = pytest.mark.skipif(
+    importlib.util.find_spec("sklearn") is None,
+    reason="needs scikit-learn from the `[ml]` extra: "
+    "pip install 'prism-platform[ml]'",
+)
 
 
 class TestPredictor:
@@ -21,6 +32,7 @@ class TestPredictor:
         registry.save_model(model, "band_gap", "random_forest", {"mae": 0.1})
         return registry
 
+    @requires_sklearn
     def test_predict_from_formula(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             registry = self._train_and_save_model(tmpdir)

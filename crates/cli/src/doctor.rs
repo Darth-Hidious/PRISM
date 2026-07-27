@@ -97,9 +97,12 @@ pub async fn run(project_root: &Path, python_bin: &Path, fix: bool) -> Result<()
     }
 
     // 4. Python venv (used by prism-python MCP server). A venv directory
-    //    alone proves nothing — [OK] means the PRISM tool platform actually
-    //    imports. (Fresh boxes used to get an empty venv that a bare
-    //    exists() check happily blessed.)
+    //    alone proves nothing, and neither does `import app` — [OK] means
+    //    every distribution declared in `[project] dependencies` is actually
+    //    installed. (Fresh boxes used to get an empty venv that a bare
+    //    exists() check happily blessed; later, a venv with no `python-ulid`
+    //    passed the `import app` check while the MACE tool code could not be
+    //    imported at all.)
     //    Path comes from the same helper `ensure_venv` uses, so this cannot
     //    drift from where the venv is actually created (Windows puts the
     //    interpreter in `Scripts\python.exe`, not `bin/python3`).
@@ -233,27 +236,28 @@ fn settle(
 
 /// Rebuild the managed Python venv.
 ///
-/// `ensure_venv` self-heals a venv that is merely missing its tools, but it
-/// never deletes one it cannot repair in place — the documented escape hatch
-/// is `rm -rf ~/.prism/venv`, which users are expected to know. `--fix` does
-/// that second pass for them, then proves the result by importing the tool
-/// platform rather than trusting `ensure_venv`'s return value.
+/// `ensure_venv` self-heals a venv that is merely missing its tools or a
+/// declared dependency, but it never deletes one it cannot repair in place —
+/// the documented escape hatch is `rm -rf ~/.prism/venv`, which users are
+/// expected to know. `--fix` does that second pass for them, then proves the
+/// result by re-running the completeness check rather than trusting
+/// `ensure_venv`'s return value.
 async fn fix_venv(prism_dir: &Path, project_root: &Path) -> BootCheck {
     let venv_dir = prism_dir.join("venv");
     let (venv_python, _) = prism_python_bridge::venv::venv_layout(&venv_dir);
-    let importable = || venv_tools_importable(&venv_python);
+    let complete = || prism_python_bridge::venv::missing_requirements(&venv_python).is_empty();
 
-    if importable() {
+    if complete() {
         return settle(
             "PRISM Python venv",
             Ok("already healthy".to_string()),
-            importable,
+            complete,
             VENV_MANUAL,
         );
     }
 
     let mut attempted = provision_venv(prism_dir, project_root).await;
-    if !importable() && venv_dir.exists() {
+    if !complete() && venv_dir.exists() {
         // `remove_dir_all` does not follow symlinks — a `~/.prism/venv`
         // symlinked onto another disk loses the link, not the target's
         // contents. Nothing outside `~/.prism/venv` is ever touched.
@@ -269,7 +273,7 @@ async fn fix_venv(prism_dir: &Path, project_root: &Path) -> BootCheck {
             }
         }
     }
-    settle("PRISM Python venv", attempted, importable, VENV_MANUAL)
+    settle("PRISM Python venv", attempted, complete, VENV_MANUAL)
 }
 
 async fn provision_venv(prism_dir: &Path, project_root: &Path) -> Result<String, String> {
@@ -399,34 +403,21 @@ fn check_binary(name: &str, candidates: &[&str]) -> BootCheck {
     }
 }
 
-/// Is the PRISM tool platform importable from this interpreter?
-///
-/// The single predicate behind both the venv check and `--fix`'s post-repair
-/// verification, so those two cannot drift apart about what "working venv"
-/// means. It deliberately mirrors `prism_python_bridge::venv::python_has_app`,
-/// which runs the same `python -I -c "import app"` probe inside `ensure_venv`
-/// — that one is async and private, so it cannot simply be called here; if
-/// either probe ever changes, change both.
-fn venv_tools_importable(venv_python: &Path) -> bool {
-    venv_python.exists()
-        && std::process::Command::new(venv_python)
-            .args(["-I", "-c", "import app"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-}
-
 /// Does the native embedding model cache hold anything? Shared by the check
-/// and `--fix` for the same anti-drift reason as [`venv_tools_importable`].
+/// and `--fix` so the diagnostic and the repair cannot drift apart about what
+/// "cached" means — the same anti-drift reason the venv rows both go through
+/// `prism_python_bridge::venv::missing_requirements`.
 fn embed_model_cached(embed_dir: &Path) -> bool {
     embed_dir.exists() && std::fs::read_dir(embed_dir).is_ok_and(|mut d| d.next().is_some())
 }
 
-/// Venv check that verifies the tool platform is importable, not merely
-/// that a directory exists. Auto-heals on next `prism` launch, so the
-/// hint points there first.
+/// Venv check that verifies every **declared** dependency is present, not
+/// merely that a directory exists or that `import app` happens to work.
+///
+/// `import app` was the old test, and it passed on a venv with `python-ulid`
+/// absent — so this row read [OK] while the MACE tool code and seven test
+/// modules were unimportable. The predicate is now the one `ensure_venv` uses,
+/// imported rather than restated, so the two cannot disagree.
 fn check_venv_tools(venv_python: &Path) -> BootCheck {
     let name = "PRISM Python venv";
     if !venv_python.exists() {
@@ -438,26 +429,33 @@ fn check_venv_tools(venv_python: &Path) -> BootCheck {
             delay_ms: 0,
         };
     }
-    if venv_tools_importable(venv_python) {
-        BootCheck {
-            name: name.to_string(),
-            result: format!("{} (tools importable)", venv_python.display()),
-            ok: true,
-            dots: 4,
-            delay_ms: 0,
-        }
+    let missing = prism_python_bridge::venv::missing_requirements(venv_python);
+    let result = if missing.is_empty() {
+        format!(
+            "{} (all declared dependencies present)",
+            venv_python.display()
+        )
     } else {
-        BootCheck {
-            name: name.to_string(),
-            // Not "next launch self-heals": a venv whose interpreter or pip
-            // is broken is exactly the case `ensure_venv` cannot repair in
-            // place, so relaunching loops on the same error. `--fix` removes
-            // it and rebuilds, which is the step that actually works.
-            result: "venv exists but tools missing — run: prism doctor --fix".to_string(),
-            ok: false,
-            dots: 4,
-            delay_ms: 0,
-        }
+        // Not "next launch self-heals": relaunching does now re-sync a venv
+        // that is merely out of date, but a venv whose interpreter or pip is
+        // broken loops on the same error. `--fix` removes it and rebuilds,
+        // which is the step that works in both cases.
+        format!(
+            "missing {}: {} — run: prism doctor --fix",
+            if missing.len() == 1 {
+                "1 declared dependency".to_string()
+            } else {
+                format!("{} declared dependencies", missing.len())
+            },
+            missing.join(", ")
+        )
+    };
+    BootCheck {
+        name: name.to_string(),
+        result,
+        ok: missing.is_empty(),
+        dots: 4,
+        delay_ms: 0,
     }
 }
 
@@ -543,11 +541,38 @@ mod tests {
         assert!(row.result.contains("timed out"), "{}", row.result);
     }
 
+    /// An interpreter that is not there accounts for nothing, so the row must
+    /// be red and must name what is unaccounted for rather than say "OK".
     #[test]
-    fn venv_predicate_rejects_a_path_that_is_not_there() {
-        assert!(!venv_tools_importable(Path::new(
-            "/nonexistent/prism-doctor-test/bin/python3"
-        )));
+    fn venv_row_is_red_and_specific_when_the_interpreter_is_absent() {
+        let row = check_venv_tools(Path::new("/nonexistent/prism-doctor-test/bin/python3"));
+        assert!(!row.ok);
+        assert!(row.result.contains("missing"), "{}", row.result);
+    }
+
+    /// The row must report a venv that is missing a declared dependency as
+    /// broken *and name it*. This is the defect the file is being repaired
+    /// for: `import app` succeeded on exactly such a venv, so the row was
+    /// green while the MACE code paths were unimportable.
+    #[test]
+    fn venv_row_names_the_dependencies_a_real_interpreter_lacks() {
+        // A stock interpreter: runs, but has no PRISM platform and none of
+        // the declared distributions installed.
+        let Some(python) = ["/usr/bin/python3", "/opt/homebrew/bin/python3"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+        else {
+            return; // no system python on this box; nothing to assert against
+        };
+        let row = check_venv_tools(python);
+        assert!(!row.ok, "a venv without the declared set is not healthy");
+        assert!(
+            row.result.contains("prism-platform"),
+            "must name what is missing: {}",
+            row.result
+        );
+        assert!(row.result.contains("prism doctor --fix"), "{}", row.result);
     }
 
     #[test]
