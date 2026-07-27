@@ -58,6 +58,22 @@ use turso::Value;
 
 use crate::{Campaign, GoalStatus};
 
+/// A watcher condition that cannot be evaluated *yet* but plausibly will be —
+/// the classic case being `watch_goal` on a goal that has not written its
+/// first checkpoint. Distinguished from a hard error so a tick can wait a
+/// bounded number of rounds, instead of either retiring the schedule on the
+/// first tick or waiting forever on a typo'd id.
+#[derive(Debug)]
+struct WatcherPending;
+
+impl std::fmt::Display for WatcherPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the watched target does not exist yet")
+    }
+}
+
+impl std::error::Error for WatcherPending {}
+
 /// What causes a schedule to fire.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -76,7 +92,16 @@ pub enum Trigger {
     WatchGoal { goal_id: String, status: String },
     /// Watcher: fire when the local knowledge graph in `db` holds at least
     /// `at_least` entities (a corpus growing).
-    WatchCorpus { db: PathBuf, at_least: i64 },
+    ///
+    /// `tenant` scopes the count. `None` counts every tenant's rows
+    /// together, which is only ever what you want on a single-tenant node —
+    /// an unscoped count is the same landmine the `:Chunk` merge keys have.
+    WatchCorpus {
+        db: PathBuf,
+        at_least: i64,
+        #[serde(default)]
+        tenant: Option<String>,
+    },
 }
 
 impl Trigger {
@@ -127,10 +152,13 @@ impl Trigger {
             Self::WatchGoal { goal_id, status } => {
                 let path = campaigns_dir().join(format!("{goal_id}.json"));
                 if !path.exists() {
-                    bail!(
-                        "watched goal '{goal_id}' has no checkpoint at {} — nothing to watch",
-                        path.display()
-                    );
+                    // "Not started yet" and "you typo'd the id" look the
+                    // same from here, and chaining a goal onto one that is
+                    // still coming up is the normal case. Report it as a
+                    // condition that is not met YET; the caller's
+                    // no-progress budget bounds how long we wait before
+                    // calling it a mistake.
+                    return Err(WatcherPending.into());
                 }
                 let campaign = Campaign::from_checkpoint(&path)?;
                 Ok(campaign
@@ -139,7 +167,11 @@ impl Trigger {
                     .as_str()
                     .eq_ignore_ascii_case(status))
             }
-            Self::WatchCorpus { db, at_least } => {
+            Self::WatchCorpus {
+                db,
+                at_least,
+                tenant,
+            } => {
                 let db_str = db
                     .to_str()
                     .ok_or_else(|| anyhow::anyhow!("corpus db path is not UTF-8: {db:?}"))?;
@@ -148,8 +180,15 @@ impl Trigger {
                     .await
                     .with_context(|| format!("failed to open corpus db {db_str}"))?
                     .connect()?;
+                let (sql, params): (&str, Vec<Value>) = match tenant {
+                    Some(t) => (
+                        "SELECT count(*) FROM emmo_entity WHERE tenant = ?1",
+                        vec![Value::Text(t.clone())],
+                    ),
+                    None => ("SELECT count(*) FROM emmo_entity", Vec::new()),
+                };
                 let mut rows = conn
-                    .query("SELECT count(*) FROM emmo_entity", ())
+                    .query(sql, params)
                     .await
                     .context("corpus watcher: emmo_entity is not queryable in that database")?;
                 let row = rows
@@ -332,6 +371,12 @@ pub trait GoalResumer: Send + Sync {
     /// True when a worker process for this goal is still alive.
     fn worker_alive(&self, goal_id: &str) -> bool;
     /// Start a worker that continues the goal. Returns its pid.
+    ///
+    /// Contract: return `Err` **only** when no process was started. Once a
+    /// worker exists it is spending money, and the scheduler retires a
+    /// schedule whose resume errored — reporting a failure after a
+    /// successful spawn would leave that worker running untracked behind a
+    /// schedule that never fires again.
     fn resume(&self, goal_id: &str) -> Result<u32>;
 }
 
@@ -367,16 +412,25 @@ pub struct WorkerResumer {
     pub exe: PathBuf,
 }
 
+/// How long after a spawn the parent's pid record still counts as "a worker
+/// is coming up", before the worker's own lock has to be the proof. Covers
+/// the milliseconds between `spawn` returning and the child taking its lock.
+const WORKER_HANDOFF_SECS: u64 = 30;
+
+/// A heartbeat older than this means the host stopped ticking. Generous
+/// enough for an hourly timer, tight enough to notice a dead supervisor.
+const HEARTBEAT_STALE_SECS: i64 = 2 * 3600;
+
 impl WorkerResumer {
-    /// Path of the pid file a worker for `goal_id` is tracked by.
+    /// Path of the lock file a worker for `goal_id` holds for its lifetime.
     #[must_use]
     pub fn worker_pid_path(goal_id: &str) -> PathBuf {
         campaigns_dir().join(format!("{goal_id}.worker"))
     }
 
-    /// Record `pid` as the live worker for `goal_id`. Called by every spawn
-    /// site (`campaign start --detach`, `campaign resume --detach`, and this
-    /// scheduler) so "is a worker already running?" has one answer.
+    /// Record `pid` as the worker just spawned for `goal_id`. This is the
+    /// short-lived handoff record; the durable liveness signal is the lock
+    /// the worker itself takes via [`WorkerLock::acquire`].
     pub fn write_worker_pid(goal_id: &str, pid: u32) -> Result<()> {
         let path = Self::worker_pid_path(goal_id);
         if let Some(parent) = path.parent() {
@@ -387,22 +441,87 @@ impl WorkerResumer {
     }
 }
 
-/// True when `pid` names a live process. On unix this is `kill(pid, 0)`.
-#[must_use]
-pub fn pid_alive(pid: u32) -> bool {
+/// The liveness token a campaign worker holds for as long as it is running.
+///
+/// This replaced "read a pid file and `kill(pid, 0)`", which had two ways to
+/// lie over a months-long goal: a `kill -9`'d worker leaves its pid file
+/// behind, and once the OS recycles that pid every future tick reads "still
+/// running" forever — a crashed goal silently never resumed, which is the
+/// exact failure this feature exists to remove. An `flock` cannot lie: the
+/// kernel drops it when the process dies, SIGKILL included.
+pub struct WorkerLock {
+    #[allow(dead_code)]
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl WorkerLock {
+    /// Take the lock for `goal_id` and record this process's pid in it.
+    /// `Ok(None)` means another worker already holds it — the caller must not
+    /// start a second loop over the same goal.
+    pub fn acquire(goal_id: &str) -> Result<Option<Self>> {
+        let path = WorkerResumer::worker_pid_path(goal_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open worker lock {}", path.display()))?;
+        if !try_lock_exclusive(&file)? {
+            return Ok(None);
+        }
+        use std::io::{Seek, Write};
+        file.set_len(0)?;
+        file.rewind()?;
+        write!(file, "{}", std::process::id())?;
+        file.flush()?;
+        Ok(Some(Self { file, path }))
+    }
+}
+
+impl Drop for WorkerLock {
+    fn drop(&mut self) {
+        // Truncate rather than delete: another worker may already be blocked
+        // on this exact inode, and removing the file would let it lock a new
+        // one and run alongside. The kernel releases our flock when `file`
+        // closes, which is the signal that matters.
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+        {
+            warn!(goal = %self.path.display(), error = %e, "could not clear worker lock file");
+        }
+    }
+}
+
+/// `Ok(false)` when another process holds the lock. Any other failure is an
+/// error: we cannot prove exclusivity, and guessing risks a duplicate worker.
+fn try_lock_exclusive(file: &std::fs::File) -> Result<bool> {
     #[cfg(unix)]
     {
-        // SAFETY: signal 0 performs error checking only; it sends nothing.
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `file` owns the fd for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let err = std::io::Error::last_os_error();
+            return match err.kind() {
+                std::io::ErrorKind::WouldBlock => Ok(false),
+                _ => Err(anyhow::anyhow!("lock unavailable: {err}")),
+            };
+        }
+        Ok(true)
     }
     #[cfg(not(unix))]
     {
-        let _ = pid;
-        // No cheap liveness probe on this platform. Reporting "alive" would
-        // wedge every schedule forever; reporting "dead" risks a duplicate
-        // worker. Prefer the recoverable error: say dead, and let the goal's
-        // own checkpoint lock be the arbiter.
-        false
+        let _ = file;
+        // No advisory lock wired up on this platform yet. Say so instead of
+        // reporting a liveness answer we cannot back up.
+        Err(anyhow::anyhow!(
+            "worker liveness locking is not implemented on this platform"
+        ))
     }
 }
 
@@ -427,13 +546,55 @@ impl GoalResumer for WorkerResumer {
 
     fn worker_alive(&self, goal_id: &str) -> bool {
         let path = Self::worker_pid_path(goal_id);
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        // Primary signal: can we take the worker's lock? If not, a worker
+        // holds it and is by definition alive. If we can, we drop it again
+        // immediately — probing must never leave the lock held.
+        match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => match try_lock_exclusive(&file) {
+                Ok(false) => return true,
+                Ok(true) => {}
+                // We could not determine exclusivity. Reporting "dead" would
+                // spawn a second worker over a possibly-live one; reporting
+                // "alive" only costs a delayed resume. Take the cheap error.
+                Err(e) => {
+                    warn!(goal = goal_id, error = %e, "worker liveness undetermined — assuming alive");
+                    return true;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => {
+                warn!(goal = goal_id, error = %e, "worker lock unreadable — assuming alive");
+                return true;
+            }
+        }
+        // The lock is free, so no worker holds it. One case remains: we
+        // spawned a worker moments ago and it has not reached its lock yet.
+        let Ok(meta) = std::fs::metadata(&path) else {
             return false;
         };
-        match text.trim().parse::<u32>() {
-            Ok(pid) => pid_alive(pid),
-            Err(_) => false,
-        }
+        let fresh = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age.as_secs() < WORKER_HANDOFF_SECS);
+        fresh
+            && std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| t.trim().parse::<u32>().ok())
+                .is_some_and(|pid| {
+                    #[cfg(unix)]
+                    // SAFETY: signal 0 performs error checking only, it sends
+                    // nothing. Only consulted inside the seconds-wide handoff
+                    // window, so pid recycling is not a concern here.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, 0) == 0
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = pid;
+                        false
+                    }
+                })
     }
 
     fn resume(&self, goal_id: &str) -> Result<u32> {
@@ -446,7 +607,13 @@ impl GoalResumer for WorkerResumer {
             .spawn()
             .with_context(|| format!("failed to spawn worker for goal '{goal_id}'"))?;
         let pid = child.id();
-        Self::write_worker_pid(goal_id, pid)?;
+        // The spawn already happened and is already spending. Failing here
+        // would retire the schedule and orphan a live, billing worker behind
+        // it, so this is a warning: the worker's own lock is the durable
+        // signal anyway, and it takes that within milliseconds.
+        if let Err(e) = Self::write_worker_pid(goal_id, pid) {
+            warn!(goal = goal_id, pid, error = %e, "worker spawned but its pid could not be recorded");
+        }
         Ok(pid)
     }
 }
@@ -505,6 +672,16 @@ impl ScheduleStore {
             (),
         )
         .await?;
+        // One row: when a tick last actually ran. This is the ONLY honest
+        // answer to "is anything on this host driving these schedules?" —
+        // the unit file existing on disk proves nothing (it may never have
+        // been loaded), and it cannot see a `schedule daemon` running in
+        // another process at all.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schedule_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
+            (),
+        )
+        .await?;
         // An in-memory store has no file to sit a lock next to (and two of
         // them are genuinely independent), so give it a private one.
         let lock_path = if path_str == ":memory:" {
@@ -518,6 +695,58 @@ impl ScheduleStore {
     /// Open the default pod-local store.
     pub async fn open_default() -> Result<Self> {
         Self::open(&default_db_path()).await
+    }
+
+    /// Unix seconds of the last completed tick, or `None` when nothing has
+    /// ever ticked this store. `None` means every schedule here is inert.
+    pub async fn last_tick_at(&self) -> Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query("SELECT v FROM schedule_meta WHERE k = 'last_tick_at'", ())
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        match row.get_value(0)? {
+            Value::Text(t) => Ok(t.parse::<i64>().ok()),
+            Value::Integer(i) => Ok(Some(i)),
+            _ => Ok(None),
+        }
+    }
+
+    async fn record_tick(&self, now: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO schedule_meta (k, v) VALUES ('last_tick_at', ?1) \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                [Value::Text(now.to_string())],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// One line saying whether anything is actually driving this store, for
+    /// humans and for the agent. Never claims health it cannot demonstrate.
+    pub async fn heartbeat_status(&self, now: i64) -> String {
+        match self.last_tick_at().await {
+            Ok(Some(last)) => {
+                let age = (now - last).max(0);
+                if age <= HEARTBEAT_STALE_SECS {
+                    format!("heartbeat OK — last tick {age}s ago")
+                } else {
+                    format!(
+                        "heartbeat STALE — last tick was {age}s ago. Nothing has run \
+                         `prism schedule tick` since then, so these schedules are not firing."
+                    )
+                }
+            }
+            Ok(None) => "heartbeat MISSING — nothing has ever run `prism schedule tick` on this \
+                         host, so no schedule here can fire. Install it with `prism schedule \
+                         install --write` (then run the command it prints), or run `prism \
+                         schedule daemon` inside a supervised container."
+                .to_string(),
+            Err(e) => format!("heartbeat UNKNOWN — could not read the tick record: {e:#}"),
+        }
     }
 
     /// Register a schedule. `max_fires` is required and finite on purpose:
@@ -739,6 +968,10 @@ pub async fn tick_once(
              is not resumed twice"
         );
     };
+    // Record the heartbeat FIRST: a tick that dies partway through still
+    // proves something is driving this store, and `heartbeat_status` must
+    // reflect reality rather than only successful passes.
+    store.record_tick(now).await?;
     let mut out = Vec::new();
     for mut sched in store.list().await? {
         if sched.state != ScheduleState::Active {
@@ -784,8 +1017,26 @@ async fn evaluate(sched: &mut Schedule, resumer: &dyn GoalResumer, now: i64) -> 
                 sched.cond_was_true = false;
                 return None;
             }
-            // An unevaluable condition is a defect: stop and say so rather
-            // than treat it as "not yet" forever.
+            // The target isn't there YET — normal when a watcher is created
+            // moments after the goal it chains onto. Wait, but on a budget:
+            // an id that never appears is a typo, and waiting forever on it
+            // silently is the failure this codebase keeps repeating.
+            Err(e) if e.downcast_ref::<WatcherPending>().is_some() => {
+                sched.no_progress += 1;
+                if sched.no_progress >= sched.max_no_progress {
+                    sched.state = ScheduleState::Wedged;
+                    return Some(Decision::Stopped(format!(
+                        "{e} after {} checks — it is not coming; check the id",
+                        sched.no_progress
+                    )));
+                }
+                return Some(Decision::Skipped(format!(
+                    "{e} — waiting ({} of {} checks used)",
+                    sched.no_progress, sched.max_no_progress
+                )));
+            }
+            // Anything else is a real defect: stop and say so rather than
+            // treat it as "not yet" forever.
             Err(e) => {
                 sched.state = ScheduleState::Wedged;
                 return Some(Decision::Stopped(format!(
@@ -863,28 +1114,42 @@ async fn evaluate(sched: &mut Schedule, resumer: &dyn GoalResumer, now: i64) -> 
         )));
     }
 
+    // ── Already running? Then there is nothing to wake. ───────────
+    //
+    // This MUST come before the no-progress check. An unchanged checkpoint
+    // while the worker is alive means the current iteration has not finished
+    // yet — a 20-minute iteration under a 5-minute schedule is healthy, and
+    // counting those ticks as "no progress" retired the schedule for a goal
+    // that was working fine. Worse than useless: the schedule is then gone
+    // when that worker really does die later.
+    if resumer.worker_alive(&sched.goal_id) {
+        advance_clock(sched, now);
+        return Some(Decision::Skipped(
+            "goal worker is still running — no resume needed".into(),
+        ));
+    }
+
     // ── No-progress detection ─────────────────────────────────────
+    //
+    // Scope, stated plainly: this compares the checkpoint between wake-ups,
+    // so it catches a goal that is not advancing at all (crash-looping,
+    // stuck before its first step). It does NOT judge whether the work is
+    // any good — a goal that dutifully burns iterations proposing junk has a
+    // changing fingerprint and will run to its iteration cap. The wake-up
+    // ceiling is the bound on that case.
     let fp = snap.fingerprint();
     if sched.fires > 0 && fp == sched.progress_fp {
         sched.no_progress += 1;
         if sched.no_progress >= sched.max_no_progress {
             sched.state = ScheduleState::Wedged;
             return Some(Decision::Stopped(format!(
-                "no progress across {} wake-ups (still at {fp}) — goal is wedged, stopping \
-                 rather than burning credits on a loop that is not advancing",
+                "no progress across {} wake-ups with no worker running (still at {fp}) — goal \
+                 is wedged, stopping rather than burning credits on a loop that is not advancing",
                 sched.no_progress
             )));
         }
     } else {
         sched.no_progress = 0;
-    }
-
-    // ── Already running? Then there is nothing to wake. ───────────
-    if resumer.worker_alive(&sched.goal_id) {
-        advance_clock(sched, now);
-        return Some(Decision::Skipped(
-            "goal worker is still running — no resume needed".into(),
-        ));
     }
 
     // ── Fire ──────────────────────────────────────────────────────
@@ -899,6 +1164,10 @@ async fn evaluate(sched: &mut Schedule, resumer: &dyn GoalResumer, now: i64) -> 
             }
             Some(Decision::Fired(pid))
         }
+        // `resume` returns Err ONLY when no process was started (see the
+        // trait contract) — otherwise retiring the schedule here would
+        // orphan a running, billing worker behind a schedule that will
+        // never fire again.
         Err(e) => {
             sched.state = ScheduleState::Wedged;
             Some(Decision::Stopped(format!("resume failed: {e:#}")))
@@ -1262,6 +1531,79 @@ mod tests {
         assert_eq!(r.resume_count(), 2, "the wedged wake-up must not resume");
     }
 
+    /// A goal whose iterations are slower than its schedule is HEALTHY, not
+    /// wedged. Checking no-progress before liveness retired the schedule for
+    /// a working goal — and then nothing was left to wake it when its worker
+    /// really did die.
+    #[tokio::test]
+    async fn a_slow_but_running_goal_is_never_declared_wedged() {
+        let store = store().await;
+        let r = FakeResumer::new(snapshot(GoalStatus::Running, 4, 40));
+        let s = store
+            .create("goal-slow", Trigger::Every { seconds: 10 }, 50, 2)
+            .await
+            .unwrap();
+
+        // First tick finds a dead worker and resumes it. This is what puts
+        // `fires` above zero and arms the no-progress comparison.
+        let mut now = s.next_due_at.unwrap();
+        assert!(matches!(
+            tick_once(&store, &r, now).await.unwrap()[0].1,
+            Decision::Fired(_)
+        ));
+        now += 10;
+
+        // That worker is now alive and grinding through one long iteration,
+        // so the checkpoint does not move for several ticks.
+        *r.alive.lock().unwrap() = true;
+        for tick in 0..6 {
+            let out = tick_once(&store, &r, now).await.unwrap();
+            assert!(
+                matches!(out[0].1, Decision::Skipped(_)),
+                "tick {tick} must skip a live worker, got {:?}",
+                out[0].1
+            );
+            now += 10;
+        }
+        let after = store.get(&s.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.state,
+            ScheduleState::Active,
+            "a working goal must keep its schedule: {}",
+            after.last_outcome
+        );
+        assert_eq!(after.no_progress, 0);
+        assert_eq!(r.resume_count(), 1, "no second worker over a live one");
+
+        // The moment its worker actually dies, the same schedule resumes it.
+        *r.alive.lock().unwrap() = false;
+        self_advance(&r, 5);
+        let out = tick_once(&store, &r, now).await.unwrap();
+        assert!(matches!(out[0].1, Decision::Fired(_)), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_missing_until_something_actually_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ScheduleStore::open(&dir.path().join("s.db")).await.unwrap();
+        assert!(store.last_tick_at().await.unwrap().is_none());
+        let status = store.heartbeat_status(1_000).await;
+        assert!(
+            status.contains("MISSING"),
+            "an unticked store must say so, not look healthy: {status}"
+        );
+
+        let r = FakeResumer::new(snapshot(GoalStatus::Running, 1, 10));
+        tick_once(&store, &r, 5_000).await.unwrap();
+        assert_eq!(store.last_tick_at().await.unwrap(), Some(5_000));
+        assert!(store.heartbeat_status(5_010).await.contains("OK"));
+        // A host that stopped ticking is reported as stale, not as healthy.
+        let stale = store
+            .heartbeat_status(5_000 + HEARTBEAT_STALE_SECS + 1)
+            .await;
+        assert!(stale.contains("STALE"), "{stale}");
+    }
+
     #[tokio::test]
     async fn a_live_worker_is_not_resumed_twice() {
         let store = store().await;
@@ -1337,8 +1679,11 @@ mod tests {
         assert_eq!(r.resume_count(), 1);
     }
 
+    /// A watcher chained onto a goal that has not started yet must wait —
+    /// chaining B onto A right after launching A is the normal case — but on
+    /// a budget, so a typo'd id is reported rather than waited on forever.
     #[tokio::test]
-    async fn unevaluable_watcher_is_reported_not_swallowed() {
+    async fn a_watcher_waits_for_a_missing_target_then_reports_it() {
         let store = store().await;
         let r = FakeResumer::new(snapshot(GoalStatus::Running, 1, 10));
         let s = store
@@ -1349,18 +1694,63 @@ mod tests {
                     status: "completed".into(),
                 },
                 10,
+                3, // three checks before calling it a mistake
+            )
+            .await
+            .unwrap();
+
+        for check in 1..=2 {
+            let out = tick_once(&store, &r, 1_000 + check).await.unwrap();
+            let Decision::Skipped(reason) = &out[0].1 else {
+                panic!("check {check} must wait, got {:?}", out[0].1);
+            };
+            assert!(reason.contains("does not exist yet"), "{reason}");
+            assert_eq!(
+                store.get(&s.id).await.unwrap().unwrap().state,
+                ScheduleState::Active
+            );
+        }
+
+        // Third check exhausts the budget: reported, not waited on forever.
+        let out = tick_once(&store, &r, 2_000).await.unwrap();
+        let Decision::Stopped(reason) = &out[0].1 else {
+            panic!("the budget must run out, got {:?}", out[0].1);
+        };
+        assert!(reason.contains("check the id"), "{reason}");
+        assert_eq!(
+            store.get(&s.id).await.unwrap().unwrap().state,
+            ScheduleState::Wedged
+        );
+        assert_eq!(r.resume_count(), 0);
+    }
+
+    /// A watcher whose condition is genuinely broken (not merely early) is
+    /// still surfaced immediately — an unreadable corpus is a defect.
+    #[tokio::test]
+    async fn a_broken_watcher_condition_is_reported_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store().await;
+        let r = FakeResumer::new(snapshot(GoalStatus::Running, 1, 10));
+        let s = store
+            .create(
+                "goal-y",
+                Trigger::WatchCorpus {
+                    // A real, openable database with no `emmo_entity` table:
+                    // the count cannot be answered, which is a defect.
+                    db: dir.path().join("not-a-graph.db"),
+                    at_least: 10,
+                    tenant: None,
+                },
+                10,
                 3,
             )
             .await
             .unwrap();
         let out = tick_once(&store, &r, 1_000).await.unwrap();
         let Decision::Stopped(reason) = &out[0].1 else {
-            panic!(
-                "an unevaluable condition must be surfaced, got {:?}",
-                out[0].1
-            );
+            panic!("a broken condition must be surfaced, got {:?}", out[0].1);
         };
-        assert!(reason.contains("no checkpoint"), "{reason}");
+        assert!(reason.contains("not queryable"), "{reason}");
         assert_eq!(
             store.get(&s.id).await.unwrap().unwrap().state,
             ScheduleState::Wedged

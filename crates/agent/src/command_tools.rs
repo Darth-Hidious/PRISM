@@ -638,7 +638,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "schedule",
         aliases: &["cron_create", "watch_create"],
         kind: CommandToolKind::ScheduleCreate,
-        description: "Set up a durable wake-up for a long-running goal so it keeps going for weeks/months without anyone restarting it (BILLABLE — each wake-up resumes billable iterations). Give `goal_id` plus exactly ONE trigger: `every` ('6h'), `cron` ('0 */6 * * *'), `watch_file` (fire when a path appears), `watch_goal` (fire when another goal finishes), or `watch_corpus_db` + `corpus_at_least` (fire when a corpus has grown). Survives reboots and crashes: if the goal's process died, the next wake-up restarts it. `max_fires` hard-caps how many times it may resume. It will NOT resume a goal paused at an approval gate — that still needs a human.",
+        description: "Set up a durable wake-up for a long-running goal so it keeps going for weeks/months without anyone restarting it (BILLABLE — each wake-up resumes billable iterations). Give `goal_id` plus exactly ONE trigger: `every` ('6h'), `cron` ('0 */6 * * *'), `at` (unix seconds, one-shot), `watch_file` (fire when a path appears), `watch_goal` (fire when another goal finishes), or `watch_corpus_db` + `corpus_at_least` (fire when a corpus has grown). If the goal's process died, the next wake-up restarts it. `max_fires` hard-caps how many times it may resume. It will NOT resume a goal paused at an approval gate — that still needs a human. IMPORTANT: wake-ups only happen if something on the host is running `prism schedule tick` (a launchd/systemd unit a HUMAN installs once with `prism schedule install --write`, or `prism schedule daemon` in a container). This tool reports the host's heartbeat status in its output — if it says MISSING or STALE, the schedule is inert and you must tell the user to install it; do not report the goal as covered.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -647,7 +647,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "schedule",
         aliases: &["cron_list", "list_schedules"],
         kind: CommandToolKind::ScheduleList,
-        description: "List every wake-up schedule and watcher on this node with its state (active/wedged/done/cancelled), fire count, and the reason for its last decision. Use this to find out why a goal is or isn't being woken up.",
+        description: "List every wake-up schedule and watcher on this node with its state (active/wedged/done/cancelled), fire count, and the reason for its last decision — plus whether anything on the host is actually running the tick that drives them. Use this to find out why a goal is or isn't being woken up; a schedule can read `active` and still be inert if the heartbeat line says MISSING or STALE.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -1461,11 +1461,13 @@ fn schedule_create_schema() -> Value {
             "goal_id": { "type": "string", "description": "Goal (campaign) id to wake up, from goal_list or goal_start." },
             "every": { "type": "string", "description": "Recurring interval: 30s, 15m, 6h, 2d. Use this OR cron OR one of the watch_* fields." },
             "cron": { "type": "string", "description": "Cron expression, e.g. '0 */6 * * *' (every 6 hours) or '30 3 * * *' (03:30 daily). 5-field crontab syntax." },
+            "at": { "type": "integer", "description": "One-shot: fire once at this unix timestamp, then retire." },
             "watch_file": { "type": "string", "description": "Fire when this path appears (a job dropping an output file, a flag being written)." },
             "watch_goal": { "type": "string", "description": "Fire when ANOTHER goal reaches watch_goal_status — chain a goal onto a job finishing." },
             "watch_goal_status": { "type": "string", "description": "Status the watched goal must reach: completed (default), failed, paused." },
             "watch_corpus_db": { "type": "string", "description": "Path to a local graph database; fire when it holds at least corpus_at_least entities (a corpus growing)." },
             "corpus_at_least": { "type": "integer", "description": "Entity count the watched corpus must reach. Required with watch_corpus_db." },
+            "corpus_tenant": { "type": "string", "description": "Scope the corpus count to one tenant. Omit only on a single-tenant node — an unscoped count mixes every tenant's rows together." },
             "max_fires": { "type": "integer", "description": "Hard cap on wake-ups (default 100). This is the spend guard that works even when nothing reports a USD cost." },
             "max_no_progress": { "type": "integer", "description": "Stop and report after this many consecutive wake-ups that produced no progress (default 3)." }
         },
@@ -2782,6 +2784,7 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             let triggers: Vec<(&str, String)> = [
                 ("--every", optional_string(input, "every")),
                 ("--cron", optional_string(input, "cron")),
+                ("--at", optional_usize(input, "at").map(|n| n.to_string())),
                 ("--watch-file", optional_string(input, "watch_file")),
                 ("--watch-goal", optional_string(input, "watch_goal")),
                 ("--watch-corpus", optional_string(input, "watch_corpus_db")),
@@ -2813,6 +2816,10 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 })?;
                 args.push("--corpus-at-least".to_string());
                 args.push(at_least.to_string());
+                if let Some(tenant) = optional_string(input, "corpus_tenant") {
+                    args.push("--corpus-tenant".to_string());
+                    args.push(tenant);
+                }
             }
             if let Some(status) = optional_string(input, "watch_goal_status") {
                 args.push("--watch-goal-status".to_string());
@@ -3924,10 +3931,22 @@ mod tests {
 
         let corpus = command_tool_preview(
             "schedule_create",
-            &json!({"goal_id": "c", "watch_corpus_db": "/tmp/g.db", "corpus_at_least": 5000}),
+            &json!({"goal_id": "c", "watch_corpus_db": "/tmp/g.db", "corpus_at_least": 5000,
+                    "corpus_tenant": "acme"}),
         )
         .expect("corpus preview renders");
         assert!(corpus.contains("--corpus-at-least 5000"), "{corpus}");
+        // An unscoped count mixes every tenant's rows — the agent must be
+        // able to say which tenant it means.
+        assert!(corpus.contains("--corpus-tenant acme"), "{corpus}");
+
+        // One-shot wake-ups are reachable from the agent, not just the CLI.
+        let once = command_tool_preview(
+            "schedule_create",
+            &json!({"goal_id": "c", "at": 1785138941}),
+        )
+        .expect("one-shot preview renders");
+        assert!(once.contains("--at 1785138941"), "{once}");
 
         assert_eq!(
             command_tool_preview("schedule_list", &json!({})).unwrap(),

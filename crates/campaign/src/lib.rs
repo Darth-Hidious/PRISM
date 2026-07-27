@@ -1006,9 +1006,23 @@ impl Campaign {
                 }),
             )
             .await;
+            // Write the terminal STATUS, not just the legacy `completed`
+            // flag. `from_checkpoint`'s flag→status fixup only fires while
+            // status is still `Submitted`, so a research goal that had ever
+            // paused at a gate (which now sets `status: paused` for real)
+            // would otherwise stay "paused" forever after finishing — every
+            // reader, this scheduler included, would treat a done goal as
+            // still waiting on a human.
+            self.transition(GoalStatus::Completed, |state| {
+                serde_json::json!({
+                    "reason": state.completion_reason,
+                    "research_steps": state.research_outcomes.len(),
+                })
+            })
+            .await?;
+        } else {
+            self.checkpoint()?;
         }
-
-        self.checkpoint()?;
 
         // Build a research-shaped result. winners/candidates are empty (those
         // are materials concepts); the research summary + artifact refs live
@@ -1464,13 +1478,36 @@ impl Campaign {
     /// background process — the goal id must exist on disk (and thus at
     /// `GET /api/goals`) the moment `--detach` returns, not only after the
     /// first `checkpoint_every` iterations.
+    /// The write is atomic — a temp file in the same directory, then a
+    /// rename. `std::fs::write` truncates first, so a crash mid-write (the
+    /// exact event this checkpoint exists to survive) left a half-written
+    /// file that `from_checkpoint` could not parse: the goal, its budget and
+    /// all its accumulated work, gone. A rename either happens or does not.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.state.last_checkpoint_at = Utc::now().to_rfc3339();
         if let Some(parent) = self.checkpoint_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(&self.state)?;
-        std::fs::write(&self.checkpoint_path, text)?;
+        let tmp = self
+            .checkpoint_path
+            .with_extension(format!("tmp-{}", std::process::id()));
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)
+                .with_context(|| format!("failed to open temp checkpoint {}", tmp.display()))?;
+            file.write_all(text.as_bytes())?;
+            // Durability of the CONTENT before the rename publishes it —
+            // without this the rename can land ahead of the bytes and a
+            // power loss leaves a valid name pointing at an empty file.
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.checkpoint_path).with_context(|| {
+            format!(
+                "failed to publish checkpoint {}",
+                self.checkpoint_path.display()
+            )
+        })?;
         debug!(
             campaign = %self.state.campaign_id,
             path = %self.checkpoint_path.display(),
