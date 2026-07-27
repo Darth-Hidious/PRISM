@@ -42,6 +42,18 @@ const RECALL_PREVIEW_CHARS: usize = 240;
 const SEMANTIC_SCORE_FLOOR: f32 = 0.4;
 /// How many tools `find_tools(query)` returns by default.
 const DEFAULT_FIND_TOOLS_LIMIT: usize = 8;
+/// Hard server-side ceiling on `limit`.
+///
+/// `limit` is MODEL-controlled, and a JSON-schema `maximum` is advisory — a
+/// provider will happily forward `limit: 130`. Every match is auto-pinned by the
+/// agent loop, so one such call used to drag the whole catalog's FULL
+/// definitions into every later request: 33,410 charged tokens as measured by
+/// the adversarial review against the live catalog, against an 8k model's
+/// ENTIRE 2,048-token tool budget. The budget cap in
+/// `agent_loop::pin_within_budget` is what actually enforces the bound; this
+/// ceiling keeps the discovery RESULT itself a readable shortlist rather than a
+/// catalog dump the model has to wade through.
+pub const MAX_FIND_TOOLS_LIMIT: usize = 25;
 /// Per-match tool-description length (chars) in a discovery result.
 const FIND_TOOLS_DESC_CHARS: usize = 400;
 
@@ -117,7 +129,9 @@ pub fn definitions() -> Vec<LoadedTool> {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max tools to return (default 8)."
+                        "minimum": 1,
+                        "maximum": MAX_FIND_TOOLS_LIMIT,
+                        "description": "Max tools to return (default 8, hard max 25)."
                     }
                 },
                 "required": ["query"]
@@ -407,12 +421,15 @@ fn find_tools(args: &Value, catalog: &ToolCatalog) -> Value {
     if query.is_empty() {
         return json!({ "error": "find_tools requires a `query`" });
     }
-    let limit = args
+    let requested = args
         .get("limit")
         .and_then(Value::as_u64)
         .map(|n| n as usize)
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_FIND_TOOLS_LIMIT);
+    // Clamped server-side: schema `maximum` is advisory, and the model controls
+    // this number. See [`MAX_FIND_TOOLS_LIMIT`].
+    let limit = requested.min(MAX_FIND_TOOLS_LIMIT);
 
     let matches: Vec<Value> = catalog
         .search(query, limit)
@@ -429,6 +446,9 @@ fn find_tools(args: &Value, catalog: &ToolCatalog) -> Value {
         "query": query,
         "count": matches.len(),
         "matches": matches,
+        // Told, not silently applied: a model that asked for 130 and got 25 must
+        // know the shortlist is a shortlist, or it concludes the catalog is small.
+        "limit_clamped_to": (requested > limit).then_some(limit),
         "hint": "these tools are now available — call one by name to use it",
     })
 }
@@ -725,6 +745,37 @@ mod tests {
             .collect();
         assert!(names.contains(&"deploy_model"));
         assert!(!names.contains(&"send_email"));
+    }
+
+    /// `limit` is MODEL-controlled. A schema `maximum` is advisory — providers
+    /// forward whatever the model emitted — so the ceiling has to be applied
+    /// HERE. Unclamped, one `find_tools(limit=130)` returned the whole catalog,
+    /// every entry of which the agent loop auto-pins into every later request.
+    #[test]
+    fn find_tools_limit_is_clamped_server_side() {
+        let entries: Vec<(String, String)> = (0..130)
+            .map(|i| (format!("tool_{i:03}"), format!("capability number {i}")))
+            .collect();
+        let pairs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_str()))
+            .collect();
+        let catalog = catalog_with(&pairs);
+
+        let out = find_tools(&json!({ "query": "capability", "limit": 130 }), &catalog);
+        let count = out["matches"].as_array().unwrap().len();
+        assert_eq!(
+            count, MAX_FIND_TOOLS_LIMIT,
+            "an unclamped limit hands the model the whole catalog to pin"
+        );
+        assert_eq!(out["count"], json!(MAX_FIND_TOOLS_LIMIT));
+        // Told, not silently truncated.
+        assert_eq!(out["limit_clamped_to"], json!(MAX_FIND_TOOLS_LIMIT));
+
+        // A sane limit is untouched, and reports no clamp.
+        let out = find_tools(&json!({ "query": "capability", "limit": 3 }), &catalog);
+        assert_eq!(out["matches"].as_array().unwrap().len(), 3);
+        assert_eq!(out["limit_clamped_to"], json!(null));
     }
 
     #[test]

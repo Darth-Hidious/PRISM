@@ -239,7 +239,10 @@ pub enum Triage {
 ///    still supplier discovery); or
 /// 2. an OPENING directive that names nothing at all ("make my alloy better"):
 ///    a directive verb, a possessive or bare comparative, and not one word in
-///    the whole message outside the closed filler vocabulary.
+///    the whole message outside the closed filler vocabulary — EXCEPT a bare
+///    speed request ("make it faster"), which is the terse software ask on a
+///    coding-capable agent rather than materials vagueness. See
+///    [`is_bare_speed_request`].
 ///
 /// Everything else proceeds. Terseness alone is never a trigger — experts are
 /// terse, and interrogating them makes the feature net negative.
@@ -264,6 +267,7 @@ pub fn triage(user_message: &str, has_prior_context: bool) -> Triage {
         && words.len() <= VAGUE_MAX_WORDS
         && is_vague_directive(&words)
         && names_nothing(&words)
+        && !is_bare_speed_request(&words)
     {
         return Triage::Classify;
     }
@@ -340,12 +344,26 @@ const VAGUE_OBJECTS: &[&str] = &[
 ];
 
 /// Comparatives that assert a direction without naming one.
+///
+/// This list is DOUBLE-DUTY — it feeds both [`is_vague_directive`] (a
+/// comparative can stand in for an unnamed object) and [`names_nothing`] (as
+/// closed filler vocabulary). Removing a word from it therefore changes two
+/// rules at once; `faster` is handled by [`is_bare_speed_request`] instead,
+/// precisely so it keeps both roles for the materials case.
 const BARE_COMPARATIVES: &[&str] = &[
     "better", "best", "good", "great", "improved", "faster", "cheaper", "stronger", "nicer", "more",
 ];
 
 /// Category nouns that stand in for a subject without being one. "My alloy" is
 /// not a material; "Hastelloy" is.
+///
+/// Deliberately EXCLUDED: `code`. It is not a materials/process category noun —
+/// it is the object of the most ordinary terse request a coding-capable agent
+/// gets ("fix my code"), which PRISM serves by reading the repo, not by asking
+/// which property the user meant. Every entry below still stands in for a
+/// materials, process or artefact subject, so `make my alloy better` and
+/// `optimize my material` are unaffected. (`system` and `model` stay: an alloy
+/// SYSTEM and a thermodynamic MODEL are real metallurgy subjects.)
 const GENERIC_NOUNS: &[&str] = &[
     "alloy",
     "alloys",
@@ -364,7 +382,6 @@ const GENERIC_NOUNS: &[&str] = &[
     "setup",
     "system",
     "model",
-    "code",
     "thing",
     "things",
     "stuff",
@@ -390,6 +407,25 @@ fn is_vague_directive(words: &[&str]) -> bool {
     let unnamed = words.iter().any(|w| VAGUE_OBJECTS.contains(w));
     let comparative = words.iter().any(|w| BARE_COMPARATIVES.contains(w));
     verb && (unnamed || comparative)
+}
+
+/// "Make it faster" with no category noun anywhere in it.
+///
+/// Speed is the one direction that is ordinarily a SOFTWARE ask on an agent
+/// that reads code, runs builds and profiles — work PRISM does directly rather
+/// than by asking which property the user meant. The narrowest thing that
+/// separates it from the materials case is the presence of a category noun:
+/// "make my process faster" names a process category and is a real
+/// process-design question with no process named; "make it faster" and "make my
+/// code faster" name no category at all and are the terse dev request.
+///
+/// Done here rather than by deleting `faster` from [`BARE_COMPARATIVES`],
+/// because that constant is double-duty: dropping the word also made
+/// "make my process faster" and "make the process faster" stop escalating —
+/// a regression an adversarial review caught and
+/// `narrowing_the_software_case_did_not_disarm_the_materials_case` now pins.
+fn is_bare_speed_request(words: &[&str]) -> bool {
+    words.contains(&"faster") && !words.iter().any(|w| GENERIC_NOUNS.contains(w))
 }
 
 /// Does the message name NOTHING — is every single word drawn from the closed
@@ -788,6 +824,61 @@ mod tests {
             "help me make this better",
         ] {
             assert_eq!(triage(q, false), Triage::Classify, "not escalated: {q}");
+        }
+    }
+
+    /// DEFECT (adversarial review): the vagueness rule taxed terse SOFTWARE
+    /// requests. PRISM is a coding-capable agent — its own tests assert that
+    /// "Why does my Rust build fail with E0507?" must Proceed — so these are
+    /// ordinary, not vague. When the classifier answers `other` the cost is one
+    /// silent round-trip the module's own doc calls "net negative"; when it
+    /// answers anything else it is worse, and `reprompt_cost_parity` measured
+    /// that worse case: "fix my code" was answered with "Which material, and
+    /// which property?" instead of reaching the model at all.
+    ///
+    /// Two causes, two different fixes: `code` sat in `GENERIC_NOUNS` (a list
+    /// meant for "my alloy" / "my material") and was simply removed, and a
+    /// bare speed request is now excluded by `is_bare_speed_request` — NOT by
+    /// deleting `faster` from `BARE_COMPARATIVES`, which is double-duty and
+    /// took the materials case down with it.
+    #[test]
+    fn terse_software_requests_are_not_taxed() {
+        for q in [
+            "fix my code",
+            "improve my code",
+            "optimize my code",
+            "make it faster",
+            "make my code faster",
+        ] {
+            assert_eq!(triage(q, false), Triage::Proceed, "over-escalated: {q}");
+        }
+    }
+
+    /// …and the materials-domain rule this feature exists for is untouched.
+    /// Both edits were domain-neutral vocabulary: every remaining generic noun
+    /// still stands in for a materials/process subject, and every remaining
+    /// bare comparative still asserts a materials-ish direction with no
+    /// dimension named.
+    #[test]
+    fn narrowing_the_software_case_did_not_disarm_the_materials_case() {
+        for q in [
+            "Make my alloy better",
+            "optimize my material",
+            "make the design better",
+            "can you improve this",
+            "make it stronger",
+            "make my part cheaper",
+            // `faster` is double-duty vocabulary: it feeds BOTH
+            // `is_vague_directive` (as a comparative) and `names_nothing` (as
+            // filler). Narrowing the SOFTWARE case must not take the
+            // materials/process case with it — "make my process faster" is a
+            // process-design request with no process named.
+            "make my process faster",
+            "make the process faster",
+            "make my recipe faster",
+            "make my setup faster",
+        ] {
+            assert_eq!(triage(q, false), Triage::Classify, "no longer caught: {q}");
         }
     }
 
