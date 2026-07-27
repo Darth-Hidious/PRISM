@@ -31,17 +31,50 @@ pub struct CommandToolRuntime {
     pub llm_model: Option<String>,
 }
 
+/// Which of a subcommand's OWN flags a free-form-argv tool may hand to clap.
+///
+/// [`reject_global_flag_override`] only knows PRISM's *global* options, and a
+/// static per-tool denylist structurally cannot know what flags a subcommand
+/// grows later. That is how `{"name":"doctor","args":["--fix"]}` reached
+/// `doctor::run(.., fix = true)` — `remove_dir_all(~/.prism/venv)`, a pip/uv
+/// reprovision and a ~90 MB model download — through a tool declared
+/// `ReadOnly, requires_approval: false`, i.e. with no approval prompt.
+///
+/// So the escape hatch is closed the other way round: a tool that runs
+/// unattended must NAME the flags it may pass, and everything else is denied.
+/// A flag added to any subcommand tomorrow is denied by default instead of
+/// silently inherited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlagPolicy {
+    /// Default-deny allowlist. Every argv token starting with `-` must appear
+    /// here or the call is refused before a child process exists.
+    Only(&'static [&'static str]),
+    /// Any flag. Legal ONLY on a tool whose `requires_approval` puts the
+    /// rendered argv in front of a human before it runs — enforced by
+    /// `unattended_argv_tools_declare_every_flag_they_may_pass`.
+    AnyBehindApproval,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandToolKind {
-    RootArgs,
+    /// `prism <root> <args…>` with the model's free-form argv.
+    RootArgs {
+        flags: FlagPolicy,
+    },
     /// An umbrella root (`prism <root> ...`) whose first argument is one of a
     /// known, closed set of subcommands. This is the typed form of RootArgs:
     /// the model picks a real verb via the `subcommand` enum, then passes any
-    /// verb-specific tokens via `args`. Execution prepends the subcommand.
+    /// verb-specific tokens via `args`. Execution prepends the subcommand
+    /// after checking it against `subcommands` — the enum in the schema is a
+    /// hint to the model, not a control.
     /// (TOOL_SURFACE_SPEC §1.1.3 — replaces the generic args:array<string>.)
     RootSubcommand {
         subcommands: &'static [&'static str],
+        flags: FlagPolicy,
     },
+    /// `prism doctor --fix` — the repair half of `doctor`, split out so the
+    /// diagnostic can stay unattended while the repair is approval-gated.
+    DoctorFix,
     QueryLocal,
     QueryPlatform,
     QueryFederated,
@@ -126,7 +159,10 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "status",
         root: "status",
         aliases: &["prism_status"],
-        kind: CommandToolKind::RootArgs,
+        // `Commands::Status` is a unit variant — it takes no flags at all.
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::Only(&[]),
+        },
         description: "Run `prism status ...` through PRISM's Rust CLI. Pass one CLI argument per entry in `args`, not a shell string.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
@@ -135,7 +171,10 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "tools",
         root: "tools",
         aliases: &["prism_tools"],
-        kind: CommandToolKind::RootArgs,
+        // `Commands::Tools` is a unit variant — it takes no flags at all.
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::Only(&[]),
+        },
         description: "Run `prism tools ...` through PRISM's Rust CLI. Use this when you need PRISM's own tool inventory or diagnostics.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
@@ -144,16 +183,49 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "doctor",
         root: "doctor",
         aliases: &["prism_doctor"],
-        kind: CommandToolKind::RootArgs,
-        description: "Run `prism doctor` — a full runtime diagnostic: local setup (binaries, models, venv, credentials) plus platform connectivity (auth, knowledge graph, models, compute, marketplace, local node, policy engine). Use this first when something feels broken before guessing at a fix.",
+        // `Commands::Doctor` has exactly one flag, `--fix`, and it is a
+        // repair: `remove_dir_all(~/.prism/venv)` + a network reprovision.
+        // This tool is the DIAGNOSTIC half and passes no flags; the repair
+        // lives in `doctor_fix`, which is approval-gated.
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::Only(&[]),
+        },
+        description: "Run `prism doctor` — a full runtime diagnostic: local setup (binaries, models, venv, credentials) plus platform connectivity (auth, knowledge graph, models, compute, marketplace, local node, policy engine). Use this first when something feels broken before guessing at a fix. Reports only; use `doctor_fix` to repair what it finds.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "doctor_fix",
+        root: "doctor",
+        aliases: &[],
+        kind: CommandToolKind::DoctorFix,
+        description: "Run `prism doctor --fix` — REPAIR, not a report. Deletes and rebuilds the managed Python venv at ~/.prism/venv when it cannot be healed in place, reinstalls its dependencies over the network, and re-downloads the local embedding model (~90 MB). Run `doctor` first; only call this for the failures it reported.",
+        // Deletes a directory outside the project and reaches the network.
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
     },
     CommandToolSpec {
         name: "query",
         root: "query",
         aliases: &["prism_query"],
-        kind: CommandToolKind::RootArgs,
+        // Every flag `Commands::Query` declares today. All of them are read
+        // paths, and all of them are already reachable through the typed
+        // `query_local` / `query_platform` / `query_federated` siblings — so
+        // this list makes the umbrella no more permissive than they are, and
+        // denies whatever `Query` grows next.
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::Only(&[
+                "--semantic",
+                "--platform",
+                "--json",
+                "--federated",
+                "--llm-url",
+                "--model",
+                "--api-key",
+                "--limit",
+                "--dashboard-url",
+            ]),
+        },
         description: "Run `prism query ...` for PRISM-native search and knowledge queries. Put each CLI argument in `args`; a query with spaces should stay one array element.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
@@ -189,7 +261,10 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "job-status",
         root: "job-status",
         aliases: &["prism_job_status"],
-        kind: CommandToolKind::RootArgs,
+        // `Commands::JobStatus` takes one positional job id and no flags.
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::Only(&[]),
+        },
         description: "Run `prism job-status ...` to inspect PRISM-managed jobs. Pass structured argv tokens in `args`.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
@@ -207,7 +282,9 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "workflow",
         root: "workflow",
         aliases: &["prism_workflow"],
-        kind: CommandToolKind::RootArgs,
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::AnyBehindApproval,
+        },
         description: "Run `prism workflow ...` for PRISM YAML workflows with Rust discovery and OPA-aware execution. Use `args=[\"list\"]`, `args=[\"show\",\"forge\"]`, `args=[\"run\",\"forge\",\"--set\",\"paper=alpha\"]`, or alias-style args like `args=[\"forge\",\"--paper\",\"alpha\"]`.",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
@@ -245,6 +322,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &["prism_marketplace"],
         kind: CommandToolKind::RootSubcommand {
             subcommands: &["search", "install", "info", "find", "update", "publish"],
+            flags: FlagPolicy::AnyBehindApproval,
         },
         description: "Run `prism marketplace <subcommand>` for marketplace resources (workflows, tools, models). Prefer the typed siblings marketplace_search / marketplace_find / marketplace_info / marketplace_install for those verbs; this umbrella covers `update`, `publish` (PRISM's own catalog — `publish --dry-run` lists what PRISM offers with licences and required extras without calling the platform) and any verb without a typed tool. Returns the CLI output (list, details, or install result).",
         permission_mode: PermissionMode::WorkspaceWrite,
@@ -290,7 +368,9 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "ingest",
         root: "ingest",
         aliases: &["prism_ingest"],
-        kind: CommandToolKind::RootArgs,
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::AnyBehindApproval,
+        },
         description: "Run `prism ingest ...` for PRISM's unified ingest pipeline. Use this for CSV/Parquet local ingest, PDF/text-like file ingest into the platform knowledge stack, watch mode, and ingest status checks instead of inventing shell glue.",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
@@ -327,6 +407,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
                 "subscriptions",
                 "health",
             ],
+            flags: FlagPolicy::AnyBehindApproval,
         },
         description: "Run `prism mesh <subcommand>` for PRISM mesh operations. Prefer the typed siblings mesh_discover / mesh_health / mesh_peers / mesh_subscriptions / mesh_publish / mesh_subscribe / mesh_unsubscribe for those verbs; this umbrella exists only for any mesh verb without a typed tool. Read verbs are free; publish/subscribe mutate mesh state and are approval-gated.",
         permission_mode: PermissionMode::FullAccess,
@@ -401,6 +482,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &["prism_node"],
         kind: CommandToolKind::RootSubcommand {
             subcommands: &["up", "down", "status", "probe", "logs", "key"],
+            flags: FlagPolicy::AnyBehindApproval,
         },
         description: "Run `prism node <subcommand>` for PRISM node fabric operations. Prefer the typed siblings node_probe / node_status / node_logs for those verbs; this umbrella covers `up`/`down` (start/stop the local node daemon) and `key` (node key management), which have no typed tool. `up` starts the daemon as a supervised background child of this app (returns pid + platform node_id, no shell needed); `down` stops it gracefully (platform deregistration included). `up`/`down` change node state and are approval-gated; `status`/`probe`/`logs` are read-only.",
         permission_mode: PermissionMode::FullAccess,
@@ -437,7 +519,10 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "agent",
         root: "agent",
         aliases: &["prism_agent"],
-        kind: CommandToolKind::RootArgs,
+        // `Commands::Agent` is a unit variant — it takes no flags at all.
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::Only(&[]),
+        },
         // The old description ("PRISM agent management commands") promised an
         // orchestration surface that does not exist. `prism agent` takes NO
         // arguments and only prints a static cheat-sheet (print_agent_guide) —
@@ -450,7 +535,9 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "run",
         root: "run",
         aliases: &["prism_run"],
-        kind: CommandToolKind::RootArgs,
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::AnyBehindApproval,
+        },
         description: "Run `prism run ...` for PRISM execution flows. Pass one CLI argument per `args` element.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
@@ -468,7 +555,9 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "research",
         root: "research",
         aliases: &["prism_research"],
-        kind: CommandToolKind::RootArgs,
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::AnyBehindApproval,
+        },
         description: "Run `prism research ...` to enter PRISM's higher-level research loop. Treat this as an orchestrated research workflow entrypoint, not a plain one-shot search command.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
@@ -488,6 +577,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &["prism_deploy"],
         kind: CommandToolKind::RootSubcommand {
             subcommands: &["create", "list", "status", "stop", "health"],
+            flags: FlagPolicy::AnyBehindApproval,
         },
         description: "Run `prism deploy <subcommand>` for PRISM deployment flows. Prefer the typed siblings deploy_list / deploy_status / deploy_health / deploy_create / deploy_stop for those verbs; this umbrella exists only for any deploy verb without a typed tool. Deployments spend compute and mutate platform state — approval-gated.",
         permission_mode: PermissionMode::FullAccess,
@@ -706,6 +796,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &["prism_models"],
         kind: CommandToolKind::RootSubcommand {
             subcommands: &["list", "search", "info"],
+            flags: FlagPolicy::Only(&["--provider", "--json"]),
         },
         description: "Run `prism models <subcommand>` for hosted model discovery for the active MARC27 project. Prefer the typed siblings models_list / models_search / models_info for those verbs; this umbrella exists only for any models verb without a typed tool. Read-only and free. Returns provider/model listings or details.",
         permission_mode: PermissionMode::ReadOnly,
@@ -744,6 +835,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &["prism_discourse"],
         kind: CommandToolKind::RootSubcommand {
             subcommands: &["create", "list", "show", "run", "status", "turns"],
+            flags: FlagPolicy::AnyBehindApproval,
         },
         description: "Run `prism discourse <subcommand>` for multi-agent debate workflows backed by the platform discourse API. Prefer the typed siblings discourse_list / discourse_create / discourse_show / discourse_run / discourse_status / discourse_turns for those verbs; this umbrella exists only for any discourse verb without a typed tool. Running a discourse instance spends compute and is approval-gated; list/show/status/turns are read-only.",
         permission_mode: PermissionMode::WorkspaceWrite,
@@ -807,7 +899,9 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         name: "publish",
         root: "publish",
         aliases: &["prism_publish"],
-        kind: CommandToolKind::RootArgs,
+        kind: CommandToolKind::RootArgs {
+            flags: FlagPolicy::AnyBehindApproval,
+        },
         description: "Run `prism publish ...` for PRISM publishing flows. Pass structured argv tokens in `args`.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
@@ -827,6 +921,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &["prism_billing"],
         kind: CommandToolKind::RootSubcommand {
             subcommands: &["usage", "history", "prices", "topup", "balance"],
+            flags: FlagPolicy::AnyBehindApproval,
         },
         description: "Run `prism billing <subcommand>` for MARC27 credits. Prefer the typed siblings billing_balance / billing_usage / billing_history / billing_prices for the common read-only checks; use this umbrella for `topup` (opens a real Stripe checkout and spends money — approval-gated) or any billing verb without a typed tool.",
         permission_mode: PermissionMode::FullAccess,
@@ -1774,10 +1869,11 @@ fn mesh_subscription_schema(action: &str) -> Value {
 
 fn schema_for_spec(spec: &CommandToolSpec) -> Value {
     match spec.kind {
-        CommandToolKind::RootArgs => root_args_schema(spec.root),
-        CommandToolKind::RootSubcommand { subcommands } => {
+        CommandToolKind::RootArgs { .. } => root_args_schema(spec.root),
+        CommandToolKind::RootSubcommand { subcommands, .. } => {
             root_subcommand_schema(spec.root, subcommands)
         }
+        CommandToolKind::DoctorFix => empty_schema(),
         CommandToolKind::QueryLocal => query_local_schema(),
         CommandToolKind::QueryPlatform => query_platform_schema(),
         CommandToolKind::QueryFederated => query_federated_schema(),
@@ -1926,6 +2022,47 @@ fn reject_global_flag_override(args: &[String]) -> Result<()> {
                  passes to the command (including which interpreter it runs)"
             );
         }
+    }
+    Ok(())
+}
+
+/// Enforce a tool's [`FlagPolicy`] over the argv the model supplied.
+///
+/// Default-deny: the question asked of every `-`-leading token is "did this
+/// tool declare you", never "are you on a list of known-bad flags". The
+/// denylist shape is what failed — `reject_global_flag_override` knows
+/// PRISM's two global options and could not know that `doctor` grew a
+/// `--fix` that deletes `~/.prism/venv` and reprovisions it over the
+/// network. Anything a subcommand grows next is refused here until someone
+/// adds it to that tool's spec, which is the moment to notice it writes.
+fn enforce_flag_policy(tool: &str, policy: FlagPolicy, args: &[String]) -> Result<()> {
+    // An approval-gated tool renders its full argv into the approval prompt
+    // before anything runs, so a human — not this function — is the control.
+    let FlagPolicy::Only(allowed) = policy else {
+        return Ok(());
+    };
+    for arg in args {
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let candidate = arg.split('=').next().unwrap_or(arg);
+        if allowed
+            .iter()
+            .any(|flag| candidate.eq_ignore_ascii_case(flag))
+        {
+            continue;
+        }
+        let declared = if allowed.is_empty() {
+            "none — this command takes no flags".to_string()
+        } else {
+            allowed.join(", ")
+        };
+        bail!(
+            "`{arg}` is not allowed in `args` for `{tool}`: it runs with no \
+             approval prompt, so it may only pass the flags its tool spec \
+             declares ({declared}). A flag that changes state belongs on an \
+             approval-gated tool."
+        );
     }
     Ok(())
 }
@@ -2264,8 +2401,9 @@ enum QueryMode {
 
 fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecution> {
     match spec.kind {
-        CommandToolKind::RootArgs => {
+        CommandToolKind::RootArgs { flags } => {
             let args = parse_args(input)?;
+            enforce_flag_policy(spec.name, flags, &args)?;
             if spec.root == "workflow" {
                 parse_workflow_execution_from_root_args(&args)
             } else {
@@ -2275,13 +2413,33 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 })
             }
         }
-        CommandToolKind::RootSubcommand { .. } => {
+        CommandToolKind::DoctorFix => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec!["--fix".to_string()],
+        }),
+        CommandToolKind::RootSubcommand { subcommands, flags } => {
             // Typed umbrella: subcommand (required) + optional verb-specific
             // tokens. Prepend the chosen subcommand, then run as a CLI command.
             // `workflow` keeps its specialized parser (it has structured
             // WorkflowList/Show/Run execution variants).
             let subcommand = required_string(input, "subcommand")?;
+            // The `enum` in the schema is a hint to the model, not a control:
+            // nothing downstream re-checked it, so an unlisted verb reached
+            // clap verbatim — `models register …` rewrites ~/.prism/models.toml
+            // (including the prices cost accounting reads) from a tool that
+            // runs with no approval prompt. Check it against the declared set.
+            if !subcommands
+                .iter()
+                .any(|verb| verb.eq_ignore_ascii_case(&subcommand))
+            {
+                bail!(
+                    "`{subcommand}` is not a subcommand of `{}`: choose one of {}",
+                    spec.name,
+                    subcommands.join(", ")
+                );
+            }
             let extra = parse_args(input)?;
+            enforce_flag_policy(spec.name, flags, &extra)?;
             let mut args = Vec::with_capacity(extra.len() + 1);
             args.push(subcommand);
             args.extend(extra);
@@ -3871,10 +4029,10 @@ mod tests {
             );
             let spec = spec_by_name(name).expect("spec resolves");
             let args = match spec.kind {
-                CommandToolKind::RootSubcommand { subcommands } => {
+                CommandToolKind::RootSubcommand { subcommands, .. } => {
                     json!({ "subcommand": subcommands[0] })
                 }
-                _ => json!({ "args": ["--help"] }),
+                _ => json!({ "args": [] }),
             };
             let preview = command_tool_preview(name, &args)
                 .unwrap_or_else(|| panic!("`{name}` must still build an invocation"));
@@ -3893,7 +4051,7 @@ mod tests {
         let offered = offered_names(true);
         for name in REDUNDANT_UMBRELLA_TOOLS {
             let spec = spec_by_name(name).expect("spec resolves");
-            if let CommandToolKind::RootSubcommand { subcommands } = spec.kind {
+            if let CommandToolKind::RootSubcommand { subcommands, .. } = spec.kind {
                 for verb in subcommands {
                     let sibling = format!("{}_{verb}", spec.root);
                     assert!(
@@ -4200,6 +4358,154 @@ mod tests {
         assert_eq!(command_tool_requires_approval("doctor"), Some(false));
         let preview = command_tool_preview("doctor", &json!({})).expect("doctor preview renders");
         assert_eq!(preview, "prism doctor");
+
+        // The version of this test that only passed `args: {}` is why the
+        // approval-gate bypass shipped. `doctor` runs with no approval prompt
+        // (ReadOnly + requires_approval:false is exactly what
+        // `protocol::build_permission_context` auto-approves), so it must not
+        // be able to reach `Commands::Doctor { fix: true }` —
+        // `remove_dir_all(~/.prism/venv)`, a pip/uv reprovision over the
+        // network, and a ~90 MB model download.
+        let err = build_execution(
+            spec_by_name("doctor").expect("doctor spec"),
+            &json!({"args": ["--fix"]}),
+        )
+        .expect_err("doctor must refuse --fix");
+        assert!(
+            err.to_string().contains("--fix"),
+            "the refusal must name the flag: {err}"
+        );
+        assert_eq!(
+            command_tool_preview("doctor", &json!({"args": ["--fix"]})),
+            None
+        );
+        // `--fix=true` and case variants are the same flag.
+        for spelling in ["--fix=true", "--FIX"] {
+            assert!(
+                build_execution(
+                    spec_by_name("doctor").unwrap(),
+                    &json!({ "args": [spelling] })
+                )
+                .is_err(),
+                "`{spelling}` must be refused too"
+            );
+        }
+
+        // The repair is not gone, it is gated: `doctor_fix` runs the same
+        // `prism doctor --fix` behind an approval prompt.
+        assert_eq!(command_tool_requires_approval("doctor_fix"), Some(true));
+        assert_eq!(
+            command_tool_preview("doctor_fix", &json!({})),
+            Some("prism doctor --fix".to_string())
+        );
+    }
+
+    #[test]
+    fn unattended_argv_tools_declare_every_flag_they_may_pass() {
+        // The class invariant. A tool that skips the approval prompt
+        // (ReadOnly + requires_approval:false — the pair
+        // `protocol::build_permission_context` auto-approves) may not hand
+        // clap a flag its spec did not declare, because nothing downstream
+        // reads argv: `agent_loop`'s gate keys on the tool NAME.
+        let mut checked = 0;
+        for spec in COMMAND_TOOLS {
+            let flags = match spec.kind {
+                CommandToolKind::RootArgs { flags } => flags,
+                CommandToolKind::RootSubcommand { flags, .. } => flags,
+                // Every other kind assembles argv from typed fields; the
+                // model never supplies a raw token.
+                _ => continue,
+            };
+            checked += 1;
+            let unattended =
+                spec.permission_mode == PermissionMode::ReadOnly && !spec.requires_approval;
+            if unattended {
+                assert!(
+                    matches!(flags, FlagPolicy::Only(_)),
+                    "`{}` runs with no approval prompt but declares \
+                     FlagPolicy::AnyBehindApproval — either list the flags it \
+                     may pass or set requires_approval",
+                    spec.name
+                );
+            }
+        }
+        assert!(
+            checked >= 18,
+            "expected the whole argv surface, saw {checked}"
+        );
+    }
+
+    #[test]
+    fn unattended_argv_tools_refuse_undeclared_flags() {
+        // Behavioural half of the invariant above, for every such tool —
+        // `doctor --fix` was only the instance that was found.
+        const INTRUDER: &str = "--prism-not-a-real-flag";
+        let mut checked = Vec::new();
+        for spec in COMMAND_TOOLS {
+            let (flags, subcommand) = match spec.kind {
+                CommandToolKind::RootArgs { flags } => (flags, None),
+                CommandToolKind::RootSubcommand {
+                    flags, subcommands, ..
+                } => (flags, Some(subcommands[0])),
+                _ => continue,
+            };
+            if !matches!(flags, FlagPolicy::Only(_)) {
+                continue;
+            }
+            let mut input = json!({ "args": [INTRUDER] });
+            if let Some(verb) = subcommand {
+                input["subcommand"] = json!(verb);
+            }
+            assert!(
+                build_execution(spec, &input).is_err(),
+                "`{}` accepted an undeclared flag",
+                spec.name
+            );
+            checked.push(spec.name);
+        }
+        // The unattended free-form-argv surface, audited against the clap
+        // definitions in crates/cli/src/main.rs. `status`, `tools`, `agent`
+        // are unit variants (no flags); `job-status` takes one positional;
+        // `doctor`'s only flag is the repair; `query` and `models` declare
+        // their read-path flags.
+        assert_eq!(
+            checked,
+            vec![
+                "status",
+                "tools",
+                "doctor",
+                "query",
+                "job-status",
+                "agent",
+                "models"
+            ]
+        );
+    }
+
+    #[test]
+    fn root_subcommand_umbrellas_reject_verbs_they_do_not_declare() {
+        // The schema's `enum` is a hint to the model; nothing downstream
+        // re-read it, so `models register …` — which rewrites
+        // ~/.prism/models.toml, including the prices cost accounting reads —
+        // reached clap from a tool with no approval prompt.
+        let models = spec_by_name("models").expect("models spec");
+        assert_eq!(models.permission_mode, PermissionMode::ReadOnly);
+        assert!(!models.requires_approval);
+        assert!(build_execution(models, &json!({"subcommand": "register"})).is_err());
+        assert_eq!(
+            command_tool_preview("models", &json!({"subcommand": "register"})),
+            None
+        );
+
+        // Declared verbs still work, on gated umbrellas too.
+        assert_eq!(
+            command_tool_preview("models", &json!({"subcommand": "list"})),
+            Some("prism models list".to_string())
+        );
+        assert_eq!(
+            command_tool_preview("node", &json!({"subcommand": "status"})),
+            Some("prism node status".to_string())
+        );
     }
 
     #[test]
