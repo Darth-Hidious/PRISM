@@ -153,7 +153,7 @@ pub fn sanitize_env_vars(env_vars: &BTreeMap<String, String>) -> Result<BTreeMap
 /// Make sure an image is available: try to pull, and when the pull fails fall
 /// back to a locally present image (pre-loaded nodes, air-gapped facilities,
 /// images built on the node itself). Bail only when the image is nowhere.
-async fn ensure_image_available(runtime: ContainerRuntime, image: &str) -> Result<()> {
+pub(crate) async fn ensure_image_available(runtime: ContainerRuntime, image: &str) -> Result<()> {
     let pull = Command::new(runtime.binary())
         .args(["pull", image])
         .output()
