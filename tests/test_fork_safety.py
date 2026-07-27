@@ -189,6 +189,32 @@ class TestSpawnHelperCannotSilentlyRegress:
         assert seen["args"][0].endswith("python3") or "python" in seen["args"][0]
         assert "/tmp" in seen["args"]
 
+    def test_unrunnable_command_says_so_instead_of_tracebacking(self):
+        """The trampoline is a process the caller never asked for. When exec
+        fails it must not leak its own Python traceback as the diagnosis."""
+        result = spawn.run(
+            ["/bin/does-not-exist", "arg"], capture_output=True, text=True
+        )
+
+        assert result.returncode == 127
+        assert "/bin/does-not-exist" in result.stderr
+        assert "Traceback" not in result.stderr
+
+    def test_process_group_wait_kills_rather_than_abandons(self):
+        """If the group never appears, the caller gets an error and PRISM is
+        left holding no untracked, unkillable child."""
+        # new_session=False, so this child never becomes a group leader and
+        # the wait is guaranteed to hit its deadline.
+        proc = spawn.popen(["/bin/sleep", "45"], stdout=subprocess.DEVNULL)
+        try:
+            with pytest.raises(RuntimeError, match="process group"):
+                spawn._await_own_process_group(proc, timeout=0.0)
+            assert proc.poll() is not None, "child was abandoned, not killed"
+        finally:
+            if proc.poll() is None:  # belt and braces; the assert above owns it
+                proc.kill()
+                proc.wait()
+
     def test_helper_never_leaks_an_inheritable_fd(self, poisoned_process):
         """Network.framework leaves inheritable sockets behind that close_fds
         would otherwise have caught. The trampoline closes them explicitly."""

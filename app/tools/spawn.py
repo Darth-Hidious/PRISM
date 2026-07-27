@@ -81,7 +81,14 @@ _TRAMPOLINE = (
     "        try: os.close(fd)\n"
     "        except OSError: pass\n"
     "if sys.argv[2]: os.chdir(sys.argv[2])\n"
-    "os.execv(sys.argv[4], sys.argv[4:])\n"
+    # execvp, not execv, so a bare command name still resolves through PATH the
+    # way subprocess.Popen would. An exec failure must not surface as a Python
+    # traceback from a process the caller never asked for: say what could not
+    # run and use the conventional 127.
+    "try: os.execvp(sys.argv[4], sys.argv[4:])\n"
+    "except OSError as exc:\n"
+    "    sys.stderr.write('cannot execute %s: %s\\n' % (sys.argv[4], exc))\n"
+    "    sys.exit(127)\n"
 )
 
 # Knobs that would silently drag us back onto the fork path. Passing one is a
@@ -136,9 +143,15 @@ def _await_own_process_group(proc: subprocess.Popen, timeout: float = 5.0) -> No
         if proc.poll() is not None:
             return  # died before setsid (trampoline failed); nothing to signal
         if time.monotonic() >= deadline:
+            # There is no group to signal, but abandoning a live child that
+            # nothing holds a handle to is worse than the error being raised.
+            # Kill the one pid we do have, and reap it.
+            proc.kill()
+            proc.wait()
             raise RuntimeError(
                 f"spawned pid {proc.pid} did not enter its own process group "
-                f"within {timeout}s, so it could not be stopped by group kill"
+                f"within {timeout}s, so it could not be stopped by group kill; "
+                f"it was killed directly instead and produced no output"
             )
         time.sleep(0.002)
 
