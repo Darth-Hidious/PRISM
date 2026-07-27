@@ -36,8 +36,8 @@ WHAT CPYTHON REQUIRES
     So chdir, setsid and fd hygiene cannot happen in the parent. They move into
     a trampoline: a short `python -I -S -c` program that is posix_spawn'ed and
     then, already past the fork in a fresh process, closes inherited
-    descriptors, chdirs, optionally setsid()s, and execv()s the real command.
-    execv keeps the pid, so os.killpg(proc.pid, ...) still reaches the whole
+    descriptors, chdirs, optionally setsid()s, and execs the real command.
+    exec keeps the pid, so os.killpg(proc.pid, ...) still reaches the whole
     process group and proc.returncode is still the real command's status.
 
 ABOUT close_fds=False
@@ -183,11 +183,16 @@ def run(
     argv: list[str],
     *,
     cwd: str | None = None,
-    new_session: bool = False,
     **kwargs: Any,
 ) -> subprocess.CompletedProcess:
-    """subprocess.run() without ever calling fork(). See popen()."""
+    """subprocess.run() without ever calling fork(). See popen().
+
+    Deliberately no new_session: subprocess.run's timeout kills only the
+    direct child, so a command in its own group could leave its children
+    running. Callers that need a group must use popen() and kill the group
+    themselves.
+    """
     _check(kwargs)
     if _IS_WINDOWS:
         return subprocess.run(argv, cwd=cwd, **kwargs)
-    return subprocess.run(_argv(argv, cwd, new_session), close_fds=False, **kwargs)
+    return subprocess.run(_argv(argv, cwd, False), close_fds=False, **kwargs)
