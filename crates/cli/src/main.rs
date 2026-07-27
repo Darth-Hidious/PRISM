@@ -207,8 +207,9 @@ enum Commands {
         /// Watch a directory for new/modified files and ingest continuously.
         #[arg(long)]
         watch: bool,
-        /// Runtime URL for local PDF extraction.
-        #[arg(long, default_value = "http://127.0.0.1:8090")]
+        /// Runtime URL for local PDF text extraction. PRISM starts a runtime
+        /// here automatically when the URL is on this machine and none is up.
+        #[arg(long, default_value = prism_node::runtime_service::DEFAULT_RUNTIME_URL)]
         runtime_url: String,
         /// Output JSON instead of human-readable progress.
         #[arg(long)]
@@ -4987,6 +4988,19 @@ async fn extract_pdf_text_with_runtime(
     runtime_url: &str,
     path: &Path,
 ) -> Result<serde_json::Value> {
+    // Step 1 of ingest runs on this machine and needs the local runtime.
+    // Nothing else starts it, so start it here — or explain, once, why we
+    // can't. The alternative (and the old behaviour) is a raw connect error
+    // against a port no PRISM code path ever binds.
+    prism_node::runtime_service::ensure_running(runtime_url, |msg| eprintln!("  {msg}"))
+        .await
+        .with_context(|| {
+            format!(
+                "local text extraction failed for {} (nothing was sent to the platform)",
+                path.display()
+            )
+        })?;
+
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read PDF {}", path.display()))?;
     let request = serde_json::json!({
@@ -5011,7 +5025,13 @@ async fn extract_pdf_text_with_runtime(
         .json(&request)
         .send()
         .await
-        .with_context(|| format!("runtime PDF extraction failed for {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "local text extraction failed for {} — the runtime at {runtime_url} stopped \
+                 responding (nothing was sent to the platform)",
+                path.display()
+            )
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -5659,7 +5679,13 @@ async fn handle_ingest(
         if locality == "local" {
             eprintln!("⚑ LOCAL — extracting on-device, nothing leaves your machine");
         } else {
-            eprintln!("☁ CLOUD — sent to the platform");
+            // Cloud ingest is two stages and the first one is LOCAL: document
+            // text is extracted by the runtime on this machine, and only that
+            // text is uploaded. Saying just "sent to the platform" made a
+            // localhost failure in stage 1 impossible to place.
+            eprintln!(
+                "☁ CLOUD — step 1: text extracted on-device · step 2: that text sent to the platform"
+            );
         }
         locality
     } else {

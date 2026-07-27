@@ -1615,7 +1615,7 @@ fn looks_like_weights_source(image: &str) -> bool {
 }
 
 fn deployment_runtime_url() -> String {
-    std::env::var("PRISM_RUNTIME_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string())
+    crate::runtime_service::default_runtime_url()
 }
 
 fn resolve_public_endpoint_url(port: u16, config: &DeploymentLaunchConfig) -> String {
@@ -1695,6 +1695,11 @@ async fn start_runtime_deployment(
     gpu: bool,
     config: &DeploymentLaunchConfig,
 ) -> Result<()> {
+    // Same hole the ingest path had: this used to POST straight at a runtime
+    // nothing ever started, so a weights-source deployment died on a raw
+    // connect error.
+    crate::runtime_service::ensure_running(runtime_url, |msg| tracing::info!("{msg}")).await?;
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .build()?;
@@ -2340,14 +2345,18 @@ mod tests {
         let health_port = reqwest::Url::parse(&health_base).unwrap().port().unwrap();
         let runtime_requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let runtime_requests_clone = runtime_requests.clone();
+        // Three requests now: `start_runtime_deployment` first probes /health
+        // (start-or-explain) before it deploys, then the stop tears down.
         let (runtime_url, runtime_server) = spawn_stub_http_server(
-            2,
+            3,
             Arc::new(move |request| {
                 runtime_requests_clone
                     .lock()
                     .unwrap()
                     .push(request.lines().next().unwrap_or("").to_string());
-                if request.starts_with("POST /deploy ") {
+                if request.starts_with("GET /health ") {
+                    (200, r#"{"status":"ok"}"#.to_string(), "application/json")
+                } else if request.starts_with("POST /deploy ") {
                     (
                         200,
                         serde_json::json!({
@@ -2444,9 +2453,12 @@ mod tests {
         }
 
         let requests = runtime_requests.lock().unwrap().clone();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with("POST /deploy "));
-        assert!(requests[1].starts_with("DELETE /deploy/"));
+        assert_eq!(requests.len(), 3);
+        // The health probe must come first and, since it answered, no container
+        // may be started — the deploy goes straight to the runtime already up.
+        assert!(requests[0].starts_with("GET /health "));
+        assert!(requests[1].starts_with("POST /deploy "));
+        assert!(requests[2].starts_with("DELETE /deploy/"));
     }
 
     fn test_paths(tmp: &TempDir) -> PrismPaths {
