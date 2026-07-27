@@ -198,16 +198,21 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // The first `terminal.draw()` will render the full frame anyway,
     // so the explicit clear is unnecessary.
 
-    // Spawn backend — real subprocess or fake deterministic player.
-    let mut backend_handle = match &config.backend_mode {
+    // Spawn backend — real subprocess or fake deterministic player. The real
+    // path spawns *and* handshakes under the retry policy; the fake one has
+    // no subprocess to race with, so it just inits.
+    let backend_handle = match &config.backend_mode {
         BackendMode::Real {
             prism_binary,
             project_root,
             python_bin,
-        } => backend::BackendHandle::spawn(prism_binary, project_root, python_bin)?,
-        BackendMode::Fake { scenario } => backend::BackendHandle::fake(*scenario),
+        } => backend::BackendHandle::spawn_and_init(prism_binary, project_root, python_bin).await?,
+        BackendMode::Fake { scenario } => {
+            let mut handle = backend::BackendHandle::fake(*scenario);
+            handle.init().await?;
+            handle
+        }
     };
-    backend_handle.init().await?;
 
     // Build app state
     let mut app = app::App::new(backend_handle);

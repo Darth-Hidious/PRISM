@@ -174,9 +174,16 @@ enum Commands {
     /// through Python.
     #[command(name = "mcp-server-native", hide = true)]
     McpServerNative,
-    /// Diagnostic snapshot — checks llama-server, models, Python venv, auth,
-    /// MCP config and tool index. Run this first when chat misbehaves.
-    Doctor,
+    /// Diagnostic snapshot — checks llama-server, models, Python venv, auth
+    /// and platform connectivity. Run this first when something feels off.
+    Doctor {
+        /// Repair what can be repaired (rebuild the Python venv, warm the
+        /// embedding model cache) and print the exact command for everything
+        /// else. Nothing is reported as fixed unless the check that failed
+        /// passes on re-run.
+        #[arg(long)]
+        fix: bool,
+    },
     /// PRISM node lifecycle commands.
     Node {
         #[command(subcommand)]
@@ -1285,7 +1292,24 @@ async fn main() -> Result<()> {
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_string());
         let prism_dir = PathBuf::from(&home).join(".prism");
-        ensure_venv(&prism_dir, &project_root).await?
+        match ensure_venv(&prism_dir, &project_root).await {
+            Ok(python) => python,
+            // `doctor` is the command you run *because* provisioning broke,
+            // and `doctor --fix` is what repairs it. Gating both behind the
+            // step that just failed left the stuck state ("venv has no
+            // working pip … delete ~/.prism/venv and relaunch") with no
+            // in-product way out: the CLI refused to start at all. Degrade to
+            // the expected interpreter path so doctor can report and repair.
+            // Every other subcommand still fails loudly — they genuinely
+            // cannot run without a working venv.
+            Err(err) if matches!(cli.command, Some(Commands::Doctor { .. })) => {
+                eprintln!(
+                    "[prism] venv unavailable ({err}) — continuing so `doctor` can report it"
+                );
+                prism_python_bridge::venv::venv_layout(&prism_dir.join("venv")).0
+            }
+            Err(err) => return Err(err.into()),
+        }
     };
 
     // ── Env-var mutations happen HERE, before ANY task is detached ──
@@ -2060,8 +2084,8 @@ async fn main() -> Result<()> {
         Commands::McpServerNative => {
             mcp_server_native::run(project_root.clone(), python.clone()).await?;
         }
-        Commands::Doctor => {
-            doctor::run(&project_root, &python).await?;
+        Commands::Doctor { fix } => {
+            doctor::run(&project_root, &python, fix).await?;
         }
         Commands::Node { command } => match command {
             NodeCommands::Up {
