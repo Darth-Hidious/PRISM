@@ -22,12 +22,13 @@
 //! A well-formed expert query must pay NOTHING for this feature. That is
 //! structural, not a tuning target:
 //!
-//! - [`triage`] is a pure function over the user's words. No I/O, no LLM, no
-//!   allocation beyond one tokenization. It runs in microseconds.
+//! - [`triage`] is a pure function over the user's words: no I/O, no LLM, one
+//!   lowercase copy and one token vector. ~9 µs on a debug build.
 //! - It escalates only on POSITIVE evidence of a problem (an out-of-domain
-//!   routing marker, or a short vague directive with no concrete subject).
+//!   routing marker, or an opening directive that names nothing at all).
 //!   Absence of detail is never itself a trigger — experts write terse.
-//! - Only an escalated turn reaches [`classify`], the one cheap LLM call.
+//! - Only an escalated turn reaches [`classify`], the one cheap LLM call, whose
+//!   token usage is returned so the caller bills it like any other.
 //!
 //! So "What is the yield strength of Inconel 718 at 650 C?" adds zero tokens
 //! and zero network round-trips. `preflight_is_free_for_expert_queries` asserts
@@ -41,7 +42,7 @@
 //! up as materials science.
 
 use crate::types::AgentConfig;
-use prism_llm::{ChatMessage, LlmClient};
+use prism_llm::{ChatMessage, LlmClient, UsageInfo};
 
 // ── Intent taxonomy ──────────────────────────────────────────────────
 
@@ -232,17 +233,24 @@ pub enum Triage {
 /// for reprompting.
 ///
 /// Escalates only on positive evidence:
-/// 1. an out-of-domain routing marker (supplier / vendor / competitor
-///    vocabulary) — these are strongly not materials-property questions, and a
-///    concrete subject does not rescue them ("companies in Poland that can
-///    machine Inconel 718" is still supplier discovery); or
-/// 2. a short vague directive ("make my alloy better") with no concrete
-///    subject anywhere in it.
+/// 1. an out-of-domain routing marker (supplier / vendor / market vocabulary)
+///    — these are strongly not materials questions, and naming a material does
+///    not rescue them ("companies in Poland that can machine Inconel 718" is
+///    still supplier discovery); or
+/// 2. an OPENING directive that names nothing at all ("make my alloy better"):
+///    a directive verb, a possessive or bare comparative, and not one word in
+///    the whole message outside the closed filler vocabulary.
 ///
 /// Everything else proceeds. Terseness alone is never a trigger — experts are
 /// terse, and interrogating them makes the feature net negative.
+///
+/// `has_prior_context` suppresses rule 2 mid-conversation. "Now make it
+/// stronger" names nothing on its own, but after a turn about Inconel 718 it is
+/// anaphoric and perfectly clear; re-asking there is the interrogation this
+/// feature exists to avoid. The routing rule is NOT suppressed — "find
+/// companies in Poland" is a misroute whenever it arrives.
 #[must_use]
-pub fn triage(user_message: &str) -> Triage {
+pub fn triage(user_message: &str, has_prior_context: bool) -> Triage {
     let lower = user_message.to_lowercase();
     let words = tokenize(&lower);
     if words.is_empty() {
@@ -251,10 +259,11 @@ pub fn triage(user_message: &str) -> Triage {
     if has_routing_marker(&lower, &words) {
         return Triage::Classify;
     }
-    if words.len() >= VAGUE_MIN_WORDS
+    if !has_prior_context
+        && words.len() >= VAGUE_MIN_WORDS
         && words.len() <= VAGUE_MAX_WORDS
         && is_vague_directive(&words)
-        && !has_concrete_subject(user_message)
+        && names_nothing(&words)
     {
         return Triage::Classify;
     }
@@ -268,34 +277,32 @@ const VAGUE_MIN_WORDS: usize = 3;
 /// evidence of anything. The routing rule is deliberately NOT length-bounded.
 const VAGUE_MAX_WORDS: usize = 12;
 
-/// Single words that mark a supplier / procurement / market request. Matched on
-/// whole tokens so `company` never fires inside another word.
+/// Single words that mark a supplier / procurement request. Matched on whole
+/// tokens so `vendor` never fires inside another word.
+///
+/// Deliberately EXCLUDED, because each is ordinary materials vocabulary and
+/// would tax a well-formed expert query with a classifier call it does not
+/// need: `foundry` ("foundry alloy", "foundry defects"), `manufacturer`
+/// ("manufacturer datasheet"), `sourcing` ("powder sourcing route"),
+/// `competitor` ("Alloy 625's main competitor, C276"), `company`. The
+/// company-seeking senses of those are carried by [`ROUTING_PHRASES`] instead.
 const ROUTING_WORDS: &[&str] = &[
     "supplier",
     "suppliers",
     "vendor",
     "vendors",
-    "company",
     "companies",
-    "manufacturer",
-    "manufacturers",
     "subcontractor",
     "subcontractors",
-    "foundry",
-    "fabricator",
-    "fabricators",
     "distributor",
     "distributors",
     "rfq",
     "quotation",
     "procurement",
-    "procure",
-    "sourcing",
-    "competitor",
-    "competitors",
 ];
 
-/// Multi-word markers, matched on the lowercased message.
+/// Multi-word markers, matched on the lowercased message. These carry the
+/// company-seeking senses of the words kept out of [`ROUTING_WORDS`].
 const ROUTING_PHRASES: &[&str] = &[
     "machine shop",
     "job shop",
@@ -306,6 +313,11 @@ const ROUTING_PHRASES: &[&str] = &[
     "who can supply",
     "who makes",
     "who supplies",
+    "which company",
+    "which manufacturer",
+    "find a manufacturer",
+    "our competitors",
+    "the competition",
     "market share",
     "market size",
     "competitive landscape",
@@ -324,26 +336,50 @@ const VAGUE_VERBS: &[&str] = &[
 
 /// Words that leave the object unnamed — a possessive or a deictic.
 const VAGUE_OBJECTS: &[&str] = &[
-    "my",
-    "our",
-    "this",
-    "that",
-    "it",
-    "mine",
-    "ours",
-    "them",
-    "these",
-    "those",
-    "something",
-    "stuff",
-    "things",
-    "me",
-    "us",
+    "my", "our", "this", "that", "it", "mine", "ours", "them", "these", "those", "me", "us",
 ];
 
 /// Comparatives that assert a direction without naming one.
 const BARE_COMPARATIVES: &[&str] = &[
     "better", "best", "good", "great", "improved", "faster", "cheaper", "stronger", "nicer", "more",
+];
+
+/// Category nouns that stand in for a subject without being one. "My alloy" is
+/// not a material; "Hastelloy" is.
+const GENERIC_NOUNS: &[&str] = &[
+    "alloy",
+    "alloys",
+    "material",
+    "materials",
+    "metal",
+    "metals",
+    "part",
+    "parts",
+    "sample",
+    "component",
+    "product",
+    "design",
+    "process",
+    "recipe",
+    "setup",
+    "system",
+    "model",
+    "code",
+    "thing",
+    "things",
+    "stuff",
+    "something",
+    "one",
+    "ones",
+];
+
+/// Function words that carry no subject. Includes the fragments an apostrophe
+/// tokenizes to (`ve`, `s`, `t`, …).
+const FUNCTION_WORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "of", "to", "for", "with", "at", "in", "on", "so", "if", "but",
+    "is", "are", "be", "been", "do", "does", "did", "can", "could", "would", "should", "will",
+    "please", "you", "i", "we", "some", "any", "just", "now", "then", "really", "up", "out", "s",
+    "t", "ve", "m", "re", "ll", "d",
 ];
 
 /// A vague directive needs a directive verb AND either an unnamed object or a
@@ -356,42 +392,23 @@ fn is_vague_directive(words: &[&str]) -> bool {
     verb && (unnamed || comparative)
 }
 
-/// Does the message name something concrete? Deliberately generous — a false
-/// "yes" costs nothing (the turn proceeds, which is the status quo), a false
-/// "no" risks interrogating someone who was perfectly clear.
+/// Does the message name NOTHING — is every single word drawn from the closed
+/// filler vocabulary?
 ///
-/// Signals, on the ORIGINAL casing:
-/// - a token containing a digit (`718`, `650`, `316L`, `Ti-6Al-4V`, `0.02`)
-/// - a path, URL or file extension
-/// - a quoted string
-/// - a capitalised word that is not the first word of the message (a proper
-///   noun: `Inconel`, `Hastelloy`, `Poland`)
-fn has_concrete_subject(message: &str) -> bool {
-    if message.contains('/')
-        || message.contains('\\')
-        || message.contains('"')
-        || message.contains('`')
-    {
-        return true;
-    }
-    let mut first = true;
-    for token in message.split_whitespace() {
-        let trimmed = token.trim_matches(|c: char| !c.is_alphanumeric());
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.chars().any(|c| c.is_ascii_digit()) {
-            return true;
-        }
-        if !first
-            && trimmed.chars().count() > 1
-            && trimmed.chars().next().is_some_and(char::is_uppercase)
-        {
-            return true;
-        }
-        first = false;
-    }
-    false
+/// This replaced a capitalisation heuristic ("a capitalised word that is not
+/// the first word is a proper noun"), which made the verdict depend on the
+/// user's typing habits rather than on content: `make hastelloy better` was
+/// treated as nameless and interrogated, while `MAKE MY ALLOY BETTER` was
+/// treated as specific and let through. A closed-vocabulary test has neither
+/// failure — an unknown word is a named thing, in any casing and any language.
+fn names_nothing(words: &[&str]) -> bool {
+    words.iter().all(|w| {
+        VAGUE_VERBS.contains(w)
+            || VAGUE_OBJECTS.contains(w)
+            || BARE_COMPARATIVES.contains(w)
+            || GENERIC_NOUNS.contains(w)
+            || FUNCTION_WORDS.contains(w)
+    })
 }
 
 /// Lowercase alphabetic-or-digit words.
@@ -421,12 +438,18 @@ other           anything else, including software work and conversation";
 
 /// Ask the cheap model for the intent. `None` on any failure — a broken or slow
 /// classifier must never block or delay a turn, so every error path proceeds.
-async fn classify(llm: &LlmClient, model: &str, user_message: &str) -> Option<Intent> {
+async fn classify(
+    llm: &LlmClient,
+    model: &str,
+    user_message: &str,
+) -> (Option<Intent>, Option<UsageInfo>) {
     let mut config = llm.config().clone();
     config.model = model.to_string();
-    // Hard latency bound: a hung classifier may not stall a user's turn.
+    // Per-request latency bound. NOT an absolute one: `LlmClient` applies its
+    // own retry policy around the request, so a pathological backend can cost a
+    // small multiple of this. It is a bound on one attempt, which is what stops
+    // a default 300s timeout from parking a user's turn.
     config.timeout_secs = config.timeout_secs.min(CLASSIFIER_TIMEOUT_SECS);
-    // The answer is one tag. Anything more is the model padding.
     config.max_output_tokens = Some(CLASSIFIER_MAX_OUTPUT_TOKENS);
     let client = LlmClient::new(config);
 
@@ -448,37 +471,47 @@ async fn classify(llm: &LlmClient, model: &str, user_message: &str) -> Option<In
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = %e, "reprompt: classifier unavailable — proceeding");
-            return None;
+            return (None, None);
         }
     };
-    if let Some(usage) = &response.usage {
-        tracing::debug!(
-            model = %model,
-            prompt_tokens = usage.prompt_tokens,
-            completion_tokens = usage.completion_tokens,
-            "reprompt: classifier cost"
-        );
-    }
-    parse_intent(response.message.content.as_deref().unwrap_or(""))
+    let intent = parse_intent(response.message.content.as_deref().unwrap_or(""));
+    tracing::debug!(
+        model = %model,
+        intent = intent.map_or("none", Intent::tag),
+        prompt_tokens = response.usage.as_ref().map(|u| u.prompt_tokens),
+        completion_tokens = response.usage.as_ref().map(|u| u.completion_tokens),
+        "reprompt: classifier"
+    );
+    (intent, response.usage)
 }
 
-/// Longest a classifier call may take before the turn gives up on it and runs
+/// Bound on ONE classifier attempt before the turn gives up on it and runs
 /// unchanged. A user waiting on their own question is the failure being avoided.
 const CLASSIFIER_TIMEOUT_SECS: u64 = 15;
-/// One tag is the whole answer.
-const CLASSIFIER_MAX_OUTPUT_TOKENS: u64 = 16;
+/// The reply is one word. This is 256 rather than a token or two because
+/// `LlmClient::effective_max_tokens` floors the requested output at 256 — a
+/// smaller number here would be silently raised, so it would lie.
+const CLASSIFIER_MAX_OUTPUT_TOKENS: u64 = 256;
 
-/// Pull the tag out of the model's reply. Lenient about surrounding prose,
-/// strict about the vocabulary: an unrecognised reply yields `None`, which
-/// proceeds.
+/// Pull the tag out of the model's reply.
+///
+/// Strict on purpose. A bare tag wins outright; otherwise the reply must
+/// mention EXACTLY ONE tag. Two tags ("this isn't literature, it's supplier
+/// discovery") is ambiguity, and ambiguity yields `None`, which proceeds — a
+/// positional or longest-match tie-break there would pick a plausible wrong
+/// intent, and a wrong intent is the failure this whole module exists to
+/// prevent.
 fn parse_intent(reply: &str) -> Option<Intent> {
     let lower = reply.to_lowercase();
-    // Longest tag first, so a reply like "supplier or other" resolves to the
-    // specific tag, and `other` — a common English word — is only reached when
-    // nothing else fits.
-    let mut tags = Intent::ALL;
-    tags.sort_by_key(|i| std::cmp::Reverse(i.tag().len()));
-    tags.into_iter().find(|i| lower.contains(i.tag()))
+    let bare = lower.trim().trim_matches(|c: char| !c.is_alphanumeric());
+    if let Some(exact) = Intent::ALL.into_iter().find(|i| i.tag() == bare) {
+        return Some(exact);
+    }
+    let mut mentioned = Intent::ALL.into_iter().filter(|i| lower.contains(i.tag()));
+    match (mentioned.next(), mentioned.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
 }
 
 // ── Decision ─────────────────────────────────────────────────────────
@@ -502,45 +535,76 @@ pub enum Preflight {
     },
 }
 
-/// Scratchpad `step_type` for the never-ask-twice ledger. The scratchpad
-/// outlives the turn on both the TUI and service paths, so it is the session
-/// memory this needs — with no new plumbing, and without polluting either the
-/// user's transcript or the model's context.
-pub const LEDGER_STEP: &str = "reprompt";
-
-/// Prefix of the injected routing hint. Load-bearing: the turn strips its own
-/// scaffolding from `history` on completion by matching this.
+/// Prefix of the injected routing hint. Load-bearing: the turn strips any stale
+/// hint out of `history` by matching this.
 pub const ROUTE_HINT_PREFIX: &str = "<system-reminder>PRE-FLIGHT ROUTING — ";
 
 /// Run the pre-flight.
 ///
 /// Cost contract: for a message that [`triage`] passes, this returns
-/// [`Preflight::Proceed`] having performed no I/O whatsoever.
+/// `(Preflight::Proceed, None)` having performed no I/O whatsoever.
 ///
-/// `asked_before` is the set of intent tags already asked about this session —
-/// the same slot is never asked twice. When it has been asked, the turn
-/// proceeds with the routing hint rather than repeating the question.
+/// `history` is the session's conversation, and carries BOTH pieces of session
+/// state this needs, with no extra plumbing and no separate ledger:
+/// - whether there is prior context (an anaphoric follow-up is not vague), and
+/// - which questions have already been asked — the questions are `'static`
+///   strings, so a previous ask is an exact match on an assistant message.
+///
+/// It is deliberately not the scratchpad: `service.rs` builds a fresh
+/// `Scratchpad` per turn and `restore_history_and_transcript_from_messages`
+/// clears it on resume, so a scratchpad ledger would be silently inert on the
+/// HTTP surface and lost on every `/resume`. `history` survives both.
 ///
 /// `can_ask` is false on unattended turns (subagents, research task steps).
 /// There is no human on those paths, so a question would become a dead tool
 /// result; they get the routing hint instead, which still carries the honesty.
+///
+/// The returned usage is the classifier's, for the caller to bill. `None` means
+/// no call was made (or the backend reported no usage).
 pub async fn preflight(
     llm: &LlmClient,
     config: &AgentConfig,
     user_message: &str,
-    asked_before: &[String],
+    history: &[ChatMessage],
     can_ask: bool,
-) -> Preflight {
+) -> (Preflight, Option<UsageInfo>) {
     if !enabled() {
-        return Preflight::Proceed;
+        return (Preflight::Proceed, None);
     }
-    if triage(user_message) == Triage::Proceed {
-        return Preflight::Proceed;
+    if triage(user_message, has_prior_context(history)) == Triage::Proceed {
+        return (Preflight::Proceed, None);
     }
-    let Some(intent) = classify(llm, &classifier_model(config), user_message).await else {
-        return Preflight::Proceed;
+    let (intent, usage) = classify(llm, &classifier_model(config), user_message).await;
+    let Some(intent) = intent else {
+        return (Preflight::Proceed, usage);
     };
-    decide(intent, user_message, asked_before, can_ask)
+    (
+        decide(intent, user_message, &asked_before(history), can_ask),
+        usage,
+    )
+}
+
+/// Has the assistant already spoken in this session? Only prior turns can have
+/// put an assistant message in `history`; the current user message is pushed
+/// before the pre-flight runs, and it is a user message.
+fn has_prior_context(history: &[ChatMessage]) -> bool {
+    history.iter().any(|m| m.role == "assistant")
+}
+
+/// Intents already asked about in this session, recovered from the questions
+/// themselves. Exact equality against `'static` question text — no marker to
+/// leak into the user's transcript, nothing extra to persist.
+fn asked_before(history: &[ChatMessage]) -> Vec<Intent> {
+    Intent::ALL
+        .into_iter()
+        .filter(|intent| {
+            let question = intent.question();
+            !question.is_empty()
+                && history
+                    .iter()
+                    .any(|m| m.role == "assistant" && m.content.as_deref() == Some(question))
+        })
+        .collect()
 }
 
 /// The deterministic half of the decision, split out so it is testable without
@@ -550,7 +614,7 @@ pub async fn preflight(
 pub fn decide(
     intent: Intent,
     user_message: &str,
-    asked_before: &[String],
+    asked_before: &[Intent],
     can_ask: bool,
 ) -> Preflight {
     if intent == Intent::Other {
@@ -564,13 +628,13 @@ pub fn decide(
     };
     // Already asked this session, or nobody there to answer → route, never
     // re-ask. The hint carries the same honesty the question would have.
-    if !can_ask || asked_before.iter().any(|k| k == intent.tag()) {
+    if !can_ask || asked_before.contains(&intent) {
         return hint();
     }
     // Unserved: say so once, plainly, with what PRISM can do instead.
-    // Served but with no concrete subject: one consolidated question.
-    // Served with a subject: proceed — prefer a stated assumption over asking.
-    if !intent.is_served() || !has_concrete_subject(user_message) {
+    // Served but naming nothing: one consolidated question.
+    // Served and naming something: proceed — prefer a stated assumption.
+    if !intent.is_served() || names_nothing(&tokenize(&user_message.to_lowercase())) {
         return Preflight::Ask {
             question: intent.question().to_string(),
             key: intent.tag(),
@@ -636,7 +700,11 @@ mod tests {
             "thanks, that's what I needed",
             "yes, go ahead",
         ] {
-            assert_eq!(triage(q), Triage::Proceed, "expert query escalated: {q}");
+            assert_eq!(
+                triage(q, false),
+                Triage::Proceed,
+                "expert query escalated: {q}"
+            );
         }
     }
 
@@ -654,7 +722,7 @@ mod tests {
         });
         let config = AgentConfig::default();
         let started = std::time::Instant::now();
-        let verdict = preflight(
+        let (verdict, usage) = preflight(
             &llm,
             &config,
             "What is the yield strength of Inconel 718 at 650 C?",
@@ -664,6 +732,7 @@ mod tests {
         .await;
         let elapsed = started.elapsed();
         assert_eq!(verdict, Preflight::Proceed);
+        assert!(usage.is_none(), "pass-through must not bill anything");
         assert!(
             elapsed < std::time::Duration::from_millis(50),
             "pass-through must not do I/O; took {elapsed:?}"
@@ -679,7 +748,7 @@ mod tests {
                  solution and double-age heat treatment?";
         let started = std::time::Instant::now();
         for _ in 0..1000 {
-            std::hint::black_box(triage(std::hint::black_box(q)));
+            std::hint::black_box(triage(std::hint::black_box(q), false));
         }
         let elapsed = started.elapsed();
         eprintln!("triage: {:?} per expert query", elapsed / 1000);
@@ -705,7 +774,7 @@ mod tests {
             // A concrete subject does NOT rescue a supplier question.
             "Find companies in Poland that can machine Inconel 718 to 0.02 mm",
         ] {
-            assert_eq!(triage(q), Triage::Classify, "not escalated: {q}");
+            assert_eq!(triage(q, false), Triage::Classify, "not escalated: {q}");
         }
     }
 
@@ -718,7 +787,7 @@ mod tests {
             "make it stronger",
             "help me make this better",
         ] {
-            assert_eq!(triage(q), Triage::Classify, "not escalated: {q}");
+            assert_eq!(triage(q, false), Triage::Classify, "not escalated: {q}");
         }
     }
 
@@ -731,7 +800,7 @@ mod tests {
             "optimize this for 316L",
             "help me fix crates/agent/src/reprompt.rs",
         ] {
-            assert_eq!(triage(q), Triage::Proceed, "over-escalated: {q}");
+            assert_eq!(triage(q, false), Triage::Proceed, "over-escalated: {q}");
         }
     }
 
@@ -817,7 +886,7 @@ mod tests {
     #[test]
     fn a_misfiring_keyword_is_corrected_by_the_classifier() {
         let q = "which companies have published on additive manufacturing of Inconel 718";
-        assert_eq!(triage(q), Triage::Classify);
+        assert_eq!(triage(q, false), Triage::Classify);
         assert!(matches!(
             decide(Intent::Literature, q, &[], true),
             Preflight::Route { .. }
@@ -827,11 +896,20 @@ mod tests {
     #[test]
     fn the_same_slot_is_never_asked_twice() {
         let q = "find companies in Poland that can do this machining";
-        let Preflight::Ask { key, .. } = decide(Intent::SupplierDiscovery, q, &[], true) else {
-            panic!("first ask expected");
-        };
+        assert!(
+            matches!(
+                decide(Intent::SupplierDiscovery, q, &[], true),
+                Preflight::Ask { .. }
+            ),
+            "first ask expected"
+        );
         // Second time, with the ledger carrying the key: no repeat question.
-        let second = decide(Intent::SupplierDiscovery, q, &[key.to_string()], true);
+        let second = decide(
+            Intent::SupplierDiscovery,
+            q,
+            &[Intent::SupplierDiscovery],
+            true,
+        );
         assert!(
             matches!(second, Preflight::Route { .. }),
             "asked the same slot twice: {second:?}"
@@ -909,19 +987,127 @@ mod tests {
         }
     }
 
+    /// The heuristic that decides "this message names nothing" must depend on
+    /// CONTENT, not on the user's shift key. The two rows below are the exact
+    /// regressions an adversarial review found in the previous capitalisation
+    /// rule: a lowercase alloy name was treated as nameless (and interrogated),
+    /// and an ALL-CAPS possessive was treated as a proper noun (and let
+    /// through).
     #[test]
-    fn concrete_subject_detection() {
-        for yes in [
+    fn naming_detection_is_independent_of_capitalisation() {
+        for names_something in [
             "Inconel 718",
+            "make hastelloy better",
+            "MAKE HASTELLOY BETTER",
             "at 650 C",
-            "crates/agent/src/lib.rs",
-            "the alloy Hastelloy X",
-            "make \"that thing\" better",
+            "improve the sintering schedule",
+            "can you help fix this bug",
         ] {
-            assert!(has_concrete_subject(yes), "should be concrete: {yes}");
+            assert!(
+                !names_nothing(&tokenize(&names_something.to_lowercase())),
+                "should be treated as naming something: {names_something}"
+            );
         }
-        for no in ["make my alloy better", "improve this", "help us with it"] {
-            assert!(!has_concrete_subject(no), "should be vague: {no}");
+        for names_nothing_at_all in [
+            "make my alloy better",
+            "MAKE MY ALLOY BETTER",
+            "improve this",
+            "can you improve it",
+            "make the design better",
+        ] {
+            assert!(
+                names_nothing(&tokenize(&names_nothing_at_all.to_lowercase())),
+                "should be treated as naming nothing: {names_nothing_at_all}"
+            );
         }
+    }
+
+    /// Ordinary materials vocabulary that happens to overlap supplier words
+    /// must not tax an expert with a classifier call. Every one of these was
+    /// escalated by the first version of the marker list.
+    #[test]
+    fn metallurgy_vocabulary_is_not_a_supplier_marker() {
+        for q in [
+            "What foundry defects are typical in A356 T6 sand-cast wheels?",
+            "How does Alloy 625 corrosion resistance compare to its main competitor, C276?",
+            "Effect of powder sourcing route (gas- vs plasma-atomised) on porosity in IN718",
+            "Check the manufacturer datasheet for AlSi10Mg mechanical properties",
+            "Can you help fix this bug?",
+        ] {
+            assert_eq!(triage(q, false), Triage::Proceed, "over-escalated: {q}");
+        }
+    }
+
+    /// A follow-up is anaphoric: "now make it stronger" names nothing on its
+    /// own, but after a turn about Inconel 718 the subject is in the history
+    /// and re-asking would be exactly the interrogation this must avoid.
+    #[test]
+    fn an_anaphoric_follow_up_is_not_treated_as_vague() {
+        for q in [
+            "Now make it stronger",
+            "make it better",
+            "ok, optimise it for cost instead",
+        ] {
+            assert_eq!(
+                triage(q, true),
+                Triage::Proceed,
+                "follow-up interrogated: {q}"
+            );
+        }
+        // The same words as an OPENING message still escalate: with no history
+        // behind them they genuinely name nothing.
+        assert_eq!(triage("Now make it stronger", false), Triage::Classify);
+        assert_eq!(triage("make it better", false), Triage::Classify);
+        // A misroute is a misroute whenever it arrives — context never excuses it.
+        assert_eq!(
+            triage("which companies in Poland can machine it", true),
+            Triage::Classify
+        );
+    }
+
+    /// The never-ask-twice ledger and the prior-context flag both come out of
+    /// `history`, which is what resume restores on every transport.
+    #[test]
+    fn history_carries_the_ledger_and_the_context_flag() {
+        let assistant = |text: &str| ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(text.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let user = ChatMessage {
+            role: "user".to_string(),
+            content: Some("find companies in Poland".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+
+        assert!(!has_prior_context(std::slice::from_ref(&user)));
+        assert!(asked_before(std::slice::from_ref(&user)).is_empty());
+
+        let after_ask = vec![user, assistant(Intent::SupplierDiscovery.question())];
+        assert!(has_prior_context(&after_ask));
+        assert_eq!(asked_before(&after_ask), vec![Intent::SupplierDiscovery]);
+
+        // An ordinary answer is not a ledger entry.
+        let ordinary = vec![assistant("Inconel 718 yields about 1030 MPa at 650 C.")];
+        assert!(has_prior_context(&ordinary));
+        assert!(asked_before(&ordinary).is_empty());
+    }
+
+    /// An ambiguous classifier reply must NOT be resolved by a tie-break — a
+    /// plausible wrong intent is the failure this module exists to prevent.
+    #[test]
+    fn an_ambiguous_classifier_reply_proceeds_rather_than_guesses() {
+        assert_eq!(
+            parse_intent("this isn't literature, it's supplier discovery"),
+            None
+        );
+        assert_eq!(parse_intent("materials_data or process_design"), None);
+        // One tag mentioned in prose still resolves.
+        assert_eq!(
+            parse_intent("The tag is: competitive."),
+            Some(Intent::CompetitiveLandscape)
+        );
     }
 }

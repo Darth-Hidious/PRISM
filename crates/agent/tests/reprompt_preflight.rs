@@ -332,3 +332,82 @@ async fn the_same_slot_is_not_asked_twice_in_a_session() {
         });
     assert!(carried, "routing hint must carry the honesty into the turn");
 }
+
+/// The ledger must survive what the HTTP chat surface actually does. That
+/// transport (`service.rs`) builds a FRESH `Scratchpad` on every turn, and
+/// `restore_history_and_transcript_from_messages` clears it on `/resume` — so a
+/// scratchpad-based ledger would be silently inert there and the same question
+/// would be asked forever. Resetting the scratchpad between turns here
+/// reproduces that exactly; the ledger lives in `history`, which both paths
+/// restore, so it still holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ledger_survives_a_scratchpad_reset() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let (base_url, _log) = start_stub_llm("supplier").await;
+
+    let mut session = Session::new(project.path(), &python, base_url).await;
+    let first = session.turn("find companies in Poland").await;
+    assert!(first.contains("cannot answer it"), "first turn asks");
+
+    // What service.rs does on every single turn.
+    session.scratchpad = prism_agent::scratchpad::Scratchpad::new();
+
+    let second = session.turn("I need suppliers in Poland").await;
+    assert_eq!(
+        second, "AGENT_ANSWER",
+        "re-asked after a scratchpad reset — the ledger is not session state: {second}"
+    );
+}
+
+/// The routing hint is turn-scoped scaffolding. It must never survive into a
+/// later turn's request, or every subsequent turn is misrouted by a stale
+/// classification. Stripping happens at the START of each turn precisely so no
+/// exit path (error, budget exhaustion, max iterations) can leak it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_routing_hint_does_not_leak_into_the_next_turn() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    // `literature` is served, so a routing hint is injected rather than a question.
+    let (base_url, log) = start_stub_llm("literature").await;
+
+    let mut session = Session::new(project.path(), &python, base_url).await;
+    session
+        .turn("which companies have published on Inconel 718 fatigue")
+        .await;
+    let after_first = log.lock().expect("log").len();
+
+    // A clean expert query: no marker, so no classifier call and no new hint.
+    session
+        .turn("What is the yield strength of Inconel 718 at 650 C?")
+        .await;
+
+    let requests = log.lock().expect("log").clone();
+    let second_turn = &requests[after_first..];
+    assert_eq!(
+        second_turn.len(),
+        1,
+        "the follow-up expert query must cost exactly one request"
+    );
+    // Match the injected hint EXACTLY. The system prompt also mentions
+    // "PRE-FLIGHT ROUTING" (it tells the model how to honour one), so a loose
+    // substring search here would report a leak on every turn.
+    let leaked = second_turn[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("<system-reminder>PRE-FLIGHT ROUTING"))
+        });
+    assert!(!leaked, "stale routing hint leaked into the next turn");
+}

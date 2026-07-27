@@ -57,20 +57,6 @@ const CAPABILITY_GAP_RETRIEVE: usize = 5;
 const CAPABILITY_GAP_NOTE: &str =
     "You said you lacked a capability. These matching tools are now available to call: ";
 
-/// Intent tags the pre-flight reprompter has already asked about in this
-/// session, read back out of the scratchpad. The scratchpad outlives the turn
-/// on both the TUI (`ServerRuntime::scratchpad`) and service paths, so it is
-/// the session ledger that enforces "never ask twice for the same thing" —
-/// with no new state threaded through the signature.
-fn asked_reprompt_keys(scratchpad: &Scratchpad) -> Vec<String> {
-    scratchpad
-        .entries()
-        .iter()
-        .filter(|e| e.step_type == crate::reprompt::LEDGER_STEP)
-        .map(|e| e.summary.clone())
-        .collect()
-}
-
 // ── Large-result handling ─────────────────────────────────────────
 
 fn uuid_hex8() -> String {
@@ -805,26 +791,56 @@ pub async fn run_turn(
     });
     transcript.append(TranscriptEntry::new("user", user_message));
 
+    let mut total_usage = UsageInfo::default();
+
     // ── 1b. Pre-flight reprompt ───────────────────────────────────
     // Deterministic triage FIRST (pure function, no I/O): a well-formed expert
     // query returns Proceed here having spent nothing — no classifier call, no
     // added latency, no added tokens. Only a message carrying positive evidence
-    // of misrouting or a bare vague directive reaches the one cheap LLM call.
-    // See `reprompt`.
+    // of misrouting, or an opening directive that names nothing, reaches the one
+    // cheap LLM call. See `reprompt`.
+    //
+    // A stale routing hint is stripped BEFORE anything else: the strip has to be
+    // unconditional and at the START of the turn, because `run_turn` can also
+    // leave via `?`, budget exhaustion, or the max-iterations arm, and a hint
+    // that survived one of those would silently misroute every later turn.
+    history.retain(|m| {
+        !m.content
+            .as_deref()
+            .is_some_and(|c| c.starts_with(crate::reprompt::ROUTE_HINT_PREFIX))
+    });
     // Only an attended turn may ask. A subagent or a research task step has no
     // human on the other end, so its question would land as a dead tool result
     // — those get the routing hint, which carries the same honesty.
     let can_ask = task.is_none() && config.subagent_depth == 0;
-    let asked_before = asked_reprompt_keys(scratchpad);
-    let mut routed_by_preflight = false;
-    match crate::reprompt::preflight(llm, config, user_message, &asked_before, can_ask).await {
+    // An exhausted budget must not pay for a classifier call either.
+    let preflight = if transcript.budget_exhausted() {
+        (crate::reprompt::Preflight::Proceed, None)
+    } else {
+        crate::reprompt::preflight(llm, config, user_message, history, can_ask).await
+    };
+    // The classifier is a real billed call. Fold it into the turn's usage and
+    // the cost ledger like any other — an LLM call nobody accounts for is how a
+    // bill becomes a surprise.
+    if let Some(usage) = preflight.1 {
+        total_usage += UsageInfo {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            ..Default::default()
+        };
+        transcript.record_cost(
+            "reprompt_classifier",
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        );
+    }
+    match preflight.0 {
         crate::reprompt::Preflight::Proceed => {}
         crate::reprompt::Preflight::Route { hint } => {
-            // Intent resolved but servable — do not interrogate. Hand the model
+            // Intent resolved and servable — do not interrogate. Hand the model
             // the capability that serves it (and, for an intent PRISM cannot
             // serve, the plain statement that it cannot) so the turn is routed
-            // rather than guessed. Stripped again at finalization.
-            routed_by_preflight = true;
+            // rather than guessed.
             history.push(ChatMessage {
                 role: "system".to_string(),
                 content: Some(hint),
@@ -835,15 +851,9 @@ pub async fn run_turn(
         crate::reprompt::Preflight::Ask { question, key } => {
             // ONE consolidated question, and the turn ends. No agent loop runs,
             // so this path is cheaper than the confidently-irrelevant answer it
-            // replaces. The key goes in the scratchpad ledger so the same slot
-            // is never asked twice in this session.
+            // replaces. The question itself is the never-ask-twice ledger: it
+            // lands in `history` verbatim, which is what resume restores.
             tracing::info!(intent = %key, "pre-flight reprompt: asked instead of answering");
-            scratchpad.log(
-                crate::reprompt::LEDGER_STEP,
-                None,
-                key,
-                Some(serde_json::json!({ "question": question })),
-            );
             emit(AgentEvent::TextDelta {
                 text: question.clone(),
             });
@@ -855,18 +865,18 @@ pub async fn run_turn(
                 tool_call_id: None,
             });
             transcript.append(TranscriptEntry::new("assistant", question.as_str()));
+            let estimated_cost = estimate_cost(&total_usage, &get_model_config(&config.model));
             emit(AgentEvent::TurnComplete {
                 text: Some(question),
                 has_more: false,
                 usage: None,
-                total_usage: None,
-                estimated_cost: None,
+                total_usage: Some(total_usage),
+                estimated_cost: Some(estimated_cost),
             });
             return Ok(());
         }
     }
 
-    let mut total_usage = UsageInfo::default();
     let mut result_store: HashMap<String, String> = HashMap::new();
     // One line per executed tool step — feeds the deterministic TRAJECTORY
     // block injected into every iteration's context.
@@ -1284,13 +1294,9 @@ pub async fn run_turn(
                             .is_some_and(|c| c.starts_with(CAPABILITY_GAP_NOTE))
                     });
                 }
-                if routed_by_preflight {
-                    history.retain(|m| {
-                        !m.content
-                            .as_deref()
-                            .is_some_and(|c| c.starts_with(crate::reprompt::ROUTE_HINT_PREFIX))
-                    });
-                }
+                // The pre-flight routing hint is stripped at the START of every
+                // turn instead (1b) — unconditionally, so no exit path can leak
+                // it. Nothing to do here.
 
                 // Auto-compact if needed
                 if transcript.should_compact()
@@ -1645,7 +1651,8 @@ pub async fn run_turn(
             if check_doom_loop(&recent_sigs, &sig) {
                 let abort_msg = format!(
                     "DOOM LOOP DETECTED: {tool_name} called {} times with identical arguments. \
-                     Try a different approach or ask the user for help.",
+                     Try a materially different approach, or stop and report plainly what you \
+                     could not do and why.",
                     DOOM_LOOP_WINDOW
                 );
                 emit(AgentEvent::ToolCallResult {
