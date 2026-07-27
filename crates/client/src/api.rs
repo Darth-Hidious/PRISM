@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use tracing::debug;
 
+use crate::platform_error::PlatformResponseExt;
+
 /// Response type for the current user endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
@@ -125,8 +127,8 @@ impl PlatformClient {
             .send()
             .await
             .with_context(|| format!("GET {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url} returned error status"))?;
+            .platform_error_for_status()
+            .await?;
 
         resp.json::<T>()
             .await
@@ -147,8 +149,8 @@ impl PlatformClient {
             .send()
             .await
             .with_context(|| format!("POST {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("POST {url} returned error status"))?;
+            .platform_error_for_status()
+            .await?;
 
         resp.json::<T>()
             .await
@@ -167,8 +169,8 @@ impl PlatformClient {
             .send()
             .await
             .with_context(|| format!("DELETE {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("DELETE {url} returned error status"))?;
+            .platform_error_for_status()
+            .await?;
 
         Ok(())
     }
@@ -203,8 +205,8 @@ impl PlatformClient {
             .send()
             .await
             .with_context(|| format!("GET {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url} returned error status"))?;
+            .platform_error_for_status()
+            .await?;
 
         resp.json::<Vec<ProjectInfo>>()
             .await

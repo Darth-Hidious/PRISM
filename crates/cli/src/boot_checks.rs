@@ -10,9 +10,27 @@
 
 use std::time::Duration;
 
+use prism_client::PlatformError;
 use prism_runtime::{PlatformEndpoints, StoredCredentials};
 
 use crate::boot;
+
+/// The platform's own `error.code` for a rejected response, for the one-line
+/// boot banner. Falls back to the HTTP reason phrase — never to a guess about
+/// *why* the credential was rejected.
+async fn reason_code(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let url = resp.url().to_string();
+    let body = resp.text().await.unwrap_or_default();
+    PlatformError::parse(status, &url, &body)
+        .code
+        .unwrap_or_else(|| {
+            status
+                .canonical_reason()
+                .unwrap_or("rejected")
+                .to_ascii_lowercase()
+        })
+}
 
 /// Run the live platform-connectivity checks.
 ///
@@ -72,12 +90,16 @@ pub async fn run_boot_checks(
                     .unwrap_or("authenticated");
                 (true, name.to_string())
             }
+            // The platform names the reason (`token_expired`, `token_invalid`,
+            // …). Show its word, not our guess — the boot line is one line, so
+            // the code is the most information that fits.
             Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                (false, "token rejected — run prism login".into())
+                (false, format!("{} — run prism login", reason_code(r).await))
             }
-            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => {
-                (false, "token lacks user scope (agent key?)".into())
-            }
+            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => (
+                false,
+                format!("{} — credential not permitted here", reason_code(r).await),
+            ),
             Ok(r) => (
                 false,
                 format!("platform error (HTTP {})", r.status().as_u16()),

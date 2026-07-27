@@ -22,8 +22,9 @@
 //! There is NO `/compute/jobs/*` surface and NO separate `/results` endpoint —
 //! the previous backend hit both, 404-ing every dispatch.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use prism_client::PlatformResponseExt;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -140,13 +141,10 @@ impl ComputeBackend for Marc27Backend {
             .json(&body)
             .send()
             .await
-            .context("failed to submit job to MARC27 platform")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("MARC27 submit failed ({status}): {text}");
-        }
+            .context("failed to submit job to MARC27 platform")?
+            .platform_error_for_status()
+            .await
+            .context("MARC27 submit failed")?;
 
         let result: SubmitResponse = resp.json().await.context("bad submit response")?;
         tracing::info!(job_id = %result.job_id, "job submitted to MARC27 platform");
@@ -159,11 +157,10 @@ impl ComputeBackend for Marc27Backend {
             .apply(self.client.get(self.url(&format!("/{job_id}"))))
             .send()
             .await
-            .context("failed to query job status")?;
-
-        if !resp.status().is_success() {
-            bail!("MARC27 status query failed: {}", resp.status());
-        }
+            .context("failed to query job status")?
+            .platform_error_for_status()
+            .await
+            .context("MARC27 status query failed")?;
 
         let job: JobResponse = resp.json().await?;
         Ok(map_status(job))
@@ -177,27 +174,24 @@ impl ComputeBackend for Marc27Backend {
             .apply(self.client.get(self.url(&format!("/{job_id}"))))
             .send()
             .await
-            .context("failed to fetch job results")?;
-
-        if !resp.status().is_success() {
-            bail!("MARC27 results query failed: {}", resp.status());
-        }
+            .context("failed to fetch job results")?
+            .platform_error_for_status()
+            .await
+            .context("MARC27 results query failed")?;
 
         let job: JobResponse = resp.json().await?;
         Ok(job.output.unwrap_or(serde_json::Value::Null))
     }
 
     async fn cancel(&self, job_id: Uuid) -> Result<()> {
-        let resp = self
-            .auth
+        self.auth
             .apply(self.client.post(self.url(&format!("/{job_id}/cancel"))))
             .send()
             .await
-            .context("failed to cancel job")?;
-
-        if !resp.status().is_success() {
-            bail!("MARC27 cancel failed: {}", resp.status());
-        }
+            .context("failed to cancel job")?
+            .platform_error_for_status()
+            .await
+            .context("MARC27 cancel failed")?;
 
         tracing::info!(%job_id, "job cancelled on MARC27 platform");
         Ok(())

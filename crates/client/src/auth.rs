@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::debug;
 
+use crate::platform_error::PlatformResponseExt;
+
 /// Response from the device-code initiation endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceCodeResponse {
@@ -85,8 +87,9 @@ impl DeviceFlowAuth {
             .send()
             .await
             .context("failed to start device flow")?
-            .error_for_status()
-            .context("device flow start returned error status")?;
+            .platform_error_for_status()
+            .await
+            .context("device flow start failed")?;
 
         resp.json::<DeviceCodeResponse>()
             .await
@@ -168,8 +171,9 @@ impl DeviceFlowAuth {
             .send()
             .await
             .context("failed to refresh token")?
-            .error_for_status()
-            .context("token refresh returned error status")?;
+            .platform_error_for_status()
+            .await
+            .context("token refresh failed")?;
 
         resp.json::<TokenResponse>()
             .await

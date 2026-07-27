@@ -137,7 +137,11 @@ impl fmt::Display for PlatformError {
         }
 
         match &self.code {
-            Some(c) => write!(f, "\n  reported by the platform as: {c} (HTTP {})", self.status.as_u16())?,
+            Some(c) => write!(
+                f,
+                "\n  reported by the platform as: {c} (HTTP {})",
+                self.status.as_u16()
+            )?,
             None if self.message.is_some() => {
                 write!(f, "\n  HTTP {}", self.status.as_u16())?;
             }
@@ -152,7 +156,10 @@ impl fmt::Display for PlatformError {
 
         if let Some(body) = &self.body_excerpt {
             if body.is_empty() {
-                write!(f, "\n  the server sent no structured error and an empty body")?;
+                write!(
+                    f,
+                    "\n  the server sent no structured error and an empty body"
+                )?;
             } else {
                 write!(f, "\n  the server sent no structured error; body: {body}")?;
             }
@@ -171,15 +178,21 @@ fn extract_code_message(json: &Value) -> (Option<String>, Option<String>) {
     match json.get("error") {
         Some(Value::Object(err)) => (
             err.get("code").and_then(Value::as_str).map(str::to_string),
-            err.get("message").and_then(Value::as_str).map(str::to_string),
+            err.get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         ),
         Some(Value::String(code)) => (
             Some(code.clone()),
-            json.get("message").and_then(Value::as_str).map(str::to_string),
+            json.get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         ),
         _ => (
             None,
-            json.get("message").and_then(Value::as_str).map(str::to_string),
+            json.get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         ),
     }
 }
@@ -390,7 +403,10 @@ mod tests {
             r#"{"error":{"code":"unauthorized","message":"missing authorization header"}}"#,
         );
         assert!(rendered.contains("missing authorization header"));
-        assert!(rendered.contains("prism login"), "no action given: {rendered}");
+        assert!(
+            rendered.contains("prism login"),
+            "no action given: {rendered}"
+        );
     }
 
     #[test]
@@ -442,7 +458,10 @@ mod tests {
         let body = format!("line one\n\n{}", "x".repeat(1000));
         let e = PlatformError::parse(StatusCode::BAD_GATEWAY, BALANCE_URL, &body);
         let excerpt = e.body_excerpt.expect("excerpt missing");
-        assert!(excerpt.starts_with("line one x"), "not collapsed: {excerpt}");
+        assert!(
+            excerpt.starts_with("line one x"),
+            "not collapsed: {excerpt}"
+        );
         assert!(excerpt.chars().count() <= BODY_EXCERPT_LIMIT + 1);
         assert!(excerpt.ends_with('…'));
     }
@@ -454,5 +473,61 @@ mod tests {
             let s = StatusCode::from_u16(code).unwrap();
             assert!(!s.is_client_error() && !s.is_server_error());
         }
+    }
+
+    // ── over the wire ──────────────────────────────────────────────
+    //
+    // The unit tests above cover translation; these cover the trait doing
+    // the body read on a real HTTP response, which is where
+    // `.error_for_status()` used to throw the reason away.
+
+    #[tokio::test]
+    async fn wire_401_carries_the_servers_reason_through() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/billing/balance")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(LIVE_TOKEN_EXPIRED)
+            .create_async()
+            .await;
+
+        let err = reqwest::get(format!("{}/billing/balance", server.url()))
+            .await
+            .unwrap()
+            .platform_error_for_status()
+            .await
+            .expect_err("401 must be an error");
+
+        let rendered = format!("{err}");
+        assert!(rendered.contains("token expired"), "{rendered}");
+        assert!(rendered.contains("token_expired"), "{rendered}");
+        assert!(rendered.contains("prism login"), "{rendered}");
+        assert!(!rendered.contains("Not authorized"), "{rendered}");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn wire_success_leaves_the_body_readable() {
+        // The success path must not consume the response — every caller
+        // still does `.json()` after this.
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/billing/balance")
+            .with_status(200)
+            .with_body(r#"{"credits":1.5}"#)
+            .create_async()
+            .await;
+
+        let body = reqwest::get(format!("{}/billing/balance", server.url()))
+            .await
+            .unwrap()
+            .platform_error_for_status()
+            .await
+            .expect("200 must pass through")
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, r#"{"credits":1.5}"#);
     }
 }
