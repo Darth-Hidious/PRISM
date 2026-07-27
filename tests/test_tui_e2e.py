@@ -63,9 +63,15 @@ pytestmark = pytest.mark.skipif(
 # pthread_atfork child handler. From then on ANY fork() in this process
 # crashes in that handler — `pexpect.spawn` uses `pty.fork()`, so it dies.
 # posix_spawn is unaffected because it does not run atfork handlers.
-# The same defect breaks the `execute_bash` / `execute_python` tools on macOS
-# (see app/tools/bash.py and app/tools/code.py, both still on the fork path).
 # Reproduce: pytest tests/test_materials_discovery_flow.py tests/test_tui_e2e.py
+#
+# The same root cause used to break the `execute_bash` / `execute_python`
+# tools. That half is fixed: both now spawn through app/tools/spawn.py, which
+# never forks, and tests/test_fork_safety.py pins it. What remains red here is
+# only pexpect's own `pty.fork()`, which this file cannot avoid without
+# replacing its PTY layer (openpty + posix_spawn(setsid=True) + opening the
+# slave for a controlling terminal). That is a separate change to the test
+# harness, not to PRISM.
 #
 # Note also that the other seven tests here `return t.report()` instead of
 # asserting. pytest ignores a test's return value (PytestReturnNotNoneWarning),

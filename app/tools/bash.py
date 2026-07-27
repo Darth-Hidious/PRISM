@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 from uuid import uuid4
 
+from app.tools import spawn
 from app.tools.base import Tool, ToolRegistry
+from app.tools.spawn import signal_name
 
 
 _ALLOWED_BASE = Path.cwd().resolve()
@@ -162,6 +164,26 @@ def _read_tail(path: Path, max_bytes: int = _TASK_TAIL_BYTES) -> str:
     return text
 
 
+def _signal_death_error(exit_code: int) -> str:
+    """Message for a command killed by a signal.
+
+    A signal death truncates the command wherever it stood, so blank
+    stdout/stderr means the output was destroyed and not that there was none.
+    Saying so is the whole point: an unexplained `success: False` with two
+    empty strings is indistinguishable from a command that legitimately
+    printed nothing, and that ambiguity is what made this class of failure
+    invisible.
+    """
+    return (
+        f"The command was killed by {signal_name(exit_code)} "
+        f"(exit code {exit_code}) before it finished. Any output it had not "
+        f"already flushed is lost — empty stdout/stderr here means output was "
+        f"destroyed, not that the command produced none. Common causes: the "
+        f"command exhausted memory, crashed inside a native library, or was "
+        f"killed by something outside PRISM."
+    )
+
+
 def _terminate_process(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         return
@@ -210,6 +232,12 @@ def _serialize_bash_task(task: dict[str, Any], include_output: bool = False) -> 
     }
     if task.get("process") is not None:
         data["pid"] = task["process"].pid
+
+    # "stopped" and "timed_out" are also signal deaths, but ones we asked for.
+    # Only an unrequested one needs explaining.
+    exit_code = data["exit_code"]
+    if data["status"] == "failed" and exit_code is not None and exit_code < 0:
+        data["error"] = _signal_death_error(exit_code)
 
     if include_output:
         data["stdout_tail"] = _read_tail(stdout_path)
@@ -266,7 +294,7 @@ def _spawn_background_bash(command: str, description: str = "", timeout: int | N
     stdout_handle = stdout_path.open("w", encoding="utf-8")
     stderr_handle = stderr_path.open("w", encoding="utf-8")
     try:
-        process = subprocess.Popen(
+        process = spawn.popen(
             [shell, "-lc", command],
             stdout=stdout_handle,
             stderr=stderr_handle,
@@ -275,7 +303,7 @@ def _spawn_background_bash(command: str, description: str = "", timeout: int | N
             errors="replace",
             cwd=str(_ALLOWED_BASE),
             env=env,
-            preexec_fn=os.setsid if os.name != "nt" else None,
+            new_session=True,
         )
     finally:
         stdout_handle.close()
@@ -759,7 +787,7 @@ def _execute_bash(
     env = {**os.environ}
 
     try:
-        process = subprocess.Popen(
+        process = spawn.popen(
             [shell, "-lc", command],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -768,7 +796,7 @@ def _execute_bash(
             errors="replace",
             cwd=str(_ALLOWED_BASE),
             env=env,
-            preexec_fn=os.setsid if os.name != "nt" else None,
+            new_session=True,
         )
         try:
             stdout, stderr = process.communicate(timeout=timeout)
@@ -790,7 +818,7 @@ def _execute_bash(
         return {"success": False, "error": str(exc)}
 
     success, interpretation = _interpret_exit_code(command, process.returncode)
-    return {
+    result = {
         "success": success,
         "exit_code": process.returncode,
         "stdout": stdout,
@@ -799,6 +827,9 @@ def _execute_bash(
         "description": description,
         "cwd": str(_ALLOWED_BASE),
     }
+    if process.returncode < 0:
+        result["error"] = _signal_death_error(process.returncode)
+    return result
 
 
 def create_bash_tools(registry: ToolRegistry) -> None:
