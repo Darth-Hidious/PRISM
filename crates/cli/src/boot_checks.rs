@@ -47,13 +47,26 @@ pub async fn run_boot_checks(
     creds: Option<&StoredCredentials>,
     endpoints: &PlatformEndpoints,
 ) -> Vec<boot::BootCheck> {
+    run_boot_checks_with(creds, endpoints, platform_configured(creds)).await
+}
+
+/// The body of [`run_boot_checks`] with the configured/not-configured
+/// decision passed in rather than read from the process environment.
+///
+/// The seam exists so the tests can pin either branch without mutating
+/// `std::env`, which is process-global and races across parallel tests.
+async fn run_boot_checks_with(
+    creds: Option<&StoredCredentials>,
+    endpoints: &PlatformEndpoints,
+    configured: bool,
+) -> Vec<boot::BootCheck> {
     let mut checks = Vec::new();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_default();
 
-    if !platform_configured(creds) {
+    if !configured {
         // Stated once, neutrally, and never as a failure: nothing is
         // broken about running PRISM without an account.
         checks.push(boot::BootCheck {
@@ -132,10 +145,15 @@ pub async fn run_boot_checks(
             delay_ms: 20,
         });
     } else {
+        // We only reach here with a platform configured, so an empty
+        // session token means the credential came from the environment
+        // (the headless/agent path). Telling that user to "run prism
+        // login" was a lying check: they have a working credential and
+        // deliberately did not want a session.
         checks.push(boot::BootCheck {
             name: "Auth".into(),
-            result: "not logged in — run prism login".into(),
-            ok: false,
+            result: "API key from environment (no session)".into(),
+            ok: true,
             dots: 3,
             delay_ms: 20,
         });
@@ -370,21 +388,12 @@ mod tests {
     /// knowledge-graph line, nothing that implies a missing account.
     #[tokio::test]
     async fn unconfigured_boot_runs_local_checks_only() {
-        // The guard is released before the await on purpose: holding a
-        // std `MutexGuard` across an await point is a real deadlock
-        // hazard, and it buys nothing here — the only code in this test
-        // binary that WRITES these vars is this module, and every writer
-        // takes the same lock and clears up after itself.
-        {
-            let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            clear_platform_env();
-        }
         // A URL that would fail loudly (and slowly) if it were ever hit.
         let endpoints = PlatformEndpoints {
             api_base: "https://platform.invalid/api/v1".to_string(),
             node_ws: "wss://platform.invalid/api/v1/nodes/connect".to_string(),
         };
-        let checks = run_boot_checks(None, &endpoints).await;
+        let checks = run_boot_checks_with(None, &endpoints, false).await;
 
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["Platform", "Local Node", "Policy Engine"]);
@@ -398,5 +407,29 @@ mod tests {
             "the boot screen must not nag about signing in: {:?}",
             platform.result
         );
+    }
+
+    /// The headless path has a real credential and deliberately no
+    /// session — telling it to `prism login` is a lying check.
+    #[tokio::test]
+    async fn env_key_path_is_not_told_to_log_in() {
+        // Configured (the env key is present) but with no stored session
+        // — exactly the headless/agent shape.
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let checks = run_boot_checks_with(None, &endpoints, true).await;
+
+        let auth = checks
+            .iter()
+            .find(|c| c.name == "Auth")
+            .expect("a configured platform still reports Auth");
+        assert!(
+            !auth.result.contains("prism login"),
+            "env-key installs have no session to log in to: {:?}",
+            auth.result
+        );
+        assert!(auth.ok, "a working API key is not an auth failure");
     }
 }
