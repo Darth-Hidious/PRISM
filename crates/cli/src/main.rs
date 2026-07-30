@@ -3783,7 +3783,10 @@ async fn main() -> Result<()> {
                         })?;
                     let platform = PlatformClient::new(&endpoints.api_base).with_token(&token);
 
-                    println!("Publishing to MARC27 marketplace...");
+                    println!(
+                        "Publishing to {} marketplace...",
+                        crate::brand::brand().display_name
+                    );
                     let name = repo.unwrap_or_else(|| {
                         artifact_path
                             .file_stem()
@@ -3817,6 +3820,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 other => {
+                    // `marc27` here is the frozen CLI value token, not the
+                    // brand: it is what shipped scripts pass to `--to`.
                     eprintln!("Unknown target: {other}. Use 'huggingface' or 'marc27'.");
                     std::process::exit(1);
                 }
@@ -3915,7 +3920,10 @@ async fn main() -> Result<()> {
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
             {
                 eprintln!();
-                eprintln!("\x1b[33mYour MARC27 session has expired — re-authenticating…\x1b[0m");
+                eprintln!(
+                    "\x1b[33mYour {} session has expired — re-authenticating…\x1b[0m",
+                    crate::brand::brand().display_name
+                );
                 eprintln!();
                 if let Err(e) = perform_full_login(
                     &paths,
@@ -4007,7 +4015,10 @@ async fn main() -> Result<()> {
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
             {
                 eprintln!();
-                eprintln!("\x1b[33mYour MARC27 session has expired — re-authenticating…\x1b[0m");
+                eprintln!(
+                    "\x1b[33mYour {} session has expired — re-authenticating…\x1b[0m",
+                    crate::brand::brand().display_name
+                );
                 eprintln!();
                 if let Err(e) = perform_full_login(
                     &paths,
@@ -4064,7 +4075,7 @@ async fn main() -> Result<()> {
                         .await?;
                     let resp: serde_json::Value =
                         friendly_status(raw, "view billing balance")?.json().await?;
-                    println!("\nMARC27 Credits");
+                    println!("\n{} Credits", crate::brand::brand().display_name);
                     println!(
                         "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}"
                     );
@@ -4519,7 +4530,10 @@ async fn handle_federation_command(
                 println!("─────────────");
                 println!("  (no peers — platform enumeration coming in F1 chunk 3)");
                 println!();
-                println!("  Trust is transitive via the MARC27 platform root CA.");
+                println!(
+                    "  Trust is transitive via the {} platform root CA.",
+                    crate::brand::brand().display_name
+                );
                 println!("  Run `prism federation whoami` to see your own identity.");
                 println!("  See docs/prism_fabric_v1_spec.md for the full design.");
                 println!();
@@ -9283,7 +9297,10 @@ async fn run_device_login_with_opts(
         println!();
         println!("  Waiting here until you approve. Ctrl+C to abort.");
     } else {
-        println!("PRISM setup needs MARC27 platform login.");
+        println!(
+            "PRISM setup needs {} platform login.",
+            crate::brand::brand().display_name
+        );
         println!("Open: {}", start.verification_uri);
         println!("Code: {}", start.user_code);
         println!();
@@ -10256,7 +10273,10 @@ async fn handle_report(
         }
     }
 
-    println!("\nReport submitted. We'll follow up on GitHub and your MARC27 dashboard.");
+    println!(
+        "\nReport submitted. We'll follow up on GitHub and your {} dashboard.",
+        crate::brand::brand().display_name
+    );
     Ok(())
 }
 
