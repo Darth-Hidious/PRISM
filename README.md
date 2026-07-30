@@ -4,7 +4,6 @@
 
 <h1 align="center">PRISM</h1>
 <p align="center"><strong>AI-Native Autonomous Materials Discovery Platform</strong></p>
-<p align="center"><em>by Mirdyne</em></p>
 
 ---
 
@@ -45,7 +44,7 @@ cp target/release/prism ~/.local/bin/
 
 Run `prism` to launch a slash-command-driven AI agent with:
 - Slash-command palette — type `/` for commands like `/new`, `/info`, `/usage`, `/help`, `/model`, `/agent`, `/update`, `/exit`
-- Model picker via `/model` — bring your own provider key, or route hundreds of hosted models through Mirdyne
+- Model picker via `/model` — bring your own provider key (OpenAI, Anthropic, Google, OpenRouter, Groq, local Ollama/llama.cpp, …)
 - Inline tool cards showing materials-science tool execution results (CALPHAD, pyiron, OPTIMADE, ML predictions, federated knowledge graph)
 - Streaming AI responses with markdown rendering
 - Boot diagnostics (Platform, Auth, Knowledge Graph, LLM Models, Compute, Marketplace, Local Node, Policy Engine) on every launch — run `prism doctor` for the full report
@@ -55,7 +54,7 @@ Run `prism` to launch a slash-command-driven AI agent with:
 ### Setup & Auth
 ```
 prism setup              # First-time setup + login
-prism login              # Optional: sign in to Mirdyne for hosted services
+prism login              # Optional: sign in to a hosted service provider
 prism configure --show   # Show LLM config
 prism status             # Auth state, paths, endpoints
 ```
@@ -129,13 +128,13 @@ prism report "bug"       # File support ticket
 ```
 prism (single Rust binary)
   prism-cli      Command routing, auth, TUI
-  prism-llm      LLM client (any OpenAI-compatible provider + Mirdyne proxy)
+  prism-llm      LLM client (any OpenAI-compatible provider)
   prism-agent    TAOR agent loop, tool calling, OPA policy
   prism-node     Daemon, probe, E2EE key exchange
   prism-ingest   Schema detection, ontology extraction
   prism-server   Axum REST API + dashboard
   prism-mesh     mDNS + Kafka pub/sub + federation
-  prism-compute  Docker / SSH / K8s / SLURM / Mirdyne
+  prism-compute  Docker / SSH / K8s / SLURM
   prism-policy   OPA/Rego policy engine
   prism-workflows YAML workflow engine (8 step types)
 
@@ -190,6 +189,3 @@ Commercial licensing: team@marc27.com
 
 ---
 
-<p align="center">
-  <em>Mirdyne</em>
-</p>
