@@ -11,7 +11,7 @@ This project uses a dual-license model:
 2. Everything else — all Rust crates (crates/), the Ink frontend
    (frontend/), install scripts, CI/CD, and documentation — is
    licensed under the Mirdyne Source-Available License. See
-   LICENSE-MARC27.
+   LICENSE-MIRDYNE.
 
 The license boundary:
 

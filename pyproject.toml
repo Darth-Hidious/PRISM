@@ -8,8 +8,8 @@ version = "1.0.0"
 description = "AI-Native Autonomous Materials Discovery Platform"
 readme = "README.md"
 authors = [{ name = "MARC27", email = "team@marc27.com" }]
-license = "LicenseRef-MARC27-Dual"
-license-files = ["LICENSE", "LICENSE-MIT", "LICENSE-MARC27"]
+license = "LicenseRef-Mirdyne-Dual"
+license-files = ["LICENSE", "LICENSE-MIT", "LICENSE-MIRDYNE"]
 maintainers = [
     {name = "PRISM Development Team", email = "team@marc27.com"}
 ]

@@ -403,7 +403,7 @@ PRISM Campaign Agent:
 ## License
 
 PRISM is licensed under the **Mirdyne Source-Available License** v1.0.
-Select components are MIT-licensed. See `LICENSE-MARC27` and `LICENSE-MIT`.
+Select components are MIT-licensed. See `LICENSE-MIRDYNE` and `LICENSE-MIT`.
 
 ## Quick Start
 

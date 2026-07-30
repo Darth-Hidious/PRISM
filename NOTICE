@@ -8,17 +8,36 @@ licensed under the Apache License, Version 2.0:
     Copyright tailcallhq and contributors
     https://github.com/tailcallhq/forgecode
 
-The vendored crates under crates/forge_* are derived from ForgeCode and
-remain under the Apache License, Version 2.0. See LICENSE-APACHE-2.0 for the
-full license text.
+The following files in this distribution are derived from ForgeCode and remain
+under the Apache License, Version 2.0. See LICENSE-APACHE-2.0 for the full
+license text.
 
-PRISM-specific code (crates/agent, crates/cli, crates/client, crates/compute,
-crates/core, crates/ingest, crates/ipc, crates/llm, crates/mesh, crates/node,
-crates/orch, crates/policy, crates/proto, crates/python-bridge, crates/runtime,
-crates/server, crates/workflows) is licensed under the dual MIT / Mirdyne
-Source-Available license documented in LICENSE-MIT and LICENSE-MARC27.
+    forge.schema.json        — configuration schema
+    templates/forge-*.md     — agent prompt and partial templates
+    shell-plugin/**          — zsh shell integration
+    .forge/commands/**       — custom command definitions
+    AGENTS-forge.md          — upstream agent guidelines
 
-Modifications to ForgeCode in this distribution include:
-- Removal of PostHog telemetry from forge_tracker
-- Removal of forge_ci (CI helpers)
-- Workspace integration with PRISM
+Modifications to ForgeCode in this distribution:
+
+    - The vendored forge_* Rust crates that earlier releases carried have been
+      removed in their entirety, including forge_tracker (and its PostHog
+      telemetry) and forge_ci. No ForgeCode-derived Rust source remains.
+    - The retained templates, shell plugin, and configuration schema listed
+      above are carried substantially unmodified.
+
+All PRISM Rust crates are licensed under the Mirdyne Source-Available License
+documented in LICENSE-MIRDYNE:
+
+    crates/agent           crates/audit           crates/campaign
+    crates/cli             crates/client          crates/compute
+    crates/core            crates/embed           crates/ingest
+    crates/ipc             crates/llm             crates/mesh
+    crates/node            crates/orch            crates/policy
+    crates/proto           crates/provenance      crates/python-bridge
+    crates/runtime         crates/server          crates/tui
+    crates/workflows
+
+The Python components enumerated in LICENSE are licensed under the MIT License
+documented in LICENSE-MIT. Where this notice and LICENSE differ, LICENSE
+governs.

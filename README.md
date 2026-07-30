@@ -184,7 +184,7 @@ discovery = ["mdns", "platform"]
 | Component | License |
 |-----------|---------|
 | Python tools, tool server, config, plugins | [MIT](LICENSE-MIT) |
-| Rust crates, TUI, agent, workflows | [Mirdyne Source-Available](LICENSE-MARC27) |
+| Rust crates, TUI, agent, workflows | [Mirdyne Source-Available](LICENSE-MIRDYNE) |
 
 Commercial licensing: team@marc27.com
 

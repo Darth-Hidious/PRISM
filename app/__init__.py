@@ -2,4 +2,4 @@
 PRISM Platform Application Package
 """
 __version__ = "2.5.0"
-__license__ = "LicenseRef-MARC27-Dual (MIT core + MARC27 Source-Available AI)"
+__license__ = "LicenseRef-Mirdyne-Dual (MIT core + Mirdyne Source-Available AI)"
