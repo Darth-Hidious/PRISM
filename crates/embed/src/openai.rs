@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! OpenAI-compatible HTTP backend — the open replacement port.
 //!
 //! Anything that speaks `POST {base}/v1/embeddings` with

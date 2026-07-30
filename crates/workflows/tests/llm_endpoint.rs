@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Endpoint resolution for workflow `llm_*` (`action: llm`) steps.
 //!
 //! An `llm` step resolves its endpoint + model with the precedence:

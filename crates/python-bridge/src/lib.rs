@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Python worker launch and supervision primitives.
 //!
 //! Makes the Python TAOR runtime an explicitly supervised child process rather

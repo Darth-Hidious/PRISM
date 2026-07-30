@@ -1,7 +1,7 @@
-MARC27 Source-Available License
+Mirdyne Source-Available License
 Version 1.0, February 2026
 
-Copyright (c) 2025-2026 MARC27
+Copyright (c) 2025-2026 Mirdyne
 All rights reserved.
 
 1. DEFINITIONS
@@ -14,7 +14,7 @@ and evaluation that does not directly generate revenue.
 
 2. GRANT OF RIGHTS
 
-Subject to the terms of this license, MARC27 grants you a
+Subject to the terms of this license, Mirdyne grants you a
 non-exclusive, non-transferable, revocable license to:
 
   a) View and inspect the Software for evaluation, security audit,
@@ -24,7 +24,7 @@ non-exclusive, non-transferable, revocable license to:
 
 3. RESTRICTIONS
 
-You may NOT, without prior written agreement from MARC27:
+You may NOT, without prior written agreement from Mirdyne:
 
   a) Use the Software, or any substantial portion thereof, in a
      commercial product or service.
@@ -38,7 +38,7 @@ You may NOT, without prior written agreement from MARC27:
 4. CONTRIBUTIONS
 
 Contributions submitted to the project (e.g., via pull request) are
-licensed back to MARC27 under the same terms, with an
+licensed back to Mirdyne under the same terms, with an
 additional perpetual, irrevocable grant to use, modify, and
 sublicense the contribution under any license.
 
@@ -47,13 +47,13 @@ sublicense the contribution under any license.
 For commercial use, redistribution, or modification rights beyond
 what this license permits, contact:
 
-  MARC27
+  Mirdyne
   Email: team@marc27.com
 
 6. NO WARRANTY
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED. IN NO EVENT SHALL MARC27 BE LIABLE FOR ANY
+OR IMPLIED. IN NO EVENT SHALL Mirdyne BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
 
 7. TERMINATION

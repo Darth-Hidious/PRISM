@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Native local backend — BGE-small-en-v1.5 on the bundled ONNX Runtime.
 //!
 //! No server, no API key, no network after the first model download.

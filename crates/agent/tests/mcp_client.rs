@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! MCP client end-to-end: PRISM's MCP client against a REAL stdio MCP server.
 //!
 //! The stub below is a genuine MCP server — newline-delimited JSON-RPC over

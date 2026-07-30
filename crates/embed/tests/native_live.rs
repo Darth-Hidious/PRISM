@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Live smoke test for the native ONNX backend.
 //!
 //! Ignored by default: the first run downloads ~90 MB of model weights into

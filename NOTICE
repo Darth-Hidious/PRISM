@@ -1,5 +1,5 @@
 PRISM
-Copyright 2026 MARC27
+Copyright 2026 Mirdyne
 
 This product includes software developed by Tailcall (https://tailcall.run)
 licensed under the Apache License, Version 2.0:
@@ -15,7 +15,7 @@ full license text.
 PRISM-specific code (crates/agent, crates/cli, crates/client, crates/compute,
 crates/core, crates/ingest, crates/ipc, crates/llm, crates/mesh, crates/node,
 crates/orch, crates/policy, crates/proto, crates/python-bridge, crates/runtime,
-crates/server, crates/workflows) is licensed under the dual MIT / MARC27
+crates/server, crates/workflows) is licensed under the dual MIT / Mirdyne
 Source-Available license documented in LICENSE-MIT and LICENSE-MARC27.
 
 Modifications to ForgeCode in this distribution include:

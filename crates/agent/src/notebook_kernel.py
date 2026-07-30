@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 """PRISM notebook kernel sidecar.
 
 A tiny, dependency-optional Python kernel that PRISM (Rust) owns as a

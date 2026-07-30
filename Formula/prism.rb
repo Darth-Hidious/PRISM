@@ -3,7 +3,7 @@ class Prism < Formula
   homepage "https://github.com/marc27/prism"
   url "https://github.com/marc27/prism/archive/refs/tags/v2.5.0.tar.gz"
   sha256 "PLACEHOLDER" # Updated on release
-  license "LicenseRef-MARC27-Dual"
+  license "LicenseRef-Mirdyne-Dual"
   head "https://github.com/marc27/prism.git", branch: "main"
 
   depends_on "rust" => :build

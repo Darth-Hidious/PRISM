@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! F6 — cross-site inference demo (PRISM Fabric v1 done bar).
 //!
 //! Wires every Fabric layer end-to-end in one process so a reader can

@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Conversational agent endpoints — the agent loop as an HTTP service.
 //!
 //! `POST /api/chat` runs the SAME agent loop the TUI backend runs (see

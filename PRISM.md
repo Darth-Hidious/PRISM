@@ -398,11 +398,11 @@ PRISM Campaign Agent:
 | VRAM (local Gemma 4 12B) | 7 GB (q4_0 K+V, flash attention) |
 | Hosted models (MARC27 proxy) | 644 |
 | OPTIMADE providers | 20+ (federated) |
-| License | MARC27 Source-Available + MIT (components) |
+| License | Mirdyne Source-Available + MIT (components) |
 
 ## License
 
-PRISM is licensed under the **MARC27 Source-Available License** v1.0.
+PRISM is licensed under the **Mirdyne Source-Available License** v1.0.
 Select components are MIT-licensed. See `LICENSE-MARC27` and `LICENSE-MIT`.
 
 ## Quick Start

@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Cross-org policy intersection — Fabric F2.
 //!
 //! When a workflow touches resources owned by multiple organizations, every

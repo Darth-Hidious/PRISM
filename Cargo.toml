@@ -6,8 +6,8 @@ resolver = "2"
 version = "1.0.0"
 rust-version = "1.92"
 edition = "2024"
-license = "LicenseRef-MARC27-Dual"
-authors = ["MARC27 <team@marc27.com>"]
+license = "LicenseRef-Mirdyne-Dual"
+authors = ["Mirdyne"]
 
 [profile.release]
 lto = true

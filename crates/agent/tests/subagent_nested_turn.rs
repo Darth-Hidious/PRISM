@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! spawn_subagent end-to-end: a REAL parent turn delegates to a REAL nested
 //! turn through the same stub OpenAI-compatible LLM and stub Python tool
 //! server used by `http_chat_parity.rs`.

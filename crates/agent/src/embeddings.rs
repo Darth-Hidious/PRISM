@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Process-wide embedding backend — lazy, shared, and strictly optional.
 //!
 //! One backend per process (native model init costs seconds and ~100 MB of

@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! End-to-end execution of the BUILTIN `ingest` playbook.
 //!
 //! Everything inside the workflow engine is REAL: the builtin YAML is

@@ -1,4 +1,4 @@
-// Copyright (c) 2025-2026 MARC27. Licensed under MARC27 Source-Available License.
+// Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! FIX D parity + approval-gating proof for the HTTP chat service.
 //!
 //! These tests drive REAL turns through both transports with a stub
