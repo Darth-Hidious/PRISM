@@ -3411,18 +3411,72 @@ async fn main() -> Result<()> {
             eprintln!("research run {run_id} started; waiting for completion…");
 
             // Poll until terminal ("completed" | "failed" | "canceled").
-            // 10 min ceiling matches the server-side run budget; dots to
-            // stderr so stdout stays a single clean JSON/answer document.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(630);
+            // Dots to stderr so stdout stays a single clean JSON/answer document.
+            //
+            // The ceiling is deliberately well past the server's run budget
+            // (RESEARCH_MAX_WALL_SECS, 600s by default but raised in
+            // deployments): if the client gives up first it reports a hang on a
+            // run that is still working, and the user loses an answer they have
+            // already paid for.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2100);
+
+            // A poll failure is NOT a run failure. The run lives server-side;
+            // this loop only reads it. Aborting on one bad response threw away
+            // ten to twenty minutes of billable work every time the API
+            // restarted underneath it — observed three times in one afternoon,
+            // as a 502 mid-poll and as a truncated stream. Transient errors are
+            // therefore tolerated until they stop looking transient.
+            const MAX_CONSECUTIVE_POLL_FAILURES: u32 = 12; // ~1 min at 5s
+            let mut consecutive_failures: u32 = 0;
+
             let resp = loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let run: serde_json::Value = auth
+
+                let polled = auth
                     .apply(client.get(format!("{api_base}/agent-runs/{run_id}")))
                     .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
+                    .await
+                    .and_then(|r| r.error_for_status());
+
+                let run: serde_json::Value = match polled {
+                    Ok(r) => match r.json().await {
+                        Ok(v) => {
+                            consecutive_failures = 0;
+                            v
+                        }
+                        Err(e) => {
+                            // A body that will not parse is the same class of
+                            // problem as a 502: a proxy error page mid-restart.
+                            consecutive_failures += 1;
+                            if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                                anyhow::bail!(
+                                    "lost contact with the platform while polling run {run_id} \
+                                     ({consecutive_failures} consecutive failures, last: {e}). \
+                                     The run may still be going — check with: prism agent"
+                                );
+                            }
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        // 4xx is a real answer (gone, forbidden, wrong id) and
+                        // retrying it just burns the deadline; only 5xx and
+                        // transport errors are worth waiting out.
+                        let transient = e.status().map(|s| s.is_server_error()).unwrap_or(true);
+                        if !transient {
+                            return Err(e.into());
+                        }
+                        consecutive_failures += 1;
+                        if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                            anyhow::bail!(
+                                "lost contact with the platform while polling run {run_id} \
+                                 ({consecutive_failures} consecutive failures, last: {e}). \
+                                 The run may still be going — check with: prism agent"
+                            );
+                        }
+                        continue;
+                    }
+                };
                 // Read the terminal state from `state` (primary) or `status`
                 // (fallback), and accept the full success/failure vocabulary the
                 // platform uses. This mirrors the sibling `run_ingest_job` poll
