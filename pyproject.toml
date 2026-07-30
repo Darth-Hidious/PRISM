@@ -7,7 +7,7 @@ name = "prism-platform"
 version = "1.0.0"
 description = "AI-Native Autonomous Materials Discovery Platform"
 readme = "README.md"
-authors = [{ name = "MARC27", email = "team@marc27.com" }]
+authors = [{ name = "Mirdyne", email = "team@marc27.com" }]
 license = "LicenseRef-Mirdyne-Dual"
 license-files = ["LICENSE", "LICENSE-MIT", "LICENSE-MIRDYNE"]
 maintainers = [
