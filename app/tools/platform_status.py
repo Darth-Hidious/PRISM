@@ -1,4 +1,4 @@
-"""Platform-status tools — thin wrappers over MARC27 platform read endpoints.
+"""Platform-status tools — thin wrappers over platform read endpoints.
 
 Three high-leverage gaps from the v2.7.2 endpoint-coverage audit get
 filled here, all *read-only*:
@@ -90,7 +90,7 @@ def _policy_evaluate(action: Optional[str] = None,
 
 
 _POLICY_EVALUATE_DESCRIPTION = (
-    "Ask the MARC27 platform's policy engine whether a given action on a "
+    "Ask the platform's policy engine whether a given action on a "
     "given resource is permitted for the current user. Use this BEFORE "
     "running anything privileged (compute submit, dataset publish, "
     "cross-org access) so you don't waste a turn on a 403.\n"
@@ -116,7 +116,7 @@ def _usage_status(project_id: Optional[str] = None, **_kwargs: Any) -> dict:
 
 
 _USAGE_STATUS_DESCRIPTION = (
-    "Read current MARC27 platform usage telemetry for the user or a "
+    "Read current platform usage telemetry for the user or a "
     "specific project. Useful for budgeting decisions BEFORE submitting "
     "expensive compute jobs.\n"
     "  • No args: returns the authenticated user's aggregate usage "
@@ -147,7 +147,7 @@ def _billing_balance(action: str = "balance", **_kwargs: Any) -> dict:
 
 
 _BILLING_BALANCE_DESCRIPTION = (
-    "Read MARC27 platform billing state. Read-only — never tops up, "
+    "Read platform billing state. Read-only — never tops up, "
     "never charges. ONE tool, three actions:\n"
     "  • action='balance' (default) — current wallet balance + plan tier "
     "(GET /billing/balance).\n"

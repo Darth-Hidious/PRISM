@@ -1,4 +1,4 @@
-"""Platform-jobs tools — thin wrappers over MARC27 platform `/jobs` endpoints.
+"""Platform-jobs tools — thin wrappers over platform `/jobs` endpoints.
 
 Closes the GAP-HIGH `/jobs` family from the v2.7.2 endpoint-coverage audit.
 
@@ -83,7 +83,7 @@ def _get_sse(path: str, max_events: int = 10, read_timeout: int = 30) -> dict:
     api_url, auth_headers = resolve_platform_auth()
     if not auth_headers:
         return {
-            "error": "Not authenticated to the MARC27 platform.",
+            "error": "Not authenticated to the platform.",
             "hint": "Run `prism login` first, then retry.",
         }
     try:
@@ -215,7 +215,7 @@ def _platform_jobs_submit(**kwargs: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 _PLATFORM_JOBS_DESCRIPTION = (
-    "Read/cancel MARC27 platform jobs. Read-only and cancel — NOT "
+    "Read/cancel platform jobs. Read-only and cancel — NOT "
     "money-spending. ONE tool, three actions:\n"
     "  • action='status' — fetch job state. Required: `job_id`.\n"
     "  • action='cancel' — cancel a running or queued job. Required: "
@@ -230,7 +230,7 @@ _PLATFORM_JOBS_DESCRIPTION = (
 
 
 _PLATFORM_JOBS_SUBMIT_DESCRIPTION = (
-    "Submit a new job to the MARC27 platform. MONEY/COMPUTE-SPENDING — "
+    "Submit a new job to the platform. MONEY/COMPUTE-SPENDING — "
     "requires_approval=True; the harness will prompt before each call.\n"
     "Required:\n"
     "  • job_type — backend job type slug (e.g. 'compute.simulation', "

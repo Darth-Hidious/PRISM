@@ -1,4 +1,4 @@
-"""Platform-workflows tools — thin wrappers over MARC27 platform `/workflows`
+"""Platform-workflows tools — thin wrappers over platform `/workflows`
 endpoints.
 
 Closes the GAP-HIGH `/workflows` family from the v2.7.2 endpoint-coverage audit.
@@ -169,7 +169,7 @@ def _platform_workflows_run(**kwargs: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 _PLATFORM_WORKFLOWS_DESCRIPTION = (
-    "Read/cancel MARC27 platform workflows. Read-only and cancel — NOT "
+    "Read/cancel platform workflows. Read-only and cancel — NOT "
     "money-spending. ONE tool, four actions:\n"
     "  • action='list' — list the user's workflow instances.\n"
     "  • action='list_specs' — list available workflow specs (org + public + "

@@ -202,7 +202,7 @@ pub fn start_mesh(
         if opts.auth_token.is_none() {
             eprintln!("\x1b[33m  ⚠ Mesh disabled: no auth token — run `prism login` first.\x1b[0m");
             eprintln!(
-                "\x1b[33m    The mesh requires MARC27 authentication for RBAC enforcement.\x1b[0m"
+                "\x1b[33m    The mesh requires platform authentication for RBAC enforcement.\x1b[0m"
             );
             return;
         }

@@ -292,7 +292,7 @@ pub async fn run_daemon(
                     if let Err(e) = registry.deregister_node(nid).await {
                         tracing::warn!(error = %e, "platform deregistration failed (non-fatal)");
                     } else {
-                        tracing::info!("deregistered from MARC27 platform");
+                        tracing::info!("deregistered from the platform");
                     }
                 }
                 tracing::info!("node shut down gracefully");

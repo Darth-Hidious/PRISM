@@ -162,7 +162,7 @@ LOGICAL_FORMS = [
             {"tool": "search_materials", "role": "primary",
              "reason": "Federated OPTIMADE search across 20+ providers"},
             {"tool": "query_platform", "role": "complement",
-             "reason": "Search MARC27 knowledge graph"},
+             "reason": "Search platform knowledge graph"},
             {"tool": "alpha_predict", "role": "followup",
              "reason": "Evaluate search results"},
         ],

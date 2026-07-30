@@ -137,7 +137,7 @@ def _act_submit(**kw) -> dict:
         "error": (
             f"Job dispatch for {svc['name']} is not implemented yet — "
             "no job was submitted. Lab submission is coming to the "
-            "MARC27 platform; list/info/subscriptions are real today."
+            "platform; list/info/subscriptions are real today."
         ),
         "status": "not_implemented",
         "register_interest": f"https://prism.marc27.com/labs/{service_id}",
@@ -169,7 +169,7 @@ def _labs(**kwargs) -> dict:
 
 
 _DESCRIPTION = (
-    "MARC27 Premium Labs marketplace catalog — autonomous robotic synthesis "
+    "Premium Labs marketplace catalog — autonomous robotic synthesis "
     "(A-Labs), design-for-manufacturing assessment, hosted DFT/QE/CP2K, real "
     "quantum hardware, synchrotron beamline time, HT screening. "
     "IMPORTANT: job SUBMISSION IS NOT LIVE YET — every service is "

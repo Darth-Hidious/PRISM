@@ -154,7 +154,7 @@ _RECALL_DESCRIPTION = (
     "what you want; use `scope='all'` to reach across all sessions on this "
     "machine. Optional `tool` filter narrows to a specific source "
     "(e.g. tool='materials_search'). NOT for searching the open web (use "
-    "web_search) and NOT for searching the MARC27 knowledge graph "
+    "web_search) and NOT for searching the platform knowledge graph "
     "(use knowledge with action='search' or action='semantic')."
 )
 

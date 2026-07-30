@@ -9,7 +9,9 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "prism-node")]
-#[command(about = "Rust runtime for turning a PRISM-installed machine into a MARC27 compute node")]
+#[command(
+    about = "Rust runtime for turning a PRISM-installed machine into a compute node for the hosted platform"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

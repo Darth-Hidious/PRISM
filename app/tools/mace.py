@@ -433,7 +433,7 @@ _PRIMITIVE_OPTIONS_SCHEMA = {
                 "Compute backend selection. 'auto' = heuristic (small + CPU-OK "
                 "jobs local; GPU-bound or large jobs prefer 'platform' if "
                 "PRISM_PROJECT_ID is set, else 'hf_jobs' if HF_TOKEN set, else "
-                "'local'). 'platform' submits to marc27 ml_predict (production "
+                "'local'). 'platform' submits to the platform ml_predict (production "
                 "path; supports relax + md tasks today, others fall back). "
                 "'hf_jobs' is the open-source HF Pro fallback. 'local' runs "
                 "MACE in-process. 'fake' is for tests only."

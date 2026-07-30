@@ -165,7 +165,7 @@ pub fn append_runtime_tool_guidance(
 
     if has_any_tools(&tool_names, &["run_submit", "run"]) {
         bullets.push(
-            "Use `run_submit` for one-off compute jobs across local, MARC27, or BYOC backends instead of hand-building `run` argv or shell wrappers."
+            "Use `run_submit` for one-off compute jobs across local, hosted-platform, or BYOC backends instead of hand-building `run` argv or shell wrappers."
                 .to_string(),
         );
     }
@@ -308,7 +308,7 @@ You are an execution agent, not an advice-only assistant. The user asks for an o
 - Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless the user explicitly asks for low-level control.
 - Use find_tools to discover tools, agent_capabilities to inspect providers/models/connectivity, and status/tools for the local environment before planning.
 - ACQUIRING NEW TOOLS: when no loaded tool fits, follow discover -> install -> connect -> verify: find_tools first (already have it?), then marketplace_search/marketplace_info, then marketplace_install (lands in ~/.prism/tools or ~/.prism/workflows; never overwrites local edits). Installed workflows are runnable immediately; installed Python tools load at the NEXT tool-server start — say so honestly and verify with list_tools before claiming a tool is callable. Full playbook: read docs/TOOL_ACQUISITION.md in the PRISM repo (read_file) when you need the complete procedure, publishing steps, or the anti-spoof/approval rules.
-- Keep local, MARC27-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
+- Keep local, platform-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
 
 # Tool Use
 - For greetings, chit-chat, and questions about things already visible in this conversation, respond with plain text. Do NOT call tools for simple chat.
@@ -381,7 +381,7 @@ You are an execution agent, not an advice-only assistant. The user asks for an o
 - Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless low-level control is explicitly required by the task.
 - Use find_tools to discover tools, agent_capabilities to inspect providers/models/connectivity, and status/tools for the local environment before planning.
 - ACQUIRING NEW TOOLS: when no loaded tool fits, follow discover -> install -> connect -> verify: find_tools first (already have it?), then marketplace_search/marketplace_info, then marketplace_install (lands in ~/.prism/tools or ~/.prism/workflows; never overwrites local edits). Installed workflows are runnable immediately; installed Python tools load at the NEXT tool-server start — say so honestly and verify with list_tools before claiming a tool is callable. Full playbook: read docs/TOOL_ACQUISITION.md in the PRISM repo (read_file) when you need the complete procedure, publishing steps, or the anti-spoof/approval rules.
-- Keep local, MARC27-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
+- Keep local, platform-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
 
 # Tool Use
 - For greetings, chit-chat, and questions about things already visible in this conversation, respond with plain text. Do NOT call tools for simple chat.

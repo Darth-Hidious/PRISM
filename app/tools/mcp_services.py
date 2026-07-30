@@ -1,4 +1,4 @@
-"""MCP-services tools — thin wrappers over MARC27 platform
+"""MCP-services tools — thin wrappers over platform
 `/projects/{project_id}/mcp-services` endpoints.
 
 Closes the GAP-HIGH `/mcp-services` family from the v2.7.2
@@ -219,7 +219,7 @@ def _mcp_services_invoke(**kwargs: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 _MCP_SERVICES_DESCRIPTION = (
-    "Read MARC27 platform-hosted MCP service instances (Model Context "
+    "Read platform-hosted MCP service instances (Model Context "
     "Protocol servers running in the platform, not locally). Read-only "
     "— NO approval gate. ONE tool, two actions:\n"
     "  • action='list' — list all MCP service instances for the active "
@@ -235,7 +235,7 @@ _MCP_SERVICES_DESCRIPTION = (
 
 
 _MCP_SERVICES_INVOKE_DESCRIPTION = (
-    "Invoke or scale a MARC27 platform-hosted MCP service instance. "
+    "Invoke or scale a platform-hosted MCP service instance. "
     "BOTH actions are state-changing — proxying executes an upstream "
     "request, scaling toggles compute. requires_approval=True; the "
     "harness will prompt before each call.\n"

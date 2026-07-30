@@ -1,4 +1,4 @@
-"""agent_capabilities tool — wrapper over MARC27 platform self-discovery.
+"""agent_capabilities tool — wrapper over platform self-discovery.
 
 Closes the `/agent/capabilities` GAP-HIGH item from the v2.7.2
 endpoint-coverage audit. One read-only tool, no approval gate.
@@ -73,7 +73,7 @@ def _agent_capabilities(**_kwargs: Any) -> dict:
 
 
 _AGENT_CAPABILITIES_DESCRIPTION = (
-    "Ask the MARC27 platform to describe itself. Returns a structured "
+    "Ask the platform to describe itself. Returns a structured "
     "self-discovery descriptor: which REST routes exist (grouped by "
     "service), which auth methods are accepted, which GraphQL queries "
     "and mutations are available, and CLI quick-start hints.\n"

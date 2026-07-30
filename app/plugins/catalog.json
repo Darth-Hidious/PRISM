@@ -1,7 +1,7 @@
 {
   "_meta": {
     "version": "2.0.0",
-    "description": "MARC27 plugin catalog. Dev-time reference — production reads from platform API."
+    "description": "Plugin catalog. Dev-time reference — production reads from platform API."
   },
   "plugins": {
     "mp_native": {
@@ -119,7 +119,7 @@
       "enabled": false,
       "platform": {
         "status": "coming_soon",
-        "notes": "Requires torch + torch_geometric. Runs on MARC27 managed GPU infrastructure."
+        "notes": "Requires torch + torch_geometric. Runs on platform-managed GPU infrastructure."
       }
     }
   }

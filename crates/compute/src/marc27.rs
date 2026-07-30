@@ -140,16 +140,16 @@ impl ComputeBackend for Marc27Backend {
             .json(&body)
             .send()
             .await
-            .context("failed to submit job to MARC27 platform")?;
+            .context("failed to submit job to the platform")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            bail!("MARC27 submit failed ({status}): {text}");
+            bail!("platform submit failed ({status}): {text}");
         }
 
         let result: SubmitResponse = resp.json().await.context("bad submit response")?;
-        tracing::info!(job_id = %result.job_id, "job submitted to MARC27 platform");
+        tracing::info!(job_id = %result.job_id, "job submitted to the platform");
         Ok(result.job_id)
     }
 
@@ -162,7 +162,7 @@ impl ComputeBackend for Marc27Backend {
             .context("failed to query job status")?;
 
         if !resp.status().is_success() {
-            bail!("MARC27 status query failed: {}", resp.status());
+            bail!("platform status query failed: {}", resp.status());
         }
 
         let job: JobResponse = resp.json().await?;
@@ -180,7 +180,7 @@ impl ComputeBackend for Marc27Backend {
             .context("failed to fetch job results")?;
 
         if !resp.status().is_success() {
-            bail!("MARC27 results query failed: {}", resp.status());
+            bail!("platform results query failed: {}", resp.status());
         }
 
         let job: JobResponse = resp.json().await?;
@@ -196,10 +196,10 @@ impl ComputeBackend for Marc27Backend {
             .context("failed to cancel job")?;
 
         if !resp.status().is_success() {
-            bail!("MARC27 cancel failed: {}", resp.status());
+            bail!("platform cancel failed: {}", resp.status());
         }
 
-        tracing::info!(%job_id, "job cancelled on MARC27 platform");
+        tracing::info!(%job_id, "job cancelled on the platform");
         Ok(())
     }
 }

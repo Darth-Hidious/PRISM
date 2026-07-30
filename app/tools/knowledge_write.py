@@ -1,4 +1,4 @@
-"""Knowledge-write tools — wrap the MARC27 Knowledge Service WRITE endpoints.
+"""Knowledge-write tools — wrap the platform Knowledge Service WRITE endpoints.
 
 The agent already has READ access to the knowledge graph (`research`, the
 `/knowledge/graph/search`, `/graph/entity`, `/graph/paths`, `/graph/stats`
@@ -237,7 +237,7 @@ def _knowledge_write(**kwargs: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 _KNOWLEDGE_WRITE_DESCRIPTION = (
-    "WRITE side of the MARC27 Knowledge Service — closes the agent's "
+    "WRITE side of the platform Knowledge Service — closes the agent's "
     "read/write asymmetry. Read paths live in the `research` tool and "
     "the platform's GET endpoints. ONE tool, five actions. "
     "MUTATING/COMPUTE-SPENDING — requires_approval=True; the harness "

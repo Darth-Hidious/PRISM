@@ -92,13 +92,13 @@ def _search_materials(**kwargs) -> dict:
 
 def _query_materials_project(**kwargs) -> dict:
     """Query Materials Project. Tries local MP_API_KEY first, then the
-    MARC27 platform proxy (which has the key set on the server side
+    platform proxy (which has the key set on the server side
     for ESA / paid programs), then suggests `materials_search` as a
     keyless fallback (OPTIMADE federation includes MP).
 
     Three-tier auth so the LLM doesn't hit a hard wall on day one:
       1. Local MP_API_KEY env var  → direct mp_api.client call.
-      2. MARC27 platform proxy     → POST /v1/data/materials-project
+      2. platform proxy     → POST /v1/data/materials-project
                                       with the user's bearer token.
       3. Keyless OPTIMADE alt      → error message points to
                                       `materials_search`.
@@ -177,7 +177,7 @@ def _query_materials_project(**kwargs) -> dict:
     error_lines = [
         "Materials Project query failed.",
         "  - Local MP_API_KEY: " + (local_err or "not set"),
-        "  - MARC27 platform proxy: "
+        "  - platform proxy: "
         + ((proxy_result or {}).get("error") or "not reachable"),
         "Recommended next tool: `materials_search` (OPTIMADE federation, "
         "no key required, covers Materials Project + 19 other databases).",
@@ -188,7 +188,7 @@ def _query_materials_project(**kwargs) -> dict:
 def _query_materials_project_via_platform(
     formula=None, material_id=None, properties=None
 ) -> dict | None:
-    """POST /v1/data/materials-project on the MARC27 platform.
+    """POST /v1/data/materials-project on the platform.
 
     The platform server holds the actual MP_API_KEY in its env; we only
     need the user's platform credentials (via _platform_client). Returns

@@ -114,7 +114,7 @@ class MPCollector(DataCollector):
             return []
 
     def _collect_via_platform_proxy(self, formula, elements, max_results) -> List[Dict]:
-        """Keyless path: route through the MARC27 platform proxy (server MP_API_KEY)."""
+        """Keyless path: route through the platform proxy (server MP_API_KEY)."""
         try:
             from app.tools.data import _query_materials_project
         except ImportError as exc:

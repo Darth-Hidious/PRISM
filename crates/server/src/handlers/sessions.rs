@@ -100,7 +100,7 @@ pub async fn create_session(
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(ErrorResponse {
-                        error: "This node is not linked to a MARC27 platform, so it \
+                        error: "This node is not linked to a hosted platform, so it \
                                 cannot verify remote identities. Remote sessions are \
                                 unavailable until the node owner runs `prism login`."
                             .into(),

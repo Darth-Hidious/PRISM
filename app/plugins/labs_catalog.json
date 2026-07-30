@@ -123,7 +123,7 @@
     "dfm_assessment": {
       "name": "Materials DfM Assessment",
       "category": "dfm",
-      "provider": "MARC27",
+      "provider": "Platform",
       "description": "Design for Manufacturability assessment for novel materials. Evaluates synthesis feasibility, scalability, cost projections, and identifies manufacturing risks. Domain-specific rules for ceramics, alloys, thin films, and composites.",
       "cost_model": "per-assessment ($25-100)",
       "status": "coming_soon",
@@ -162,7 +162,7 @@
     "ht_screening": {
       "name": "High-Throughput Screening",
       "category": "ht-screening",
-      "provider": "MARC27",
+      "provider": "Platform",
       "description": "Combinatorial high-throughput materials screening. Automated synthesis of composition libraries, rapid characterization, and ML-guided iteration. Covers alloys, oxides, and thin-film systems.",
       "cost_model": "per-campaign ($5,000-50,000)",
       "status": "coming_soon",

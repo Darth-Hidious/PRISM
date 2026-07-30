@@ -247,8 +247,17 @@ fn render_provider_list(
         .unwrap_or(0)
         .max(4);
 
+    // Neutral ordering. The registry declares the hosted platform first,
+    // and rendering it in that order put it at the top of every listing —
+    // which reads as PRISM promoting one provider over the peers it is
+    // otherwise interchangeable with. Sorting by display name makes
+    // position carry no editorial weight. The ❯ still marks whichever
+    // target is currently selected, whatever that happens to be.
+    let mut listed: Vec<_> = registry.all().iter().collect();
+    listed.sort_by_key(|p| p.display_name().to_lowercase());
+
     let mut out = String::from("Providers PRISM can route chat to:\n\n");
-    for p in registry.all() {
+    for p in listed {
         // The platform's credential is a login session, not an env var,
         // so it is judged on login state; everyone else on their key.
         let ready = if p.platform {

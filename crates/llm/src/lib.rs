@@ -290,7 +290,10 @@ impl LlmClient {
             "max_tokens": self.effective_max_tokens(Self::estimate_tokens(messages)),
         });
         let resp = self.post(&url, &body).await?;
-        let text = resp.text().await.context("failed to read MARC27 stream")?;
+        let text = resp
+            .text()
+            .await
+            .context("failed to read platform stream")?;
         let mut result = String::new();
         for line in text.lines() {
             let line = line.strip_prefix("data: ").unwrap_or(line).trim();
@@ -307,7 +310,7 @@ impl LlmClient {
             }
         }
         if result.is_empty() {
-            bail!("MARC27 LLM returned empty response");
+            bail!("platform LLM returned empty response");
         }
         Ok(result)
     }
@@ -627,13 +630,13 @@ impl LlmClient {
             let resp = req
                 .send()
                 .await
-                .with_context(|| format!("MARC27 stream request to {url} failed"))?;
+                .with_context(|| format!("platform stream request to {url} failed"))?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                bail!("MARC27 LLM returned HTTP {status}: {text}");
+                bail!("platform LLM returned HTTP {status}: {text}");
             }
-            debug!("MARC27 stream response received, reading chunks...");
+            debug!("platform stream response received, reading chunks...");
 
             // Read SSE stream incrementally — don't use resp.text() which
             // blocks until the connection closes (SSE keeps it open).
@@ -1089,13 +1092,13 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         why none of them worked.\n\n\
         ## Quick reference (most common tools)\n\n\
         - `find_tools` — discover tools by capability/keyword (progressive tool discovery)\n\
-        - `query_platform` — search the MARC27 knowledge graph (plain text = graph, semantic=true = vector)\n\
+        - `query_platform` — search the platform knowledge graph (plain text = graph, semantic=true = vector)\n\
         - `materials_search` — federated search across 20+ materials databases (OPTIMADE)\n\
         - `predict` — predict a material property from composition (ML)\n\
         - `execute_python` — run Python code for analysis\n\
         - `web` — fetch a URL or search the open web (action='read' / 'search')\n\
         - `prior_art_search` — search arXiv, Semantic Scholar, and patents (Lens.org)\n\
-        - `research` — iterative research loop via the MARC27 platform\n\n\
+        - `research` — iterative research loop via the platform\n\n\
         Names above MUST match the actual registry. If a tool you'd expect \
         isn't in this list, call `find_tools` instead of guessing.\n\n\
         ## Tool-composition patterns (USE THESE for the common tasks)\n\n\
@@ -1141,7 +1144,7 @@ fn build_tool_prompt_block(tools: &[ToolDefinition]) -> String {
         `prior_art_search` first (does anyone publish on this?), then \
         `materials_search` for compositional alternatives, then `web` only \
         for industry / regulatory context that isn't in academic papers.\n\
-        - **Knowledge-graph queries**: `knowledge` for MARC27-internal \
+        - **Knowledge-graph queries**: `knowledge` for platform-internal \
         provenance. Use BEFORE `materials_search` if the user is asking \
         about a specific project / dataset rather than a general material.\n\n\
         For ANY recommendation you give the user: cite the source. \

@@ -1,5 +1,5 @@
 # Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
-"""THE MARC27 platform HTTP client for PRISM agent tools.
+"""THE platform HTTP client for PRISM agent tools.
 
 Every tool that talks to api.marc27.com goes through this module — no tool
 hand-rolls ``requests`` + auth headers. That rule exists because the hand-
@@ -66,7 +66,7 @@ class PlatformClient:
             }
         if not self._headers:
             return {
-                "error": "not connected to the MARC27 platform — run `prism login`",
+                "error": "not connected to the platform — run `prism login`",
                 "path": path,
             }
         resp = self._send(method, path, params, json, timeout)

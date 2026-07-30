@@ -171,7 +171,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "query",
         aliases: &[],
         kind: CommandToolKind::QueryPlatform,
-        description: "Search the MARC27 platform's OWN knowledge base — embedded corpora (NASA propulsion technical reports, Materials Project, JARVIS-DFT, MatKG, alloy/superalloy datasheets, additive-manufacturing and fatigue datasets) plus the materials knowledge graph. PREFER this before external literature searches (prior_art_search/web) for materials, alloy, propulsion, and manufacturing questions — the platform often already holds the answer with provenance. Plain text runs a graph-entity search ('find Ti-6Al-4V'); `semantic=true` searches corpus chunks by meaning ('materials for oxygen-rich preburner environments'). Use `knowledge_entity`/`knowledge_paths` for one-entity neighbors or relationship paths.",
+        description: "Search the platform's OWN knowledge base — embedded corpora (NASA propulsion technical reports, Materials Project, JARVIS-DFT, MatKG, alloy/superalloy datasheets, additive-manufacturing and fatigue datasets) plus the materials knowledge graph. PREFER this before external literature searches (prior_art_search/web) for materials, alloy, propulsion, and manufacturing questions — the platform often already holds the answer with provenance. Plain text runs a graph-entity search ('find Ti-6Al-4V'); `semantic=true` searches corpus chunks by meaning ('materials for oxygen-rich preburner environments'). Use `knowledge_entity`/`knowledge_paths` for one-entity neighbors or relationship paths.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -254,7 +254,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "marketplace",
         aliases: &[],
         kind: CommandToolKind::MarketplaceSearch,
-        description: "Search the MARC27 marketplace for tools and workflows. Use this before installation when you need downloadable workflow definitions.",
+        description: "Search the platform marketplace for tools and workflows. Use this before installation when you need downloadable workflow definitions.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -455,7 +455,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "run",
         aliases: &[],
         kind: CommandToolKind::RunSubmit,
-        description: "Submit a compute job with typed fields instead of manually assembling `prism run` arguments. Use this for local, MARC27, or BYOC execution backends.",
+        description: "Submit a compute job with typed fields instead of manually assembling `prism run` arguments. Use this for local, hosted-platform, or BYOC execution backends.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -473,7 +473,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "research",
         aliases: &[],
         kind: CommandToolKind::ResearchQuery,
-        description: "Start the PRISM/MARC27 research loop from a typed request body. This may trigger iterative retrieval and synthesis rather than a single search call. Supports the same platform auth path as `query`: MARC27_API_KEY if present, otherwise the logged-in PRISM session.",
+        description: "Start the PRISM research loop from a typed request body. This may trigger iterative retrieval and synthesis rather than a single search call. Supports the same platform auth path as `query`: MARC27_API_KEY if present, otherwise the logged-in PRISM session.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -493,7 +493,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "deploy",
         aliases: &[],
         kind: CommandToolKind::DeployList,
-        description: "List deployments visible to the current MARC27 auth context. Use this before status or stop when you need a deployment ID.",
+        description: "List deployments visible to the current platform auth context. Use this before status or stop when you need a deployment ID.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -538,7 +538,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "compute",
         aliases: &[],
         kind: CommandToolKind::ComputeGpus,
-        description: "List purchasable GPU offers on the MARC27 compute broker (type, VRAM, region, provider, $/hr).",
+        description: "List purchasable GPU offers on the platform compute broker (type, VRAM, region, provider, $/hr).",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -583,7 +583,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "compute",
         aliases: &[],
         kind: CommandToolKind::ComputeSubmit,
-        description: "Dispatch a real, BILLABLE containerized GPU/CPU job to the MARC27 compute broker. Provide `image` and `inputs`; set `budget_max_usd` to cap spend.",
+        description: "Dispatch a real, BILLABLE containerized GPU/CPU job to the platform compute broker. Provide `image` and `inputs`; set `budget_max_usd` to cap spend.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -637,7 +637,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "knowledge",
         aliases: &[],
         kind: CommandToolKind::KnowledgeEntity,
-        description: "Look up one entity plus its 1-hop neighbors in the MARC27 knowledge graph. Requires `name`. For plain term search use `query_platform`; for conceptual/vector search use `query_platform` with semantic=true.",
+        description: "Look up one entity plus its 1-hop neighbors in the platform knowledge graph. Requires `name`. For plain term search use `query_platform`; for conceptual/vector search use `query_platform` with semantic=true.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -646,7 +646,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "knowledge",
         aliases: &[],
         kind: CommandToolKind::KnowledgePaths,
-        description: "Find shortest hop-paths between two entities in the MARC27 knowledge graph ('how does X relate to Y?'). Requires `from_entity` and `to_entity`.",
+        description: "Find shortest hop-paths between two entities in the platform knowledge graph ('how does X relate to Y?'). Requires `from_entity` and `to_entity`.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -655,7 +655,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "knowledge",
         aliases: &[],
         kind: CommandToolKind::KnowledgeCorpora,
-        description: "List available corpora from the MARC27 catalog (Materials Project, JARVIS-DFT, QMOF, MatKG, ...). Filter by `domain` or `kind`.",
+        description: "List available corpora from the platform catalog (Materials Project, JARVIS-DFT, QMOF, MatKG, ...). Filter by `domain` or `kind`.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -664,7 +664,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "knowledge",
         aliases: &[],
         kind: CommandToolKind::KnowledgeIngest,
-        description: "Submit a background extraction job into the MARC27 knowledge graph from a `url` or free-text `query`. Entity extraction runs asynchronously server-side; poll graph growth via `ingest` --status.",
+        description: "Submit a background extraction job into the platform knowledge graph from a `url` or free-text `query`. Entity extraction runs asynchronously server-side; poll graph growth via `ingest` --status.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: false,
     },
@@ -675,7 +675,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         kind: CommandToolKind::RootSubcommand {
             subcommands: &["list", "search", "info"],
         },
-        description: "Run `prism models <subcommand>` for hosted model discovery for the active MARC27 project. Prefer the typed siblings models_list / models_search / models_info for those verbs; this umbrella exists only for any models verb without a typed tool. Read-only and free. Returns provider/model listings or details.",
+        description: "Run `prism models <subcommand>` for hosted model discovery for the active platform project. Prefer the typed siblings models_list / models_search / models_info for those verbs; this umbrella exists only for any models verb without a typed tool. Read-only and free. Returns provider/model listings or details.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -684,7 +684,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "models",
         aliases: &[],
         kind: CommandToolKind::ModelsList,
-        description: "List hosted LLM models for the active MARC27 project. Filter by provider when you need a narrower catalog.",
+        description: "List hosted LLM models for the active platform project. Filter by provider when you need a narrower catalog.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -796,7 +796,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         kind: CommandToolKind::RootSubcommand {
             subcommands: &["usage", "history", "prices", "topup", "balance"],
         },
-        description: "Run `prism billing <subcommand>` for MARC27 credits. Prefer the typed siblings billing_balance / billing_usage / billing_history / billing_prices for the common read-only checks; use this umbrella for `topup` (opens a real Stripe checkout and spends money — approval-gated) or any billing verb without a typed tool.",
+        description: "Run `prism billing <subcommand>` for platform credits. Prefer the typed siblings billing_balance / billing_usage / billing_history / billing_prices for the common read-only checks; use this umbrella for `topup` (opens a real Stripe checkout and spends money — approval-gated) or any billing verb without a typed tool.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -805,7 +805,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "billing",
         aliases: &[],
         kind: CommandToolKind::BillingBalance,
-        description: "Check the current MARC27 credits balance and dollar value for the active org. Use before starting a billable action (goal_start, predict, deploy, ...) so spend is never a surprise.",
+        description: "Check the current platform credits balance and dollar value for the active org. Use before starting a billable action (goal_start, predict, deploy, ...) so spend is never a surprise.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -823,7 +823,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "billing",
         aliases: &[],
         kind: CommandToolKind::BillingHistory,
-        description: "Show recent MARC27 credit transactions (charges and top-ups) for the active org.",
+        description: "Show recent platform credit transactions (charges and top-ups) for the active org.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -832,7 +832,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "billing",
         aliases: &[],
         kind: CommandToolKind::BillingPrices,
-        description: "Show the current MARC27 credit price sheet (credits per unit and markup) for every metered service.",
+        description: "Show the current platform credit price sheet (credits per unit and markup) for every metered service.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -840,14 +840,14 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
     // The agent's escape hatch when it hits a problem it cannot resolve on its
     // own — a broken/erroring tool, a platform error, a missing capability.
     // Reuses the existing `prism report` machinery (system-context capture +
-    // file to GitHub + MARC27 support ticket). Approval-gated because it files
+    // file to GitHub + platform support ticket). Approval-gated because it files
     // an external issue/ticket; the prompt hint tells the agent WHEN to use it.
     CommandToolSpec {
         name: "report_bug",
         root: "report",
         aliases: &["bug_report", "report_issue"],
         kind: CommandToolKind::ReportBug,
-        description: "File a bug or issue report when you hit a problem you cannot resolve on your own — a tool that errors or returns broken output, a platform failure, or a missing capability. Captures system context automatically and files it (GitHub issue + MARC27 support ticket) so the team can fix it. Say what you tried and what went wrong in `description`; optionally attach a log/error file path. Use this instead of silently failing or looping on a broken tool.",
+        description: "File a bug or issue report when you hit a problem you cannot resolve on your own — a tool that errors or returns broken output, a platform failure, or a missing capability. Captures system context automatically and files it (GitHub issue + platform support ticket) so the team can fix it. Say what you tried and what went wrong in `description`; optionally attach a log/error file path. Use this instead of silently failing or looping on a broken tool.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -1065,7 +1065,7 @@ fn query_platform_schema() -> Value {
         "properties": {
             "text": {
                 "type": "string",
-                "description": "Graph-search text or semantic-search query for the MARC27 platform."
+                "description": "Graph-search text or semantic-search query for the platform."
             },
             "semantic": {
                 "type": "boolean",
@@ -1537,7 +1537,7 @@ fn run_submit_schema() -> Value {
             },
             "platform_url": {
                 "type": "string",
-                "description": "Override the MARC27 platform API URL when using the `marc27` backend."
+                "description": "Override the platform API URL when using the `marc27` backend."
             },
             "inputs": {
                 "type": "object",
@@ -5074,7 +5074,7 @@ ValueError: boom\n";
         // TASK 4: the agent's self-bug-report escape hatch. Reuses the
         // `prism report` machinery; approval-gated because it files an external
         // issue/ticket; --no-github by default (agent path files to the
-        // attributable MARC27 support ticket, not the public repo).
+        // attributable platform support ticket, not the public repo).
         assert!(is_command_tool("report_bug"));
         assert!(is_command_tool("bug_report"), "alias resolves");
         assert!(is_command_tool("report_issue"), "alias resolves");

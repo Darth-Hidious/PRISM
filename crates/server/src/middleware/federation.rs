@@ -195,7 +195,7 @@ pub async fn federation_layer(
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "federation_not_initialized",
-            "Node has not cached the MARC27 platform pubkey yet. Run `prism login` \
+            "Node has not cached the platform pubkey yet. Run `prism login` \
              to fetch it (writes to ~/.prism/federation/platform_pubkey.bin).",
         );
     };

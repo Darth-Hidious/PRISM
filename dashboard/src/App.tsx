@@ -78,7 +78,7 @@ export default function App() {
                 P
               </div>
               <div>
-                <div className="text-[10px] uppercase tracking-[0.22em] text-[var(--dim)]">MARC27 Research Ops</div>
+                <div className="text-[10px] uppercase tracking-[0.22em] text-[var(--dim)]">Research Ops</div>
                 <div className="text-lg font-semibold tracking-tight text-[var(--fg)]">PRISM Board</div>
               </div>
             </div>

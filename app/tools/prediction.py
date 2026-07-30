@@ -100,7 +100,7 @@ _KNOWN_ALGORITHMS = ["random_forest", "gradient_boosting", "linear", "xgboost", 
 
 def _gather_mp_training_rows(property_name: str, patterns: list, max_samples: int):
     """Pull (formula, value) pairs via the existing query_materials_project
-    path (local MP_API_KEY → MARC27 platform proxy). Returns (rows, error)."""
+    path (local MP_API_KEY → platform proxy). Returns (rows, error)."""
     from app.tools.data import _query_materials_project
 
     seen: dict = {}

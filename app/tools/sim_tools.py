@@ -735,7 +735,7 @@ _SIM_JOB_DESCRIPTION = (
     "`code_filter`.\n"
     "  • action='delete' — destructive. Removes job + output files. "
     "Required: `job_id`, `confirm=true`. Cannot be undone.\n"
-    "NOT for the MARC27 compute broker (use `compute(action='status')` for "
+    "NOT for the platform compute broker (use `compute(action='status')` for "
     "cloud broker jobs); these are local pyiron jobs."
 )
 

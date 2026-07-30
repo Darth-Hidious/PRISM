@@ -2794,7 +2794,7 @@ fn format_doctor_report(
     let profile = profile_for_model(&llm_config.model);
     let endpoint = &llm_config.base_url;
     let mode_hint = if endpoint.contains("/llm") || endpoint.contains("api.marc27") {
-        "MARC27 cloud (signed-in endpoint)"
+        "hosted platform (signed-in endpoint)"
     } else if endpoint.contains("localhost") || endpoint.contains("127.0.0.1") {
         "local"
     } else {
@@ -6255,7 +6255,7 @@ async fn handle_command(
                 "account",
                 "Login Complete",
                 &format_account_result(
-                    "Stored MARC27 account credentials.",
+                    "Stored platform account credentials.",
                     &creds,
                     &selected.notes,
                     &paths,
@@ -6275,7 +6275,7 @@ async fn handle_command(
             emit_view(
                 "account",
                 "Logged Out",
-                "Removed stored MARC27 credentials from the CLI state and Python SDK cache.",
+                "Removed stored platform credentials from the CLI state and Python SDK cache.",
                 "warning",
             );
             emit_notification("ui.turn.complete", serde_json::json!({}));

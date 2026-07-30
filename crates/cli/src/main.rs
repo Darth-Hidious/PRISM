@@ -1268,6 +1268,27 @@ struct SelectedContext {
     project_name: Option<String>,
 }
 
+/// Whether this command will actually reach the Python tool server.
+///
+/// Deliberately a deny-list of the pure-Rust commands rather than an
+/// allow-list of the Python ones: anything unrecognised falls through to
+/// `true` and provisions the venv exactly as before. The worst case of a
+/// stale list is therefore the old (slow) behaviour, never a command handed
+/// a path to an interpreter nobody built.
+fn command_needs_python(command: Option<&Commands>) -> bool {
+    match command {
+        // Rust-side state only: the config TOML, the provider registry, the
+        // local provenance ledger, paths and endpoints.
+        Some(
+            Commands::Status | Commands::Use { .. } | Commands::Agent | Commands::Provenance { .. },
+        ) => false,
+        // Reports on the venv — including its absence — rather than using it.
+        Some(Commands::Doctor) => false,
+        // Bare `prism` is the TUI, which spawns the tool server.
+        _ => true,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install the process-wide rustls CryptoProvider before ANY TLS can happen.
@@ -1308,6 +1329,16 @@ async fn main() -> Result<()> {
     // override (used by CI/the smoke harness to point at a pre-seeded
     // interpreter so an isolated $HOME never triggers venv provisioning,
     // which needs the network); otherwise manage ~/.prism/venv/.
+    //
+    // Provisioning is LAZY. This used to run for every invocation, before
+    // command dispatch — so `prism use list`, which only reads a TOML file,
+    // spent ~30 s building a venv on a fresh machine, and on a box without
+    // Python 3.11+ it failed outright with nothing printed. Commands that
+    // touch no Python now get the path the venv *would* live at, without
+    // creating it; `doctor` reports that absence as a check result instead
+    // of dying on it. `command_needs_python` defaults to TRUE, so a command
+    // added later keeps today's eager behaviour rather than silently
+    // receiving a path to an interpreter that was never built.
     let python = if cli.python.as_os_str() != "python3" {
         cli.python.clone()
     } else if let Some(p) = std::env::var_os("PRISM_PYTHON").filter(|p| !p.is_empty()) {
@@ -1315,7 +1346,11 @@ async fn main() -> Result<()> {
     } else {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         let prism_dir = PathBuf::from(&home).join(".prism");
-        ensure_venv(&prism_dir, &project_root).await?
+        if command_needs_python(cli.command.as_ref()) {
+            ensure_venv(&prism_dir, &project_root).await?
+        } else {
+            prism_dir.join("venv/bin/python3")
+        }
     };
 
     // ── Env-var mutations happen HERE, before ANY task is detached ──
@@ -3926,10 +3961,7 @@ async fn main() -> Result<()> {
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
             {
                 eprintln!();
-                eprintln!(
-                    "\x1b[33mYour {} session has expired — re-authenticating…\x1b[0m",
-                    crate::brand::brand().display_name
-                );
+                eprintln!("\x1b[33mYour platform session has expired — re-authenticating…\x1b[0m");
                 eprintln!();
                 if let Err(e) = perform_full_login(
                     &paths,
@@ -4021,10 +4053,7 @@ async fn main() -> Result<()> {
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
             {
                 eprintln!();
-                eprintln!(
-                    "\x1b[33mYour {} session has expired — re-authenticating…\x1b[0m",
-                    crate::brand::brand().display_name
-                );
+                eprintln!("\x1b[33mYour platform session has expired — re-authenticating…\x1b[0m");
                 eprintln!();
                 if let Err(e) = perform_full_login(
                     &paths,
@@ -4081,7 +4110,7 @@ async fn main() -> Result<()> {
                         .await?;
                     let resp: serde_json::Value =
                         friendly_status(raw, "view billing balance")?.json().await?;
-                    println!("\n{} Credits", crate::brand::brand().display_name);
+                    println!("\nCredits");
                     println!(
                         "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}"
                     );
@@ -4536,10 +4565,7 @@ async fn handle_federation_command(
                 println!("─────────────");
                 println!("  (no peers — platform enumeration coming in F1 chunk 3)");
                 println!();
-                println!(
-                    "  Trust is transitive via the {} platform root CA.",
-                    crate::brand::brand().display_name
-                );
+                println!("  Trust is transitive via the platform root CA.");
                 println!("  Run `prism federation whoami` to see your own identity.");
                 println!("  See docs/prism_fabric_v1_spec.md for the full design.");
                 println!();
@@ -9303,10 +9329,7 @@ async fn run_device_login_with_opts(
         println!();
         println!("  Waiting here until you approve. Ctrl+C to abort.");
     } else {
-        println!(
-            "PRISM setup needs {} platform login.",
-            crate::brand::brand().display_name
-        );
+        println!("PRISM setup needs a platform login.");
         println!("Open: {}", start.verification_uri);
         println!("Code: {}", start.user_code);
         println!();
@@ -10243,7 +10266,7 @@ async fn handle_report(
     if let Some(c) = creds
         && !c.access_token.is_empty()
     {
-        print!("Sending to {}... ", crate::brand::brand().platform_name);
+        print!("Sending to the {}... ", crate::brand::brand().platform_name);
         let platform_body = serde_json::json!({
             "title": format!("bug report: {}", &description[..description.len().min(60)]),
             "description": format!(
@@ -10280,10 +10303,7 @@ async fn handle_report(
         }
     }
 
-    println!(
-        "\nReport submitted. We'll follow up on GitHub and your {} dashboard.",
-        crate::brand::brand().display_name
-    );
+    println!("\nReport submitted. We'll follow up on GitHub and your platform dashboard.");
     Ok(())
 }
 

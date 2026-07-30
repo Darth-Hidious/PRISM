@@ -98,7 +98,7 @@ def create_agent_run_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="start_background_research",
         description=(
-            "Launch a SEPARATE long-running research agent on the MARC27 "
+            "Launch a SEPARATE long-running research agent on the hosted "
             "platform (frontier model with knowledge-graph + web access). "
             "Use this instead of the blocking `research` tool whenever the "
             "question needs deep multi-step work — you get a run_id back "

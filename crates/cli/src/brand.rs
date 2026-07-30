@@ -1,10 +1,11 @@
-//! The single definition of the platform's user-visible brand.
+//! The single definition of how the hosted platform is named to users.
 //!
-//! PRISM is MIT and stands alone as a product; the company operating the
-//! hosted platform is one provider among many. Before this module its name
-//! was spelled out in hundreds of literals, so renaming the company was a
-//! tree-wide sweep across two languages. Now user-visible text reads from
-//! [`Brand`], sourced from `brand.toml` (embedded) with an optional
+//! PRISM stands alone as a product; the hosted platform is one provider
+//! among many. The shipped strings name **no company** — the service is
+//! described by what it is ("hosted platform"), never by who operates it,
+//! because a product naming its own operator reads as an endorsement the
+//! product has no business making. User-visible text reads from [`Brand`],
+//! sourced from `brand.toml` (embedded) with an optional
 //! `~/.prism/brand.toml` override — the same data-file pattern as the
 //! provider registry, so white-labelling needs no rebuild.
 //!
@@ -30,9 +31,9 @@ const BUILTIN_BRAND_TOML: &str = include_str!("../brand.toml");
 /// User-visible names for the hosted platform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Brand {
-    /// Company/platform display name, e.g. `MARC27`.
+    /// How the service reads mid-sentence, e.g. `the platform`.
     pub display_name: String,
-    /// How the platform reads as a chat target, e.g. `MARC27 cloud`.
+    /// How the platform reads as a chat target, e.g. `hosted platform`.
     pub platform_name: String,
     /// Sign-up / documentation URL.
     pub docs_url: String,
@@ -46,10 +47,10 @@ impl Default for Brand {
     /// rather than panicking over a cosmetic string.
     fn default() -> Self {
         Self {
-            display_name: "MARC27".to_string(),
-            platform_name: "MARC27 cloud".to_string(),
+            display_name: "the platform".to_string(),
+            platform_name: "hosted platform".to_string(),
             docs_url: "https://marc27.com".to_string(),
-            tagline: "hosted models, no keys to manage — works out of the box".to_string(),
+            tagline: "hosted models — no key required".to_string(),
         }
     }
 }
@@ -113,16 +114,29 @@ mod tests {
         assert_eq!(Brand::builtin().unwrap(), Brand::default());
     }
 
-    /// The platform name should contain the company name — a rename that
-    /// updated one but not the other would read as two different products.
+    /// PRISM names no company in its own UI. Every string here is rendered
+    /// to users, so a company name reaching one of them puts the product in
+    /// the position of advertising whoever operates the hosted platform.
+    ///
+    /// `docs_url` is exempt on purpose: it is a live address that has to
+    /// resolve, in the same class as `api.marc27.com` and the `MARC27_*`
+    /// env vars, and it is never rendered as a name.
     #[test]
-    fn platform_name_carries_the_display_name() {
+    fn no_company_name_in_rendered_strings() {
         let b = Brand::builtin().unwrap();
-        assert!(
-            b.platform_name.contains(&b.display_name),
-            "platform_name {:?} should build on display_name {:?}",
-            b.platform_name,
-            b.display_name
-        );
+        for (field, value) in [
+            ("display_name", &b.display_name),
+            ("platform_name", &b.platform_name),
+            ("tagline", &b.tagline),
+        ] {
+            let lowered = value.to_lowercase();
+            for banned in ["marc27", "mirdyne"] {
+                assert!(
+                    !lowered.contains(banned),
+                    "brand.{field} = {value:?} names a company; \
+                     describe the service, do not brand it"
+                );
+            }
+        }
     }
 }

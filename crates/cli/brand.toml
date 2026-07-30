@@ -1,8 +1,11 @@
-# The ONE definition of who ships PRISM.
+# The ONE definition of how the hosted platform is named to users.
 #
-# PRISM is MIT and stands alone; the company behind the hosted platform is
-# named here and NOWHERE else in user-visible text. Renaming the company
-# should be an edit to this file, not a sweep across the tree.
+# PRISM stands alone as a product. The company operating the hosted
+# platform is NOT named in any user-visible string — PRISM describes the
+# service it connects to by what it is ("hosted platform"), never by who
+# runs it. These values are deliberately generic nouns; a downstream
+# white-labeller can put their own name here, but the shipped product
+# names no company.
 #
 # ── What belongs here ─────────────────────────────────────────────────
 # User-visible strings only: things a human reads in help text, prompts,
@@ -24,17 +27,21 @@
 # Changing any of those is a breaking change with a deprecation window,
 # not a rename. Renaming the COMPANY does not require renaming them.
 
-# Display name of the company/platform, e.g. in "MARC27 cloud (logged in)".
-display_name = "MARC27"
+# How the service is referred to mid-sentence, e.g. "Token rejected by
+# the platform". Written to read naturally inside a sentence.
+display_name = "the platform"
 
-# How the hosted platform is named as a chat/provider target.
-platform_name = "MARC27 cloud"
+# How the hosted platform is named as a chat/provider target, e.g. in
+# `prism use list` and "hosted platform (logged in)".
+platform_name = "hosted platform"
 
-# Where a user goes to sign up or read about the platform.
+# Where a user goes to sign up. A live address, not a byline — it has to
+# resolve, so it is exempt from the no-company-name rule the same way
+# `api.marc27.com` is. It is not rendered as a name anywhere.
 docs_url = "https://marc27.com"
 
-# One-line pitch shown next to the platform in `prism use list`. This is
-# the product position: the platform is the ZERO-SETUP option, not a
-# required one — every other provider in the registry is equally reachable
-# with the user's own key.
-tagline = "hosted models, no keys to manage — works out of the box"
+# One-line description shown next to the platform in `prism use list`,
+# alongside "your own key · OPENAI_API_KEY" and friends. States what the
+# entry requires, nothing more — the other rows describe themselves the
+# same way, and PRISM does not advertise any provider over the rest.
+tagline = "hosted models — no key required"
