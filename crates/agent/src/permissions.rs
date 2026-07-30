@@ -7,8 +7,8 @@
 //! use prism_agent::permissions::{ToolPermissionContext, PermissionMode, get_tool_permission};
 //!
 //! let ctx = ToolPermissionContext::default();
-//! assert!(!ctx.blocks("search_materials"));
-//! assert!(ctx.auto_approves("search_materials"));
+//! assert!(!ctx.blocks("materials_search"));
+//! assert!(ctx.auto_approves("materials_search"));
 //!
 //! // Create a more restrictive context
 //! let restricted = ctx.with_deny(
@@ -70,7 +70,7 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         let mut m = HashMap::new();
 
         // Read-only tools (safe, no side effects)
-        m.insert("search_materials", ReadOnly);
+        m.insert("materials_search", ReadOnly);
         m.insert("query_materials_project", ReadOnly);
         m.insert("literature_search", ReadOnly);
         m.insert("patent_search", ReadOnly);
@@ -357,7 +357,7 @@ impl Default for ToolPermissionContext {
             deny_names: HashSet::new(),
             deny_prefixes: Vec::new(),
             auto_approve_names: HashSet::from([
-                "search_materials".to_string(),
+                "materials_search".to_string(),
                 "literature_search".to_string(),
                 "web_search".to_string(),
                 "web_read".to_string(),
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn tool_permission_lookup() {
         assert_eq!(
-            get_tool_permission("search_materials"),
+            get_tool_permission("materials_search"),
             PermissionMode::ReadOnly
         );
         assert_eq!(
@@ -466,13 +466,13 @@ mod tests {
         let ctx = ToolPermissionContext::default().with_deny(&[], &["compute_".to_string()]);
         assert!(ctx.blocks("compute_submit"));
         assert!(ctx.blocks("compute_cancel"));
-        assert!(!ctx.blocks("search_materials"));
+        assert!(!ctx.blocks("materials_search"));
     }
 
     #[test]
     fn context_auto_approve_default() {
         let ctx = ToolPermissionContext::default();
-        assert!(ctx.auto_approves("search_materials"));
+        assert!(ctx.auto_approves("materials_search"));
         assert!(ctx.auto_approves("read_file"));
         assert!(!ctx.auto_approves("execute_python"));
     }
@@ -490,15 +490,15 @@ mod tests {
         let ctx =
             ToolPermissionContext::default().with_auto_approve(&["execute_python".to_string()]);
         assert!(ctx.auto_approves("execute_python"));
-        assert!(ctx.auto_approves("search_materials")); // still approved
+        assert!(ctx.auto_approves("materials_search")); // still approved
     }
 
     #[test]
     fn context_deny_overrides_auto_approve() {
         let ctx =
-            ToolPermissionContext::default().with_deny(&["search_materials".to_string()], &[]);
+            ToolPermissionContext::default().with_deny(&["materials_search".to_string()], &[]);
         // blocked even though it's in auto_approve
-        assert!(ctx.blocks("search_materials"));
+        assert!(ctx.blocks("materials_search"));
     }
 
     #[test]

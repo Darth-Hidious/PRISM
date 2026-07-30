@@ -11,6 +11,30 @@ use crate::permissions::{PermissionMode, get_tool_permission};
 /// the contract.
 pub const MAX_TOOLS_PER_REQUEST: usize = 15;
 
+/// Tools that survive keyword filtering in every session.
+///
+/// Module-level rather than buried in the filter so `stale_tool_names_are_gone`
+/// can actually read it. It named the removed `search_materials` for months,
+/// which meant the federated OPTIMADE search reached the model only when the
+/// user's phrasing happened to keyword-match it — on a materials platform, the
+/// one tool that must always be on the table.
+pub const ALWAYS_INCLUDE: &[&str] = &["query", "materials_search", "query_platform"];
+
+/// Tool names this codebase has renamed away from.
+///
+/// A stale name in any model-facing list is not a cosmetic bug: the model is
+/// told a tool exists, calls it, and gets an error it cannot act on. This
+/// shipped once already (PR #91, `search_materials` → `materials_search`) and
+/// the guard written for it covered only the prompt block — so the same dead
+/// name survived in three other lists. Anything added here is checked against
+/// all of them.
+pub const RENAMED_AWAY: &[&str] = &[
+    "search_materials",
+    "knowledge_search",
+    "predict_property",
+    "semantic_search",
+];
+
 /// Full metadata for one loaded tool. Rust keeps this alongside the OpenAI
 /// function definition so command views, permission logic, and approval UI all
 /// talk about the same concrete tool facts.
@@ -247,9 +271,6 @@ impl ToolCatalog {
             .filter(|w| w.len() > 2)
             .collect();
 
-        // Always-include tools that are core to every session
-        const ALWAYS_INCLUDE: &[&str] = &["query", "search_materials", "query_platform"];
-
         let mut scored: Vec<(usize, &LoadedTool)> = self
             .tools
             .iter()
@@ -324,6 +345,50 @@ fn is_untrusted_source(source: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every model-facing tool list, checked against the names we renamed away.
+    ///
+    /// The existing guard in `prism_llm` covers only the quick-reference prompt
+    /// block. When `search_materials` became `materials_search`, that guard went
+    /// green while the dead name survived here, in `CORE_TOOL_SET`, and in the
+    /// permission map — so a weak model never got the materials tool at all and
+    /// the live tool fell through to the `WorkspaceWrite` default. One list
+    /// being guarded is not the same as the drift being caught.
+    #[test]
+    fn stale_tool_names_are_gone_from_every_model_facing_list() {
+        for stale in RENAMED_AWAY {
+            assert!(
+                !ALWAYS_INCLUDE.contains(stale),
+                "ALWAYS_INCLUDE still names the removed tool `{stale}`"
+            );
+            assert!(
+                !crate::prompt_profile::CORE_TOOL_SET.contains(stale),
+                "CORE_TOOL_SET still names the removed tool `{stale}`"
+            );
+        }
+    }
+
+    /// The federated materials search must be reachable and read-only.
+    ///
+    /// Two separate ways it was not: absent from the core set, so weak models
+    /// never saw it; and absent from the permission map, so it inherited
+    /// `WorkspaceWrite` and stopped being auto-approved.
+    #[test]
+    fn materials_search_is_core_and_read_only() {
+        assert!(
+            ALWAYS_INCLUDE.contains(&"materials_search"),
+            "materials_search must survive keyword filtering on a materials platform"
+        );
+        assert!(
+            crate::prompt_profile::CORE_TOOL_SET.contains(&"materials_search"),
+            "a weak model without materials_search has nothing to answer from"
+        );
+        assert_eq!(
+            get_tool_permission("materials_search"),
+            PermissionMode::ReadOnly,
+            "a federated database read must not require approval"
+        );
+    }
 
     #[test]
     fn parses_tool_metadata_from_python_tool_server() {

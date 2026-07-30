@@ -99,6 +99,9 @@ pub const CORE_TOOL_SET: &[&str] = &[
     "query_platform",
     "knowledge_entity",
     "research_query",
+    // Federated materials search. A weak model on a materials platform that
+    // cannot reach the materials databases has nothing to answer from.
+    "materials_search",
     // environment / discovery
     "status",
     "list_tools",
