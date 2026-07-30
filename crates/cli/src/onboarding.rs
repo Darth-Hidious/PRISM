@@ -89,37 +89,198 @@ pub async fn run_if_first_launch(
 
     welcome();
 
-    // Step 1 — sign in. Reuses the exact device-flow `prism login` uses:
-    // opens the browser (or prints a paste-this URL + code) and polls.
-    step_header(1, "Sign in to MARC27");
-    println!("  A browser window will open to sign in. If it doesn't, copy the");
-    println!("  link and code shown below into any browser on any device.\n");
-    perform_full_login(
-        paths,
-        endpoints,
-        python,
-        LoginMode::Device { no_browser: false },
-    )
-    .await?;
+    // Step 1 — pick how PRISM reaches a model.
+    //
+    // This used to be "sign in", full stop, with the login error
+    // propagating out of `run_if_first_launch` — so a user without a
+    // platform account could not get past the wizard into PRISM at all,
+    // and `prism --offline` was the only way in. PRISM works with any
+    // OpenAI-compatible endpoint and the user's own key, so the wizard
+    // now asks rather than assumes.
+    //
+    // The hosted platform stays option 1 and the bare-Enter default: it
+    // is the least-friction route (no keys, nothing to install). It is
+    // just no longer the ONLY route.
+    step_header(1, "Choose where your models run");
+    match choose_route()? {
+        Route::Platform => {
+            println!("\n  A browser window will open to sign in. If it doesn't, copy the");
+            println!("  link and code shown below into any browser on any device.\n");
+            perform_full_login(
+                paths,
+                endpoints,
+                python,
+                LoginMode::Device { no_browser: false },
+            )
+            .await?;
 
-    // Step 2 — pick a default model from the shortlist.
-    step_header(2, "Choose your model");
-    choose_model()?;
+            step_header(2, "Choose your model");
+            choose_model()?;
 
-    // Step 3 — how model billing / keys work (informational, no secrets
-    // collected here — the user sets their own env var in their own
-    // shell if they want to bring a key).
-    step_header(3, "API keys");
-    api_keys_note();
+            step_header(3, "API keys");
+            api_keys_note();
+        }
+        Route::OwnProvider => {
+            step_header(2, "Pick a provider");
+            choose_provider()?;
+
+            step_header(3, "You can sign in later");
+            platform_later_note();
+        }
+    }
 
     done();
     Ok(())
 }
 
+/// How a first-run user wants chat routed.
+enum Route {
+    /// The hosted platform — no keys, no local install.
+    Platform,
+    /// Any provider in the registry, on the user's own key (or a local
+    /// server needing no key at all).
+    OwnProvider,
+}
+
+struct RouteChoice {
+    route: Route,
+    label: &'static str,
+    blurb: String,
+}
+
+/// Ask how to route chat. Bare Enter picks the platform: it is the option
+/// that needs nothing installed and no key pasted.
+fn choose_route() -> Result<Route> {
+    let brand = crate::brand::brand();
+    println!("  PRISM talks to any OpenAI-compatible model. Two ways to start:");
+
+    let options = [
+        RouteChoice {
+            route: Route::Platform,
+            label: "Hosted",
+            blurb: format!("{} — {}", brand.platform_name, brand.tagline),
+        },
+        RouteChoice {
+            route: Route::OwnProvider,
+            label: "Own key",
+            blurb: "OpenAI, Anthropic, Groq, Ollama, … — your key, your bill".to_string(),
+        },
+    ];
+    let chosen = prompt_select("Route", &options, |o| {
+        format!("{:<10} \x1b[2m{}\x1b[0m", o.label, o.blurb)
+    })?;
+    Ok(match chosen.route {
+        Route::Platform => Route::Platform,
+        Route::OwnProvider => Route::OwnProvider,
+    })
+}
+
+/// Present the provider registry and persist the pick as the chat target.
+///
+/// Providers whose key is already exported are marked, so the common case
+/// (someone who already has `OPENAI_API_KEY` in their shell) is a single
+/// keypress away from a working PRISM with no account anywhere.
+fn choose_provider() -> Result<()> {
+    let registry = crate::providers::Registry::load();
+    let choices: Vec<&crate::providers::Provider> =
+        registry.all().iter().filter(|p| !p.platform).collect();
+    if choices.is_empty() {
+        // Cannot happen with the shipped registry, but refusing to prompt
+        // over an empty list beats panicking on an index.
+        return Ok(());
+    }
+
+    println!("  Your key is read from an env var at request time — PRISM never");
+    println!("  writes it to disk. Local servers need no key at all.");
+
+    let chosen = prompt_select("Provider", &choices, |p| {
+        let ready = if p.key_present() {
+            "\x1b[32m✓ key found\x1b[0m"
+        } else {
+            "\x1b[2m  no key   \x1b[0m"
+        };
+        format!(
+            "{:<24} {ready}  \x1b[2m{}\x1b[0m",
+            p.display_name(),
+            p.blurb()
+        )
+    })?;
+
+    let model = prompt_line(&format!(
+        "Model id for {} (e.g. the one you use today)",
+        chosen.display_name()
+    ))?;
+
+    let mut cfg = chat_config::load().unwrap_or_default();
+    cfg.chat = ChatTarget::Provider {
+        provider: chosen.id.clone(),
+        model: model.clone(),
+        api_key_env: chosen.api_key_env.clone(),
+    };
+    chat_config::save(&cfg)?;
+
+    println!(
+        "\n  \x1b[32m✓\x1b[0m Chat routed to \x1b[1m{}\x1b[0m ({model}).",
+        chosen.display_name()
+    );
+    match &chosen.api_key_env {
+        Some(var) if !chosen.key_present() => {
+            println!(
+                "  \x1b[33m!\x1b[0m Set your key before chatting: \x1b[1mexport {var}=…\x1b[0m"
+            );
+            if let Some(docs) = &chosen.docs {
+                println!("    Get one at \x1b[4m{docs}\x1b[0m");
+            }
+        }
+        Some(var) => println!("  \x1b[2mUsing {var} from your environment.\x1b[0m"),
+        None => println!("  \x1b[2mNo key needed — make sure the server is running.\x1b[0m"),
+    }
+    Ok(())
+}
+
+/// Read one non-empty line. Used for the model id, which we cannot offer a
+/// shortlist for without querying a provider we have no key for yet.
+fn prompt_line(label: &str) -> Result<String> {
+    loop {
+        print!("\n{label}: ");
+        io::stdout().flush()?;
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf)?;
+        let trimmed = buf.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+        println!("  \x1b[2mA model id is required.\x1b[0m");
+    }
+}
+
+/// Close the own-key path by naming what signing in would add, without
+/// implying anything is broken without it.
+fn platform_later_note() {
+    let brand = crate::brand::brand();
+    println!("  You're set — chat, local tools, notebooks and workflows all work now.");
+    println!(
+        "  \x1b[2mSigning in to {} later adds the hosted knowledge graph, discourse,\x1b[0m",
+        brand.display_name
+    );
+    println!("  \x1b[2mmarketplace and managed compute:\x1b[0m \x1b[1mprism login\x1b[0m");
+    println!(
+        "  \x1b[2mSwitch or compare providers any time:\x1b[0m \x1b[1mprism use list\x1b[0m\n"
+    );
+    print!("  Press \x1b[1mEnter\x1b[0m to continue. ");
+    let _ = io::stdout().flush();
+    let mut scratch = String::new();
+    let _ = io::stdin().read_line(&mut scratch);
+}
+
 /// Present the shortlist and persist the pick as the default chat target.
 fn choose_model() -> Result<()> {
-    println!("  PRISM runs on MARC27's hosted models — billed per call to your");
-    println!("  org's credits, no keys to manage. Pick a default (change any time");
+    let brand = crate::brand::brand();
+    println!(
+        "  Models are served on {}'s keys — billed per call to your org's",
+        brand.display_name
+    );
+    println!("  credits, nothing to manage. Pick a default (change any time");
     println!("  with \x1b[1m/model\x1b[0m inside PRISM):");
 
     let chosen = prompt_select("Model", CURATED_MODELS, |m| {
@@ -143,13 +304,17 @@ fn choose_model() -> Result<()> {
 /// through this prompt — we only point at the env var the user sets
 /// themselves.
 fn api_keys_note() {
-    println!("  By default every model is served on MARC27's keys — nothing to set up.");
+    let brand = crate::brand::brand();
+    println!(
+        "  By default every model is served on {}'s keys — nothing to set up.",
+        brand.display_name
+    );
     println!("  To use your \x1b[1mown\x1b[0m provider key instead (billed to you directly):\n");
     println!(
         "    \x1b[2mexport OPENAI_API_KEY=…\x1b[0m   \x1b[2m# or ANTHROPIC_API_KEY, etc.\x1b[0m"
     );
     println!(
-        "    \x1b[2mthen switch with \x1b[0m\x1b[1m/use\x1b[0m\x1b[2m inside PRISM (see `prism use --help`)\x1b[0m\n"
+        "    \x1b[2mthen \x1b[0m\x1b[1m/use list\x1b[0m\x1b[2m inside PRISM to see every provider and switch\x1b[0m\n"
     );
     print!("  Press \x1b[1mEnter\x1b[0m to continue. ");
     let _ = io::stdout().flush();

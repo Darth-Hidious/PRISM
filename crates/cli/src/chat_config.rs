@@ -3,28 +3,33 @@
 //! Right now it stores only one thing: the **chat target** (where chat
 //! turns get sent). Three first-class options:
 //!
-//!   - **MARC27 cloud** (default) — chat goes through MARC27's platform
-//!     proxy (`api.marc27.com`), which fronts ~590 hosted models. The
-//!     user picks WHICH model MARC27 should serve (`gpt-5.5`,
-//!     `claude-sonnet-4`, `mistral-large-latest`, …). **MARC27's own
-//!     internal vendor keys never leave the platform backend.** PRISM
-//!     does not see them.
+//!   - **Hosted platform** (the zero-setup default) — chat goes through
+//!     the platform's proxy, which fronts hundreds of hosted models. The
+//!     user picks WHICH model the platform should serve. **The platform's
+//!     own internal vendor keys never leave its backend.** PRISM does not
+//!     see them.
 //!   - **Local LLM** — chat goes to a user-supplied OpenAI-compatible URL
 //!     (Ollama at `:11434/v1`, llama.cpp `--server`, vLLM, etc.). No
 //!     keys leave the user's machine — strictly local.
-//!   - **Direct provider** — chat goes straight to a vendor (Anthropic
-//!     / OpenAI / Mistral / …) using **the user's OWN API key**, which
-//!     PRISM reads from a named env var at request time and never
-//!     persists to disk. This is the user's choice; their keys, their
-//!     call. The hygiene rule that matters is that *MARC27's* own
-//!     platform keys stay on MARC27.
+//!   - **Direct provider** — chat goes straight to any vendor in the
+//!     [`crate::providers`] registry (OpenAI, Anthropic, Google, Groq,
+//!     OpenRouter, …) using **the user's OWN API key**, read from a named
+//!     env var at request time and never persisted to disk. This is the
+//!     user's choice; their keys, their call. The hygiene rule that
+//!     matters is that the *platform's* own keys stay on the platform.
 //!
-//! The chat target is **independent** of MARC27 platform tools. MARC27
-//! tools (knowledge graph, discourse, marketplace, materials project,
-//! …) work regardless of which chat target is selected, so long as
-//! `prism login` was run at some point. This lets a user run a local
-//! llama for chat while still pulling tool results from MARC27's
-//! materials-science backbone — that's the whole point of decoupling.
+//! The chat target is **independent** of the platform's tools, and the
+//! reverse is also true: chat works with no account at all via the other
+//! two options. Platform tools (knowledge graph, discourse, marketplace)
+//! need `prism login`; local tools, notebooks and workflows do not. That
+//! separation is the whole point — PRISM is a complete product without
+//! the platform, and the platform is the easiest way to run it, not a
+//! requirement.
+//!
+//! The `mode = "marc27"` value serialized into this file is a **frozen
+//! wire identifier** — existing installs on disk depend on it — so it
+//! does not move when the platform's display name changes. See
+//! [`crate::brand`].
 
 use std::path::{Path, PathBuf};
 
@@ -91,21 +96,28 @@ impl ChatTarget {
     /// method on the enum so that PR is purely additive (no
     /// changes to chat_config).
     #[allow(dead_code)]
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            Self::Marc27 { .. } => "MARC27 cloud",
-            Self::Local { .. } => "local",
-            Self::Provider { .. } => "direct provider",
+            Self::Marc27 { .. } => crate::brand::brand().platform_name.clone(),
+            Self::Local { .. } => "local".to_string(),
+            Self::Provider { .. } => "direct provider".to_string(),
         }
     }
 
     /// Long-form rendering used by `/use show` and boot status. Includes
     /// model name and any user-visible target hint.
+    ///
+    /// The platform's name comes from `brand.toml` (see [`crate::brand`]),
+    /// not a literal — this string is on the boot screen and in every
+    /// `/use show`, so it was one of the most-repeated brand spellings in
+    /// the tree. The `marc27` serde tag underneath is a frozen wire
+    /// identifier and does NOT move with the brand.
     pub fn human_full(&self) -> String {
+        let platform = &crate::brand::brand().platform_name;
         match self {
             Self::Marc27 { model } => match model {
-                Some(m) => format!("MARC27 cloud ({m})"),
-                None => "MARC27 cloud".to_string(),
+                Some(m) => format!("{platform} ({m})"),
+                None => platform.clone(),
             },
             Self::Local { url, model, .. } => format!("local ({url}, {model})"),
             Self::Provider {
@@ -114,20 +126,12 @@ impl ChatTarget {
         }
     }
 
-    /// Default API-key env var for a provider when the user didn't
-    /// override it. Centralises the "what env var holds the key" rule
-    /// so we can update it once if a vendor renames theirs.
-    pub fn default_api_key_env(provider: &str) -> &'static str {
-        match provider.to_ascii_lowercase().as_str() {
-            "anthropic" => "ANTHROPIC_API_KEY",
-            "openai" => "OPENAI_API_KEY",
-            "mistral" => "MISTRAL_API_KEY",
-            "google" | "gemini" => "GEMINI_API_KEY",
-            "cohere" => "COHERE_API_KEY",
-            // Catch-all — caller can still set api_key_env explicitly.
-            _ => "PRISM_PROVIDER_API_KEY",
-        }
-    }
+    // NOTE: `default_api_key_env` used to live here as a hardcoded
+    // `match` over five vendors. It now lives in
+    // [`crate::providers::default_api_key_env`], reading the shipped
+    // `providers.toml` plus the user's `~/.prism/providers.toml`
+    // override — so adding a vendor, or renaming the env var one of them
+    // uses, is a config edit rather than a release.
 }
 
 /// The whole `~/.prism/config.toml` file. Today only `chat` is here;
@@ -147,7 +151,7 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 /// Load config; if the file is missing or malformed, return the
-/// default (MARC27 cloud) rather than erroring. A malformed file is
+/// default (the hosted platform) rather than erroring. A malformed file is
 /// not fatal — the user can fix it via `prism use ...` and we'll
 /// rewrite cleanly. Logging the parse error is the right balance
 /// between "loud" (panic) and "silent" (forget the user's setting).
@@ -249,16 +253,19 @@ mod tests {
 
     #[test]
     fn human_full_renders() {
+        // Asserted against `brand.toml`, not a literal: this is what
+        // makes a company rename a one-file edit instead of a test sweep.
+        let platform = &crate::brand::brand().platform_name;
         assert_eq!(
             ChatTarget::Marc27 { model: None }.human_full(),
-            "MARC27 cloud"
+            platform.as_str()
         );
         assert_eq!(
             ChatTarget::Marc27 {
                 model: Some("gpt-5.5".to_string())
             }
             .human_full(),
-            "MARC27 cloud (gpt-5.5)"
+            format!("{platform} (gpt-5.5)")
         );
         let local = ChatTarget::Local {
             url: "http://localhost:11434/v1".into(),
@@ -275,19 +282,5 @@ mod tests {
             api_key_env: None,
         };
         assert_eq!(provider.human_full(), "anthropic (claude-sonnet-4)");
-    }
-
-    #[test]
-    fn default_api_key_env_known_providers() {
-        assert_eq!(
-            ChatTarget::default_api_key_env("anthropic"),
-            "ANTHROPIC_API_KEY"
-        );
-        assert_eq!(ChatTarget::default_api_key_env("OpenAI"), "OPENAI_API_KEY");
-        assert_eq!(ChatTarget::default_api_key_env("gemini"), "GEMINI_API_KEY");
-        assert_eq!(
-            ChatTarget::default_api_key_env("some-new-vendor"),
-            "PRISM_PROVIDER_API_KEY"
-        );
     }
 }

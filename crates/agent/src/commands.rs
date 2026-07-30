@@ -285,6 +285,11 @@ const BUILTIN_COMMANDS: &[SlashCommandSpec] = &[
         description: "Show the active chat target (MARC27 / local / provider)",
         category: "Settings",
     },
+    SlashCommandSpec {
+        usage: "/use list",
+        description: "List every LLM provider PRISM can route chat to, and which have keys",
+        category: "Settings",
+    },
 ];
 
 const CLI_BACKED_ROOTS: &[&str] = &[

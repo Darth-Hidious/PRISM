@@ -1,0 +1,181 @@
+# PRISM built-in LLM provider registry.
+#
+# PRISM is provider-neutral. The hosted platform is the FIRST entry because
+# it is the least-friction one — it works with no keys and no setup — but
+# it is an entry in the same table as everyone else, not a dependency.
+# Every other provider here is equally reachable with `prism use provider
+# <id> --model <model>` (or `/use provider ...` in the TUI) using YOUR OWN
+# key, read from the named env var at request time. PRISM never writes your
+# key to disk.
+#
+# ── Overriding / extending ────────────────────────────────────────────
+# Drop a file with this same schema at `~/.prism/providers.toml`. Entries
+# whose `id` matches a built-in REPLACE it; new ids are appended. That is
+# the supported way to point at a private gateway, a corporate proxy, or a
+# vendor PRISM has not shipped yet — no rebuild, no code change.
+#
+#   [[provider]]
+#   id = "my-gateway"
+#   name = "Internal gateway"
+#   base_url = "https://llm.corp.internal/v1"
+#   api_key_env = "CORP_LLM_KEY"
+#
+# ── Fields ────────────────────────────────────────────────────────────
+#   id           required. The slug passed to `prism use provider <id>`.
+#   name         display name for `prism use list`.
+#   base_url     OpenAI-compatible base. PRISM appends `/chat/completions`.
+#                Omit only when `platform = true`.
+#   api_key_env  env var PRISM reads the key from at request time. Omit
+#                for keyless endpoints (local servers).
+#   docs         where to get a key. Shown when the key is missing.
+#   platform     true ⇒ the base URL comes from the signed-in session, not
+#                this file. Only MARC27 sets this.
+#
+# NOTE ON base_url: these are each vendor's OpenAI-COMPATIBLE endpoint,
+# which is the only chat protocol PRISM's LLM client speaks (besides
+# MARC27's native one). Where a vendor's native API differs (Anthropic,
+# Google), the URL below is their documented OpenAI-compat surface.
+
+# ── The hosted platform: zero setup, listed first ─────────────────────
+# `name`, `docs` and the listing blurb come from `brand.toml` — the ONE
+# place the company is named — so renaming the company renames this entry
+# too. `platform = true` means the base URL is resolved from the signed-in
+# session (the per-project LLM endpoint), never from this file.
+#
+# The `id` is a frozen wire identifier: it is what `prism use marc27`
+# accepts and what gets serialized into `~/.prism/config.toml`. Renaming
+# the company does NOT rename it.
+
+[[provider]]
+id = "marc27"
+platform = true
+
+# ── Hosted, bring-your-own-key ────────────────────────────────────────
+
+[[provider]]
+id = "openai"
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+docs = "https://platform.openai.com/api-keys"
+
+[[provider]]
+id = "anthropic"
+name = "Anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+docs = "https://console.anthropic.com/settings/keys"
+
+[[provider]]
+id = "google"
+name = "Google Gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key_env = "GEMINI_API_KEY"
+docs = "https://aistudio.google.com/apikey"
+
+# `gemini` is the same endpoint under the name people actually type. It
+# is a separate entry rather than an alias mechanism because a second
+# table is cheaper than a second concept — and the old hardcoded match
+# accepted both spellings, so dropping one would be a regression.
+[[provider]]
+id = "gemini"
+name = "Google Gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key_env = "GEMINI_API_KEY"
+docs = "https://aistudio.google.com/apikey"
+
+[[provider]]
+id = "openrouter"
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+docs = "https://openrouter.ai/keys"
+
+[[provider]]
+id = "groq"
+name = "Groq"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+docs = "https://console.groq.com/keys"
+
+[[provider]]
+id = "cerebras"
+name = "Cerebras"
+base_url = "https://api.cerebras.ai/v1"
+api_key_env = "CEREBRAS_API_KEY"
+docs = "https://cloud.cerebras.ai"
+
+[[provider]]
+id = "zai"
+name = "z.ai (GLM)"
+base_url = "https://api.z.ai/api/paas/v4"
+api_key_env = "ZAI_API_KEY"
+docs = "https://z.ai/manage-apikey/apikey-list"
+
+[[provider]]
+id = "mistral"
+name = "Mistral"
+base_url = "https://api.mistral.ai/v1"
+api_key_env = "MISTRAL_API_KEY"
+docs = "https://console.mistral.ai/api-keys"
+
+[[provider]]
+id = "deepseek"
+name = "DeepSeek"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+docs = "https://platform.deepseek.com/api_keys"
+
+[[provider]]
+id = "xai"
+name = "xAI (Grok)"
+base_url = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"
+docs = "https://console.x.ai"
+
+[[provider]]
+id = "together"
+name = "Together AI"
+base_url = "https://api.together.xyz/v1"
+api_key_env = "TOGETHER_API_KEY"
+docs = "https://api.together.xyz/settings/api-keys"
+
+[[provider]]
+id = "fireworks"
+name = "Fireworks AI"
+base_url = "https://api.fireworks.ai/inference/v1"
+api_key_env = "FIREWORKS_API_KEY"
+docs = "https://fireworks.ai/account/api-keys"
+
+[[provider]]
+id = "cohere"
+name = "Cohere"
+base_url = "https://api.cohere.ai/compatibility/v1"
+api_key_env = "COHERE_API_KEY"
+docs = "https://dashboard.cohere.com/api-keys"
+
+# ── Local, no key, no account, no network ─────────────────────────────
+
+[[provider]]
+id = "ollama"
+name = "Ollama (local)"
+base_url = "http://localhost:11434/v1"
+docs = "https://ollama.com/download"
+
+[[provider]]
+id = "llamacpp"
+name = "llama.cpp server (local)"
+base_url = "http://localhost:8080/v1"
+docs = "https://github.com/ggml-org/llama.cpp"
+
+[[provider]]
+id = "lmstudio"
+name = "LM Studio (local)"
+base_url = "http://localhost:1234/v1"
+docs = "https://lmstudio.ai"
+
+[[provider]]
+id = "vllm"
+name = "vLLM (local)"
+base_url = "http://localhost:8000/v1"
+docs = "https://docs.vllm.ai"

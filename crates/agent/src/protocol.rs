@@ -7067,6 +7067,24 @@ async fn handle_command(
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
+        // `/use list` — the provider registry. Read-only like `show`, so
+        // it carries none of the switching variants' "printed as if it
+        // took effect" problem, and it is the answer to "what else can
+        // PRISM talk to?" without leaving the TUI for a shell.
+        _ if trimmed == "/use list" => {
+            let raw =
+                spawn_prism_cli(&[String::from("use"), String::from("list")], slash_ctx).await?;
+            let output = format_cli_output(
+                &raw.invocation,
+                &raw.stdout,
+                &raw.stderr,
+                raw.success,
+                raw.code,
+            );
+            emit_view("use", "Providers", &output, "info");
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
         _ if trimmed.starts_with("/billing topup") => {
             // Buy credits: list the packs, and with a slug open the hosted
             // checkout in the browser. Crediting is server-side on payment.

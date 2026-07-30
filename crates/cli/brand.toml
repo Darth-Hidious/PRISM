@@ -1,0 +1,40 @@
+# The ONE definition of who ships PRISM.
+#
+# PRISM is MIT and stands alone; the company behind the hosted platform is
+# named here and NOWHERE else in user-visible text. Renaming the company
+# should be an edit to this file, not a sweep across the tree.
+#
+# ── What belongs here ─────────────────────────────────────────────────
+# User-visible strings only: things a human reads in help text, prompts,
+# error messages, and listings.
+#
+# ── What deliberately does NOT belong here ────────────────────────────
+# WIRE IDENTIFIERS. These are a compatibility surface — shipped clients,
+# existing installs, and on-disk state depend on their exact spelling, so
+# they are FROZEN and stay hardcoded on purpose:
+#
+#   • env vars       MARC27_API_KEY, MARC27_TOKEN, MARC27_API_URL,
+#                    MARC27_PLATFORM_URL, MARC27_PROJECT_ID
+#   • API key prefix `m27_` (the platform routes it to X-API-Key by shape)
+#   • config values  `[chat] mode = "marc27"`, `[indexer] mode = "marc27"`,
+#                    `prism use marc27`, `publish --to marc27`,
+#                    `run --backend marc27`
+#   • on-disk paths  ~/.prism/ (PRISM's own name, not the company's)
+#
+# Changing any of those is a breaking change with a deprecation window,
+# not a rename. Renaming the COMPANY does not require renaming them.
+
+# Display name of the company/platform, e.g. in "MARC27 cloud (logged in)".
+display_name = "MARC27"
+
+# How the hosted platform is named as a chat/provider target.
+platform_name = "MARC27 cloud"
+
+# Where a user goes to sign up or read about the platform.
+docs_url = "https://marc27.com"
+
+# One-line pitch shown next to the platform in `prism use list`. This is
+# the product position: the platform is the ZERO-SETUP option, not a
+# required one — every other provider in the registry is equally reachable
+# with the user's own key.
+tagline = "hosted models, no keys to manage — works out of the box"

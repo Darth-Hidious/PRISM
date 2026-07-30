@@ -7,11 +7,13 @@
 
 mod boot;
 mod boot_checks;
+mod brand;
 mod chat_config;
 mod doctor;
 mod mcp_server_native;
 mod notebook;
 mod onboarding;
+mod providers;
 mod pyiron_cmd;
 mod tool_sync;
 mod use_command;
@@ -1248,6 +1250,9 @@ enum UseCommands {
         #[arg(long)]
         api_key_env: Option<String>,
     },
+    /// List every provider PRISM can route chat to, and which ones have
+    /// credentials present right now. Read-only.
+    List,
     /// Print the current chat target and the tools-auth state.
     Show,
     /// Reset chat target back to MARC27 cloud (the default).
@@ -1889,15 +1894,13 @@ async fn main() -> Result<()> {
                     model,
                     api_key_env,
                 } => {
-                    let env_name = api_key_env.as_deref().unwrap_or_else(|| {
-                        crate::chat_config::ChatTarget::default_api_key_env(provider)
+                    let registry = crate::providers::Registry::load();
+                    let env_name = api_key_env.clone().unwrap_or_else(|| {
+                        crate::providers::default_api_key_env(&registry, provider)
                     });
-                    let provider_key = std::env::var(env_name).ok();
+                    let provider_key = std::env::var(&env_name).ok();
                     (
-                        format!(
-                            "https://api.{provider}.com/v1",
-                            provider = provider.to_ascii_lowercase()
-                        ),
+                        provider_endpoint(&registry, provider),
                         model.clone(),
                         provider_key.or(api_key),
                     )
@@ -2384,16 +2387,14 @@ async fn main() -> Result<()> {
                             model,
                             api_key_env,
                         } => {
-                            let env_name = api_key_env.as_deref().unwrap_or_else(|| {
-                                crate::chat_config::ChatTarget::default_api_key_env(provider)
+                            let registry = crate::providers::Registry::load();
+                            let env_name = api_key_env.clone().unwrap_or_else(|| {
+                                crate::providers::default_api_key_env(&registry, provider)
                             });
                             (
-                                format!(
-                                    "https://api.{provider}.com/v1",
-                                    provider = provider.to_ascii_lowercase()
-                                ),
+                                provider_endpoint(&registry, provider),
                                 model.clone(),
-                                std::env::var(env_name).ok().or_else(|| {
+                                std::env::var(&env_name).ok().or_else(|| {
                                     prism_core::config::NodeConfig::resolve_api_key(
                                         &node_config.indexer,
                                     )
@@ -4846,6 +4847,25 @@ fn handle_configure(
     Ok(())
 }
 
+/// The chat endpoint for a direct-provider target, from the provider
+/// registry (`providers.toml` + `~/.prism/providers.toml`).
+///
+/// Every chat surface resolves the endpoint here so the four of them can
+/// never drift apart again. Before the registry they each carried their own
+/// copy of `format!("https://api.{provider}.com/v1")` — a guess that only
+/// happens to be right for OpenAI and DeepSeek, and that quietly aimed
+/// Mistral at `api.mistral.com` (the real host is `.ai`), Groq at the wrong
+/// path, and Google at a host that does not serve chat at all.
+///
+/// An id in nobody's registry keeps that historical guess rather than
+/// erroring: it is the only thing we can do for an unknown slug, it is what
+/// the code did before, and `prism use provider` warns at selection time
+/// (the moment the user can act on it) instead of failing mid-turn.
+fn provider_endpoint(registry: &crate::providers::Registry, provider: &str) -> String {
+    crate::providers::base_url_for(registry, provider)
+        .unwrap_or_else(|| crate::providers::legacy_guess_base_url(provider))
+}
+
 /// Build LlmConfig from prism.toml with optional CLI overrides.
 ///
 /// Precedence: CLI flags > config.toml [chat] > prism.toml [llm] > built-in defaults.
@@ -4888,22 +4908,20 @@ fn build_llm_config(
             model: prov_model,
             api_key_env,
         } => {
+            let registry = crate::providers::Registry::load();
             let env_name = api_key_env
-                .as_deref()
-                .unwrap_or_else(|| crate::chat_config::ChatTarget::default_api_key_env(provider));
+                .clone()
+                .unwrap_or_else(|| crate::providers::default_api_key_env(&registry, provider));
             (
-                url_override.map(str::to_string).unwrap_or_else(|| {
-                    format!(
-                        "https://api.{provider}.com/v1",
-                        provider = provider.to_ascii_lowercase()
-                    )
-                }),
+                url_override
+                    .map(str::to_string)
+                    .unwrap_or_else(|| provider_endpoint(&registry, provider)),
                 model_override
                     .map(str::to_string)
                     .unwrap_or_else(|| prov_model.clone()),
                 api_key_override
                     .map(str::to_string)
-                    .or_else(|| std::env::var(env_name).ok())
+                    .or_else(|| std::env::var(&env_name).ok())
                     .or_else(|| llm.resolve_api_key()),
             )
         }
@@ -4951,6 +4969,7 @@ fn build_llm_config(
 /// never shadows a working env override. The model honors `LLM_MODEL` (env) →
 /// `/use marc27 --model` → `[llm].model`, else the platform's `default` alias.
 fn resolve_workflow_llm_endpoint(
+    registry: &crate::providers::Registry,
     chat_target: &crate::chat_config::ChatTarget,
     cfg_model: Option<&str>,
     env_model: Option<String>,
@@ -4963,13 +4982,7 @@ fn resolve_workflow_llm_endpoint(
         }
         ChatTarget::Provider {
             provider, model, ..
-        } => Some((
-            format!(
-                "https://api.{provider}.com/v1",
-                provider = provider.to_ascii_lowercase()
-            ),
-            model.clone(),
-        )),
+        } => Some((provider_endpoint(registry, provider), model.clone())),
         ChatTarget::Marc27 {
             model: target_model,
         } => {
@@ -5001,6 +5014,7 @@ fn resolve_workflow_llm_pair(project_root: &Path, paths: &PrismPaths) -> Option<
     };
 
     resolve_workflow_llm_endpoint(
+        &crate::providers::Registry::load(),
         &chat_target,
         cfg_llm.model.as_deref(),
         std::env::var("LLM_MODEL").ok(),
@@ -8277,6 +8291,7 @@ async fn handle_use_command(command: UseCommands) -> Result<()> {
             model,
             api_key_env,
         },
+        UseCommands::List => use_command::UseAction::List,
         UseCommands::Show => use_command::UseAction::Show,
         UseCommands::Reset => use_command::UseAction::Reset,
     };
@@ -10600,6 +10615,7 @@ mod tests {
         // dead localhost default.
         let target = crate::chat_config::ChatTarget::Marc27 { model: None };
         let resolved = resolve_workflow_llm_endpoint(
+            &test_registry(),
             &target,
             None,
             None,
@@ -10619,6 +10635,7 @@ mod tests {
         let target = crate::chat_config::ChatTarget::Marc27 { model: None };
         // env LLM_MODEL wins.
         let with_env = resolve_workflow_llm_endpoint(
+            &test_registry(),
             &target,
             Some("cfg-model"),
             Some("env-model".to_string()),
@@ -10627,6 +10644,7 @@ mod tests {
         assert_eq!(with_env.unwrap().1, "env-model");
         // No env ⇒ [llm].model is used.
         let with_cfg = resolve_workflow_llm_endpoint(
+            &test_registry(),
             &target,
             Some("cfg-model"),
             None,
@@ -10644,7 +10662,13 @@ mod tests {
         // smuggled in via this path.
         let target = crate::chat_config::ChatTarget::Marc27 { model: None };
         assert_eq!(
-            resolve_workflow_llm_endpoint(&target, None, Some("m".to_string()), None),
+            resolve_workflow_llm_endpoint(
+                &test_registry(),
+                &target,
+                None,
+                Some("m".to_string()),
+                None
+            ),
             None
         );
     }
@@ -10657,7 +10681,7 @@ mod tests {
             api_key: None,
         };
         assert_eq!(
-            resolve_workflow_llm_endpoint(&target, None, None, None),
+            resolve_workflow_llm_endpoint(&test_registry(), &target, None, None, None),
             Some((
                 "http://127.0.0.1:11434/v1".to_string(),
                 "llama3".to_string()
@@ -10673,9 +10697,16 @@ mod tests {
             api_key: None,
         };
         assert_eq!(
-            resolve_workflow_llm_endpoint(&target, None, None, None),
+            resolve_workflow_llm_endpoint(&test_registry(), &target, None, None, None),
             None
         );
+    }
+
+    /// The built-in registry, used by every endpoint-resolution test so
+    /// they exercise the shipped data rather than a fixture that could
+    /// drift from it.
+    fn test_registry() -> crate::providers::Registry {
+        crate::providers::Registry::builtin().expect("built-in registry must parse")
     }
 
     #[test]
@@ -10686,12 +10717,76 @@ mod tests {
             api_key_env: None,
         };
         assert_eq!(
-            resolve_workflow_llm_endpoint(&target, None, None, None),
+            resolve_workflow_llm_endpoint(&test_registry(), &target, None, None, None),
             Some((
                 "https://api.anthropic.com/v1".to_string(),
                 "claude-sonnet-5".to_string()
             ))
         );
+    }
+
+    /// The bug the registry exists to kill. `https://api.{id}.com/v1`
+    /// pointed Mistral at a host that does not exist, Groq at a path that
+    /// 404s, Google at a host that serves no chat API, and OpenRouter at
+    /// the wrong domain entirely. Every one of these came back wrong from
+    /// all four chat surfaces; this pins the corrected values.
+    #[test]
+    fn workflow_llm_provider_uses_registry_not_the_dot_com_guess() {
+        let reg = test_registry();
+        let cases = [
+            ("mistral", "https://api.mistral.ai/v1"),
+            ("groq", "https://api.groq.com/openai/v1"),
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            (
+                "google",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+            ),
+            ("cerebras", "https://api.cerebras.ai/v1"),
+            ("zai", "https://api.z.ai/api/paas/v4"),
+            ("xai", "https://api.x.ai/v1"),
+            ("ollama", "http://localhost:11434/v1"),
+        ];
+        for (provider, expected) in cases {
+            let target = crate::chat_config::ChatTarget::Provider {
+                provider: provider.to_string(),
+                model: "m".to_string(),
+                api_key_env: None,
+            };
+            assert_eq!(
+                resolve_workflow_llm_endpoint(&reg, &target, None, None, None),
+                Some((expected.to_string(), "m".to_string())),
+                "{provider} must resolve from the registry"
+            );
+        }
+    }
+
+    /// A slug nobody has declared keeps the historical guess rather than
+    /// erroring — unchanged behaviour for unknown providers, so the
+    /// registry is purely additive.
+    #[test]
+    fn workflow_llm_unknown_provider_keeps_legacy_guess() {
+        let target = crate::chat_config::ChatTarget::Provider {
+            provider: "some-new-vendor".to_string(),
+            model: "m".to_string(),
+            api_key_env: None,
+        };
+        assert_eq!(
+            resolve_workflow_llm_endpoint(&test_registry(), &target, None, None, None),
+            Some((
+                "https://api.some-new-vendor.com/v1".to_string(),
+                "m".to_string()
+            ))
+        );
+    }
+
+    /// MARC27 must NOT resolve through the direct-provider path: its
+    /// endpoint is session-derived. If `base_url_for` ever started
+    /// returning a static URL for it, cloud chat would silently bypass the
+    /// signed-in project endpoint.
+    #[test]
+    fn marc27_is_never_a_direct_provider_endpoint() {
+        let reg = test_registry();
+        assert_eq!(crate::providers::base_url_for(&reg, "marc27"), None);
     }
 
     #[test]
