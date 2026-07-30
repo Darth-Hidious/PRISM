@@ -9,6 +9,8 @@ the tool result from being returned to the LLM.
 
 from __future__ import annotations
 
+from ..core.calculator import calc_signature as _calc_signature
+
 import json
 import platform
 import socket
@@ -81,9 +83,16 @@ def build(
         "cache_key": cache_key,
         "input": _sanitise(input_payload),
         "result_summary": _sanitise(result_summary),
+        # Resolved, never hardcoded: the record must name the weights the run
+        # actually used. It hardcoded mace-mh-1 while the default moved to the
+        # MIT weights, which would have made every provenance record claim ASL
+        # weights it never loaded.
         "mace_model": {
-            "repo_id": "mace-foundations/mace-mh-1",
-            "filename": "mace-mh-1.model",
+            **{
+                k: v
+                for k, v in _calc_signature(head, "", dtype).items()
+                if k in ("repo_id", "filename", "license")
+            },
             "head": head,
             "dtype": dtype,
         },

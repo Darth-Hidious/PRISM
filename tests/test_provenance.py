@@ -62,7 +62,21 @@ async def test_provenance_written_with_required_fields(tmp_path, monkeypatch):
     prov = json.loads(prov_files[0].read_text())
     missing = REQUIRED_FIELDS - set(prov)
     assert not missing, f"missing keys: {missing}"
-    assert prov["mace_model"]["repo_id"] == "mace-foundations/mace-mh-1"
+    # Provenance must name the weights the run ACTUALLY used, and the default
+    # must be the MIT ones. mace-mh-1's weights are ASL (academic
+    # non-commercial); this platform bills for predictions, so a default that
+    # loads them — or a record that claims them when it loaded something else —
+    # is a licensing problem, not just a cosmetic one.
+    from app.tools.simulation.mace.core.calculator import resolve_model
+
+    expected_repo, expected_file, expected_licence = resolve_model()
+    assert prov["mace_model"]["repo_id"] == expected_repo
+    assert prov["mace_model"]["filename"] == expected_file
+    assert prov["mace_model"]["license"] == expected_licence
+    assert expected_licence == "MIT", (
+        "the default weights must be MIT-licensed; ASL weights are reachable "
+        "only via an explicit MACE_ACCEPT_ASL_LICENSE opt-in"
+    )
 
 
 async def test_provenance_scrubs_hf_token(tmp_path, monkeypatch):

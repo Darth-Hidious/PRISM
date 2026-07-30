@@ -79,9 +79,13 @@ _TOOL_TO_ML_PREDICT_TASK: dict[str, str] = {
 
 
 # Default canonical model for this backend. Override per-call via
-# `job.input_payload["options"]["model"]` if the user wants mace-mp-0 or
-# another UIP from the registry.
-_DEFAULT_MODEL = "mace-mh-1"
+# `job.input_payload["options"]["model"]`.
+#
+# MIT weights, because this backend submits BILLABLE jobs. mace-mh-1's weights
+# are ASL (academic non-commercial); serving them from a paid endpoint is the
+# thing that licence forbids. Callers holding a commercial licence can still
+# pass model="mace-mh-1" explicitly.
+_DEFAULT_MODEL = "mace-mp-0"
 
 
 class PlatformBackend(Backend):
