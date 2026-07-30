@@ -1105,7 +1105,7 @@ fn model_field(v: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
-// ── Account (MARC27 login/logout) ─────────────────────────────────
+// ── Account (platform login/logout) ───────────────────────────────
 //
 // Reads ~/.prism/credentials.json for status (client-side) and dispatches
 // Login/Logout to the backend's existing /login (device flow) and /logout.
@@ -1403,7 +1403,7 @@ fn draw_account(f: &mut Frame, app: &App) {
         )));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "  MARC27 platform tools need an account.",
+            "  Hosted platform tools need an account.",
             Style::default().fg(t.dim),
         )));
     }

@@ -296,7 +296,7 @@ pub static CATALOG: &[Command] = &[
     Command {
         id: "account.show",
         title: "Account",
-        description: "MARC27 login / logout & status",
+        description: "Platform login / logout & status",
         category: "Account",
         keybind: "palette",
         suggested: false,
@@ -409,7 +409,7 @@ pub static CATALOG: &[Command] = &[
     Command {
         id: "slash.billing",
         title: "Billing & credits",
-        description: "MARC27 balance, usage & prices",
+        description: "Credit balance, usage & prices",
         category: "Settings",
         keybind: "/billing",
         suggested: false,
@@ -425,7 +425,7 @@ pub static CATALOG: &[Command] = &[
     Command {
         id: "use.show",
         title: "Chat target",
-        description: "Show the active chat route (MARC27 / local / provider)",
+        description: "Show the active chat route (hosted / local / provider)",
         category: "Settings",
         keybind: "/use show",
         suggested: false,

@@ -58,7 +58,7 @@ struct Cli {
     /// Auto-approve all tool calls without prompting.
     #[arg(long, global = false)]
     auto_approve: bool,
-    /// Run in offline mode (no MARC27 platform connection).
+    /// Run without contacting the hosted platform.
     #[arg(long, global = false)]
     offline: bool,
     #[command(subcommand)]
@@ -94,7 +94,7 @@ enum Commands {
         /// Conversation UUID to resume directly. Omit to get the picker.
         id: Option<String>,
     },
-    /// Authenticate against the MARC27 platform.
+    /// Authenticate against the configured hosted platform.
     ///
     /// Default: device-flow login that opens a browser to approve the
     /// session. For HPC nodes / SSH sessions / any environment without
@@ -108,13 +108,13 @@ enum Commands {
     ///
     ///   prism login --token <PAT>
     ///       Skip the device flow entirely. Use a Personal Access
-    ///       Token created on the MARC27 website. The token is
+    ///       Token created on the platform's website. The token is
     ///       written to ~/.prism/credentials.json with no further
     ///       interaction. This is the right path for headless
     ///       servers and CI environments.
     Login {
         /// Bypass the device flow. Use a pre-issued Personal Access
-        /// Token from the MARC27 website. Headless / CI / SSH-only
+        /// Token from the platform's website. Headless / CI / SSH-only
         /// use. Token is read from this flag, env var
         /// `PRISM_LOGIN_TOKEN`, or stdin (in that priority order)
         /// so the token never has to appear in shell history.
@@ -215,11 +215,11 @@ enum Commands {
         /// Show current ingest/job status instead of ingesting a path.
         #[arg(long)]
         status: bool,
-        /// Send the file to the MARC27 platform instead of extracting locally.
+        /// Send the file to the hosted platform instead of extracting locally.
         ///
         /// Without this, `prism ingest` runs the LOCAL pipeline — it needs a
         /// local LLM and a local runtime, and it writes to the local Turso
-        /// store. There was no way to put a PDF into your MARC27 knowledge
+        /// store. There was no way to put a PDF into your hosted knowledge
         /// graph from the CLI at all, which is the thing most people actually
         /// want; the only route was calling the API by hand.
         #[arg(long)]
@@ -244,7 +244,7 @@ enum Commands {
         /// Semantic vector search.
         #[arg(long)]
         semantic: bool,
-        /// Use the MARC27 platform API instead of local graph.
+        /// Use the hosted platform API instead of the local graph.
         #[arg(long)]
         platform: bool,
         /// Output as JSON (for piping to other tools / agents).
@@ -271,7 +271,7 @@ enum Commands {
     },
     /// Print available commands for AI agents. Pipe-friendly, grep-friendly.
     Agent,
-    /// Submit a compute job (run a container on local Docker, MARC27 cloud, or BYOC).
+    /// Submit a compute job (local Docker, the hosted platform, or BYOC).
     Run {
         /// Container image to run.
         image: String,
@@ -284,7 +284,7 @@ enum Commands {
         /// Backend: local, marc27, or byoc.
         #[arg(long, default_value = "local")]
         backend: String,
-        /// MARC27 platform API URL (for marc27 backend). Defaults to the public
+        /// Platform API URL (for the `marc27` backend). Defaults to the public
         /// gateway; override only to point at a staging/self-hosted control plane.
         #[arg(long, default_value = "https://api.marc27.com/api/v1")]
         platform_url: String,
@@ -324,7 +324,7 @@ enum Commands {
         command: MeshCommands,
     },
     /// PRISM Fabric — cross-org federation primitives (read-only). Trust is
-    /// managed in the MARC27 platform UI; the CLI only inspects state.
+    /// managed in the platform UI; the CLI only inspects state.
     Federation {
         #[command(subcommand)]
         command: FederationCommands,
@@ -336,16 +336,16 @@ enum Commands {
         /// Attach a log file or error output.
         #[arg(long)]
         log_file: Option<PathBuf>,
-        /// Don't open a GitHub issue (only send to MARC27 platform).
+        /// Don't open a GitHub issue (only send to the hosted platform).
         #[arg(long)]
         no_github: bool,
     },
-    /// Browse and install tools and workflows from the MARC27 marketplace.
+    /// Browse and install tools and workflows from the platform marketplace.
     Marketplace {
         #[command(subcommand)]
         command: MarketplaceCommands,
     },
-    /// Start a PRISM/MARC27 research loop for a materials-science goal.
+    /// Start a hosted research loop for a materials-science goal.
     Research {
         /// Research goal or question that can trigger iterative search and synthesis.
         query: String,
@@ -356,12 +356,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Deploy a model or service to the MARC27 compute platform.
+    /// Deploy a model or service to the hosted compute platform.
     Deploy {
         #[command(subcommand)]
         command: DeployCommands,
     },
-    /// Discover hosted LLM models available for the active MARC27 project.
+    /// Discover hosted LLM models available for the active platform project.
     Models {
         #[command(subcommand)]
         command: ModelsCommands,
@@ -455,7 +455,7 @@ enum Commands {
         #[arg(long)]
         keep: bool,
     },
-    /// List GPU offers purchasable through the MARC27 compute platform.
+    /// List GPU offers purchasable through the hosted compute platform.
     ///
     /// Prints the live catalog (type, VRAM, region, provider, $/hr) as one
     /// raw JSON array on stdout — machine-readable by design: the TUI
@@ -463,7 +463,7 @@ enum Commands {
     /// `{"error": "..."}` and still exit 0 so callers always get exactly
     /// one JSON document.
     Gpus,
-    /// One-shot compute-broker jobs (GPU/CPU) on the MARC27 platform.
+    /// One-shot compute-broker jobs (GPU/CPU) on the hosted platform.
     ///
     /// Read actions (gpus/providers/estimate/status) and cancel are safe;
     /// `submit` dispatches a real, billable job. Every subcommand prints one
@@ -503,7 +503,7 @@ enum Commands {
         #[arg(long, default_value_t = 1800)]
         poll_timeout_secs: u64,
     },
-    /// Knowledge-plane reads + platform ingest (MARC27 knowledge graph).
+    /// Knowledge-plane reads + platform ingest (hosted knowledge graph).
     ///
     /// entity/paths/corpora are read-only graph/catalog lookups; `ingest`
     /// submits a background extraction job. Every subcommand prints one JSON
@@ -536,14 +536,14 @@ enum Commands {
         #[arg(long, default_value_t = 1800)]
         poll_timeout_secs: u64,
     },
-    /// Run multi-agent discourse workflows backed by the MARC27 platform.
+    /// Run multi-agent discourse workflows backed by the hosted platform.
     Discourse {
         #[command(subcommand)]
         command: DiscourseCommands,
     },
-    /// Pick where chat turns are routed: MARC27 cloud (default), a
-    /// local OpenAI-compatible LLM, or a direct vendor (Anthropic /
-    /// OpenAI / etc). MARC27 platform tools — knowledge graph,
+    /// Pick where chat turns are routed: the hosted platform
+    /// (default), a local OpenAI-compatible LLM, or a direct vendor
+    /// (Anthropic / OpenAI / etc). Hosted tools — knowledge graph,
     /// discourse, marketplace, materials project — stay available
     /// regardless of which chat target is selected.
     ///
@@ -923,7 +923,7 @@ enum MeshCommands {
 
 /// Read-only commands for inspecting PRISM Fabric state.
 ///
-/// **Trust is managed in the MARC27 platform UI, not from this CLI.** The
+/// **Trust is managed in the platform UI, not from this CLI.** The
 /// platform owns org / project / role definitions; PRISM nodes are clients
 /// that use the platform-signed token to make cross-org requests. This
 /// command surface is for *inspecting* what other nodes will see when
@@ -941,7 +941,7 @@ enum FederationCommands {
         json: bool,
     },
     /// List known peer organizations the current user can interact with
-    /// across the Fabric. Sourced from the MARC27 platform; trust is
+    /// across the Fabric. Sourced from the hosted platform; trust is
     /// transitive via the platform root CA.
     Peers {
         /// Emit JSON instead of the human-readable summary.
@@ -952,7 +952,7 @@ enum FederationCommands {
 
 #[derive(Debug, Subcommand)]
 enum MarketplaceCommands {
-    /// Search the MARC27 marketplace for tools and workflows.
+    /// Search the platform marketplace for tools and workflows.
     /// Aliases: `list`, `browse` — shorthand for an empty search.
     #[command(alias = "list", alias = "browse")]
     Search {
@@ -996,7 +996,7 @@ enum MarketplaceCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Pull tool updates from the MARC27 marketplace. Re-downloads any
+    /// Pull tool updates from the platform marketplace. Re-downloads any
     /// tool whose marketplace version differs from the locally-installed
     /// one. Remote wins: locally-edited files are overwritten. Use
     /// `--dry-run` to see what would change without modifying anything.
@@ -1082,7 +1082,7 @@ enum DeployCommands {
 
 #[derive(Debug, Subcommand)]
 enum ModelsCommands {
-    /// List hosted models available to the active MARC27 project.
+    /// List hosted models available to the active platform project.
     List {
         /// Filter by provider such as `anthropic`, `openai`, `google`, or `openrouter`.
         #[arg(long)]
@@ -1196,25 +1196,26 @@ enum DiscourseCommands {
 /// Subcommands of `prism use`. See `chat_config::ChatTarget` for what
 /// each variant ends up as in `~/.prism/config.toml`.
 ///
-/// `Marc27` stays on the default route (MARC27 cloud) but pins which
-/// upstream model MARC27 should serve. `Local` and `Provider` are the
-/// two non-MARC27 chat targets. `Show` prints the current state (chat
-/// target + tools auth state). `Reset` goes back to MARC27 cloud
-/// without a pinned model (PRISM's compiled-in default).
+/// `Marc27` — the frozen wire id for the hosted route — stays on the
+/// default route but pins which upstream model the platform should
+/// serve. `Local` and `Provider` are the two chat targets that need no
+/// platform at all. `Show` prints the current state (chat target +
+/// tools auth state). `Reset` goes back to the hosted route without a
+/// pinned model (PRISM's compiled-in default).
 #[derive(Debug, Subcommand)]
 enum UseCommands {
-    /// Stay on MARC27 cloud, but pin a specific upstream model
+    /// Stay on the hosted route, but pin a specific upstream model
     /// (`gpt-5.5`, `claude-sonnet-4`, `mistral-large-latest`, …).
-    /// MARC27's own vendor keys stay on the platform — PRISM only
-    /// passes the model id forward.
+    /// The platform's own vendor keys stay there — PRISM only passes
+    /// the model id forward.
     Marc27 {
-        /// Upstream model id MARC27 should serve. If omitted,
+        /// Upstream model id the platform should serve. If omitted,
         /// PRISM uses its compiled-in default.
         #[arg(long)]
         model: Option<String>,
     },
     /// Route chat turns to an OpenAI-compatible local server (Ollama,
-    /// llama.cpp, vLLM, etc.). MARC27 platform tools stay available
+    /// llama.cpp, vLLM, etc.). Hosted platform tools stay available
     /// when the user is logged in.
     Local {
         /// Base URL of the local server, including `/v1`. Examples:
@@ -1236,7 +1237,7 @@ enum UseCommands {
     },
     /// Route chat turns direct to a cloud vendor using the user's own
     /// API key (read from an env var, never persisted to disk).
-    /// MARC27 platform tools stay available when the user is logged in.
+    /// Hosted platform tools stay available when the user is logged in.
     Provider {
         /// Vendor slug: `anthropic`, `openai`, `mistral`, `gemini`,
         /// `cohere`, …
@@ -1255,7 +1256,7 @@ enum UseCommands {
     List,
     /// Print the current chat target and the tools-auth state.
     Show,
-    /// Reset chat target back to MARC27 cloud (the default).
+    /// Reset chat target back to the hosted route (the default).
     Reset,
 }
 
@@ -3202,7 +3203,10 @@ async fn main() -> Result<()> {
                     } else {
                         println!("Marketplace resources:\n");
                         for t in &tools {
-                            let author = t.author.as_deref().unwrap_or("MARC27");
+                            let author = t
+                                .author
+                                .as_deref()
+                                .unwrap_or(&crate::brand::brand().display_name);
                             // Print the slug — it's the identifier install/info
                             // take; the footer told users to install "<slug>"
                             // without ever showing one.
@@ -3347,7 +3351,9 @@ async fn main() -> Result<()> {
                     println!("Version:     {}", tool.version);
                     println!(
                         "Author:      {}",
-                        tool.author.as_deref().unwrap_or("MARC27")
+                        tool.author
+                            .as_deref()
+                            .unwrap_or(&crate::brand::brand().display_name)
                     );
                     println!("Description: {}", tool.description);
                     println!("Pricing:     {}", tool.pricing);
@@ -6264,7 +6270,7 @@ fn print_agent_guide() {
         r#"PRISM Agent Interface — grep-friendly commands
 ==============================================
 
-KNOWLEDGE GRAPH (use --platform to query MARC27 cloud, 211K+ entities):
+KNOWLEDGE GRAPH (--platform queries the hosted graph; omit it to stay local):
   prism query --platform --semantic "creep resistant superalloy"     # semantic search
   prism query --platform "Inconel 718"                               # graph search
   prism query --platform --semantic "yield strength titanium" --json # JSON output for piping
@@ -6273,9 +6279,9 @@ KNOWLEDGE GRAPH (use --platform to query MARC27 cloud, 211K+ entities):
 
 COMPUTE:
   prism run <image> --backend local                    # run container locally
-  prism run <image> --backend marc27                   # run on MARC27 cloud
+  prism run <image> --backend marc27                   # run on the hosted platform
   prism job-status <job-id>                            # check job status
-  prism deploy create --name serve --image marc27/mace:latest --target local
+  prism deploy create --name serve --image ghcr.io/example/mace:latest --target local
   prism deploy list                                    # list persistent deployments
   prism deploy status <deployment-id>                  # inspect one deployment
 
@@ -6314,7 +6320,7 @@ AUTH (two paths — decoupled):
 OUTPUT:
   Default: human-readable, one result per line (grep-friendly)
   --json:  JSON array (pipe to jq/python)
-  --platform: route through MARC27 API (211K nodes, 6.5M edges, 208K embeddings)
+  --platform: route through the hosted API instead of the local graph
 
 AGENT SETUP (one line):
   export MARC27_API_KEY=m27_...                        # that's it. no login, no refresh, no expiry.
@@ -6430,7 +6436,7 @@ fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
     // paths that bypass PlatformClient's own guard.
     if std::env::var("PRISM_OFFLINE").is_ok_and(|v| v == "1") {
         anyhow::bail!(
-            "offline mode: this command needs the MARC27 platform \
+            "offline mode: this command needs the hosted platform \
              (remove --offline to use it)"
         );
     }
@@ -9411,8 +9417,9 @@ async fn run_token_login(endpoints: &PlatformEndpoints, token: &str) -> Result<S
     let platform = PlatformClient::new(&endpoints.api_base).with_token(token);
     let profile = platform.fetch_current_user().await.with_context(|| {
         format!(
-            "Token rejected by MARC27 ({}). Check the PAT is correct and not revoked. \
+            "Token rejected by {} ({}). Check the PAT is correct and not revoked. \
              Issue a new one at {}/settings/tokens.",
+            crate::brand::brand().display_name,
             endpoints.api_base,
             endpoints
                 .api_base
@@ -10232,11 +10239,11 @@ async fn handle_report(
         }
     }
 
-    // 4. Send to MARC27 platform
+    // 4. Send to the hosted platform
     if let Some(c) = creds
         && !c.access_token.is_empty()
     {
-        print!("Sending to MARC27 platform... ");
+        print!("Sending to {}... ", crate::brand::brand().platform_name);
         let platform_body = serde_json::json!({
             "title": format!("bug report: {}", &description[..description.len().min(60)]),
             "description": format!(
@@ -10497,9 +10504,9 @@ fn resolve_unauth_llm_url(fallback_url: &str) -> anyhow::Result<String> {
         return Ok(fallback_url.to_string());
     }
     anyhow::bail!(
-        "Not signed in and no LLM endpoint configured. Sign in to use MARC27 cloud \
-         (run sign-in from the palette), or set `[llm].url` in prism.toml (or LLM_BASE_URL) \
-         to use a local model explicitly."
+        "Not signed in and no LLM endpoint configured. Sign in to use the hosted \
+         platform (run sign-in from the palette), or set `[llm].url` in prism.toml \
+         (or LLM_BASE_URL) to use a local model explicitly."
     )
 }
 

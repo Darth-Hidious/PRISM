@@ -82,12 +82,12 @@ const BUILTIN_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         usage: "/login",
-        description: "Authenticate against the MARC27 platform",
+        description: "Authenticate against the hosted platform",
         category: "Account",
     },
     SlashCommandSpec {
         usage: "/logout",
-        description: "Clear stored MARC27 account credentials",
+        description: "Clear stored platform account credentials",
         category: "Account",
     },
     SlashCommandSpec {
@@ -217,7 +217,7 @@ const BUILTIN_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         usage: "/models list",
-        description: "List hosted LLM models for the active MARC27 project",
+        description: "List hosted LLM models for the active platform project",
         category: "Settings",
     },
     SlashCommandSpec {
@@ -277,12 +277,12 @@ const BUILTIN_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         usage: "/billing",
-        description: "Show MARC27 credits balance, usage, and prices",
+        description: "Show credit balance, usage, and prices",
         category: "Settings",
     },
     SlashCommandSpec {
         usage: "/use show",
-        description: "Show the active chat target (MARC27 / local / provider)",
+        description: "Show the active chat target (hosted / local / provider)",
         category: "Settings",
     },
     SlashCommandSpec {

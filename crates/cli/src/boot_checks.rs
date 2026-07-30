@@ -1,8 +1,9 @@
-//! Platform-connectivity boot checks shared by `prism` startup and `prism doctor`.
+//! Boot checks shared by `prism` startup and `prism doctor`.
 //!
-//! Pings the live MARC27 platform endpoints (auth, KG, models, compute,
-//! marketplace) plus the local node and policy engine, returns a vector of
-//! [`BootCheck`] for the renderer to print.
+//! Two halves. The LOCAL half (node daemon, policy engine) always runs.
+//! The PLATFORM half (auth, knowledge graph, models, compute, marketplace)
+//! only runs when a platform credential actually exists — see
+//! [`platform_configured`].
 //!
 //! Extracted from `main.rs` so `prism doctor` can run the same checks
 //! without duplicating the logic — keeps the doctor a true superset of
@@ -14,10 +15,34 @@ use prism_runtime::{PlatformEndpoints, StoredCredentials};
 
 use crate::boot;
 
-/// Run the live platform-connectivity checks.
+/// Env vars that carry a platform credential on the headless/agent path
+/// (no `prism login`, no `~/.prism` state). These are frozen wire
+/// identifiers — see `brand.rs` for why they are not routed through the
+/// brand definition.
+const PLATFORM_TOKEN_ENV: [&str; 3] = ["MARC27_API_KEY", "MARC27_TOKEN", "MARC27_API_TOKEN"];
+
+/// Whether this install has a platform credential at all.
 ///
-/// Each check times out after 5s; failures are reported as `[--]` so the
-/// boot screen never hangs.
+/// PRISM works fully locally, so a user who never signed in has not
+/// configured a platform — and startup must not reach out to a network
+/// it was never pointed at. Before this check, every launch made an
+/// unconditional HTTPS request to the hosted API and then rendered a red
+/// `[--]` line about it, which is both a phone-home on a local-only tool
+/// and a standing advert for a service the user declined.
+pub fn platform_configured(creds: Option<&StoredCredentials>) -> bool {
+    if creds.is_some_and(|c| !c.access_token.trim().is_empty()) {
+        return true;
+    }
+    PLATFORM_TOKEN_ENV
+        .iter()
+        .any(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()))
+}
+
+/// Run the boot checks.
+///
+/// With no platform credential this touches the network only to probe the
+/// local node on loopback. Otherwise each platform check times out after
+/// 5s; failures are reported as `[--]` so the boot screen never hangs.
 pub async fn run_boot_checks(
     creds: Option<&StoredCredentials>,
     endpoints: &PlatformEndpoints,
@@ -27,6 +52,20 @@ pub async fn run_boot_checks(
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_default();
+
+    if !platform_configured(creds) {
+        // Stated once, neutrally, and never as a failure: nothing is
+        // broken about running PRISM without an account.
+        checks.push(boot::BootCheck {
+            name: "Platform".into(),
+            result: "not configured — running local-only".into(),
+            ok: true,
+            dots: 8,
+            delay_ms: 30,
+        });
+        push_local_checks(&client, &mut checks).await;
+        return checks;
+    }
 
     let token = creds.map(|c| c.access_token.as_str()).unwrap_or("");
     let api = &endpoints.api_base;
@@ -220,7 +259,15 @@ pub async fn run_boot_checks(
         });
     }
 
-    // 7. Local node
+    push_local_checks(&client, &mut checks).await;
+
+    checks
+}
+
+/// The checks that need no account and no internet: the local node daemon
+/// on loopback and the in-process policy engine. Appended by both the
+/// configured and the local-only path.
+async fn push_local_checks(client: &reqwest::Client, checks: &mut Vec<boot::BootCheck>) {
     let node_ok = client
         .get("http://127.0.0.1:7327/api/health")
         .send()
@@ -239,7 +286,6 @@ pub async fn run_boot_checks(
         delay_ms: 20,
     });
 
-    // 8. Policy engine (always local, always OK)
     checks.push(boot::BootCheck {
         name: "Policy Engine".into(),
         result: "OPA/Rego loaded".into(),
@@ -247,6 +293,110 @@ pub async fn run_boot_checks(
         dots: 4,
         delay_ms: 15,
     });
+}
 
-    checks
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `set_var`/`remove_var` are process-global; serialize every
+    /// env-touching test through this guard.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_platform_env() {
+        for key in PLATFORM_TOKEN_ENV {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    fn creds_with(token: &str) -> StoredCredentials {
+        StoredCredentials {
+            access_token: token.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_credential_anywhere_means_not_configured() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        assert!(!platform_configured(None));
+    }
+
+    /// A credentials file left behind by a logout — or written empty —
+    /// is not a credential. Treating it as one is what made a signed-out
+    /// user still phone home on every launch.
+    #[test]
+    fn blank_stored_token_is_not_a_credential() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        assert!(!platform_configured(Some(&creds_with("   "))));
+    }
+
+    #[test]
+    fn stored_token_means_configured() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        assert!(platform_configured(Some(&creds_with("token-abc"))));
+    }
+
+    /// The headless path never runs `prism login`, so the env key alone
+    /// has to count — otherwise CI/agent installs would skip the very
+    /// checks they need.
+    #[test]
+    fn env_key_alone_means_configured() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        for key in PLATFORM_TOKEN_ENV {
+            unsafe { std::env::set_var(key, "m27_test") };
+            assert!(platform_configured(None), "{key} should count");
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    #[test]
+    fn blank_env_key_is_not_a_credential() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        unsafe { std::env::set_var("MARC27_API_KEY", "  ") };
+        let configured = platform_configured(None);
+        clear_platform_env();
+        assert!(!configured);
+    }
+
+    /// The regression guard for the phone-home: with nothing configured,
+    /// the boot screen must contain only local checks — no auth line, no
+    /// knowledge-graph line, nothing that implies a missing account.
+    #[tokio::test]
+    async fn unconfigured_boot_runs_local_checks_only() {
+        // The guard is released before the await on purpose: holding a
+        // std `MutexGuard` across an await point is a real deadlock
+        // hazard, and it buys nothing here — the only code in this test
+        // binary that WRITES these vars is this module, and every writer
+        // takes the same lock and clears up after itself.
+        {
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            clear_platform_env();
+        }
+        // A URL that would fail loudly (and slowly) if it were ever hit.
+        let endpoints = PlatformEndpoints {
+            api_base: "https://platform.invalid/api/v1".to_string(),
+            node_ws: "wss://platform.invalid/api/v1/nodes/connect".to_string(),
+        };
+        let checks = run_boot_checks(None, &endpoints).await;
+
+        let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Platform", "Local Node", "Policy Engine"]);
+        let platform = &checks[0];
+        assert!(
+            platform.ok,
+            "an unconfigured platform is a choice, not a failure"
+        );
+        assert!(
+            !platform.result.contains("login"),
+            "the boot screen must not nag about signing in: {:?}",
+            platform.result
+        );
+    }
 }
