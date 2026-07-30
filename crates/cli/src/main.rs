@@ -213,6 +213,15 @@ enum Commands {
         /// Show current ingest/job status instead of ingesting a path.
         #[arg(long)]
         status: bool,
+        /// Send the file to the MARC27 platform instead of extracting locally.
+        ///
+        /// Without this, `prism ingest` runs the LOCAL pipeline — it needs a
+        /// local LLM and a local runtime, and it writes to the local Turso
+        /// store. There was no way to put a PDF into your MARC27 knowledge
+        /// graph from the CLI at all, which is the thing most people actually
+        /// want; the only route was calling the API by hand.
+        #[arg(long)]
+        platform: bool,
         /// Watch a directory for new/modified files and ingest continuously.
         #[arg(long)]
         watch: bool,
@@ -3039,6 +3048,7 @@ async fn main() -> Result<()> {
             api_key,
             schema_only,
             status,
+            platform,
             watch,
             runtime_url,
             json,
@@ -3046,6 +3056,11 @@ async fn main() -> Result<()> {
         } => {
             if status {
                 handle_ingest_status(corpus.as_deref(), json).await?;
+            } else if platform {
+                let path = path.as_deref().ok_or_else(|| {
+                    anyhow!("`prism ingest --platform` requires a file to upload.")
+                })?;
+                handle_ingest_platform(path, json).await?;
             } else if watch {
                 let path = path.as_deref().ok_or_else(|| {
                     anyhow!("`prism ingest --watch` requires a path or directory.")
@@ -5694,6 +5709,191 @@ async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> 
     }
 
     Ok(summary)
+}
+
+/// Upload a document to the MARC27 platform's holistic ingest pipeline.
+///
+/// The local pipeline (`prism ingest` with no flags) needs a local LLM and a
+/// local runtime and writes to the local Turso store. This is the other half:
+/// the platform extracts, and the result lands in your MARC27 knowledge graph.
+///
+/// The endpoint streams Server-Sent Events and holds the connection until
+/// extraction finishes, which is minutes for a real paper. The CLI has no
+/// streaming HTTP dependency, so the body is read whole and the events are
+/// replayed afterwards — the user is told that up front rather than left
+/// staring at a silent terminal wondering whether it hung.
+///
+/// A PROV-O activity is recorded locally on success. Without it the client
+/// keeps no record that this machine ingested anything: the facts live in
+/// FalkorDB server-side and the local provenance spine stays empty, so
+/// `prism query` can never answer "what did I put in, and when".
+async fn handle_ingest_platform(path: &Path, json_output: bool) -> Result<()> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
+
+    // Check the magic here rather than let the server reject it after the
+    // upload — on a large file that is a pointless round trip, and the local
+    // error can name the actual path.
+    if !bytes.starts_with(b"%PDF") {
+        bail!(
+            "{} is not a PDF (no %PDF magic bytes). The platform ingest \
+             endpoint accepts PDFs; for an HTML paper use `prism ingest-and-wait --url <URL>`.",
+            path.display()
+        );
+    }
+
+    let (api_base, auth) = resolve_agent_auth()?;
+    let client = reqwest::Client::builder()
+        // Generous: extraction of a full paper routinely runs into minutes,
+        // and a timeout here would abandon work the platform has already
+        // started paying for.
+        .timeout(Duration::from_secs(1800))
+        .build()?;
+
+    if !json_output {
+        println!(
+            "Uploading {} ({} KB) to the platform…",
+            path.display(),
+            bytes.len() / 1024
+        );
+        println!(
+            "The platform extracts while this connection is held open — this can take several minutes."
+        );
+    }
+
+    let resp = auth
+        .apply(
+            client
+                .post(format!("{api_base}/knowledge/ingest/holistic/upload"))
+                .header("Content-Type", "application/pdf")
+                .body(bytes.clone()),
+        )
+        .send()
+        .await
+        .context("upload request failed")?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("platform ingest failed ({status}): {}", body.trim());
+    }
+
+    // Replay the SSE stream. `error` is a real failure even though the HTTP
+    // status was 200 — the pipeline reports stage failures inside the stream,
+    // so trusting the status code alone would call a failed ingest a success.
+    let mut steps: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut failure: Option<String> = None;
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        let step = event
+            .get("step")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let data = event
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if step == "error" {
+            failure = Some(
+                data.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            );
+        }
+        steps.push((step, data));
+    }
+
+    if let Some(message) = failure {
+        bail!("platform ingest failed during extraction: {message}");
+    }
+    if steps.is_empty() {
+        bail!("platform returned no ingest events — nothing was ingested");
+    }
+
+    record_platform_ingest_provenance(path, &steps).await;
+
+    if json_output {
+        let out = serde_json::json!({
+            "path": path.display().to_string(),
+            "steps": steps.iter().map(|(s, d)| serde_json::json!({"step": s, "data": d})).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!();
+        for (step, data) in &steps {
+            let detail = data
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .filter(|(k, _)| {
+                            matches!(k.as_str(), "chars" | "count" | "title" | "warning")
+                        })
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            println!("  {step:<24} {detail}");
+        }
+        // "degraded" is not "failed", and the difference matters: a degraded
+        // run really did ingest, just without the GPU document model.
+        if steps.iter().any(|(s, _)| s.contains("degraded")) {
+            println!();
+            println!("Note: the run was DEGRADED — the GPU document model was unavailable,");
+            println!("so text was extracted without figure segmentation. The facts landed;");
+            println!("figures and their captions did not.");
+        }
+        println!();
+        println!("Check the graph with:  prism ingest --status");
+    }
+    Ok(())
+}
+
+/// Best-effort local PROV-O record of a platform ingest.
+///
+/// Best-effort on purpose: the document IS in the platform graph by the time
+/// this runs, so failing the command because a local bookkeeping write failed
+/// would report a successful ingest as an error.
+async fn record_platform_ingest_provenance(path: &Path, steps: &[(String, serde_json::Value)]) {
+    let Some(store) = open_campaign_provenance().await else {
+        return;
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let title = steps
+        .iter()
+        .find_map(|(_, d)| d.get("title").and_then(|v| v.as_str()))
+        .unwrap_or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("uploaded document")
+        })
+        .to_string();
+
+    let prov = prism_provenance::LocalProvenance {
+        activity_id: uuid::Uuid::new_v4().to_string(),
+        // The platform did the extraction, so it is the agent — attributing it
+        // to this CLI would misname who produced the facts.
+        agent_id: "marc27-platform/holistic-ingest".to_string(),
+        agent_kind: "SoftwareAgent".to_string(),
+        source_entity_id: path.display().to_string(),
+        source_kind: "Document".to_string(),
+        tenant: "local".to_string(),
+        started_at: now.clone(),
+        ended_at: now,
+        // Distinguishes this from a locally-extracted document: the facts are
+        // NOT in the local store, they are in the platform graph.
+        locality: "platform".to_string(),
+    };
+    if let Err(e) = store.record_activity(&prov).await {
+        tracing::warn!(error = %e, title = %title, "platform ingest succeeded but the local provenance record failed");
+    }
 }
 
 async fn handle_ingest_status(corpus: Option<&str>, json_output: bool) -> Result<()> {
