@@ -58,7 +58,17 @@ jobs:
         with:
           target: ${{ matrix.rust_target }}
 
+      # Key the cache on the RUNNER IMAGE, not just `runner.os`.
+      #
+      # Swatinem/rust-cache keys on `runner.os`, which is the string "Linux" —
+      # identical across ubuntu-22.04 and ubuntu-24.04. When `ubuntu-latest`
+      # rolled from 22.04 to 24.04, cached objects built against one glibc were
+      # restored onto the other and the link failed with
+      # `undefined symbol: __isoc23_strtoll` (a glibc 2.38+ symbol). That is
+      # what killed the linux-x86_64 and linux-aarch64 jobs on 27 Jul.
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-${{ matrix.os }}-${{ matrix.rust_target }}"
 
       - uses: actions/setup-node@v4
         with:
@@ -132,3 +142,51 @@ jobs:
         with:
           files: |
             dist/*.whl
+
+  # A release is all-or-nothing. `fail-fast: false` plus a per-job
+  # `softprops/action-gh-release` means each platform publishes independently,
+  # so when one job fails the tag still gets a release — just missing that
+  # archive. That is exactly how v1.0.0 shipped without
+  # prism-macos-x86_64.tar.gz while install.sh computed that very name for
+  # Intel Macs: every such user got a 404 from the documented one-liner, and
+  # nothing anywhere went red.
+  #
+  # This job fails the workflow when an expected asset is absent, so an
+  # incomplete release is loud instead of silent.
+  verify-release-complete:
+    name: Verify all release assets published
+    needs: [package-native, python-wheel]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check every platform archive exists on the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Must match the archive names install.sh computes from uname.
+          expected="prism-linux-x86_64.tar.gz
+          prism-linux-aarch64.tar.gz
+          prism-macos-aarch64.tar.gz
+          prism-macos-x86_64.tar.gz
+          prism-windows-x86_64.zip"
+
+          published=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
+          echo "Published assets:"; echo "$published" | sed 's/^/  /'
+
+          missing=0
+          while read -r asset; do
+            [ -z "$asset" ] && continue
+            if ! echo "$published" | grep -qx "$asset"; then
+              echo "::error::release $TAG is missing $asset — install.sh will 404 for that platform"
+              missing=1
+            fi
+          done <<< "$(echo "$expected" | sed 's/^[[:space:]]*//')"
+
+          if [ "$missing" -ne 0 ]; then
+            echo "Incomplete release. Re-run the failed platform job, then re-run this check."
+            exit 1
+          fi
+          echo "All platform archives present."
