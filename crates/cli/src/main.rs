@@ -10,6 +10,7 @@ mod boot_checks;
 mod brand;
 mod chat_config;
 mod doctor;
+mod local_llm;
 mod mcp_server_native;
 mod notebook;
 mod onboarding;
@@ -33,6 +34,11 @@ use prism_client::auth::{DeviceCodeResponse, TokenResponse};
 use prism_proto::NodeCapabilities;
 use prism_python_bridge::{ToolServer, ensure_venv};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
+
+// Loopback detection lives with the local-server probe that also needs it,
+// so ingest locality and discovery cannot disagree about what "on this
+// machine" means.
+use crate::local_llm::is_loopback_url;
 use prism_workflows::{
     WorkflowRunResult, WorkflowSpec, discover_workflows, execute_workflow, find_workflow,
     load_workflow_from_str, parse_workflow_command_args,
@@ -1224,9 +1230,10 @@ enum UseCommands {
         url: String,
         /// Model name to send in chat requests (whatever the local
         /// server advertises — `llama-3.1-70b`, `mistral-7b-instruct`,
-        /// `qwen2.5-coder`, etc.).
+        /// `qwen2.5-coder`, etc.). Omit it and PRISM asks the server:
+        /// if it is serving exactly one model, that one is used.
         #[arg(long)]
-        model: String,
+        model: Option<String>,
         /// Optional API key. Most local servers accept any non-empty
         /// string or none at all. Stored in plaintext in
         /// `~/.prism/config.toml` — only set this for trusted local
@@ -5167,20 +5174,6 @@ fn ingest_format(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-/// True when the URL's host is loopback (`localhost`, 127.x.x.x, `::1`) —
-/// i.e. the model runs on this machine.
-fn is_loopback_url(raw: &str) -> bool {
-    match url::Url::parse(raw) {
-        Ok(parsed) => match parsed.host() {
-            Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            None => false,
-        },
-        Err(_) => false,
-    }
-}
-
 /// Where text-document ingest runs — and, when it lands on the hosted
 /// platform, whether the user actually asked for that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5234,19 +5227,88 @@ fn resolve_text_ingest_locality(
     text_locality_for(&node_config.ontology.locality, llm_base_url.as_deref())
 }
 
-/// What to print when `prism ingest` has neither an on-device model nor a
-/// platform account. Local comes first: `prism ingest` with no flags is a
-/// local-first command, and the old error ("Not logged in. Run `prism
-/// login`.") named the one remedy the user was trying to avoid.
-fn no_ingest_backend_message() -> String {
-    "no on-device model to extract with, and the hosted platform needs an account.\n\n\
-     Ingest these documents locally — nothing leaves your machine:\n  \
-     prism use local --url http://localhost:11434/v1 --model <model>   (Ollama)\n  \
-     prism use local --url http://localhost:8080 --model <model>       (llama.cpp)\n\
-     then re-run this command.\n\n\
-     Or use the hosted platform instead:\n  \
-     prism login"
-        .to_string()
+/// What to print when `prism ingest` has neither a configured on-device
+/// model nor a platform account. Local comes first: `prism ingest` with no
+/// flags is a local-first command, and the old error ("Not logged in. Run
+/// `prism login`.") named the one remedy the user was trying to avoid.
+///
+/// `discovered` is what a sweep of this machine actually found. When it is
+/// non-empty the message stops being a template: PRISM saw the server, so
+/// it prints the command that uses it, model id and all. Telling a user
+/// with Ollama already serving two models to go and find a model id was
+/// the friction this replaces — the information was a 400ms probe away.
+fn no_ingest_backend_message(discovered: &[local_llm::LocalServer]) -> String {
+    let ready: Vec<&local_llm::LocalServer> = discovered
+        .iter()
+        .filter(|s| s.state == local_llm::ServerState::Ready && !s.models.is_empty())
+        .collect();
+
+    if ready.is_empty() {
+        // Nothing is serving. Keep the template — it is the honest answer
+        // when there is no reality to report — but note anything we found
+        // mid-startup rather than pretending the machine is empty.
+        let loading: Vec<String> = discovered
+            .iter()
+            .filter(|s| s.state == local_llm::ServerState::Loading)
+            .map(|s| {
+                format!(
+                    "\n\n{} at {} is up but still loading a model.",
+                    s.name, s.base_url
+                )
+            })
+            .collect();
+        return format!(
+            "no on-device model to extract with, and the hosted platform needs an \
+             account.{loading}\n\n\
+             Ingest these documents locally — nothing leaves your machine:\n  \
+             prism use local --url http://localhost:11434/v1 --model <model>   (Ollama)\n  \
+             prism use local --url http://localhost:8080 --model <model>       (llama.cpp)\n\
+             then re-run this command.\n\n\
+             Or use the hosted platform instead:\n  \
+             prism login",
+            loading = loading.join(""),
+        );
+    }
+
+    // One server, one model: there is exactly one thing the user can mean,
+    // so hand them that command complete. We still do not run it for them —
+    // where inference happens is their call, not ours.
+    let single = match ready.as_slice() {
+        [only] => only.sole_model().map(|model| (*only, model)),
+        _ => None,
+    };
+    if let Some((server, model)) = single {
+        return format!(
+            "no on-device model configured for extraction, and the hosted platform \
+             needs an account.\n\n\
+             {name} is already running here with {model}. Use it — nothing leaves \
+             your machine:\n  {command}\n\
+             then re-run this command.\n\n\
+             Or use the hosted platform instead:\n  prism login",
+            name = server.name,
+            command = server.use_command(model),
+        );
+    }
+
+    // Several candidates. List them; picking would be a guess.
+    let options: Vec<String> = ready
+        .iter()
+        .flat_map(|server| {
+            server
+                .models
+                .iter()
+                .map(move |model| format!("  {}", server.use_command(model)))
+        })
+        .collect();
+    format!(
+        "no on-device model configured for extraction, and the hosted platform \
+         needs an account.\n\n\
+         These are already running on this machine — pick one, and nothing leaves \
+         your machine:\n{options}\n\
+         then re-run this command.\n\n\
+         Or use the hosted platform instead:\n  prism login",
+        options = options.join("\n"),
+    )
 }
 
 fn collect_ingest_paths(root: &Path) -> Result<Vec<PathBuf>> {
@@ -6190,7 +6252,13 @@ async fn handle_ingest(
         // no-account user at an account instead of at the local ingest that
         // was there all along.
         if locality == TextLocality::CloudNoLocalModel && resolve_agent_auth().is_err() {
-            bail!("{}", no_ingest_backend_message());
+            // Both doors look shut — so look before saying so. This runs
+            // only on the failure path, so the probe costs a user with a
+            // working setup nothing.
+            bail!(
+                "{}",
+                no_ingest_backend_message(&local_llm::discover().await)
+            );
         }
         if locality.is_local() {
             eprintln!("⚑ LOCAL — extracting on-device, nothing leaves your machine");
@@ -11188,13 +11256,16 @@ mod tests {
     }
 
     #[test]
-    fn is_loopback_url_recognizes_on_device_endpoints() {
-        assert!(is_loopback_url("http://localhost:8080"));
-        assert!(is_loopback_url("http://LOCALHOST:11434/v1"));
-        assert!(is_loopback_url("http://127.0.0.1:8090"));
-        assert!(is_loopback_url("http://[::1]:8080/v1"));
+    fn ingest_locality_and_discovery_agree_on_what_is_on_this_machine() {
+        // Both surfaces read the same predicate; this pins that they still
+        // do, so ingest can never call an endpoint "cloud" while discovery
+        // is reporting it as a local server.
+        for url in ["http://localhost:11434/v1", "http://127.0.0.1:8080"] {
+            assert!(is_loopback_url(url));
+            assert!(text_locality_for("auto", Some(url)).is_local());
+        }
         assert!(!is_loopback_url("https://api.openai.com/v1"));
-        assert!(!is_loopback_url("not a url"));
+        assert!(!text_locality_for("auto", Some("https://api.openai.com/v1")).is_local());
     }
 
     #[test]
@@ -11238,7 +11309,7 @@ mod tests {
 
     #[test]
     fn no_ingest_backend_message_names_the_local_door_first() {
-        let msg = no_ingest_backend_message();
+        let msg = no_ingest_backend_message(&[]);
         let local = msg.find("prism use local").expect("names local ingest");
         let login = msg.find("prism login").expect("names the platform");
         assert!(
@@ -11247,6 +11318,87 @@ mod tests {
         );
         assert!(msg.contains("11434"), "names the Ollama endpoint:\n{msg}");
         assert!(msg.contains("8080"), "names the llama.cpp endpoint:\n{msg}");
+    }
+
+    fn discovered(
+        provider_id: &str,
+        name: &str,
+        url: &str,
+        models: &[&str],
+    ) -> local_llm::LocalServer {
+        local_llm::LocalServer {
+            provider_id: provider_id.to_string(),
+            name: name.to_string(),
+            base_url: url.to_string(),
+            models: models.iter().map(|m| m.to_string()).collect(),
+            state: local_llm::ServerState::Ready,
+        }
+    }
+
+    /// The whole point: one server, one model ⇒ the user gets a command
+    /// they can run, not a template with a `<model>` hole in it.
+    #[test]
+    fn no_ingest_backend_message_prints_a_runnable_command_when_one_model_is_found() {
+        let msg = no_ingest_backend_message(&[discovered(
+            "ollama",
+            "Ollama (local)",
+            "http://localhost:11434/v1",
+            &["qwen2.5:3b"],
+        )]);
+        assert!(
+            msg.contains("prism use local --url http://localhost:11434/v1 --model qwen2.5:3b"),
+            "expected a ready-to-run command:\n{msg}"
+        );
+        assert!(
+            !msg.contains("<model>"),
+            "a discovered model must replace the placeholder:\n{msg}"
+        );
+        // Local still comes before the account pitch.
+        let local = msg.find("prism use local").unwrap();
+        let login = msg.find("prism login").unwrap();
+        assert!(local < login, "{msg}");
+    }
+
+    /// Several candidates ⇒ list them. Choosing where inference runs is
+    /// the user's call, so a guess here would be the wrong kind of help.
+    #[test]
+    fn no_ingest_backend_message_lists_every_candidate_without_choosing() {
+        let msg = no_ingest_backend_message(&[
+            discovered(
+                "ollama",
+                "Ollama (local)",
+                "http://localhost:11434/v1",
+                &["qwen2.5:3b", "llama3.2:1b"],
+            ),
+            discovered(
+                "llamacpp",
+                "llama.cpp server (local)",
+                "http://localhost:8081/v1",
+                &["gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"],
+            ),
+        ]);
+        for model in [
+            "qwen2.5:3b",
+            "llama3.2:1b",
+            "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+        ] {
+            assert!(msg.contains(model), "{model} missing from:\n{msg}");
+        }
+        assert!(msg.contains("http://localhost:8081/v1"), "{msg}");
+        assert!(!msg.contains("<model>"), "{msg}");
+    }
+
+    /// A server still loading its weights is neither absent nor usable.
+    /// Saying nothing about it sends the user off to start another one.
+    #[test]
+    fn no_ingest_backend_message_reports_a_loading_server() {
+        let mut loading = discovered("vllm", "vLLM (local)", "http://localhost:8000/v1", &[]);
+        loading.state = local_llm::ServerState::Loading;
+        let msg = no_ingest_backend_message(&[loading]);
+        assert!(msg.contains("still loading"), "{msg}");
+        assert!(msg.contains("http://localhost:8000/v1"), "{msg}");
+        // No model to offer, so the template stays.
+        assert!(msg.contains("<model>"), "{msg}");
     }
 
     #[test]

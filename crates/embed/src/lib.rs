@@ -43,7 +43,7 @@ use async_trait::async_trait;
 mod native;
 mod openai;
 
-pub use native::NativeOnnx;
+pub use native::{NativeOnnx, default_cache_dir};
 pub use openai::OpenAiCompat;
 
 /// The embedding port. Implementations must be cheap to share (`Arc`) and

@@ -17,6 +17,7 @@ use std::path::Path;
 use prism_runtime::{PlatformEndpoints, PrismPaths};
 
 use crate::chat_config::{self, ChatTarget};
+use crate::local_llm::{LocalServer, ServerState};
 use crate::{LoginMode, perform_full_login, prompt_select};
 
 /// One model offered on the onboarding shortlist. `id` is the exact
@@ -102,7 +103,12 @@ pub async fn run_if_first_launch(
     // is the least-friction route (no keys, nothing to install). It is
     // just no longer the ONLY route.
     step_header(1, "Choose where your models run");
-    match choose_route()? {
+    // Look before offering. A first-run user who already has Ollama serving
+    // is the single best answer to "does PRISM work without an account" —
+    // and the old wizard, which only knew about hosted-vs-bring-a-key, made
+    // them type a URL and a model id PRISM could simply have read.
+    let local_servers = crate::local_llm::discover().await;
+    match choose_route(&local_servers)? {
         Route::Platform => {
             println!("\n  A browser window will open to sign in. If it doesn't, copy the");
             println!("  link and code shown below into any browser on any device.\n");
@@ -127,6 +133,13 @@ pub async fn run_if_first_launch(
             step_header(3, "You can sign in later");
             platform_later_note();
         }
+        Route::LocalServer(server) => {
+            step_header(2, "Pick a model");
+            choose_local_model(&server)?;
+
+            step_header(3, "You can sign in later");
+            platform_later_note();
+        }
     }
 
     done();
@@ -134,45 +147,92 @@ pub async fn run_if_first_launch(
 }
 
 /// How a first-run user wants chat routed.
+#[derive(Clone)]
 enum Route {
     /// The hosted platform — no keys, no local install.
     Platform,
     /// Any provider in the registry, on the user's own key (or a local
     /// server needing no key at all).
     OwnProvider,
+    /// A model server already running on this machine. Offered only when
+    /// one was actually found, and still chosen by the user.
+    LocalServer(LocalServer),
 }
 
 struct RouteChoice {
     route: Route,
-    label: &'static str,
+    label: String,
     blurb: String,
 }
 
-/// Ask how to route chat. Bare Enter picks the platform: it is the option
-/// that needs nothing installed and no key pasted.
-fn choose_route() -> Result<Route> {
+/// Ask how to route chat.
+///
+/// Anything already serving on this machine leads the list — it is the
+/// option with nothing left to set up, no key and no account, and it is
+/// offered as a choice rather than applied silently. When nothing is
+/// running the list is exactly what it was: hosted, or your own key.
+fn choose_route(local_servers: &[LocalServer]) -> Result<Route> {
     let brand = crate::brand::brand();
-    println!("  PRISM talks to any OpenAI-compatible model. Two ways to start:");
+    let mut options: Vec<RouteChoice> = local_servers
+        .iter()
+        .filter(|s| s.state == ServerState::Ready && !s.models.is_empty())
+        .map(|server| RouteChoice {
+            route: Route::LocalServer(server.clone()),
+            label: "On this Mac".to_string(),
+            blurb: format!("{} — {}, no key, no account", server.name, server.summary()),
+        })
+        .collect();
 
-    let options = [
-        RouteChoice {
-            route: Route::Platform,
-            label: "Hosted",
-            blurb: format!("{} — {}", brand.platform_name, brand.tagline),
-        },
-        RouteChoice {
-            route: Route::OwnProvider,
-            label: "Own key",
-            blurb: "OpenAI, Anthropic, Groq, Ollama, … — your key, your bill".to_string(),
-        },
-    ];
+    if options.is_empty() {
+        println!("  PRISM talks to any OpenAI-compatible model. Two ways to start:");
+    } else {
+        println!("  PRISM talks to any OpenAI-compatible model — including the one");
+        println!("  already running here:");
+    }
+
+    options.push(RouteChoice {
+        route: Route::Platform,
+        label: "Hosted".to_string(),
+        blurb: format!("{} — {}", brand.platform_name, brand.tagline),
+    });
+    options.push(RouteChoice {
+        route: Route::OwnProvider,
+        label: "Own key".to_string(),
+        blurb: "OpenAI, Anthropic, Groq, Ollama, … — your key, your bill".to_string(),
+    });
+
     let chosen = prompt_select("Route", &options, |o| {
-        format!("{:<10} \x1b[2m{}\x1b[0m", o.label, o.blurb)
+        format!("{:<12} \x1b[2m{}\x1b[0m", o.label, o.blurb)
     })?;
-    Ok(match chosen.route {
-        Route::Platform => Route::Platform,
-        Route::OwnProvider => Route::OwnProvider,
-    })
+    Ok(chosen.route.clone())
+}
+
+/// Route chat at a server we found, once the user has picked it. The model
+/// list comes from the server, so there is no id to type and no id to get
+/// wrong — which is the difference between this and the own-key path.
+fn choose_local_model(server: &LocalServer) -> Result<()> {
+    let model = match server.sole_model() {
+        Some(only) => only.to_string(),
+        None => {
+            println!("  {} is serving these:", server.name);
+            prompt_select("Model", &server.models, |m| m.clone())?.clone()
+        }
+    };
+
+    let mut cfg = chat_config::load().unwrap_or_default();
+    cfg.chat = ChatTarget::Local {
+        url: server.base_url.clone(),
+        model: model.clone(),
+        api_key: None,
+    };
+    chat_config::save(&cfg)?;
+
+    println!(
+        "\n  \x1b[32m✓\x1b[0m Chat routed to \x1b[1m{}\x1b[0m ({model}) at {}.",
+        server.name, server.base_url
+    );
+    println!("  \x1b[2mNo key, no account — inference stays on this machine.\x1b[0m");
+    Ok(())
 }
 
 /// Present the provider registry and persist the pick as the chat target.

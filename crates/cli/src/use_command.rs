@@ -24,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::RwLock;
 
 use crate::chat_config::{self, ChatTarget};
+use crate::local_llm::{self, LocalServer, ServerState};
 use crate::providers::Registry;
 
 /// Subcommand variants. Mirrors the clap enum in main.rs but kept
@@ -38,9 +39,17 @@ pub enum UseAction {
     Marc27 {
         model: Option<String>,
     },
+    /// Point chat at any OpenAI-compatible server by URL — loopback or a
+    /// GPU box across the network.
+    ///
+    /// `model` is optional because the server already knows what it is
+    /// serving: omitted, PRISM asks the endpoint and uses the answer when
+    /// there is exactly one. Completing the command from the endpoint is
+    /// also the only way to get a vLLM id right — it serves under the full
+    /// Hugging Face repo path, which nobody types from memory.
     Local {
         url: String,
-        model: String,
+        model: Option<String>,
         api_key: Option<String>,
     },
     Provider {
@@ -90,6 +99,10 @@ pub async fn apply(
             api_key,
         } => {
             validate_url(&url)?;
+            let model = match model {
+                Some(model) => model,
+                None => resolve_model_from_server(&url).await?,
+            };
             ChatTarget::Local {
                 url,
                 model,
@@ -173,9 +186,11 @@ pub async fn apply(
             target
         }
         UseAction::List => {
+            let registry = Registry::load();
+            let discovered = local_llm::discover_in(&registry).await;
             return Ok(UseOutcome {
                 new_target: cfg.chat.clone(),
-                message: render_provider_list(&Registry::load(), &cfg.chat, marc27_logged_in),
+                message: render_provider_list(&registry, &cfg.chat, marc27_logged_in, &discovered),
             });
         }
         UseAction::Show => {
@@ -209,6 +224,47 @@ pub async fn apply(
     })
 }
 
+/// Ask the server at `url` which model to use, when the user did not say.
+///
+/// Errors are the point here: every one of them names the endpoint, says
+/// what it actually answered, and gives the user the next move. The one
+/// thing this never does is pick when the answer is ambiguous — routing
+/// inference somewhere the user did not choose is the surprise this whole
+/// feature exists to avoid.
+async fn resolve_model_from_server(url: &str) -> Result<String> {
+    let Some(server) = local_llm::probe_url(url).await else {
+        bail!(
+            "nothing is answering at {url}.\n  \
+             Start the server, or pass --model <model> to save this target anyway."
+        );
+    };
+    if server.state == ServerState::Loading {
+        bail!(
+            "{url} is up but still loading a model — retry in a moment, \
+             or pass --model <model>."
+        );
+    }
+    match server.sole_model() {
+        Some(only) => Ok(only.to_string()),
+        None if server.models.is_empty() => bail!(
+            "{url} is running but serving no models.\n  \
+             Load one on the server, then re-run this command."
+        ),
+        None => {
+            let options = server
+                .models
+                .iter()
+                .map(|m| format!("  {}", server.use_command(m)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "{url} is serving {} models — pick one:\n{options}",
+                server.models.len()
+            )
+        }
+    }
+}
+
 fn tools_state_line(marc27_logged_in: bool) -> String {
     let platform = &crate::brand::brand().platform_name;
     if marc27_logged_in {
@@ -227,10 +283,17 @@ fn tools_state_line(marc27_logged_in: bool) -> String {
 /// exported should see at a glance that they can chat today, with no
 /// account anywhere — that is what makes the provider list a real
 /// alternative rather than a documented one.
+///
+/// `discovered` upgrades that from a claim to an observation. A local
+/// provider that is actually serving stops rendering as a bare `no key`
+/// row — the row names the models it holds, so a user who already has
+/// Ollama running can see it from here instead of being told PRISM has no
+/// local model while it does.
 fn render_provider_list(
     registry: &Registry,
     current: &ChatTarget,
     marc27_logged_in: bool,
+    discovered: &[LocalServer],
 ) -> String {
     let current_id = match current {
         ChatTarget::Marc27 { .. } => Some("marc27".to_string()),
@@ -258,41 +321,98 @@ fn render_provider_list(
 
     let mut out = String::from("Providers PRISM can route chat to:\n\n");
     for p in listed {
-        // The platform's credential is a login session, not an env var,
-        // so it is judged on login state; everyone else on their key.
-        let ready = if p.platform {
-            marc27_logged_in
-        } else {
-            p.key_present()
-        };
         let mark = if current_id.as_deref() == Some(p.id.as_str()) {
             "\x1b[36m❯\x1b[0m"
         } else {
             " "
         };
-        let status = if ready {
-            "\x1b[32mready\x1b[0m    "
-        } else if p.platform {
-            "\x1b[2mlogin   \x1b[0m "
-        } else {
-            "\x1b[2mno key  \x1b[0m "
+        let row = |status: &str, blurb: &str| {
+            format!(
+                "{mark} {status} \x1b[1m{name:<width$}\x1b[0m  \x1b[2m{id}\x1b[0m  \x1b[2m{blurb}\x1b[0m\n",
+                name = p.display_name(),
+                id = p.id,
+            )
         };
-        out.push_str(&format!(
-            "{mark} {status} \x1b[1m{name:<width$}\x1b[0m  \x1b[2m{id}\x1b[0m  \x1b[2m{blurb}\x1b[0m\n",
-            name = p.display_name(),
-            id = p.id,
-            blurb = p.blurb(),
-        ));
+
+        // A provider we can see serving gets one row per running server —
+        // llama-server on both 8080 and 8081 is two different servers with
+        // two different models, and collapsing them would hide one.
+        let running: Vec<&LocalServer> = discovered
+            .iter()
+            .filter(|s| s.provider_id == p.id)
+            .collect();
+        if running.is_empty() {
+            // The platform's credential is a login session, not an env var,
+            // so it is judged on login state; everyone else on their key.
+            let ready = if p.platform {
+                marc27_logged_in
+            } else {
+                p.key_present()
+            };
+            let status = if ready {
+                "\x1b[32mready\x1b[0m    "
+            } else if p.platform {
+                "\x1b[2mlogin   \x1b[0m "
+            } else {
+                "\x1b[2mno key  \x1b[0m "
+            };
+            out.push_str(&row(status, &p.blurb()));
+            continue;
+        }
+        for server in running {
+            let status = match server.state {
+                ServerState::Ready => "\x1b[32mrunning\x1b[0m  ",
+                ServerState::Loading => "\x1b[33mloading\x1b[0m  ",
+            };
+            // Name the URL whenever it is not the one the registry declares,
+            // so an alternate port is visibly a different server.
+            let blurb = if p.base_url.as_deref() == Some(server.base_url.as_str()) {
+                server.summary()
+            } else {
+                format!("{} · {}", server.summary(), server.base_url)
+            };
+            out.push_str(&row(status, &blurb));
+        }
     }
 
+    // The bundled ONNX embedder is the part of PRISM that already needs no
+    // account at all, so a user weighing that question should see it here.
+    out.push_str(&format!(
+        "\n  \x1b[2mEmbeddings:\x1b[0m {}\n",
+        local_llm::onnx_embedder().summary()
+    ));
+
+    // Prefer a command the user can run as-is over one they must complete.
+    let ready_to_run = discovered
+        .iter()
+        .find(|s| s.state == ServerState::Ready && s.sole_model().is_some())
+        .or_else(|| {
+            discovered
+                .iter()
+                .find(|s| s.state == ServerState::Ready && !s.models.is_empty())
+        });
+    let local_line = match ready_to_run {
+        Some(server) => server.use_command(&server.models[0]),
+        None => "prism use local --url http://localhost:11434/v1 --model <model>".to_string(),
+    };
     out.push_str(&format!(
         "\n  \x1b[2mSwitch:\x1b[0m prism use provider <id> --model <model>\n  \
-         \x1b[2mLocal: \x1b[0m prism use local --url http://localhost:11434/v1 --model <model>\n  \
+         \x1b[2mLocal: \x1b[0m {local_line}\n  \
          \x1b[2mAdd:   \x1b[0m declare any OpenAI-compatible endpoint in {path}\n",
         path = crate::providers::user_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "~/.prism/providers.toml".to_string()),
     ));
+
+    if discovered.iter().any(|s| s.state == ServerState::Ready) {
+        // Measured, not guessed: a 12B thinking model timed out on ingest at
+        // the 300s default while a 3B non-thinking model finished, because
+        // reasoning tokens come out of the same generation budget.
+        out.push_str(
+            "\n  \x1b[2mNote: a reasoning model spends its generation budget on thinking — \
+             for\n        `prism ingest`, prefer a non-thinking model or raise the timeout.\x1b[0m\n",
+        );
+    }
     out
 }
 
@@ -382,7 +502,7 @@ mod tests {
         let out = apply(
             UseAction::Local {
                 url: "http://localhost:11434/v1".into(),
-                model: "llama-3.1-70b".into(),
+                model: Some("llama-3.1-70b".into()),
                 api_key: None,
             },
             None,
@@ -440,7 +560,7 @@ mod tests {
         apply(
             UseAction::Local {
                 url: "http://localhost:11434/v1".into(),
-                model: "x".into(),
+                model: Some("x".into()),
                 api_key: None,
             },
             None,
@@ -462,7 +582,7 @@ mod tests {
         apply(
             UseAction::Local {
                 url: "http://localhost:11434/v1".into(),
-                model: "qwen2.5".into(),
+                model: Some("qwen2.5".into()),
                 api_key: None,
             },
             Some(&live),
@@ -483,7 +603,7 @@ mod tests {
         let err = apply(
             UseAction::Local {
                 url: "localhost:11434/v1".into(),
-                model: "x".into(),
+                model: Some("x".into()),
                 api_key: None,
             },
             None,
@@ -552,9 +672,115 @@ mod tests {
         let out = apply(UseAction::List, None, false).await.unwrap();
         assert!(provider_line(&out.message, "groq").contains("ready"));
         assert!(provider_line(&out.message, "deepseek").contains("no key"));
-        // Local servers need no key, so they are always usable.
-        assert!(provider_line(&out.message, "ollama").contains("ready"));
+        // NB: no assertion on the local providers here. `apply` probes this
+        // machine, so their rows depend on whether a server happens to be
+        // running — see `render_lists_a_keyless_local_provider_as_ready`,
+        // which pins that claim against an injected discovery result instead.
         unsafe { std::env::remove_var("GROQ_API_KEY") };
+    }
+
+    /// Discovery-independent rendering. `render_provider_list` is pure, so
+    /// these pin the listing against an injected result rather than against
+    /// whatever is listening on the developer's machine.
+    fn render(discovered: &[LocalServer]) -> String {
+        render_provider_list(
+            &Registry::builtin().unwrap(),
+            &ChatTarget::Marc27 { model: None },
+            false,
+            discovered,
+        )
+    }
+
+    fn found(provider_id: &str, url: &str, models: &[&str]) -> LocalServer {
+        LocalServer {
+            provider_id: provider_id.to_string(),
+            name: format!("{provider_id} (local)"),
+            base_url: url.to_string(),
+            models: models.iter().map(|m| m.to_string()).collect(),
+            state: ServerState::Ready,
+        }
+    }
+
+    /// With nothing running, a keyless local provider is still listed as
+    /// usable — there is no credential for it to be missing.
+    #[test]
+    fn render_lists_a_keyless_local_provider_as_ready() {
+        let out = render(&[]);
+        assert!(provider_line(&out, "ollama").contains("ready"));
+        // Nothing to run yet, so the command keeps its placeholder.
+        assert!(out.contains("--model <model>"), "{out}");
+        // And no reasoning caveat, because no model was found to caveat.
+        assert!(!out.contains("reasoning model"), "{out}");
+    }
+
+    /// The headline fix: a running server stops reading as a bare `no key`
+    /// row and names the models it is actually holding.
+    #[test]
+    fn render_names_the_models_a_running_server_holds() {
+        let out = render(&[found(
+            "ollama",
+            "http://localhost:11434/v1",
+            &["qwen2.5:3b", "llama3.2:1b"],
+        )]);
+        let row = provider_line(&out, "ollama");
+        assert!(row.contains("running"), "{row}");
+        assert!(row.contains("2 models (qwen2.5:3b, llama3.2:1b)"), "{row}");
+
+        // The footer command is now runnable as-is.
+        assert!(
+            out.contains("prism use local --url http://localhost:11434/v1 --model qwen2.5:3b"),
+            "{out}"
+        );
+        // The `Switch:` provider hint keeps its placeholder — it is generic
+        // by nature — but the local line must no longer carry one.
+        assert!(
+            !out.contains("prism use local --url http://localhost:11434/v1 --model <model>"),
+            "{out}"
+        );
+        // A found model earns the reasoning-budget caveat.
+        assert!(out.contains("reasoning model"), "{out}");
+    }
+
+    /// Two llama-servers on different ports are two servers, not one.
+    /// Collapsing them would hide a model the user can actually use.
+    #[test]
+    fn render_gives_each_running_server_its_own_row() {
+        let out = render(&[
+            found("llamacpp", "http://localhost:8080/v1", &["a.gguf"]),
+            found("llamacpp", "http://localhost:8081/v1", &["b.gguf"]),
+        ]);
+        let rows: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("\x1b[2mllamacpp\x1b[0m"))
+            .collect();
+        assert_eq!(rows.len(), 2, "expected one row per server, got {rows:?}");
+        assert!(out.contains("a.gguf") && out.contains("b.gguf"), "{out}");
+        // The non-default port must be visible, or the rows are ambiguous.
+        assert!(out.contains("http://localhost:8081/v1"), "{out}");
+    }
+
+    /// A server still loading is reported as such — not as ready, and not
+    /// as absent.
+    #[test]
+    fn render_marks_a_loading_server_as_loading() {
+        let mut loading = found("vllm", "http://localhost:8000/v1", &[]);
+        loading.state = ServerState::Loading;
+        let out = render(&[loading]);
+        let row = provider_line(&out, "vllm");
+        assert!(row.contains("loading"), "{row}");
+        assert!(!row.contains("running"), "{row}");
+        // Not a usable model, so it must not become the suggested command.
+        assert!(out.contains("--model <model>"), "{out}");
+    }
+
+    /// The bundled ONNX embedder is reported on every listing — it is the
+    /// part of PRISM that already needs no account at all.
+    #[test]
+    fn render_reports_the_bundled_onnx_embedder() {
+        let out = render(&[]);
+        assert!(out.contains("Embeddings:"), "{out}");
+        assert!(out.contains("local ONNX"), "{out}");
+        assert!(out.contains("384-dim"), "{out}");
     }
 
     /// The listing row for one provider. Matches the id column by its
@@ -584,7 +810,7 @@ mod tests {
         apply(
             UseAction::Local {
                 url: "http://localhost:11434/v1".into(),
-                model: "qwen".into(),
+                model: Some("qwen".into()),
                 api_key: None,
             },
             None,
