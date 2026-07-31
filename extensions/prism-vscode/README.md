@@ -1,6 +1,6 @@
 # PRISM VS Code Extension
 
-Status: first-party scaffold for the PRISM/MARC27 developer surface.
+Status: first-party scaffold for the PRISM/the hosted platform developer surface.
 
 This extension is the VS Code client for PRISM. It keeps VS Code where it is
 strongest: files, notebooks, terminals, Git, language servers, and review loops.
@@ -11,8 +11,8 @@ scientist/developer surface.
 
 - Activity-bar container: `PRISM`
 - Agent webview: local `prism backend` JSON-RPC over stdio
-- Context tree: backend state, workspace root, MARC27 auth state
-- MARC27 capability discovery: `GET /api/v1/agent/capabilities`
+- Context tree: backend state, workspace root, the hosted platform auth state
+- the hosted platform capability discovery: `GET /api/v1/agent/capabilities`
 - Service trees: models, workflows, jobs, billing
 - Commands:
   - `PRISM: Open Agent`
@@ -23,8 +23,8 @@ scientist/developer surface.
   - `PRISM: Query Knowledge`
   - `PRISM: Show Models`
   - `PRISM: Show Workflows`
-  - `PRISM: Refresh MARC27 Capabilities`
-  - `PRISM: Set MARC27 API Key`
+  - `PRISM: Refresh the hosted platform Capabilities`
+  - `PRISM: Set platform API Key`
 
 ## Local Development
 
@@ -55,11 +55,11 @@ Override the command in VS Code settings when testing local binaries:
 
 ## Credential Handling
 
-MARC27 API keys are stored in VS Code `SecretStorage`. They are never written to
+platform API keys are stored in VS Code `SecretStorage`. They are never written to
 workspace files, settings JSON, logs, or handoff documents. The extension can
 read public capabilities without a key.
 
 ## Design Map
 
 See `docs/api-revamp-and-extension-map.md` for the API boundary, feature map,
-and MARC27 revamp contract this extension is intended to stabilize.
+and the hosted platform revamp contract this extension is intended to stabilize.

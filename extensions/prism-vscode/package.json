@@ -1,9 +1,9 @@
 {
   "name": "prism-vscode",
   "displayName": "PRISM",
-  "description": "VS Code client for PRISM and MARC27 materials-science workflows.",
+  "description": "VS Code client for PRISM materials-science workflows.",
   "version": "0.1.0",
-  "publisher": "marc27",
+  "publisher": "mirdyne",
   "private": true,
   "license": "UNLICENSED",
   "engines": {
@@ -16,7 +16,6 @@
   ],
   "keywords": [
     "prism",
-    "marc27",
     "materials-science",
     "llm",
     "workflow"
@@ -71,7 +70,7 @@
         "prism.marc27ApiBaseUrl": {
           "type": "string",
           "default": "https://api.marc27.com/api/v1",
-          "description": "Base URL for the MARC27 API."
+          "description": "Base URL for the hosted platform API."
         },
         "prism.maxStreamingBufferChars": {
           "type": "number",
@@ -82,7 +81,7 @@
         "prism.experimentalMarc27ApiV2": {
           "type": "boolean",
           "default": false,
-          "description": "Enable opt-in calls to versioned MARC27 API revamp endpoints as they land."
+          "description": "Enable opt-in calls to versioned platform API revamp endpoints as they land."
         }
       }
     },
@@ -121,15 +120,15 @@
       },
       {
         "command": "prism.refreshMarc27",
-        "title": "PRISM: Refresh MARC27 Capabilities"
+        "title": "PRISM: Refresh Platform Capabilities"
       },
       {
         "command": "prism.setMarc27ApiKey",
-        "title": "PRISM: Set MARC27 API Key"
+        "title": "PRISM: Set Platform API Key"
       },
       {
         "command": "prism.clearMarc27ApiKey",
-        "title": "PRISM: Clear MARC27 API Key"
+        "title": "PRISM: Clear Platform API Key"
       }
     ],
     "menus": {

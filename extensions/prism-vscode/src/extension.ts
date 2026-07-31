@@ -106,12 +106,12 @@ export function activate(context: vscode.ExtensionContext): void {
       capabilities = await api.capabilities();
       refreshTrees();
       vscode.window.showInformationMessage(
-        `MARC27 capabilities loaded: ${capabilities.total_endpoints} endpoints.`
+        `Platform capabilities loaded: ${capabilities.total_endpoints} endpoints.`
       );
     }),
     vscode.commands.registerCommand("prism.setMarc27ApiKey", async () => {
       const value = await vscode.window.showInputBox({
-        title: "Set MARC27 API Key",
+        title: "Set Platform API Key",
         password: true,
         ignoreFocusOut: true,
         prompt: "Stored in VS Code SecretStorage, never in workspace files.",
@@ -119,13 +119,13 @@ export function activate(context: vscode.ExtensionContext): void {
       if (value) {
         await api.setApiKey(value);
         refreshTrees();
-        vscode.window.showInformationMessage("MARC27 API key stored.");
+        vscode.window.showInformationMessage("Platform API key stored.");
       }
     }),
     vscode.commands.registerCommand("prism.clearMarc27ApiKey", async () => {
       await api.clearApiKey();
       refreshTrees();
-      vscode.window.showInformationMessage("MARC27 API key cleared.");
+      vscode.window.showInformationMessage("Platform API key cleared.");
     })
   );
 }
@@ -197,7 +197,7 @@ async function queryKnowledge(backend: PrismBackend): Promise<void> {
     return;
   }
   await backend.sendMessage(
-    `Query the MARC27 knowledge graph and semantic corpus for: ${text.trim()}`
+    `Query the platform knowledge graph and semantic corpus for: ${text.trim()}`
   );
   await vscode.commands.executeCommand("prism.openAgent");
 }
@@ -238,7 +238,7 @@ async function contextEntries(
       icon: new vscode.ThemeIcon("root-folder"),
     },
     {
-      label: "MARC27 API",
+      label: "Platform API",
       description: hasApiKey ? "key stored" : "public discovery only",
       icon: new vscode.ThemeIcon(hasApiKey ? "lock" : "unlock"),
       children: [
@@ -272,7 +272,7 @@ function serviceEntries(serviceName: string, emptyLabel: string): PrismTreeEntry
         description: "refresh capabilities",
         icon: new vscode.ThemeIcon("cloud-download"),
         command: {
-          title: "Refresh MARC27 capabilities",
+          title: "Refresh platform capabilities",
           command: "prism.refreshMarc27",
         },
       },

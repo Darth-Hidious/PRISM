@@ -77,7 +77,7 @@ export class Marc27ApiClient {
         apiError.error?.message ??
         apiError.error?.code ??
         `${response.status} ${response.statusText}`;
-      throw new Error(`MARC27 request failed: ${message}`);
+      throw new Error(`Platform request failed: ${message}`);
     }
 
     return parsed as T;
