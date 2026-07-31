@@ -177,6 +177,44 @@ pub fn load() -> Result<PrismConfig> {
     }
 }
 
+/// Has the user actually chosen where chat goes?
+///
+/// [`load`] cannot answer this. It returns the hosted-platform default for
+/// a missing file, which is byte-identical to what a user who deliberately
+/// chose the hosted platform gets — so "did they decide?" and "what did
+/// they decide?" are two different questions and only one of them has an
+/// answer in `PrismConfig`.
+///
+/// Onboarding needs the first one. It used to ask whether *platform
+/// credentials* existed, which is a different question again: someone who
+/// picked "own key" or a local server never gets credentials, so they were
+/// shown the three-step first-run wizard on every single launch. That is
+/// the sharpest possible contradiction of "PRISM works standalone".
+pub fn chat_target_is_configured() -> bool {
+    config_path()
+        .map(|p| target_is_configured_at(&p))
+        .unwrap_or(false)
+}
+
+/// [`chat_target_is_configured`] against an explicit path, so it is
+/// testable without mutating `$HOME` out from under other tests.
+///
+/// A file with no `[chat]` table is NOT a choice — `serde(default)` would
+/// silently turn it into the hosted-platform default, which is exactly the
+/// ambiguity this function exists to remove. A malformed file, on the other
+/// hand, is a user who chose and then broke it: re-running the wizard would
+/// overwrite their intent, so it counts as configured and `load` reports
+/// the parse error instead.
+fn target_is_configured_at(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match toml::from_str::<toml::Value>(&raw) {
+        Ok(value) => value.get("chat").and_then(|c| c.get("mode")).is_some(),
+        Err(_) => true,
+    }
+}
+
 /// Atomically write the config. Write to a sibling tempfile then rename
 /// — rules out half-written files if the process is killed mid-write.
 pub fn save(cfg: &PrismConfig) -> Result<()> {
@@ -350,6 +388,75 @@ mod tests {
             0o600,
             "config.toml can hold an API key and must be owner-only"
         );
+    }
+
+    /// The onboarding predicate. Nothing on disk ⇒ nobody has chosen ⇒ the
+    /// wizard is genuinely a first launch.
+    #[test]
+    fn no_config_file_means_no_choice_has_been_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!target_is_configured_at(&tmp.path().join("config.toml")));
+    }
+
+    /// THE defect: a standalone user. `choose_provider` (own key) and
+    /// `choose_local_model` (a server on this machine) both write a chat
+    /// target and never produce platform credentials — so onboarding, which
+    /// keyed on credentials, ran again on every launch.
+    #[test]
+    fn choosing_own_key_or_a_local_server_counts_as_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        for target in [
+            ChatTarget::Provider {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4".into(),
+                api_key_env: None,
+            },
+            ChatTarget::Local {
+                url: "http://localhost:11434/v1".into(),
+                model: "llama-3.1-70b".into(),
+                api_key: None,
+            },
+            ChatTarget::Marc27 {
+                model: Some("gpt-5.5".into()),
+            },
+        ] {
+            let path = tmp.path().join("config.toml");
+            let cfg = PrismConfig {
+                chat: target.clone(),
+            };
+            write_atomic(&path, toml::to_string_pretty(&cfg).unwrap().as_bytes()).unwrap();
+            assert!(
+                target_is_configured_at(&path),
+                "{target:?} is a choice the user made"
+            );
+        }
+    }
+
+    /// A file that exists but says nothing about chat is not a choice —
+    /// `serde(default)` would quietly render it as the hosted platform,
+    /// which is the ambiguity this predicate exists to remove.
+    #[test]
+    fn a_file_without_a_chat_table_is_not_a_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        for body in ["", "# nothing here\n", "[something_else]\nkey = 1\n"] {
+            std::fs::write(&path, body).unwrap();
+            assert!(
+                !target_is_configured_at(&path),
+                "{body:?} should not count as a configured chat target"
+            );
+        }
+    }
+
+    /// A user who chose and then broke the file has still chosen. Re-running
+    /// the wizard would overwrite their intent; `load` already reports the
+    /// parse error loudly.
+    #[test]
+    fn a_malformed_file_still_counts_as_a_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[chat\nmode = broken").unwrap();
+        assert!(target_is_configured_at(&path));
     }
 
     /// A 0644 temp file left by an earlier crash must not be reused and

@@ -73,18 +73,22 @@ const CURATED_MODELS: &[CuratedModel] = &[
     },
 ];
 
-/// Run the wizard iff this looks like a genuine first launch: no
-/// credentials stored AND we have a real terminal to prompt on. Piped or
-/// automated invocations (tui-driver, CI, `prism | cat`) must never block
-/// on stdin, so we bail early there and let the normal boot flow handle
-/// the not-logged-in state.
+/// Run the wizard iff this looks like a genuine first launch: the user has
+/// not yet chosen how PRISM reaches a model, AND we have a real terminal to
+/// prompt on. Piped or automated invocations (tui-driver, CI, `prism | cat`)
+/// must never block on stdin, so we bail early there and let the normal boot
+/// flow handle the not-set-up state.
 pub async fn run_if_first_launch(
     paths: &PrismPaths,
     endpoints: &PlatformEndpoints,
     python: &Path,
 ) -> Result<()> {
     let state = paths.load_cli_state().unwrap_or_default();
-    if state.credentials.is_some() || !io::stdin().is_terminal() {
+    if !should_run_wizard(
+        state.credentials.is_some(),
+        chat_config::chat_target_is_configured(),
+        io::stdin().is_terminal(),
+    ) {
         return Ok(());
     }
 
@@ -144,6 +148,22 @@ pub async fn run_if_first_launch(
 
     done();
     Ok(())
+}
+
+/// Is this a genuine first launch?
+///
+/// The bug this replaces: the condition was `has_credentials`, full stop.
+/// Credentials only exist for someone who signed in to the hosted platform,
+/// so a user who picked "own key" — or a model server already running on
+/// their machine — was shown the whole three-step wizard again on every
+/// launch, forever. Onboarding is finished when the user has *decided*, and
+/// the hosted account is one of several ways to decide.
+fn should_run_wizard(
+    has_credentials: bool,
+    chat_target_configured: bool,
+    interactive: bool,
+) -> bool {
+    interactive && !has_credentials && !chat_target_configured
 }
 
 /// How a first-run user wants chat routed.
@@ -405,4 +425,40 @@ fn done() {
     println!("  \x1b[32m✓ All set.\x1b[0m Launching PRISM…");
     println!("  \x1b[2mTip: /model changes models, /help lists commands.\x1b[0m");
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// THE defect. A user who chose "own key" never gets platform
+    /// credentials, so keying wizard-completion on credentials showed them
+    /// the whole three-step first run on every single launch.
+    #[test]
+    fn a_configured_chat_target_finishes_onboarding_without_an_account() {
+        assert!(
+            !should_run_wizard(false, true, true),
+            "the user has chosen — do not ask again"
+        );
+    }
+
+    #[test]
+    fn a_genuine_first_launch_still_runs_the_wizard() {
+        assert!(should_run_wizard(false, false, true));
+    }
+
+    #[test]
+    fn signing_in_also_finishes_onboarding() {
+        assert!(!should_run_wizard(true, false, true));
+    }
+
+    /// Piped or automated invocations must never block on stdin.
+    #[test]
+    fn a_non_interactive_run_never_prompts() {
+        for credentials in [false, true] {
+            for configured in [false, true] {
+                assert!(!should_run_wizard(credentials, configured, false));
+            }
+        }
+    }
 }
