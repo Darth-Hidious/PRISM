@@ -199,6 +199,32 @@ pub struct LlmClient {
     config: LlmConfig,
 }
 
+/// The chat-completions endpoint for an OpenAI-compatible base URL.
+///
+/// Appends `/chat/completions`, and nothing else. This used to synthesise a
+/// `/v1` segment whenever the base did not already end in one, which broke
+/// every vendor whose OpenAI-compatible surface is not mounted at `/v1`:
+///
+/// ```text
+/// google, gemini   https://generativelanguage.googleapis.com/v1beta/openai
+///                    → …/v1beta/openai/v1/chat/completions   404
+/// zai              https://api.z.ai/api/paas/v4
+///                    → …/api/paas/v4/v1/chat/completions     404
+/// ```
+///
+/// Those are each vendor's documented endpoint, so the registry was right
+/// and the guess was the bug — and because Google is offered as a headline
+/// bring-your-own-key option in the onboarding wizard, it was a new user's
+/// very first chat that 404'd.
+///
+/// A base URL is now taken at face value. Whoever supplied it — the shipped
+/// `providers.toml`, `prism use local --url`, a `~/.prism/providers.toml`
+/// gateway override — already said where the API lives, and a client that
+/// edits that string can only be wrong in ways they cannot correct.
+pub fn chat_completions_url(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
 impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
         let client = reqwest::Client::builder()
@@ -228,17 +254,10 @@ impl LlmClient {
         self.config.base_url.contains("marc27.com") || self.config.base_url.contains("/llm")
     }
 
-    /// Build the OpenAI chat-completions URL. Handles base URLs that
-    /// already include `/v1` (e.g. `http://localhost:8081/v1`) by not
-    /// double-appending, and base URLs that don't (e.g.
-    /// `http://localhost:8081`) by appending `/v1`.
+    /// This client's chat-completions endpoint. See the free
+    /// [`chat_completions_url`] for why it appends nothing but the path.
     fn chat_completions_url(&self) -> String {
-        let base = self.config.base_url.trim_end_matches('/');
-        if base.ends_with("/v1") {
-            format!("{base}/chat/completions")
-        } else {
-            format!("{base}/v1/chat/completions")
-        }
+        chat_completions_url(&self.config.base_url)
     }
 
     /// Extract the assistant's text from an OpenAI-compatible response.
@@ -1453,6 +1472,78 @@ mod tests {
     fn llm_client_constructs_with_defaults() {
         let config = LlmConfig::default();
         let _client = LlmClient::new(config);
+    }
+
+    /// The base URL is data, not a hint. Whatever path a vendor mounts its
+    /// OpenAI-compatible surface at, only `/chat/completions` is appended.
+    #[test]
+    fn chat_completions_url_appends_only_the_path() {
+        for (base, expected) in [
+            // Mounted at /v1 — the case the old code got right.
+            (
+                "https://api.openai.com/v1",
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            // Trailing slash is trimmed, not doubled.
+            (
+                "https://api.openai.com/v1/",
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            // NOT mounted at /v1 — the 404s this function used to cause.
+            (
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            ),
+            (
+                "https://api.z.ai/api/paas/v4",
+                "https://api.z.ai/api/paas/v4/chat/completions",
+            ),
+            // Mounted below /v1.
+            (
+                "https://api.groq.com/openai/v1",
+                "https://api.groq.com/openai/v1/chat/completions",
+            ),
+        ] {
+            assert_eq!(chat_completions_url(base), expected, "base {base}");
+        }
+    }
+
+    /// Named regression pin: no `/v1` may ever be synthesised again. A base
+    /// that already carries a version segment must not grow a second one.
+    #[test]
+    fn chat_completions_url_never_invents_a_version_segment() {
+        for base in [
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "https://api.z.ai/api/paas/v4",
+            "https://api.cohere.ai/compatibility/v1",
+            "https://llm.corp.internal/openai",
+        ] {
+            let url = chat_completions_url(base);
+            assert_eq!(
+                url,
+                format!("{base}/chat/completions"),
+                "the client must not rewrite {base}"
+            );
+            assert!(
+                !url.contains("/v1/chat/completions") || base.ends_with("/v1"),
+                "a /v1 was synthesised into {url}"
+            );
+        }
+    }
+
+    /// The client and the LlmConfig it was built from must agree — the
+    /// method is what the four request paths actually call.
+    #[test]
+    fn client_uses_its_configured_base_verbatim() {
+        let client = LlmClient::new(LlmConfig {
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+            model: "gemini-2.5-flash".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            client.chat_completions_url(),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
     }
 
     #[test]

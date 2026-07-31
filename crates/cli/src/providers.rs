@@ -384,6 +384,91 @@ mod tests {
         }
     }
 
+    /// Every shipped base URL, pinned to the exact endpoint a chat turn
+    /// POSTs to. This is the test that would have caught the 404s: the
+    /// client used to synthesise a `/v1` segment for any base that did not
+    /// already end in one, so `google`, `gemini` and `zai` — whose vendors
+    /// mount their OpenAI-compatible surface elsewhere — resolved to URLs
+    /// that do not exist. Nothing pinned the composition, so the suite
+    /// stayed green while three shipped providers were unusable.
+    ///
+    /// Each expectation below is the vendor's documented OpenAI-compatible
+    /// chat endpoint. Adding a provider without adding it here fails the
+    /// coverage assertion at the bottom.
+    #[test]
+    fn every_shipped_base_resolves_to_the_vendors_real_endpoint() {
+        use prism_ingest::llm::chat_completions_url;
+
+        const EXPECTED: &[(&str, &str)] = &[
+            ("openai", "https://api.openai.com/v1/chat/completions"),
+            ("anthropic", "https://api.anthropic.com/v1/chat/completions"),
+            (
+                "google",
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            ),
+            (
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            ),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ),
+            ("groq", "https://api.groq.com/openai/v1/chat/completions"),
+            ("cerebras", "https://api.cerebras.ai/v1/chat/completions"),
+            ("zai", "https://api.z.ai/api/paas/v4/chat/completions"),
+            ("mistral", "https://api.mistral.ai/v1/chat/completions"),
+            ("deepseek", "https://api.deepseek.com/v1/chat/completions"),
+            ("xai", "https://api.x.ai/v1/chat/completions"),
+            ("together", "https://api.together.xyz/v1/chat/completions"),
+            (
+                "fireworks",
+                "https://api.fireworks.ai/inference/v1/chat/completions",
+            ),
+            (
+                "cohere",
+                "https://api.cohere.ai/compatibility/v1/chat/completions",
+            ),
+            ("ollama", "http://localhost:11434/v1/chat/completions"),
+            ("llamacpp", "http://localhost:8080/v1/chat/completions"),
+            ("lmstudio", "http://localhost:1234/v1/chat/completions"),
+            ("vllm", "http://localhost:8000/v1/chat/completions"),
+        ];
+
+        let reg = Registry::builtin().unwrap();
+        for (id, expected) in EXPECTED {
+            let base =
+                base_url_for(&reg, id).unwrap_or_else(|| panic!("{id} missing from registry"));
+            assert_eq!(
+                chat_completions_url(&base),
+                *expected,
+                "{id}: base {base} resolves to the wrong endpoint"
+            );
+        }
+
+        // Coverage: no shipped provider may go unpinned. A new vendor added
+        // to providers.toml without a line above is exactly how an unusable
+        // endpoint ships unnoticed.
+        let pinned: Vec<&str> = EXPECTED.iter().map(|(id, _)| *id).collect();
+        let shipped: Vec<&str> = reg
+            .all()
+            .iter()
+            .filter(|p| !p.platform)
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            shipped.len(),
+            EXPECTED.len(),
+            "pin every shipped provider: {shipped:?} vs pinned {pinned:?}"
+        );
+        for id in &shipped {
+            assert!(
+                pinned.contains(id),
+                "{id} ships but its endpoint is unpinned"
+            );
+        }
+    }
+
     #[test]
     fn platform_provider_has_no_static_base_url() {
         let reg = Registry::builtin().unwrap();
