@@ -14,9 +14,16 @@
 //! pointed at hosts that do not exist. The registry replaces that guess
 //! with a declared, overridable URL.
 //!
-//! Keys are never stored here or anywhere else by PRISM: an entry names
-//! the **env var** to read at request time (`api_key_env`), so rotating a
-//! key is `export …` with no PRISM restart and no secret on disk.
+//! A registry entry never carries a key: it names the **env var** to read
+//! at request time (`api_key_env`), so rotating a key is `export …` with no
+//! PRISM restart and no secret on disk.
+//!
+//! Scoped deliberately to this route. PRISM as a whole does write a key to
+//! disk on one path — `prism use local --api-key sk-…` stores it in the
+//! `[chat]` table of `~/.prism/config.toml` (0600), because a local
+//! server's token has no env-var convention to fall back on. These docs
+//! previously extended the registry's env-only guarantee to the whole
+//! product, which that path has always contradicted.
 
 use std::path::PathBuf;
 
@@ -193,6 +200,14 @@ impl Registry {
     /// Every provider, in file order.
     pub fn all(&self) -> &[Provider] {
         &self.providers
+    }
+
+    /// A registry of exactly these providers. Tests-only: it lets the
+    /// local-server sweep run against stub endpoints instead of whatever
+    /// happens to be listening on the developer's machine.
+    #[cfg(test)]
+    pub fn from_providers(providers: Vec<Provider>) -> Self {
+        Self { providers }
     }
 }
 

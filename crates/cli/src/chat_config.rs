@@ -190,9 +190,44 @@ pub fn save(cfg: &PrismConfig) -> Result<()> {
     Ok(())
 }
 
+/// Write `bytes` to `path` atomically and owner-only.
+///
+/// 0600 because this file can hold a secret: `prism use local --api-key
+/// sk-…` persists that key verbatim in the `[chat]` table. Plain
+/// `std::fs::write` inherited the umask — 0644 on most distros — leaving
+/// any other local user able to read it, while `credentials.json` next door
+/// was already 0600 for exactly the same reason.
+///
+/// The mode is set when the temp file is CREATED, not on the final path
+/// after the rename: fixing it afterwards leaves a window in which the
+/// finished file is world-readable. It is unconditional rather than
+/// "only when a key is present" — a predicate over which fields count as
+/// secret is one new field away from being wrong, and nothing but PRISM
+/// reads this file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    // `mode` only applies to a file this call CREATES, so a 0644 temp file
+    // left behind by an earlier crash would otherwise be reused as-is and
+    // renamed into place still world-readable.
+    let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
@@ -282,5 +317,129 @@ mod tests {
             api_key_env: None,
         };
         assert_eq!(provider.human_full(), "anthropic (claude-sonnet-4)");
+    }
+
+    /// `prism use local --api-key sk-…` puts a live secret in this file, in
+    /// plaintext. It was written with a plain `fs::write`, so it inherited
+    /// the umask — 0644 on most distros — and any other local user could
+    /// read the key, while `credentials.json` next door was already 0600.
+    #[test]
+    #[cfg(unix)]
+    fn config_holding_an_api_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let cfg = PrismConfig {
+            chat: ChatTarget::Local {
+                url: "http://localhost:11434/v1".into(),
+                model: "llama-3.1-70b".into(),
+                api_key: Some("sk-super-secret".into()),
+            },
+        };
+        write_atomic(&path, toml::to_string_pretty(&cfg).unwrap().as_bytes()).unwrap();
+
+        // The key really is in there — this is what makes the mode matter.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("sk-super-secret"),
+            "the key is persisted verbatim, so the file is a secret"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "config.toml can hold an API key and must be owner-only"
+        );
+    }
+
+    /// A 0644 temp file left by an earlier crash must not be reused and
+    /// renamed into place still world-readable — `OpenOptions::mode` only
+    /// applies to a file the call creates.
+    #[test]
+    #[cfg(unix)]
+    fn a_stale_world_readable_temp_file_cannot_leak_the_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let stale = path.with_extension("toml.tmp");
+        std::fs::write(&stale, b"leftover").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_atomic(&path, b"chat = {}\n").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// Reduce a source file to the prose a reader actually sees, so a claim
+    /// is still found when it is line-wrapped across comment markers or
+    /// `println!` calls.
+    ///
+    /// Without this the check is inert: in `providers.toml` the promise is
+    /// split as `…PRISM never writes your\n# key to disk.`, and in
+    /// `onboarding.rs` as `…PRISM never");\n println!("  writes it to
+    /// disk.`. A plain `contains` matches neither, which is precisely the
+    /// kind of test that passes while the defect ships.
+    fn user_visible_prose(text: &str) -> String {
+        let mut s = text.to_string();
+        for scaffold in [
+            "println!", "print!", "//!", "///", "#", "(", ")", "\"", ";", "\\n", "—",
+        ] {
+            s = s.replace(scaffold, " ");
+        }
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The shipped text must not promise something the code does not do.
+    /// `ChatTarget::Local` has an `api_key` field that `prism use local
+    /// --api-key` fills and `save` persists, so an unqualified "never writes
+    /// your key to disk" is false wherever a user can read it.
+    #[test]
+    fn shipped_text_makes_no_blanket_never_writes_your_key_promise() {
+        const BANNED: &[&str] = &[
+            "PRISM never writes your key to disk",
+            "PRISM never writes it to disk",
+            "never stored here or anywhere else by PRISM",
+        ];
+        for (what, text) in [
+            ("providers.toml", include_str!("../providers.toml")),
+            ("providers.rs", include_str!("providers.rs")),
+            ("onboarding.rs", include_str!("onboarding.rs")),
+        ] {
+            let prose = user_visible_prose(text);
+            for banned in BANNED {
+                assert!(
+                    !prose.contains(banned),
+                    "{what} still tells the user \"{banned}\", which \
+                     `prism use local --api-key` makes false"
+                );
+            }
+        }
+    }
+
+    /// Guards the guard: prove the normaliser really does see a promise that
+    /// is wrapped the way each of these files wraps it. A `contains` over
+    /// the raw text matches none of these.
+    #[test]
+    fn the_prose_normaliser_sees_wrapped_claims() {
+        for wrapped in [
+            // providers.toml style
+            "# key, read from the named env var at request time. PRISM never writes your\n\
+             # key to disk.",
+            // onboarding.rs style
+            "    println!(\"  ... at request time — PRISM never\");\n\
+                 println!(\"  writes it to disk. Local servers need no key.\");",
+        ] {
+            let prose = user_visible_prose(wrapped);
+            assert!(
+                prose.contains("PRISM never writes your key to disk")
+                    || prose.contains("PRISM never writes it to disk"),
+                "the normaliser missed a wrapped claim, so the honesty test \
+                 would be inert:\n{prose}"
+            );
+        }
     }
 }

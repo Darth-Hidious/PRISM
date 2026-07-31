@@ -5,8 +5,14 @@
 # it is an entry in the same table as everyone else, not a dependency.
 # Every other provider here is equally reachable with `prism use provider
 # <id> --model <model>` (or `/use provider ...` in the TUI) using YOUR OWN
-# key, read from the named env var at request time. PRISM never writes your
-# key to disk.
+# key. A registry provider's key is read from the named env var at request
+# time and is never written to disk.
+#
+# That is a property of THIS route, not a blanket promise: `prism use local
+# --api-key sk-…` does persist the key you hand it, in the `[chat]` table of
+# `~/.prism/config.toml` (owner-only, 0600). A local server's token has no
+# env-var convention to fall back on, so storing it is the point — but it is
+# stored, and saying otherwise here would be a lie in shipped text.
 #
 # ── Overriding / extending ────────────────────────────────────────────
 # Drop a file with this same schema at `~/.prism/providers.toml`. Entries

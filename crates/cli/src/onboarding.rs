@@ -190,8 +190,12 @@ fn choose_provider() -> Result<()> {
         return Ok(());
     }
 
-    println!("  Your key is read from an env var at request time — PRISM never");
-    println!("  writes it to disk. Local servers need no key at all.");
+    // Scoped to this screen on purpose. Every option below is a registry
+    // provider, whose key really is env-only — but "PRISM never writes it to
+    // disk" (what this used to say) is not true of PRISM as a whole:
+    // `prism use local --api-key` stores the key it is handed.
+    println!("  Your key is read from an env var at request time — nothing on this");
+    println!("  screen writes it to disk. Local servers need no key at all.");
 
     let chosen = prompt_select("Provider", &choices, |p| {
         let ready = if p.key_present() {
