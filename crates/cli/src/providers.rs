@@ -201,14 +201,6 @@ impl Registry {
     pub fn all(&self) -> &[Provider] {
         &self.providers
     }
-
-    /// A registry of exactly these providers. Tests-only: it lets the
-    /// local-server sweep run against stub endpoints instead of whatever
-    /// happens to be listening on the developer's machine.
-    #[cfg(test)]
-    pub fn from_providers(providers: Vec<Provider>) -> Self {
-        Self { providers }
-    }
 }
 
 /// `~/.prism/providers.toml`. `None` when `$HOME` is unset.
