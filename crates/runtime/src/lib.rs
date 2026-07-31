@@ -7,7 +7,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
@@ -42,20 +42,38 @@ pub struct PrismPaths {
     pub state_dir: PathBuf,
 }
 
+/// The on-disk qualifier triple. The PRODUCT's name, not a company's: this
+/// string is visible to every user as the path (`~/Library/Application
+/// Support/dev.prism.prism` on macOS) and `prism status` prints it. A
+/// company name here made PRISM look like a client for someone else's
+/// platform.
+const BUNDLE_ID: [&str; 3] = ["dev", "prism", "prism"];
+
+/// The qualifier every shipped release up to and including v2.7.1 used.
+/// Those installs are real — they hold `cli-state.json` (the login),
+/// `node_key` / `node_signing_key` (the node's identity), and the audit,
+/// session, rbac and subscription databases — so [`PrismPaths::discover`]
+/// moves them across once rather than orphaning them. Frozen: changing it
+/// strands everyone who has not upgraded yet.
+const LEGACY_BUNDLE_ID: [&str; 3] = ["com", "marc27", "prism"];
+
 impl PrismPaths {
     pub fn discover() -> Result<Self, RuntimeError> {
-        // Qualifier is the PRODUCT's, not a company's: this string is visible to
-        // every user as the on-disk path (`~/Library/Application Support/
-        // dev.prism.prism` on macOS) and `prism status` prints it. A company
-        // name here made PRISM look like a client for someone else's platform.
-        //
-        // Changed with no migration deliberately — there are no installs to
-        // migrate. If that ever stops being true, this needs a one-time move of
-        // the old directory before anyone's audit db and cli-state are orphaned.
-        let dirs = ProjectDirs::from("dev", "prism", "prism")
-            .ok_or(RuntimeError::ProjectDirsUnavailable)?;
+        let dirs = Self::for_bundle_id(BUNDLE_ID).ok_or(RuntimeError::ProjectDirsUnavailable)?;
+        // Releases v1.0.0…v2.7.1 wrote under `com.marc27.prism`. Renaming the
+        // bundle id without moving the data would silently log those installs
+        // out, mint a second node identity on the next `node up`, and hide
+        // their audit/rbac/subscription history. Best-effort by design — see
+        // `migrate_dir`.
+        dirs.migrate_legacy_install();
+        Ok(dirs)
+    }
 
-        Ok(Self {
+    /// The four directories `directories` derives for one qualifier triple.
+    /// `None` only when no home directory can be resolved at all.
+    fn for_bundle_id(id: [&str; 3]) -> Option<Self> {
+        let dirs = ProjectDirs::from(id[0], id[1], id[2])?;
+        Some(Self {
             config_dir: dirs.config_dir().to_path_buf(),
             cache_dir: dirs.cache_dir().to_path_buf(),
             data_dir: dirs.data_dir().to_path_buf(),
@@ -64,6 +82,65 @@ impl PrismPaths {
                 .unwrap_or_else(|| dirs.data_local_dir())
                 .to_path_buf(),
         })
+    }
+
+    /// One-time move of a pre-rename install into these directories.
+    ///
+    /// On platforms where the qualifier is not part of the path (Linux/XDG
+    /// derives both from the application name alone) the old and new paths
+    /// are identical and every pair is a no-op.
+    fn migrate_legacy_install(&self) {
+        let Some(legacy) = Self::for_bundle_id(LEGACY_BUNDLE_ID) else {
+            return;
+        };
+        for (from, to) in [
+            (&legacy.config_dir, &self.config_dir),
+            (&legacy.cache_dir, &self.cache_dir),
+            (&legacy.data_dir, &self.data_dir),
+            (&legacy.state_dir, &self.state_dir),
+        ] {
+            migrate_dir(from, to);
+        }
+    }
+}
+
+/// Move one pre-rename directory to its new home, exactly once.
+///
+/// Skips unless the old directory exists and the new one does not, which is
+/// what makes it both idempotent and non-destructive: a user who already
+/// launched a renamed build and signed in again keeps that state, and a
+/// second run after a successful move finds nothing left to do.
+///
+/// `rename` rather than copy: old and new are siblings under the same
+/// parent, so it cannot cross a filesystem, it is atomic, and the 0600 modes
+/// on `cli-state.json`, `node_key` and `node_signing_key` survive untouched
+/// because the inodes never move.
+///
+/// Failure is reported and swallowed. A migration that cannot complete must
+/// leave PRISM starting on an empty new directory — recoverable, and the old
+/// data is still there — instead of refusing to start at all.
+fn migrate_dir(from: &Path, to: &Path) {
+    if from == to || to.exists() || !from.is_dir() {
+        return;
+    }
+    if let Some(parent) = to.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!("[prism] could not prepare {}: {e}", parent.display());
+        return;
+    }
+    match fs::rename(from, to) {
+        Ok(()) => eprintln!(
+            "[prism] moved your PRISM data from {} to {}",
+            from.display(),
+            to.display()
+        ),
+        Err(e) => eprintln!(
+            "[prism] could not move {} to {} ({e}); starting fresh at the new \
+             location — your old data is untouched.",
+            from.display(),
+            to.display()
+        ),
     }
 }
 
@@ -557,5 +634,175 @@ mod tests {
         assert!(!paths.clear_node_token());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Pre-rename install migration (`com.marc27.prism` → `dev.prism.prism`) ──
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Seed a directory shaped like a real pre-rename install: the login
+    /// state and the node's identity keys at 0600, a world-readable database,
+    /// and a nested directory.
+    fn seed_legacy_install(dir: &Path, marker: &str) {
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::write(dir.join("cli-state.json"), marker).unwrap();
+        fs::write(dir.join("node_key"), b"raw-32-bytes").unwrap();
+        fs::write(dir.join("node_signing_key"), b"raw-32-bytes").unwrap();
+        fs::write(dir.join("audit.db"), b"sqlite").unwrap();
+        fs::write(dir.join("nested").join("sessions.db"), b"sqlite").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for secret in ["cli-state.json", "node_key", "node_signing_key"] {
+                fs::set_permissions(dir.join(secret), fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+    }
+
+    /// The whole point of the migration: everything an install owns arrives
+    /// at the new location, and the owner-only modes on the credential and
+    /// node-identity files survive the move.
+    #[test]
+    fn migrate_dir_moves_a_legacy_install_preserving_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("com.marc27.prism");
+        let new = tmp.path().join("dev.prism.prism");
+        seed_legacy_install(&legacy, "the-original-login");
+
+        migrate_dir(&legacy, &new);
+
+        assert_eq!(
+            fs::read_to_string(new.join("cli-state.json")).unwrap(),
+            "the-original-login",
+            "the login must survive the bundle-id rename"
+        );
+        for carried in ["node_key", "node_signing_key", "audit.db"] {
+            assert!(new.join(carried).exists(), "{carried} was left behind");
+        }
+        assert!(
+            new.join("nested").join("sessions.db").exists(),
+            "nested databases must come across too"
+        );
+        #[cfg(unix)]
+        for secret in ["cli-state.json", "node_key", "node_signing_key"] {
+            assert_eq!(
+                mode_of(&new.join(secret)),
+                0o600,
+                "{secret} must stay owner-only after migration"
+            );
+        }
+        assert!(!legacy.exists(), "the old directory should be gone");
+    }
+
+    /// Run it twice — the second launch of an upgraded build must be a
+    /// no-op, not a second move that undoes the first.
+    #[test]
+    fn migrate_dir_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("com.marc27.prism");
+        let new = tmp.path().join("dev.prism.prism");
+        seed_legacy_install(&legacy, "the-original-login");
+
+        migrate_dir(&legacy, &new);
+        fs::write(new.join("cli-state.json"), "refreshed-after-upgrade").unwrap();
+        migrate_dir(&legacy, &new);
+
+        assert_eq!(
+            fs::read_to_string(new.join("cli-state.json")).unwrap(),
+            "refreshed-after-upgrade",
+            "a second run must not resurrect the pre-migration state"
+        );
+    }
+
+    /// Someone who already ran the un-migrated build and signed in again has
+    /// live state at the new location. Migration must never overwrite it.
+    #[test]
+    fn migrate_dir_never_clobbers_the_new_location() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("com.marc27.prism");
+        let new = tmp.path().join("dev.prism.prism");
+        seed_legacy_install(&legacy, "stale-login");
+        fs::create_dir_all(&new).unwrap();
+        fs::write(new.join("cli-state.json"), "the-login-in-use").unwrap();
+
+        migrate_dir(&legacy, &new);
+
+        assert_eq!(
+            fs::read_to_string(new.join("cli-state.json")).unwrap(),
+            "the-login-in-use",
+            "an existing new-location file must win"
+        );
+        assert!(
+            legacy.exists(),
+            "with nothing to do, the old directory is left for the user to inspect"
+        );
+    }
+
+    /// A fresh install has no legacy directory. Migration must not conjure
+    /// the new one either — `discover()` runs on every invocation, including
+    /// ones that go on to touch no state at all.
+    #[test]
+    fn migrate_dir_does_nothing_without_a_legacy_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("com.marc27.prism");
+        let new = tmp.path().join("dev.prism.prism");
+
+        migrate_dir(&legacy, &new);
+
+        assert!(!new.exists(), "no legacy install ⇒ nothing to create");
+    }
+
+    /// The wiring test: `discover()` itself must perform the migration.
+    /// Releases v1.0.0…v2.7.1 wrote under `com.marc27.prism`; without this
+    /// call an upgrade silently logs the user out.
+    ///
+    /// On platforms where the qualifier is not part of the path (Linux/XDG)
+    /// the two locations coincide and this passes trivially — which is
+    /// correct: there is nothing to migrate there.
+    #[test]
+    fn discover_adopts_a_pre_rename_install() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", tmp.path());
+        }
+
+        let legacy = PrismPaths::for_bundle_id(LEGACY_BUNDLE_ID).expect("legacy dirs under $HOME");
+        fs::create_dir_all(&legacy.config_dir).unwrap();
+        let state = PrismCliState {
+            credentials: Some(StoredCredentials {
+                access_token: "at-from-the-old-bundle-id".into(),
+                ..Default::default()
+            }),
+            preferred_python: None,
+        };
+        legacy.save_cli_state(&state).unwrap();
+
+        let paths = PrismPaths::discover().unwrap();
+        let carried = paths
+            .load_cli_state()
+            .unwrap()
+            .credentials
+            .expect("an upgrade must not log the user out");
+
+        unsafe {
+            match prev_home {
+                Some(h) => env::set_var("HOME", h),
+                None => env::remove_var("HOME"),
+            }
+        }
+
+        assert_eq!(carried.access_token, "at-from-the-old-bundle-id");
+        #[cfg(unix)]
+        assert_eq!(
+            mode_of(&paths.cli_state_path()),
+            0o600,
+            "the migrated credential file must still be owner-only"
+        );
     }
 }
