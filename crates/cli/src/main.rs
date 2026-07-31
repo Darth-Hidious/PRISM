@@ -158,11 +158,14 @@ enum Commands {
         command: CampaignCommands,
     },
     /// Start the agent backend (JSON-RPC server for TUI frontend).
+    //
+    // No `--python` of its own. It used to declare one, defaulting to the
+    // literal "python3", which shadowed nothing and served only to hand the
+    // handler a sentinel instead of the resolved interpreter — see the
+    // global `--python` on `Cli`.
     Backend {
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
-        #[arg(long, default_value = "python3")]
-        python: PathBuf,
     },
     /// Serve the agent over JSON-RPC on stdio for external frontends
     /// (PRISM Desktop, IDE extensions) — the LSP-server role. Same-user
@@ -170,8 +173,6 @@ enum Commands {
     IpcServe {
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
-        #[arg(long, default_value = "python3")]
-        python: PathBuf,
     },
     /// Launch and manage Jupyter notebooks (local or remote compute).
     Notebook {
@@ -1932,8 +1933,8 @@ async fn main() -> Result<()> {
         },
         Commands::Backend {
             project_root: backend_pr,
-            python: backend_py,
         } => {
+            let backend_py = python.clone();
             use prism_ingest::LlmConfig;
 
             // Load from prism.toml [llm] section, env vars as overrides
@@ -2120,8 +2121,8 @@ async fn main() -> Result<()> {
         }
         Commands::IpcServe {
             project_root: ipc_pr,
-            python: ipc_py,
         } => {
+            let ipc_py = python.clone();
             // Thin adapter: spawn `prism backend` (this same binary) and expose
             // its native protocol to an external frontend as a minimal JSON-RPC
             // surface on our stdin/stdout. Tracing already goes to stderr, so
@@ -10715,6 +10716,78 @@ mod tests {
         // #132: unauthenticated + untouched default must NOT silently become
         // localhost — it errors instead.
         assert!(resolve_unauth_llm_url(DEFAULT_LLM_URL).is_err());
+    }
+
+    // ── `backend` / `ipc-serve` must not invent their own interpreter ──
+
+    /// THE defect. `Backend` and `IpcServe` each declared their own
+    /// `--python` defaulting to the literal `"python3"`, so their handlers
+    /// received that sentinel instead of the resolved managed venv and ran
+    /// whatever `python3` was first on `$PATH` — a system interpreter with
+    /// none of PRISM's tools installed. `Commands::Tools` and the TUI used
+    /// the resolved path. `ipc-serve` is the documented route for every
+    /// external frontend (Desktop, IDE extension), so those frontends got a
+    /// tool server that could not import `app`. Proven with a `python3`
+    /// shim on `$PATH`.
+    ///
+    /// There is now exactly ONE `--python`: the global one, resolved once.
+    #[test]
+    fn only_one_python_flag_exists_and_it_is_the_global_one() {
+        use clap::CommandFactory;
+
+        let cmd = Cli::command();
+        let global: Vec<_> = cmd
+            .get_arguments()
+            .filter(|a| a.get_id() == "python")
+            .collect();
+        assert_eq!(global.len(), 1, "the top level declares --python once");
+        assert!(global[0].is_global_set(), "--python must be global");
+
+        for sub in cmd.get_subcommands() {
+            assert!(
+                !sub.get_arguments().any(|a| a.get_id() == "python"),
+                "`prism {}` declares its own --python; the global one is \
+                 the only interpreter knob, and a second one is how these \
+                 two subcommands ended up on a system python3",
+                sub.get_name()
+            );
+        }
+    }
+
+    /// The global flag still carries a value given after the subcommand —
+    /// which is how `prism ipc-serve` re-invokes `prism backend`, and how
+    /// CI points at a pre-seeded interpreter.
+    #[test]
+    fn the_global_python_flag_works_in_subcommand_position() {
+        for argv in [
+            vec!["prism", "backend", "--python", "/opt/ci/python3.12"],
+            vec!["prism", "ipc-serve", "--python", "/opt/ci/python3.12"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert_eq!(cli.python, PathBuf::from("/opt/ci/python3.12"));
+        }
+        // Left off, it stays the sentinel that main() replaces with the venv.
+        let cli = Cli::try_parse_from(["prism", "backend"]).unwrap();
+        assert_eq!(cli.python, PathBuf::from("python3"));
+    }
+
+    /// …and the sentinel is only replaced for commands that are declared to
+    /// need Python. Both of these are, so both get the managed venv.
+    #[test]
+    fn backend_and_ipc_serve_are_declared_to_need_the_venv() {
+        for cmd in [
+            Commands::Backend {
+                project_root: PathBuf::from("."),
+            },
+            Commands::IpcServe {
+                project_root: PathBuf::from("."),
+            },
+        ] {
+            assert!(
+                command_needs_python(Some(&cmd)),
+                "{cmd:?} spawns the Python tool server"
+            );
+        }
     }
 
     // ── F0 review-fix primitives ───────────────────────────────────────
