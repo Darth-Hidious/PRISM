@@ -1315,6 +1315,36 @@ fn command_needs_python(command: Option<&Commands>) -> bool {
     }
 }
 
+/// Whether this invocation should kick off the background marketplace
+/// tool-sync.
+///
+/// Two gates, and the second one used to be missing. The command has to be
+/// one of the long-running ones — that part was always here. But the sync
+/// also fired with no credential of any kind, so `prism` or `prism resume`
+/// on a fresh install with no account issued an unauthenticated
+/// `GET /api/v1/marketplace/resources` to the hosted platform. For a tool
+/// that advertises working fully locally, that is a phone-home on first run.
+///
+/// [`boot_checks::platform_configured`] is the same test the boot screen
+/// uses to decide whether the platform exists for this user at all, so the
+/// two surfaces cannot drift apart. `--offline` is already handled further
+/// up: it sets `PRISM_OFFLINE` before any task is spawned, and
+/// `PlatformClient` checks it before every request.
+fn should_sync_tools(
+    command: Option<&Commands>,
+    credentials: Option<&prism_runtime::StoredCredentials>,
+) -> bool {
+    matches!(
+        command,
+        Some(
+            Commands::Tui { .. }
+                | Commands::Backend { .. }
+                | Commands::Resume { .. }
+                | Commands::Campaign { .. }
+        ) | None
+    ) && boot_checks::platform_configured(credentials)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install the process-wide rustls CryptoProvider before ANY TLS can happen.
@@ -1435,14 +1465,8 @@ async fn main() -> Result<()> {
     // where long-running sessions benefit from fresh tools. Skip for
     // one-shot commands like `marketplace`, `billing`, `doctor` to
     // avoid a network call on every trivial invocation.
-    if matches!(
-        cli.command,
-        Some(Commands::Tui { .. })
-            | Some(Commands::Backend { .. })
-            | Some(Commands::Resume { .. })
-            | Some(Commands::Campaign { .. })
-            | None
-    ) && let Ok(state) = paths.load_cli_state()
+    if let Ok(state) = paths.load_cli_state()
+        && should_sync_tools(cli.command.as_ref(), state.credentials.as_ref())
     {
         let token = state.credentials.as_ref().map(|c| c.access_token.clone());
         let platform = if let Some(t) = &token {
@@ -12177,5 +12201,80 @@ data:\n\
         }
         // Bare `prism` is the TUI, which spawns the backend.
         assert!(command_needs_python(None), "bare `prism` launches the TUI");
+    }
+
+    // ── Background marketplace sync: no account, no phone-home ─────────
+    //
+    // These share `boot_checks::ENV_LOCK` with the boot_checks tests: both
+    // clear the same three platform token vars, and two separate locks
+    // would not serialize against each other.
+
+    fn creds_with(token: &str) -> prism_runtime::StoredCredentials {
+        prism_runtime::StoredCredentials {
+            access_token: token.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The defect: bare `prism` and `prism resume` on a fresh install with
+    /// no account issued an unauthenticated GET to the hosted marketplace.
+    #[test]
+    fn no_account_means_no_marketplace_call() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        boot_checks::clear_platform_env();
+
+        assert!(
+            !should_sync_tools(None, None),
+            "bare `prism` with no account must not contact the platform"
+        );
+        let resume = Cli::try_parse_from(["prism", "resume"]).unwrap();
+        assert!(
+            !should_sync_tools(resume.command.as_ref(), None),
+            "`prism resume` with no account must not contact the platform"
+        );
+        // A credentials file left behind by a logout is not a credential.
+        assert!(!should_sync_tools(None, Some(&creds_with("   "))));
+    }
+
+    /// …but a signed-in user still gets fresh tools. The fix must not have
+    /// simply switched the sync off.
+    #[test]
+    fn a_signed_in_user_still_syncs_tools() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        boot_checks::clear_platform_env();
+
+        assert!(should_sync_tools(None, Some(&creds_with("token-abc"))));
+        let resume = Cli::try_parse_from(["prism", "resume"]).unwrap();
+        assert!(should_sync_tools(
+            resume.command.as_ref(),
+            Some(&creds_with("token-abc"))
+        ));
+    }
+
+    /// The command gate is unchanged: one-shot commands never synced and
+    /// still must not, credential or no credential.
+    #[test]
+    fn one_shot_commands_never_sync_tools() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        boot_checks::clear_platform_env();
+
+        let signed_in = creds_with("token-abc");
+        for argv in [
+            ["prism", "doctor"].as_slice(),
+            &["prism", "billing"],
+            &["prism", "status"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(
+                !should_sync_tools(cli.command.as_ref(), Some(&signed_in)),
+                "{argv:?} is one-shot and must not sync"
+            );
+        }
     }
 }

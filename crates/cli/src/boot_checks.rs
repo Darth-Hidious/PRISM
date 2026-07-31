@@ -313,20 +313,26 @@ async fn push_local_checks(client: &reqwest::Client, checks: &mut Vec<boot::Boot
     });
 }
 
+/// `set_var`/`remove_var` are process-global; serialize every env-touching
+/// test through this guard. `pub(crate)` so tests outside this module that
+/// exercise [`platform_configured`] share the SAME lock — two private locks
+/// would not serialize against each other, and both would be clearing the
+/// same three variables.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Remove every platform token env var, so a test can pin the
+/// no-credential branch regardless of the developer's shell.
+#[cfg(test)]
+pub(crate) fn clear_platform_env() {
+    for key in PLATFORM_TOKEN_ENV {
+        unsafe { std::env::remove_var(key) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// `set_var`/`remove_var` are process-global; serialize every
-    /// env-touching test through this guard.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn clear_platform_env() {
-        for key in PLATFORM_TOKEN_ENV {
-            unsafe { std::env::remove_var(key) };
-        }
-    }
 
     fn creds_with(token: &str) -> StoredCredentials {
         StoredCredentials {
