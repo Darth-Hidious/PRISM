@@ -5131,25 +5131,72 @@ fn is_loopback_url(raw: &str) -> bool {
     }
 }
 
+/// Where text-document ingest runs — and, when it lands on the hosted
+/// platform, whether the user actually asked for that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextLocality {
+    /// On-device extraction into the bundled Turso store.
+    Local,
+    /// The platform, because the user said so (`locality = "cloud"`).
+    Cloud,
+    /// The platform only because `auto` found no on-device model to extract
+    /// with. Nobody chose the cloud here, so a missing account is a dead end
+    /// to report — not a routing decision to announce. See [`handle_ingest`].
+    CloudNoLocalModel,
+}
+
+impl TextLocality {
+    fn is_local(self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
+
+/// Decide locality from the two inputs that matter: the configured
+/// `[ontology] locality` and the base URL of the LLM that would do the
+/// extraction (`None` = no usable LLM config at all). Split out from
+/// [`resolve_text_ingest_locality`] so the decision is testable without
+/// a `$HOME` and a config file.
+fn text_locality_for(configured: &str, llm_base_url: Option<&str>) -> TextLocality {
+    match configured {
+        "local" => TextLocality::Local,
+        "cloud" => TextLocality::Cloud,
+        // auto: local iff the extraction model runs on this machine.
+        _ => match llm_base_url {
+            Some(url) if is_loopback_url(url) => TextLocality::Local,
+            _ => TextLocality::CloudNoLocalModel,
+        },
+    }
+}
+
 /// Resolve where text-document ingest runs: `[ontology] locality` in
 /// prism.toml ("local"/"cloud" honored as-is); "auto" → local iff the LLM
 /// endpoint `build_llm_config` resolves is loopback (an on-device model).
-/// No usable LLM config → cloud, preserving the pre-locality default.
 fn resolve_text_ingest_locality(
     project_root: &Path,
     llm_url: Option<&str>,
     model: Option<&str>,
     api_key: Option<&str>,
-) -> &'static str {
+) -> TextLocality {
     let node_config = prism_core::config::NodeConfig::load(Some(project_root));
-    match node_config.ontology.locality.as_str() {
-        "local" => "local",
-        "cloud" => "cloud",
-        _ => match build_llm_config(project_root, llm_url, model, api_key) {
-            Ok(cfg) if is_loopback_url(&cfg.base_url) => "local",
-            _ => "cloud",
-        },
-    }
+    let llm_base_url = build_llm_config(project_root, llm_url, model, api_key)
+        .ok()
+        .map(|cfg| cfg.base_url);
+    text_locality_for(&node_config.ontology.locality, llm_base_url.as_deref())
+}
+
+/// What to print when `prism ingest` has neither an on-device model nor a
+/// platform account. Local comes first: `prism ingest` with no flags is a
+/// local-first command, and the old error ("Not logged in. Run `prism
+/// login`.") named the one remedy the user was trying to avoid.
+fn no_ingest_backend_message() -> String {
+    "no on-device model to extract with, and the hosted platform needs an account.\n\n\
+     Ingest these documents locally — nothing leaves your machine:\n  \
+     prism use local --url http://localhost:11434/v1 --model <model>   (Ollama)\n  \
+     prism use local --url http://localhost:8080 --model <model>       (llama.cpp)\n\
+     then re-run this command.\n\n\
+     Or use the hosted platform instead:\n  \
+     prism login"
+        .to_string()
 }
 
 fn collect_ingest_paths(root: &Path) -> Result<Vec<PathBuf>> {
@@ -6084,14 +6131,25 @@ async fn handle_ingest(
         .any(|target| ingest_backend(target) == Some(IngestBackend::PlatformText))
     {
         let locality = resolve_text_ingest_locality(project_root, llm_url, model, api_key);
-        if locality == "local" {
+        // `auto` fell through to the platform only because no on-device model
+        // was found — the user never asked to send their documents anywhere.
+        // If the platform can't authenticate either, both doors are shut, so
+        // say that once, up front. The old path announced "☁ CLOUD — sent to
+        // the platform" (a claim about documents the user wanted kept local)
+        // and then died on "Not logged in. Run `prism login`." — pointing a
+        // no-account user at an account instead of at the local ingest that
+        // was there all along.
+        if locality == TextLocality::CloudNoLocalModel && resolve_agent_auth().is_err() {
+            bail!("{}", no_ingest_backend_message());
+        }
+        if locality.is_local() {
             eprintln!("⚑ LOCAL — extracting on-device, nothing leaves your machine");
         } else {
             eprintln!("☁ CLOUD — sent to the platform");
         }
         locality
     } else {
-        "cloud"
+        TextLocality::Cloud
     };
 
     let mut summaries = Vec::new();
@@ -6109,7 +6167,7 @@ async fn handle_ingest(
                 )
                 .await?
             }
-            Some(IngestBackend::PlatformText) if text_locality == "local" => {
+            Some(IngestBackend::PlatformText) if text_locality.is_local() => {
                 run_local_text_ingest_file(
                     &target,
                     project_root,
@@ -11077,6 +11135,68 @@ mod tests {
             Some(IngestBackend::LocalTabular)
         );
         assert_eq!(ingest_backend(Path::new("/tmp/image.png")), None);
+    }
+
+    #[test]
+    fn is_loopback_url_recognizes_on_device_endpoints() {
+        assert!(is_loopback_url("http://localhost:8080"));
+        assert!(is_loopback_url("http://LOCALHOST:11434/v1"));
+        assert!(is_loopback_url("http://127.0.0.1:8090"));
+        assert!(is_loopback_url("http://[::1]:8080/v1"));
+        assert!(!is_loopback_url("https://api.openai.com/v1"));
+        assert!(!is_loopback_url("not a url"));
+    }
+
+    #[test]
+    fn text_locality_honors_explicit_config() {
+        // An explicit choice is never second-guessed, whatever the LLM is.
+        assert_eq!(
+            text_locality_for("local", None),
+            TextLocality::Local,
+            "locality = \"local\" must stay local even with no LLM configured"
+        );
+        assert_eq!(
+            text_locality_for("cloud", Some("http://localhost:8080")),
+            TextLocality::Cloud
+        );
+    }
+
+    #[test]
+    fn text_locality_auto_follows_the_model() {
+        assert_eq!(
+            text_locality_for("auto", Some("http://localhost:11434/v1")),
+            TextLocality::Local
+        );
+        assert_eq!(
+            text_locality_for("auto", Some("https://api.openai.com/v1")),
+            TextLocality::CloudNoLocalModel
+        );
+    }
+
+    #[test]
+    fn text_locality_auto_without_a_model_is_not_a_cloud_choice() {
+        // The fresh-install case: no `[llm] model`, so `build_llm_config`
+        // fails and there is nothing on-device to extract with. This must
+        // NOT read as "the user chose the cloud" — `handle_ingest` keys the
+        // both-doors-shut error off this variant.
+        assert_eq!(
+            text_locality_for("auto", None),
+            TextLocality::CloudNoLocalModel
+        );
+        assert!(!text_locality_for("auto", None).is_local());
+    }
+
+    #[test]
+    fn no_ingest_backend_message_names_the_local_door_first() {
+        let msg = no_ingest_backend_message();
+        let local = msg.find("prism use local").expect("names local ingest");
+        let login = msg.find("prism login").expect("names the platform");
+        assert!(
+            local < login,
+            "local ingest must be offered before `prism login`:\n{msg}"
+        );
+        assert!(msg.contains("11434"), "names the Ollama endpoint:\n{msg}");
+        assert!(msg.contains("8080"), "names the llama.cpp endpoint:\n{msg}");
     }
 
     #[test]
