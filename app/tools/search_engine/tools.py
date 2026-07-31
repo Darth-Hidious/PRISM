@@ -262,6 +262,48 @@ def _materials_search_factory(provider_registry: ProviderRegistry):
             else:
                 summary["failed"] += 1
 
+        # An empty provider list is NOT a successful empty search. It means
+        # nothing was asked, so nothing can be concluded — and
+        # `{"materials": [], "count": 0}` is indistinguishable from "nothing
+        # matched your filters". That exact shape is what a broken install
+        # returned for months: the wheel omitted
+        # `provider_overrides.json`, `build_registry()` raised
+        # FileNotFoundError, bootstrap swallowed it into an empty registry,
+        # and `materials_search` answered "no materials" with exit 0.
+        #
+        # `materials`/`count` are deliberately absent from this branch: a
+        # caller that reads them before checking `error` must not find an
+        # empty list to believe.
+        if not providers_queried:
+            known = len(provider_registry.get_all())
+            if known == 0:
+                reason = (
+                    "no materials data providers are registered — provider "
+                    "discovery produced an empty registry. This is an "
+                    "installation or connectivity fault, not an empty result: "
+                    "check that app/tools/search_engine/providers/"
+                    "provider_overrides.json is present in the installed "
+                    "package, and that the OPTIMADE provider index is "
+                    "reachable."
+                )
+            else:
+                reason = (
+                    f"none of the {known} registered providers can serve this "
+                    "query — every one of them was filtered out by capability "
+                    "matching or an open circuit breaker. Nothing was queried, "
+                    "so nothing was ruled out."
+                )
+            logger.error("materials_search queried no providers: %s", reason)
+            return {
+                "error": reason,
+                "error_type": "NoProvidersQueried",
+                "providers_queried": [],
+                "providers_summary": summary,
+                "warnings": result.warnings,
+                "query": query.model_dump(exclude_none=True, mode="json"),
+                "query_hash": query.query_hash(),
+            }
+
         return {
             "materials": [m.model_dump(mode="json") for m in result.materials],
             "count": len(result.materials),

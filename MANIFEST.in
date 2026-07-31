@@ -1,0 +1,22 @@
+# Source-distribution contents.
+#
+# The wheel gets its data files from [tool.setuptools.package-data] in
+# pyproject.toml; this file is what makes an *sdist* complete, so that
+# `pip install prism-platform` from a source tarball builds the same wheel
+# the release publishes. Both are covered by tests/test_packaging.py.
+
+include LICENSE LICENSE-MIT LICENSE-MIRDYNE LICENSE-APACHE-2.0 NOTICE
+include README.md
+include pyproject.toml
+
+recursive-include app *.json *.yaml *.yml *.tdb *.csv *.txt
+
+# Not product content: editor state, local tool indexes, build droppings.
+# `recursive-include` above WOULD pick these up when an sdist is built from
+# a developer's working copy (they are gitignored, so a clean checkout has
+# neither). The wheel is unaffected either way — package-data patterns do
+# not descend into non-package directories.
+prune app/.claude
+prune app/.srclight
+global-exclude __pycache__/*
+global-exclude *.py[cod]

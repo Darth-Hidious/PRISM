@@ -153,24 +153,42 @@ Repository = "https://github.com/Darth-Hidious/PRISM"
 "Bug Reports" = "https://github.com/Darth-Hidious/PRISM/issues"
 
 [tool.setuptools]
-packages = [
-    "app", "app.config", "app.tools", "app.tools.data_collectors", "app.tools.ml",
-    "app.tools.simulation",
-    "app.tools.simulation.mace",
-    "app.tools.simulation.mace.core",
-    "app.tools.simulation.mace.backends",
-    "app.tools.simulation.mace.cache",
-    "app.tools.simulation.mace.jobs",
-    "app.tools.simulation.mace.payloads",
-    "app.tools.skills", "app.plugins", "app.tools.validation",
-    "app.tools.search_engine", "app.tools.search_engine.cache",
-    "app.tools.search_engine.providers", "app.tools.search_engine.resilience",
-    "app.workflows", "app.workflows.builtin",
-]
 include-package-data = true
 
+# Subpackages are DISCOVERED, not enumerated. The hand-maintained list this
+# replaces had silently gone stale: `app.tools.memory` and
+# `app.tools.materials` were never added to it, so the published wheel
+# shipped without them. `app/tools/base.py` imports the memory recorder on
+# every tool call and `bootstrap` imports both, so on an installed venv the
+# imports failed, the provider registry fell back to empty, and
+# `materials_search` answered `{"materials": [], "count": 0}` with exit 0.
+# A list you have to remember to update is how that happens; discovery is
+# how it stops happening.
+[tool.setuptools.packages.find]
+include = ["app*"]
+namespaces = false
+
+# Non-.py assets. Without these the wheel is code-only: the search
+# federation's `provider_overrides.json` went missing exactly this way, and
+# `load_overrides()` reads it unguarded, so provider discovery raised
+# FileNotFoundError on every installed copy.
+#
+# `tests/test_packaging.py` asserts that EVERY non-.py file under `app/`
+# reaches the built wheel — that test, not this list, is the invariant. If
+# a new asset type or a new nested data directory appears, the test fails
+# loudly instead of the tool answering emptily.
 [tool.setuptools.package-data]
-"app.workflows.builtin" = ["*.yaml"]
+"*" = ["*.json", "*.yaml", "*.yml", "*.tdb", "*.csv", "*.txt"]
+# Nested data directory (not itself a package) under app.tools.materials.
+"app.tools.materials" = ["tdb/*.tdb"]
+#
+# No `exclude-package-data` counterpart: these patterns only match a
+# package's own directory, so nothing under `app/.claude/` or
+# `app/.srclight/` can be swept up (and both are gitignored, so a release
+# build never sees them at all). An exclusion here was written, measured
+# against a mutation, found to change nothing, and removed rather than left
+# as reassuring but inert config. The sdist is a different story — see
+# MANIFEST.in.
 
 [tool.black]
 line-length = 88
