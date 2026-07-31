@@ -44,7 +44,15 @@ pub struct PrismPaths {
 
 impl PrismPaths {
     pub fn discover() -> Result<Self, RuntimeError> {
-        let dirs = ProjectDirs::from("com", "marc27", "prism")
+        // Qualifier is the PRODUCT's, not a company's: this string is visible to
+        // every user as the on-disk path (`~/Library/Application Support/
+        // dev.prism.prism` on macOS) and `prism status` prints it. A company
+        // name here made PRISM look like a client for someone else's platform.
+        //
+        // Changed with no migration deliberately — there are no installs to
+        // migrate. If that ever stops being true, this needs a one-time move of
+        // the old directory before anyone's audit db and cli-state are orphaned.
+        let dirs = ProjectDirs::from("dev", "prism", "prism")
             .ok_or(RuntimeError::ProjectDirsUnavailable)?;
 
         Ok(Self {
