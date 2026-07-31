@@ -11,6 +11,13 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::PythonBridgeError;
 
+/// The Python module that IS the tool server.
+///
+/// Exported so `prism status` can report it instead of restating it. It
+/// used to restate it as `app.backend`, a module that does not exist —
+/// a label nobody could act on, and nothing tied the two together.
+pub const TOOL_SERVER_MODULE: &str = "app.tool_server";
+
 /// Configuration for spawning a Python tool server.
 pub struct ToolServer {
     pub python_bin: PathBuf,
@@ -30,7 +37,7 @@ impl ToolServer {
     pub async fn spawn(&self) -> Result<ToolServerHandle, PythonBridgeError> {
         let mut cmd = Command::new(&self.python_bin);
         cmd.arg("-m")
-            .arg("app.tool_server")
+            .arg(TOOL_SERVER_MODULE)
             .current_dir(&self.project_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

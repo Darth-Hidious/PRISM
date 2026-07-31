@@ -278,11 +278,7 @@ fn choose_provider() -> Result<()> {
     println!("  screen writes it to disk. Local servers need no key at all.");
 
     let chosen = prompt_select("Provider", &choices, |p| {
-        let ready = if p.key_present() {
-            "\x1b[32m✓ key found\x1b[0m"
-        } else {
-            "\x1b[2m  no key   \x1b[0m"
-        };
+        let ready = key_status(p);
         format!(
             "{:<24} {ready}  \x1b[2m{}\x1b[0m",
             p.display_name(),
@@ -320,6 +316,21 @@ fn choose_provider() -> Result<()> {
         None => println!("  \x1b[2mNo key needed — make sure the server is running.\x1b[0m"),
     }
     Ok(())
+}
+
+/// The readiness column on the provider picker.
+///
+/// Three states, not two. `Provider::key_present()` is `true` for a keyless
+/// local server — correctly, since nothing can be missing — but rendering
+/// that as "✓ key found" told users Ollama had found a key they had never
+/// set, and implied the others were somehow less ready. A local server's
+/// readiness is a different fact, so it gets its own words.
+fn key_status(p: &crate::providers::Provider) -> &'static str {
+    match (&p.api_key_env, p.key_present()) {
+        (None, _) => "\x1b[32m✓ no key needed\x1b[0m",
+        (Some(_), true) => "\x1b[32m✓ key found\x1b[0m   ",
+        (Some(_), false) => "\x1b[2m  no key      \x1b[0m",
+    }
 }
 
 /// Read one non-empty line. Used for the model id, which we cannot offer a
@@ -430,6 +441,18 @@ fn done() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::Provider;
+
+    fn provider(api_key_env: Option<&str>) -> Provider {
+        Provider {
+            id: "test".into(),
+            name: None,
+            base_url: Some("http://localhost:1/v1".into()),
+            api_key_env: api_key_env.map(str::to_string),
+            docs: None,
+            platform: false,
+        }
+    }
 
     /// THE defect. A user who chose "own key" never gets platform
     /// credentials, so keying wizard-completion on credentials showed them
@@ -460,5 +483,23 @@ mod tests {
                 assert!(!should_run_wizard(credentials, configured, false));
             }
         }
+    }
+
+    /// A local server needs no key, so "✓ key found" was a claim about a
+    /// key the user never set.
+    #[test]
+    fn a_keyless_provider_is_not_described_as_having_found_a_key() {
+        let status = key_status(&provider(None));
+        assert!(!status.contains("key found"), "got {status:?}");
+        assert!(status.contains("no key needed"), "got {status:?}");
+    }
+
+    #[test]
+    fn a_keyed_provider_reports_the_environment_honestly() {
+        // SAFETY: a uniquely-named var no other test reads or writes.
+        unsafe { std::env::set_var("PRISM_ONBOARDING_KEY_PROBE", "sk-x") };
+        assert!(key_status(&provider(Some("PRISM_ONBOARDING_KEY_PROBE"))).contains("key found"));
+        unsafe { std::env::remove_var("PRISM_ONBOARDING_KEY_PROBE") };
+        assert!(key_status(&provider(Some("PRISM_ONBOARDING_KEY_PROBE"))).contains("no key"));
     }
 }

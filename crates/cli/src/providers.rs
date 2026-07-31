@@ -359,6 +359,33 @@ mod tests {
         );
     }
 
+    /// `prism use list` renders `display_name()`, so two entries sharing
+    /// one name print the same row twice with nothing to choose between
+    /// them. `google` and `gemini` are deliberately the same endpoint —
+    /// which is exactly why the listing has to say so rather than look
+    /// like a duplicate-row bug.
+    #[test]
+    fn no_two_providers_render_under_the_same_name() {
+        let reg = Registry::builtin().unwrap();
+        let mut seen: Vec<&str> = Vec::new();
+        for p in reg.all() {
+            let name = p.display_name();
+            assert!(
+                !seen.contains(&name),
+                "{} and an earlier entry both display as {name:?}",
+                p.id
+            );
+            seen.push(name);
+        }
+        // The pair that motivated this: same endpoint, distinguishable rows.
+        assert_eq!(
+            base_url_for(&reg, "gemini"),
+            base_url_for(&reg, "google"),
+            "the alias must stay an alias"
+        );
+        assert!(reg.get("gemini").unwrap().display_name().contains("alias"));
+    }
+
     #[test]
     fn lookup_is_case_insensitive() {
         let reg = Registry::builtin().unwrap();

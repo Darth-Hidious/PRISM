@@ -14,7 +14,7 @@ use tokio::process::{Child, Command};
 
 pub mod tool_server;
 pub mod venv;
-pub use tool_server::{ToolServer, ToolServerHandle};
+pub use tool_server::{TOOL_SERVER_MODULE, ToolServer, ToolServerHandle};
 pub use venv::ensure_venv;
 
 #[derive(Debug, thiserror::Error)]

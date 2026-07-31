@@ -1650,7 +1650,11 @@ async fn main() -> Result<()> {
                     "org_name": state.credentials.as_ref().and_then(|c| c.org_name.clone()),
                     "preferred_python": state.preferred_python,
                     "backbone": {
-                        "python_worker": "app.backend",
+                        // The module `ToolServer` actually runs. This said
+                        // "app.backend" — a module that does not exist in
+                        // the tree, so anyone trusting `prism status` to
+                        // tell them what to look at was sent nowhere.
+                        "python_worker": prism_python_bridge::TOOL_SERVER_MODULE,
                         "node_binary": "prism-node",
                         // User-facing surface is "prism"; the underlying chat
                         // harness is forge_main but that's an internal detail
@@ -10788,6 +10792,15 @@ mod tests {
                 "{cmd:?} spawns the Python tool server"
             );
         }
+    }
+
+    /// `prism status` named a Python module that does not exist in the
+    /// tree, so anyone who used it to find the worker was sent nowhere.
+    /// The label is now the constant the spawner itself uses.
+    #[test]
+    fn status_names_the_module_the_tool_server_actually_runs() {
+        assert_eq!(prism_python_bridge::TOOL_SERVER_MODULE, "app.tool_server");
+        assert_ne!(prism_python_bridge::TOOL_SERVER_MODULE, "app.backend");
     }
 
     // ── F0 review-fix primitives ───────────────────────────────────────

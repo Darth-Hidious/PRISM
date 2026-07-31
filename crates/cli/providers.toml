@@ -83,9 +83,14 @@ docs = "https://aistudio.google.com/apikey"
 # is a separate entry rather than an alias mechanism because a second
 # table is cheaper than a second concept — and the old hardcoded match
 # accepted both spellings, so dropping one would be a regression.
+#
+# The `name` must say so. Both entries used to render as plain "Google
+# Gemini", so `prism use list` showed the same provider twice with no way
+# to tell which row did what — it read as a bug in the listing rather than
+# as two spellings of one endpoint.
 [[provider]]
 id = "gemini"
-name = "Google Gemini"
+name = "Google Gemini (alias of google)"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 api_key_env = "GEMINI_API_KEY"
 docs = "https://aistudio.google.com/apikey"
