@@ -1284,6 +1284,32 @@ fn command_needs_python(command: Option<&Commands>) -> bool {
         ) => false,
         // Reports on the venv — including its absence — rather than using it.
         Some(Commands::Doctor) => false,
+        // Pure platform HTTP: these talk to the API over reqwest and print
+        // the answer. None of their handlers takes the interpreter path.
+        Some(
+            Commands::Billing { .. }
+            | Commands::Marketplace { .. }
+            | Commands::Mesh { .. }
+            | Commands::Workflow { .. }
+            | Commands::Models { .. }
+            | Commands::Gpus,
+        ) => false,
+        // `prism login` is the FIRST command a new user runs, and it must
+        // work on a machine with no Python at all: the device flow is pure
+        // HTTP, and `perform_full_login` only records the interpreter path
+        // as a string in `preferred_python` — it never executes it. Before
+        // this, a fresh install on a box without Python 3.11+ died on "No
+        // Python 3.11+ found" before the browser ever opened.
+        Some(Commands::Login { .. }) => false,
+        // An unrecognised word — `prism verison` — reaches clap's external
+        // subcommand catch-all and is about to be told it is unknown.
+        // Building a venv to print a typo message is the most obviously
+        // wasted ~30 s in the product.
+        Some(Commands::External(_)) => false,
+        // NOT listed, deliberately: `Commands::Node`. `node up` spawns the
+        // Python tool server for the node's /api/chat service, and this
+        // match cannot see which subcommand was given.
+        //
         // Bare `prism` is the TUI, which spawns the tool server.
         _ => true,
     }
@@ -12077,5 +12103,79 @@ data:\n\
                 .is_none(),
             "store open failure must degrade to a miss"
         );
+    }
+
+    // ── Lazy venv provisioning: who really needs the interpreter ───────
+    //
+    // Asserted through clap rather than by hand-building `Commands`, so a
+    // renamed flag or a subcommand that stops parsing shows up here too —
+    // and so the typo case exercises the real external-subcommand path.
+
+    fn needs_python(argv: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"));
+        command_needs_python(cli.command.as_ref())
+    }
+
+    /// The one that mattered most: `prism login` is the FIRST command a new
+    /// user runs. It is pure HTTP — `perform_full_login` only records the
+    /// interpreter path as a string — so on a machine without Python 3.11+
+    /// it used to die on "No Python 3.11+ found" before the device flow ever
+    /// started, with no way forward.
+    #[test]
+    fn login_does_not_provision_a_venv() {
+        assert!(
+            !needs_python(&["prism", "login"]),
+            "`prism login` must work on a machine with no Python at all"
+        );
+    }
+
+    /// A mistyped command is about to be told it is unknown. Spending ~30 s
+    /// building a virtualenv first is the most obviously wasted wait in the
+    /// product.
+    #[test]
+    fn a_typo_does_not_provision_a_venv() {
+        let cli = Cli::try_parse_from(["prism", "verison"]).expect("typos reach the catch-all");
+        assert!(
+            matches!(cli.command, Some(Commands::External(_))),
+            "expected clap's external-subcommand catch-all, got {:?}",
+            cli.command
+        );
+        assert!(!command_needs_python(cli.command.as_ref()));
+    }
+
+    /// One-shot commands that only talk to the platform over HTTP. None of
+    /// their handlers accepts the interpreter path.
+    #[test]
+    fn one_shot_platform_commands_do_not_provision_a_venv() {
+        for argv in [
+            ["prism", "billing"].as_slice(),
+            &["prism", "marketplace", "list"],
+            &["prism", "mesh", "discover"],
+            &["prism", "workflow", "list"],
+            &["prism", "models", "list"],
+            &["prism", "gpus"],
+            // Already denied before this change — pinned so they stay denied.
+            &["prism", "status"],
+            &["prism", "doctor"],
+            &["prism", "use", "list"],
+        ] {
+            assert!(!needs_python(argv), "{argv:?} must not build a venv");
+        }
+    }
+
+    /// The deny-list must stay a deny-list. These genuinely spawn the Python
+    /// tool server, and `node up` is the reason `Commands::Node` is NOT
+    /// denied: this match cannot see which node subcommand was given.
+    #[test]
+    fn commands_that_spawn_the_tool_server_still_provision_a_venv() {
+        for argv in [
+            ["prism", "node", "up"].as_slice(),
+            &["prism", "tools"],
+            &["prism", "tui"],
+        ] {
+            assert!(needs_python(argv), "{argv:?} really does need Python");
+        }
+        // Bare `prism` is the TUI, which spawns the backend.
+        assert!(command_needs_python(None), "bare `prism` launches the TUI");
     }
 }
