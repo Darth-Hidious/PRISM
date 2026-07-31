@@ -109,19 +109,16 @@ pub async fn ensure_venv(
     // provisioned on demand by the sidecar (`prism pyiron install`) and
     // per-tool installers instead of taxing every first launch.
     //
-    // Version-matched wheel from the release assets first (no git needed
-    // on the target box); git main as fallback for dev builds without a
-    // published wheel.
+    // WHERE the tools come from is decided by `install_plan` — see there
+    // for why a source build must never pull a published wheel.
     eprintln!("[prism] Installing PRISM tools into venv…");
-    let version = env!("CARGO_PKG_VERSION");
-    let wheel_spec = format!(
-        "prism-platform @ https://github.com/Darth-Hidious/PRISM/releases/download/v{version}/prism_platform-{version}-py3-none-any.whl"
-    );
-    let git_spec = "prism-platform @ git+https://github.com/Darth-Hidious/PRISM.git";
+    let plan = install_plan(env!("CARGO_PKG_VERSION"), build_source_root());
     let mut installed = false;
-    for spec in [wheel_spec.as_str(), git_spec] {
+    for source in &plan {
+        eprintln!("[prism] {}", source.describe());
         let pip_status = Command::new(&venv_python)
-            .args(["-m", "pip", "install", spec])
+            .args(["-m", "pip", "install"])
+            .args(source.pip_args())
             .current_dir(project_root)
             .stderr(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::null())
@@ -132,17 +129,114 @@ pub async fn ensure_venv(
             installed = true;
             break;
         }
-        eprintln!("[prism] install from {spec} failed — trying fallback…");
+        eprintln!("[prism] that install failed — trying the next source…");
     }
     if !installed || !python_has_app(&venv_python).await {
+        let retry = plan
+            .first()
+            .map(|s| s.pip_args().join(" "))
+            .unwrap_or_default();
         return Err(PythonBridgeError::Spawn(std::io::Error::other(format!(
             "could not install PRISM tools — retry manually: \
-             ~/.prism/venv/bin/pip install \"{wheel_spec}\""
+             ~/.prism/venv/bin/pip install {retry}"
         ))));
     }
 
     eprintln!("[prism] Venv ready at {}", venv_dir.display());
     Ok(venv_python)
+}
+
+/// The directory holding *this crate's* `Cargo.toml`, baked in at compile
+/// time. On the machine that COMPILED the binary it points at the checkout
+/// that was built; on any other machine it does not exist. That difference
+/// is the whole signal: it distinguishes "developer running what they just
+/// built" from "user running a downloaded release", with no flag to set and
+/// nothing to detect at runtime.
+const BUILD_MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+/// Where the Python half of PRISM is installed from, in preference order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallSource {
+    /// An editable install of the checkout this binary was built from.
+    /// Editable rather than a plain `pip install <dir>` so that later
+    /// edits to `app/` are live without re-provisioning the venv.
+    Source(PathBuf),
+    /// The wheel published alongside *this binary's own* release tag.
+    Wheel { version: String },
+    /// Git main — last resort for a build whose version has no published
+    /// wheel (a tag cut but not yet released, a fork, a nightly).
+    Git,
+}
+
+impl InstallSource {
+    fn pip_args(&self) -> Vec<String> {
+        match self {
+            Self::Source(root) => vec!["-e".to_string(), root.to_string_lossy().into_owned()],
+            Self::Wheel { version } => vec![format!(
+                "prism-platform @ https://github.com/Darth-Hidious/PRISM/releases/download/v{version}/prism_platform-{version}-py3-none-any.whl"
+            )],
+            Self::Git => {
+                vec!["prism-platform @ git+https://github.com/Darth-Hidious/PRISM.git".to_string()]
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Source(root) => format!("from this source tree ({})", root.display()),
+            Self::Wheel { version } => format!("from the v{version} release wheel"),
+            Self::Git => "from git main".to_string(),
+        }
+    }
+}
+
+/// Ordered list of places to try installing `prism-platform` from.
+///
+/// The bug this encodes against: the plan used to be the release wheel
+/// first, unconditionally. The crate version has sat at `1.0.0` across
+/// months of work, so *every* build from source — including one made from
+/// HEAD five minutes ago — pip-installed the wheel attached to the v1.0.0
+/// release and ran months-old Python. None of the day's work reached the
+/// user's tools, and nothing said so.
+///
+/// So: if the checkout this binary was compiled from is still on disk, that
+/// is what gets installed. Otherwise the wheel, keyed on the binary's own
+/// version (never a literal), then git main.
+fn install_plan(version: &str, source_root: Option<PathBuf>) -> Vec<InstallSource> {
+    let mut plan = Vec::new();
+    if let Some(root) = source_root {
+        plan.push(InstallSource::Source(root));
+    }
+    plan.push(InstallSource::Wheel {
+        version: version.to_string(),
+    });
+    plan.push(InstallSource::Git);
+    plan
+}
+
+/// The PRISM checkout this binary was built from, if it is still present.
+fn build_source_root() -> Option<PathBuf> {
+    // `crates/python-bridge` → repo root.
+    let root = Path::new(BUILD_MANIFEST_DIR).parent()?.parent()?;
+    prism_source_root(root)
+}
+
+/// `Some(root)` iff `root` is a PRISM source checkout we can install from.
+///
+/// Checked rather than assumed: the compile-time path can be occupied by
+/// something else entirely by the time the binary runs (a CI workspace
+/// reused for another repo, a directory the developer moved). Installing
+/// whatever happens to live there would be worse than falling back to the
+/// wheel.
+fn prism_source_root(root: &Path) -> Option<PathBuf> {
+    if !root.join("app").join("__init__.py").is_file() {
+        return None;
+    }
+    let pyproject = std::fs::read_to_string(root.join("pyproject.toml")).ok()?;
+    pyproject
+        .lines()
+        .any(|l| l.trim_start().starts_with("name") && l.contains("prism-platform"))
+        .then(|| root.to_path_buf())
 }
 
 /// Does this interpreter have the PRISM tool platform importable?
@@ -208,5 +302,120 @@ async fn check_python(candidate: &str) -> Option<PathBuf> {
         Some(PathBuf::from(candidate))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// THE defect. A binary built from this checkout must install the
+    /// Python half from this checkout — not from the wheel attached to
+    /// whatever release happens to share the crate's version number.
+    ///
+    /// Before the fix a cold install of a build from HEAD pip-installed
+    /// `prism_platform-1.0.0-py3-none-any.whl` from the v1.0.0 release
+    /// (3 July), so the day's Python work never reached the user.
+    #[test]
+    fn a_build_from_source_installs_that_source_not_a_published_wheel() {
+        let root = build_source_root().expect(
+            "this test runs from the checkout it was compiled in, so the \
+             source tree must be detected",
+        );
+        assert!(
+            root.join("app").join("__init__.py").is_file(),
+            "detected root {} is not the PRISM source tree",
+            root.display()
+        );
+
+        let plan = install_plan(env!("CARGO_PKG_VERSION"), Some(root.clone()));
+        assert_eq!(
+            plan.first(),
+            Some(&InstallSource::Source(root.clone())),
+            "a source build must install its own app/ first"
+        );
+        assert_eq!(
+            plan[0].pip_args(),
+            vec!["-e".to_string(), root.to_string_lossy().into_owned()]
+        );
+        assert!(
+            !plan[0]
+                .pip_args()
+                .iter()
+                .any(|a| a.contains("releases/download")),
+            "a source build must not reach for a release asset"
+        );
+    }
+
+    /// The released-binary path, unchanged and still keyed on the binary's
+    /// OWN version — never a literal. A release that forgets to publish a
+    /// wheel still falls through to git main rather than dying.
+    #[test]
+    fn without_a_source_tree_the_wheel_matches_the_binarys_own_version() {
+        let plan = install_plan("7.3.1", None);
+        assert_eq!(
+            plan,
+            vec![
+                InstallSource::Wheel {
+                    version: "7.3.1".to_string()
+                },
+                InstallSource::Git
+            ]
+        );
+        let url = plan[0].pip_args().remove(0);
+        assert!(
+            url.contains("/download/v7.3.1/prism_platform-7.3.1-py3-none-any.whl"),
+            "wheel URL must carry the binary's own version, got {url}"
+        );
+        assert!(
+            !url.contains("1.0.0"),
+            "the version must not be hardcoded, got {url}"
+        );
+    }
+
+    /// The compile-time path can be occupied by something else by the time
+    /// the binary runs. Installing whatever lives there would be worse than
+    /// falling back to the wheel.
+    #[test]
+    fn only_a_real_prism_checkout_counts_as_a_source_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Empty directory.
+        assert_eq!(prism_source_root(tmp.path()), None);
+
+        // Somebody else's Python project sitting at the same path.
+        let other = tmp.path().join("other");
+        write(&other.join("app").join("__init__.py"), "");
+        write(
+            &other.join("pyproject.toml"),
+            "[project]\nname = \"totally-different\"\n",
+        );
+        assert_eq!(
+            prism_source_root(&other),
+            None,
+            "a non-PRISM project must not be installed into the user's venv"
+        );
+
+        // PRISM's pyproject but no app/ — a partial or pruned tree.
+        let pruned = tmp.path().join("pruned");
+        write(
+            &pruned.join("pyproject.toml"),
+            "[project]\nname = \"prism-platform\"\n",
+        );
+        assert_eq!(prism_source_root(&pruned), None);
+
+        // The real shape.
+        let good = tmp.path().join("good");
+        write(&good.join("app").join("__init__.py"), "");
+        write(
+            &good.join("pyproject.toml"),
+            "[project]\nname = \"prism-platform\"\nversion = \"1.0.0\"\n",
+        );
+        assert_eq!(prism_source_root(&good), Some(good));
     }
 }
