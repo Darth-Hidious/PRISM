@@ -48,30 +48,25 @@ use crate::types::{AgentConfig, AgentEvent};
 
 // ── Emit helpers ──────────────────────────────────────────────────
 
-/// Native (in-process) output sink. `run_server` always runs on a
-/// dedicated thread (stdio backend: the CLI main thread's runtime; native:
-/// a thread spawned by the frontend), so a thread-local keeps all 100+
-/// emit call sites unchanged while letting an in-process frontend receive
-/// the same `ui.*` / response values without a subprocess.
-thread_local! {
-    static SINK: std::cell::RefCell<Option<std::sync::mpsc::Sender<Value>>> = const { std::cell::RefCell::new(None) };
-}
+/// Native (in-process) output sink. Emits happen on tokio worker threads
+/// of the session runtime, so the sink is process-global rather than
+/// thread-local. Exactly one native session exists per frontend process
+/// (TUI or Desktop); the stdio backend never installs a sink and keeps
+/// writing to stdout.
+static SINK: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::mpsc::Sender<Value>>>> =
+    std::sync::OnceLock::new();
 
 fn install_sink(tx: std::sync::mpsc::Sender<Value>) {
-    SINK.with(|s| *s.borrow_mut() = Some(tx));
+    let slot = SINK.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap() = Some(tx);
 }
 
 fn emit_raw(value: &Value) {
-    let handled = SINK.with(|s| {
-        if let Some(tx) = s.borrow().as_ref() {
+    if let Some(slot) = SINK.get() {
+        if let Some(tx) = slot.lock().unwrap().as_ref() {
             let _ = tx.send(value.clone());
-            true
-        } else {
-            false
+            return;
         }
-    });
-    if handled {
-        return;
     }
     let line = serde_json::to_string(value).expect("JSON serialization failed");
     let stdout = io::stdout();
