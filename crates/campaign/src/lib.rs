@@ -1135,14 +1135,18 @@ impl Campaign {
         let compositions = self.parse_compositions(&response);
 
         if compositions.is_empty() {
+            // No synthetic proposals, ever: a campaign that cannot get
+            // parseable proposals from the model HALTS instead of running
+            // on fabricated compositions.
             warn!(
                 campaign = %self.state.campaign_id,
                 iteration = iter,
                 raw = %response,
-                "LLM returned no parseable compositions; falling back to MCMC"
+                "LLM returned no parseable compositions; halting proposal step"
             );
-            // Fall back to simple random generation if LLM fails.
-            return Ok(self.fallback_proposals(batch));
+            anyhow::bail!(
+                "proposal step failed: LLM returned no parseable compositions                  (campaign halted rather than proposing synthetic candidates)"
+            );
         }
 
         Ok(compositions.into_iter().take(batch).collect())
@@ -1229,36 +1233,6 @@ impl Campaign {
         comps
     }
 
-    /// Fallback: generate simple placeholder compositions when the LLM fails.
-    fn fallback_proposals(&self, batch: usize) -> Vec<String> {
-        let elements: Vec<String> = if self.state.goal.elements.is_empty() {
-            vec![
-                "Fe".into(),
-                "Ni".into(),
-                "Cr".into(),
-                "Co".into(),
-                "Ti".into(),
-            ]
-        } else {
-            self.state.goal.elements.clone()
-        };
-
-        (0..batch)
-            .map(|i| {
-                // Simple equal-fraction distribution, rotated by index.
-                let n = elements.len().min(4);
-                let offset = i % elements.len();
-                elements
-                    .iter()
-                    .cycle()
-                    .skip(offset)
-                    .take(n)
-                    .map(|el| format!("{}{:.1}", el, 1.0 / n as f64))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect()
-    }
 
     /// Evaluate a single candidate composition.
     ///
@@ -1516,16 +1490,6 @@ mod tests {
         assert!(campaign.parse_compositions("").is_empty());
     }
 
-    #[test]
-    fn fallback_proposals_uses_allowed_elements() {
-        let campaign = Campaign::new(test_goal(), CampaignConfig::default(), "c1".into());
-        let proposals = campaign.fallback_proposals(3);
-        assert_eq!(proposals.len(), 3);
-        // Each should contain at least one of the allowed elements
-        for p in &proposals {
-            assert!(p.contains("Ti") || p.contains("Al") || p.contains("V"));
-        }
-    }
 
     #[test]
     fn compute_reward_default_heuristic() {
