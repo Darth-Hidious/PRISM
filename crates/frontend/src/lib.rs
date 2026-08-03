@@ -136,14 +136,30 @@ pub fn ensure_fresh_credentials() {
 /// the LLM endpoint cannot be resolved (not signed in and no local
 /// endpoint configured).
 pub fn spawn_native_session(project_root: &Path) -> Result<NativeSession> {
+    spawn_native_session_with(project_root, None)
+}
+
+/// Spawn with an explicitly chosen chat target (provider picker path).
+pub fn spawn_native_session_with(
+    project_root: &Path,
+    target: Option<prism_core::chat_config::ChatTarget>,
+) -> Result<NativeSession> {
     ensure_fresh_credentials();
     let paths = prism_runtime::PrismPaths::discover()
         .map_err(|e| anyhow::anyhow!("prism paths unavailable: {e}"))?;
-    let inputs = prism_runtime::llm_resolve::native_session_inputs(
-        project_root,
-        prism_runtime::llm_resolve::resolve_python_bin(),
-        &paths,
-    )?;
+    let inputs = match target {
+        Some(t) => prism_runtime::llm_resolve::native_session_inputs_with(
+            project_root,
+            prism_runtime::llm_resolve::resolve_python_bin(),
+            &paths,
+            Some(t),
+        )?,
+        None => prism_runtime::llm_resolve::native_session_inputs(
+            project_root,
+            prism_runtime::llm_resolve::resolve_python_bin(),
+            &paths,
+        )?,
+    };
     let llm_config = prism_llm::LlmConfig {
         base_url: inputs.llm.base_url,
         model: inputs.llm.model,

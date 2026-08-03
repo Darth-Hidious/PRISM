@@ -10,6 +10,7 @@ authors.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 prism-runtime = { path = "../runtime" }
+prism-core = { path = "../core" }
 prism-client = { path = "../client" }
 chrono.workspace = true
 tracing.workspace = true

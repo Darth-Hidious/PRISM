@@ -146,6 +146,9 @@ pub struct PrismConfig {
 /// Resolve `~/.prism/config.toml` from `$HOME`. Returns the path even
 /// if the file doesn't exist yet — caller decides whether to create.
 pub fn config_path() -> Result<PathBuf> {
+    if let Ok(override_path) = std::env::var("PRISM_CONFIG_PATH") {
+        return Ok(PathBuf::from(override_path));
+    }
     let home = std::env::var_os("HOME").context("HOME env var not set")?;
     Ok(PathBuf::from(home).join(".prism").join("config.toml"))
 }

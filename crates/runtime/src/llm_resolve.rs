@@ -86,9 +86,32 @@ pub fn provider_endpoint(registry: &providers::Registry, provider: &str) -> Stri
 /// Resolve the LLM endpoint + credential for a native frontend session,
 /// with the same per-target policy as the CLI backend.
 pub fn resolve_llm(project_root: &Path, paths: &PrismPaths) -> Result<ResolvedLlm> {
+    resolve_llm_with(project_root, paths, None)
+}
+
+/// Like [`resolve_llm`] but with an explicit target chosen by the user
+/// (provider picker). `None` falls back to the persisted config — which
+/// is only honored when the user actually chose one; a missing `[chat]`
+/// table is NOT a choice and errors honestly instead of presetting the
+/// hosted platform.
+pub fn resolve_llm_with(
+    project_root: &Path,
+    paths: &PrismPaths,
+    target: Option<chat_config::ChatTarget>,
+) -> Result<ResolvedLlm> {
     let node_config = core_config::NodeConfig::load(Some(project_root));
     let cfg_llm = &node_config.llm;
-    let chat_target = chat_config::load().unwrap_or_default().chat;
+    let chat_target = match target {
+        Some(t) => t,
+        None => {
+            if !chat_config::chat_target_is_configured() {
+                anyhow::bail!(
+                    "No LLM provider selected. PRISM is provider-neutral: choose the hosted                      platform, a local endpoint, or a direct provider (prism use / the app's                      picker)."
+                );
+            }
+            chat_config::load().unwrap_or_default().chat
+        }
+    };
     let endpoints = PlatformEndpoints::from_env();
 
     // The session's platform JWT — the credential the MARC27 LLM proxy
@@ -206,7 +229,17 @@ pub fn native_session_inputs(
     python_bin: PathBuf,
     paths: &PrismPaths,
 ) -> Result<NativeSessionInputs> {
-    let llm = resolve_llm(project_root, paths)?;
+    native_session_inputs_with(project_root, python_bin, paths, None)
+}
+
+/// With an explicit chat target (provider picker path).
+pub fn native_session_inputs_with(
+    project_root: &Path,
+    python_bin: PathBuf,
+    paths: &PrismPaths,
+    target: Option<chat_config::ChatTarget>,
+) -> Result<NativeSessionInputs> {
+    let llm = resolve_llm_with(project_root, paths, target)?;
     Ok(NativeSessionInputs {
         llm,
         python_bin,

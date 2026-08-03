@@ -4751,6 +4751,7 @@ dependencies = [
  "chrono",
  "prism-agent",
  "prism-client",
+ "prism-core",
  "prism-llm",
  "prism-python-bridge",
  "prism-runtime",
