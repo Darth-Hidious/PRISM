@@ -21,7 +21,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 arboard = "3"
 prism-client = { path = "../client" }
-prism-agent = { path = "../agent" }
+prism-frontend = { path = "../frontend" }
 prism-runtime = { path = "../runtime" }
 prism-llm = { path = "../llm" }
 prism-python-bridge = { path = "../python-bridge" }

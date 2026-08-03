@@ -214,3 +214,20 @@ pub fn native_session_inputs(
         env: tool_server_env(),
     })
 }
+
+// ── Native session spawning ────────────────────────────────────────
+
+/// Resolve the Python interpreter with the same managed-venv preference
+/// as the CLI: PRISM_PYTHON → ~/.prism/venv/bin/python3 → `python3`.
+pub fn resolve_python_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("PRISM_PYTHON") {
+        return PathBuf::from(p);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let venv = PathBuf::from(home).join(".prism").join("venv").join("bin").join("python3");
+        if venv.exists() {
+            return venv;
+        }
+    }
+    PathBuf::from("python3")
+}

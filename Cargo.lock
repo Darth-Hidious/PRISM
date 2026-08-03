@@ -4744,6 +4744,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism-frontend"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "prism-agent",
+ "prism-client",
+ "prism-llm",
+ "prism-python-bridge",
+ "prism-runtime",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "prism-ingest"
 version = "1.0.0"
 dependencies = [
@@ -4978,8 +4994,8 @@ dependencies = [
  "futures",
  "insta",
  "libc",
- "prism-agent",
  "prism-client",
+ "prism-frontend",
  "prism-llm",
  "prism-python-bridge",
  "prism-runtime",

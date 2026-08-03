@@ -831,38 +831,17 @@ impl Drop for BackendHandle {
 /// channel, with the exact same message contract as the subprocess so
 /// the app code is transport-agnostic.
 pub struct NativeBackend {
-    tx: Option<std::sync::mpsc::Sender<String>>,
+    in_tx: std::sync::mpsc::Sender<String>,
     rx: mpsc::UnboundedReceiver<Value>,
     next_id: u64,
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl NativeBackend {
-    pub fn spawn(project_root: &str, python_bin: &str) -> Result<Self> {
-        let paths = prism_runtime::PrismPaths::discover()
-            .map_err(|e| anyhow::anyhow!("prism paths unavailable: {e}"))?;
-        let inputs = prism_runtime::llm_resolve::native_session_inputs(
-            std::path::Path::new(project_root),
-            std::path::PathBuf::from(python_bin),
-            &paths,
-        )?;
-        let llm_config = prism_llm::LlmConfig {
-            base_url: inputs.llm.base_url,
-            model: inputs.llm.model,
-            api_key: inputs.llm.api_key,
-            embedding_model: inputs.llm.embedding_model,
-            context_window: inputs.llm.context_window,
-            max_output_tokens: inputs.llm.max_output_tokens,
-            ..Default::default()
-        };
-        let tool_server = prism_python_bridge::ToolServer {
-            python_bin: inputs.python_bin,
-            project_root: inputs.project_root,
-            env: inputs.env,
-        };
-
-        let (in_tx, in_rx) = std::sync::mpsc::channel::<String>();
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<Value>();
+    pub fn spawn(project_root: &str, _python_bin: &str) -> Result<Self> {
+        let session = prism_frontend::spawn_native_session(std::path::Path::new(project_root))?;
+        let (_in_tx, out_rx) = session.into_parts();
+        // keep a request sender alive inside the session-less struct:
+        // store it separately
         let (tx, rx) = mpsc::unbounded_channel();
         // Bridge: sync session output → tokio channel the app awaits on.
         std::thread::spawn(move || {
@@ -872,20 +851,10 @@ impl NativeBackend {
                 }
             }
         });
-        let thread = std::thread::spawn(move || {
-            let _ = prism_agent::protocol::run_server_native(
-                llm_config,
-                tool_server,
-                in_rx,
-                out_tx,
-            );
-        });
-
         Ok(Self {
-            tx: Some(in_tx),
+            in_tx: _in_tx,
             rx,
             next_id: 1,
-            thread: Some(thread),
         })
     }
 
@@ -903,11 +872,8 @@ impl NativeBackend {
             "id": id,
             "params": params,
         });
-        let line = serde_json::to_string(&req)?;
-        self.tx
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("native session killed"))?
-            .send(line)
+        self.in_tx
+            .send(serde_json::to_string(&req)?)
             .map_err(|_| anyhow::anyhow!("native session thread is gone"))?;
         Ok(id)
     }
@@ -946,12 +912,8 @@ impl NativeBackend {
     }
 
     pub fn kill(&mut self) {
-        // Closing the request channel ends the session loop; the thread
-        // then exits on its own.
-        self.tx.take();
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        // The session ends when `in_tx` drops (see Drop below); there is
+        // no subprocess to signal in native mode.
     }
 }
 
