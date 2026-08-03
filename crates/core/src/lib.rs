@@ -12,6 +12,9 @@
 //!   executing, under which policy mode, reconstructable from trace events).
 
 pub mod audit;
+pub mod brand;
+pub mod chat_config;
+pub mod providers;
 pub mod config;
 pub mod execution;
 pub mod rbac;

@@ -4924,8 +4924,10 @@ dependencies = [
 name = "prism-runtime"
 version = "1.0.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "directories",
+ "prism-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -4976,7 +4978,11 @@ dependencies = [
  "futures",
  "insta",
  "libc",
+ "prism-agent",
  "prism-client",
+ "prism-llm",
+ "prism-python-bridge",
+ "prism-runtime",
  "ratatui",
  "ratatui-textarea",
  "serde",

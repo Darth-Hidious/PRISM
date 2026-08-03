@@ -5,6 +5,8 @@
 //! (credential persistence), and [`PlatformEndpoints`] (URL derivation for
 //! the MARC27 platform API, WebSocket, and dashboard).
 
+pub mod llm_resolve;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

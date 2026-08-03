@@ -204,7 +204,22 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
             prism_binary,
             project_root,
             python_bin,
-        } => backend::BackendHandle::spawn(prism_binary, project_root, python_bin)?,
+        } => {
+            // Native in-process agent by default; the subprocess JSON-RPC
+            // path remains as an explicit fallback (PRISM_BACKEND=rpc) and as
+            // a recovery when native resolution fails (e.g. missing creds).
+            if std::env::var("PRISM_BACKEND").as_deref() == Ok("rpc") {
+                backend::BackendHandle::spawn(prism_binary, project_root, python_bin)?
+            } else {
+                match backend::BackendHandle::spawn_native(project_root, python_bin) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "native backend unavailable — falling back to subprocess");
+                        backend::BackendHandle::spawn(prism_binary, project_root, python_bin)?
+                    }
+                }
+            }
+        }
         BackendMode::Fake { scenario } => backend::BackendHandle::fake(*scenario),
     };
     backend_handle.init().await?;

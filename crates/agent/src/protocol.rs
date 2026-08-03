@@ -48,7 +48,31 @@ use crate::types::{AgentConfig, AgentEvent};
 
 // ── Emit helpers ──────────────────────────────────────────────────
 
+/// Native (in-process) output sink. `run_server` always runs on a
+/// dedicated thread (stdio backend: the CLI main thread's runtime; native:
+/// a thread spawned by the frontend), so a thread-local keeps all 100+
+/// emit call sites unchanged while letting an in-process frontend receive
+/// the same `ui.*` / response values without a subprocess.
+thread_local! {
+    static SINK: std::cell::RefCell<Option<std::sync::mpsc::Sender<Value>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn install_sink(tx: std::sync::mpsc::Sender<Value>) {
+    SINK.with(|s| *s.borrow_mut() = Some(tx));
+}
+
 fn emit_raw(value: &Value) {
+    let handled = SINK.with(|s| {
+        if let Some(tx) = s.borrow().as_ref() {
+            let _ = tx.send(value.clone());
+            true
+        } else {
+            false
+        }
+    });
+    if handled {
+        return;
+    }
     let line = serde_json::to_string(value).expect("JSON serialization failed");
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -7355,7 +7379,50 @@ pub async fn build_agent_seed(
     })
 }
 
+/// Stdio backend entry (unchanged contract): JSON-RPC lines on stdin,
+/// `ui.*` notifications on stdout. Now a thin adapter over
+/// [`run_server_core`].
 pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -> Result<()> {
+    run_server_core(
+        llm_config,
+        tool_server_config,
+        Box::new(io::stdin().lines().map_while(|l| l.ok())),
+    )
+    .await
+}
+
+/// Native (in-process) backend entry for frontends (TUI, PRISM Desktop).
+/// Drives the exact same session loop as [`run_server`] on a dedicated
+/// thread with its own runtime — no subprocess, no stdio pipes. Requests
+/// arrive as JSON-RPC lines on `input`; responses/notifications are
+/// delivered as values on `output`.
+pub fn run_server_native(
+    llm_config: LlmConfig,
+    tool_server_config: ToolServer,
+    input: std::sync::mpsc::Receiver<String>,
+    output: std::sync::mpsc::Sender<Value>,
+) -> Result<()> {
+    install_sink(output);
+    struct NativeLines(std::sync::mpsc::Receiver<String>);
+    impl Iterator for NativeLines {
+        type Item = String;
+        fn next(&mut self) -> Option<String> {
+            self.0.recv().ok()
+        }
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(run_server_core(
+        llm_config,
+        tool_server_config,
+        Box::new(NativeLines(input)),
+    ))
+}
+
+async fn run_server_core(
+    llm_config: LlmConfig,
+    tool_server_config: ToolServer,
+    input: Box<dyn Iterator<Item = String>>,
+) -> Result<()> {
     // LlmClient is rebuilt per-turn so /model switches take effect.
     let _verify_config = LlmClient::new(llm_config.clone());
 
@@ -7448,16 +7515,9 @@ pub async fn run_server(llm_config: LlmConfig, tool_server_config: ToolServer) -
     // These are processed when the current turn completes.
     let mut message_queue: Vec<String> = Vec::new();
 
-    // Read JSON-RPC lines from stdin
-    let stdin = io::stdin();
-    let reader = stdin.lock();
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-
+    // Request lines: stdin (stdio backend) or an in-process channel
+    // (native frontends). The loop body is identical for both.
+    for line in input {
         if line.trim().is_empty() {
             continue;
         }

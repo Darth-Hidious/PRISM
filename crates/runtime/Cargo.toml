@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+prism-core = { path = "../core" }
 chrono.workspace = true
 directories.workspace = true
 serde.workspace = true

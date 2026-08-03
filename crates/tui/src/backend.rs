@@ -108,6 +108,7 @@ impl FakeScenario {
 pub enum BackendHandle {
     Real(RealBackend),
     Fake(FakeBackend),
+    Native(NativeBackend),
 }
 
 // ── Real backend ────────────────────────────────────────────────────
@@ -742,6 +743,14 @@ impl BackendHandle {
         Self::Fake(FakeBackend::new(scenario))
     }
 
+    /// Spawn the NATIVE in-process backend (no subprocess, no RPC
+    /// transport). Errors when LLM endpoint resolution fails (e.g. not
+    /// signed in and no local endpoint configured) so callers can fall
+    /// back to the subprocess path or surface the honest error.
+    pub fn spawn_native(project_root: &str, python_bin: &str) -> Result<Self> {
+        Ok(Self::Native(NativeBackend::spawn(project_root, python_bin)?))
+    }
+
     /// Test-only constructor: assemble a real backend from pre-spawned
     /// parts.  Kept for backward compatibility with existing tests.
     #[doc(hidden)]
@@ -763,6 +772,7 @@ impl BackendHandle {
         match self {
             Self::Real(b) => b.init().await,
             Self::Fake(b) => b.init().await,
+            Self::Native(b) => b.init().await,
         }
     }
 
@@ -770,6 +780,7 @@ impl BackendHandle {
         match self {
             Self::Real(b) => b.send_message(text),
             Self::Fake(b) => b.send_message(text),
+            Self::Native(b) => b.send_message(text),
         }
     }
 
@@ -777,6 +788,7 @@ impl BackendHandle {
         match self {
             Self::Real(b) => b.send_command(command),
             Self::Fake(b) => b.send_command(command),
+            Self::Native(b) => b.send_command(command),
         }
     }
 
@@ -784,6 +796,7 @@ impl BackendHandle {
         match self {
             Self::Real(b) => b.send_approval(response, tool_name),
             Self::Fake(b) => b.send_approval(response, tool_name),
+            Self::Native(b) => b.send_approval(response, tool_name),
         }
     }
 
@@ -791,6 +804,7 @@ impl BackendHandle {
         match self {
             Self::Real(b) => b.recv().await,
             Self::Fake(b) => b.recv().await,
+            Self::Native(b) => b.recv().await,
         }
     }
 
@@ -798,11 +812,150 @@ impl BackendHandle {
         match self {
             Self::Real(b) => b.kill(),
             Self::Fake(b) => b.kill(),
+            Self::Native(b) => b.kill(),
         }
     }
 }
 
 impl Drop for BackendHandle {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+// ── Native backend ────────────────────────────────────────────────
+
+/// Native in-process backend — drives `prism_agent` in THIS process via
+/// [`prism_agent::protocol::run_server_native`]. No subprocess, no stdio
+/// pipes: requests go in over a channel, `ui.*` values come back over a
+/// channel, with the exact same message contract as the subprocess so
+/// the app code is transport-agnostic.
+pub struct NativeBackend {
+    tx: Option<std::sync::mpsc::Sender<String>>,
+    rx: mpsc::UnboundedReceiver<Value>,
+    next_id: u64,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl NativeBackend {
+    pub fn spawn(project_root: &str, python_bin: &str) -> Result<Self> {
+        let paths = prism_runtime::PrismPaths::discover()
+            .map_err(|e| anyhow::anyhow!("prism paths unavailable: {e}"))?;
+        let inputs = prism_runtime::llm_resolve::native_session_inputs(
+            std::path::Path::new(project_root),
+            std::path::PathBuf::from(python_bin),
+            &paths,
+        )?;
+        let llm_config = prism_llm::LlmConfig {
+            base_url: inputs.llm.base_url,
+            model: inputs.llm.model,
+            api_key: inputs.llm.api_key,
+            embedding_model: inputs.llm.embedding_model,
+            context_window: inputs.llm.context_window,
+            max_output_tokens: inputs.llm.max_output_tokens,
+            ..Default::default()
+        };
+        let tool_server = prism_python_bridge::ToolServer {
+            python_bin: inputs.python_bin,
+            project_root: inputs.project_root,
+            env: inputs.env,
+        };
+
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<Value>();
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Bridge: sync session output → tokio channel the app awaits on.
+        std::thread::spawn(move || {
+            while let Ok(v) = out_rx.recv() {
+                if tx.send(v).is_err() {
+                    break;
+                }
+            }
+        });
+        let thread = std::thread::spawn(move || {
+            let _ = prism_agent::protocol::run_server_native(
+                llm_config,
+                tool_server,
+                in_rx,
+                out_tx,
+            );
+        });
+
+        Ok(Self {
+            tx: Some(in_tx),
+            rx,
+            next_id: 1,
+            thread: Some(thread),
+        })
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn send_request(&mut self, method: &str, params: Value) -> Result<u64> {
+        let id = self.next_id();
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "id": id,
+            "params": params,
+        });
+        let line = serde_json::to_string(&req)?;
+        self.tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native session killed"))?
+            .send(line)
+            .map_err(|_| anyhow::anyhow!("native session thread is gone"))?;
+        Ok(id)
+    }
+
+    pub async fn init(&mut self) -> Result<()> {
+        self.send_request("init", serde_json::json!({"auto_approve": false, "resume": ""}))?;
+        if let Some(resp) = self.rx.recv().await
+            && (resp.get("result").is_some() || resp.get("method").is_some())
+        {
+            return Ok(());
+        }
+        anyhow::bail!("init failed — no response from native session")
+    }
+
+    pub fn send_message(&mut self, text: &str) -> Result<u64> {
+        self.send_request("input.message", serde_json::json!({"text": text}))
+    }
+
+    pub fn send_command(&mut self, command: &str) -> Result<u64> {
+        self.send_request(
+            "input.command",
+            serde_json::json!({"command": command, "silent": false}),
+        )
+    }
+
+    pub fn send_approval(&mut self, response: &str, tool_name: &str) -> Result<()> {
+        self.send_request(
+            "input.prompt_response",
+            serde_json::json!({"response": response, "tool_name": tool_name}),
+        )?;
+        Ok(())
+    }
+
+    pub async fn recv(&mut self) -> Option<Value> {
+        self.rx.recv().await
+    }
+
+    pub fn kill(&mut self) {
+        // Closing the request channel ends the session loop; the thread
+        // then exits on its own.
+        self.tx.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for NativeBackend {
     fn drop(&mut self) {
         self.kill();
     }

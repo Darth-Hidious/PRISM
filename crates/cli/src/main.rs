@@ -7,14 +7,14 @@
 
 mod boot;
 mod boot_checks;
-mod brand;
-mod chat_config;
+use prism_core::brand;
+use prism_core::chat_config;
 mod doctor;
 mod local_llm;
 mod mcp_server_native;
 mod notebook;
 mod onboarding;
-mod providers;
+use prism_core::providers;
 mod pyiron_cmd;
 mod tool_sync;
 mod use_command;
