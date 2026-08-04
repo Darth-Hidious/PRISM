@@ -43,7 +43,7 @@
 //! # });
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -53,301 +53,22 @@ use tracing::{debug, info, warn};
 
 use prism_provenance::{ActionType, Actor, ProvenanceRecord, ProvenanceStore, new_record};
 
-const EVALUATION_TOOL: &str = "hea_descriptors";
-const PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION: f64 = 0.05;
+mod domain;
 
-/// Maximum absolute error accepted for `sum(fractions) == 1.0`.
-///
-/// `1e-6` admits ordinary decimal round-off (for example, three fractions
-/// written as `0.333333`, `0.333333`, `0.333334`) without accepting ratios,
-/// percentages, or model output that needs normalization. PRISM rejects
-/// outside this tolerance; it never silently changes the proposed material.
-pub const COMPOSITION_SUM_TOLERANCE: f64 = 1e-6;
+pub use domain::alloy::{
+    COMPOSITION_SUM_TOLERANCE, DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K,
+    DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS, HeaDefinition, STRICT_YEH_MIN_CONFIG_ENTROPY_J_PER_MOL_K,
+    STRICT_YEH_MIN_PRINCIPAL_ELEMENTS,
+};
+pub use domain::polymer::RDKIT_INSTALL_HINT;
+pub use domain::{
+    ConstraintOperator, Domain, DomainKind, EvaluatorTier, ParsedCandidate, PropertyConstraint,
+    builtin_domain,
+};
 
-const ELEMENT_SYMBOLS: &str = "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg Bh Hs Mt Ds Rg Cn Nh Fl Mc Lv Ts Og";
-
-fn is_element_symbol(symbol: &str) -> bool {
-    ELEMENT_SYMBOLS
-        .split_ascii_whitespace()
-        .any(|candidate| candidate == symbol)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct ExpandedComposition {
-    original: String,
-    expanded: String,
-    fractions: Vec<f64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompositionNotation {
-    BareEquiatomic,
-    AtomicPercent,
-    AtomicFraction,
-}
-
-/// Parse standard HEA notation, expand it to explicit atomic fractions, then
-/// enforce the existing strict validation. Bare symbols mean equiatomic;
-/// integer suffixes mean atomic percent; decimal/scientific suffixes mean
-/// atomic fractions. Mixing those conventions is rejected rather than guessed.
-fn parse_and_expand_composition(
-    composition: &str,
-    allowed_elements: &[String],
-) -> std::result::Result<ExpandedComposition, String> {
-    let original = composition.trim();
-    if original.is_empty() {
-        return Err("composition is empty".into());
-    }
-    let compact = original
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace())
-        .collect::<String>();
-    let bytes = compact.as_bytes();
-    let mut index = 0;
-    let mut seen_elements = BTreeSet::new();
-    let mut element_names = Vec::new();
-    let mut values = Vec::new();
-    let mut notation = None;
-
-    while index < bytes.len() {
-        let symbol_start = index;
-        if !bytes[index].is_ascii_uppercase() {
-            return Err(format!(
-                "expected an element symbol at byte {index} in '{original}'"
-            ));
-        }
-        index += 1;
-        if index < bytes.len() && bytes[index].is_ascii_lowercase() {
-            index += 1;
-        }
-        let symbol = &compact[symbol_start..index];
-        if !is_element_symbol(symbol) {
-            return Err(format!("'{symbol}' is not a real element symbol"));
-        }
-        if !allowed_elements.is_empty() && !allowed_elements.iter().any(|item| item == symbol) {
-            return Err(format!(
-                "element {symbol} is outside the allowed set [{}]",
-                allowed_elements.join(", ")
-            ));
-        }
-        if !seen_elements.insert(symbol.to_string()) {
-            return Err(format!("element {symbol} appears more than once"));
-        }
-        element_names.push(symbol.to_string());
-
-        let fraction_start = index;
-        let mut has_mantissa_digit = false;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-            has_mantissa_digit = true;
-        }
-        let mut is_fraction = false;
-        if index < bytes.len() && bytes[index] == b'.' {
-            is_fraction = true;
-            index += 1;
-            while index < bytes.len() && bytes[index].is_ascii_digit() {
-                index += 1;
-                has_mantissa_digit = true;
-            }
-            if !has_mantissa_digit {
-                return Err(format!("invalid decimal fraction for element {symbol}"));
-            }
-        }
-        if has_mantissa_digit
-            && index < bytes.len()
-            && matches!(bytes[index], b'e' | b'E')
-            && index + 1 < bytes.len()
-            && (matches!(bytes[index + 1], b'+' | b'-') || bytes[index + 1].is_ascii_digit())
-        {
-            is_fraction = true;
-            index += 1;
-            if index < bytes.len() && matches!(bytes[index], b'+' | b'-') {
-                index += 1;
-            }
-            let exponent_start = index;
-            while index < bytes.len() && bytes[index].is_ascii_digit() {
-                index += 1;
-            }
-            if exponent_start == index {
-                return Err(format!("invalid exponent for element {symbol}"));
-            }
-        }
-
-        // A bare integer zero is invalid in either notation. Treat it as a
-        // fraction so `W1.0 Mo0` retains the precise positivity error instead
-        // of becoming a misleading mixed-notation error.
-        if !is_fraction && fraction_start < index && &compact[fraction_start..index] == "0" {
-            is_fraction = true;
-        }
-        let current_notation = if fraction_start == index {
-            CompositionNotation::BareEquiatomic
-        } else if is_fraction {
-            CompositionNotation::AtomicFraction
-        } else {
-            CompositionNotation::AtomicPercent
-        };
-        if let Some(previous) = notation
-            && previous != current_notation
-        {
-            return Err(
-                "composition mixes bare, atomic-percent, or atomic-fraction notation".into(),
-            );
-        }
-        notation = Some(current_notation);
-
-        if current_notation != CompositionNotation::BareEquiatomic {
-            let token = &compact[fraction_start..index];
-            let value = token
-                .parse::<f64>()
-                .map_err(|_| format!("invalid fraction '{token}' for element {symbol}"))?;
-            if !value.is_finite() {
-                return Err(format!("fraction for element {symbol} must be finite"));
-            }
-            if value <= 0.0 {
-                return Err(format!(
-                    "fraction for element {symbol} must be strictly positive"
-                ));
-            }
-            values.push(value);
-        }
-
-        if index < bytes.len() && !bytes[index].is_ascii_uppercase() {
-            return Err(format!(
-                "unexpected character after fraction for element {symbol}"
-            ));
-        }
-    }
-
-    let fractions = match notation {
-        Some(CompositionNotation::BareEquiatomic) => {
-            if element_names.len() < 2 {
-                return Err("composition must contain at least two elements".into());
-            }
-            vec![1.0 / element_names.len() as f64; element_names.len()]
-        }
-        Some(CompositionNotation::AtomicPercent) => {
-            let sum: f64 = values.iter().sum();
-            let tolerance = COMPOSITION_SUM_TOLERANCE * 100.0;
-            if (sum - 100.0).abs() > tolerance {
-                return Err(format!(
-                    "atomic-percent suffixes must sum to 100.0 ± {tolerance:.6}; got {sum:.6}"
-                ));
-            }
-            values.into_iter().map(|value| value / 100.0).collect()
-        }
-        Some(CompositionNotation::AtomicFraction) => values,
-        None => return Err("composition is empty".into()),
-    };
-
-    let sum: f64 = fractions.iter().sum();
-    if !sum.is_finite() {
-        return Err("composition fraction sum must be finite".into());
-    }
-    if (sum - 1.0).abs() > COMPOSITION_SUM_TOLERANCE {
-        return Err(format!(
-            "composition fractions must sum to 1.0 ± {COMPOSITION_SUM_TOLERANCE:.6}; got {sum:.6}"
-        ));
-    }
-    let expanded = element_names
-        .iter()
-        .zip(&fractions)
-        .map(|(element, fraction)| format!("{element}{fraction}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Ok(ExpandedComposition {
-        original: original.to_string(),
-        expanded,
-        fractions,
-    })
-}
-
-fn validate_composition(
-    composition: &str,
-    allowed_elements: &[String],
-) -> std::result::Result<(), String> {
-    parse_and_expand_composition(composition, allowed_elements).map(|_| ())
-}
-
-fn validate_allowed_elements(elements: &[String]) -> std::result::Result<(), String> {
-    let mut seen = BTreeSet::new();
-    for symbol in elements {
-        if !is_element_symbol(symbol) {
-            return Err(format!("'{symbol}' is not a real allowed element symbol"));
-        }
-        if !seen.insert(symbol) {
-            return Err(format!("allowed element {symbol} appears more than once"));
-        }
-    }
-    Ok(())
-}
-
-/// Permissive RHEA definition: at least four principal elements and a mixing
-/// entropy of at least `R`. This admits equiatomic NbMoTaW (`R ln(4)`) from
-/// the founding refractory-HEA study.
-///
-/// Source: O. N. Senkov et al., "Refractory high-entropy alloys,"
-/// Intermetallics 18 (2010) 1758-1765,
-/// <https://doi.org/10.1016/j.intermet.2010.05.014>.
-pub const DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K: f64 = 8.314;
-pub const DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS: usize = 4;
-
-/// Strict Yeh definition: at least five principal elements and `ΔS_mix >=
-/// 1.5R`, conventionally rounded to 12.47 J/(mol K).
-///
-/// Source: J.-W. Yeh et al., "Nanostructured High-Entropy Alloys with Multiple
-/// Principal Elements: Novel Alloy Design Concepts and Outcomes," Advanced
-/// Engineering Materials 6 (2004) 299-303,
-/// <https://doi.org/10.1002/adem.200300567>.
-pub const STRICT_YEH_MIN_CONFIG_ENTROPY_J_PER_MOL_K: f64 = 12.47;
-pub const STRICT_YEH_MIN_PRINCIPAL_ELEMENTS: usize = 5;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HeaDefinition {
-    /// RHEA-inclusive policy based on Senkov's four-principal-element NbMoTaW.
-    PermissiveRhea,
-    /// Original strict multiple-principal-element policy from Yeh et al.
-    StrictYeh,
-    /// Explicit per-campaign thresholds that differ from either named preset.
-    Custom,
-}
-
-impl HeaDefinition {
-    fn name(self) -> &'static str {
-        match self {
-            Self::PermissiveRhea => "permissive_rhea",
-            Self::StrictYeh => "strict_yeh",
-            Self::Custom => "custom",
-        }
-    }
-
-    fn source(self) -> &'static str {
-        match self {
-            Self::PermissiveRhea => {
-                "Senkov et al., Intermetallics 18 (2010), DOI 10.1016/j.intermet.2010.05.014"
-            }
-            Self::StrictYeh => {
-                "Yeh et al., Advanced Engineering Materials 6 (2004), DOI 10.1002/adem.200300567"
-            }
-            Self::Custom => {
-                "campaign-configured thresholds (permissive RHEA baseline: Senkov et al., Intermetallics 18 (2010), DOI 10.1016/j.intermet.2010.05.014)"
-            }
-        }
-    }
-
-    fn defaults(self) -> (f64, usize) {
-        match self {
-            Self::PermissiveRhea | Self::Custom => (
-                DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K,
-                DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS,
-            ),
-            Self::StrictYeh => (
-                STRICT_YEH_MIN_CONFIG_ENTROPY_J_PER_MOL_K,
-                STRICT_YEH_MIN_PRINCIPAL_ELEMENTS,
-            ),
-        }
-    }
-}
+#[cfg(test)]
+use domain::alloy::{EVALUATION_TOOL, parse_and_expand_composition, validate_composition};
+use domain::builtin_domain as domain_for;
 
 /// Durable schedules and watchers — what wakes a paused or crashed goal back
 /// up without a human. See [`schedule`] for the design rationale.
@@ -423,6 +144,18 @@ pub struct CampaignConfig {
     /// Negative = minimize, positive = maximize.
     #[serde(default)]
     pub reward_weights: BTreeMap<String, f64>,
+    /// Scientific domain plugin. Omitted legacy checkpoints default to alloy.
+    #[serde(default, skip_serializing_if = "DomainKind::is_alloy")]
+    pub domain: DomainKind,
+    /// Evaluator tier selected from the active domain's declared tiers.
+    /// None selects that domain's cheapest applicable tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_tier: Option<u8>,
+    /// Named, cited hard property constraints. The active domain judges these
+    /// against evaluator evidence and rejects a candidate when evidence is
+    /// absent rather than substituting a value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub property_constraints: Vec<PropertyConstraint>,
     /// Optional hard minimum for measured configurational entropy, in
     /// J/(mol K). When the goal explicitly asks for an HEA and this is None,
     /// the campaign stores [`DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K`].
@@ -475,6 +208,9 @@ impl Default for CampaignConfig {
             llm_model: String::new(),
             llm_temperature: 0.7,
             reward_weights: BTreeMap::new(),
+            domain: DomainKind::Alloy,
+            evaluation_tier: None,
+            property_constraints: Vec::new(),
             min_configurational_entropy_j_per_mol_k: None,
             min_principal_elements: None,
             hea_definition: None,
@@ -487,99 +223,16 @@ impl Default for CampaignConfig {
 
 impl CampaignConfig {
     fn apply_goal_implied_constraints(&mut self, goal: &CampaignGoal) {
-        let has_explicit_hea_constraint = self.hea_definition.is_some()
-            || self.min_configurational_entropy_j_per_mol_k.is_some()
-            || self.min_principal_elements.is_some();
-        if !goal_explicitly_requests_hea(goal) && !has_explicit_hea_constraint {
-            return;
-        }
-
-        let requested = self.hea_definition.unwrap_or(
-            match (
-                self.min_configurational_entropy_j_per_mol_k,
-                self.min_principal_elements,
-            ) {
-                (Some(entropy), Some(principal_elements))
-                    if entropy == STRICT_YEH_MIN_CONFIG_ENTROPY_J_PER_MOL_K
-                        && principal_elements == STRICT_YEH_MIN_PRINCIPAL_ELEMENTS =>
-                {
-                    HeaDefinition::StrictYeh
-                }
-                (Some(entropy), Some(principal_elements))
-                    if entropy == DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K
-                        && principal_elements == DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS =>
-                {
-                    HeaDefinition::PermissiveRhea
-                }
-                (Some(_), _) | (_, Some(_)) => HeaDefinition::Custom,
-                (None, None) => HeaDefinition::PermissiveRhea,
-            },
-        );
-        let (default_entropy, default_principal_elements) = requested.defaults();
-        let entropy = self
-            .min_configurational_entropy_j_per_mol_k
-            .get_or_insert(default_entropy);
-        let principal_elements = self
-            .min_principal_elements
-            .get_or_insert(default_principal_elements);
-        self.hea_definition = Some(if (*entropy, *principal_elements) == requested.defaults() {
-            requested
-        } else {
-            HeaDefinition::Custom
-        });
+        domain_for(self.domain).apply_goal_implied_constraints(self, goal);
     }
 
-    fn active_hea_definition(&self) -> Option<serde_json::Value> {
-        let definition = self.hea_definition?;
-        let entropy = self.min_configurational_entropy_j_per_mol_k?;
-        let principal_elements = self.min_principal_elements?;
-        Some(serde_json::json!({
-            "name": definition.name(),
-            "min_configurational_entropy_j_per_mol_k": entropy,
-            "min_principal_elements": principal_elements,
-            "principal_element_min_atomic_fraction": PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION,
-            "source": definition.source(),
-        }))
+    fn active_domain_definition(&self) -> Option<serde_json::Value> {
+        domain_for(self.domain).definition(self)
     }
 }
 
-fn goal_explicitly_requests_hea(goal: &CampaignGoal) -> bool {
-    let text = format!(
-        "{} {} {}",
-        goal.description,
-        goal.objective,
-        goal.constraints.join(" ")
-    )
-    .to_ascii_lowercase();
-    let words = text
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-
-    words.iter().any(|word| matches!(*word, "hea" | "heas"))
-        || words.windows(3).any(|window| {
-            window[0] == "high" && window[1] == "entropy" && matches!(window[2], "alloy" | "alloys")
-        })
-}
-
-fn configured_compositional_constraints(config: &CampaignConfig) -> Vec<String> {
-    let mut constraints = Vec::new();
-    let definition = config
-        .hea_definition
-        .map(HeaDefinition::name)
-        .unwrap_or("unnamed");
-    if let Some(minimum) = config.min_configurational_entropy_j_per_mol_k {
-        constraints.push(format!(
-            "[{definition}] delta_S_mix_J_per_molK >= {minimum:.4} J/(mol K)"
-        ));
-    }
-    if let Some(minimum) = config.min_principal_elements {
-        constraints.push(format!(
-            "[{definition}] principal elements >= {minimum} (each >= {:.0} at.%)",
-            PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION * 100.0
-        ));
-    }
-    constraints
+fn configured_domain_constraints(config: &CampaignConfig) -> Vec<String> {
+    domain_for(config.domain).configured_constraints(config)
 }
 
 // ── Campaign State ──────────────────────────────────────────────────
@@ -716,9 +369,10 @@ impl std::fmt::Display for BudgetStatus {
 /// A single evaluated candidate material.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
-    /// Composition string (e.g. "W0.3 Mo0.2 Ta0.3 Nb0.2").
+    /// Canonical candidate identity supplied by the active domain. The field
+    /// name is retained for checkpoint/API compatibility with alloy campaigns.
     pub composition: String,
-    /// Physics descriptors from the configured evaluation tool.
+    /// Properties and method evidence from the configured evaluation tool.
     #[serde(default)]
     pub properties: serde_json::Value,
     /// Scalarized reward score (higher = better).
@@ -729,24 +383,24 @@ pub struct Candidate {
     pub source: String,
 }
 
-/// A candidate excluded by a hard compositional constraint. The `evaluated`
-/// field distinguishes descriptor-based rejection from strict composition
-/// validation that stopped before evaluation.
+/// A candidate excluded by a hard domain constraint. The `evaluated` field
+/// distinguishes property-based rejection from identity validation that
+/// stopped before evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConstraintRejection {
-    /// Present only when a syntactically valid composition reached the
+    /// Present only when a syntactically valid candidate identity reached the
     /// evaluator. Invalid raw proposals are intentionally not checkpointed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub composition: String,
     pub properties: serde_json::Value,
     pub iteration: usize,
     pub reasons: Vec<String>,
-    /// Whether the descriptor evaluator actually received this composition.
+    /// Whether the evaluator actually received this candidate identity.
     /// Defaults to true so checkpoints from before this field remain honest.
     #[serde(default = "rejection_was_evaluated")]
     pub evaluated: bool,
     /// Live-run evidence for logs and the terminal summary. Serde must never
-    /// put a malformed composition into a checkpoint.
+    /// put a malformed candidate identity into a checkpoint.
     #[serde(skip)]
     raw_proposal: Option<String>,
 }
@@ -785,11 +439,11 @@ impl ConstraintRejection {
 }
 
 #[derive(Debug)]
-struct CompositionProposal {
+struct CandidateProposal {
     /// Submitted notation, retained for live rejection records and provenance.
     original: String,
-    /// Canonical explicit fractions, used for evaluation and durable candidates.
-    expanded: Option<String>,
+    /// Canonical identity used for evaluation and durable candidates.
+    canonical: Option<String>,
     rejection_reason: Option<String>,
 }
 
@@ -1067,33 +721,44 @@ impl CampaignState {
         }
         s.push_str(&format!("Budget: {}\n", self.budget_status()));
         s.push_str(&format!("Avg reward: {:.4}\n", self.avg_reward()));
-        let hard_constraints = configured_compositional_constraints(&self.config);
+        let domain = domain_for(self.config.domain);
+        let hard_constraints = configured_domain_constraints(&self.config);
         if !hard_constraints.is_empty() {
-            s.push_str("Hard compositional constraints:\n");
+            let heading = if self.config.domain == DomainKind::Alloy {
+                "Hard compositional constraints:\n"
+            } else {
+                "Hard domain constraints:\n"
+            };
+            s.push_str(heading);
             for constraint in &hard_constraints {
                 s.push_str(&format!("  - {constraint}\n"));
             }
-            if let Some(definition) = self.config.active_hea_definition() {
-                let name = definition["name"].as_str().unwrap_or("unknown");
-                let source = definition["source"].as_str().unwrap_or("unknown");
-                s.push_str(&format!("HEA definition: {name} ({source})\n"));
-            }
+        }
+        if (!hard_constraints.is_empty() || self.config.domain != DomainKind::Alloy)
+            && let Some(definition) = self.config.active_domain_definition()
+        {
+            let name = definition["name"].as_str().unwrap_or("unknown");
+            let source = definition["source"].as_str().unwrap_or("unknown");
+            s.push_str(&format!(
+                "{}: {name} ({source})\n",
+                domain.definition_label()
+            ));
         }
         if let Some(best) = self.best() {
             s.push_str(&format!(
                 "Best: {} (reward={:.4})\n",
-                display_recorded_composition(&best.composition, &best.properties),
+                display_recorded_candidate(self.config.domain, &best.composition, &best.properties),
                 best.reward
             ));
         }
         if !winners.is_empty() {
             s.push_str("\nTop candidates:\n");
             for (i, c) in winners.iter().enumerate() {
-                let descriptors = summarize_descriptors(&c.properties);
+                let descriptors = domain.summarize_properties(&c.properties);
                 s.push_str(&format!(
                     "  {}. {} — reward={:.4} (iter {}, {}){}\n",
                     i + 1,
-                    display_recorded_composition(&c.composition, &c.properties),
+                    display_recorded_candidate(self.config.domain, &c.composition, &c.properties),
                     c.reward,
                     c.iteration,
                     c.source,
@@ -1102,18 +767,26 @@ impl CampaignState {
             }
         }
         if !self.rejected_candidates.is_empty() {
-            s.push_str("\nREJECTED by hard compositional constraints:\n");
+            if self.config.domain == DomainKind::Alloy {
+                s.push_str("\nREJECTED by hard compositional constraints:\n");
+            } else {
+                s.push_str("\nREJECTED by hard domain constraints:\n");
+            }
             for rejection in &self.rejected_candidates {
-                let composition = if rejection.evaluated {
-                    display_recorded_composition(&rejection.composition, &rejection.properties)
+                let candidate = if rejection.evaluated {
+                    display_recorded_candidate(
+                        self.config.domain,
+                        &rejection.composition,
+                        &rejection.properties,
+                    )
                 } else {
                     rejection.display_composition().to_string()
                 };
                 s.push_str(&format!(
-                    "  - {composition} (iter {}) — {}{}\n",
+                    "  - {candidate} (iter {}) — {}{}\n",
                     rejection.iteration,
                     rejection.reasons.join("; "),
-                    summarize_descriptors(&rejection.properties)
+                    domain.summarize_properties(&rejection.properties)
                 ));
             }
         }
@@ -1121,48 +794,23 @@ impl CampaignState {
     }
 }
 
-fn display_recorded_composition(composition: &str, properties: &serde_json::Value) -> String {
-    match properties
-        .get("original_composition")
-        .and_then(serde_json::Value::as_str)
-        .filter(|original| !original.is_empty() && *original != composition)
-    {
-        Some(original) => format!("{composition} (input: {original})"),
-        None => composition.to_string(),
-    }
-}
-
-fn summarize_descriptors(properties: &serde_json::Value) -> String {
-    const KEYS: [&str; 8] = [
-        "Tm_estimate_K",
-        "delta_S_mix_J_per_molK",
-        "delta_H_mix_kJ_per_mol",
-        "omega",
-        "VEC",
-        "delta_radius_pct",
-        "mixing_entropy",
-        "density",
-    ];
-    let mut descriptors = KEYS
-        .iter()
-        .filter_map(|key| {
-            properties
-                .get(key)
-                .and_then(serde_json::Value::as_f64)
-                .map(|value| format!("{key}={value:.4}"))
-        })
-        .collect::<Vec<_>>();
-    if let Some(phase) = properties
-        .get("phase_prediction")
-        .and_then(serde_json::Value::as_str)
-    {
-        descriptors.push(format!("phase_prediction={phase}"));
-    }
-
-    if descriptors.is_empty() {
-        String::new()
+fn display_recorded_candidate(
+    kind: DomainKind,
+    candidate: &str,
+    properties: &serde_json::Value,
+) -> String {
+    let original_key = if kind == DomainKind::Alloy {
+        "original_composition"
     } else {
-        format!("; descriptors: {}", descriptors.join(", "))
+        "original_candidate"
+    };
+    match properties
+        .get(original_key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|original| !original.is_empty() && *original != candidate)
+    {
+        Some(original) => format!("{candidate} (input: {original})"),
+        None => candidate.to_string(),
     }
 }
 
@@ -1170,33 +818,42 @@ fn summarize_descriptors(properties: &serde_json::Value) -> String {
 /// boundary; this prevents a future constructor or a legacy/corrupt checkpoint
 /// from publishing an invalid candidate as resumable campaign state.
 fn validate_checkpoint_compositions(state: &CampaignState) -> Result<()> {
-    validate_allowed_elements(&state.goal.elements)
-        .map_err(|reason| anyhow::anyhow!("invalid campaign allowed-element set: {reason}"))?;
+    let domain = domain_for(state.config.domain);
+    domain.validate_goal(&state.goal).map_err(|reason| {
+        if state.config.domain == DomainKind::Alloy {
+            anyhow::anyhow!("invalid campaign allowed-element set: {reason}")
+        } else {
+            anyhow::anyhow!("invalid campaign domain search space: {reason}")
+        }
+    })?;
 
     for seed in &state.goal.seeds {
-        validate_composition(seed, &state.goal.elements)
+        domain
+            .parse_candidate(seed, &state.goal)
             .map_err(|reason| anyhow::anyhow!("invalid campaign seed '{seed}': {reason}"))?;
     }
     for candidate in &state.candidates {
-        validate_composition(&candidate.composition, &state.goal.elements).map_err(|reason| {
-            anyhow::anyhow!(
-                "invalid accepted candidate '{}': {reason}",
-                candidate.composition
-            )
-        })?;
+        domain
+            .parse_candidate(&candidate.composition, &state.goal)
+            .map_err(|reason| {
+                anyhow::anyhow!(
+                    "invalid accepted candidate '{}': {reason}",
+                    candidate.composition
+                )
+            })?;
     }
     for rejection in &state.rejected_candidates {
         if rejection.evaluated {
-            validate_composition(&rejection.composition, &state.goal.elements).map_err(
-                |reason| {
+            domain
+                .parse_candidate(&rejection.composition, &state.goal)
+                .map_err(|reason| {
                     anyhow::anyhow!(
                         "invalid evaluated rejection '{}': {reason}",
                         rejection.composition
                     )
-                },
-            )?;
+                })?;
         } else if !rejection.composition.is_empty() {
-            bail!("invalid pre-evaluation rejection must not retain a checkpointed composition");
+            bail!("invalid pre-evaluation rejection must not retain a checkpointed candidate");
         }
     }
     Ok(())
@@ -1675,8 +1332,13 @@ impl Campaign {
     async fn finish(&mut self, reason: &str) -> Result<()> {
         if self.state.candidates.is_empty() {
             if let Some(last) = self.state.rejected_candidates.last() {
+                let constraint_scope = if self.state.config.domain == DomainKind::Alloy {
+                    "hard compositional constraints"
+                } else {
+                    "hard domain constraints"
+                };
                 bail!(
-                    "{reason} reached with zero candidates satisfying the hard compositional constraints — {} proposals were REJECTED; last rejection: {} ({})",
+                    "{reason} reached with zero candidates satisfying the {constraint_scope} — {} proposals were REJECTED; last rejection: {} ({})",
                     self.state.rejected_candidates.len(),
                     last.durable_composition_label(),
                     last.reasons.join("; ")
@@ -2004,43 +1666,42 @@ impl Campaign {
         let mut evaluation_failures = 0;
         let mut iteration_cost = 0.0;
         let mut last_err: Option<anyhow::Error> = None;
-        for comp in &proposals {
-            if let Some(reason) = &comp.rejection_reason {
+        for proposal in &proposals {
+            if let Some(reason) = &proposal.rejection_reason {
                 self.record_event(
                     "campaign.reject",
-                    serde_json::json!({
-                        "iteration": iter,
-                        "original_composition": &comp.original,
-                        "expanded_composition": &comp.expanded,
-                        "evaluation_skipped": true,
-                        "hard_constraint_violations": [reason],
-                    }),
+                    invalid_proposal_event_data(
+                        self.state.config.domain,
+                        iter,
+                        &proposal.original,
+                        reason,
+                    ),
                 )
                 .await;
                 rejected += 1;
                 warn!(
                     campaign = %self.state.campaign_id,
-                    composition = %comp.original,
+                    candidate = %proposal.original,
                     reason,
-                    "candidate REJECTED by composition validation before evaluation"
+                    "candidate REJECTED by domain identity validation before evaluation"
                 );
                 self.state
                     .rejected_candidates
                     .push(ConstraintRejection::invalid_proposal(
-                        comp.original.clone(),
+                        proposal.original.clone(),
                         iter,
                         reason.clone(),
                     ));
                 continue;
             }
 
-            let expanded = comp
-                .expanded
+            let canonical = proposal
+                .canonical
                 .as_deref()
-                .expect("valid composition proposals always have an expansion");
+                .expect("valid candidate proposals always have a canonical identity");
             evaluation_attempts += 1;
             match self
-                .evaluate_candidate(expanded, &comp.original, iter)
+                .evaluate_candidate(canonical, &proposal.original, iter)
                 .await
             {
                 Ok(CandidateEvaluation::Accepted(candidate)) => {
@@ -2052,16 +1713,16 @@ impl Campaign {
                     rejected += 1;
                     warn!(
                         campaign = %self.state.campaign_id,
-                        composition = %rejection.display_composition(),
+                        candidate = %rejection.display_composition(),
                         reasons = %rejection.reasons.join("; "),
-                        "candidate REJECTED by hard compositional constraints"
+                        "candidate REJECTED by hard domain constraints"
                     );
                     self.state.rejected_candidates.push(rejection);
                 }
                 Err(e) => {
                     warn!(
                         campaign = %self.state.campaign_id,
-                        composition = %comp.original,
+                        candidate = %proposal.original,
                         error = %e,
                         "evaluation failed for candidate"
                     );
@@ -2143,12 +1804,11 @@ impl Campaign {
         Ok(())
     }
 
-    /// Propose candidate compositions for this iteration.
+    /// Propose domain candidate identities for this iteration.
     ///
-    /// On iteration 0, uses seed data or asks the LLM to propose.
-    /// On later iterations, asks the LLM to propose variations around
-    /// the best-performing candidates so far (adaptive narrowing).
-    async fn propose_candidates(&mut self) -> Result<Vec<CompositionProposal>> {
+    /// On iteration 0, uses seed data or asks the LLM to propose. On later
+    /// iterations, asks for variations around the best-performing candidates.
+    async fn propose_candidates(&mut self) -> Result<Vec<CandidateProposal>> {
         let batch = self.state.config.batch_size;
         let iter = self.state.current_iteration;
 
@@ -2229,9 +1889,8 @@ impl Campaign {
         };
         let client = prism_llm::LlmClient::new(config);
 
-        let system = "You are a materials scientist designing novel alloys. \
-                      Respond with ONLY a JSON array of composition strings, \
-                      no explanation. Example: [\"W0.3 Mo0.2 Ta0.3 Nb0.2\", \"Cr0.4 V0.3 Ti0.3\"]";
+        let domain = domain_for(self.state.config.domain);
+        let system = domain.proposal_system_prompt();
 
         // Counted BEFORE the await: a call that errors mid-flight may still
         // have been billed, and a ceiling that only counts successes
@@ -2258,25 +1917,31 @@ impl Campaign {
         )
         .await;
 
-        // Parse the response — expect a JSON array of composition strings.
-        let compositions = self.parse_compositions(&response);
+        // Parse the response as a JSON array of domain candidate strings.
+        let proposals = self.parse_compositions(&response);
 
-        if compositions.is_empty() {
+        if proposals.is_empty() {
             // No synthetic proposals, ever: a campaign that cannot get
-            // parseable proposals from the model HALTS instead of running
-            // on fabricated compositions.
+            // parseable identities from the model HALTS instead of fabricating
+            // candidates.
+            let candidate_plural = domain.candidate_plural();
             warn!(
                 campaign = %self.state.campaign_id,
                 iteration = iter,
                 raw = %response,
-                "LLM returned no parseable compositions; halting proposal step"
+                "LLM returned no parseable {candidate_plural}; halting proposal step"
             );
+            if self.state.config.domain == DomainKind::Alloy {
+                anyhow::bail!(
+                    "proposal step failed: LLM returned no parseable compositions                  (campaign halted rather than proposing synthetic candidates)"
+                );
+            }
             anyhow::bail!(
-                "proposal step failed: LLM returned no parseable compositions                  (campaign halted rather than proposing synthetic candidates)"
+                "proposal step failed: LLM returned no parseable {candidate_plural} (campaign halted rather than fabricating candidates)"
             );
         }
 
-        Ok(compositions.into_iter().take(batch).collect())
+        Ok(proposals.into_iter().take(batch).collect())
     }
 
     /// Build the LLM prompt for the proposal step.
@@ -2286,12 +1951,8 @@ impl Campaign {
             self.state.goal.description, self.state.goal.objective
         );
 
-        if !self.state.goal.elements.is_empty() {
-            prompt.push_str(&format!(
-                "Allowed elements: {}\n",
-                self.state.goal.elements.join(", ")
-            ));
-        }
+        let domain = domain_for(self.state.config.domain);
+        prompt.push_str(&domain.search_space_prompt(&self.state.goal));
 
         if !self.state.goal.constraints.is_empty() {
             prompt.push_str(&format!(
@@ -2300,15 +1961,26 @@ impl Campaign {
             ));
         }
 
-        let hard_constraints = configured_compositional_constraints(&self.state.config);
+        let hard_constraints = configured_domain_constraints(&self.state.config);
         if !hard_constraints.is_empty() {
-            prompt.push_str("Hard compositional constraints (mandatory):\n");
+            let heading = if self.state.config.domain == DomainKind::Alloy {
+                "Hard compositional constraints (mandatory):\n"
+            } else {
+                "Hard domain constraints (mandatory, named and cited):\n"
+            };
+            prompt.push_str(heading);
             for constraint in &hard_constraints {
                 prompt.push_str(&format!("  - {constraint}\n"));
             }
-            prompt.push_str(
-                "A proposal that violates either hard constraint will be visibly REJECTED and excluded from ranking.\n",
-            );
+            if self.state.config.domain == DomainKind::Alloy {
+                prompt.push_str(
+                    "A proposal that violates either hard constraint will be visibly REJECTED and excluded from ranking.\n",
+                );
+            } else {
+                prompt.push_str(
+                    "A proposal that violates a hard constraint will be visibly REJECTED and excluded from ranking.\n",
+                );
+            }
         }
         if !self.state.rejected_candidates.is_empty() {
             prompt.push_str("\nRecent hard-constraint rejections (do not repeat them):\n");
@@ -2323,29 +1995,29 @@ impl Campaign {
 
         if self.state.current_iteration > 0 && !self.state.candidates.is_empty() {
             // Show the LLM the top performers so it can narrow the search.
-            prompt.push_str("\nBest candidates so far (composition → reward):\n");
+            if self.state.config.domain == DomainKind::Alloy {
+                prompt.push_str("\nBest candidates so far (composition → reward):\n");
+            } else {
+                prompt.push_str(&format!(
+                    "\nBest {} so far (candidate identity → reward):\n",
+                    domain.candidate_plural()
+                ));
+            }
             for c in self.state.top_n(5) {
                 prompt.push_str(&format!("  {} → {:.4}\n", c.composition, c.reward));
             }
-            prompt.push_str(&format!(
-                "\nPropose {} NEW compositions that improve on these. \
-                 Vary the ratios and try new element combinations within the allowed set.\n",
-                batch
-            ));
+            prompt.push_str(&domain.improvement_prompt(batch));
         } else {
-            prompt.push_str(&format!(
-                "\nPropose {} initial candidate compositions.\n",
-                batch
-            ));
+            prompt.push_str(&domain.initial_prompt(batch));
         }
 
         prompt
     }
 
-    /// Extract and validate composition strings from an LLM response.
+    /// Extract and validate candidate strings from an LLM response.
     /// Handles JSON arrays, newline-separated lists, and free text. Malformed
     /// strings remain in the returned batch as visible rejection records.
-    fn parse_compositions(&self, text: &str) -> Vec<CompositionProposal> {
+    fn parse_compositions(&self, text: &str) -> Vec<CandidateProposal> {
         let raw_compositions = if let Ok(arr) = serde_json::from_str::<Vec<String>>(text.trim()) {
             arr
         } else if let Some(start) = text.find('[')
@@ -2354,6 +2026,7 @@ impl Campaign {
         {
             arr
         } else {
+            let domain = domain_for(self.state.config.domain);
             text.lines()
                 .filter_map(|line| {
                     let line = line.trim().trim_start_matches(|c: char| {
@@ -2362,12 +2035,18 @@ impl Campaign {
                     if line.is_empty() || line.len() < 3 {
                         return None;
                     }
-                    let looks_like_comp = line.chars().any(|c| c.is_ascii_uppercase())
-                        && (line.chars().any(|c| c.is_ascii_digit() || c == '.')
-                            || parse_and_expand_composition(line, &self.state.goal.elements)
-                                .is_ok());
-                    (looks_like_comp && !line.starts_with("Propose") && !line.starts_with("Goal"))
-                        .then(|| line.to_string())
+                    let domain_valid = domain.parse_candidate(line, &self.state.goal).is_ok();
+                    let looks_like_candidate = if self.state.config.domain == DomainKind::Alloy {
+                        line.chars().any(|c| c.is_ascii_uppercase())
+                            && (line.chars().any(|c| c.is_ascii_digit() || c == '.')
+                                || domain_valid)
+                    } else {
+                        line.starts_with('{') || domain_valid
+                    };
+                    (looks_like_candidate
+                        && !line.starts_with("Propose")
+                        && !line.starts_with("Goal"))
+                    .then(|| line.to_string())
                 })
                 .collect()
         };
@@ -2378,48 +2057,48 @@ impl Campaign {
             .collect()
     }
 
-    fn validate_proposal(&self, original: String) -> CompositionProposal {
-        match parse_and_expand_composition(&original, &self.state.goal.elements) {
-            Ok(parsed) => CompositionProposal {
+    fn validate_proposal(&self, original: String) -> CandidateProposal {
+        match domain_for(self.state.config.domain).parse_candidate(&original, &self.state.goal) {
+            Ok(parsed) => CandidateProposal {
                 original: parsed.original,
-                expanded: Some(parsed.expanded),
+                canonical: Some(parsed.canonical),
                 rejection_reason: None,
             },
-            Err(reason) => CompositionProposal {
+            Err(reason) => CandidateProposal {
                 original,
-                expanded: None,
+                canonical: None,
                 rejection_reason: Some(reason),
             },
         }
     }
 
-    /// Evaluate a single candidate composition.
-    ///
-    /// Calls the registered HEA descriptor tool via the local PRISM node API
-    /// and computes a scalarized reward from the returned physics descriptors.
+    /// Evaluate one domain candidate through the active plugin's selected
+    /// evaluator tier and scalarization policy.
     async fn evaluate_candidate(
         &self,
-        composition: &str,
-        original_composition: &str,
+        candidate: &str,
+        original_candidate: &str,
         iteration: usize,
     ) -> Result<CandidateEvaluation> {
-        // Defensive evaluator boundary: callers inside this crate must not be
-        // able to bypass expansion and score a different material.
-        let parsed = match parse_and_expand_composition(composition, &self.state.goal.elements) {
+        let domain = domain_for(self.state.config.domain);
+        domain.validate_tier(&self.state.config)?;
+
+        // Defensive evaluator boundary: internal callers cannot bypass the
+        // active domain parser and score a different identity.
+        let mut parsed = match domain.parse_candidate(candidate, &self.state.goal) {
             Ok(parsed) => parsed,
             Err(reason) => {
                 return Ok(CandidateEvaluation::Rejected(
                     ConstraintRejection::invalid_proposal(
-                        original_composition.to_string(),
+                        original_candidate.to_string(),
                         iteration,
                         reason,
                     ),
                 ));
             }
         };
+        parsed.original = original_candidate.to_string();
 
-        // Call the PRISM node's registered HEA evaluation tool with the
-        // explicit fractions, never the shorthand that needed interpretation.
         let base = self.state.config.node_base_url.clone().unwrap_or_else(|| {
             let port = std::env::var("PRISM_NODE_PORT").unwrap_or_else(|_| "7327".to_string());
             format!("http://127.0.0.1:{port}")
@@ -2428,29 +2107,29 @@ impl Campaign {
             "failed to locate PRISM state directories; authenticate with `prism login --no-browser` and retry",
         )?;
         let identity = load_local_node_identity(&paths)?;
-        let mut resp_body =
-            call_evaluate_material(&base, &parsed.expanded, Some(&identity)).await?;
-        self.record_composition_and_definition(
-            &mut resp_body,
-            original_composition,
-            &parsed.expanded,
-        )?;
+        let mut resp_body = call_evaluation_tool(
+            &base,
+            domain.evaluator_tool(),
+            domain.evaluator_inputs(&parsed),
+            Some(&identity),
+            domain.dependency_install_hint(),
+        )
+        .await?;
+        domain.decorate_properties(&mut resp_body, &parsed, &self.state.config)?;
 
-        let violations = self.constraint_violations(&resp_body);
+        let violations = domain.constraint_violations(&parsed, &resp_body, &self.state.config);
         if !violations.is_empty() {
-            self.record_event(
-                "campaign.reject",
-                serde_json::json!({
-                    "iteration": iteration,
-                    "original_composition": original_composition,
-                    "expanded_composition": &parsed.expanded,
-                    "properties": &resp_body,
-                    "hard_constraint_violations": &violations,
-                }),
-            )
-            .await;
+            let evidence = candidate_event_data(
+                self.state.config.domain,
+                iteration,
+                &parsed,
+                &resp_body,
+                Some(&violations),
+                None,
+            );
+            self.record_event("campaign.reject", evidence).await;
             return Ok(CandidateEvaluation::Rejected(ConstraintRejection {
-                composition: parsed.expanded,
+                composition: parsed.canonical,
                 properties: resp_body,
                 iteration,
                 reasons: violations,
@@ -2461,22 +2140,19 @@ impl Campaign {
 
         // Only candidates satisfying every hard constraint receive a reward
         // and enter the ranking.
-        let reward = self.compute_reward(&resp_body)?;
-
-        self.record_event(
-            "campaign.evaluate",
-            serde_json::json!({
-                "iteration": iteration,
-                "original_composition": original_composition,
-                "expanded_composition": &parsed.expanded,
-                "properties": &resp_body,
-                "reward": reward,
-            }),
-        )
-        .await;
+        let reward = domain.compute_reward(&self.state.goal, &self.state.config, &resp_body)?;
+        let evidence = candidate_event_data(
+            self.state.config.domain,
+            iteration,
+            &parsed,
+            &resp_body,
+            None,
+            Some(reward),
+        );
+        self.record_event("campaign.evaluate", evidence).await;
 
         Ok(CandidateEvaluation::Accepted(Candidate {
-            composition: parsed.expanded,
+            composition: parsed.canonical,
             properties: resp_body,
             reward,
             iteration,
@@ -2488,157 +2164,42 @@ impl Campaign {
         }))
     }
 
+    #[cfg(test)]
     fn record_composition_and_definition(
         &self,
         properties: &mut serde_json::Value,
         original_composition: &str,
         expanded_composition: &str,
     ) -> Result<()> {
-        let object = properties.as_object_mut().ok_or_else(|| {
-            anyhow::anyhow!("{EVALUATION_TOOL} returned a non-object descriptor payload")
-        })?;
-        object.insert(
-            "original_composition".into(),
-            serde_json::Value::String(original_composition.to_string()),
-        );
-        object.insert(
-            "expanded_composition".into(),
-            serde_json::Value::String(expanded_composition.to_string()),
-        );
-        if let Some(definition) = self.state.config.active_hea_definition() {
-            object.insert("hea_definition".into(), definition);
-        }
-        Ok(())
+        domain_for(DomainKind::Alloy).decorate_properties(
+            properties,
+            &ParsedCandidate {
+                original: original_composition.to_string(),
+                canonical: expanded_composition.to_string(),
+            },
+            &self.state.config,
+        )
     }
 
+    #[cfg(test)]
     fn constraint_violations(&self, properties: &serde_json::Value) -> Vec<String> {
-        let mut violations = Vec::new();
-        let definition = self
-            .state
-            .config
-            .hea_definition
-            .map(HeaDefinition::name)
-            .unwrap_or("unnamed");
-
-        if let Some(minimum) = self.state.config.min_configurational_entropy_j_per_mol_k {
-            let entropy = properties
-                .get("delta_S_mix_J_per_molK")
-                .and_then(serde_json::Value::as_f64)
-                .or_else(|| {
-                    properties
-                        .get("mixing_entropy")
-                        .or_else(|| properties.get("entropy"))
-                        .and_then(serde_json::Value::as_f64)
-                        .map(|in_gas_constant_units| in_gas_constant_units * 8.314)
-                });
-            match entropy {
-                Some(value) if value < minimum => violations.push(format!(
-                    "[{definition}] delta_S_mix_J_per_molK={value:.4} J/(mol K) is below hard minimum {minimum:.4}"
-                )),
-                Some(_) => {}
-                None => violations.push(format!(
-                    "[{definition}] {EVALUATION_TOOL} returned no configurational-entropy descriptor required by hard minimum {minimum:.4} J/(mol K)"
-                )),
-            }
-        }
-
-        if let Some(minimum) = self.state.config.min_principal_elements {
-            let fractions = properties
-                .get("fractions")
-                .and_then(serde_json::Value::as_array);
-            match fractions {
-                Some(fractions) if fractions.iter().all(serde_json::Value::is_number) => {
-                    let count = fractions
-                        .iter()
-                        .filter_map(serde_json::Value::as_f64)
-                        .filter(|fraction| *fraction >= PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION)
-                        .count();
-                    if count < minimum {
-                        violations.push(format!(
-                            "[{definition}] principal-element count {count} is below hard minimum {minimum} ({:.0} at.% cutoff)",
-                            PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION * 100.0
-                        ));
-                    }
-                }
-                _ => violations.push(format!(
-                    "[{definition}] {EVALUATION_TOOL} returned no numeric composition fractions required to verify hard minimum {minimum} principal elements"
-                )),
-            }
-        }
-
-        violations
+        domain_for(self.state.config.domain).constraint_violations(
+            &ParsedCandidate {
+                original: String::new(),
+                canonical: String::new(),
+            },
+            properties,
+            &self.state.config,
+        )
     }
 
-    /// Compute a scalarized reward from physics descriptors.
-    ///
-    /// Uses `config.reward_weights` to combine multiple properties into
-    /// a single score. If no weights are configured, uses a default
-    /// heuristic: higher mixing entropy and lower density = better.
-    fn compute_reward(&self, props: &serde_json::Value) -> Result<f64> {
-        if self.state.config.reward_weights.is_empty() {
-            let objective = self.state.goal.objective.to_ascii_lowercase();
-            if objective.contains("melting point") {
-                let melting_point = props
-                    .get("Tm_estimate_K")
-                    .or_else(|| props.get("melting_point_k"))
-                    .or_else(|| props.get("melting_point"))
-                    .and_then(serde_json::Value::as_f64)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "{EVALUATION_TOOL} returned no numeric melting-point descriptor for objective '{}'",
-                            self.state.goal.objective
-                        )
-                    })?;
-                return Ok(if objective.contains("minimize") {
-                    -melting_point
-                } else {
-                    melting_point
-                });
-            }
-
-            // Default heuristic: reward high entropy and, when available,
-            // lower density. Missing descriptors are not replaced with
-            // invented defaults.
-            let entropy = props
-                .get("mixing_entropy")
-                .or_else(|| props.get("entropy"))
-                .and_then(serde_json::Value::as_f64)
-                .or_else(|| {
-                    props
-                        .get("delta_S_mix_J_per_molK")
-                        .and_then(serde_json::Value::as_f64)
-                        .map(|value| value / 8.314)
-                });
-            let density = props.get("density").and_then(serde_json::Value::as_f64);
-            return match (entropy, density) {
-                (Some(entropy), Some(density)) => {
-                    let entropy_score = entropy / 2.0;
-                    let density_score = 1.0 - (density / 20.0).clamp(0.0, 1.0);
-                    Ok(entropy_score * 0.6 + density_score * 0.4)
-                }
-                (Some(entropy), None) => Ok(entropy / 2.0),
-                (None, Some(density)) => Ok(1.0 - (density / 20.0).clamp(0.0, 1.0)),
-                (None, None) => bail!(
-                    "{EVALUATION_TOOL} returned no numeric descriptors supported by the campaign reward function"
-                ),
-            };
-        }
-
-        // Weighted sum of named properties. Every configured property must be
-        // present; silently substituting zero would fabricate a ranking.
-        let mut reward = 0.0;
-        for (prop, weight) in &self.state.config.reward_weights {
-            let value = props
-                .get(prop)
-                .and_then(serde_json::Value::as_f64)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{EVALUATION_TOOL} returned no numeric value for weighted property '{prop}'"
-                    )
-                })?;
-            reward += value * weight;
-        }
-        Ok(reward)
+    #[cfg(test)]
+    fn compute_reward(&self, properties: &serde_json::Value) -> Result<f64> {
+        domain_for(self.state.config.domain).compute_reward(
+            &self.state.goal,
+            &self.state.config,
+            properties,
+        )
     }
 
     /// Save campaign state to a checkpoint file.
@@ -2709,6 +2270,77 @@ impl Campaign {
     }
 }
 
+fn invalid_proposal_event_data(
+    kind: DomainKind,
+    iteration: usize,
+    original: &str,
+    reason: &str,
+) -> serde_json::Value {
+    if kind == DomainKind::Alloy {
+        serde_json::json!({
+            "iteration": iteration,
+            "original_composition": original,
+            "expanded_composition": null,
+            "evaluation_skipped": true,
+            "hard_constraint_violations": [reason],
+        })
+    } else {
+        serde_json::json!({
+            "iteration": iteration,
+            "original_candidate": original,
+            "canonical_candidate": null,
+            "evaluation_skipped": true,
+            "hard_constraint_violations": [reason],
+        })
+    }
+}
+
+fn candidate_event_data(
+    kind: DomainKind,
+    iteration: usize,
+    parsed: &ParsedCandidate,
+    properties: &serde_json::Value,
+    violations: Option<&[String]>,
+    reward: Option<f64>,
+) -> serde_json::Value {
+    let mut event = serde_json::json!({
+        "iteration": iteration,
+        "properties": properties,
+    });
+    let object = event
+        .as_object_mut()
+        .expect("candidate event is constructed as an object");
+    if kind == DomainKind::Alloy {
+        object.insert(
+            "original_composition".into(),
+            serde_json::Value::String(parsed.original.clone()),
+        );
+        object.insert(
+            "expanded_composition".into(),
+            serde_json::Value::String(parsed.canonical.clone()),
+        );
+    } else {
+        object.insert(
+            "original_candidate".into(),
+            serde_json::Value::String(parsed.original.clone()),
+        );
+        object.insert(
+            "canonical_candidate".into(),
+            serde_json::Value::String(parsed.canonical.clone()),
+        );
+    }
+    if let Some(violations) = violations {
+        object.insert(
+            "hard_constraint_violations".into(),
+            serde_json::json!(violations),
+        );
+    }
+    if let Some(reward) = reward {
+        object.insert("reward".into(), serde_json::json!(reward));
+    }
+    event
+}
+
 fn load_local_node_identity(paths: &prism_runtime::PrismPaths) -> Result<LocalNodeIdentity> {
     let state = paths.load_cli_state().with_context(|| {
         "failed to read PRISM credentials; authenticate with `prism login --no-browser` and retry"
@@ -2730,10 +2362,28 @@ fn load_local_node_identity(paths: &prism_runtime::PrismPaths) -> Result<LocalNo
     })
 }
 
+#[cfg(test)]
 async fn call_evaluate_material(
     base: &str,
     composition: &str,
     identity: Option<&LocalNodeIdentity>,
+) -> Result<serde_json::Value> {
+    call_evaluation_tool(
+        base,
+        EVALUATION_TOOL,
+        serde_json::json!({ "composition": composition }),
+        identity,
+        None,
+    )
+    .await
+}
+
+async fn call_evaluation_tool(
+    base: &str,
+    tool: &str,
+    inputs: serde_json::Value,
+    identity: Option<&LocalNodeIdentity>,
+    install_hint: Option<&str>,
 ) -> Result<serde_json::Value> {
     let identity = identity.ok_or_else(|| {
         anyhow::anyhow!(
@@ -2752,14 +2402,8 @@ async fn call_evaluate_material(
         )
     })?;
 
-    let url = format!(
-        "{}/api/tools/{EVALUATION_TOOL}/run",
-        base.trim_end_matches('/')
-    );
-    let body = serde_json::json!({
-        "inputs": { "composition": composition },
-    });
-
+    let url = format!("{}/api/tools/{tool}/run", base.trim_end_matches('/'));
+    let body = serde_json::json!({ "inputs": inputs });
     let resp = reqwest::Client::new()
         .post(&url)
         .header("Authorization", format!("Bearer {node_token}"))
@@ -2774,9 +2418,12 @@ async fn call_evaluate_material(
     let response_text = resp
         .text()
         .await
-        .with_context(|| format!("failed to read {EVALUATION_TOOL} response"))?;
+        .with_context(|| format!("failed to read {tool} response"))?;
+    let unavailable_hint = install_hint
+        .map(|hint| format!(" Domain unavailable. {hint}"))
+        .unwrap_or_default();
     let resp_body: serde_json::Value = serde_json::from_str(&response_text).with_context(|| {
-        format!("{EVALUATION_TOOL} returned a non-JSON response (HTTP {status})")
+        format!("{tool} returned a non-JSON response (HTTP {status}){unavailable_hint}")
     })?;
 
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -2785,29 +2432,32 @@ async fn call_evaluate_material(
         );
     }
     if !status.is_success() {
-        bail!("{EVALUATION_TOOL} returned HTTP {status}: {resp_body}");
+        bail!("{tool} returned HTTP {status}: {resp_body}{unavailable_hint}");
     }
 
-    extract_evaluation_result(resp_body)
+    extract_evaluation_result(resp_body, tool)
 }
 
-fn extract_evaluation_result(mut value: serde_json::Value) -> Result<serde_json::Value> {
+fn extract_evaluation_result(
+    mut value: serde_json::Value,
+    tool: &str,
+) -> Result<serde_json::Value> {
     loop {
         if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
-            bail!("{EVALUATION_TOOL} failed: {error}");
+            bail!("{tool} failed: {error}");
         }
         if value.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
-            bail!("{EVALUATION_TOOL} reported an unsuccessful evaluation: {value}");
+            bail!("{tool} reported an unsuccessful evaluation: {value}");
         }
 
         let Some(object) = value.as_object() else {
-            bail!("{EVALUATION_TOOL} returned an invalid descriptor payload: {value}");
+            bail!("{tool} returned an invalid descriptor payload: {value}");
         };
         let is_node_envelope = object.contains_key("tool") && object.contains_key("result");
         let is_python_envelope = object.len() == 1 && object.contains_key("result");
         if is_node_envelope || is_python_envelope {
             let Some(result) = object.get("result").cloned() else {
-                bail!("{EVALUATION_TOOL} returned an invalid result envelope: {value}");
+                bail!("{tool} returned an invalid result envelope: {value}");
             };
             value = result;
             continue;
