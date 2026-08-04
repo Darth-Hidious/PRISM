@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -139,7 +141,8 @@ pub fn find_active_deployment(
 }
 
 pub fn write_shutdown_request(state_dir: &Path) -> Result<()> {
-    fs::create_dir_all(state_dir)?;
+    let control_dir = control_dir(state_dir);
+    fs::create_dir_all(&control_dir)?;
     fs::write(shutdown_file_path(state_dir), b"shutdown\n")
         .context("failed to write node shutdown request")
 }
@@ -152,8 +155,23 @@ pub fn clear_shutdown_request(state_dir: &Path) {
     let _ = fs::remove_file(shutdown_file_path(state_dir));
 }
 
+/// Local-machine control files do not belong on a parallel filesystem.
+///
+/// The node's durable job/deployment records remain under `state_dir`, but
+/// the PID and shutdown marker are coordination files. Keep them in local
+/// temp storage so Lustre/GPFS locking and metadata propagation cannot leave a
+/// stale marker or make `node down` observe another machine's control file.
+pub fn control_dir(state_dir: &Path) -> PathBuf {
+    let digest = Sha256::digest(state_dir.to_string_lossy().as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::env::temp_dir().join(format!("prism-node-{suffix}"))
+}
+
 fn shutdown_file_path(state_dir: &Path) -> PathBuf {
-    state_dir.join(SHUTDOWN_FILE)
+    control_dir(state_dir).join(SHUTDOWN_FILE)
 }
 
 fn active_jobs_path(state_dir: &Path) -> PathBuf {
@@ -264,6 +282,11 @@ mod tests {
         assert!(!shutdown_requested(tmp.path()));
         write_shutdown_request(tmp.path()).unwrap();
         assert!(shutdown_requested(tmp.path()));
+        assert_ne!(
+            control_dir(tmp.path()),
+            tmp.path(),
+            "control markers must not live beside shared state"
+        );
         clear_shutdown_request(tmp.path());
         assert!(!shutdown_requested(tmp.path()));
     }

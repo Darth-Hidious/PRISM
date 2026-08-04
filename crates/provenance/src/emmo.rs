@@ -1126,7 +1126,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// Tempfile-backed Turso DB, removed (with WAL sidecars) on drop.
+    /// Tempfile-backed Turso DB, removed (with SQLite journal sidecars) on drop.
     struct TempDb {
         path: PathBuf,
     }

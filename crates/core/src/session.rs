@@ -30,7 +30,9 @@ impl SessionManager {
     /// Pass `":memory:"` for an in-memory database.
     pub fn new<P: AsRef<Path>>(db_path: P, default_timeout: Duration) -> Result<Self> {
         let conn = Connection::open(db_path).context("failed to open session database")?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        // DELETE journaling leaves no WAL sidecar and works on Lustre/GPFS
+        // where SQLite WAL coordination is not reliable across clients.
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id           TEXT PRIMARY KEY,
@@ -445,6 +447,18 @@ mod tests {
         let found = mgr.validate_session(&session_id).unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().user_id, "persist-user");
+    }
+
+    #[test]
+    fn file_backed_session_uses_delete_journaling() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path(), Duration::hours(1)).unwrap();
+        let mode: String = mgr
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+        assert!(!std::path::PathBuf::from(format!("{}-wal", tmp.path().display())).exists());
     }
 
     #[test]

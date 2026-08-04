@@ -1,17 +1,17 @@
 """Artifact store — SQLite + FTS5 hybrid retrieval for tool outputs.
 
 Single DB at the configured path (default: ~/.prism/artifacts.db).
-WAL mode + production PRAGMAs (busy_timeout, mmap, cache, temp_store).
+DELETE journaling + production PRAGMAs (busy_timeout, mmap, cache, temp_store).
 Hybrid recall: BM25 (FTS5) + cosine (per-row vectors) + RRF fusion.
 
 ATOMICITY: Every record() / update_embedding() is one BEGIN IMMEDIATE
 transaction. On any error mid-record the artifact is rolled back.
 
 THREADING: Each public method opens its own connection. The store is
-thread-safe under WAL mode + busy_timeout=5000.
+thread-safe under DELETE journaling + busy_timeout=5000.
 
 PROCESS: Multi-process safe — multiple PRISM agent subprocesses can
-share the same DB file under WAL.
+share the same DB file without a WAL sidecar.
 
 See docs/stateful_tools_2026.md for the architecture and Revisions
 section for the rationale behind the single-DB + FTS5 hybrid choices.
@@ -283,7 +283,8 @@ def default_db_path() -> Path:
 class ArtifactStore:
     """SQLite + FTS5 hybrid artifact store.
 
-    Single DB file. WAL mode. Production-tuned PRAGMAs. Hybrid recall
+    Single DB file. DELETE journaling is deliberate: it leaves no WAL
+    sidecar and works on Lustre/GPFS parallel filesystems. Hybrid recall
     via BM25 (FTS5) + cosine (per-row vectors) + RRF fusion.
     """
 
@@ -291,7 +292,9 @@ class ArtifactStore:
         self.db_path = Path(db_path) if db_path else default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # serialize writes within this process so we don't trip
-        # SQLITE_BUSY at high tool-call rates; readers go straight through
+        # SQLITE_BUSY at high tool-call rates; readers go straight through.
+        # Cross-process readers remain safe without a WAL sidecar on shared
+        # parallel filesystems.
         self._write_lock = threading.Lock()
         self._init_schema()
 
@@ -299,7 +302,7 @@ class ArtifactStore:
         # isolation_level=None lets us drive transactions explicitly with BEGIN/COMMIT
         conn = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
         # Production PRAGMAs — these MUST be set on every connection
-        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA journal_mode = DELETE")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute("PRAGMA mmap_size = 8388608")

@@ -2014,7 +2014,7 @@ fn hostname() -> String {
 }
 
 fn pid_file_path(paths: &PrismPaths) -> PathBuf {
-    paths.state_dir.join("node.pid")
+    state::control_dir(&paths.state_dir).join("node.pid")
 }
 
 fn write_pid_file(path: &PathBuf) -> Result<()> {

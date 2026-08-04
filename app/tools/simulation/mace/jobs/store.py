@@ -2,8 +2,8 @@
 
 One row per job. Status transitions are validated in code (not via SQL
 constraints). All writes are serialised through a single connection with
-WAL mode and a check_same_thread=False so the async runner can write
-concurrently with reader tools.
+DELETE journaling and a check_same_thread=False so the async runner can write
+concurrently with reader tools without WAL sidecars on shared filesystems.
 """
 
 from __future__ import annotations
@@ -71,7 +71,8 @@ class JobStore:
         )
         self._conn.row_factory = sqlite3.Row
         with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
+            # Avoid WAL/-shm sidecars: job state may live on Lustre/GPFS.
+            self._conn.execute("PRAGMA journal_mode=DELETE")
             self._conn.executescript(_SCHEMA)
 
     # ------------------------------------------------------------------

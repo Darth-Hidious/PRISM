@@ -167,8 +167,9 @@ impl AuditLog {
         let conn = Connection::open(db_path).context("opening audit database")?;
         conn.execute_batch(CREATE_TABLE)
             .context("creating audit_log table")?;
-        // WAL mode for better concurrent-read performance.
-        conn.pragma_update(None, "journal_mode", "WAL").ok();
+        // DELETE journaling avoids WAL sidecars and cross-client WAL locks
+        // on Lustre/GPFS and other parallel filesystems.
+        conn.pragma_update(None, "journal_mode", "DELETE").ok();
         Ok(Self { conn })
     }
 

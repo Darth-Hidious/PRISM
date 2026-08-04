@@ -170,6 +170,11 @@ impl ProvenanceStore {
             .await
             .context("failed to open Turso database")?;
         let conn = db.connect()?;
+        // Keep local provenance portable on Lustre/GPFS: WAL requires
+        // cross-client shared-memory coordination and creates -wal/-shm
+        // sidecars that are not reliable on parallel filesystems.
+        let mut journal_mode = conn.query("PRAGMA journal_mode=DELETE", ()).await?;
+        while journal_mode.next().await?.is_some() {}
 
         Self::init_schema(&conn).await?;
         Ok(Self { conn })

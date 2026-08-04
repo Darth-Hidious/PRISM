@@ -406,7 +406,7 @@ fn internal_error(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
 mod tests {
     use super::*;
 
-    /// Tempfile-backed Turso DB, removed (with WAL sidecars) on drop.
+    /// Tempfile-backed Turso DB, removed (with SQLite journal sidecars) on drop.
     struct TempProvenanceDb {
         path: PathBuf,
     }
