@@ -117,12 +117,12 @@ jobs:
             -w /work \
             rockylinux/rockylinux:8.10 \
             bash -euxo pipefail -c '
-              dnf -y module enable python39
+              dnf -y module enable python311
               dnf -y install \
                 ca-certificates gcc gcc-c++ git libcurl-devel make openssl-devel \
                 perl-core pkgconf-pkg-config protobuf-compiler \
-                python39 python39-pip tar which
-              python3.9 -m pip install --no-cache-dir \
+                python3.11 python3.11-pip tar which
+              python3.11 -m pip install --no-cache-dir \
                 "cmake==3.31.6" "ninja==1.11.1.4" "packaging==24.2"
               export PATH="/root/.cargo/bin:/usr/local/bin:$PATH"
 
@@ -147,7 +147,7 @@ jobs:
                 git clone --branch v1.24.2 --depth 1 --recursive \
                   --shallow-submodules \
                   https://github.com/microsoft/onnxruntime.git "$ort_src"
-                python3.9 "$ort_src/tools/ci_build/build.py" \
+                python3.11 "$ort_src/tools/ci_build/build.py" \
                   --build_dir "$ort_src/build/Linux" \
                   --config Release \
                   --update --build --parallel --skip_tests \
