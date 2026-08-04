@@ -517,7 +517,7 @@ mod tests {
         for (what, text) in [
             ("providers.toml", include_str!("../providers.toml")),
             ("providers.rs", include_str!("providers.rs")),
-            ("onboarding.rs", include_str!("onboarding.rs")),
+            ("onboarding.rs", include_str!("../../cli/src/onboarding.rs")),
         ] {
             let prose = user_visible_prose(text);
             for banned in BANNED {

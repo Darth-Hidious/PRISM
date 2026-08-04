@@ -19,4 +19,5 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+prism-ingest = { path = "../ingest" }
 tempfile = "3"

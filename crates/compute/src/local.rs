@@ -525,9 +525,9 @@ mod tests {
         // A job id that was never submitted has no result.json. results()
         // must surface a real error naming the job — and must NOT return
         // Ok (which would be indistinguishable from a successful empty run).
-        // The docker logs/inspect calls fail on a nonexistent container and
-        // are handled gracefully, so this test does not require real docker.
-        let backend = LocalBackend::with_runtime("docker");
+        // Use a deterministic command that exits unsuccessfully instead of
+        // contacting a real container daemon, which may be unavailable or hang.
+        let backend = LocalBackend::with_runtime("false");
         let unknown = Uuid::new_v4();
 
         let result = backend.results(unknown).await;

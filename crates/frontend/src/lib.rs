@@ -20,9 +20,17 @@ pub struct NativeSession {
 impl NativeSession {
     /// Decompose into the raw channel ends. The session thread keeps
     /// running until the returned sender is dropped.
-    pub fn into_parts(mut self) -> (std::sync::mpsc::Sender<String>, std::sync::mpsc::Receiver<serde_json::Value>) {
+    pub fn into_parts(
+        mut self,
+    ) -> (
+        std::sync::mpsc::Sender<String>,
+        std::sync::mpsc::Receiver<serde_json::Value>,
+    ) {
         self.thread = None;
-        (self.tx.take().expect("session already decomposed"), self.rx.take().expect("session already decomposed"))
+        (
+            self.tx.take().expect("session already decomposed"),
+            self.rx.take().expect("session already decomposed"),
+        )
     }
 }
 
@@ -43,7 +51,10 @@ impl NativeSession {
     }
 
     pub fn init(&self) -> Result<()> {
-        self.request("init", serde_json::json!({"auto_approve": false, "resume": ""}))
+        self.request(
+            "init",
+            serde_json::json!({"auto_approve": false, "resume": ""}),
+        )
     }
 
     pub fn send_message(&self, text: &str) -> Result<()> {
@@ -72,7 +83,6 @@ impl Drop for NativeSession {
         self.shutdown();
     }
 }
-
 
 /// Proactive credential refresh, mirroring the CLI startup policy:
 /// signed-in with a refresh_token and within 5 minutes of expiry (or
@@ -105,7 +115,10 @@ pub fn ensure_fresh_credentials() {
     }
     let endpoints = prism_runtime::PlatformEndpoints::from_env();
     let creds_clone = creds.clone();
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(_) => return,
     };

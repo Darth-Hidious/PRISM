@@ -11,12 +11,19 @@ fn main() {
     let (tx, rx) = session.into_parts();
 
     let req = |method: &str, params: serde_json::Value| {
-        tx.send(serde_json::to_string(&serde_json::json!({
-            "jsonrpc": "2.0", "method": method, "params": params
-        })).unwrap()).unwrap();
+        tx.send(
+            serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0", "method": method, "params": params
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     };
 
-    req("init", serde_json::json!({"auto_approve": false, "resume": ""}));
+    req(
+        "init",
+        serde_json::json!({"auto_approve": false, "resume": ""}),
+    );
 
     let start = Instant::now();
     let mut turn_sent = false;
@@ -27,28 +34,50 @@ fn main() {
                 let m = v.get("method").and_then(|m| m.as_str()).unwrap_or("(resp)");
                 match m {
                     "ui.welcome" => println!("[welcome] {}", v["params"]),
-                    "ui.status" => println!("[status] model={} mode={}", v["params"]["model"], v["params"]["mode"]),
+                    "ui.status" => println!(
+                        "[status] model={} mode={}",
+                        v["params"]["model"], v["params"]["mode"]
+                    ),
                     "ui.text.delta" => {
                         print!("{}", v["params"]["text"].as_str().unwrap_or(""));
                         std::io::Write::flush(&mut std::io::stdout()).unwrap();
                     }
                     "ui.thinking.delta" => print!("·"),
-                    "ui.tool.start" => println!("\n[tool] {} {}", v["params"]["tool_name"], v["params"]["verb"]),
+                    "ui.tool.start" => println!(
+                        "\n[tool] {} {}",
+                        v["params"]["tool_name"], v["params"]["verb"]
+                    ),
                     "ui.card" => println!("\n[card] {} :: {}", v["params"]["tool_name"], {
                         let c = v["params"]["content"].as_str().unwrap_or("");
-                        &c[..c.char_indices().take(120).last().map(|(i,_)|i).unwrap_or(0)]
+                        &c[..c
+                            .char_indices()
+                            .take(120)
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0)]
                     }),
-                    "ui.turn.complete" => { println!("\n[turn.complete]"); turn_done = true; }
+                    "ui.turn.complete" => {
+                        println!("\n[turn.complete]");
+                        turn_done = true;
+                    }
                     "ui.backend.error" => println!("\n[error] {}", v["params"]),
                     "ui.backend.warning" => println!("\n[warn] {}", v["params"]),
                     "(resp)" => println!("[resp] id={}", v["id"]),
                     other => println!("[{}] ", other),
                 }
-                if !turn_sent && m == "ui.welcome" && std::env::var("PRISM_OFFLINE").as_deref() != Ok("1") {
-                    req("input.message", serde_json::json!({"text": "Reply with exactly the single word: prism-ok"}));
+                if !turn_sent
+                    && m == "ui.welcome"
+                    && std::env::var("PRISM_OFFLINE").as_deref() != Ok("1")
+                {
+                    req(
+                        "input.message",
+                        serde_json::json!({"text": "Reply with exactly the single word: prism-ok"}),
+                    );
                     turn_sent = true;
                 }
-                if turn_done { break; }
+                if turn_done {
+                    break;
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(_) => break,

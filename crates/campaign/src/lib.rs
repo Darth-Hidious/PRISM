@@ -1233,7 +1233,6 @@ impl Campaign {
         comps
     }
 
-
     /// Evaluate a single candidate composition.
     ///
     /// In the current implementation, this calls the `evaluate_material` tool
@@ -1489,7 +1488,6 @@ mod tests {
         let campaign = Campaign::new(test_goal(), CampaignConfig::default(), "c1".into());
         assert!(campaign.parse_compositions("").is_empty());
     }
-
 
     #[test]
     fn compute_reward_default_heuristic() {

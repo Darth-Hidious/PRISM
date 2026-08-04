@@ -4716,6 +4716,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
+ "prism-ingest",
  "rusqlite",
  "serde",
  "serde_json",

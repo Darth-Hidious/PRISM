@@ -202,10 +202,10 @@ impl Registry {
         &self.providers
     }
 
-    /// A registry of exactly these providers. Tests-only: it lets the
+    /// A registry of exactly these providers. Test support: it lets the
     /// local-server sweep run against stub endpoints instead of whatever
     /// happens to be listening on the developer's machine.
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn from_providers(providers: Vec<Provider>) -> Self {
         Self { providers }
     }
