@@ -121,7 +121,8 @@ jobs:
                 ca-certificates gcc-toolset-11-gcc gcc-toolset-11-gcc-c++ \
                 gcc-toolset-11-libstdc++-devel git libcurl-devel make \
                 openssl-devel perl-core pkgconf-pkg-config protobuf-compiler \
-                python3.11 python3.11-pip tar which
+                python3.11 python3.11-pip tar which \
+                patch diffutils file unzip zlib-devel
               source /opt/rh/gcc-toolset-11/enable
               python3.11 -m pip install --no-cache-dir \
                 "cmake==3.31.6" "ninja==1.11.1.4" "packaging==24.2"
