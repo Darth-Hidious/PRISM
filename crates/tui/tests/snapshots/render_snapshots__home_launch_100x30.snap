@@ -1,11 +1,8 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 106
 expression: rendered
 ---
  ‹ back  New session    0 tools    Ctrl-P · ?                      │ Workspace
-                                                                   │ [Activity] Tools Files
-                                                                   │
           ┌ PRISM · materials research workspace ────────────────────────────────────────┐
           │                                                                              │
           │  WORKFLOWS                                                                   │
@@ -27,9 +24,11 @@ expression: rendered
           │                                                                              │
           │                                                                              │
           │                                                                              │
-┌ Prompt ─│                                                                              │
-│ Type a m│                                                                              │
-│         └──────────────────────────────────────────────────────────────────────────────┘
+          │                                                                              │
+          └──────────────────────────────────────────────────────────────────────────────┘
+┌ Prompt ─────────────────────────────────────────────────────────┐│
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)              ││
+│                                                                 ││
 │                                                                 ││
 └─────────────────────────────────────────────────────────────────┘│
   Ready  model: —   [INPUT]    Ctrl-C quit                         │

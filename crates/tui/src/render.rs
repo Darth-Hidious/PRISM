@@ -92,7 +92,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else if app.apikey_window.open {
         draw_apikey_window(f, app);
     } else if app.home.open {
-        draw_home(f, app);
+        let home_bounds = Rect::new(area.x, chunks[1].y, area.width, chunks[1].height);
+        draw_home(f, app, home_bounds);
     } else if let Some(modal) = app.modal {
         draw_modal(f, modal, app);
     }
@@ -1685,10 +1686,21 @@ fn draw_status_window(f: &mut Frame, app: &App) {
 /// Mission Control home — the launch screen. A glanceable, honest dashboard
 /// built from live App state only (see docs/design/PLATFORM_ARCHITECTURE.md §3):
 /// where a field isn't reported yet, it says so rather than inventing a number.
-fn draw_home(f: &mut Frame, app: &App) {
+fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
     let t = app.theme();
-    let area = centered_rect(80, 80, f.area());
-    f.render_widget(Clear, area);
+    let panel_height = bounds.height.min(28);
+    let panel_bounds = Rect::new(
+        bounds.x,
+        bounds.y + bounds.height.saturating_sub(panel_height) / 2,
+        bounds.width,
+        panel_height,
+    );
+    let area = centered_rect(80, 100, panel_bounds);
+    f.render_widget(Clear, bounds);
+    f.render_widget(
+        Block::default().style(Style::default().bg(t.overlay_bg)),
+        bounds,
+    );
 
     let section = |label: &str| -> Line<'static> {
         Line::from(Span::styled(

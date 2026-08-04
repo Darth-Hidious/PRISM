@@ -106,6 +106,88 @@ fn snapshot_home_launch_100x30() {
     insta::assert_snapshot!("home_launch_100x30", rendered);
 }
 
+#[test]
+fn first_screen_has_no_debug_text_stale_state_or_panel_overlap() {
+    let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+    app.handle_backend_message(&serde_json::json!({
+        "method": "ui.welcome",
+        "params": {"version": "1.0.0", "tool_count": 164}
+    }));
+    let tools = (0..164)
+        .map(|index| {
+            serde_json::json!({
+                "name": format!("tool-{index}"),
+                "approval": index < 55
+            })
+        })
+        .collect::<Vec<_>>();
+    app.handle_backend_message(&serde_json::json!({
+        "method": "ui.tools.catalog",
+        "params": {"tools": tools}
+    }));
+    app.handle_backend_message(&serde_json::json!({
+        "method": "ui.status",
+        "params": {
+            "model": "qwen2.5:3b",
+            "session_mode": "chat",
+            "message_count": 0
+        }
+    }));
+
+    let rendered = render_app_to_string(&app, 150, 42);
+    assert!(
+        rendered.lines().all(|line| !line.contains("tui-dbg")),
+        "debug output leaked into rendered lines:\n{rendered}"
+    );
+    assert!(!rendered.contains("loading tool catalog…"), "{rendered}");
+    assert!(
+        rendered.contains("164 tools · 55 need approval · 109 auto"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("model: —"), "{rendered}");
+    assert_eq!(
+        rendered.matches("qwen2.5:3b").count(),
+        3,
+        "header, home, and footer must show the same model:\n{rendered}"
+    );
+    assert!(rendered.contains("session cost  $0.0000"), "{rendered}");
+    assert!(
+        rendered.contains("credits  not reported (unauthed / not fetched)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Ctrl-C quit"), "{rendered}");
+    assert!(!rendered.contains("C rl-C quit"), "{rendered}");
+
+    for (width, height) in [(150, 42), (100, 30), (200, 60), (40, 12)] {
+        let rendered = render_app_to_string(&app, width, height);
+        let lines = rendered.lines().collect::<Vec<_>>();
+        let sidebar_width = (width / 3).clamp(24, 42);
+        let prompt_right = usize::from(width - sidebar_width - 1);
+        let prompt_top = usize::from(height - 6);
+        let prompt_bottom = usize::from(height - 2);
+        assert_eq!(
+            lines[prompt_top].chars().nth(prompt_right),
+            Some('┐'),
+            "home panel overwrote the Prompt top-right corner at {width}x{height}:\n{rendered}"
+        );
+        assert_eq!(
+            lines[prompt_bottom].chars().nth(prompt_right),
+            Some('┘'),
+            "home panel overwrote the Prompt bottom-right corner at {width}x{height}:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn backend_message_ingress_has_no_direct_terminal_debug_writes() {
+    let source = include_str!("../src/app.rs");
+    assert!(
+        !source.contains("eprintln!"),
+        "App must not write behind Ratatui"
+    );
+    assert!(!source.contains("tui-dbg"), "debug marker must not ship");
+}
+
 /// Snapshot: basic chat after response at 100x30.
 /// Apply welcome + status + user message + streamed response.
 #[test]

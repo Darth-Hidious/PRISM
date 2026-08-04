@@ -3201,11 +3201,6 @@ impl App {
 
     /// Handle an agent backend JSON-RPC message.
     pub fn handle_backend_message(&mut self, msg: &Value) {
-        eprintln!(
-            "[tui-dbg] value kind={} method={:?}",
-            if msg.is_string() { "STRING" } else { "OBJ" },
-            msg.get("method").and_then(|m| m.as_str()).unwrap_or("-")
-        );
         let agent_msg = parse_notification(msg);
         self.apply_agent_msg(agent_msg);
     }
