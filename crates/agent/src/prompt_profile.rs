@@ -102,6 +102,16 @@ pub const CORE_TOOL_SET: &[&str] = &[
     // Federated materials search. A weak model on a materials platform that
     // cannot reach the materials databases has nothing to answer from.
     "materials_search",
+    // ...but search alone means a local model can look things up and never
+    // COMPUTE anything, which is backwards for this product. Observed live:
+    // asked for HEA descriptors, a core-set model called `materials_search`
+    // (the only materials tool it could see), got an unrelated compound back,
+    // and described the JSON. It did not choose badly -- it chose the only
+    // thing on offer. These three are deterministic, run offline, and carry
+    // their own evidence class, so they are safe to expose to a weak model.
+    "hea_descriptors",
+    "polymer_insulation_properties",
+    "evaluate_candidate",
     // environment / discovery
     "status",
     "list_tools",
@@ -388,6 +398,23 @@ mod tests {
     fn core_tool_set_includes_find_tools() {
         assert!(CORE_TOOL_SET.contains(&"find_tools"));
         assert!(CORE_TOOL_SET.contains(&"read_file"));
+    }
+
+    /// A weak/local model must be able to COMPUTE a material property, not
+    /// only search for one. Regression for a live failure where the core set
+    /// exposed `materials_search` as its sole materials tool.
+    #[test]
+    fn core_tool_set_can_compute_not_only_search() {
+        for tool in [
+            "hea_descriptors",
+            "polymer_insulation_properties",
+            "evaluate_candidate",
+        ] {
+            assert!(
+                CORE_TOOL_SET.contains(&tool),
+                "{tool} must be reachable by a core-set model"
+            );
+        }
     }
 
     #[test]
