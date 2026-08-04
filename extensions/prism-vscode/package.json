@@ -1,6 +1,6 @@
 {
   "name": "prism-vscode",
-  "displayName": "PRISM",
+  "displayName": "Mirdyne PRISM",
   "description": "VS Code client for PRISM materials-science workflows.",
   "version": "1.0.0",
   "publisher": "mirdyne",
@@ -28,9 +28,12 @@
   "activationEvents": [
     "onView:prism.agent",
     "onView:prism.context",
+    "onView:prism.tools",
+    "onView:prism.materials",
     "onCommand:prism.openAgent",
     "onCommand:prism.startBackend",
-    "onCommand:prism.refreshMarc27"
+    "onCommand:prism.refreshMarc27",
+    "onCommand:prism.showWelcome"
   ],
   "main": "./out/extension.js",
   "scripts": {
@@ -71,6 +74,16 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically start the local backend before sending agent messages."
+        },
+        "prism.autoApprove": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically approve all tool calls without prompting. Sent to the backend at init; takes effect on the next backend start."
+        },
+        "prism.welcome.showOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the PRISM welcome tab when the window opens."
         },
         "prism.marc27ApiBaseUrl": {
           "type": "string",
@@ -134,6 +147,94 @@
       {
         "command": "prism.clearMarc27ApiKey",
         "title": "PRISM: Clear Platform API Key"
+      },
+      {
+        "command": "prism.newChat",
+        "title": "PRISM: New Chat",
+        "icon": "$(add)"
+      },
+      {
+        "command": "prism.openChatTab",
+        "title": "PRISM: Open Agent Chat Tab",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "prism.toggleAutoApprove",
+        "title": "PRISM: Toggle Auto-Approve"
+      },
+      {
+        "command": "prism.askAboutFile",
+        "title": "PRISM: Ask Agent About This File"
+      },
+      {
+        "command": "prism.setModel",
+        "title": "PRISM: Set Agent Model"
+      },
+      {
+        "command": "prism.marketplaceSearch",
+        "title": "PRISM: Search Marketplace",
+        "icon": "$(search)"
+      },
+      {
+        "command": "prism.marketplaceInstall",
+        "title": "PRISM: Install from Marketplace",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "prism.marketplaceFind",
+        "title": "PRISM: Discover Marketplace by Capability"
+      },
+      {
+        "command": "prism.refreshTools",
+        "title": "PRISM: Refresh Agent Tools",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "prism.meshHealth",
+        "title": "PRISM Mesh: Health"
+      },
+      {
+        "command": "prism.meshPeers",
+        "title": "PRISM Mesh: List Peers"
+      },
+      {
+        "command": "prism.meshDiscover",
+        "title": "PRISM Mesh: Discover Peers"
+      },
+      {
+        "command": "prism.listNodes",
+        "title": "PRISM: List Platform Nodes"
+      },
+      {
+        "command": "prism.accountStatus",
+        "title": "PRISM: Account Status"
+      },
+      {
+        "command": "prism.signIn",
+        "title": "PRISM: Sign In"
+      },
+      {
+        "command": "prism.signOut",
+        "title": "PRISM: Sign Out"
+      },
+      {
+        "command": "prism.openPeriodicTable",
+        "title": "PRISM: Open Periodic Table",
+        "icon": "$(symbol-misc)"
+      },
+      {
+        "command": "prism.searchMaterials",
+        "title": "PRISM: Search Materials",
+        "icon": "$(search)"
+      },
+      {
+        "command": "prism.askAboutComposition",
+        "title": "PRISM: Ask Agent About Composition",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "prism.showWelcome",
+        "title": "PRISM: Show Welcome"
       }
     ],
     "menus": {
@@ -142,6 +243,37 @@
           "command": "prism.sendSelection",
           "when": "editorHasSelection",
           "group": "navigation@90"
+        },
+        {
+          "command": "prism.askAboutFile",
+          "group": "prism"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "prism.newChat",
+          "when": "view == prism.agent",
+          "group": "navigation"
+        },
+        {
+          "command": "prism.openChatTab",
+          "when": "view == prism.agent",
+          "group": "navigation"
+        },
+        {
+          "command": "prism.refreshTools",
+          "when": "view == prism.tools",
+          "group": "navigation"
+        },
+        {
+          "command": "prism.searchMaterials",
+          "when": "view == prism.materials",
+          "group": "navigation"
+        },
+        {
+          "command": "prism.askAboutComposition",
+          "when": "view == prism.materials",
+          "group": "navigation"
         }
       ]
     },
@@ -164,6 +296,15 @@
         {
           "id": "prism.context",
           "name": "Context"
+        },
+        {
+          "id": "prism.tools",
+          "name": "Agent Tools"
+        },
+        {
+          "id": "prism.materials",
+          "name": "Materials Explorer",
+          "type": "webview"
         },
         {
           "id": "prism.models",

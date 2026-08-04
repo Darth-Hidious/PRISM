@@ -124,8 +124,14 @@ export class PrismBackend implements vscode.Disposable {
     if (this.initialized) {
       return;
     }
+    // `auto_approve` is read by the backend's `init` handler
+    // (crates/agent/src/protocol.rs). It is init-time only — toggling
+    // prism.autoApprove applies on the next backend start.
+    const autoApprove = vscode.workspace
+      .getConfiguration("prism")
+      .get<boolean>("autoApprove", false);
     await this.rpc.sendRequest<OkResult>("init", {
-      auto_approve: false,
+      auto_approve: autoApprove,
       resume: "",
     });
     this.initialized = true;
