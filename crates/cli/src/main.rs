@@ -10198,6 +10198,10 @@ fn validate_run_backend_target(
     Ok(())
 }
 
+fn run_job_status_hint(resolved_backend: &str, job_id: uuid::Uuid) -> Option<String> {
+    (resolved_backend == "marc27").then(|| format!("Check status:  prism job-status {job_id}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_run(
     name: &str,
@@ -10391,7 +10395,9 @@ async fn handle_run(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("Job submitted: {job_id}");
-        println!("Check status:  prism job-status {job_id}");
+        if let Some(hint) = run_job_status_hint(resolved_backend, job_id) {
+            println!("{hint}");
+        }
         match status_result {
             Ok(status) => println!("Status: {:?}", status),
             Err(e) => println!("Status check: {e}"),
@@ -11646,6 +11652,12 @@ mod tests {
             }
             _ => panic!("expected Research command"),
         }
+    }
+
+    #[test]
+    fn byoc_run_omits_unusable_cross_process_status_hint() {
+        assert_eq!(run_job_status_hint("byoc", uuid::Uuid::nil()), None);
+        assert!(run_job_status_hint("marc27", uuid::Uuid::nil()).is_some());
     }
 
     #[test]
