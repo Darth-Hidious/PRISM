@@ -10748,6 +10748,11 @@ fn run_job_status_hint(resolved_backend: &str, job_id: uuid::Uuid) -> Option<Str
     (resolved_backend != "local").then(|| format!("Check status:  prism job-status {job_id}"))
 }
 
+fn should_fetch_job_results(status: &prism_compute::JobStatus, is_slurm_array: bool) -> bool {
+    matches!(status, prism_compute::JobStatus::Completed)
+        || (is_slurm_array && matches!(status, prism_compute::JobStatus::Failed { .. }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_run(
     data_dir: &Path,
@@ -10980,6 +10985,11 @@ async fn handle_job_status(paths: &PrismPaths, job_id_str: &str) -> Result<()> {
         )
     })?;
 
+    let is_slurm_array = matches!(
+        &record.target,
+        JobTarget::Byoc(prism_compute::byoc::ByocTarget::Slurm { config, .. })
+            if config.array.is_some()
+    );
     let backend: Box<dyn prism_compute::ComputeBackend> = match record.target {
         JobTarget::Marc27 { api_base } => {
             let (_, platform_auth) = resolve_agent_auth()?;
@@ -11005,7 +11015,7 @@ async fn handle_job_status(paths: &PrismPaths, job_id_str: &str) -> Result<()> {
         .update_status(job_id, TrackedStatus::from(&status))
         .await?;
     println!("Status: {status:?}");
-    if matches!(status, prism_compute::JobStatus::Completed) {
+    if should_fetch_job_results(&status, is_slurm_array) {
         match backend.results(job_id).await {
             Ok(output) => println!("Output: {output}"),
             Err(e) => println!("Output: unavailable ({e})"),
@@ -12251,6 +12261,24 @@ mod tests {
         assert!(run_job_status_hint("byoc", uuid::Uuid::nil()).is_some());
         assert!(run_job_status_hint("marc27", uuid::Uuid::nil()).is_some());
         assert_eq!(run_job_status_hint("local", uuid::Uuid::nil()), None);
+    }
+
+    #[test]
+    fn failed_slurm_arrays_still_fetch_the_successful_task_results() {
+        use prism_compute::JobStatus;
+
+        assert!(should_fetch_job_results(
+            &JobStatus::Failed {
+                error: "task 7 failed".into(),
+            },
+            true,
+        ));
+        assert!(!should_fetch_job_results(
+            &JobStatus::Failed {
+                error: "single job failed".into(),
+            },
+            false,
+        ));
     }
 
     #[test]

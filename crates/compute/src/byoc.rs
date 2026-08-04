@@ -24,7 +24,7 @@
 //! then omitted entirely. Container images must be pulled or built on the
 //! login node before submission and supplied as a shared `.sif` path.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -461,12 +461,36 @@ impl ComputeBackend for ByocBackend {
                 config,
                 ..
             } => {
-                let result_path = if config.array.is_some() {
-                    format!("prism-{job_id}-*.out")
-                } else {
-                    format!("prism-{job_id}.out")
-                };
-                let output = Self::slurm_ssh(head_node, user, &format!("cat {result_path}"))
+                if config.array.is_some() {
+                    let slurm_job_id = self.slurm_job_id(job_id).await;
+                    let sacct = Self::slurm_ssh(
+                        head_node,
+                        user,
+                        &slurm_array_sacct_command(job_id, slurm_job_id),
+                    )
+                    .output()
+                    .await
+                    .context("SSH SLURM array accounting query failed")?;
+                    if !sacct.status.success() {
+                        let stderr = String::from_utf8_lossy(&sacct.stderr);
+                        bail!("SLURM array accounting query failed: {stderr}");
+                    }
+                    let states = String::from_utf8(sacct.stdout)
+                        .context("non-UTF-8 SLURM array accounting output")?;
+
+                    let output =
+                        Self::slurm_ssh(head_node, user, &slurm_array_logs_command(job_id))
+                            .output()
+                            .await
+                            .context("SSH SLURM array results query failed")?;
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        bail!("SLURM array results query failed: {stderr}");
+                    }
+                    return build_slurm_array_results(job_id, &states, &output.stdout);
+                }
+
+                let output = Self::slurm_ssh(head_node, user, &format!("cat prism-{job_id}.out"))
                     .output()
                     .await
                     .context("SSH SLURM results query failed")?;
@@ -565,6 +589,145 @@ fn slurm_sacct_command(job_id: Uuid, slurm_job_id: Option<u64>) -> String {
              --noheader --parsable2 --format=State"
         ),
     }
+}
+
+fn slurm_array_sacct_command(job_id: Uuid, slurm_job_id: Option<u64>) -> String {
+    match slurm_job_id {
+        Some(id) => {
+            format!("sacct -X --jobs={id} --noheader --parsable2 --format=JobIDRaw,State")
+        }
+        None => format!(
+            "sacct -X --name=prism-{job_id} --starttime=1970-01-01 \
+             --noheader --parsable2 --format=JobIDRaw,State"
+        ),
+    }
+}
+
+/// Frame every array log as `<filename>\\t<byte-count>\\n<bytes>`. The byte
+/// count makes adjacent outputs unambiguous even when a task omits its final
+/// newline or prints text that resembles another filename.
+fn slurm_array_logs_command(job_id: Uuid) -> String {
+    format!(
+        "for prism_file in prism-{job_id}-*.out; do \
+         [ -f \"$prism_file\" ] || continue; \
+         prism_size=$(wc -c < \"$prism_file\") || exit $?; \
+         printf '%s\\t%s\\n' \"$prism_file\" \"$prism_size\"; \
+         cat -- \"$prism_file\" || exit $?; \
+         done"
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct SlurmArrayTaskResult {
+    task_id: String,
+    array_index: u64,
+    state: String,
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_error: Option<String>,
+}
+
+fn parse_slurm_array_logs(
+    job_id: Uuid,
+    framed: &[u8],
+) -> Result<HashMap<String, serde_json::Value>> {
+    let prefix = format!("prism-{job_id}-");
+    let mut logs = HashMap::new();
+    let mut cursor = 0;
+
+    while cursor < framed.len() {
+        let header_len = framed[cursor..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .context("SLURM array result frame has no header newline")?;
+        let header_end = cursor + header_len;
+        let header = std::str::from_utf8(&framed[cursor..header_end])
+            .context("non-UTF-8 SLURM array result header")?;
+        let (filename, size) = header
+            .split_once('\t')
+            .context("SLURM array result header has no byte count")?;
+        let size = size
+            .trim()
+            .parse::<usize>()
+            .context("invalid SLURM array result byte count")?;
+        cursor = header_end + 1;
+        let end = cursor
+            .checked_add(size)
+            .filter(|end| *end <= framed.len())
+            .context("truncated SLURM array result frame")?;
+
+        let task_id = filename
+            .strip_prefix(&prefix)
+            .and_then(|name| name.strip_suffix(".out"))
+            .with_context(|| format!("unexpected SLURM array result filename {filename:?}"))?;
+        let text = std::str::from_utf8(&framed[cursor..end])
+            .with_context(|| format!("non-UTF-8 output for SLURM array task {task_id}"))?;
+        let result =
+            serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({"output": text}));
+        if logs.insert(task_id.to_string(), result).is_some() {
+            bail!("duplicate output for SLURM array task {task_id}");
+        }
+        cursor = end;
+    }
+
+    Ok(logs)
+}
+
+fn build_slurm_array_results(
+    job_id: Uuid,
+    sacct_output: &str,
+    framed_logs: &[u8],
+) -> Result<serde_json::Value> {
+    let mut logs = parse_slurm_array_logs(job_id, framed_logs)?;
+    let mut tasks = BTreeMap::new();
+    let mut array_job_id = None;
+
+    for line in sacct_output.lines().filter(|line| !line.trim().is_empty()) {
+        let mut columns = line.split('|');
+        let task_id = columns.next().unwrap_or_default().trim();
+        let state = columns.next().unwrap_or_default().trim();
+        let Some((parent, index)) = task_id.split_once('_') else {
+            // sacct also emits one aggregate row for the array parent.
+            continue;
+        };
+        let parent = parent
+            .parse::<u64>()
+            .with_context(|| format!("invalid SLURM array parent id in {task_id:?}"))?;
+        let index = index
+            .parse::<u64>()
+            .with_context(|| format!("invalid SLURM array index in {task_id:?}"))?;
+        if state.is_empty() {
+            bail!("missing state for SLURM array task {task_id}");
+        }
+        if let Some(existing) = array_job_id {
+            if existing != parent {
+                bail!("sacct returned tasks from more than one SLURM array");
+            }
+        } else {
+            array_job_id = Some(parent);
+        }
+
+        let result = logs.remove(task_id);
+        let result_error = result
+            .is_none()
+            .then(|| "output file was not found".to_string());
+        let task = SlurmArrayTaskResult {
+            task_id: task_id.to_string(),
+            array_index: index,
+            state: state.to_string(),
+            result,
+            result_error,
+        };
+        if tasks.insert(index, task).is_some() {
+            bail!("duplicate accounting row for SLURM array index {index}");
+        }
+    }
+
+    let array_job_id = array_job_id.context("sacct returned no SLURM array task rows")?;
+    Ok(serde_json::json!({
+        "array_job_id": array_job_id,
+        "tasks": tasks.into_values().collect::<Vec<_>>(),
+    }))
 }
 
 fn slurm_cancel_command(job_id: Uuid, slurm_job_id: Option<u64>) -> String {
@@ -1033,6 +1196,19 @@ mod tests {
     }
 
     #[test]
+    fn slurm_array_queries_preserve_task_identity_and_frame_outputs() {
+        let job_id = Uuid::nil();
+        assert_eq!(
+            slurm_array_sacct_command(job_id, Some(98765)),
+            "sacct -X --jobs=98765 --noheader --parsable2 --format=JobIDRaw,State"
+        );
+        let logs = slurm_array_logs_command(job_id);
+        assert!(logs.contains("prism-00000000-0000-0000-0000-000000000000-*.out"));
+        assert!(logs.contains("wc -c"));
+        assert!(logs.contains("printf '%s\\t%s\\n'"));
+    }
+
+    #[test]
     fn slurm_script_emits_all_configured_resources_array_and_dependency() {
         let job_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
         let config = SlurmJobConfig {
@@ -1140,6 +1316,41 @@ mod tests {
         let config = slurm_config("registry.example/prism:latest");
         let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap_err();
         assert!(error.to_string().contains("pre-staged .sif path"));
+    }
+
+    #[test]
+    fn slurm_array_results_identify_tasks_and_keep_successful_output() {
+        let job_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let states = "98765|FAILED|\n98765_0|COMPLETED|\n98765_1|FAILED|\n";
+        let logs = concat!(
+            "prism-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa-98765_0.out\t11\n",
+            "{\"score\":1}",
+            "prism-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa-98765_1.out\t4\n",
+            "boom",
+        );
+
+        let results = build_slurm_array_results(job_id, states, logs.as_bytes()).unwrap();
+        assert_eq!(results["array_job_id"], 98765);
+        assert_eq!(results["tasks"][0]["task_id"], "98765_0");
+        assert_eq!(results["tasks"][0]["array_index"], 0);
+        assert_eq!(results["tasks"][0]["state"], "COMPLETED");
+        assert_eq!(results["tasks"][0]["result"]["score"], 1);
+        assert_eq!(results["tasks"][1]["task_id"], "98765_1");
+        assert_eq!(results["tasks"][1]["state"], "FAILED");
+        assert_eq!(results["tasks"][1]["result"]["output"], "boom");
+    }
+
+    #[test]
+    fn slurm_array_results_report_a_missing_task_log_without_hiding_the_task() {
+        let job_id = Uuid::nil();
+        let results = build_slurm_array_results(job_id, "42_7|COMPLETED|\n", b"").unwrap();
+
+        assert_eq!(results["tasks"][0]["task_id"], "42_7");
+        assert_eq!(results["tasks"][0]["result"], serde_json::Value::Null);
+        assert_eq!(
+            results["tasks"][0]["result_error"],
+            "output file was not found"
+        );
     }
 
     #[test]
