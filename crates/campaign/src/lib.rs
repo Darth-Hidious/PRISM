@@ -72,42 +72,55 @@ fn is_element_symbol(symbol: &str) -> bool {
         .any(|candidate| candidate == symbol)
 }
 
-/// Validate the campaign's strict atomic-fraction syntax without rewriting it.
-/// Every element must carry an explicit positive fraction, and duplicate
-/// symbols are rejected rather than combined behind the caller's back.
-fn validate_composition(
+#[derive(Debug, Clone, PartialEq)]
+struct ExpandedComposition {
+    original: String,
+    expanded: String,
+    fractions: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompositionNotation {
+    BareEquiatomic,
+    AtomicPercent,
+    AtomicFraction,
+}
+
+/// Parse standard HEA notation, expand it to explicit atomic fractions, then
+/// enforce the existing strict validation. Bare symbols mean equiatomic;
+/// integer suffixes mean atomic percent; decimal/scientific suffixes mean
+/// atomic fractions. Mixing those conventions is rejected rather than guessed.
+fn parse_and_expand_composition(
     composition: &str,
     allowed_elements: &[String],
-) -> std::result::Result<(), String> {
-    let composition = composition.trim();
-    if composition.is_empty() {
+) -> std::result::Result<ExpandedComposition, String> {
+    let original = composition.trim();
+    if original.is_empty() {
         return Err("composition is empty".into());
     }
-
-    let bytes = composition.as_bytes();
+    let compact = original
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    let bytes = compact.as_bytes();
     let mut index = 0;
-    let mut elements = BTreeSet::new();
-    let mut fractions = Vec::new();
+    let mut seen_elements = BTreeSet::new();
+    let mut element_names = Vec::new();
+    let mut values = Vec::new();
+    let mut notation = None;
 
     while index < bytes.len() {
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index == bytes.len() {
-            break;
-        }
-
         let symbol_start = index;
         if !bytes[index].is_ascii_uppercase() {
             return Err(format!(
-                "expected an element symbol at byte {index} in '{composition}'"
+                "expected an element symbol at byte {index} in '{original}'"
             ));
         }
         index += 1;
         if index < bytes.len() && bytes[index].is_ascii_lowercase() {
             index += 1;
         }
-        let symbol = &composition[symbol_start..index];
+        let symbol = &compact[symbol_start..index];
         if !is_element_symbol(symbol) {
             return Err(format!("'{symbol}' is not a real element symbol"));
         }
@@ -117,29 +130,36 @@ fn validate_composition(
                 allowed_elements.join(", ")
             ));
         }
-        if !elements.insert(symbol.to_string()) {
+        if !seen_elements.insert(symbol.to_string()) {
             return Err(format!("element {symbol} appears more than once"));
         }
+        element_names.push(symbol.to_string());
 
         let fraction_start = index;
-        let mut digits = 0;
+        let mut has_mantissa_digit = false;
         while index < bytes.len() && bytes[index].is_ascii_digit() {
             index += 1;
-            digits += 1;
+            has_mantissa_digit = true;
         }
+        let mut is_fraction = false;
         if index < bytes.len() && bytes[index] == b'.' {
+            is_fraction = true;
             index += 1;
             while index < bytes.len() && bytes[index].is_ascii_digit() {
                 index += 1;
-                digits += 1;
+                has_mantissa_digit = true;
+            }
+            if !has_mantissa_digit {
+                return Err(format!("invalid decimal fraction for element {symbol}"));
             }
         }
-        if digits == 0 {
-            return Err(format!(
-                "element {symbol} must have an explicit numeric fraction"
-            ));
-        }
-        if index < bytes.len() && matches!(bytes[index], b'e' | b'E') {
+        if has_mantissa_digit
+            && index < bytes.len()
+            && matches!(bytes[index], b'e' | b'E')
+            && index + 1 < bytes.len()
+            && (matches!(bytes[index + 1], b'+' | b'-') || bytes[index + 1].is_ascii_digit())
+        {
+            is_fraction = true;
             index += 1;
             if index < bytes.len() && matches!(bytes[index], b'+' | b'-') {
                 index += 1;
@@ -153,29 +173,71 @@ fn validate_composition(
             }
         }
 
-        let token = &composition[fraction_start..index];
-        let fraction = token
-            .parse::<f64>()
-            .map_err(|_| format!("invalid fraction '{token}' for element {symbol}"))?;
-        if !fraction.is_finite() {
-            return Err(format!("fraction for element {symbol} must be finite"));
+        // A bare integer zero is invalid in either notation. Treat it as a
+        // fraction so `W1.0 Mo0` retains the precise positivity error instead
+        // of becoming a misleading mixed-notation error.
+        if !is_fraction && fraction_start < index && &compact[fraction_start..index] == "0" {
+            is_fraction = true;
         }
-        if fraction <= 0.0 {
-            return Err(format!(
-                "fraction for element {symbol} must be strictly positive"
-            ));
-        }
-        fractions.push(fraction);
-
-        if index < bytes.len()
-            && !bytes[index].is_ascii_whitespace()
-            && !bytes[index].is_ascii_uppercase()
+        let current_notation = if fraction_start == index {
+            CompositionNotation::BareEquiatomic
+        } else if is_fraction {
+            CompositionNotation::AtomicFraction
+        } else {
+            CompositionNotation::AtomicPercent
+        };
+        if let Some(previous) = notation
+            && previous != current_notation
         {
+            return Err(
+                "composition mixes bare, atomic-percent, or atomic-fraction notation".into(),
+            );
+        }
+        notation = Some(current_notation);
+
+        if current_notation != CompositionNotation::BareEquiatomic {
+            let token = &compact[fraction_start..index];
+            let value = token
+                .parse::<f64>()
+                .map_err(|_| format!("invalid fraction '{token}' for element {symbol}"))?;
+            if !value.is_finite() {
+                return Err(format!("fraction for element {symbol} must be finite"));
+            }
+            if value <= 0.0 {
+                return Err(format!(
+                    "fraction for element {symbol} must be strictly positive"
+                ));
+            }
+            values.push(value);
+        }
+
+        if index < bytes.len() && !bytes[index].is_ascii_uppercase() {
             return Err(format!(
                 "unexpected character after fraction for element {symbol}"
             ));
         }
     }
+
+    let fractions = match notation {
+        Some(CompositionNotation::BareEquiatomic) => {
+            if element_names.len() < 2 {
+                return Err("composition must contain at least two elements".into());
+            }
+            vec![1.0 / element_names.len() as f64; element_names.len()]
+        }
+        Some(CompositionNotation::AtomicPercent) => {
+            let sum: f64 = values.iter().sum();
+            let tolerance = COMPOSITION_SUM_TOLERANCE * 100.0;
+            if (sum - 100.0).abs() > tolerance {
+                return Err(format!(
+                    "atomic-percent suffixes must sum to 100.0 ± {tolerance:.6}; got {sum:.6}"
+                ));
+            }
+            values.into_iter().map(|value| value / 100.0).collect()
+        }
+        Some(CompositionNotation::AtomicFraction) => values,
+        None => return Err("composition is empty".into()),
+    };
 
     let sum: f64 = fractions.iter().sum();
     if !sum.is_finite() {
@@ -186,7 +248,24 @@ fn validate_composition(
             "composition fractions must sum to 1.0 ± {COMPOSITION_SUM_TOLERANCE:.6}; got {sum:.6}"
         ));
     }
-    Ok(())
+    let expanded = element_names
+        .iter()
+        .zip(&fractions)
+        .map(|(element, fraction)| format!("{element}{fraction}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(ExpandedComposition {
+        original: original.to_string(),
+        expanded,
+        fractions,
+    })
+}
+
+fn validate_composition(
+    composition: &str,
+    allowed_elements: &[String],
+) -> std::result::Result<(), String> {
+    parse_and_expand_composition(composition, allowed_elements).map(|_| ())
 }
 
 fn validate_allowed_elements(elements: &[String]) -> std::result::Result<(), String> {
@@ -202,27 +281,73 @@ fn validate_allowed_elements(elements: &[String]) -> std::result::Result<(), Str
     Ok(())
 }
 
-/// Conventional lower bound for the ideal configurational entropy of an HEA:
-/// `1.5R`, conventionally rounded to 12.47 J/(mol K).
+/// Permissive RHEA definition: at least four principal elements and a mixing
+/// entropy of at least `R`. This admits equiatomic NbMoTaW (`R ln(4)`) from
+/// the founding refractory-HEA study.
 ///
-/// Source: D. B. Miracle and O. N. Senkov, "A critical review of high entropy
-/// alloys and related concepts," Acta Materialia 122 (2017) 448-511,
-/// <https://doi.org/10.1016/j.actamat.2016.08.081>.
-pub const DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K: f64 = 12.47;
+/// Source: O. N. Senkov et al., "Refractory high-entropy alloys,"
+/// Intermetallics 18 (2010) 1758-1765,
+/// <https://doi.org/10.1016/j.intermet.2010.05.014>.
+pub const DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K: f64 = 8.314;
+pub const DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS: usize = 4;
 
-/// Conventional minimum number of principal elements in an HEA. A principal
-/// element is counted at 5 at.% or above; the original compositional
-/// definition uses at least five principal elements at 5-35 at.% each.
+/// Strict Yeh definition: at least five principal elements and `ΔS_mix >=
+/// 1.5R`, conventionally rounded to 12.47 J/(mol K).
 ///
 /// Source: J.-W. Yeh et al., "Nanostructured High-Entropy Alloys with Multiple
 /// Principal Elements: Novel Alloy Design Concepts and Outcomes," Advanced
 /// Engineering Materials 6 (2004) 299-303,
 /// <https://doi.org/10.1002/adem.200300567>.
-pub const DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS: usize = 5;
+pub const STRICT_YEH_MIN_CONFIG_ENTROPY_J_PER_MOL_K: f64 = 12.47;
+pub const STRICT_YEH_MIN_PRINCIPAL_ELEMENTS: usize = 5;
 
-const HEA_DEFAULTS_SOURCE: &str = "Miracle & Senkov, Acta Materialia 122 (2017), \
-DOI 10.1016/j.actamat.2016.08.081; principal-element definition: Yeh et al., \
-Advanced Engineering Materials 6 (2004), DOI 10.1002/adem.200300567";
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaDefinition {
+    /// RHEA-inclusive policy based on Senkov's four-principal-element NbMoTaW.
+    PermissiveRhea,
+    /// Original strict multiple-principal-element policy from Yeh et al.
+    StrictYeh,
+    /// Explicit per-campaign thresholds that differ from either named preset.
+    Custom,
+}
+
+impl HeaDefinition {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PermissiveRhea => "permissive_rhea",
+            Self::StrictYeh => "strict_yeh",
+            Self::Custom => "custom",
+        }
+    }
+
+    fn source(self) -> &'static str {
+        match self {
+            Self::PermissiveRhea => {
+                "Senkov et al., Intermetallics 18 (2010), DOI 10.1016/j.intermet.2010.05.014"
+            }
+            Self::StrictYeh => {
+                "Yeh et al., Advanced Engineering Materials 6 (2004), DOI 10.1002/adem.200300567"
+            }
+            Self::Custom => {
+                "campaign-configured thresholds (permissive RHEA baseline: Senkov et al., Intermetallics 18 (2010), DOI 10.1016/j.intermet.2010.05.014)"
+            }
+        }
+    }
+
+    fn defaults(self) -> (f64, usize) {
+        match self {
+            Self::PermissiveRhea | Self::Custom => (
+                DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K,
+                DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS,
+            ),
+            Self::StrictYeh => (
+                STRICT_YEH_MIN_CONFIG_ENTROPY_J_PER_MOL_K,
+                STRICT_YEH_MIN_PRINCIPAL_ELEMENTS,
+            ),
+        }
+    }
+}
 
 /// Durable schedules and watchers — what wakes a paused or crashed goal back
 /// up without a human. See [`schedule`] for the design rationale.
@@ -306,9 +431,16 @@ pub struct CampaignConfig {
     /// Optional hard minimum number of principal elements. Elements whose
     /// evaluated atomic fraction is at least 5 at.% count as principal. When
     /// the goal explicitly asks for an HEA and this is None, the campaign
-    /// stores [`DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS`].
+    /// stores the active definition's default.
     #[serde(default)]
     pub min_principal_elements: Option<usize>,
+    /// Named HEA compositional definition for this campaign. HEA goals default
+    /// to [`HeaDefinition::PermissiveRhea`]; select StrictYeh to apply the
+    /// original five-principal-element, 1.5R policy. Numeric minima remain
+    /// independently configurable; values differing from a preset are named
+    /// `custom` in the checkpoint and output.
+    #[serde(default)]
+    pub hea_definition: Option<HeaDefinition>,
     /// Base URL override for the proposal LLM. None = the configured chat
     /// target, unless `$LLM_API_BASE` is explicitly set.
     #[serde(default)]
@@ -345,6 +477,7 @@ impl Default for CampaignConfig {
             reward_weights: BTreeMap::new(),
             min_configurational_entropy_j_per_mol_k: None,
             min_principal_elements: None,
+            hea_definition: None,
             llm_base_url: None,
             project_root: None,
             node_base_url: None,
@@ -354,13 +487,59 @@ impl Default for CampaignConfig {
 
 impl CampaignConfig {
     fn apply_goal_implied_constraints(&mut self, goal: &CampaignGoal) {
-        if !goal_explicitly_requests_hea(goal) {
+        let has_explicit_hea_constraint = self.hea_definition.is_some()
+            || self.min_configurational_entropy_j_per_mol_k.is_some()
+            || self.min_principal_elements.is_some();
+        if !goal_explicitly_requests_hea(goal) && !has_explicit_hea_constraint {
             return;
         }
-        self.min_configurational_entropy_j_per_mol_k
-            .get_or_insert(DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K);
-        self.min_principal_elements
-            .get_or_insert(DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS);
+
+        let requested = self.hea_definition.unwrap_or(
+            match (
+                self.min_configurational_entropy_j_per_mol_k,
+                self.min_principal_elements,
+            ) {
+                (Some(entropy), Some(principal_elements))
+                    if entropy == STRICT_YEH_MIN_CONFIG_ENTROPY_J_PER_MOL_K
+                        && principal_elements == STRICT_YEH_MIN_PRINCIPAL_ELEMENTS =>
+                {
+                    HeaDefinition::StrictYeh
+                }
+                (Some(entropy), Some(principal_elements))
+                    if entropy == DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K
+                        && principal_elements == DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS =>
+                {
+                    HeaDefinition::PermissiveRhea
+                }
+                (Some(_), _) | (_, Some(_)) => HeaDefinition::Custom,
+                (None, None) => HeaDefinition::PermissiveRhea,
+            },
+        );
+        let (default_entropy, default_principal_elements) = requested.defaults();
+        let entropy = self
+            .min_configurational_entropy_j_per_mol_k
+            .get_or_insert(default_entropy);
+        let principal_elements = self
+            .min_principal_elements
+            .get_or_insert(default_principal_elements);
+        self.hea_definition = Some(if (*entropy, *principal_elements) == requested.defaults() {
+            requested
+        } else {
+            HeaDefinition::Custom
+        });
+    }
+
+    fn active_hea_definition(&self) -> Option<serde_json::Value> {
+        let definition = self.hea_definition?;
+        let entropy = self.min_configurational_entropy_j_per_mol_k?;
+        let principal_elements = self.min_principal_elements?;
+        Some(serde_json::json!({
+            "name": definition.name(),
+            "min_configurational_entropy_j_per_mol_k": entropy,
+            "min_principal_elements": principal_elements,
+            "principal_element_min_atomic_fraction": PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION,
+            "source": definition.source(),
+        }))
     }
 }
 
@@ -385,12 +564,18 @@ fn goal_explicitly_requests_hea(goal: &CampaignGoal) -> bool {
 
 fn configured_compositional_constraints(config: &CampaignConfig) -> Vec<String> {
     let mut constraints = Vec::new();
+    let definition = config
+        .hea_definition
+        .map(HeaDefinition::name)
+        .unwrap_or("unnamed");
     if let Some(minimum) = config.min_configurational_entropy_j_per_mol_k {
-        constraints.push(format!("delta_S_mix_J_per_molK >= {minimum:.4} J/(mol K)"));
+        constraints.push(format!(
+            "[{definition}] delta_S_mix_J_per_molK >= {minimum:.4} J/(mol K)"
+        ));
     }
     if let Some(minimum) = config.min_principal_elements {
         constraints.push(format!(
-            "principal elements >= {minimum} (each >= {:.0} at.%)",
+            "[{definition}] principal elements >= {minimum} (each >= {:.0} at.%)",
             PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION * 100.0
         ));
     }
@@ -601,7 +786,10 @@ impl ConstraintRejection {
 
 #[derive(Debug)]
 struct CompositionProposal {
-    raw: String,
+    /// Submitted notation, retained for live rejection records and provenance.
+    original: String,
+    /// Canonical explicit fractions, used for evaluation and durable candidates.
+    expanded: Option<String>,
     rejection_reason: Option<String>,
 }
 
@@ -885,14 +1073,17 @@ impl CampaignState {
             for constraint in &hard_constraints {
                 s.push_str(&format!("  - {constraint}\n"));
             }
-            if goal_explicitly_requests_hea(&self.goal) {
-                s.push_str(&format!("HEA defaults source: {HEA_DEFAULTS_SOURCE}\n"));
+            if let Some(definition) = self.config.active_hea_definition() {
+                let name = definition["name"].as_str().unwrap_or("unknown");
+                let source = definition["source"].as_str().unwrap_or("unknown");
+                s.push_str(&format!("HEA definition: {name} ({source})\n"));
             }
         }
         if let Some(best) = self.best() {
             s.push_str(&format!(
                 "Best: {} (reward={:.4})\n",
-                best.composition, best.reward
+                display_recorded_composition(&best.composition, &best.properties),
+                best.reward
             ));
         }
         if !winners.is_empty() {
@@ -902,7 +1093,7 @@ impl CampaignState {
                 s.push_str(&format!(
                     "  {}. {} — reward={:.4} (iter {}, {}){}\n",
                     i + 1,
-                    c.composition,
+                    display_recorded_composition(&c.composition, &c.properties),
                     c.reward,
                     c.iteration,
                     c.source,
@@ -913,9 +1104,13 @@ impl CampaignState {
         if !self.rejected_candidates.is_empty() {
             s.push_str("\nREJECTED by hard compositional constraints:\n");
             for rejection in &self.rejected_candidates {
+                let composition = if rejection.evaluated {
+                    display_recorded_composition(&rejection.composition, &rejection.properties)
+                } else {
+                    rejection.display_composition().to_string()
+                };
                 s.push_str(&format!(
-                    "  - {} (iter {}) — {}{}\n",
-                    rejection.display_composition(),
+                    "  - {composition} (iter {}) — {}{}\n",
                     rejection.iteration,
                     rejection.reasons.join("; "),
                     summarize_descriptors(&rejection.properties)
@@ -923,6 +1118,17 @@ impl CampaignState {
             }
         }
         s
+    }
+}
+
+fn display_recorded_composition(composition: &str, properties: &serde_json::Value) -> String {
+    match properties
+        .get("original_composition")
+        .and_then(serde_json::Value::as_str)
+        .filter(|original| !original.is_empty() && *original != composition)
+    {
+        Some(original) => format!("{composition} (input: {original})"),
+        None => composition.to_string(),
     }
 }
 
@@ -1277,6 +1483,9 @@ impl Campaign {
             .with_context(|| format!("failed to read campaign checkpoint: {}", path.display()))?;
         let mut state: CampaignState = serde_json::from_str(&text)
             .context("failed to parse campaign checkpoint (version mismatch?)")?;
+        // Backfill the named policy for pre-policy checkpoints without
+        // weakening their stored numeric thresholds.
+        state.config.apply_goal_implied_constraints(&state.goal);
         validate_checkpoint_compositions(&state).with_context(|| {
             format!(
                 "campaign checkpoint {} contains an invalid composition",
@@ -1801,7 +2010,8 @@ impl Campaign {
                     "campaign.reject",
                     serde_json::json!({
                         "iteration": iter,
-                        "composition": &comp.raw,
+                        "original_composition": &comp.original,
+                        "expanded_composition": &comp.expanded,
                         "evaluation_skipped": true,
                         "hard_constraint_violations": [reason],
                     }),
@@ -1810,22 +2020,29 @@ impl Campaign {
                 rejected += 1;
                 warn!(
                     campaign = %self.state.campaign_id,
-                    composition = %comp.raw,
+                    composition = %comp.original,
                     reason,
                     "candidate REJECTED by composition validation before evaluation"
                 );
                 self.state
                     .rejected_candidates
                     .push(ConstraintRejection::invalid_proposal(
-                        comp.raw.clone(),
+                        comp.original.clone(),
                         iter,
                         reason.clone(),
                     ));
                 continue;
             }
 
+            let expanded = comp
+                .expanded
+                .as_deref()
+                .expect("valid composition proposals always have an expansion");
             evaluation_attempts += 1;
-            match self.evaluate_candidate(&comp.raw, iter).await {
+            match self
+                .evaluate_candidate(expanded, &comp.original, iter)
+                .await
+            {
                 Ok(CandidateEvaluation::Accepted(candidate)) => {
                     iteration_cost += reported_cost(&candidate.properties);
                     evaluated.push(candidate);
@@ -1844,7 +2061,7 @@ impl Campaign {
                 Err(e) => {
                     warn!(
                         campaign = %self.state.campaign_id,
-                        composition = %comp.raw,
+                        composition = %comp.original,
                         error = %e,
                         "evaluation failed for candidate"
                     );
@@ -2146,7 +2363,9 @@ impl Campaign {
                         return None;
                     }
                     let looks_like_comp = line.chars().any(|c| c.is_ascii_uppercase())
-                        && line.chars().any(|c| c.is_ascii_digit() || c == '.');
+                        && (line.chars().any(|c| c.is_ascii_digit() || c == '.')
+                            || parse_and_expand_composition(line, &self.state.goal.elements)
+                                .is_ok());
                     (looks_like_comp && !line.starts_with("Propose") && !line.starts_with("Goal"))
                         .then(|| line.to_string())
                 })
@@ -2159,11 +2378,18 @@ impl Campaign {
             .collect()
     }
 
-    fn validate_proposal(&self, raw: String) -> CompositionProposal {
-        let rejection_reason = validate_composition(&raw, &self.state.goal.elements).err();
-        CompositionProposal {
-            raw,
-            rejection_reason,
+    fn validate_proposal(&self, original: String) -> CompositionProposal {
+        match parse_and_expand_composition(&original, &self.state.goal.elements) {
+            Ok(parsed) => CompositionProposal {
+                original: parsed.original,
+                expanded: Some(parsed.expanded),
+                rejection_reason: None,
+            },
+            Err(reason) => CompositionProposal {
+                original,
+                expanded: None,
+                rejection_reason: Some(reason),
+            },
         }
     }
 
@@ -2174,17 +2400,26 @@ impl Campaign {
     async fn evaluate_candidate(
         &self,
         composition: &str,
+        original_composition: &str,
         iteration: usize,
     ) -> Result<CandidateEvaluation> {
         // Defensive evaluator boundary: callers inside this crate must not be
-        // able to bypass proposal validation and score a different material.
-        if let Err(reason) = validate_composition(composition, &self.state.goal.elements) {
-            return Ok(CandidateEvaluation::Rejected(
-                ConstraintRejection::invalid_proposal(composition.to_string(), iteration, reason),
-            ));
-        }
+        // able to bypass expansion and score a different material.
+        let parsed = match parse_and_expand_composition(composition, &self.state.goal.elements) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                return Ok(CandidateEvaluation::Rejected(
+                    ConstraintRejection::invalid_proposal(
+                        original_composition.to_string(),
+                        iteration,
+                        reason,
+                    ),
+                ));
+            }
+        };
 
-        // Call the PRISM node's registered HEA evaluation tool.
+        // Call the PRISM node's registered HEA evaluation tool with the
+        // explicit fractions, never the shorthand that needed interpretation.
         let base = self.state.config.node_base_url.clone().unwrap_or_else(|| {
             let port = std::env::var("PRISM_NODE_PORT").unwrap_or_else(|_| "7327".to_string());
             format!("http://127.0.0.1:{port}")
@@ -2193,7 +2428,13 @@ impl Campaign {
             "failed to locate PRISM state directories; authenticate with `prism login --no-browser` and retry",
         )?;
         let identity = load_local_node_identity(&paths)?;
-        let resp_body = call_evaluate_material(&base, composition, Some(&identity)).await?;
+        let mut resp_body =
+            call_evaluate_material(&base, &parsed.expanded, Some(&identity)).await?;
+        self.record_composition_and_definition(
+            &mut resp_body,
+            original_composition,
+            &parsed.expanded,
+        )?;
 
         let violations = self.constraint_violations(&resp_body);
         if !violations.is_empty() {
@@ -2201,14 +2442,15 @@ impl Campaign {
                 "campaign.reject",
                 serde_json::json!({
                     "iteration": iteration,
-                    "composition": composition,
+                    "original_composition": original_composition,
+                    "expanded_composition": &parsed.expanded,
                     "properties": &resp_body,
                     "hard_constraint_violations": &violations,
                 }),
             )
             .await;
             return Ok(CandidateEvaluation::Rejected(ConstraintRejection {
-                composition: composition.to_string(),
+                composition: parsed.expanded,
                 properties: resp_body,
                 iteration,
                 reasons: violations,
@@ -2225,7 +2467,8 @@ impl Campaign {
             "campaign.evaluate",
             serde_json::json!({
                 "iteration": iteration,
-                "composition": composition,
+                "original_composition": original_composition,
+                "expanded_composition": &parsed.expanded,
                 "properties": &resp_body,
                 "reward": reward,
             }),
@@ -2233,7 +2476,7 @@ impl Campaign {
         .await;
 
         Ok(CandidateEvaluation::Accepted(Candidate {
-            composition: composition.to_string(),
+            composition: parsed.expanded,
             properties: resp_body,
             reward,
             iteration,
@@ -2245,8 +2488,37 @@ impl Campaign {
         }))
     }
 
+    fn record_composition_and_definition(
+        &self,
+        properties: &mut serde_json::Value,
+        original_composition: &str,
+        expanded_composition: &str,
+    ) -> Result<()> {
+        let object = properties.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("{EVALUATION_TOOL} returned a non-object descriptor payload")
+        })?;
+        object.insert(
+            "original_composition".into(),
+            serde_json::Value::String(original_composition.to_string()),
+        );
+        object.insert(
+            "expanded_composition".into(),
+            serde_json::Value::String(expanded_composition.to_string()),
+        );
+        if let Some(definition) = self.state.config.active_hea_definition() {
+            object.insert("hea_definition".into(), definition);
+        }
+        Ok(())
+    }
+
     fn constraint_violations(&self, properties: &serde_json::Value) -> Vec<String> {
         let mut violations = Vec::new();
+        let definition = self
+            .state
+            .config
+            .hea_definition
+            .map(HeaDefinition::name)
+            .unwrap_or("unnamed");
 
         if let Some(minimum) = self.state.config.min_configurational_entropy_j_per_mol_k {
             let entropy = properties
@@ -2261,11 +2533,11 @@ impl Campaign {
                 });
             match entropy {
                 Some(value) if value < minimum => violations.push(format!(
-                    "delta_S_mix_J_per_molK={value:.4} J/(mol K) is below hard minimum {minimum:.4}"
+                    "[{definition}] delta_S_mix_J_per_molK={value:.4} J/(mol K) is below hard minimum {minimum:.4}"
                 )),
                 Some(_) => {}
                 None => violations.push(format!(
-                    "{EVALUATION_TOOL} returned no configurational-entropy descriptor required by hard minimum {minimum:.4} J/(mol K)"
+                    "[{definition}] {EVALUATION_TOOL} returned no configurational-entropy descriptor required by hard minimum {minimum:.4} J/(mol K)"
                 )),
             }
         }
@@ -2283,13 +2555,13 @@ impl Campaign {
                         .count();
                     if count < minimum {
                         violations.push(format!(
-                            "principal-element count {count} is below hard minimum {minimum} ({:.0} at.% cutoff)",
+                            "[{definition}] principal-element count {count} is below hard minimum {minimum} ({:.0} at.% cutoff)",
                             PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION * 100.0
                         ));
                     }
                 }
                 _ => violations.push(format!(
-                    "{EVALUATION_TOOL} returned no numeric composition fractions required to verify hard minimum {minimum} principal elements"
+                    "[{definition}] {EVALUATION_TOOL} returned no numeric composition fractions required to verify hard minimum {minimum} principal elements"
                 )),
             }
         }
@@ -2828,6 +3100,92 @@ mod tests {
     }
 
     #[test]
+    fn canonical_hea_shorthand_expands_without_relaxing_unit_sum_validation() {
+        let allowed = ["Nb", "Mo", "Ta", "W"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let parsed = parse_and_expand_composition("NbMoTaW", &allowed).unwrap();
+        assert_eq!(parsed.expanded, "Nb0.25 Mo0.25 Ta0.25 W0.25");
+        assert_eq!(parsed.fractions, vec![0.25, 0.25, 0.25, 0.25]);
+
+        let percent = parse_and_expand_composition("Nb25Mo25Ta25W25", &allowed).unwrap();
+        assert_eq!(percent.expanded, parsed.expanded);
+        let decimal = parse_and_expand_composition("W0.5Ta0.3Mo0.2", &allowed).unwrap();
+        assert_eq!(decimal.expanded, "W0.5 Ta0.3 Mo0.2");
+
+        assert!(
+            parse_and_expand_composition("W0.6 Mo0.2 Ta0.4 Nb0.4", &allowed)
+                .unwrap_err()
+                .contains("got 1.600000")
+        );
+    }
+
+    #[test]
+    fn canonical_rhea_is_accepted_by_default_and_named_when_strict_yeh_rejects_it() {
+        let goal = CampaignGoal {
+            description: "Find a refractory high-entropy alloy".into(),
+            elements: ["Nb", "Mo", "Ta", "W"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            objective: "maximize strength".into(),
+            constraints: vec![],
+            seeds: vec![],
+        };
+        let properties = json!({
+            "delta_S_mix_J_per_molK": 8.314 * 2.0 * std::f64::consts::LN_2,
+            "fractions": [0.25, 0.25, 0.25, 0.25],
+        });
+
+        let default_campaign = Campaign::new(
+            goal.clone(),
+            CampaignConfig::default(),
+            "default-rhea".into(),
+        );
+        assert_eq!(
+            default_campaign.state.config.hea_definition,
+            Some(HeaDefinition::PermissiveRhea)
+        );
+        assert!(
+            default_campaign
+                .constraint_violations(&properties)
+                .is_empty()
+        );
+        let mut accepted_record = properties.clone();
+        default_campaign
+            .record_composition_and_definition(
+                &mut accepted_record,
+                "NbMoTaW",
+                "Nb0.25 Mo0.25 Ta0.25 W0.25",
+            )
+            .unwrap();
+        assert_eq!(accepted_record["original_composition"], "NbMoTaW");
+        assert_eq!(accepted_record["hea_definition"]["name"], "permissive_rhea");
+        assert!(
+            default_campaign
+                .state
+                .summary(&[])
+                .contains("permissive_rhea")
+        );
+
+        let strict_campaign = Campaign::new(
+            goal,
+            CampaignConfig {
+                hea_definition: Some(HeaDefinition::StrictYeh),
+                ..Default::default()
+            },
+            "strict-rhea".into(),
+        );
+        let rejection = strict_campaign.constraint_violations(&properties);
+        assert!(!rejection.is_empty());
+        assert!(rejection.iter().all(|reason| reason.contains("strict_yeh")));
+        assert!(strict_campaign.state.summary(&[]).contains("strict_yeh"));
+        let checkpoint = serde_json::to_value(strict_campaign.state()).unwrap();
+        assert_eq!(checkpoint["config"]["hea_definition"], "strict_yeh");
+    }
+
+    #[test]
     fn checkpoint_writer_refuses_an_invalid_ranked_candidate() {
         let tmp = tempfile::tempdir().unwrap();
         let mut campaign = Campaign::new(
@@ -3089,7 +3447,7 @@ mod tests {
         let campaign = Campaign::new(test_goal(), CampaignConfig::default(), "c1".into());
         let parsed = campaign.parse_compositions("[\"Ti0.8 Al0.2\", \"Cr0.5 V0.5\"]");
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].raw, "Ti0.8 Al0.2");
+        assert_eq!(parsed[0].original, "Ti0.8 Al0.2");
         assert!(
             parsed
                 .iter()
@@ -3154,7 +3512,7 @@ mod tests {
             .expect("LLM_API_BASE should override the campaign endpoint");
 
         assert_eq!(proposals.len(), 1);
-        assert_eq!(proposals[0].raw, "Ti0.5 Al0.5");
+        assert_eq!(proposals[0].original, "Ti0.5 Al0.5");
         assert!(proposals[0].rejection_reason.is_none());
         server.abort();
     }
@@ -3201,7 +3559,7 @@ mod tests {
             .expect("configured target should serve proposals");
 
         assert_eq!(proposals.len(), 1);
-        assert_eq!(proposals[0].raw, "Ti0.5 Al0.5");
+        assert_eq!(proposals[0].original, "Ti0.5 Al0.5");
         assert!(proposals[0].rejection_reason.is_none());
         assert_eq!(
             captured_model.lock().unwrap().as_deref(),
@@ -3216,7 +3574,7 @@ mod tests {
         let text = "Here are my suggestions:\n[\"Ti0.8 Al0.2\", \"Ti0.7 V0.3\"]\nGood luck!";
         let parsed = campaign.parse_compositions(text);
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].raw, "Ti0.8 Al0.2");
+        assert_eq!(parsed[0].original, "Ti0.8 Al0.2");
         assert!(
             parsed
                 .iter()

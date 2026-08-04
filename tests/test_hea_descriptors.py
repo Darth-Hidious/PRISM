@@ -19,6 +19,32 @@ def test_parse_composition_dict():
     assert all(abs(f - 0.25) < 1e-6 for f in fracs)  # equal fractions
 
 
+def test_parse_composition_expands_standard_hea_shorthand_with_traceability():
+    elems, fracs = _parse_composition("NbMoTaW")
+    assert elems == ["Nb", "Mo", "Ta", "W"]
+    assert fracs == [0.25, 0.25, 0.25, 0.25]
+
+    from app.tools.base import ToolRegistry
+    from app.tools.materials.hea import create_hea_tools
+
+    registry = ToolRegistry()
+    create_hea_tools(registry)
+    result = registry.get("hea_descriptors").func(composition="NbMoTaW")
+    assert result["original_composition"] == "NbMoTaW"
+    assert result["expanded_composition"] == "Nb0.25Mo0.25Ta0.25W0.25"
+    assert result["fractions"] == [0.25, 0.25, 0.25, 0.25]
+
+
+def test_parse_composition_accepts_percent_and_decimal_shorthand():
+    elems, fracs = _parse_composition("Nb25Mo25Ta25W25")
+    assert elems == ["Nb", "Mo", "Ta", "W"]
+    assert fracs == [0.25, 0.25, 0.25, 0.25]
+
+    elems, fracs = _parse_composition("W0.5Ta0.3Mo0.2")
+    assert elems == ["W", "Ta", "Mo"]
+    assert fracs == [0.5, 0.3, 0.2]
+
+
 def test_parse_composition_rejects_invalid():
     assert _parse_composition("not_a_formula") is None or _parse_composition("Fe") is None
     assert _parse_composition({}) is None

@@ -168,6 +168,107 @@ def _validate_composition_components(
     return list(elems), checked
 
 
+def _parse_formula_components(spec: str) -> tuple[list[str], list[float]]:
+    """Parse explicit fractions plus the standard HEA formula shorthands.
+
+    Bare symbols are the conventional equiatomic notation (``NbMoTaW``).
+    Integer suffixes are atomic percent (``Nb25Mo25Ta25W25``); decimal or
+    scientific-notation suffixes are atomic fractions
+    (``W0.5Ta0.3Mo0.2``).  The three forms are deliberately not mixed: a
+    caller must state one unambiguous composition convention.
+    """
+    compact = "".join(spec.split())
+    if not compact:
+        raise ValueError("composition is empty")
+
+    elems: list[str] = []
+    values: list[float] = []
+    forms: set[str] = set()
+    index = 0
+    while index < len(compact):
+        if not compact[index].isupper():
+            raise ValueError(
+                f"expected an element symbol at character {index} in {spec!r}"
+            )
+        symbol_start = index
+        index += 1
+        if index < len(compact) and compact[index].islower():
+            index += 1
+        elems.append(compact[symbol_start:index])
+
+        number_start = index
+        while index < len(compact) and compact[index].isdigit():
+            index += 1
+        saw_decimal = False
+        if index < len(compact) and compact[index] == ".":
+            saw_decimal = True
+            index += 1
+            decimal_start = index
+            while index < len(compact) and compact[index].isdigit():
+                index += 1
+            if decimal_start == index and number_start == decimal_start - 1:
+                raise ValueError(f"invalid decimal fraction for {elems[-1]}")
+        saw_exponent = False
+        if index < len(compact) and compact[index] in "eE":
+            # ``Fe0.5Er0.5`` has an Er symbol, not an exponent.  An exponent
+            # must immediately contain a sign or a digit.
+            exponent_marker = index
+            if index + 1 < len(compact) and (
+                compact[index + 1] in "+-" or compact[index + 1].isdigit()
+            ):
+                saw_exponent = True
+                index += 1
+                if index < len(compact) and compact[index] in "+-":
+                    index += 1
+                exponent_start = index
+                while index < len(compact) and compact[index].isdigit():
+                    index += 1
+                if exponent_start == index:
+                    raise ValueError(f"invalid exponent for {elems[-1]}")
+            else:
+                index = exponent_marker
+
+        if number_start == index:
+            forms.add("bare")
+            continue
+        token = compact[number_start:index]
+        try:
+            value = float(token)
+        except ValueError as exc:
+            raise ValueError(f"invalid fraction {token!r} for {elems[-1]}") from exc
+        values.append(value)
+        # Zero is invalid in either unit system; classify it as a fraction so
+        # an explicit decimal composition reports the precise positivity error.
+        forms.add(
+            "fraction" if saw_decimal or saw_exponent or token == "0" else "percent"
+        )
+
+    if forms == {"bare"}:
+        if len(elems) < 2:
+            raise ValueError("composition must contain at least two elements")
+        return elems, [1.0 / len(elems)] * len(elems)
+    if "bare" in forms or len(forms) != 1:
+        raise ValueError(
+            "composition mixes bare, atomic-percent, or atomic-fraction notation"
+        )
+    if len(values) != len(elems):
+        raise ValueError("composition has an unparseable numeric suffix")
+    if forms == {"percent"}:
+        total = math.fsum(values)
+        if abs(total - 100.0) > COMPOSITION_SUM_TOLERANCE * 100.0:
+            raise ValueError(
+                "atomic-percent suffixes must sum to 100.0 ± "
+                f"{COMPOSITION_SUM_TOLERANCE * 100.0:.6f}; got {total:.6f}"
+            )
+        values = [value / 100.0 for value in values]
+    return elems, values
+
+
+def _explicit_composition(elems: list[str], fracs: list[float]) -> str:
+    """Canonical, round-trip-safe explicit atomic-fraction record."""
+    return "".join(f"{element}{fraction!r}" for element, fraction in zip(elems, fracs))
+
+
 def _parse_composition_or_raise(
     spec: str | dict[str, float],
 ) -> tuple[list[str], list[float]]:
@@ -175,17 +276,7 @@ def _parse_composition_or_raise(
         elems = list(spec.keys())
         fracs = list(spec.values())
     elif isinstance(spec, str):
-        try:
-            from pymatgen.core import Composition
-
-            # get_el_amt_dict preserves the caller's raw coefficients. Using
-            # get_atomic_fraction here would silently turn a sum-2 proposal
-            # into a different, apparently valid material.
-            amounts = Composition(spec).get_el_amt_dict()
-        except Exception as exc:
-            raise ValueError(f"could not parse composition: {spec}") from exc
-        elems = list(amounts)
-        fracs = list(amounts.values())
+        elems, fracs = _parse_formula_components(spec)
     else:
         raise ValueError("composition must be a formula string or fractions dict")
     return _validate_composition_components(elems, fracs)
@@ -365,7 +456,10 @@ def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, A
         "rationale": criterion_notes,
         "n_elements": n,
         "elements": elems,
-        "fractions": [round(f, 4) for f in fracs],
+        # Preserve the evaluated fractions exactly rather than rounding them
+        # into a composition different from the descriptor calculation.
+        "fractions": fracs,
+        "expanded_composition": _explicit_composition(elems, fracs),
     }
 
 
@@ -391,10 +485,13 @@ _HEA_SCHEMA: dict = {
         "composition": {
             "type": "string",
             "description": (
-                "Atomic-fraction composition with every fraction explicit and "
-                "summing to 1.0 ± 1e-6, e.g. "
-                "'Co0.2Cr0.2Fe0.2Mn0.2Ni0.2' (the Cantor alloy). "
-                "Ratios and percentages are rejected, never normalized."
+                "Composition notation: bare element sequences are expanded as "
+                "equiatomic (e.g. 'NbMoTaW'); integer suffixes are atomic "
+                "percent and must sum to 100 (e.g. 'Nb25Mo25Ta25W25'); decimal "
+                "or scientific suffixes are atomic fractions and must sum to "
+                "1.0 ± 1e-6 (e.g. 'Co0.2Cr0.2Fe0.2Mn0.2Ni0.2'). The result "
+                "records both the original input and expanded fractions; "
+                "ambiguous mixed notation is rejected."
             ),
         },
         "fractions": {
@@ -418,7 +515,14 @@ def _hea_descriptors_tool() -> Tool:
             return {"error": "provide a composition (formula string or fractions dict)"}
         try:
             elems, fracs = _parse_composition_or_raise(fracs_dict if fracs_dict else comp)
-            return compute_hea_descriptors(elems, fracs)
+            result = compute_hea_descriptors(elems, fracs)
+            # The formula parser expands only documented shorthand. Keep the
+            # submitted string beside that explicit material record so users
+            # can inspect exactly what was interpreted.
+            result["original_composition"] = comp if isinstance(comp, str) else None
+            if fracs_dict:
+                result["input_fractions"] = fracs_dict
+            return result
         except (TypeError, ValueError) as exc:
             return {"error": f"invalid composition: {exc}"}
 
