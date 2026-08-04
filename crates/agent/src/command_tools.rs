@@ -1571,6 +1571,50 @@ fn run_submit_schema() -> Value {
             "slurm_partition": {
                 "type": "string",
                 "description": "SLURM partition name."
+            },
+            "slurm_account": {
+                "type": "string",
+                "description": "SLURM allocation account."
+            },
+            "slurm_time": {
+                "type": "string",
+                "description": "SLURM wall time, for example `02:00:00`."
+            },
+            "slurm_gres": {
+                "type": "string",
+                "description": "SLURM generic resources, for example `gpu:a100:1`."
+            },
+            "slurm_mem": {
+                "type": "string",
+                "description": "Total SLURM memory per node, for example `64G`."
+            },
+            "slurm_mem_per_cpu": {
+                "type": "string",
+                "description": "SLURM memory per allocated CPU, for example `8G`; do not combine with `slurm_mem`."
+            },
+            "slurm_cpus_per_task": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "SLURM CPUs per task."
+            },
+            "slurm_nodes": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "SLURM node count."
+            },
+            "slurm_ntasks": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "SLURM task count."
+            },
+            "slurm_array": {
+                "type": "string",
+                "description": "SLURM array expression, for example `0-15%4`."
+            },
+            "slurm_dependency_afterok": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Run only after this numeric SLURM job id completes successfully."
             }
         },
         "required": ["image"],
@@ -2865,6 +2909,36 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             if let Some(slurm_partition) = optional_string(input, "slurm_partition") {
                 args.push("--slurm-partition".to_string());
                 args.push(slurm_partition);
+            }
+            for (field, flag) in [
+                ("slurm_account", "--slurm-account"),
+                ("slurm_time", "--slurm-time"),
+                ("slurm_gres", "--slurm-gres"),
+                ("slurm_mem", "--slurm-mem"),
+                ("slurm_mem_per_cpu", "--slurm-mem-per-cpu"),
+            ] {
+                if let Some(value) = optional_string(input, field) {
+                    args.push(flag.to_string());
+                    args.push(value);
+                }
+            }
+            for (field, flag) in [
+                ("slurm_cpus_per_task", "--slurm-cpus-per-task"),
+                ("slurm_nodes", "--slurm-nodes"),
+                ("slurm_ntasks", "--slurm-ntasks"),
+            ] {
+                if let Some(value) = optional_usize(input, field) {
+                    args.push(flag.to_string());
+                    args.push(value.to_string());
+                }
+            }
+            if let Some(slurm_array) = optional_string(input, "slurm_array") {
+                args.push("--slurm-array".to_string());
+                args.push(slurm_array);
+            }
+            if let Some(job_id) = optional_usize(input, "slurm_dependency_afterok") {
+                args.push("--slurm-dependency-afterok".to_string());
+                args.push(job_id.to_string());
             }
             args.push(required_string(input, "image")?);
             args.push("--json".to_string());
@@ -5403,6 +5477,57 @@ ValueError: boom\n";
         assert_eq!(
             preview,
             "prism discourse run abc-123 --param alloy=IN718 --json"
+        );
+    }
+
+    #[test]
+    fn run_submit_schema_exposes_all_slurm_resources() {
+        let schema = run_submit_schema();
+        let properties = schema["properties"].as_object().unwrap();
+        for field in [
+            "slurm_account",
+            "slurm_time",
+            "slurm_gres",
+            "slurm_mem",
+            "slurm_mem_per_cpu",
+            "slurm_cpus_per_task",
+            "slurm_nodes",
+            "slurm_ntasks",
+            "slurm_array",
+            "slurm_dependency_afterok",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "missing schema field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_submit_emits_all_slurm_resource_flags() {
+        let preview = command_tool_preview(
+            "run_submit",
+            &json!({
+                "image": "/shared/prism-worker.sif",
+                "backend": "byoc",
+                "slurm": "researcher@login.hpc",
+                "slurm_partition": "gpu",
+                "slurm_account": "esa-materials",
+                "slurm_time": "02:00:00",
+                "slurm_gres": "gpu:a100:1",
+                "slurm_mem": "64G",
+                "slurm_cpus_per_task": 8,
+                "slurm_nodes": 2,
+                "slurm_ntasks": 4,
+                "slurm_array": "0-15%4",
+                "slurm_dependency_afterok": 98765
+            }),
+        )
+        .expect("SLURM run preview should render");
+
+        assert_eq!(
+            preview,
+            "prism run --backend byoc --slurm researcher@login.hpc --slurm-partition gpu --slurm-account esa-materials --slurm-time 02:00:00 --slurm-gres gpu:a100:1 --slurm-mem 64G --slurm-cpus-per-task 8 --slurm-nodes 2 --slurm-ntasks 4 --slurm-array 0-15%4 --slurm-dependency-afterok 98765 /shared/prism-worker.sif --json"
         );
     }
 
