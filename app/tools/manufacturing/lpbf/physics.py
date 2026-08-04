@@ -115,20 +115,44 @@ def _rosenthal_isotherm_geometry(
     advection_per_m: float,
     temperature_rise_k: float,
 ) -> dict[str, float]:
-    """Return exact Rosenthal isotherm extents using the Lambert W function."""
+    """Return exact Rosenthal isotherm extents.
+
+    Longitudinal extents are closed-form via Lambert W.  The transverse
+    extents are NOT: a moving source drags its pool backwards, so the widest
+    and deepest point of the isotherm lies behind the beam, not beneath it.
+    Evaluating the isotherm radius at xi=0 understates both by ~40% in the
+    LPBF regime, which would over-predict lack of fusion.  The maximum is
+    found properly below.
+    """
+    from scipy.optimize import brentq
     from scipy.special import lambertw
 
     argument = advection_per_m * amplitude_k_m / temperature_rise_k
-    transverse_radius = float(lambertw(argument).real / advection_per_m)
     rear_length = amplitude_k_m / temperature_rise_k
     front_length = float(
         lambertw(2.0 * argument).real / (2.0 * advection_per_m)
     )
+
+    # Widest point of the isotherm.  On the isotherm, dR/dxi = 0 gives
+    # xi = -beta R^2 / (1 + beta R); substituting back leaves, with
+    # s = beta R, the scalar root  s * exp(s / (1 + s)) = argument.
+    def _max_radius_residual(s: float) -> float:
+        return s * math.exp(s / (1.0 + s)) - argument
+
+    upper = max(4.0 * argument, 1.0)
+    s_max = brentq(_max_radius_residual, 1e-12, upper, xtol=1e-14, rtol=1e-13)
+    radius_at_widest = s_max / advection_per_m
+    xi_at_widest = -(advection_per_m * radius_at_widest**2) / (1.0 + s_max)
+    half_width = math.sqrt(
+        max(radius_at_widest**2 - xi_at_widest**2, 0.0)
+    )
+
     values = {
-        "width_m": 2.0 * transverse_radius,
-        # In the isotropic surface-point-source solution the transverse
-        # isotherm is circular; only its lower half lies in the body.
-        "depth_m": transverse_radius,
+        "width_m": 2.0 * half_width,
+        # The isotherm is a surface of revolution about the scan axis, so its
+        # maximum radial extent is the same sideways and downwards; only the
+        # lower half lies in the body, hence depth == half-width.
+        "depth_m": half_width,
         "length_m": rear_length + front_length,
         "rear_length_m": rear_length,
         "front_length_m": front_length,

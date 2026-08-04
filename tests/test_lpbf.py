@@ -36,12 +36,15 @@ def _synthetic_material() -> dict:
 
 
 def _analytical_process() -> dict:
-    # Hand calculation for the liquidus transverse isotherm:
-    # alpha = 10/(1000*1000) = 1e-5 m2/s. Choose r=1e-4 m and
-    # beta*r=ln(2), then exp(-beta*r)=1/2. Choose A=eta*P/(2*pi*k)
-    # = 2*DeltaT*r = 0.2 K m. Therefore
-    # DeltaT=A/r*exp(-beta*r)=0.2/1e-4/2=1000 K exactly,
-    # so liquidus depth=r and width=2r.
+    # A clean process point, chosen so the field constants are exact:
+    # alpha = 10/(1000*1000) = 1e-5 m2/s, beta*r = ln(2) at r = 1e-4 m, and
+    # A = eta*P/(2*pi*k) = 0.2 K m, giving a liquidus rise of exactly 1000 K.
+    #
+    # NOTE: r = 1e-4 is the isotherm radius directly beneath the source
+    # (xi = 0). That is NOT the melt pool depth or half-width — a moving
+    # source drags its pool backwards, so the widest point sits behind the
+    # beam. The transverse extents are pinned in the tests against an
+    # independent root-find, not against this number.
     radius_m = 1.0e-4
     alpha = 1.0e-5
     beta = math.log(2.0) / radius_m
@@ -70,10 +73,71 @@ def test_rosenthal_known_analytical_transverse_isotherm():
     )
 
     assert result["thermal_diffusivity_m2_per_s"] == pytest.approx(1.0e-5)
-    assert result["liquidus"]["depth_m"] == pytest.approx(1.0e-4, rel=1e-12)
-    assert result["liquidus"]["width_m"] == pytest.approx(2.0e-4, rel=1e-12)
+    # Transverse extents are the MAXIMUM over the pool, which lies behind the
+    # beam — not the isotherm radius at xi = 0 (which would be 1.0e-4 here).
+    # Values cross-checked against a per-xi root-find in the test below.
+    assert result["liquidus"]["depth_m"] == pytest.approx(1.11153157e-4, rel=1e-8)
+    assert result["liquidus"]["width_m"] == pytest.approx(2.22306314e-4, rel=1e-8)
+    # Rear length is exactly A/DeltaT and is unaffected by the above.
     assert result["liquidus"]["rear_length_m"] == pytest.approx(2.0e-4)
     assert result["latent_heat_used_in_temperature_field"] is False
+
+
+def test_rosenthal_transverse_extents_match_independent_root_find():
+    """Guard the melt-pool maximum against a method that shares no algebra.
+
+    The implementation reduces the widest-point condition to a scalar root in
+    s = beta*R. This test instead solves T(xi, rho) = dT for rho at each xi and
+    maximises over xi, so a mistake in that reduction cannot hide.
+    """
+    from scipy.optimize import brentq, minimize_scalar
+
+    material = _synthetic_material()
+    process = _analytical_process()
+    result = rosenthal_melt_pool_geometry(**process, **material)
+
+    alpha = material["thermal_conductivity_w_mk"] / (
+        material["density_kg_m3"] * material["specific_heat_j_kgk"]
+    )
+    amplitude = (
+        material["absorptivity"]
+        * process["power_w"]
+        / (2.0 * math.pi * material["thermal_conductivity_w_mk"])
+    )
+    beta = process["scan_velocity_m_per_s"] / (2.0 * alpha)
+
+    for isotherm in ("solidus", "liquidus"):
+        rise = material[f"{isotherm}_temperature_k"] - material[
+            "initial_temperature_k"
+        ]
+
+        def radius_at(xi: float) -> float:
+            def residual(rho: float) -> float:
+                radial = math.sqrt(xi * xi + rho * rho)
+                return (amplitude / radial) * math.exp(
+                    -beta * (radial + xi)
+                ) - rise
+
+            if residual(1e-12) < 0.0:
+                return 0.0
+            return brentq(residual, 1e-12, 1e-2, xtol=1e-16, rtol=1e-15)
+
+        found = minimize_scalar(
+            lambda xi: -radius_at(xi),
+            bounds=(-5e-3, 0.0),
+            method="bounded",
+            options={"xatol": 1e-12},
+        )
+        half_width = -found.fun
+
+        assert result[isotherm]["depth_m"] == pytest.approx(half_width, rel=1e-9)
+        assert result[isotherm]["width_m"] == pytest.approx(
+            2.0 * half_width, rel=1e-9
+        )
+        # The widest point is strictly behind the beam, so it must exceed the
+        # xi = 0 radius. This is the assertion the original code failed.
+        radius_beneath_beam = radius_at(0.0)
+        assert half_width > radius_beneath_beam * 1.05
 
 
 def test_lack_of_fusion_boundary_triggers_and_does_not_trigger():
@@ -81,11 +145,15 @@ def test_lack_of_fusion_boundary_triggers_and_does_not_trigger():
     assert safe["metrics"]["lack_of_fusion_overlap_index"] < 1.0
     assert safe["defects"]["lack_of_fusion"] is False
 
+    # Hatch wider than the pool and a layer thicker than half its depth, so
+    # (h/W)^2 + (t/D)^2 clears 1.0 with margin rather than sitting on it. The
+    # earlier values sat at 0.987 and only "triggered" because the melt pool
+    # was being undersized by ~40%.
     insufficient_overlap = classify_parameter_set(
         **{
             **_classification_inputs(),
-            "hatch_spacing_m": 2.2e-4,
-            "layer_thickness_m": 1.0e-5,
+            "hatch_spacing_m": 2.4e-4,
+            "layer_thickness_m": 6.0e-5,
         }
     )
     assert insufficient_overlap["metrics"]["lack_of_fusion_overlap_index"] > 1.0
