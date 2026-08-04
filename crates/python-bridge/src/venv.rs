@@ -19,6 +19,8 @@ const PYTHON_CANDIDATES: &[&str] = &[
     "python3.11",
     "python3",
 ];
+const OFFLINE_ENV: &str = "PRISM_OFFLINE";
+const WHEELHOUSE_ENV: &str = "PRISM_WHEELHOUSE";
 
 /// Ensure a managed venv exists at `{prism_dir}/venv/` and return the path to
 /// its `python3` binary.  Creates the venv (and pip-installs PRISM) on first
@@ -29,12 +31,23 @@ pub async fn ensure_venv(
 ) -> Result<PathBuf, PythonBridgeError> {
     let venv_dir = prism_dir.join("venv");
     let venv_python = venv_dir.join("bin/python3");
+    let offline = std::env::var(OFFLINE_ENV).is_ok_and(|value| value == "1");
+    let wheelhouse = offline_wheelhouse(prism_dir);
 
     // Fast path — venv exists AND actually has the PRISM tools. A venv
     // directory alone proves nothing (fresh boxes used to end up with an
     // empty, pipless venv that this fast path then trusted forever).
     if venv_python.exists() && python_has_app(&venv_python).await {
         return Ok(venv_python);
+    }
+
+    if offline && !wheelhouse.is_dir() {
+        return Err(PythonBridgeError::Spawn(std::io::Error::other(format!(
+            "offline mode: PRISM Python is not installed and no wheelhouse exists at {}. \
+             Pre-stage it with `prism provision --wheels {}` before moving this node.",
+            wheelhouse.display(),
+            wheelhouse.display()
+        ))));
     }
 
     // 1. Create the venv if the interpreter is missing entirely.
@@ -74,7 +87,7 @@ pub async fn ensure_venv(
             .status()
             .await;
     }
-    if !pip.exists() {
+    if !pip.exists() && !offline {
         eprintln!("[prism] Bootstrapping pip (get-pip.py)…");
         let _ = Command::new("sh")
             .args([
@@ -112,13 +125,26 @@ pub async fn ensure_venv(
     // WHERE the tools come from is decided by `install_plan` — see there
     // for why a source build must never pull a published wheel.
     eprintln!("[prism] Installing PRISM tools into venv…");
-    let plan = install_plan(env!("CARGO_PKG_VERSION"), build_source_root());
+    let version = env!("CARGO_PKG_VERSION");
+    let plan = if offline {
+        offline_install_plan(version, build_source_root())
+    } else {
+        install_plan(version, build_source_root())
+    };
     let mut installed = false;
     for source in &plan {
         eprintln!("[prism] {}", source.describe());
+        let mut pip_args = vec!["-m".to_string(), "pip".to_string(), "install".to_string()];
+        if offline {
+            pip_args.extend([
+                "--no-index".to_string(),
+                "--find-links".to_string(),
+                wheelhouse.to_string_lossy().into_owned(),
+            ]);
+        }
+        pip_args.extend(source.pip_args());
         let pip_status = Command::new(&venv_python)
-            .args(["-m", "pip", "install"])
-            .args(source.pip_args())
+            .args(&pip_args)
             .current_dir(project_root)
             .stderr(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::null())
@@ -136,10 +162,21 @@ pub async fn ensure_venv(
             .first()
             .map(|s| s.pip_args().join(" "))
             .unwrap_or_default();
-        return Err(PythonBridgeError::Spawn(std::io::Error::other(format!(
-            "could not install PRISM tools — retry manually: \
-             ~/.prism/venv/bin/pip install {retry}"
-        ))));
+        let message = if offline {
+            format!(
+                "offline mode: could not install PRISM tools from {} — \
+                 pre-stage compatible wheels with `prism provision --wheels {}`; \
+                 attempted: {retry}",
+                wheelhouse.display(),
+                wheelhouse.display()
+            )
+        } else {
+            format!(
+                "could not install PRISM tools — retry manually: \
+                 ~/.prism/venv/bin/pip install {retry}"
+            )
+        };
+        return Err(PythonBridgeError::Spawn(std::io::Error::other(message)));
     }
 
     eprintln!("[prism] Venv ready at {}", venv_dir.display());
@@ -157,6 +194,8 @@ const BUILD_MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 /// Where the Python half of PRISM is installed from, in preference order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstallSource {
+    /// A wheelhouse install of the published Python package.
+    Wheelhouse { version: String },
     /// An editable install of the checkout this binary was built from.
     /// Editable rather than a plain `pip install <dir>` so that later
     /// edits to `app/` are live without re-provisioning the venv.
@@ -171,6 +210,7 @@ enum InstallSource {
 impl InstallSource {
     fn pip_args(&self) -> Vec<String> {
         match self {
+            Self::Wheelhouse { version } => vec![format!("prism-platform=={version}")],
             Self::Source(root) => vec!["-e".to_string(), root.to_string_lossy().into_owned()],
             Self::Wheel { version } => vec![format!(
                 "prism-platform @ https://github.com/Darth-Hidious/PRISM/releases/download/v{version}/prism_platform-{version}-py3-none-any.whl"
@@ -183,6 +223,7 @@ impl InstallSource {
 
     fn describe(&self) -> String {
         match self {
+            Self::Wheelhouse { version } => format!("from the offline wheelhouse (v{version})"),
             Self::Source(root) => format!("from this source tree ({})", root.display()),
             Self::Wheel { version } => format!("from the v{version} release wheel"),
             Self::Git => "from git main".to_string(),
@@ -212,6 +253,22 @@ fn install_plan(version: &str, source_root: Option<PathBuf>) -> Vec<InstallSourc
     });
     plan.push(InstallSource::Git);
     plan
+}
+
+fn offline_wheelhouse(prism_dir: &Path) -> PathBuf {
+    std::env::var_os(WHEELHOUSE_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| prism_dir.join("wheelhouse"))
+}
+
+fn offline_install_plan(version: &str, source_root: Option<PathBuf>) -> Vec<InstallSource> {
+    source_root
+        .map(|root| vec![InstallSource::Source(root)])
+        .unwrap_or_else(|| {
+            vec![InstallSource::Wheelhouse {
+                version: version.to_string(),
+            }]
+        })
 }
 
 /// The PRISM checkout this binary was built from, if it is still present.
@@ -259,11 +316,13 @@ async fn find_system_python() -> Result<PathBuf, PythonBridgeError> {
         }
     }
 
-    // Fallback: uv python find
-    if let Ok(output) = Command::new("uv")
-        .args(["python", "find", "--min-version", "3.11"])
-        .output()
-        .await
+    // `uv python find` is useful online, but keep the offline path strictly
+    // local: a future uv configuration must not turn this into a download.
+    if std::env::var(OFFLINE_ENV).is_err()
+        && let Ok(output) = Command::new("uv")
+            .args(["python", "find", "--min-version", "3.11"])
+            .output()
+            .await
         && output.status.success()
     {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -376,6 +435,32 @@ mod tests {
             !url.contains("1.0.0"),
             "the version must not be hardcoded, got {url}"
         );
+    }
+
+    #[test]
+    fn offline_install_never_falls_back_to_remote_sources() {
+        let source_root = PathBuf::from("/opt/prism");
+        let source_plan = offline_install_plan("1.0.0", Some(source_root.clone()));
+        assert_eq!(
+            source_plan,
+            vec![InstallSource::Source(source_root.clone())]
+        );
+        assert!(
+            source_plan[0]
+                .pip_args()
+                .iter()
+                .all(|arg| !arg.contains("https://") && !arg.contains("git+")),
+            "offline source install must not contain a remote URL"
+        );
+
+        let wheel_plan = offline_install_plan("1.0.0", None);
+        assert_eq!(
+            wheel_plan,
+            vec![InstallSource::Wheelhouse {
+                version: "1.0.0".to_string()
+            }]
+        );
+        assert_eq!(wheel_plan[0].pip_args(), vec!["prism-platform==1.0.0"]);
     }
 
     /// The compile-time path can be occupied by something else by the time
