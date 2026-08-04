@@ -110,10 +110,14 @@ pub struct CampaignConfig {
     /// Negative = minimize, positive = maximize.
     #[serde(default)]
     pub reward_weights: BTreeMap<String, f64>,
-    /// Base URL override for the proposal LLM. None = `$LLM_BASE_URL` /
-    /// `$LLM_API_BASE`, then `http://127.0.0.1:8081/v1`.
+    /// Base URL override for the proposal LLM. None = the configured chat
+    /// target, unless `$LLM_API_BASE` is explicitly set.
     #[serde(default)]
     pub llm_base_url: Option<String>,
+    /// Project root used by the shared chat-target resolver.
+    /// `None` uses the current working directory.
+    #[serde(default)]
+    pub project_root: Option<PathBuf>,
     /// Base URL override for the PRISM node that runs the evaluation tool.
     /// None = `http://127.0.0.1:$PRISM_NODE_PORT` (default port 7327).
     #[serde(default)]
@@ -141,6 +145,7 @@ impl Default for CampaignConfig {
             llm_temperature: 0.7,
             reward_weights: BTreeMap::new(),
             llm_base_url: None,
+            project_root: None,
             node_base_url: None,
         }
     }
@@ -1088,17 +1093,53 @@ impl Campaign {
         // Build the LLM prompt for proposal.
         let prompt = self.build_proposal_prompt(batch);
 
-        // Use the LLM to propose candidates.
-        let base_url = self.state.config.llm_base_url.clone().unwrap_or_else(|| {
-            std::env::var("LLM_BASE_URL")
-                .or_else(|_| std::env::var("LLM_API_BASE"))
-                .unwrap_or_else(|_| "http://127.0.0.1:8081/v1".to_string())
-        });
-        let api_key = std::env::var("LLM_API_KEY")
-            .or_else(|_| std::env::var("MARC27_TOKEN"))
-            .ok();
+        // Use the shared chat-target resolver for the proposal LLM. An
+        // explicit endpoint override remains an escape hatch, but the
+        // resolver is still attempted first so it supplies the selected
+        // target's model and credentials when available.
+        let explicit_base_url = std::env::var("LLM_API_BASE")
+            .ok()
+            .or_else(|| self.state.config.llm_base_url.clone())
+            .or_else(|| std::env::var("LLM_BASE_URL").ok());
+        let project_root = self
+            .state
+            .config
+            .project_root
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let paths = prism_runtime::PrismPaths::discover()
+            .context("failed to locate PRISM state directories for campaign LLM resolution")?;
+        let resolved = match prism_runtime::llm_resolve::resolve_llm(&project_root, &paths) {
+            Ok(resolved) => Some(resolved),
+            Err(error) if explicit_base_url.is_some() => {
+                debug!(error = %error, "using explicit campaign LLM endpoint override");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let base_url = explicit_base_url
+            .or_else(|| resolved.as_ref().map(|llm| llm.base_url.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No LLM endpoint resolved. Run `prism use marc27 --model <model>` for the hosted platform or `prism use local --url <url> --model <model>` for a local model."
+                )
+            })?;
+        let api_key = resolved
+            .as_ref()
+            .and_then(|llm| llm.api_key.clone())
+            .or_else(|| {
+                std::env::var("LLM_API_KEY")
+                    .or_else(|_| std::env::var("MARC27_TOKEN"))
+                    .ok()
+            });
         let model = if self.state.config.llm_model.is_empty() {
-            std::env::var("LLM_MODEL").unwrap_or_else(|_| "gemma-4-12b".to_string())
+            resolved
+                .as_ref()
+                .map(|llm| llm.model.clone())
+                .filter(|model| !model.is_empty())
+                .or_else(|| std::env::var("LLM_MODEL").ok())
+                .unwrap_or_else(|| "gemma-4-12b".to_string())
         } else {
             self.state.config.llm_model.clone()
         };
@@ -1107,7 +1148,7 @@ impl Campaign {
             base_url,
             api_key,
             model: model.clone(),
-            embedding_model: None,
+            embedding_model: resolved.and_then(|llm| llm.embedding_model),
             ..Default::default()
         };
         let client = prism_llm::LlmClient::new(config);
@@ -1371,7 +1412,59 @@ impl Campaign {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use axum::extract::State;
+    use axum::response::Json;
+    use axum::routing::post;
+    use serde_json::{Value, json};
+    use std::ffi::OsString;
+    use std::sync::{Arc, Mutex};
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl Into<OsString>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests serialize environment changes with ENV_LOCK.
+            unsafe { std::env::set_var(key, value.into()) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests serialize environment changes with ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests serialize environment changes with ENV_LOCK.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    async fn configured_target_chat(
+        State(model): State<Arc<Mutex<Option<String>>>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        *model.lock().unwrap() = body["model"].as_str().map(str::to_string);
+        Json(json!({
+            "choices": [{
+                "message": { "content": "[\"W0.5 Mo0.5\"]" }
+            }]
+        }))
+    }
 
     fn test_goal() -> CampaignGoal {
         CampaignGoal {
@@ -1464,6 +1557,115 @@ mod tests {
         let parsed = campaign.parse_compositions("[\"W0.3 Mo0.2\", \"Ta0.5 Nb0.5\"]");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0], "W0.3 Mo0.2");
+    }
+
+    #[tokio::test]
+    async fn proposal_without_chat_target_fails_with_actionable_error() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_config = tmp.path().join("missing-config.toml");
+        let _config = EnvGuard::set("PRISM_CONFIG_PATH", missing_config.into_os_string());
+        let _api_base = EnvGuard::remove("LLM_API_BASE");
+        let _base_url = EnvGuard::remove("LLM_BASE_URL");
+
+        let mut goal = test_goal();
+        goal.seeds.clear();
+        let mut campaign = Campaign::new(goal, CampaignConfig::default(), "no-target".into());
+        let error = campaign
+            .propose_candidates()
+            .await
+            .expect_err("an unresolved chat target must halt the campaign");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("prism use marc27"), "error: {message}");
+        assert!(message.contains("prism use local"), "error: {message}");
+        assert!(!message.contains("127.0.0.1:8081"), "error: {message}");
+    }
+
+    #[tokio::test]
+    async fn llm_api_base_override_wins_over_campaign_endpoint() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(configured_target_chat))
+            .with_state(Arc::new(Mutex::new(None)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_config = tmp.path().join("missing-config.toml");
+        let _config = EnvGuard::set("PRISM_CONFIG_PATH", missing_config.into_os_string());
+        let _api_base = EnvGuard::set("LLM_API_BASE", format!("{base_url}/v1"));
+        let _base_url = EnvGuard::remove("LLM_BASE_URL");
+        let mut goal = test_goal();
+        goal.seeds.clear();
+        let mut campaign = Campaign::new(
+            goal,
+            CampaignConfig {
+                llm_base_url: Some("http://127.0.0.1:1/v1".into()),
+                ..Default::default()
+            },
+            "api-base-override".into(),
+        );
+
+        let proposals = campaign
+            .propose_candidates()
+            .await
+            .expect("LLM_API_BASE should override the campaign endpoint");
+
+        assert_eq!(proposals, vec!["W0.5 Mo0.5"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn proposal_uses_configured_chat_target_and_model() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let captured_model = Arc::new(Mutex::new(None));
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(configured_target_chat))
+            .with_state(captured_model.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[chat]\nmode = \"local\"\nurl = \"{base_url}/v1\"\nmodel = \"target-model\"\n"
+            ),
+        )
+        .unwrap();
+        let _config = EnvGuard::set("PRISM_CONFIG_PATH", config_path.into_os_string());
+        let _api_base = EnvGuard::remove("LLM_API_BASE");
+        let _base_url = EnvGuard::remove("LLM_BASE_URL");
+
+        let mut goal = test_goal();
+        goal.seeds.clear();
+        let mut campaign = Campaign::new(
+            goal,
+            CampaignConfig {
+                checkpoint_dir: Some(tmp.path().to_path_buf()),
+                ..Default::default()
+            },
+            "configured-target".into(),
+        );
+        let proposals = campaign
+            .propose_candidates()
+            .await
+            .expect("configured target should serve proposals");
+
+        assert_eq!(proposals, vec!["W0.5 Mo0.5"]);
+        assert_eq!(
+            captured_model.lock().unwrap().as_deref(),
+            Some("target-model")
+        );
+        server.abort();
     }
 
     #[test]

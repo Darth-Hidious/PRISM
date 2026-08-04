@@ -110,7 +110,7 @@ pub fn resolve_llm_with(
         None => {
             if !chat_config::chat_target_is_configured() {
                 anyhow::bail!(
-                    "No LLM provider selected. PRISM is provider-neutral: choose the hosted                      platform, a local endpoint, or a direct provider (prism use / the app's                      picker)."
+                    "No LLM provider selected. Choose a chat target with `prism use marc27 --model <model>` for the hosted platform or `prism use local --url <url> --model <model>` for a local model."
                 );
             }
             chat_config::load().unwrap_or_default().chat

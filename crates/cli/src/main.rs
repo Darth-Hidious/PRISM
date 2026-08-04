@@ -1771,6 +1771,7 @@ async fn main() -> Result<()> {
                         budget_usd: budget,
                         checkpoint_every,
                         approval_gate_at: gates_vec,
+                        project_root: Some(project_root.clone()),
                         ..Default::default()
                     };
 

@@ -19,6 +19,7 @@ uuid = { workspace = true }
 prism-workflows = { path = "../workflows" }
 prism-provenance = { path = "../provenance" }
 prism-llm = { path = "../llm" }
+prism-runtime = { path = "../runtime" }
 reqwest.workspace = true
 
 [dev-dependencies]

@@ -4626,6 +4626,7 @@ dependencies = [
  "chrono",
  "prism-llm",
  "prism-provenance",
+ "prism-runtime",
  "prism-workflows",
  "reqwest",
  "serde",
