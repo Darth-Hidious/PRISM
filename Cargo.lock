@@ -4567,7 +4567,7 @@ dependencies = [
 
 [[package]]
 name = "prism-agent"
-version = "2.6.1"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4601,7 +4601,7 @@ dependencies = [
 
 [[package]]
 name = "prism-audit"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4619,7 +4619,7 @@ dependencies = [
 
 [[package]]
 name = "prism-campaign"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -4639,7 +4639,7 @@ dependencies = [
 
 [[package]]
 name = "prism-cli"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4683,7 +4683,7 @@ dependencies = [
 
 [[package]]
 name = "prism-client"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -4696,7 +4696,7 @@ dependencies = [
 
 [[package]]
 name = "prism-compute"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4711,7 +4711,7 @@ dependencies = [
 
 [[package]]
 name = "prism-core"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4728,7 +4728,7 @@ dependencies = [
 
 [[package]]
 name = "prism-embed"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4745,7 +4745,7 @@ dependencies = [
 
 [[package]]
 name = "prism-frontend"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4762,7 +4762,7 @@ dependencies = [
 
 [[package]]
 name = "prism-ingest"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4784,7 +4784,7 @@ dependencies = [
 
 [[package]]
 name = "prism-ipc"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -4795,7 +4795,7 @@ dependencies = [
 
 [[package]]
 name = "prism-llm"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4808,7 +4808,7 @@ dependencies = [
 
 [[package]]
 name = "prism-mesh"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4837,7 +4837,7 @@ dependencies = [
 
 [[package]]
 name = "prism-node"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4871,7 +4871,7 @@ dependencies = [
 
 [[package]]
 name = "prism-orch"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4886,7 +4886,7 @@ dependencies = [
 
 [[package]]
 name = "prism-policy"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4899,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "prism-proto"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4908,7 +4908,7 @@ dependencies = [
 
 [[package]]
 name = "prism-provenance"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4925,7 +4925,7 @@ dependencies = [
 
 [[package]]
 name = "prism-python-bridge"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4937,7 +4937,7 @@ dependencies = [
 
 [[package]]
 name = "prism-runtime"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4951,7 +4951,7 @@ dependencies = [
 
 [[package]]
 name = "prism-server"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -4984,7 +4984,7 @@ dependencies = [
 
 [[package]]
 name = "prism-tui"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5011,7 +5011,7 @@ dependencies = [
 
 [[package]]
 name = "prism-workflows"
-version = "1.0.0"
+version = "2.7.1"
 dependencies = [
  "anyhow",
  "axum",

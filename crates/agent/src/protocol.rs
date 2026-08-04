@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -62,11 +62,11 @@ fn install_sink(tx: std::sync::mpsc::Sender<Value>) {
 }
 
 fn emit_raw(value: &Value) {
-    if let Some(slot) = SINK.get() {
-        if let Some(tx) = slot.lock().unwrap().as_ref() {
-            let _ = tx.send(value.clone());
-            return;
-        }
+    if let Some(slot) = SINK.get()
+        && let Some(tx) = slot.lock().unwrap().as_ref()
+    {
+        let _ = tx.send(value.clone());
+        return;
     }
     let line = serde_json::to_string(value).expect("JSON serialization failed");
     let stdout = io::stdout();
@@ -7405,7 +7405,9 @@ pub fn run_server_native(
             self.0.recv().ok()
         }
     }
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(run_server_core(
         llm_config,
         tool_server_config,
