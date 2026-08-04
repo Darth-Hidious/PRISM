@@ -228,7 +228,7 @@ def test_isothermal_volume_fraction_approaches_equilibrium(long_isothermal_run):
     assert vf[-1] > 0.0, "no precipitation occurred at all"
 
     # Independent equilibrium reference via pycalphad.
-    from app.tools.materials.precipitation.compat import apply_py314_workspace_shim
+    from app.tools.pycalphad_compat import apply_py314_workspace_shim
 
     apply_py314_workspace_shim()
     from pycalphad import Database, equilibrium, variables as v

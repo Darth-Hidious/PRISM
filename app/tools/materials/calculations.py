@@ -250,6 +250,9 @@ def _hea_phase_stability_tool() -> Tool:
             return _missing_error()
         try:
             import pycalphad as pyc
+            from app.tools.pycalphad_compat import apply_py314_workspace_shim
+
+            apply_py314_workspace_shim()
             from pycalphad import Database, equilibrium
             from pycalphad.model import Model
             import numpy as np

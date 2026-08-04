@@ -185,6 +185,11 @@ class CalphadBridge:
         if db is None:
             return {"error": f"Database '{database_name}' not found"}
 
+        # pycalphad 0.11.2 Workspace is broken under PEP 649 (py3.14);
+        # equilibrium() routes through it. No-op on older interpreters.
+        from app.tools.pycalphad_compat import apply_py314_workspace_shim
+
+        apply_py314_workspace_shim()
         from pycalphad import equilibrium, variables as v
 
         comps = _ensure_vacancy(components)
@@ -230,6 +235,11 @@ class CalphadBridge:
         if db is None:
             return {"error": f"Database '{database_name}' not found"}
 
+        # pycalphad 0.11.2 Workspace is broken under PEP 649 (py3.14);
+        # equilibrium() routes through it. No-op on older interpreters.
+        from app.tools.pycalphad_compat import apply_py314_workspace_shim
+
+        apply_py314_workspace_shim()
         from pycalphad import equilibrium, variables as v
 
         comps = _ensure_vacancy(components)

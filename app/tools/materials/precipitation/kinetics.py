@@ -295,8 +295,9 @@ def _build_and_solve(spec: dict) -> dict:
 
     # Python 3.14 / PEP 649 fix for pycalphad 0.11.2's Workspace (no-op
     # elsewhere). Without it every CALPHAD lookup inside kawin raises
-    # AttributeError before any physics runs. See compat.py for evidence.
-    from app.tools.materials.precipitation.compat import apply_py314_workspace_shim
+    # AttributeError before any physics runs. See app/tools/pycalphad_compat.py
+    # for evidence.
+    from app.tools.pycalphad_compat import apply_py314_workspace_shim
 
     apply_py314_workspace_shim()
 
