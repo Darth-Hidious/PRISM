@@ -280,7 +280,7 @@ enum Commands {
     Agent,
     /// Submit a compute job (local Docker, the hosted platform, or BYOC).
     Run {
-        /// Container image to run.
+        /// Container image to run, or a pre-staged .sif path for SLURM.
         image: String,
         /// Job name.
         #[arg(long, default_value = "experiment")]
@@ -316,6 +316,36 @@ enum Commands {
         /// SLURM partition.
         #[arg(long, default_value = "default")]
         slurm_partition: String,
+        /// SLURM allocation account.
+        #[arg(long)]
+        slurm_account: Option<String>,
+        /// SLURM wall time, for example 02:00:00.
+        #[arg(long)]
+        slurm_time: Option<String>,
+        /// SLURM generic resources, for example gpu:a100:1.
+        #[arg(long)]
+        slurm_gres: Option<String>,
+        /// Total SLURM memory per node, for example 64G.
+        #[arg(long, conflicts_with = "slurm_mem_per_cpu")]
+        slurm_mem: Option<String>,
+        /// SLURM memory per allocated CPU, for example 8G.
+        #[arg(long, conflicts_with = "slurm_mem")]
+        slurm_mem_per_cpu: Option<String>,
+        /// SLURM CPUs per task.
+        #[arg(long)]
+        slurm_cpus_per_task: Option<u32>,
+        /// SLURM node count.
+        #[arg(long)]
+        slurm_nodes: Option<u32>,
+        /// SLURM task count.
+        #[arg(long)]
+        slurm_ntasks: Option<u32>,
+        /// SLURM array expression, for example 0-15%4.
+        #[arg(long)]
+        slurm_array: Option<String>,
+        /// Run only after this SLURM job id completes successfully.
+        #[arg(long)]
+        slurm_dependency_afterok: Option<u64>,
         /// Emit machine-readable JSON instead of human-readable status lines.
         #[arg(long)]
         json: bool,
@@ -3233,6 +3263,16 @@ async fn main() -> Result<()> {
             k8s_namespace,
             slurm,
             slurm_partition,
+            slurm_account,
+            slurm_time,
+            slurm_gres,
+            slurm_mem,
+            slurm_mem_per_cpu,
+            slurm_cpus_per_task,
+            slurm_nodes,
+            slurm_ntasks,
+            slurm_array,
+            slurm_dependency_afterok,
             json,
         } => {
             handle_run(
@@ -3248,6 +3288,16 @@ async fn main() -> Result<()> {
                 &k8s_namespace,
                 slurm.as_deref(),
                 &slurm_partition,
+                slurm_account.as_deref(),
+                slurm_time.as_deref(),
+                slurm_gres.as_deref(),
+                slurm_mem.as_deref(),
+                slurm_mem_per_cpu.as_deref(),
+                slurm_cpus_per_task,
+                slurm_nodes,
+                slurm_ntasks,
+                slurm_array.as_deref(),
+                slurm_dependency_afterok,
                 json,
             )
             .await?;
@@ -10150,11 +10200,21 @@ async fn handle_run(
     k8s_namespace: &str,
     slurm: Option<&str>,
     slurm_partition: &str,
+    slurm_account: Option<&str>,
+    slurm_time: Option<&str>,
+    slurm_gres: Option<&str>,
+    slurm_mem: Option<&str>,
+    slurm_mem_per_cpu: Option<&str>,
+    slurm_cpus_per_task: Option<u32>,
+    slurm_nodes: Option<u32>,
+    slurm_ntasks: Option<u32>,
+    slurm_array: Option<&str>,
+    slurm_dependency_afterok: Option<u64>,
     json: bool,
 ) -> Result<()> {
     use prism_compute::ExperimentPlan;
     use prism_compute::backend::ComputeRouter;
-    use prism_compute::byoc::ByocTarget;
+    use prism_compute::byoc::{ByocTarget, SlurmJobConfig};
 
     // Parse key=value inputs into JSON
     let mut input_map = serde_json::Map::new();
@@ -10218,6 +10278,20 @@ async fn handle_run(
             head_node,
             user,
             partition: slurm_partition.to_string(),
+            config: Box::new(SlurmJobConfig {
+                account: slurm_account.map(str::to_string),
+                time: slurm_time.map(str::to_string),
+                gres: slurm_gres.map(str::to_string),
+                mem: slurm_mem.map(str::to_string),
+                mem_per_cpu: slurm_mem_per_cpu.map(str::to_string),
+                cpus_per_task: slurm_cpus_per_task,
+                nodes: slurm_nodes,
+                ntasks: slurm_ntasks,
+                array: slurm_array.map(str::to_string),
+                dependency_afterok: slurm_dependency_afterok,
+                sif_path: image.to_string(),
+                ..SlurmJobConfig::default()
+            }),
         };
         (
             ComputeRouter::local_only().with_byoc(target),
@@ -11585,6 +11659,64 @@ mod tests {
                 assert_eq!(name, "trial");
                 assert_eq!(backend, "marc27");
                 assert!(json);
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_slurm_resource_options() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "run",
+            "--slurm",
+            "researcher@login.hpc",
+            "--slurm-partition",
+            "gpu",
+            "--slurm-account",
+            "esa-materials",
+            "--slurm-time",
+            "02:00:00",
+            "--slurm-gres",
+            "gpu:a100:1",
+            "--slurm-mem",
+            "64G",
+            "--slurm-cpus-per-task",
+            "8",
+            "--slurm-nodes",
+            "2",
+            "--slurm-ntasks",
+            "4",
+            "--slurm-array",
+            "0-15%4",
+            "--slurm-dependency-afterok",
+            "98765",
+            "/shared/prism-worker.sif",
+        ])
+        .unwrap();
+
+        match cli.command.unwrap() {
+            Commands::Run {
+                slurm_account,
+                slurm_time,
+                slurm_gres,
+                slurm_mem,
+                slurm_cpus_per_task,
+                slurm_nodes,
+                slurm_ntasks,
+                slurm_array,
+                slurm_dependency_afterok,
+                ..
+            } => {
+                assert_eq!(slurm_account.as_deref(), Some("esa-materials"));
+                assert_eq!(slurm_time.as_deref(), Some("02:00:00"));
+                assert_eq!(slurm_gres.as_deref(), Some("gpu:a100:1"));
+                assert_eq!(slurm_mem.as_deref(), Some("64G"));
+                assert_eq!(slurm_cpus_per_task, Some(8));
+                assert_eq!(slurm_nodes, Some(2));
+                assert_eq!(slurm_ntasks, Some(4));
+                assert_eq!(slurm_array.as_deref(), Some("0-15%4"));
+                assert_eq!(slurm_dependency_afterok, Some(98765));
             }
             _ => panic!("expected Run command"),
         }

