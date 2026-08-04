@@ -13,26 +13,15 @@ jobs:
   package-native:
     name: Package Native (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ── Linux: build on 22.04, NOT ubuntu-latest ──────────────────
-          # A Rust binary linked against glibc runs on that version OR NEWER,
-          # never older. ubuntu-latest is 24.04 (glibc 2.39) and the v1.0.0
-          # artifacts built there are hard-broken on every LTS below it:
-          #   $ docker run ubuntu:22.04 ./prism --version
-          #   /lib/.../libc.so.6: version `GLIBC_2.39' not found
-          #   /lib/.../libc.so.6: version `GLIBC_2.38' not found
-          #   /lib/.../libstdc++.so.6: version `CXXABI_1.3.15' not found
-          # Verified failing on ubuntu:22.04 and debian:12; passing on
-          # ubuntu:24.04 and debian:13. Ubuntu 22.04 LTS is the single most
-          # common institutional Linux, so that is a silent total loss.
-          # 22.04 ships glibc 2.35 + GCC 11, which covers Ubuntu 22.04+,
-          # Debian 12+ and SLES 15 SP6+. (RHEL/Rocky 9 sit at glibc 2.34 and
-          # still need an older build host — see docs/RELEASING.md.)
-          # Runner support ends 2027-04-17; revisit before then.
+          # Linux compiles inside Rocky Linux 8.10 (glibc 2.28), not against
+          # the Ubuntu host. ONNX Runtime is rebuilt in that same container;
+          # using ort-sys's downloaded static archive would import symbols
+          # from the newer glibc headers used by pyke's build machine.
           - os: ubuntu-22.04
             label: linux-x86_64
             rust_target: x86_64-unknown-linux-gnu
@@ -56,9 +45,7 @@ jobs:
             label: macos-x86_64
             rust_target: x86_64-apple-darwin
             archive: prism-macos-x86_64.tar.gz
-          # ARM Linux (ARM servers/cloud, incl. our own Hetzner box) —
-          # install.sh computes prism-linux-aarch64 for aarch64 Linux.
-          # Same glibc-floor reasoning as x86_64 above.
+          # ARM Linux uses the same native-architecture Rocky 8.10 build.
           - os: ubuntu-22.04-arm
             label: linux-aarch64
             rust_target: aarch64-unknown-linux-gnu
@@ -66,10 +53,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install system deps (Linux — rdkafka needs libcurl)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake libcurl4-openssl-dev
 
       - name: Install protoc (vendored forge_repo needs it on all platforms)
         uses: arduino/setup-protoc@v3
@@ -81,17 +64,22 @@ jobs:
         with:
           target: ${{ matrix.rust_target }}
 
-      # Key the cache on the RUNNER IMAGE, not just `runner.os`.
-      #
-      # Swatinem/rust-cache keys on `runner.os`, which is the string "Linux" —
-      # identical across ubuntu-22.04 and ubuntu-24.04. When `ubuntu-latest`
-      # rolled from 22.04 to 24.04, cached objects built against one glibc were
-      # restored onto the other and the link failed with
-      # `undefined symbol: __isoc23_strtoll` (a glibc 2.38+ symbol). That is
-      # what killed the linux-x86_64 and linux-aarch64 jobs on 27 Jul.
+      # Keep target directories isolated by target and by the Rocky-based
+      # Linux build recipe. Cached Rust objects were not the __isoc23 cause:
+      # those objects came from ort-sys's downloaded libonnxruntime.a.
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-${{ matrix.os }}-${{ matrix.rust_target }}"
+          prefix-key: "v2-${{ matrix.os }}-${{ matrix.rust_target }}"
+
+      # A source build is expensive, but its absolute path is stable inside
+      # the container (/work/.native/onnxruntime), so both the ORT build and
+      # Cargo's recorded link-search path remain valid after cache restore.
+      - name: Cache source-built ONNX Runtime (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: .native/onnxruntime
+          key: "onnxruntime-v1.24.2-rockylinux8-v1-${{ matrix.rust_target }}"
 
       - uses: actions/setup-node@v4
         with:
@@ -103,8 +91,121 @@ jobs:
       - name: Build dashboard bundle
         run: cd dashboard && npm run build
 
-      - name: Build Rust binaries
-        run: cargo build --release --bin prism --bin prism-node --target ${{ matrix.rust_target }}
+      - name: Build Rust binaries (macOS / Windows)
+        if: runner.os != 'Linux'
+        run: cargo build --locked --release --bin prism --bin prism-node --target ${{ matrix.rust_target }}
+
+      - name: Build Rust binaries with source-built ONNX Runtime (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git" .native
+
+          # This container is the ABI contract. Both Linux runners are native
+          # architecture, so neither leg cross-links against the Ubuntu host.
+          docker run --rm \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e RUST_TARGET="${{ matrix.rust_target }}" \
+            -e RUSTUP_HOME=/root/.rustup \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v "$HOME/.rustup:/root/.rustup:ro" \
+            -v "$HOME/.cargo/bin:/root/.cargo/bin:ro" \
+            -v "$HOME/.cargo/registry:/root/.cargo/registry" \
+            -v "$HOME/.cargo/git:/root/.cargo/git" \
+            -w /work \
+            rockylinux:8.10 \
+            bash -euxo pipefail -c '
+              dnf -y module enable python39
+              dnf -y install \
+                ca-certificates gcc gcc-c++ git libcurl-devel make openssl-devel \
+                perl-core pkgconf-pkg-config protobuf-compiler \
+                python39 python39-pip tar which
+              python3.9 -m pip install --no-cache-dir \
+                "cmake==3.31.6" "ninja==1.11.1.4" "packaging==24.2"
+              export PATH="/root/.cargo/bin:/usr/local/bin:$PATH"
+
+              case "$RUST_TARGET" in
+                x86_64-unknown-linux-gnu) expected_arch=x86_64 ;;
+                aarch64-unknown-linux-gnu) expected_arch=aarch64 ;;
+                *) echo "::error::unexpected Linux target $RUST_TARGET"; exit 1 ;;
+              esac
+              [[ $(uname -m) == "$expected_arch" ]]
+              [[ $(getconf GNU_LIBC_VERSION) == "glibc 2.28" ]]
+
+              echo "Linux build environment:"
+              ldd --version 2>&1 | sed -n "1p"
+              gcc --version | sed -n "1p"
+              rustc --version
+              cmake --version | sed -n "1p"
+
+              ort_src=/work/.native/onnxruntime
+              ort_common="$ort_src/build/Linux/Release/libonnxruntime_common.a"
+              if [[ ! -f "$ort_common" ]]; then
+                rm -rf "$ort_src"
+                git clone --branch v1.24.2 --depth 1 --recursive \
+                  --shallow-submodules \
+                  https://github.com/microsoft/onnxruntime.git "$ort_src"
+                python3.9 "$ort_src/tools/ci_build/build.py" \
+                  --build_dir "$ort_src/build/Linux" \
+                  --config Release \
+                  --update --build --parallel --skip_tests \
+                  --compile_no_warning_as_error
+              fi
+              test -f "$ort_common"
+              [[ $(git -C "$ort_src" describe --tags --exact-match) == "v1.24.2" ]]
+              git -C "$ort_src" rev-parse HEAD
+
+              # This is the exact regression guard: no object supplied by the
+              # rebuilt ORT may require glibc 2.38 C23 conversion symbols.
+              isoc23_imports=$(find "$ort_src/build/Linux/Release" -name "*.a" \
+                -exec nm -u {} + 2>/dev/null | grep "__isoc23_" || true)
+              if [[ -n "$isoc23_imports" ]]; then
+                printf "%s\n" "$isoc23_imports"
+                echo "::error::source-built ONNX Runtime imports __isoc23 symbols"
+                exit 1
+              fi
+
+              export ORT_LIB_LOCATION="$ort_src/build/Linux"
+              export ORT_SKIP_DOWNLOAD=1
+              cargo build --locked --release --bin prism --bin prism-node \
+                --target "$RUST_TARGET"
+
+              check_abi_ceiling() {
+                local binary=$1 namespace=$2 ceiling=$3 actual
+                actual=$(readelf --version-info "$binary" \
+                  | grep -oE "${namespace}_[0-9]+(\\.[0-9]+)*" \
+                  | sed "s/${namespace}_//" | sort -Vu | tail -1 || true)
+                if [[ -z "$actual" ]]; then
+                  echo "$binary: no $namespace dependency"
+                  return
+                fi
+                if [[ $(printf "%s\\n%s\\n" "$actual" "$ceiling" \
+                     | sort -V | tail -1) != "$ceiling" ]]; then
+                  echo "::error::$binary requires $namespace $actual (ceiling: $ceiling)"
+                  return 1
+                fi
+                echo "$binary: ${namespace}_$actual (ceiling ${namespace}_$ceiling)"
+              }
+
+              # Rocky 8 compatibility: glibc 2.28, GCC 8 libstdc++ 3.4.25,
+              # and CXXABI 1.3.11. Inspect the final ELFs, not the container
+              # version, so a future dependency cannot silently raise a floor.
+              for binary in \
+                "target/$RUST_TARGET/release/prism" \
+                "target/$RUST_TARGET/release/prism-node"; do
+                check_abi_ceiling "$binary" GLIBC 2.28
+                check_abi_ceiling "$binary" GLIBCXX 3.4.25
+                check_abi_ceiling "$binary" CXXABI 1.3.11
+                "$binary" --version </dev/null
+              done
+
+              # Cache post-actions run as the host runner user.
+              chown -R "$HOST_UID:$HOST_GID" \
+                /work/.native /work/target \
+                /root/.cargo/registry /root/.cargo/git
+            '
 
       - name: Assemble package
         shell: bash
