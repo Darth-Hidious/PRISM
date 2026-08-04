@@ -116,12 +116,18 @@ fn serve(mut stream: TcpStream, evaluations: &AtomicUsize) {
 
     let (status, payload) = if request_line.contains("/chat/completions") {
         // Two fresh compositions per call, distinct per proposal so the
-        // campaign never dedupes them away.
+        // campaign never dedupes them away. Fractions must sum to 1.0 within
+        // COMPOSITION_SUM_TOLERANCE or the candidate is rejected outright, so
+        // vary a balanced *pair* — moving one fraction alone breaks the sum.
         let n = evaluations.load(Ordering::SeqCst);
+        let w = 100 + n % 600; // 0.100 ..= 0.699, paired against 0.800 - w
+        let cr = 100 + (n * 7) % 600;
         let content = format!(
-            "[\"W0.{} Mo0.5 Ta0.2\", \"Cr0.{} V0.4 Ti0.2\"]",
-            n % 9 + 1,
-            n % 7 + 1
+            "[\"W{:.3} Mo{:.3} Ta0.2\", \"Cr{:.3} V{:.3} Ti0.2\"]",
+            w as f64 / 1000.0,
+            (800 - w) as f64 / 1000.0,
+            cr as f64 / 1000.0,
+            (800 - cr) as f64 / 1000.0
         );
         (
             "200 OK",
