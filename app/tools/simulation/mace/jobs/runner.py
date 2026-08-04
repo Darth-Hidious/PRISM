@@ -196,10 +196,10 @@ class JobRunner:
             )
             self.store.transition(job_id, "failed")
             log.error(
-                "job_failed",
-                job_id=job_id,
-                tool_name=tool_name,
-                error=scrub_token(str(ex)),
+                "job_failed job_id=%s tool_name=%s error=%s",
+                job_id,
+                tool_name,
+                scrub_token(str(ex)),
             )
             return
 
@@ -260,7 +260,7 @@ class JobRunner:
             if push_url:
                 self.store.set_provenance_ref(job_id, push_url)
         except Exception as ex:
-            log.warning("dataset_push_failed_after_result", error=scrub_token(str(ex)))
+            log.warning("dataset_push_failed_after_result error=%s", scrub_token(str(ex)))
 
         # Write result + finalise
         self.cache.write_result(cache_key, result)

@@ -306,6 +306,18 @@ def build_full_registry(
     except Exception:
         logger.exception("HEA tools registration failed")
 
+    # Tiered evaluation ladder — one interface over the empirical screen,
+    # MACE MLIP, CALPHAD and QE tiers with cheap-first escalation and
+    # per-property provenance. The tool itself is always registered (tier 0
+    # is pure math); unavailable higher tiers report themselves per call,
+    # exactly like the gated QE/MACE blocks above. See app/tools/evaluation.py.
+    try:
+        from app.tools.evaluation import create_evaluation_tools
+
+        create_evaluation_tools(registry)
+    except Exception:
+        logger.exception("evaluation ladder tools registration failed")
+
     # Phase-stability screening (E4): convex-hull distance via the platform-
     # brokered MP key. Free Thermo-Calc phase-stability equivalent.
     try:
