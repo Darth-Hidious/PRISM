@@ -19,7 +19,7 @@ expression: rendered
                   │                                                              │
                   │  https://example.org/paper                                   │
                   │                                                              │
-                  │  [y/↵] Open in browser   [n/Esc] Cancel                      │
+                  │  [y/↵] Show URL for manual opening   [n/Esc] Cancel          │
                   └──────────────────────────────────────────────────────────────┘
                                                                    │
                                                                    │

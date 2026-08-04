@@ -425,7 +425,7 @@ pub static CATALOG: &[Command] = &[
     Command {
         id: "slash.billing topup",
         title: "Buy credits",
-        description: "Open a credit-pack checkout in the browser",
+        description: "Show a credit-pack checkout URL for manual opening",
         category: "Settings",
         keybind: "/billing topup",
         suggested: false,
@@ -497,7 +497,7 @@ pub static CATALOG: &[Command] = &[
     Command {
         id: "links.open",
         title: "Open link",
-        description: "Open a URL from the transcript in the browser",
+        description: "Show a URL from the transcript for manual opening",
         category: "Session",
         keybind: "o",
         suggested: false,

@@ -19,7 +19,7 @@ expression: rendered
                     │  project: 00000000                                       │
                     │                                                          │
                     │  [l] login   [o] logout   [r] refresh                    │
-                    │  login uses the device flow — approve in your browser    │
+                    │  login is non-interactive — use `prism login --token <PAT│
                     │                                                          │
                     │  Esc close                                               │
                     │                                                          │

@@ -353,9 +353,9 @@ async fn fix_embedding_model(embed_dir: &Path) -> BootCheck {
 const REPAIR_RELEVANT: &[&str] = &["Platform", "Auth"];
 
 /// Rows for the things `--fix` deliberately does not touch, each carrying the
-/// exact command. Credentials need a browser; platform reachability needs the
-/// platform. Pretending otherwise is the failure mode this section exists to
-/// avoid.
+/// exact command. Credentials are supplied outside this diagnostic; platform
+/// reachability needs the platform. Pretending otherwise is the failure mode
+/// this section exists to avoid.
 fn manual_only(creds_present: bool, platform: &[BootCheck]) -> Vec<BootCheck> {
     let mut rows = Vec::new();
     if !creds_present {

@@ -20,7 +20,7 @@ mod tool_sync;
 mod use_command;
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 // std::process::Stdio removed — old Ink TUI launcher no longer needed
 use std::time::Duration;
@@ -34,6 +34,7 @@ use prism_client::api::PlatformClient;
 use prism_client::auth::{DeviceCodeResponse, TokenResponse};
 use prism_proto::NodeCapabilities;
 use prism_python_bridge::{ToolServer, ensure_venv};
+use prism_runtime::auth::{self, AuthSurface, PlatformAuth};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 
 // Loopback detection lives with the local-server probe that also needs it,
@@ -75,7 +76,11 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Run first-time native setup and platform login.
-    Setup,
+    Setup {
+        /// Explicitly allow the retained device flow in a real TTY.
+        #[arg(long)]
+        interactive_auth: bool,
+    },
     /// Launch the interactive AI agent TUI.
     Tui {
         /// Use a deterministic fake backend instead of spawning `prism
@@ -103,37 +108,23 @@ enum Commands {
     },
     /// Authenticate against the configured hosted platform.
     ///
-    /// Default: device-flow login that opens a browser to approve the
-    /// session. For HPC nodes / SSH sessions / any environment without
-    /// a browser, two extra modes are supported:
-    ///
-    ///   prism login --no-browser
-    ///       Run the device flow but DON'T try to open a browser
-    ///       automatically. The URL + user code are printed; approve
-    ///       from any other machine's browser, then return to the
-    ///       terminal — the poll continues until you do.
-    ///
-    ///   prism login --token <PAT>
-    ///       Skip the device flow entirely. Use a Personal Access
-    ///       Token created on the platform's website. The token is
-    ///       written to ~/.prism/credentials.json with no further
-    ///       interaction. This is the right path for headless
-    ///       servers and CI environments.
+    /// Non-interactive by default: use `--token <PAT>` or configure
+    /// `MARC27_API_KEY`. The retained device flow requires the explicit
+    /// `--interactive-auth` opt-in and a real TTY; PRISM never opens a browser.
     Login {
-        /// Bypass the device flow. Use a pre-issued Personal Access
-        /// Token from the platform's website. Headless / CI / SSH-only
-        /// use. Token is read from this flag, env var
-        /// `PRISM_LOGIN_TOKEN`, or stdin (in that priority order)
-        /// so the token never has to appear in shell history.
+        /// Use a pre-issued Personal Access Token from the platform website.
+        /// This is non-interactive and suitable for headless runs.
         #[arg(long, value_name = "PAT", env = "PRISM_LOGIN_TOKEN")]
         token: Option<String>,
 
-        /// Run the device flow but skip the browser auto-open. Prints
-        /// the verification URL + user code and waits for approval.
-        /// Useful when on a headless HPC node — you copy the URL to
-        /// your laptop's browser and approve there.
+        /// Retained compatibility flag. Device auth is always manual; PRISM
+        /// never launches a browser.
         #[arg(long, conflicts_with = "token")]
         no_browser: bool,
+
+        /// Explicitly allow the retained device flow in a real TTY.
+        #[arg(long, conflicts_with = "token")]
+        interactive_auth: bool,
     },
     /// Show runtime paths, endpoints, and auth status.
     Status,
@@ -663,7 +654,7 @@ enum BillingCommands {
     History,
     /// Show credit pricing table.
     Prices,
-    /// Buy credits — lists packs; with a slug, opens the checkout in a browser.
+    /// Buy credits — lists packs; with a slug, prints the checkout URL for manual opening.
     Topup {
         /// Package slug: starter, standard, pro, enterprise. Omit to just
         /// list the available packs (no checkout is created).
@@ -1452,12 +1443,30 @@ struct SelectedContext {
 /// `true` and provisions the venv exactly as before. The worst case of a
 /// stale list is therefore the old (slow) behaviour, never a command handed
 /// a path to an interpreter nobody built.
+fn preflight_command_auth(command: Option<&Commands>) -> Result<()> {
+    if let Some(Commands::Node {
+        command: NodeCommands::Up { offline, .. },
+    }) = command
+        && !offline
+    {
+        // `node up` needs Python later, but missing auth must be reported
+        // before venv provisioning can block or touch the network.
+        let _ = resolve_agent_auth()?;
+    }
+    Ok(())
+}
+
 fn command_needs_python(command: Option<&Commands>) -> bool {
     match command {
         // Rust-side state only: the config TOML, the provider registry, the
         // local provenance ledger, paths and endpoints.
         Some(
-            Commands::Status | Commands::Use { .. } | Commands::Agent | Commands::Provenance { .. },
+            Commands::Status
+            | Commands::Use { .. }
+            | Commands::Agent
+            | Commands::Provenance { .. }
+            | Commands::Federation { .. }
+            | Commands::Publish { .. },
         ) => false,
         // Reports on the venv — including its absence — rather than using it.
         Some(Commands::Doctor { .. }) => false,
@@ -1566,6 +1575,7 @@ async fn main() -> Result<()> {
             std::env::set_var(prism_runtime::offline::ENV, "1");
         }
     }
+    preflight_command_auth(cli.command.as_ref())?;
     let project_root = cli.project_root.clone();
     let endpoints = PlatformEndpoints::from_env();
     let paths = PrismPaths::discover()?;
@@ -1666,11 +1676,11 @@ async fn main() -> Result<()> {
         fake_backend: false,
         scenario: "basic_chat".to_string(),
     }) {
-        Commands::Setup => {
+        Commands::Setup { interactive_auth } => {
             let mut state = paths.load_cli_state()?;
             state.preferred_python = Some(python.display().to_string());
             if state.credentials.is_none() {
-                let credentials = run_device_login(&endpoints).await?;
+                let credentials = run_device_login(&endpoints, interactive_auth).await?;
                 let platform =
                     PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
                 let profile = platform.fetch_current_user().await.ok();
@@ -1679,6 +1689,7 @@ async fn main() -> Result<()> {
                     profile
                         .as_ref()
                         .and_then(|user| user.display_name.as_deref()),
+                    interactive_auth,
                 )
                 .await?;
                 state.credentials = Some(StoredCredentials {
@@ -1709,7 +1720,9 @@ async fn main() -> Result<()> {
                         .as_ref()
                         .is_some_and(|project_id| Some(project_id) != creds.project_id.as_ref())
                 {
-                    let selected = select_project(&platform, creds.display_name.as_deref()).await?;
+                    let selected =
+                        select_project(&platform, creds.display_name.as_deref(), interactive_auth)
+                            .await?;
                     creds.org_id = selected.org_id;
                     creds.org_name = selected.org_name;
                     creds.project_id = selected.project_id;
@@ -1803,10 +1816,17 @@ async fn main() -> Result<()> {
             };
             prism_tui::run_with_config(config).await?;
         }
-        Commands::Login { token, no_browser } => {
+        Commands::Login {
+            token,
+            no_browser,
+            interactive_auth,
+        } => {
             let mode = match token {
                 Some(pat) => LoginMode::Token(pat),
-                None => LoginMode::Device { no_browser },
+                None => LoginMode::Device {
+                    interactive_auth,
+                    no_browser,
+                },
             };
             perform_full_login(&paths, &endpoints, &python, mode).await?;
             println!("Login complete.");
@@ -2082,7 +2102,7 @@ async fn main() -> Result<()> {
                 println!("  PID:   {}", session.pid);
                 println!("  Port:  {}", session.port);
                 println!("  Token: {}", session.token);
-                println!("\nOpen the URL in your browser or IDE.");
+                println!("\nOpen the URL manually in a browser or IDE.");
             }
             NotebookCommands::List => {
                 let sessions = notebook::list()?;
@@ -2762,146 +2782,151 @@ async fn main() -> Result<()> {
                 let mut daemon_platform_node_id: Option<String> = None;
                 let mut daemon_org_id: Option<String> = None;
 
-                // Load CLI state for mesh auth — even in offline mode,
-                // we need credentials to join the mesh. The mesh refuses
-                // to start without an auth token (RBAC gate).
+                // Resolve auth before registration. API-key-only users do
+                // not have cli-state metadata and must still be accepted.
                 let cli_state = paths.load_cli_state().ok().unwrap_or_default();
-                let mesh_auth_token = cli_state
-                    .credentials
+                let resolved_platform_auth = if !offline {
+                    Some(resolve_agent_auth()?)
+                } else {
+                    None
+                };
+                let mesh_auth_token = resolved_platform_auth
                     .as_ref()
-                    .map(|c| c.access_token.clone());
+                    .map(|(_, auth)| auth.secret().to_string());
                 let mesh_has_auth = mesh_auth_token.is_some();
 
                 if !offline {
-                    if let Some(ref creds) = cli_state.credentials {
-                        daemon_org_id = creds.org_id.clone();
+                    let (resolved_api_base, resolved_auth) = resolved_platform_auth
+                        .as_ref()
+                        .expect("non-offline node auth was preflighted");
+                    let creds = cli_state.credentials.as_ref();
+                    daemon_org_id = creds.and_then(|value| value.org_id.clone());
+                    let (token, maybe_refreshed) = if resolved_auth.is_api_key() {
+                        (resolved_auth.secret().to_string(), None)
+                    } else if let Some(creds) = creds {
+                        resolve_node_token(&paths, &endpoints, creds).await?
+                    } else {
+                        (resolved_auth.secret().to_string(), None)
+                    };
+                    let effective_creds = maybe_refreshed.or_else(|| creds.cloned());
 
-                        // Resolve the platform token through the SAME priority
-                        // + refresh path the WS daemon uses
-                        // (daemon::load_access_token): durable node token →
-                        // MARC27_API_KEY → cli-state creds, refreshed when
-                        // expired. Previously this built the client straight
-                        // from `creds.access_token` with NO refresh, so once the
-                        // session token aged past 24h (and the SDK mirror held a
-                        // stale copy) `POST /nodes/register` 401'd and the node
-                        // silently fell back to offline mode while the platform
-                        // still listed it online.
-                        //
-                        // `resolve_node_token` returns the rotated creds when it
-                        // refreshed (it consumes the single-use refresh token);
-                        // we MUST keep those as the effective creds for any later
-                        // refresh, never the stale startup `creds` binding, or we
-                        // replay a now-REVOKED token and trip token-family
-                        // invalidation.
-                        let (token, maybe_refreshed) =
-                            resolve_node_token(&paths, &endpoints, creds).await?;
-                        // The EFFECTIVE creds — `resolve_node_token`'s rotation
-                        // if it refreshed, else the startup creds. The 401-retry
-                        // arm refreshes from THIS (never the stale `creds`
-                        // binding), so a single-use refresh token already
-                        // consumed by resolve_node_token is never replayed.
-                        let effective_creds = maybe_refreshed.unwrap_or_else(|| creds.clone());
-                        // `mut`: the 401-retry arm reassigns this to a client
-                        // built from the refreshed token, so the value stored
-                        // into the daemon state below carries the LIVE token
-                        // (not the one that just 401'd — a prior bug stored the
-                        // stale client and the daemon then heartbeat/role-sync/
-                        // deregister'd on the dead token → all 401 → stale
-                        // "online" record).
-                        let mut platform =
-                            PlatformClient::new(&endpoints.api_base).with_token(&token);
-                        let caps = serde_json::json!({
-                            "compute": !no_compute,
-                            "storage": !no_storage,
-                            "dashboard_port": dashboard_port,
-                        });
+                    // Resolve the platform token through the SAME priority
+                    // + refresh path the WS daemon uses
+                    // (daemon::load_access_token): durable node token →
+                    // MARC27_API_KEY → cli-state creds, refreshed when
+                    // expired. Previously this built the client straight
+                    // from `creds.access_token` with NO refresh, so once the
+                    // session token aged past 24h (and the SDK mirror held a
+                    // stale copy) `POST /nodes/register` 401'd and the node
+                    // silently fell back to offline mode while the platform
+                    // still listed it online.
+                    //
+                    // `resolve_node_token` returns the rotated creds when it
+                    // refreshed (it consumes the single-use refresh token);
+                    // we MUST keep those as the effective creds for any later
+                    // refresh, never the stale startup `creds` binding, or we
+                    // replay a now-REVOKED token and trip token-family
+                    // invalidation.
+                    // The EFFECTIVE creds — `resolve_node_token`'s rotation
+                    // if it refreshed, else the startup creds. The 401-retry
+                    // arm refreshes from THIS (never the stale startup
+                    // binding), so a single-use refresh token already
+                    // consumed by resolve_node_token is never replayed.
+                    // `mut`: the 401-retry arm reassigns this to a client
+                    // built from the refreshed token, so the value stored
+                    // into the daemon state below carries the LIVE token
+                    // (not the one that just 401'd — a prior bug stored the
+                    // stale client and the daemon then heartbeat/role-sync/
+                    // deregister'd on the dead token → all 401 → stale
+                    // "online" record).
+                    let mut platform = PlatformClient::new(resolved_api_base).with_token(&token);
+                    let caps = serde_json::json!({
+                        "compute": !no_compute,
+                        "storage": !no_storage,
+                        "dashboard_port": dashboard_port,
+                    });
 
-                        // register_node_inspect returns a typed ApiError
-                        // carrying the HTTP status + parsed `code`, so a stale
-                        // token (401 / token_expired) can be recovered with a
-                        // refresh + single retry instead of the opaque
-                        // "returned error status" that hid the cause.
-                        let reg = {
-                            let registry =
-                                prism_client::node_registry::NodeRegistryClient::new(&platform);
-                            match registry.register_node_inspect(&node_name, &caps).await {
-                                Ok(reg) => reg,
-                                Err(api_err) if api_err.is_token_expired() => {
-                                    tracing::info!(
-                                        "node register rejected with token_expired — refreshing and retrying once"
-                                    );
-                                    // Refresh from the EFFECTIVE creds (rotated
-                                    // by resolve_node_token if it already
-                                    // refreshed), never the stale startup
-                                    // binding.
-                                    let refreshed = refresh_access_token(
-                                        &paths, &endpoints, &effective_creds,
+                    // register_node_inspect returns a typed ApiError
+                    // carrying the HTTP status + parsed `code`, so a stale
+                    // token (401 / token_expired) can be recovered with a
+                    // refresh + single retry instead of the opaque
+                    // "returned error status" that hid the cause.
+                    let reg = {
+                        let registry =
+                            prism_client::node_registry::NodeRegistryClient::new(&platform);
+                        match registry.register_node_inspect(&node_name, &caps).await {
+                            Ok(reg) => reg,
+                            Err(api_err)
+                                if api_err.is_token_expired() && !resolved_auth.is_api_key() =>
+                            {
+                                tracing::info!(
+                                    "node register rejected with token_expired — refreshing and retrying once"
+                                );
+                                // Refresh from the EFFECTIVE creds (rotated
+                                // by resolve_node_token if it already
+                                // refreshed), never the stale startup
+                                // binding.
+                                let effective_creds = effective_creds.as_ref().ok_or_else(|| {
+                                        anyhow!("token expired without stored session; run `prism login --token <PAT>` or set MARC27_API_KEY")
+                                    })?;
+                                let refreshed = refresh_access_token(
+                                        &paths, &endpoints, effective_creds,
                                     )
                                     .await
                                     .context(
                                         "token expired and refresh failed — run `prism login` to re-authenticate",
                                     )?;
-                                    // Reassign the OUTER client so the daemon
-                                    // state (stored below) carries the live token.
-                                    platform = PlatformClient::new(&endpoints.api_base)
-                                        .with_token(&refreshed.access_token);
-                                    let registry =
-                                        prism_client::node_registry::NodeRegistryClient::new(
-                                            &platform,
-                                        );
-                                    registry
-                                        .register_node_inspect(&node_name, &caps)
-                                        .await
-                                        .map_err(|e| {
-                                            anyhow!(
-                                                "platform registration failed after token refresh: {e}"
-                                            )
-                                        })?
-                                }
-                                Err(e) => {
-                                    // Fail LOUD: a non-offline `node up` that cannot
-                                    // register leaves the node in a dangerous
-                                    // half-state — the dashboard/mesh run, but the
-                                    // node never receives broker-dispatched jobs, and
-                                    // the platform may still list a stale record as
-                                    // online. Fail with a clear message + non-zero
-                                    // exit instead of silently dropping to "offline
-                                    // mode". (Pass --offline to run without the
-                                    // platform.)
-                                    return Err(anyhow!(
-                                        "platform registration failed: {e}\n\
+                                // Reassign the OUTER client so the daemon
+                                // state (stored below) carries the live token.
+                                platform = PlatformClient::new(resolved_api_base)
+                                    .with_token(&refreshed.access_token);
+                                let registry =
+                                    prism_client::node_registry::NodeRegistryClient::new(&platform);
+                                registry
+                                    .register_node_inspect(&node_name, &caps)
+                                    .await
+                                    .map_err(|e| {
+                                        anyhow!(
+                                            "platform registration failed after token refresh: {e}"
+                                        )
+                                    })?
+                            }
+                            Err(e) => {
+                                // Fail LOUD: a non-offline `node up` that cannot
+                                // register leaves the node in a dangerous
+                                // half-state — the dashboard/mesh run, but the
+                                // node never receives broker-dispatched jobs, and
+                                // the platform may still list a stale record as
+                                // online. Fail with a clear message + non-zero
+                                // exit instead of silently dropping to "offline
+                                // mode". (Pass --offline to run without the
+                                // platform.)
+                                return Err(anyhow!(
+                                    "platform registration failed: {e}\n\
                                          re-authenticate with `prism login`, or pass --offline \
                                          to run without platform dispatch."
-                                    ));
-                                }
+                                ));
                             }
-                        };
+                        }
+                    };
 
-                        // NOTE: the in-app node supervisor
-                        // (prism_agent::node_supervisor) parses this
-                        // line out of the daemon log to learn the
-                        // platform node id — keep the
-                        // "(node_id: …)" shape if rewording.
-                        println!(
-                            "  \u{2713} Registered with platform (node_id: {})",
-                            reg.node_id
-                        );
-                        daemon_platform_node_id = Some(reg.node_id);
-                        // `platform` is the LIVE client: either the original
-                        // (register succeeded first try) or the reassigned
-                        // refreshed one (after a 401-retry). Storing the stale
-                        // client here was the bug that made the daemon's REST
-                        // calls all 401 silently.
-                        server_node_state.platform_client = Some(platform.clone());
-                        daemon_platform_client = Some(platform);
-                    } else {
-                        // No creds + not --offline → fail LOUD with the remedy,
-                        // same rationale as the registration-error arm above.
-                        return Err(anyhow!(
-                            "not authenticated — run `prism login` (or `prism setup`), \
-                             set MARC27_API_KEY, or pass --offline to run without the platform"
-                        ));
-                    }
+                    // NOTE: the in-app node supervisor
+                    // (prism_agent::node_supervisor) parses this
+                    // line out of the daemon log to learn the
+                    // platform node id — keep the
+                    // "(node_id: …)" shape if rewording.
+                    println!(
+                        "  \u{2713} Registered with platform (node_id: {})",
+                        reg.node_id
+                    );
+                    daemon_platform_node_id = Some(reg.node_id);
+                    // `platform` is the LIVE client: either the original
+                    // (register succeeded first try) or the reassigned
+                    // refreshed one (after a 401-retry). Storing the stale
+                    // client here was the bug that made the daemon's REST
+                    // calls all 401 silently.
+                    server_node_state.platform_client = Some(platform.clone());
+                    daemon_platform_client = Some(platform);
                 }
 
                 // ── Cross-org audit envelopes (F5) ──
@@ -4217,15 +4242,10 @@ async fn main() -> Result<()> {
                     }
                 }
                 "marc27" | "platform" => {
-                    let state = paths.load_cli_state()?;
-                    let token = state
-                        .credentials
-                        .as_ref()
-                        .map(|c| c.access_token.clone())
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Not logged in. Run `prism login` first.")
-                        })?;
-                    let platform = PlatformClient::new(&endpoints.api_base).with_token(&token);
+                    let (api_base, auth) = resolve_agent_auth()?;
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .build()?;
 
                     println!(
                         "Publishing to {} marketplace...",
@@ -4238,15 +4258,18 @@ async fn main() -> Result<()> {
                             .unwrap_or("artifact")
                             .to_string()
                     });
-                    let resp: serde_json::Value = platform
-                        .post(
-                            "/marketplace",
-                            &serde_json::json!({
-                                "name": name,
-                                "path": path,
-                                "private": private,
-                            }),
-                        )
+                    let resp: serde_json::Value = auth
+                        .apply(client.post(format!("{api_base}/marketplace")))
+                        .json(&serde_json::json!({
+                            "name": name,
+                            "path": path,
+                            "private": private,
+                        }))
+                        .send()
+                        .await?
+                        .platform_error_for_status()
+                        .await?
+                        .json()
                         .await?;
                     if json {
                         println!(
@@ -4370,7 +4393,10 @@ async fn main() -> Result<()> {
                     &paths,
                     &endpoints,
                     &python,
-                    LoginMode::Device { no_browser: false },
+                    LoginMode::Device {
+                        interactive_auth: false,
+                        no_browser: true,
+                    },
                 )
                 .await
                 {
@@ -4462,7 +4488,10 @@ async fn main() -> Result<()> {
                     &paths,
                     &endpoints,
                     &python,
-                    LoginMode::Device { no_browser: false },
+                    LoginMode::Device {
+                        interactive_auth: false,
+                        no_browser: true,
+                    },
                 )
                 .await
                 {
@@ -4645,11 +4674,7 @@ async fn main() -> Result<()> {
                         .await?;
 
                     if let Some(url) = resp["checkout_url"].as_str() {
-                        println!("Checkout: {url}\n");
-                        if let Err(e) = open_browser(url) {
-                            eprintln!("Could not open browser: {e}");
-                            println!("Open the URL above manually.");
-                        }
+                        println!("Checkout URL (open manually): {url}\n");
                     } else {
                         eprintln!(
                             "Error: {}",
@@ -4879,69 +4904,87 @@ async fn handle_federation_command(
 ) -> Result<()> {
     match command {
         FederationCommands::Whoami { json } => {
+            // This is local reporting, not an authenticated platform call.
+            // API-key-only users and fresh installs therefore get a truthful
+            // identity report instead of an invented login requirement.
             let state = paths.load_cli_state().ok().unwrap_or_default();
-            let creds = state.credentials.as_ref().ok_or_else(|| {
-                anyhow!("Not logged in. Run `prism login` to set up your platform identity.")
-            })?;
-
-            let now = chrono::Utc::now();
-            let expired = creds.expires_at.is_some_and(|exp| now >= exp);
+            let creds = state.credentials.as_ref();
+            let endpoints = PlatformEndpoints::from_env();
+            let credential_source = if std::env::var("MARC27_API_KEY")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                "MARC27_API_KEY"
+            } else if creds.is_some() {
+                "cli-state session"
+            } else {
+                "none"
+            };
+            let expired = creds
+                .and_then(|value| value.expires_at)
+                .is_some_and(|exp| chrono::Utc::now() >= exp);
+            let platform_url = creds
+                .map(|value| value.platform_url.as_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&endpoints.api_base);
 
             if json {
                 let out = serde_json::json!({
-                    "org_id": creds.org_id,
-                    "org_name": creds.org_name,
-                    "project_id": creds.project_id,
-                    "project_name": creds.project_name,
-                    "user_id": creds.user_id,
-                    "display_name": creds.display_name,
-                    "platform_url": creds.platform_url,
-                    "valid_until": creds.expires_at.map(|d| d.to_rfc3339()),
+                    "org_id": creds.and_then(|value| value.org_id.as_deref()),
+                    "org_name": creds.and_then(|value| value.org_name.as_deref()),
+                    "project_id": creds.and_then(|value| value.project_id.as_deref()),
+                    "project_name": creds.and_then(|value| value.project_name.as_deref()),
+                    "user_id": creds.and_then(|value| value.user_id.as_deref()),
+                    "display_name": creds.and_then(|value| value.display_name.as_deref()),
+                    "platform_url": platform_url,
+                    "credential_source": credential_source,
+                    "valid_until": creds.and_then(|value| value.expires_at.map(|d| d.to_rfc3339())),
                     "expired": expired,
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);
                 return Ok(());
             }
 
-            // Human-readable. The shape mirrors what
-            // crates/mesh/src/federation.rs::PeerIdentity emits over
-            // the wire so a user inspecting their own identity sees
-            // (roughly) what a remote node verifies.
-            println!("\nFabric identity (this is what peer nodes see)");
+            println!("\nFabric identity (local state)");
             println!("───────────────────────────────────────────────");
             println!(
                 "  Display name : {}",
-                creds.display_name.as_deref().unwrap_or("(unset)")
+                creds
+                    .and_then(|value| value.display_name.as_deref())
+                    .unwrap_or("(not stored locally)")
             );
             println!(
                 "  User ID      : {}",
-                creds.user_id.as_deref().unwrap_or("(unset)")
+                creds
+                    .and_then(|value| value.user_id.as_deref())
+                    .unwrap_or("(not stored locally)")
             );
             println!(
                 "  Org          : {} ({})",
-                creds.org_name.as_deref().unwrap_or("(unset)"),
-                creds.org_id.as_deref().unwrap_or("(unset)")
+                creds
+                    .and_then(|value| value.org_name.as_deref())
+                    .unwrap_or("(not stored locally)"),
+                creds
+                    .and_then(|value| value.org_id.as_deref())
+                    .unwrap_or("(not stored locally)")
             );
             println!(
                 "  Project      : {} ({})",
-                creds.project_name.as_deref().unwrap_or("(unset)"),
-                creds.project_id.as_deref().unwrap_or("(unset)")
+                creds
+                    .and_then(|value| value.project_name.as_deref())
+                    .unwrap_or("(not stored locally)"),
+                creds
+                    .and_then(|value| value.project_id.as_deref())
+                    .unwrap_or("(not stored locally)")
             );
-            println!("  Platform     : {}", creds.platform_url);
-            match creds.expires_at {
+            println!("  Platform     : {platform_url}");
+            println!("  Credential   : {credential_source}");
+            match creds.and_then(|value| value.expires_at) {
                 Some(exp) => {
                     let label = if expired { "EXPIRED" } else { "valid until" };
-                    println!("  Token        : {} {}", label, exp.to_rfc3339());
+                    println!("  Token        : {label} {}", exp.to_rfc3339());
                 }
-                None => println!("  Token        : no expiry set"),
-            }
-            if expired {
-                println!();
-                println!(
-                    "  Token has expired. Run `prism login` to refresh — \
-                     cross-org requests will be rejected by other nodes \
-                     until you re-auth."
-                );
+                None => println!("  Token        : no stored expiry"),
             }
             println!();
         }
@@ -6912,67 +6955,12 @@ EXAMPLES:
     );
 }
 
-/// Resolve platform auth for the human user (prism login → JWT).
-fn resolve_user_auth() -> Result<(String, String)> {
-    // Primary: read from PrismPaths (cli-state.json)
-    if let Ok(paths) = prism_runtime::PrismPaths::discover()
-        && let Ok(state) = paths.load_cli_state()
-        && let Some(creds) = &state.credentials
-    {
-        let raw_url = &creds.platform_url;
-        let api_base = if raw_url.ends_with("/api/v1") {
-            raw_url.clone()
-        } else {
-            format!("{}/api/v1", raw_url.trim_end_matches('/'))
-        };
-        return Ok((api_base, format!("Bearer {}", creds.access_token)));
-    }
-
-    // Fallback: legacy ~/.prism/credentials.json
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let cred_path = format!("{home}/.prism/credentials.json");
-    let cred_data =
-        std::fs::read_to_string(&cred_path).context("Not logged in. Run `prism login`.")?;
-    let creds: serde_json::Value = serde_json::from_str(&cred_data)?;
-    let raw_url = creds
-        .get("platform_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("https://api.marc27.com");
-    let api_base = if raw_url.ends_with("/api/v1") {
-        raw_url.to_string()
-    } else {
-        format!("{}/api/v1", raw_url.trim_end_matches('/'))
-    };
-    let token = creds
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .context("No access_token. Run `prism login`.")?;
-    Ok((api_base, format!("Bearer {token}")))
-}
-
-/// Auth credentials — either API key (agent) or Bearer token (user).
-enum PlatformAuth {
-    ApiKey(String), // X-API-Key header
-    Bearer(String), // Authorization: Bearer header
-}
-
-impl PlatformAuth {
-    fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self {
-            PlatformAuth::ApiKey(key) => req.header("X-API-Key", key),
-            PlatformAuth::Bearer(token) => req.header("Authorization", format!("Bearer {token}")),
-        }
-    }
-}
-
 /// Default `--platform-url` for `prism run --backend marc27`. Kept as a const so
 /// `handle_run` can tell an explicit override from the default and pick the
 /// agent-resolved base otherwise.
 const DEFAULT_RUN_PLATFORM_URL: &str = "https://api.marc27.com/api/v1";
 
-/// Map the CLI's `PlatformAuth` (API key vs session Bearer) onto the compute
-/// crate's decoupled `Marc27Auth`. Same semantics: API keys → `X-API-Key`,
-/// sessions → `Authorization: Bearer`.
+/// Map the shared auth seam onto the compute crate's decoupled `Marc27Auth`.
 fn marc27_auth_from(auth: PlatformAuth) -> prism_compute::Marc27Auth {
     match auth {
         PlatformAuth::ApiKey(key) => prism_compute::Marc27Auth::ApiKey(key),
@@ -6980,37 +6968,22 @@ fn marc27_auth_from(auth: PlatformAuth) -> prism_compute::Marc27Auth {
     }
 }
 
-/// Resolve platform auth for agents (MARC27_API_KEY env var → X-API-Key header).
-/// Decoupled from user auth — agents use API keys, users use JWT.
-/// Falls back to user auth if no API key is set (backward compat).
+/// Resolve platform auth for every CLI command that reaches MARC27. This is
+/// the single CLI auth chokepoint: it accepts API-key-only users, stored
+/// sessions, and legacy credentials, and never starts interactive auth.
 fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
-    // Commands that build raw reqwest calls (research, discourse, …) all
-    // resolve auth here first — so this is the offline chokepoint for the
-    // paths that bypass PlatformClient's own guard.
     if std::env::var("PRISM_OFFLINE").is_ok_and(|v| v == "1") {
         anyhow::bail!(
             "offline mode: this command needs the hosted platform \
              (remove --offline to use it)"
         );
     }
-    if let Ok(api_key) = std::env::var("MARC27_API_KEY") {
-        let api_base = std::env::var("MARC27_API_URL")
-            .unwrap_or_else(|_| "https://api.marc27.com/api/v1".to_string());
-        return Ok((api_base, PlatformAuth::ApiKey(api_key)));
-    }
-    if let Ok(token) = std::env::var("MARC27_TOKEN").or_else(|_| std::env::var("MARC27_API_TOKEN"))
-    {
-        let api_base = std::env::var("MARC27_API_URL")
-            .unwrap_or_else(|_| "https://api.marc27.com/api/v1".to_string());
-        return Ok((api_base, PlatformAuth::Bearer(token)));
-    }
-    let (base, token_header) = resolve_user_auth()?;
-    // token_header is "Bearer <token>"
-    let token = token_header
-        .strip_prefix("Bearer ")
-        .unwrap_or(&token_header)
-        .to_string();
-    Ok((base, PlatformAuth::Bearer(token)))
+
+    let default_api_base = std::env::var("MARC27_API_URL")
+        .unwrap_or_else(|_| "https://api.marc27.com/api/v1".to_string());
+    let paths = PrismPaths::discover().ok();
+    let resolved = auth::resolve_from_environment(paths.as_ref(), &default_api_base)?;
+    Ok((resolved.api_base, resolved.credential))
 }
 
 fn resolve_active_project_id(paths: &PrismPaths) -> Result<String> {
@@ -8850,13 +8823,12 @@ async fn handle_gpus_command() {
 }
 
 async fn fetch_gpu_catalog() -> Result<serde_json::Value> {
-    let (api_base, auth_header) = resolve_user_auth()?;
+    let (api_base, auth) = resolve_agent_auth()?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    let response = client
-        .get(format!("{api_base}/compute/gpus"))
-        .header("Authorization", auth_header)
+    let response = auth
+        .apply(client.get(format!("{api_base}/compute/gpus")))
         .send()
         .await?;
     let value = response.platform_error_for_status().await?.json().await?;
@@ -9997,9 +9969,13 @@ enum LoginMode {
     /// Personal Access Token — non-interactive, suitable for headless
     /// scripts and CI. Skips the device-flow polling step.
     Token(String),
-    /// Interactive device flow. `no_browser=true` renders a paste-this-
-    /// URL block instead of auto-launching the browser.
-    Device { no_browser: bool },
+    /// Retained device flow. It is usable only with explicit opt-in and a
+    /// TTY; the URL is printed for the human to open manually and PRISM never
+    /// launches a browser.
+    Device {
+        interactive_auth: bool,
+        no_browser: bool,
+    },
 }
 
 /// Run the full login recipe used by `prism login` AND by the inline
@@ -10029,11 +10005,15 @@ async fn perform_full_login(
     mode: LoginMode,
 ) -> Result<()> {
     let mut state = paths.load_cli_state().unwrap_or_default();
-    let credentials = match mode {
-        LoginMode::Token(pat) => run_token_login(endpoints, &pat).await?,
-        LoginMode::Device { no_browser } => {
-            run_device_login_with_opts(endpoints, no_browser).await?
-        }
+    let (credentials, interactive_auth) = match mode {
+        LoginMode::Token(pat) => (run_token_login(endpoints, &pat).await?, false),
+        LoginMode::Device {
+            interactive_auth,
+            no_browser,
+        } => (
+            run_device_login_with_opts(endpoints, interactive_auth, no_browser).await?,
+            true,
+        ),
     };
     let platform = PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
     let profile = platform.fetch_current_user().await.ok();
@@ -10042,6 +10022,7 @@ async fn perform_full_login(
         profile
             .as_ref()
             .and_then(|user| user.display_name.as_deref()),
+        interactive_auth,
     )
     .await?;
     state.preferred_python = Some(python.display().to_string());
@@ -10108,24 +10089,28 @@ async fn perform_full_login(
     Ok(())
 }
 
-async fn run_device_login(endpoints: &PlatformEndpoints) -> Result<StoredCredentials> {
-    // Default behaviour preserves the original "open a browser" UX
-    // for users with a desktop GUI. HPC / SSH paths reach the new
-    // headless variant via `prism login --no-browser`.
-    run_device_login_with_opts(endpoints, false).await
+async fn run_device_login(
+    endpoints: &PlatformEndpoints,
+    interactive_auth: bool,
+) -> Result<StoredCredentials> {
+    run_device_login_with_opts(endpoints, interactive_auth, true).await
 }
 
-/// Headless variant of `run_device_login`.
-///
-/// `no_browser=true` skips the auto-open and renders an explicit
-/// instruction block so the user can paste the URL into ANY browser
-/// (their laptop's, their phone's, …) and approve. The polling loop
-/// is identical — once the device is approved, the token comes back
-/// and gets stored exactly the same way.
+/// Retained device-flow implementation. It is never entered without the
+/// explicit interactive-auth opt-in and a real TTY. The verification URL is
+/// printed for the human to open manually; PRISM never launches a browser.
 async fn run_device_login_with_opts(
     endpoints: &PlatformEndpoints,
-    no_browser: bool,
+    interactive_auth: bool,
+    _no_browser: bool,
 ) -> Result<StoredCredentials> {
+    auth::require_interactive_auth(
+        AuthSurface::Cli,
+        interactive_auth,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    )?;
+
     let platform = PlatformClient::new(&endpoints.api_base);
     let http = platform.inner().clone();
 
@@ -10133,28 +10118,11 @@ async fn run_device_login_with_opts(
         DeviceFlowAuth::start_device_flow(&http, &endpoints.api_base).await?;
 
     println!();
-    if no_browser {
-        // Headless block — no auto-open, structure the output so the
-        // user can clearly see what to do on a different machine.
-        println!("\u{2501}\u{2501} PRISM headless login \u{2501}\u{2501}");
-        println!();
-        println!("  1. Open this URL on any browser (laptop, phone, …):");
-        println!("       {}", start.verification_uri);
-        println!("  2. Enter this code:");
-        println!("       {}", start.user_code);
-        println!("  3. Approve the session.");
-        println!();
-        println!("  Waiting here until you approve. Ctrl+C to abort.");
-    } else {
-        println!("PRISM setup needs a platform login.");
-        println!("Open: {}", start.verification_uri);
-        println!("Code: {}", start.user_code);
-        println!();
-        if let Err(err) = open_browser(&start.verification_uri) {
-            eprintln!("warning: failed to open browser automatically: {err}");
-        }
-        println!("Approve the device in your browser, then return here.");
-    }
+    println!("PRISM device login (manual approval)");
+    println!("Open this URL manually: {}", start.verification_uri);
+    println!("Code: {}", start.user_code);
+    println!();
+    println!("Approve the device, then wait here. Ctrl+C to abort.");
 
     let token: TokenResponse = DeviceFlowAuth::poll_for_token(
         &http,
@@ -10302,6 +10270,7 @@ async fn run_token_login(endpoints: &PlatformEndpoints, token: &str) -> Result<S
 async fn select_project(
     platform: &PlatformClient,
     display_name: Option<&str>,
+    interactive_auth: bool,
 ) -> Result<SelectedContext> {
     if let Some(project_id) = env_project_override() {
         match platform.get_project(&project_id).await {
@@ -10349,10 +10318,14 @@ async fn select_project(
         let only = &orgs[0];
         println!("Using organization: {} ({})", only.name, only.slug);
         only
-    } else {
+    } else if interactive_auth {
         prompt_select("Select organization", &orgs, |org| {
             format!("{} ({})", org.name, org.slug)
         })?
+    } else {
+        bail!(
+            "multiple organizations require a selection; set MARC27_PROJECT_ID=<project_id> and rerun `prism login --token <PAT>`"
+        );
     };
 
     let projects = platform.list_projects_for_org(&selected_org.id).await?;
@@ -10383,10 +10356,14 @@ async fn select_project(
         let only = &projects[0];
         println!("Using project: {} ({})", only.name, only.slug);
         only
-    } else {
+    } else if interactive_auth {
         prompt_select("Select project", &projects, |project| {
             format!("{} ({})", project.name, project.slug)
         })?
+    } else {
+        bail!(
+            "multiple projects require a selection; set MARC27_PROJECT_ID=<project_id> and rerun `prism login --token <PAT>`"
+        );
     };
 
     Ok(SelectedContext {
@@ -10528,38 +10505,6 @@ async fn resolve_node_token(
 }
 
 // Old Ink/TypeScript TUI launcher removed — native Ratatui TUI is in crates/cli/src/tui/
-
-fn open_browser(url: &str) -> Result<()> {
-    // Defense-in-depth: only http(s) URLs.
-    //
-    // The two callers pass `verification_uri` from the OAuth device-flow
-    // response and `checkout_url` from the billing topup response. Both
-    // come from the MARC27 platform and should always be https. Validating
-    // here means a compromised or buggy platform can't slip in
-    // `--version`, `file:///etc/passwd`, or a `javascript:` payload that
-    // some browser opener would happily execute.
-    let trimmed = url.trim();
-    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-        bail!("refusing to open non-http(s) URL: {url}");
-    }
-
-    let status = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(trimmed).status()
-    } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", trimmed])
-            .status()
-    } else {
-        std::process::Command::new("xdg-open").arg(trimmed).status()
-    }
-    .context("failed to spawn browser opener")?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("browser opener exited with status {status}")
-    }
-}
 
 /// Check if Ollama has a specific model available.
 async fn check_ollama_model(model: &str) -> Result<bool> {

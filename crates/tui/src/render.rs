@@ -1107,8 +1107,9 @@ fn model_field(v: &serde_json::Value, key: &str) -> String {
 
 // ── Account (platform login/logout) ───────────────────────────────
 //
-// Reads ~/.prism/credentials.json for status (client-side) and dispatches
-// Login/Logout to the backend's existing /login (device flow) and /logout.
+// Reads ~/.prism/credentials.json for status (client-side). Logout is sent
+// to the backend; login is intentionally non-interactive and reports the
+// exact CLI commands instead.
 
 // ── Session picker (list / resume) ────────────────────────────────
 
@@ -1417,7 +1418,7 @@ fn draw_account(f: &mut Frame, app: &App) {
         Style::default().fg(t.accent),
     )));
     lines.push(Line::from(Span::styled(
-        "  login uses the device flow — approve in your browser",
+        "  login is non-interactive — use `prism login --token <PAT>`",
         Style::default().fg(t.muted),
     )));
     lines.push(Line::raw(""));
@@ -2794,7 +2795,7 @@ fn draw_which_key(f: &mut Frame, app: &App) {
 // ── Link picker (`o`) ─────────────────────────────────────────────
 //
 // Lists http(s) URLs collected from the transcript (newest first) and
-// asks for explicit confirmation before opening one in the browser.
+// shows the selected URL for manual opening; PRISM never launches a browser.
 
 fn draw_link_picker(f: &mut Frame, app: &App) {
     let t = app.theme();
@@ -2824,7 +2825,7 @@ fn draw_link_picker(f: &mut Frame, app: &App) {
             Line::raw(""),
             Line::from(vec![
                 Span::raw("  [y/↵] "),
-                Span::styled("Open in browser", Style::default().fg(t.ok)),
+                Span::styled("Show URL for manual opening", Style::default().fg(t.ok)),
                 Span::raw("   [n/Esc] "),
                 Span::styled("Cancel", Style::default().fg(t.muted)),
             ]),

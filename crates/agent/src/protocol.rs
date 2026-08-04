@@ -15,10 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use prism_client::api::{OrgInfo, PlatformClient, ProjectInfo};
-use prism_client::{DeviceFlowAuth, auth::DeviceCodeResponse, auth::TokenResponse};
 use prism_ingest::LlmConfig;
 use prism_ingest::llm::{ChatMessage, LlmClient};
 use prism_python_bridge::tool_server::{ToolServer, ToolServerHandle};
+use prism_runtime::auth::{self, AUTH_REQUIRED_RPC_CODE};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
     WorkflowRunResult, WorkflowSpec, discover_workflows, execute_workflow_with_policy,
@@ -178,6 +178,7 @@ struct ServerRuntime {
     policy_engine: Option<prism_policy::PolicyEngine>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 struct SelectedContext {
     org_id: Option<String>,
@@ -186,12 +187,14 @@ struct SelectedContext {
     project_name: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 struct SelectionOutcome {
     context: SelectedContext,
     notes: Vec<String>,
 }
 
+#[allow(dead_code)]
 fn env_project_override() -> Option<String> {
     std::env::var("MARC27_PROJECT_ID")
         .ok()
@@ -199,6 +202,7 @@ fn env_project_override() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[allow(dead_code)]
 fn default_project_name(display_name: Option<&str>) -> String {
     match display_name
         .map(str::trim)
@@ -209,11 +213,13 @@ fn default_project_name(display_name: Option<&str>) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn default_project_slug() -> String {
     let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
     format!("prism-{timestamp}")
 }
 
+#[allow(dead_code)]
 fn pick_organization(
     orgs: &[OrgInfo],
     prior: Option<&StoredCredentials>,
@@ -249,6 +255,7 @@ fn pick_organization(
     ))
 }
 
+#[allow(dead_code)]
 fn pick_project(
     projects: &[ProjectInfo],
     prior: Option<&StoredCredentials>,
@@ -296,6 +303,7 @@ fn pick_project(
     ))
 }
 
+#[allow(dead_code)]
 async fn select_project_context_automatically(
     platform: &PlatformClient,
     display_name: Option<&str>,
@@ -380,58 +388,6 @@ async fn select_project_context_automatically(
     })
 }
 
-async fn start_native_device_login(endpoints: &PlatformEndpoints) -> Result<DeviceCodeResponse> {
-    let platform = PlatformClient::new(&endpoints.api_base);
-    let http = platform.inner().clone();
-
-    let start: DeviceCodeResponse =
-        DeviceFlowAuth::start_device_flow(&http, &endpoints.api_base).await?;
-    if let Err(error) = open_browser(&start.verification_uri) {
-        tracing::warn!(error = %error, "failed to open browser automatically during login");
-    }
-    Ok(start)
-}
-
-async fn poll_native_device_login(
-    endpoints: &PlatformEndpoints,
-    start: &DeviceCodeResponse,
-) -> Result<StoredCredentials> {
-    let platform = PlatformClient::new(&endpoints.api_base);
-    let http = platform.inner().clone();
-    let token: TokenResponse = DeviceFlowAuth::poll_for_token(
-        &http,
-        &endpoints.api_base,
-        &start.device_code,
-        start.interval.max(1) as u64,
-    )
-    .await?;
-
-    let expires_at = token.expires_in.and_then(|secs| {
-        chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
-    });
-
-    Ok(StoredCredentials {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        platform_url: endpoints.api_base.trim_end_matches("/api/v1").to_string(),
-        user_id: None,
-        display_name: None,
-        org_id: None,
-        org_name: None,
-        project_id: None,
-        project_name: None,
-        expires_at,
-    })
-}
-
-fn sync_sdk_credentials(creds: &StoredCredentials) {
-    // Single source of truth for the `~/.prism/credentials.json` SDK mirror —
-    // login (here) and silent refresh (CLI + node daemon) all go through the
-    // same writer so the two credential stores can never drift in shape or
-    // freshness. See PrismPaths::save_sdk_credentials.
-    PrismPaths::save_sdk_credentials(creds);
-}
-
 fn clear_sdk_credentials() {
     if let Some(home) = std::env::var_os("HOME") {
         let sdk_path = PathBuf::from(home).join(".prism").join("credentials.json");
@@ -497,34 +453,18 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
     }
 }
 
-fn open_browser(url: &str) -> Result<()> {
-    // Defense-in-depth: only http(s) URLs. See crates/cli/src/main.rs for
-    // the same restriction — protects against a compromised platform
-    // returning `--version`, `file:///`, or a `javascript:` payload that
-    // some browser opener would happily execute.
-    let trimmed = url.trim();
-    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-        return Err(anyhow::anyhow!("refusing to open non-http(s) URL: {url}"));
-    }
-
-    let status = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(trimmed).status()
-    } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", trimmed])
-            .status()
-    } else {
-        std::process::Command::new("xdg-open").arg(trimmed).status()
-    }
-    .context("failed to spawn browser opener")?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "browser opener exited with status {status}"
-        ))
-    }
+fn emit_auth_required(surface: &str) {
+    let failure = auth::AuthFailure::missing(surface);
+    emit_notification(
+        "ui.backend.error",
+        serde_json::json!({
+            "code": AUTH_REQUIRED_RPC_CODE,
+            "message": failure.message,
+            "recoverable": false,
+            "auth": auth::auth_failure_json(&failure),
+        }),
+    );
+    emit_notification("ui.turn.complete", serde_json::json!({}));
 }
 
 fn parse_slash_command(command: &str) -> Result<Option<Vec<String>>> {
@@ -6107,11 +6047,8 @@ async fn handle_command(
         }
         "/setup" => {
             let paths = PrismPaths::discover()?;
-            let mut state = paths.load_cli_state()?;
-            state.preferred_python = Some(slash_ctx.python_bin.display().to_string());
-
+            let state = paths.load_cli_state()?;
             if let Some(creds) = state.credentials.as_ref() {
-                paths.save_cli_state(&state)?;
                 apply_account_env(Some(creds));
                 emit_view(
                     "account",
@@ -6120,168 +6057,14 @@ async fn handle_command(
                     "info",
                 );
             } else {
-                let endpoints = PlatformEndpoints::from_env();
-                let start = match start_native_device_login(&endpoints).await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        emit_view(
-                            "account",
-                            "Setup Failed",
-                            &format!("Device login failed.\n\n{error}"),
-                            "warning",
-                        );
-                        emit_notification("ui.turn.complete", serde_json::json!({}));
-                        return Ok(true);
-                    }
-                };
-                emit_view(
-                    "account",
-                    "Approve Login",
-                    &format!(
-                        "Open this URL in your browser and approve the device.\n\n{}\n\nCode\n  {}\n\nIf the browser did not open automatically, copy the URL above.",
-                        start.verification_uri, start.user_code,
-                    ),
-                    "accent",
-                );
-                let base_creds = match poll_native_device_login(&endpoints, &start).await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        emit_view(
-                            "account",
-                            "Setup Failed",
-                            &format!("Device approval did not complete.\n\n{error}"),
-                            "warning",
-                        );
-                        emit_notification("ui.turn.complete", serde_json::json!({}));
-                        return Ok(true);
-                    }
-                };
-
-                let platform =
-                    PlatformClient::new(&endpoints.api_base).with_token(&base_creds.access_token);
-                let profile = platform.fetch_current_user().await.ok();
-                let selected = select_project_context_automatically(
-                    &platform,
-                    profile
-                        .as_ref()
-                        .and_then(|user| user.display_name.as_deref()),
-                    None,
-                )
-                .await?;
-                let creds = StoredCredentials {
-                    access_token: base_creds.access_token,
-                    refresh_token: base_creds.refresh_token,
-                    platform_url: base_creds.platform_url,
-                    user_id: profile.as_ref().map(|p| p.id.clone()),
-                    display_name: profile.and_then(|p| p.display_name),
-                    org_id: selected.context.org_id,
-                    org_name: selected.context.org_name,
-                    project_id: selected.context.project_id,
-                    project_name: selected.context.project_name,
-                    expires_at: base_creds.expires_at,
-                };
-                state.credentials = Some(creds.clone());
-                paths.save_cli_state(&state)?;
-                sync_sdk_credentials(&creds);
-                apply_account_env(Some(&creds));
-                emit_view(
-                    "account",
-                    "Setup Complete",
-                    &format_account_result(
-                        "PRISM account setup finished.",
-                        &creds,
-                        &selected.notes,
-                        &paths,
-                    ),
-                    "info",
-                );
+                emit_auth_required("agent protocol /setup");
+                return Ok(true);
             }
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
         "/login" => {
-            let endpoints = PlatformEndpoints::from_env();
-            let paths = PrismPaths::discover()?;
-            let mut state = paths.load_cli_state()?;
-            state.preferred_python = Some(slash_ctx.python_bin.display().to_string());
-
-            let start = match start_native_device_login(&endpoints).await {
-                Ok(value) => value,
-                Err(error) => {
-                    emit_view(
-                        "account",
-                        "Login Failed",
-                        &format!("Device login failed.\n\n{error}"),
-                        "warning",
-                    );
-                    emit_notification("ui.turn.complete", serde_json::json!({}));
-                    return Ok(true);
-                }
-            };
-
-            emit_view(
-                "account",
-                "Approve Login",
-                &format!(
-                    "Open this URL in your browser and approve the device.\n\n{}\n\nCode\n  {}\n\nIf the browser did not open automatically, copy the URL above.",
-                    start.verification_uri, start.user_code,
-                ),
-                "accent",
-            );
-            let base_creds = match poll_native_device_login(&endpoints, &start).await {
-                Ok(value) => value,
-                Err(error) => {
-                    emit_view(
-                        "account",
-                        "Login Failed",
-                        &format!("Device approval did not complete.\n\n{error}"),
-                        "warning",
-                    );
-                    emit_notification("ui.turn.complete", serde_json::json!({}));
-                    return Ok(true);
-                }
-            };
-
-            let platform =
-                PlatformClient::new(&endpoints.api_base).with_token(&base_creds.access_token);
-            let profile = platform.fetch_current_user().await.ok();
-            let selected = select_project_context_automatically(
-                &platform,
-                profile
-                    .as_ref()
-                    .and_then(|user| user.display_name.as_deref()),
-                state.credentials.as_ref(),
-            )
-            .await?;
-
-            let creds = StoredCredentials {
-                access_token: base_creds.access_token,
-                refresh_token: base_creds.refresh_token,
-                platform_url: base_creds.platform_url,
-                user_id: profile.as_ref().map(|p| p.id.clone()),
-                display_name: profile.and_then(|p| p.display_name),
-                org_id: selected.context.org_id,
-                org_name: selected.context.org_name,
-                project_id: selected.context.project_id,
-                project_name: selected.context.project_name,
-                expires_at: base_creds.expires_at,
-            };
-            state.credentials = Some(creds.clone());
-            paths.save_cli_state(&state)?;
-            sync_sdk_credentials(&creds);
-            apply_account_env(Some(&creds));
-            emit_view(
-                "account",
-                "Login Complete",
-                &format_account_result(
-                    "Stored platform account credentials.",
-                    &creds,
-                    &selected.notes,
-                    &paths,
-                ),
-                "info",
-            );
-            emit_notification("ui.turn.complete", serde_json::json!({}));
+            emit_auth_required("agent protocol /login");
             Ok(true)
         }
         "/logout" => {
@@ -7105,8 +6888,8 @@ async fn handle_command(
             Ok(true)
         }
         _ if trimmed.starts_with("/billing topup") => {
-            // Buy credits: list the packs, and with a slug open the hosted
-            // checkout in the browser. Crediting is server-side on payment.
+            // Buy credits: list the packs, and with a slug print the hosted
+            // checkout URL for manual opening. Crediting is server-side on payment.
             // (Previously advertised in the /billing footer but never routed.)
             let pkg = trimmed["/billing topup".len()..].trim();
             let mut args = vec![String::from("billing"), String::from("topup")];
@@ -8007,6 +7790,7 @@ mod tests {
         summarize_api_view, system_prompt_for_mode, truncate_for_ui,
     };
     use prism_ingest::LlmConfig;
+    use prism_runtime::auth;
     use std::collections::BTreeMap;
 
     /// A resolved chat endpoint, as `build_llm_config` would produce.
@@ -8237,6 +8021,23 @@ mod tests {
         let parsed =
             parse_slash_command("just talk to the agent").expect("plain text should not error");
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn agent_auth_failure_is_structured_and_never_starts_device_flow() {
+        let failure = auth::AuthFailure::missing("agent protocol /login");
+        let payload = auth::auth_failure_json(&failure);
+        assert_eq!(payload["code"], "AUTH_REQUIRED");
+        assert!(
+            payload["action"]
+                .as_str()
+                .expect("action is present")
+                .contains("prism login --token <PAT>")
+        );
+        assert!(
+            auth::require_interactive_auth(auth::AuthSurface::AgentProtocol, true, true, true,)
+                .is_err()
+        );
     }
 
     #[test]

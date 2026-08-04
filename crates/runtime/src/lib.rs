@@ -12,6 +12,7 @@
 //! paths, credential resolution, offline policy, and retry policy; it does not
 //! own an event loop, scheduler, process supervision, or task executor.
 
+pub mod auth;
 pub mod llm_resolve;
 pub mod offline;
 pub mod retry;

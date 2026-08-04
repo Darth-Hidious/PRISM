@@ -114,13 +114,16 @@ pub async fn run_if_first_launch(
     let local_servers = crate::local_llm::discover().await;
     match choose_route(&local_servers)? {
         Route::Platform => {
-            println!("\n  A browser window will open to sign in. If it doesn't, copy the");
-            println!("  link and code shown below into any browser on any device.\n");
+            println!("\n  Hosted login is disabled by default. Set PRISM_ALLOW_INTERACTIVE_AUTH=1");
+            println!("  and run `prism login --interactive-auth` from a TTY, or provide a PAT.\n");
             perform_full_login(
                 paths,
                 endpoints,
                 python,
-                LoginMode::Device { no_browser: false },
+                LoginMode::Device {
+                    interactive_auth: false,
+                    no_browser: true,
+                },
             )
             .await?;
 

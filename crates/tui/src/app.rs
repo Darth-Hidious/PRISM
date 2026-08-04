@@ -182,8 +182,9 @@ pub struct AccountStatus {
     pub project: String,
 }
 
-/// Account dialog — MARC27 login/logout. Status is read locally; Login/Logout
-/// dispatch to the backend's existing `/login` (device flow) and `/logout`.
+/// Account dialog — MARC27 logout and local status. Login is deliberately
+/// non-interactive: callers must run `prism login --token <PAT>` or configure
+/// `MARC27_API_KEY` outside the TUI.
 #[derive(Debug, Clone, Default)]
 pub struct AccountDialog {
     pub open: bool,
@@ -314,8 +315,8 @@ pub(crate) fn extract_path(content: &str) -> Option<String> {
 }
 
 /// Link picker (`o` in chat focus) — collects http(s) URLs from the
-/// transcript (newest turn first) and opens the selected one in the
-/// system browser after an explicit confirm dialog.
+/// transcript (newest turn first) and shows the selected URL for manual
+/// opening after an explicit confirm dialog.
 #[derive(Debug, Clone, Default)]
 pub struct LinkPicker {
     pub open: bool,
@@ -499,7 +500,7 @@ pub struct App {
     pub config_window: ConfigWindow,
     /// API-key window.
     pub apikey_window: ApiKeyWindow,
-    /// Link picker (`o`): open a transcript URL in the browser.
+    /// Link picker (`o`): show a transcript URL for manual opening.
     pub link_picker: LinkPicker,
     /// Open form pane (generic structured input), if any.
     pub form: Option<FormPane>,
@@ -2336,8 +2337,12 @@ impl App {
         }
         match key.code {
             KeyCode::Char('l') => {
-                self.account_action("/login", "login (approve in browser)");
-                self.close_account();
+                let failure = prism_runtime::auth::AuthFailure::missing("TUI account login");
+                self.push_error(&failure.message);
+                self.toast(
+                    "login is non-interactive; see the error for the exact command",
+                    ToastKind::Warn,
+                );
             }
             KeyCode::Char('o') => {
                 self.account_action("/logout", "logging out");
@@ -2850,8 +2855,8 @@ impl App {
     // ── Link picker (`o`) ───────────────────────────────────────────
 
     /// Collect http(s) URLs from the transcript (newest message first)
-    /// and open the picker. With exactly one URL the picker goes straight
-    /// to the confirm dialog — opening a browser always asks first.
+    /// and show the picker. URLs are displayed for manual opening; PRISM
+    /// never launches a browser.
     pub fn open_link_picker(&mut self) {
         let mut urls: Vec<String> = Vec::new();
         for m in self.messages.iter().rev() {
@@ -2928,7 +2933,8 @@ impl App {
         }
     }
 
-    /// Open `urls[selected]` in the system browser (detached) and close.
+    /// Show the selected URL for manual opening and close. PRISM never
+    /// launches a browser subprocess.
     fn open_selected_link(&mut self) {
         if let Some(url) = self
             .link_picker
@@ -2936,10 +2942,11 @@ impl App {
             .get(self.link_picker.selected)
             .cloned()
         {
-            match open_url_detached(&url) {
-                Ok(()) => self.toast(format!("opening {url}"), ToastKind::Ok),
-                Err(e) => self.toast(format!("open failed: {e}"), ToastKind::Err),
-            }
+            self.push_system(&format!("Browser launch disabled; open manually: {url}"));
+            self.toast(
+                "browser launch disabled; URL shown in the transcript",
+                ToastKind::Info,
+            );
         }
         self.link_picker.open = false;
     }
@@ -3847,32 +3854,6 @@ fn chatline_detail_json(m: &ChatLine) -> Value {
     v
 }
 
-/// Open a URL with the platform opener (`open` on macOS, `xdg-open` on
-/// Linux), fully detached with null stdio — the UI never blocks on it.
-/// Only http(s) URLs reach this (see [`crate::markdown::extract_urls`])
-/// and the URL is passed as a single argument, never through a shell.
-fn open_url_detached(url: &str) -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
-    let mut cmd = if cfg!(target_os = "macos") {
-        let mut c = Command::new("open");
-        c.arg(url);
-        c
-    } else if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        c
-    } else {
-        let mut c = Command::new("xdg-open");
-        c.arg(url);
-        c
-    };
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
-}
-
 /// Shell-quote one CLI argv token for embedding in a slash-command string.
 ///
 /// The agent backend re-splits the string with `shlex` (POSIX-style), so
@@ -4251,6 +4232,17 @@ mod tests {
         app2.handle_key(key(KeyCode::Char('t')));
         assert!(!app2.home.open, "'t' closes the home");
         assert!(app2.tools_window.open, "'t' opens the tools window");
+    }
+
+    #[test]
+    fn account_login_is_local_fail_fast_and_does_not_dispatch_auth() {
+        let mut app = fresh();
+        app.account.open = true;
+        app.handle_key(key(KeyCode::Char('l')));
+        assert!(!app.account.busy, "TUI login must not start a backend turn");
+        let last = app.messages.last().expect("login failure is visible");
+        assert!(last.text.contains("prism login --token <PAT>"));
+        assert!(last.text.contains("MARC27_API_KEY"));
     }
 
     #[test]

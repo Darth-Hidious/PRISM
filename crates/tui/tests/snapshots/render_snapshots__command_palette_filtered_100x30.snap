@@ -23,7 +23,7 @@ expression: rendered
                │      account ▸ Account                 Platform login / l… palette │
                │      session ▸ Set goal                Standing goal… /goal <text> │
                │   automation ▸ Show workflow           Inspect one workfl… palette │
-               │  … 26 more — ↓ to scroll or type to filter                         │
+               │  … 27 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│
