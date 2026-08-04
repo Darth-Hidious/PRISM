@@ -97,6 +97,13 @@ qe = [
     "ase>=3.23.0",
     "pymatgen>=2024.1.1",
 ]
+lpbf = [
+    # LPBF Rosenthal process-window maps and Kou cracking index
+    # (app/tools/manufacturing/lpbf). Kept out of the base install and gated
+    # at bootstrap so missing numerical dependencies leave no ghost tools.
+    "numpy>=1.26,<3.0",
+    "scipy>=1.11,<2.0",
+]
 calphad = [
     # pycalphad supports Python 3.9–3.14; same window as pyiron.
     "pycalphad>=0.10,<0.12; python_version<'3.15'",
@@ -131,7 +138,7 @@ reports = [
     "weasyprint>=60.0",
 ]
  all = [
-    "prism-platform[ml,calphad,mace,qe,data,reports]",
+    "prism-platform[ml,calphad,mace,qe,lpbf,data,reports]",
  ]
 full = [
     "prism-platform[all,simulation]",

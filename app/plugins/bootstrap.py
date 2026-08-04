@@ -209,6 +209,19 @@ def build_full_registry(
     except Exception:
         logger.debug("qe tools not registered", exc_info=True)
 
+    # LPBF manufacturing physics (optional `[lpbf]` extra): analytical
+    # Rosenthal printability maps and Kou cracking susceptibility. Registered
+    # only when NumPy + SciPy import; there is no sidecar or ghost tool.
+    try:
+        from app.tools.manufacturing.lpbf import check_lpbf_available
+
+        if check_lpbf_available():
+            from app.tools.manufacturing.lpbf.tools import create_lpbf_tools
+
+            create_lpbf_tools(registry)
+    except Exception:
+        logger.debug("lpbf tools not registered", exc_info=True)
+
     # Structure import — CIF / lattice-dict → MACE cache (cache_ref) +
     # pyiron StructureStore (structure_id). Bridges "found a structure in
     # MP / a paper" to "run a simulation on it".
