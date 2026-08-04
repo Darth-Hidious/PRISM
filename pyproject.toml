@@ -89,6 +89,14 @@ simulation = [
     "pyiron-base>=0.9; python_version<'3.15'",
     "pyiron-atomistics>=0.6; python_version<'3.15'",
 ]
+qe = [
+    # Quantum ESPRESSO input/output path (app/tools/simulation/qe): pw.x
+    # .in writing + .out parsing through ASE's espresso formats, structure
+    # handling through pymatgen. Deliberately pyiron-free — this path does
+    # not use or require pyiron at all.
+    "ase>=3.23.0",
+    "pymatgen>=2024.1.1",
+]
 calphad = [
     # pycalphad supports Python 3.9–3.14; same window as pyiron.
     "pycalphad>=0.10,<0.12; python_version<'3.15'",
@@ -123,7 +131,7 @@ reports = [
     "weasyprint>=60.0",
 ]
  all = [
-    "prism-platform[ml,calphad,mace,data,reports]",
+    "prism-platform[ml,calphad,mace,qe,data,reports]",
  ]
 full = [
     "prism-platform[all,simulation]",

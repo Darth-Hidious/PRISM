@@ -193,6 +193,22 @@ def build_full_registry(
     except Exception:
         logger.debug("mace tools not registered", exc_info=True)
 
+    # Quantum ESPRESSO input/output tools (pyiron-free path): pw.x .in
+    # writing via ASE's espresso-in format and .out parsing via ASE's
+    # espresso-out reader, with pymatgen structure handling. Registered
+    # ONLY when ase + pymatgen import — deliberately no sidecar fallback
+    # and no registered-but-always-erroring ghost tools: if the deps are
+    # missing the tools simply do not appear in the catalog.
+    try:
+        from app.tools.simulation.qe import check_qe_available
+
+        if check_qe_available():
+            from app.tools.simulation.qe.tools import create_qe_tools
+
+            create_qe_tools(registry)
+    except Exception:
+        logger.debug("qe tools not registered", exc_info=True)
+
     # Structure import — CIF / lattice-dict → MACE cache (cache_ref) +
     # pyiron StructureStore (structure_id). Bridges "found a structure in
     # MP / a paper" to "run a simulation on it".
