@@ -91,9 +91,6 @@ impl PolicyDecision {
     }
 }
 
-pub mod intersect;
-pub use intersect::intersect_decisions;
-
 // ---------------------------------------------------------------------------
 // Enforcement-point (gate) helper
 // ---------------------------------------------------------------------------

@@ -31,14 +31,5 @@ prism-proto = { path = "../proto" }
 prism-provenance = { path = "../provenance" }
 
 [dev-dependencies]
-prism-audit = { path = "../audit" }
-prism-policy = { path = "../policy" }
 rand = { workspace = true }
 tempfile = "3"
-
-# F6 — cross-site inference demo.
-# Wires F1 (identity) + F1c3 (lookups) + F2 (policy) + F3 (locality)
-# + F4 (burst routing) + F5 (audit) end-to-end in a single binary.
-[[example]]
-name = "cross_site_inference"
-path = "examples/cross_site_inference.rs"

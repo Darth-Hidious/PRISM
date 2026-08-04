@@ -37,8 +37,10 @@
 //! - **Transport.** Bytes move via `crate::subscription` and the
 //!   existing mesh WebSocket channel. This module is data shapes +
 //!   verify logic only.
-//! - **Policy evaluation.** Once a peer is verified, the cross-org
-//!   policy intersection lives in `crates/policy/intersect.rs`.
+//! - **Policy evaluation.** Once a peer is verified, cross-org policy
+//!   intersection is not yet implemented in the workspace (the former
+//!   `crates/policy/intersect.rs` prototype had no production callers
+//!   and was removed).
 //! - **Audit.** Signed cross-org audit envelopes live in their own
 //!   `crates/audit/` crate (F5). This module emits the verified
 //!   identity that audit then signs over.
