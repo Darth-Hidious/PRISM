@@ -692,6 +692,14 @@ enum ProvenanceCommands {
     },
 }
 
+fn format_classified_reward(reward: f64, evidence_class: prism_campaign::EvidenceClass) -> String {
+    format!(
+        "{reward:.4} [{} {}]",
+        evidence_class.color().to_ascii_uppercase(),
+        evidence_class.as_str()
+    )
+}
+
 #[derive(Debug, Subcommand)]
 enum CampaignCommands {
     /// Start a new discovery campaign from a goal description.
@@ -2042,9 +2050,16 @@ async fn main() -> Result<()> {
                     // as "$0.00 of $25.00" otherwise, which is a green light
                     // for a limit that cannot fire.
                     println!("Budget: {}", state.budget_status());
-                    println!("Avg reward: {:.4}", state.avg_reward());
+                    println!(
+                        "Avg reward: {}",
+                        format_classified_reward(state.avg_reward(), state.evidence_class)
+                    );
                     if let Some(best) = state.best() {
-                        println!("Best: {} (reward={:.4})", best.composition, best.reward);
+                        println!(
+                            "Best: {} (reward={})",
+                            best.composition,
+                            format_classified_reward(best.reward, best.evidence_class)
+                        );
                     }
                 }
                 CampaignCommands::List => {
@@ -11373,6 +11388,18 @@ fn resolve_unauth_llm_url(fallback_url: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn campaign_rewards_include_text_evidence_tokens() {
+        assert_eq!(
+            format_classified_reward(0.8125, prism_campaign::EvidenceClass::Screening),
+            "0.8125 [YELLOW screening]"
+        );
+        assert_eq!(
+            format_classified_reward(3455.3, prism_campaign::EvidenceClass::Indeterminate),
+            "3455.3000 [RED indeterminate]"
+        );
+    }
 
     #[test]
     fn unauth_llm_url_refuses_built_in_default() {

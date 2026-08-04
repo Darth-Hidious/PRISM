@@ -75,12 +75,16 @@ fn emit_raw(value: &Value) {
     let _ = out.flush();
 }
 
-fn emit_notification(method: &str, params: Value) {
-    emit_raw(&serde_json::json!({
+fn notification_value(method: &str, params: Value) -> Value {
+    serde_json::json!({
         "jsonrpc": "2.0",
         "method": method,
         "params": params,
-    }));
+    })
+}
+
+fn emit_notification(method: &str, params: Value) {
+    emit_raw(&notification_value(method, params));
 }
 
 fn emit_response(id: Value, result: Value) {
@@ -4878,36 +4882,19 @@ fn emit_agent_event(event: AgentEvent) {
             elapsed_ms,
             is_error,
         } => {
-            let (display_content, extra_data) = build_tool_card_payload(
+            // Frontend expects "ui.card" with UiCard schema. Evidence fields
+            // are additive for older clients and always present for receivers
+            // that must treat missing/unknown producer metadata as RED.
+            let payload = build_ui_card_payload(
+                &call_id,
                 &tool_name,
                 &content,
-                preview.as_deref(),
                 summary.as_deref(),
+                preview.as_deref(),
+                elapsed_ms,
+                is_error,
             );
-            let mut data = serde_json::Map::new();
-            data.insert("call_id".to_string(), serde_json::json!(call_id));
-            if let Some(summary) = summary {
-                data.insert("summary".to_string(), serde_json::json!(summary));
-            }
-            if let Some(preview) = preview {
-                data.insert("preview".to_string(), serde_json::json!(preview));
-            }
-            if let Some(extra) = extra_data.as_object() {
-                for (key, value) in extra {
-                    data.insert(key.clone(), value.clone());
-                }
-            }
-            // Frontend expects "ui.card" with UiCard schema
-            emit_notification(
-                "ui.card",
-                serde_json::json!({
-                    "card_type": if is_error { "error" } else { "results" },
-                    "tool_name": tool_name,
-                    "elapsed_ms": elapsed_ms,
-                    "content": display_content,
-                    "data": data,
-                }),
-            );
+            emit_notification("ui.card", payload);
             // When the AGENT ran a notebook cell, mirror it into the human's
             // notebook pane so both see the one shared kernel live.
             // G5f: also match the root canonical name "notebook" (was omitted —
@@ -4969,7 +4956,66 @@ fn emit_agent_event(event: AgentEvent) {
     }
 }
 
+fn build_ui_card_payload(
+    call_id: &str,
+    tool_name: &str,
+    content: &str,
+    summary: Option<&str>,
+    preview: Option<&str>,
+    elapsed_ms: u64,
+    is_error: bool,
+) -> Value {
+    let (display_content, extra_data) =
+        build_tool_card_payload(tool_name, content, preview, summary);
+    let evidence = crate::tool_result::tool_result_evidence(content);
+    let mut data = serde_json::Map::new();
+    data.insert("call_id".to_string(), serde_json::json!(call_id));
+    if let Some(summary) = summary {
+        data.insert("summary".to_string(), serde_json::json!(summary));
+    }
+    if let Some(preview) = preview {
+        data.insert("preview".to_string(), serde_json::json!(preview));
+    }
+    if let Some(extra) = extra_data.as_object() {
+        for (key, value) in extra {
+            data.insert(key.clone(), value.clone());
+        }
+    }
+
+    serde_json::json!({
+        "card_type": if is_error { "error" } else { "results" },
+        "tool_name": tool_name,
+        "elapsed_ms": elapsed_ms,
+        "content": display_content,
+        "evidence_class": evidence.as_str(),
+        "evidence_color": evidence.color(),
+        "data": data,
+    })
+}
+
 fn build_tool_card_payload(
+    tool_name: &str,
+    content: &str,
+    preview: Option<&str>,
+    summary: Option<&str>,
+) -> (String, Value) {
+    let (display_content, mut data) = build_tool_card_content(tool_name, content, preview, summary);
+    let evidence = crate::tool_result::tool_result_evidence(content);
+    let data = data
+        .as_object_mut()
+        .expect("tool card formatter data must be an object");
+    data.insert(
+        "evidence_class".to_string(),
+        serde_json::json!(evidence.as_str()),
+    );
+    data.insert(
+        "evidence_color".to_string(),
+        serde_json::json!(evidence.color()),
+    );
+    (display_content, Value::Object(data.clone()))
+}
+
+fn build_tool_card_content(
     tool_name: &str,
     content: &str,
     preview: Option<&str>,
@@ -7780,14 +7826,15 @@ mod tests {
     use super::{
         BashSlashAction, DiffSlashAction, EditSlashAction, PlanRuntimeState, PythonSlashAction,
         SessionMode, SlashCommandContext, WriteSlashAction, assemble_workflow_run_values,
-        build_effective_permission_context, build_tool_card_payload, format_skill_create,
-        format_skill_run, format_skills_list, handle_skills_slash_command, humanize_tool_verb,
-        inline_list, load_plan_snapshot, parse_bash_slash_action, parse_command_tail,
-        parse_diff_slash_action, parse_edit_slash_action, parse_notebook_run_args,
-        parse_python_slash_action, parse_read_slash_path, parse_skill_create_args,
-        parse_slash_command, parse_write_slash_action, persist_plan_snapshot, pick_organization,
-        pick_project, plan_snapshot_path, project_api_history, shell_command_join,
-        summarize_api_view, system_prompt_for_mode, truncate_for_ui,
+        build_effective_permission_context, build_tool_card_payload, build_ui_card_payload,
+        format_skill_create, format_skill_run, format_skills_list, handle_skills_slash_command,
+        humanize_tool_verb, inline_list, load_plan_snapshot, notification_value,
+        parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
+        parse_edit_slash_action, parse_notebook_run_args, parse_python_slash_action,
+        parse_read_slash_path, parse_skill_create_args, parse_slash_command,
+        parse_write_slash_action, persist_plan_snapshot, pick_organization, pick_project,
+        plan_snapshot_path, project_api_history, shell_command_join, summarize_api_view,
+        system_prompt_for_mode, truncate_for_ui,
     };
     use prism_ingest::LlmConfig;
     use prism_runtime::auth;
@@ -8431,6 +8478,57 @@ mod tests {
         assert_eq!(data["exit_code"], 0);
         assert_eq!(data["stdout"], "ok\n");
         assert_eq!(data["return_code_interpretation"], "No matches found");
+    }
+
+    #[test]
+    fn build_tool_card_payload_lifts_evidence_fields_without_changing_content() {
+        let raw = r#"{"composition":"W0.3 Mo0.2 Ta0.3 Nb0.2","reward":0.8125,"evidence_class":"screening","evidence_color":"yellow"}"#;
+        let (content, data) = build_tool_card_payload("hea_descriptors", raw, None, None);
+
+        assert_eq!(content, raw, "existing card content must remain compatible");
+        assert_eq!(data["evidence_class"], "screening");
+        assert_eq!(data["evidence_color"], "yellow");
+    }
+
+    #[test]
+    fn build_tool_card_payload_defaults_missing_evidence_to_indeterminate() {
+        let (_, data) = build_tool_card_payload(
+            "legacy_evaluator",
+            r#"{"composition":"W0.7 Mo0.3","reward":3455.3}"#,
+            None,
+            None,
+        );
+
+        assert_eq!(data["evidence_class"], "indeterminate");
+        assert_eq!(data["evidence_color"], "red");
+    }
+
+    #[test]
+    fn ui_card_notification_carries_structured_evidence() {
+        let raw = r#"{"composition":"W0.3 Mo0.2 Ta0.3 Nb0.2","reward":0.8125,"evidence_class":"screening","evidence_color":"yellow"}"#;
+        let params = build_ui_card_payload(
+            "call-1",
+            "hea_descriptors",
+            raw,
+            Some("hea_descriptors: completed"),
+            None,
+            12,
+            false,
+        );
+        let notification = notification_value("ui.card", params);
+
+        assert_eq!(notification["method"], "ui.card");
+        assert_eq!(
+            notification["params"]["content"],
+            "hea_descriptors: completed"
+        );
+        assert_eq!(notification["params"]["evidence_class"], "screening");
+        assert_eq!(notification["params"]["evidence_color"], "yellow");
+        assert_eq!(
+            notification["params"]["data"]["evidence_class"],
+            "screening"
+        );
+        println!("{notification}");
     }
 
     #[test]

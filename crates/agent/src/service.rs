@@ -73,6 +73,8 @@ pub enum ChatEvent {
         content: String,
         elapsed_ms: u64,
         is_error: bool,
+        evidence_class: String,
+        evidence_color: String,
     },
     /// A tool needed human approval and was SKIPPED (headless mode).
     /// Re-send the same message with `approve: ["<tool_name>"]` to run it.
@@ -107,6 +109,27 @@ impl ChatEvent {
             Self::Done { .. } => "done",
             Self::Error { .. } => "error",
         }
+    }
+}
+
+fn tool_result_event(
+    tool_name: String,
+    call_id: String,
+    summary: Option<String>,
+    content: String,
+    elapsed_ms: u64,
+    is_error: bool,
+) -> ChatEvent {
+    let evidence = crate::tool_result::tool_result_evidence(&content);
+    ChatEvent::ToolResult {
+        tool_name,
+        call_id,
+        summary,
+        content,
+        elapsed_ms,
+        is_error,
+        evidence_class: evidence.as_str().to_string(),
+        evidence_color: evidence.color().to_string(),
     }
 }
 
@@ -535,14 +558,9 @@ impl ChatService {
             } => {
                 // Same persistence the backend applies in spawn_agent_turn.
                 store.append_message("tool", &content, &tool_name, &call_id, None);
-                let _ = events.send(ChatEvent::ToolResult {
-                    tool_name,
-                    call_id,
-                    summary,
-                    content,
-                    elapsed_ms,
-                    is_error,
-                });
+                let _ = events.send(tool_result_event(
+                    tool_name, call_id, summary, content, elapsed_ms, is_error,
+                ));
             }
             AgentEvent::ToolApprovalRequest {
                 tool_name,
@@ -706,14 +724,7 @@ mod tests {
                 call_id: "c1".into(),
                 preview: None,
             },
-            ChatEvent::ToolResult {
-                tool_name: "query".into(),
-                call_id: "c1".into(),
-                summary: None,
-                content: "{}".into(),
-                elapsed_ms: 3,
-                is_error: false,
-            },
+            tool_result_event("query".into(), "c1".into(), None, "{}".into(), 3, false),
             ChatEvent::ApprovalRequired {
                 tool_name: "execute_bash".into(),
                 call_id: "c2".into(),
@@ -749,6 +760,33 @@ mod tests {
                 "serde type tag must match SSE event name"
             );
         }
+    }
+
+    #[test]
+    fn tool_result_wire_event_carries_evidence_and_defaults_missing_to_indeterminate() {
+        let classified = tool_result_event(
+            "hea_descriptors".into(),
+            "c1".into(),
+            None,
+            r#"{"value":0.8125,"evidence_class":"screening","evidence_color":"yellow"}"#.into(),
+            3,
+            false,
+        );
+        let classified = serde_json::to_value(classified).expect("serialize classified event");
+        assert_eq!(classified["evidence_class"], "screening");
+        assert_eq!(classified["evidence_color"], "yellow");
+
+        let legacy = tool_result_event(
+            "legacy_evaluator".into(),
+            "c2".into(),
+            None,
+            r#"{"value":3455.3}"#.into(),
+            3,
+            false,
+        );
+        let legacy = serde_json::to_value(legacy).expect("serialize legacy event");
+        assert_eq!(legacy["evidence_class"], "indeterminate");
+        assert_eq!(legacy["evidence_color"], "red");
     }
 
     #[test]

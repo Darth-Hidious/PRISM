@@ -22,7 +22,48 @@
 //! last-expression *value* (a string or null), NOT a wrapped payload. We only
 //! descend into a `result` sub-object when it is actually an object.
 
+use prism_provenance::EvidenceClass;
 use serde_json::Value;
+
+fn evidence_class_from_value(value: &Value) -> Option<EvidenceClass> {
+    let object = value.as_object()?;
+    object
+        .get("evidence_class")
+        .map(|value| match value.as_str() {
+            Some("reference_validated") => EvidenceClass::ReferenceValidated,
+            Some("screening") => EvidenceClass::Screening,
+            Some("research") => EvidenceClass::Research,
+            _ => EvidenceClass::Indeterminate,
+        })
+}
+
+/// Extract the evidence class from a tool-result content string.
+///
+/// Tool results normally carry evidence at the top level. CLI-backed command
+/// tools are transport envelopes, so their JSON stdout is also checked. Any
+/// missing, malformed, or unknown class is indeterminate; `evidence_color` is
+/// deliberately not trusted because color is derived from the class.
+pub fn tool_result_evidence(content: &str) -> EvidenceClass {
+    let Ok(value) = serde_json::from_str::<Value>(content) else {
+        return EvidenceClass::Indeterminate;
+    };
+    if let Some(evidence_class) = evidence_class_from_value(&value) {
+        return evidence_class;
+    }
+
+    let Some(object) = value.as_object() else {
+        return EvidenceClass::Indeterminate;
+    };
+    if object.contains_key("root")
+        && let Some(stdout) = object.get("stdout").and_then(Value::as_str)
+        && let Ok(stdout_value) = serde_json::from_str::<Value>(stdout.trim())
+        && let Some(evidence_class) = evidence_class_from_value(&stdout_value)
+    {
+        return evidence_class;
+    }
+
+    EvidenceClass::Indeterminate
+}
 
 /// Inspect a tool result and decide whether it represents a failure.
 ///
@@ -351,5 +392,46 @@ mod tests {
         // notebook_exec: top-level result is a string; exit_code is at top level.
         let v = json!({ "exit_code": 1, "result": "last-expr" });
         assert_eq!(tool_exit_code(&v), Some(1));
+    }
+
+    #[test]
+    fn evidence_uses_authoritative_class_and_derives_color() {
+        let evidence = tool_result_evidence(
+            r#"{"value":1.5,"evidence_class":"screening","evidence_color":"green"}"#,
+        );
+        assert_eq!(evidence, EvidenceClass::Screening);
+        assert_eq!(evidence.color(), "yellow");
+    }
+
+    #[test]
+    fn evidence_missing_unknown_or_malformed_is_indeterminate() {
+        for content in [
+            r#"{"value":1.5}"#,
+            r#"{"value":1.5,"evidence_class":"confirmed"}"#,
+            r#"{"value":1.5,"evidence_color":"green"}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                tool_result_evidence(content),
+                EvidenceClass::Indeterminate,
+                "content must not receive an optimistic default: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_reads_cli_command_json_stdout() {
+        let content = json!({
+            "root": "campaign",
+            "stdout": json!({
+                "reward": 0.8125,
+                "evidence_class": "research",
+                "evidence_color": "orange",
+            })
+            .to_string(),
+        })
+        .to_string();
+
+        assert_eq!(tool_result_evidence(&content), EvidenceClass::Research);
     }
 }
