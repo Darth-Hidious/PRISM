@@ -227,7 +227,14 @@ jobs:
                 check_abi_ceiling "$binary" GCC 7.0.0
                 # Do not let the SCL environment satisfy the smoke test with
                 # toolset runtime libraries absent from a stock Rocky 8 host.
-                env -u LD_LIBRARY_PATH "$binary" --version </dev/null
+                # prism takes --version; prism-node requires a subcommand, and
+                # `probe` reports local capabilities without touching the network,
+                # so it exercises the runtime rather than just the arg parser.
+                case "$(basename "$binary")" in
+                  prism-node) smoke=(probe) ;;
+                  *)          smoke=(--version) ;;
+                esac
+                env -u LD_LIBRARY_PATH "$binary" "${smoke[@]}" </dev/null
               done
 
               # Cache post-actions run as the host runner user.
