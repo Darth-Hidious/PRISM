@@ -97,7 +97,7 @@ prism mesh publish       # Share dataset to mesh
 
 ### Models
 ```
-prism models list        # 535 hosted LLMs
+prism models list        # Browse the hosted LLM catalog
 prism models search "claude"
 ```
 
@@ -117,7 +117,7 @@ prism billing prices     # Pricing table
 
 ### Other
 ```
-prism tools              # List 123 available tools
+prism tools              # List available tools
 prism marketplace search # Browse datasets, models, plugins
 prism discourse list     # Multi-agent debate workflows
 prism report "bug"       # File support ticket
@@ -138,7 +138,7 @@ prism (single Rust binary)
   prism-policy   OPA/Rego policy engine
   prism-workflows YAML workflow engine (8 step types)
 
-Python tools (123 tools via JSON stdio)
+Python tools (served over JSON stdio)
   Search: OPTIMADE (20+ providers), arXiv, Semantic Scholar
   Predict: property prediction, structure prediction
   Simulate: CALPHAD, DFT planning
