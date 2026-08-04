@@ -6,6 +6,11 @@
   "publisher": "mirdyne",
   "private": true,
   "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Darth-Hidious/PRISM.git",
+    "directory": "extensions/prism-vscode"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },

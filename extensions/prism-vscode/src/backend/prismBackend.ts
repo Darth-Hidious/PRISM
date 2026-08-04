@@ -108,7 +108,10 @@ export class PrismBackend implements vscode.Disposable {
 
   async respondToApproval(response: "y" | "n" | "a" | "b"): Promise<OkResult> {
     await this.ensureStarted();
-    return this.rpc.sendRequest<OkResult>("approval.respond", { response });
+    // Native backend protocol method; `approval.respond` was never a real
+    // backend method and got -32601 Method not found (see
+    // crates/agent/src/protocol.rs dispatch and crates/ipc/src/methods.rs).
+    return this.rpc.sendRequest<OkResult>("input.prompt_response", { response });
   }
 
   dispose(): void {
