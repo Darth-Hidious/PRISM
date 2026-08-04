@@ -1,6 +1,8 @@
 """PRISM MCP Server — exposes all tools to external MCP hosts."""
-import json
 import inspect
+import json
+import os
+import sys
 from typing import Annotated, Optional
 
 from app.tools.base import Tool, ToolRegistry
@@ -21,7 +23,74 @@ _JSON_TO_PYTHON_TYPE = {
     "boolean": bool,
     "array": list,
     "object": dict,
+    "null": type(None),
 }
+
+
+def _schema_type_to_python(schema_type):
+    """Select a Python type from a JSON Schema ``type`` value."""
+    if isinstance(schema_type, str):
+        type_names = [schema_type]
+    elif isinstance(schema_type, list):
+        type_names = [name for name in schema_type if isinstance(name, str)]
+    else:
+        return str
+
+    concrete_types = [name for name in type_names if name != "null"]
+    if not concrete_types:
+        return type(None) if "null" in type_names else str
+
+    python_type = _JSON_TO_PYTHON_TYPE.get(concrete_types[0], str)
+    if "null" in type_names:
+        return Optional[python_type]
+    return python_type
+
+
+class _MCPStdout:
+    """Send normal stdout writes to stderr while preserving MCP's byte stream."""
+
+    def __init__(self, redirected_stdout, protocol_buffer):
+        self._redirected_stdout = redirected_stdout
+        self.buffer = protocol_buffer
+
+    def write(self, text):
+        return self._redirected_stdout.write(text)
+
+    def flush(self):
+        return self._redirected_stdout.flush()
+
+    def fileno(self):
+        return self._redirected_stdout.fileno()
+
+    def isatty(self):
+        return self._redirected_stdout.isatty()
+
+    @property
+    def encoding(self):
+        return self._redirected_stdout.encoding
+
+    @property
+    def errors(self):
+        return self._redirected_stdout.errors
+
+
+def _isolate_mcp_stdout():
+    """Reserve the original stdout for MCP and redirect all other output."""
+    if isinstance(sys.stdout, _MCPStdout):
+        return
+
+    redirected_stdout = sys.stdout
+    redirected_stdout.flush()
+    sys.stderr.flush()
+    protocol_fd = os.dup(redirected_stdout.fileno())
+    try:
+        os.dup2(sys.stderr.fileno(), redirected_stdout.fileno())
+    except Exception:
+        os.close(protocol_fd)
+        raise
+
+    protocol_buffer = os.fdopen(protocol_fd, "wb", buffering=0)
+    sys.stdout = _MCPStdout(redirected_stdout, protocol_buffer)
 
 
 def _make_typed_handler(tool: Tool):
@@ -43,7 +112,7 @@ def _make_typed_handler(tool: Tool):
     annotations = {}
     sorted_props = sorted(properties.items(), key=lambda x: x[0] not in required)
     for pname, pdef in sorted_props:
-        base_type = _JSON_TO_PYTHON_TYPE.get(pdef.get("type", "string"), str)
+        base_type = _schema_type_to_python(pdef.get("type", "string"))
         desc = pdef.get("description", "")
 
         # Use Annotated[type, Field(...)] to pass descriptions to FastMCP
@@ -258,8 +327,9 @@ def main():
     Forge (and any other MCP host such as Claude Desktop) spawns this as a
     child process and talks JSON-RPC over stdin/stdout.
     """
+    _isolate_mcp_stdout()
     server = create_mcp_server()
-    server.run()  # FastMCP defaults to stdio transport
+    server.run(show_banner=False)  # FastMCP defaults to stdio transport
 
 
 if __name__ == "__main__":

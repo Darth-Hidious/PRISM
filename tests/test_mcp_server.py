@@ -1,9 +1,65 @@
 """Tests for MCP server."""
 import asyncio
+import inspect
 import json
+import os
+import subprocess
+import sys
+from typing import Optional
+
 import pytest
 from fastmcp import Client
-from app.mcp_server import create_mcp_server
+
+from app.mcp_server import _make_typed_handler, create_mcp_server
+from app.tools.base import Tool
+
+
+def test_make_typed_handler_accepts_json_schema_union_types():
+    tool = Tool(
+        name="union_schema",
+        description="Union schema regression fixture.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "value": {"type": ["string", "object"]},
+                "nullable_count": {"type": ["null", "integer"]},
+            },
+            "required": ["value", "nullable_count"],
+        },
+        func=lambda **kwargs: kwargs,
+    )
+
+    signature = inspect.signature(_make_typed_handler(tool))
+
+    assert signature.parameters["value"].annotation is str
+    assert signature.parameters["nullable_count"].annotation == Optional[int]
+
+
+def test_stdio_stdout_is_reserved_for_protocol_frames():
+    script = r'''
+import os
+import sys
+from app.mcp_server import _isolate_mcp_stdout
+
+_isolate_mcp_stdout()
+print("python-level noise")
+os.write(1, b"file-descriptor noise\n")
+sys.stdout.buffer.write(b'{"jsonrpc":"2.0","id":1}\n')
+sys.stdout.buffer.flush()
+'''
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": os.getcwd()},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == '{"jsonrpc":"2.0","id":1}\n'
+    assert "python-level noise" in completed.stderr
+    assert "file-descriptor noise" in completed.stderr
 
 
 class TestMCPServer:
