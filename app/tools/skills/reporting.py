@@ -294,7 +294,15 @@ def _generate_report(**kwargs) -> dict:
                 result["pdf_path"] = pdf_path
                 result["format"] = "pdf"
             except ImportError:
-                pass  # PDF deps not installed — Markdown still saved
+                # PDF deps absent — Markdown is still saved, but say so
+                # rather than silently handing back a different format.
+                from app.tools._extras import install_command
+
+                result["pdf_skipped"] = (
+                    "PDF output needs markdown + weasyprint; the Markdown "
+                    "report was written instead."
+                )
+                result["install_hint"] = install_command("reports")
 
     return result
 

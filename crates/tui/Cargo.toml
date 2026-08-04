@@ -22,10 +22,10 @@ chrono = { workspace = true }
 arboard = "3"
 prism-client = { path = "../client" }
 prism-frontend = { path = "../frontend" }
-prism-runtime = { path = "../runtime" }
 prism-llm = { path = "../llm" }
 prism-python-bridge = { path = "../python-bridge" }
-
+# Shared offline and retry policies.
+prism-runtime = { path = "../runtime" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

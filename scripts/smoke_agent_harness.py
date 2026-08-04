@@ -452,17 +452,17 @@ def start_backend(
     tool_count = params.get("loaded_tool_count", params.get("tool_count", 0))
     if not isinstance(tool_count, int) or tool_count <= 0:
         raise RuntimeError(f"backend reported invalid loaded tool count={tool_count!r}")
-    # model_tool_selection is an OPTIONAL welcome field: the backend does
-    # not implement a per-request tool cap today (dynamic selection is
-    # find_tools-driven). Only validate it when the backend reports it —
-    # the old unconditional assert failed every run against a backend
-    # that never emitted the field.
+    # model_tool_selection is an OPTIONAL welcome field. When present it now
+    # reports a per-request TOKEN BUDGET (derived from the model's context
+    # window) rather than a fixed tool count. Only validate it when the
+    # backend reports it — the old unconditional assert failed every run
+    # against a backend that never emitted the field.
     selection = params.get("model_tool_selection")
-    if isinstance(selection, dict) and "max_per_request" in selection:
-        max_per_request = selection.get("max_per_request")
-        if not isinstance(max_per_request, int) or max_per_request <= 0:
+    if isinstance(selection, dict) and "token_budget" in selection:
+        token_budget = selection.get("token_budget")
+        if not isinstance(token_budget, int) or token_budget <= 0:
             raise RuntimeError(
-                f"backend reported invalid model tool selection limit={max_per_request!r}"
+                f"backend reported invalid model tool token budget={token_budget!r}"
             )
 
     return backend

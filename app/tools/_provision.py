@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from app.tools import spawn
+
 SCIENCE_EXTRAS = frozenset(
     {"qe", "calphad", "mace", "precipitation", "lpbf", "simulation", "ml"}
 )
@@ -43,7 +45,7 @@ def provision_extra(extra: str) -> dict[str, Any]:
     if wheelhouse:
         command.extend(["--wheelhouse", wheelhouse])
     try:
-        result = subprocess.run(
+        result = spawn.run(
             command,
             cwd=project_root,
             capture_output=True,

@@ -2,20 +2,19 @@
 //! Shared runtime primitives for PRISM Rust binaries.
 //!
 //! Provides [`PrismPaths`] (XDG-based directory discovery), [`PrismCliState`]
-//! (credential persistence), and [`PlatformEndpoints`] (URL derivation for
-//! the MARC27 platform API, WebSocket, and dashboard).
+//! (credential persistence), [`PlatformEndpoints`] (URL derivation for the
+//! platform API, WebSocket, and dashboard), and [`retry`] — the shared
+//! "is this failure worth another attempt?" policy every network path uses.
 //!
 //! # Naming: this is *not* a process/execution runtime
 //!
-//! The crate name `runtime` is historical and can mislead. This crate holds
-//! **no** event loop, scheduler, task spawn, or process supervision — it is
-//! purely configuration / path / credential resolution ([`PrismPaths`],
-//! [`PrismCliState`], [`PlatformEndpoints`] are plain data + file I/O).
-//! Tokio runtimes live in the binaries/crates that actually need async;
-//! nothing here drives execution.
+//! The crate name `runtime` is historical. This crate owns configuration,
+//! paths, credential resolution, offline policy, and retry policy; it does not
+//! own an event loop, scheduler, process supervision, or task executor.
 
 pub mod llm_resolve;
 pub mod offline;
+pub mod retry;
 
 use std::env;
 use std::fs;

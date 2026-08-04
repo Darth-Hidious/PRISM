@@ -18,6 +18,16 @@ tokio = { workspace = true }
 tracing.workspace = true
 dirs = { workspace = true }
 toml = { workspace = true }
+
+# `fastembed` pulls in `ort` -> `ort-sys`, which fetches prebuilt ONNX Runtime
+# binaries. pyke publishes none for `x86_64-apple-darwin`, so on Intel macOS
+# the build script hard-fails:
+#   "ort does not provide prebuilt binaries for the target x86_64-apple-darwin"
+# That one dependency is the entire reason there has never been an Intel Mac
+# release. Excluding it there builds the crate without the native backend;
+# the OpenAI-compatible backend still works and `from_config` already
+# degrades to keyword-only search when no backend is available.
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
 fastembed = { workspace = true }
 
 [dev-dependencies]

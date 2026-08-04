@@ -1,13 +1,14 @@
 """Code execution tool: run Python in a subprocess."""
 import os
-import signal
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 
+from app.tools import spawn
 from app.tools.base import Tool, ToolRegistry
+from app.tools.spawn import signal_name as _signal_name
 
 
 MAX_TIMEOUT = 300  # Hard cap: 5 minutes regardless of agent request
@@ -320,14 +321,6 @@ def _filter_traceback(raw_stderr: str, cwd: str = "", persist: bool = True) -> d
     }
 
 
-def _signal_name(returncode: int) -> str:
-    """Map a negative subprocess return code (killed-by-signal) to its name."""
-    try:
-        return signal.Signals(-returncode).name
-    except (ValueError, TypeError):
-        return f"signal {-returncode}"
-
-
 def _child_env() -> dict:
     """Environment for the code subprocess.
 
@@ -347,20 +340,20 @@ def _child_env() -> dict:
 def _execute_python(code: str, timeout: int = 60, description: str = "") -> dict:
     """Execute Python code in a subprocess. Returns stdout, stderr, exit code.
 
-    Spawned via the default posix_spawn path — deliberately NO preexec_fn.
-    A preexec_fn forces the fork() path, which is macOS-fragile from the
-    multithreaded tool server and buys nothing here (subprocess.run's timeout
-    only kills the direct child, never the process group). See #68.
+    Spawned through app.tools.spawn, which guarantees posix_spawn and never
+    fork(). fork() is not survivable here: once a materials search has loaded
+    Network.framework, forking SIGSEGVs in an atfork handler and the child dies
+    blank. The child needs no process group of its own — subprocess.run's
+    timeout only ever kills the direct child anyway.
     """
     timeout = min(timeout, MAX_TIMEOUT)
-    cwd = str(Path.cwd())
+    cwd = os.getcwd()
     try:
-        result = subprocess.run(
+        result = spawn.run(
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=cwd,
             env=_child_env(),
         )
         out = {
@@ -377,12 +370,14 @@ def _execute_python(code: str, timeout: int = 60, description: str = "") -> dict
         if result.returncode < 0:
             sig = _signal_name(result.returncode)
             out["error"] = (
-                f"The code subprocess was killed by {sig}. This is almost always a "
-                f"crash inside a native library (numpy/torch/BLAS, a GUI plotting "
-                f"backend, etc.) in the executed code — not a PRISM failure. Check "
-                f"stderr for a fault traceback (PYTHONFAULTHANDLER is on), isolate "
-                f"the failing import/op, and retry. Plotting is headless "
-                f"(MPLBACKEND=Agg) — use plt.savefig(), never plt.show()."
+                f"The code subprocess was killed by {sig}. Anything it had not "
+                f"already flushed is lost, so empty stdout/stderr here means "
+                f"output was destroyed, not that the code produced none. A signal "
+                f"death is almost always a crash inside a native library "
+                f"(numpy/torch/BLAS, a GUI plotting backend, …) in the executed "
+                f"code. Check stderr for a fault traceback (PYTHONFAULTHANDLER is "
+                f"on), isolate the failing import/op, and retry. Plotting is "
+                f"headless (MPLBACKEND=Agg) — use plt.savefig(), never plt.show()."
             )
         # VS2-P1a: filter the traceback for the agent-facing stderr. The RAW
         # stderr is persisted to ~/.prism/state/tracebacks/ and only its path

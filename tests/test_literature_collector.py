@@ -136,7 +136,10 @@ class TestLiteratureCollector:
         resp.raise_for_status = MagicMock()
         mock_requests.get.return_value = resp
         c = LiteratureCollector()
-        results = c._search_s2("test", 10)
+        # `_search_s2` reports (results, error) so collect_with_status can name
+        # WHICH source failed instead of returning a silently thinner list.
+        results, error = c._search_s2("test", 10)
+        assert error is None
         assert results == []
 
     @patch("app.tools.data_collectors.literature_collector.requests")
@@ -150,6 +153,7 @@ class TestLiteratureCollector:
         resp.raise_for_status = MagicMock()
         mock_requests.get.return_value = resp
         c = LiteratureCollector()
-        results = c._search_s2("test", 10)
+        results, error = c._search_s2("test", 10)
+        assert error is None
         assert len(results) == 1
         assert results[0]["authors"] == []

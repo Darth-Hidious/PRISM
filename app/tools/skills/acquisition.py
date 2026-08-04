@@ -41,7 +41,20 @@ def _acquire_materials(**kwargs) -> dict:
         except KeyError:
             continue
         try:
-            if src == "optimade" and filter_string:
+            if src == "optimade":
+                # OPTIMADE cannot be queried without a filter. Falling through
+                # to the parameterless `else` branch below called collect()
+                # with no arguments and turned a usage error into
+                # "TypeError: missing 1 required positional argument".
+                if not filter_string:
+                    skipped.append({
+                        "source": src,
+                        "reason": (
+                            "optimade needs a query: pass `elements` (a filter "
+                            "is built from them) or an explicit `filter_string`"
+                        ),
+                    })
+                    continue
                 records = collector.collect(
                     filter_string=filter_string, max_per_provider=max_results
                 )
@@ -55,7 +68,7 @@ def _acquire_materials(**kwargs) -> dict:
                     elements=elements if elements else None,
                     max_results=max_results,
                 )
-            elif src in ("literature", "patents"):
+            elif src in ("literature", "patents", "eastern_literature"):
                 query = kwargs.get("query", "")
                 if not query and elements:
                     query = " ".join(elements) + " alloy"
@@ -140,7 +153,7 @@ ACQUIRE_SKILL = Skill(
             "sources": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Data sources to query: optimade, mp, omat24, literature, patents (default from preferences)",
+                "description": "Data sources to query: optimade, mp, omat24, literature, patents, eastern_literature (default from preferences)",
             },
             "max_results": {
                 "type": "integer",

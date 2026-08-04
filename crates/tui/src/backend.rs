@@ -212,20 +212,42 @@ impl RealBackend {
             serde_json::json!({"auto_approve": false, "resume": ""}),
         )?;
         // Wait for the init response (first message with a "result" field)
-        if let Some(resp) = self.rx.recv().await
-            && (resp.get("result").is_some() || resp.get("method").is_some())
-        {
-            // Could be the response or a welcome notification — both are fine
-            // If it's a notification, process it as a welcome
-            if resp.get("method").and_then(|m| m.as_str()) == Some("ui.welcome") {
-                // Re-send to the channel for the app to process
-                // Actually we should just let the app handle it — but since we
-                // consumed it, we need to handle it. Let's just return Ok.
+        if let Some(resp) = self.rx.recv().await {
+            if resp.get("result").is_some() || resp.get("method").is_some() {
+                // Could be the response or a welcome notification — both are
+                // fine; the app processes the welcome itself.
                 return Ok(());
             }
-            return Ok(());
+            // A reply arrived but it is not the handshake. That is a protocol
+            // mismatch, not weather — untyped on purpose so the shared retry
+            // classifier leaves it alone.
+            anyhow::bail!("init failed — backend answered with an unexpected message: {resp}");
         }
-        anyhow::bail!("init failed — no response from backend")
+        // The channel closed, which means the reader thread saw EOF on the
+        // child's stdout: the backend died before answering. Typed as
+        // `UnexpectedEof` so `prism_runtime::retry` recognises it as
+        // transient and `spawn_and_init` gets to try once more.
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "prism backend exited before answering init",
+        ))
+        .context("backend init failed")
+    }
+
+    /// Spawn the backend and complete the init handshake, killing the child
+    /// if the handshake fails so a retry cannot leave an orphan behind.
+    async fn spawn_and_init_once(
+        prism_binary: &str,
+        project_root: &str,
+        python_bin: &str,
+    ) -> Result<Self> {
+        let mut backend = Self::spawn(prism_binary, project_root, python_bin)?;
+        if let Err(err) = backend.init().await {
+            let _ = backend.child.kill();
+            let _ = backend.child.wait();
+            return Err(err);
+        }
+        Ok(backend)
     }
 
     pub fn send_message(&mut self, text: &str) -> Result<u64> {
@@ -728,13 +750,27 @@ impl FakeBackend {
 // ── BackendHandle enum dispatch ─────────────────────────────────────
 
 impl BackendHandle {
-    /// Spawn the real backend subprocess.
-    pub fn spawn(prism_binary: &str, project_root: &str, python_bin: &str) -> Result<Self> {
-        Ok(Self::Real(RealBackend::spawn(
-            prism_binary,
-            project_root,
-            python_bin,
-        )?))
+    /// Spawn the real backend subprocess and complete the init handshake.
+    ///
+    /// Retried, because this is the TUI's single point of failure: if the
+    /// child loses a race at boot (venv being provisioned by another PRISM,
+    /// a fork that fails under load) the whole app used to die on the spot
+    /// with "init failed — no response from backend". A missing binary or a
+    /// protocol mismatch still fails immediately — the shared classifier
+    /// only lets broken-pipe-shaped failures through, so a backend that is
+    /// genuinely misconfigured fails fast instead of four times slowly.
+    pub async fn spawn_and_init(
+        prism_binary: &str,
+        project_root: &str,
+        python_bin: &str,
+    ) -> Result<Self> {
+        let backend = prism_runtime::retry::retrying(
+            "tui.backend.spawn",
+            prism_runtime::retry::Idempotency::Safe,
+            || RealBackend::spawn_and_init_once(prism_binary, project_root, python_bin),
+        )
+        .await?;
+        Ok(Self::Real(backend))
     }
 
     /// Create a fake backend with the given scenario.  Does NOT spawn

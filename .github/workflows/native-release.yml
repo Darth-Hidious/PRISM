@@ -18,11 +18,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # ── Linux: build on 22.04, NOT ubuntu-latest ──────────────────
+          # A Rust binary linked against glibc runs on that version OR NEWER,
+          # never older. ubuntu-latest is 24.04 (glibc 2.39) and the v1.0.0
+          # artifacts built there are hard-broken on every LTS below it:
+          #   $ docker run ubuntu:22.04 ./prism --version
+          #   /lib/.../libc.so.6: version `GLIBC_2.39' not found
+          #   /lib/.../libc.so.6: version `GLIBC_2.38' not found
+          #   /lib/.../libstdc++.so.6: version `CXXABI_1.3.15' not found
+          # Verified failing on ubuntu:22.04 and debian:12; passing on
+          # ubuntu:24.04 and debian:13. Ubuntu 22.04 LTS is the single most
+          # common institutional Linux, so that is a silent total loss.
+          # 22.04 ships glibc 2.35 + GCC 11, which covers Ubuntu 22.04+,
+          # Debian 12+ and SLES 15 SP6+. (RHEL/Rocky 9 sit at glibc 2.34 and
+          # still need an older build host — see docs/RELEASING.md.)
+          # Runner support ends 2027-04-17; revisit before then.
+          - os: ubuntu-22.04
             label: linux-x86_64
             rust_target: x86_64-unknown-linux-gnu
             archive: prism-linux-x86_64.tar.gz
-          - os: macos-14
+          # macos-14 enters full deprecation 2026-11-02; 15 is the safe floor.
+          - os: macos-15
             label: macos-aarch64
             rust_target: aarch64-apple-darwin
             archive: prism-macos-aarch64.tar.gz
@@ -30,14 +46,20 @@ jobs:
             label: windows-x86_64
             rust_target: x86_64-pc-windows-msvc
             archive: prism-windows-x86_64.zip
-          # Intel Macs — install.sh computes prism-macos-x86_64 for x86_64 Darwin.
+          # Intel Macs — install.sh computes prism-macos-x86_64 for x86_64
+          # Darwin. This job FAILED for v1.0.0 (that is why no Intel Mac
+          # build has ever shipped): fastembed pulls ort-sys, and pyke
+          # publishes no ONNX Runtime for x86_64-apple-darwin. crates/embed
+          # now excludes fastembed on that one target, so it builds.
+          # GitHub retires x86_64 macOS runners entirely in Aug 2027.
           - os: macos-15-intel
             label: macos-x86_64
             rust_target: x86_64-apple-darwin
             archive: prism-macos-x86_64.tar.gz
           # ARM Linux (ARM servers/cloud, incl. our own Hetzner box) —
           # install.sh computes prism-linux-aarch64 for aarch64 Linux.
-          - os: ubuntu-24.04-arm
+          # Same glibc-floor reasoning as x86_64 above.
+          - os: ubuntu-22.04-arm
             label: linux-aarch64
             rust_target: aarch64-unknown-linux-gnu
             archive: prism-linux-aarch64.tar.gz

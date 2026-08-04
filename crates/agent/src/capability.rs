@@ -3,10 +3,12 @@
 //! `docs/CAPABILITY_REGISTRY_DESIGN.md`, Phases 0-2:
 //! - **P0**: [`CapabilityIndex`] — embed-once, cosine top-K retrieval primitive.
 //! - **P1**: [`global_index`] caches the embedded index; `agent_loop` uses
-//!   `CapabilityIndex::retrieve` instead of keyword `definitions_for_query`,
-//!   with the keyword path kept as fallback.
+//!   `CapabilityIndex::retrieve` instead of keyword `ToolCatalog::names_by_relevance`,
+//!   with the keyword path kept as fallback. Either way the ranking covers the
+//!   WHOLE catalog; how far down it the request can afford to go is the token
+//!   budget's call (`tool_catalog::tool_token_budget`).
 //! - **P2**: [`capability_menu`] builds the L1 progressive-disclosure menu so the
-//!   model is AWARE of capabilities beyond the callable top-K.
+//!   model is AWARE of capabilities the budget could not afford.
 //!
 //! Neural selection is **on by default**; `PRISM_NEURAL_TOOLS=0/false/off`
 //! forces the legacy keyword path. It degrades gracefully (cold turn or no embed
@@ -327,6 +329,8 @@ mod tests {
     ///   `cargo test -p prism-agent --lib -- --ignored real_embedding`
     /// Proves neural retrieval ranks the right capability on real vectors from
     /// paraphrased queries with no literal keyword overlap.
+    // No native backend on Intel macOS (no ONNX Runtime for x86_64-apple-darwin).
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     #[tokio::test]
     #[ignore = "requires the local ONNX embed model; run with --ignored"]
     async fn real_embedding_backend_ranks_the_right_capability() {

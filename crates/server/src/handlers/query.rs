@@ -167,61 +167,70 @@ async fn local_graph_lookup(
     if nodes.is_empty() { None } else { Some(nodes) }
 }
 
-/// Semantic entity search over the bundled Turso store using the offline
-/// `prism-embed` backend (no Qdrant, no cloud) — the vectors that local
+/// Semantic entity search over the bundled Turso store, ranked by Turso's
+/// native `vector_distance_cos()`, using the offline `prism-embed` backend
+/// for the query vector (no Qdrant, no cloud) — the vectors that local
 /// ingest writes via `embed_entities_best_effort`.
 ///
-/// Never errors: an unopenable store, an empty store, an unavailable
-/// embedding backend, or zero hits all degrade to `None`, which the
-/// handler renders as an empty result set. The store is checked BEFORE
-/// the backend is built, so a fresh install never pays the
-/// embedding-model init just to return nothing.
+/// # Honesty contract
+///
+/// `Ok(vec![])` means **nothing is embedded locally yet**, and nothing
+/// else. Anything that makes the index unusable — an unopenable store, a
+/// missing embedding backend, a dimension mismatch — is an `Err` whose
+/// message names the problem, so a broken index can never be served as
+/// "no matches". The store is counted BEFORE the backend is built, so a
+/// fresh install never pays the embedding-model init just to return
+/// nothing.
 async fn local_semantic_lookup(
     db_path: &Path,
     text: &str,
     limit: usize,
-) -> Option<Vec<(String, f32)>> {
-    let store = match prism_provenance::ProvenanceStore::open(db_path).await {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::debug!("local semantic store open failed: {e:#}");
-            return None;
-        }
-    };
-    match store.entity_embedding_count(LOCAL_ONTOLOGY_TENANT).await {
-        Ok(0) => return None,
-        Ok(_) => {}
-        Err(e) => {
-            tracing::debug!("local semantic embedding count failed: {e:#}");
-            return None;
-        }
+) -> anyhow::Result<Vec<(String, f32)>> {
+    use anyhow::Context as _;
+
+    // No store file at all ⇒ nothing was ever ingested. That is an empty
+    // index, not a broken one, so it must not raise the alarm a fresh
+    // install would otherwise trip on (opening a path under a missing
+    // `~/.prism` fails outright).
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = prism_provenance::ProvenanceStore::open(db_path)
+        .await
+        .with_context(|| {
+            format!(
+                "local semantic store {} could not be opened",
+                db_path.display()
+            )
+        })?;
+    let embedded = store
+        .entity_embedding_count(LOCAL_ONTOLOGY_TENANT)
+        .await
+        .context("local semantic index could not be counted")?;
+    if embedded == 0 {
+        return Ok(Vec::new()); // nothing ingested yet — a real empty answer
     }
 
     // First ever native init may download the model — blocking pool.
     let backend = tokio::task::spawn_blocking(prism_embed::from_config)
         .await
-        .ok()
-        .flatten()?;
-    let query_vec = match backend.embed(std::slice::from_ref(&text.to_string())).await {
-        Ok(mut vecs) if !vecs.is_empty() => vecs.remove(0),
-        Ok(_) => return None,
-        Err(e) => {
-            tracing::debug!("local semantic query embedding failed: {e:#}");
-            return None;
-        }
-    };
+        .context("embedding backend initialization panicked")?
+        .context(
+            "no embedding backend available, so the query cannot be embedded — set \
+             PRISM_EMBED_BACKEND=native (the default) or =openai with \
+             PRISM_EMBED_ENDPOINT_URL",
+        )?;
+    let query_vec = backend
+        .embed(std::slice::from_ref(&text.to_string()))
+        .await
+        .context("embedding the query failed")?
+        .into_iter()
+        .next()
+        .context("embedding backend returned no vector for the query")?;
 
-    match store
+    store
         .semantic_search_entities(&query_vec, LOCAL_ONTOLOGY_TENANT, limit)
         .await
-    {
-        Ok(hits) if !hits.is_empty() => Some(hits),
-        Ok(_) => None,
-        Err(e) => {
-            tracing::debug!("local semantic search failed: {e:#}");
-            None
-        }
-    }
 }
 
 /// Map local Turso graph nodes into the same JSON shape the retired Neo4j
@@ -287,29 +296,52 @@ async fn handle_graph_query(
 }
 
 /// Vector similarity search over the bundled Turso entity vectors written
-/// by local ingest (offline prism-embed query embedding — no services
-/// needed). A miss (empty store, unavailable embedding backend, zero hits)
-/// is an empty result set, not an error.
+/// by local ingest, ranked by the native `vector_distance_cos()` (offline
+/// prism-embed query embedding — no services needed).
+///
+/// An empty result set means the local index holds nothing yet. An
+/// unusable index — unopenable store, missing embedding backend, dimension
+/// mismatch — is a `503` naming the problem and an audited failure, never
+/// a silent `200 []`.
 async fn handle_semantic_query(
     state: &NodeState,
     body: &QueryRequest,
     user_id: &str,
 ) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let hits = local_semantic_lookup(&default_provenance_db_path(), &body.query, body.limit)
-        .await
-        .unwrap_or_default();
+    let audit = |detail: String, outcome: prism_core::audit::AuditOutcome| {
+        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            user_id: user_id.to_string(),
+            action: prism_core::audit::AuditAction::DataQuery,
+            target: "semantic".into(),
+            detail: Some(detail),
+            outcome,
+        });
+    };
+
+    let hits =
+        match local_semantic_lookup(&default_provenance_db_path(), &body.query, body.limit).await {
+            Ok(hits) => hits,
+            Err(e) => {
+                let error = format!("{e:#}");
+                audit(
+                    format!("source=turso-local, error={error}"),
+                    prism_core::audit::AuditOutcome::Failure,
+                );
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse { error }),
+                ));
+            }
+        };
     let results = semantic_hits_to_results(&hits);
     let count = results.len() as u64;
 
-    state.audit_and_broadcast(&prism_core::audit::AuditEntry {
-        id: 0,
-        timestamp: chrono::Utc::now(),
-        user_id: user_id.to_string(),
-        action: prism_core::audit::AuditAction::DataQuery,
-        target: "semantic".into(),
-        detail: Some(format!("results={count}, source=turso-local")),
-        outcome: prism_core::audit::AuditOutcome::Success,
-    });
+    audit(
+        format!("results={count}, source=turso-local"),
+        prism_core::audit::AuditOutcome::Success,
+    );
 
     Ok(Json(QueryResponse {
         results,
@@ -459,37 +491,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_lookups_miss_cleanly_on_empty_or_unopenable_store() {
+    async fn local_graph_lookup_misses_cleanly_on_empty_or_unopenable_store() {
         let db = TempProvenanceDb::new();
-
-        // Fresh (empty) store: clean miss — the handlers render an empty
-        // result set instead of erroring.
         assert!(
             local_graph_lookup(&db.path, "titanium", 10).await.is_none(),
             "empty store must be a clean graph miss"
         );
-        // Zero stored embeddings short-circuits BEFORE the embedding
-        // backend is built, so this stays model-free.
-        assert!(
-            local_semantic_lookup(&db.path, "titanium", 10)
-                .await
-                .is_none(),
-            "empty store must be a clean semantic miss"
-        );
-
-        // Unopenable path (a directory): also a clean miss, never an error.
         assert!(
             local_graph_lookup(&std::env::temp_dir(), "titanium", 10)
                 .await
                 .is_none(),
             "graph store open failure must degrade to a miss"
         );
+    }
+
+    /// An EMPTY local index and a BROKEN one must not look the same to the
+    /// caller: empty is `Ok([])`, broken is an `Err` that names the cause.
+    #[tokio::test]
+    async fn empty_semantic_index_is_ok_but_unopenable_store_is_a_named_error() {
+        let db = TempProvenanceDb::new();
+
+        // Fresh (empty) store: a real empty answer. Zero stored embeddings
+        // short-circuits BEFORE the embedding backend is built, so this
+        // stays model-free.
+        let hits = local_semantic_lookup(&db.path, "titanium", 10)
+            .await
+            .expect("an empty index is an empty answer, not a failure");
+        assert!(hits.is_empty());
+
+        // Unopenable path (a directory): a loud error naming the store,
+        // never an empty result set the caller would read as "no matches".
+        let err = local_semantic_lookup(&std::env::temp_dir(), "titanium", 10)
+            .await
+            .expect_err("an unopenable store must not masquerade as no matches");
+        let msg = format!("{err:#}");
         assert!(
-            local_semantic_lookup(&std::env::temp_dir(), "titanium", 10)
-                .await
-                .is_none(),
-            "semantic store open failure must degrade to a miss"
+            msg.contains("could not be opened"),
+            "error must name the problem: {msg}"
         );
+
+        // A fresh install has no store file at all (and no `~/.prism` to
+        // open one under). "Never ingested" is empty, NOT broken — this
+        // must not be the loud error the unopenable case earns.
+        let missing = std::env::temp_dir()
+            .join(format!("prism_absent_{}", uuid::Uuid::new_v4()))
+            .join(".prism/provenance.db");
+        let hits = local_semantic_lookup(&missing, "titanium", 10)
+            .await
+            .expect("a never-created store is an empty index, not a broken one");
+        assert!(hits.is_empty());
     }
 
     #[tokio::test]

@@ -82,3 +82,38 @@ class TestAcquireSkill:
 
         result = _acquire_materials(elements=["Fe"], dataset_name="iron_alloys")
         assert result["dataset_name"] == "iron_alloys"
+
+    def test_optimade_without_a_query_is_an_honest_skip(self, mock_prefs):
+        """Regression: with neither `elements` nor `filter_string`, the optimade
+        branch used to fall through to the parameterless `collect()` call and
+        report `TypeError: ... missing 1 required positional argument:
+        filter_string`. The collector is right — OPTIMADE needs a filter — so
+        the caller must say so instead of crashing into it."""
+        result = _acquire_materials(sources=["optimade"], dataset_name="probe")
+
+        assert result["skipped"] == [
+            {
+                "source": "optimade",
+                "reason": (
+                    "optimade needs a query: pass `elements` (a filter is "
+                    "built from them) or an explicit `filter_string`"
+                ),
+            }
+        ]
+
+    @patch(
+        "app.tools.data_collectors.collector.OPTIMADECollector.collect",
+        autospec=True,
+    )
+    def test_optimade_is_called_with_the_signature_it_declares(
+        self, mock_collect, mock_prefs
+    ):
+        """`autospec=True` binds the collector's REAL signature, so this fails
+        the same way production did if the caller ever drops `filter_string`."""
+        mock_collect.return_value = []
+
+        _acquire_materials(elements=["W", "Rh"])
+
+        _, kwargs = mock_collect.call_args
+        assert kwargs["filter_string"] == 'elements HAS "W" AND elements HAS "Rh"'
+        assert kwargs["max_per_provider"] == mock_prefs.max_results_per_source

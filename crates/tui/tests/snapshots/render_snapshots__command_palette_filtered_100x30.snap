@@ -16,14 +16,14 @@ expression: rendered
                │  marketplace ▸ Marketplace install     Install a tool or … palette │
                │  marketplace ▸ Marketplace find        Semantic discovery… palette │
                │   navigation ▸ Workspace: Tools        Switch sidebar to Tools ←/→ │
+               │  marketplace ▸ Marketplace publish     PRISM's own tools:… palette │
                │  marketplace ▸ Marketplace search      Search downloadabl… palette │
                │      display ▸ Mission Control         The launch dashboa… palette │
                │      science ▸ Node stop               Stop the local nod… palette │
                │      account ▸ Account                 Platform login / l… palette │
                │      session ▸ Set goal                Standing goal… /goal <text> │
                │   automation ▸ Show workflow           Inspect one workfl… palette │
-               │      science ▸ Node status             Local daemon + pla… palette │
-               │  … 25 more — ↓ to scroll or type to filter                         │
+               │  … 26 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│

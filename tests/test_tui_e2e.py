@@ -26,11 +26,57 @@ import signal
 import pathlib
 import traceback
 
-import pexpect
+import pytest
+
+# Two things this file cannot run without, and neither is a PRISM dependency:
+# a PTY client, and a release build of the binary it drives. Import-time
+# `import pexpect` turned both into a collection error, which aborts the whole
+# suite before a single test runs. Skipping with the reason stated is the
+# honest form: it says what is absent and how to supply it.
+pexpect = pytest.importorskip(
+    "pexpect",
+    reason="drives the TUI through a real PTY; pexpect is not a PRISM "
+    "dependency — install it to run this file: pip install pexpect",
+)
 
 # ── Config ──────────────────────────────────────────────────────────
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PRISM_BIN = str(PROJECT_ROOT / "target" / "release" / "prism")
+
+pytestmark = pytest.mark.skipif(
+    not pathlib.Path(PRISM_BIN).exists(),
+    reason=f"no release binary at {PRISM_BIN} — build it first: cargo build --release",
+)
+
+# KNOWN RED, and deliberately NOT skipped: with the release binary present,
+# `test_fake_backend_shutdown` fails under the full suite while passing in
+# isolation. Do NOT paper this over with a skip — the cause is real and the
+# stack trace names it:
+#
+#     fork  ->  _pthread_atfork_child_handlers
+#           ->  nw_settings_child_has_forked   (Network.framework)
+#           ->  nw_path_release_globals
+#           ->  NEFlowDirectorDestroy          (libnetworkextension.dylib)
+#           ->  SIGSEGV
+#
+# A PRISM materials search loads Apple's Network.framework, which registers a
+# pthread_atfork child handler. From then on ANY fork() in this process
+# crashes in that handler — `pexpect.spawn` uses `pty.fork()`, so it dies.
+# posix_spawn is unaffected because it does not run atfork handlers.
+# Reproduce: pytest tests/test_materials_discovery_flow.py tests/test_tui_e2e.py
+#
+# The same root cause used to break the `execute_bash` / `execute_python`
+# tools. That half is fixed: both now spawn through app/tools/spawn.py, which
+# never forks, and tests/test_fork_safety.py pins it. What remains red here is
+# only pexpect's own `pty.fork()`, which this file cannot avoid without
+# replacing its PTY layer (openpty + posix_spawn(setsid=True) + opening the
+# slave for a controlling terminal). That is a separate change to the test
+# harness, not to PRISM.
+#
+# Note also that the other seven tests here `return t.report()` instead of
+# asserting. pytest ignores a test's return value (PytestReturnNotNoneWarning),
+# so those seven pass unconditionally — they record failures via `t.check` and
+# then throw the result away. Only this file's bare `assert` can go red.
 PYTHON_BIN = str(PROJECT_ROOT / ".venv" / "bin" / "python")
 TIMEOUT_SHORT = 5   # seconds for quick interactions
 TIMEOUT_MEDIUM = 15 # seconds for backend startup + first response

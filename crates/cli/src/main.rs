@@ -29,6 +29,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use prism_client::DeviceFlowAuth;
+use prism_client::PlatformResponseExt;
 use prism_client::api::PlatformClient;
 use prism_client::auth::{DeviceCodeResponse, TokenResponse};
 use prism_proto::NodeCapabilities;
@@ -157,6 +158,13 @@ enum Commands {
         #[command(subcommand)]
         command: CampaignCommands,
     },
+    /// Durable schedules and watchers that wake a long-running goal back up —
+    /// on a clock, on a cron expression, or when a condition becomes true —
+    /// so a goal survives reboots and crashes without a human restarting it.
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommands,
+    },
     /// Start the agent backend (JSON-RPC server for TUI frontend).
     //
     // No `--python` of its own. It used to declare one, defaulting to the
@@ -197,9 +205,16 @@ enum Commands {
     /// through Python.
     #[command(name = "mcp-server-native", hide = true)]
     McpServerNative,
-    /// Diagnostic snapshot — checks llama-server, models, Python venv, auth,
-    /// MCP config and tool index. Run this first when chat misbehaves.
-    Doctor,
+    /// Diagnostic snapshot — checks llama-server, models, Python venv, auth
+    /// and platform connectivity. Run this first when something feels off.
+    Doctor {
+        /// Repair what can be repaired (rebuild the Python venv, warm the
+        /// embedding model cache) and print the exact command for everything
+        /// else. Nothing is reported as fixed unless the check that failed
+        /// passes on re-run.
+        #[arg(long)]
+        fix: bool,
+    },
     /// PRISM node lifecycle commands.
     Node {
         #[command(subcommand)]
@@ -239,8 +254,9 @@ enum Commands {
         /// Watch a directory for new/modified files and ingest continuously.
         #[arg(long)]
         watch: bool,
-        /// Runtime URL for local PDF extraction.
-        #[arg(long, default_value = "http://127.0.0.1:8090")]
+        /// Runtime URL for local PDF text extraction. PRISM starts a runtime
+        /// here automatically when the URL is on this machine and none is up.
+        #[arg(long, default_value = prism_node::runtime_service::DEFAULT_RUNTIME_URL)]
         runtime_url: String,
         /// Output JSON instead of human-readable progress.
         #[arg(long)]
@@ -743,6 +759,87 @@ enum CampaignCommands {
     List,
 }
 
+/// Arguments for `schedule create`. A named struct (rather than inline
+/// variant fields) so the enum stays small next to its one-word variants.
+#[derive(Debug, clap::Args)]
+struct ScheduleCreateArgs {
+    /// Goal (campaign) id to wake up.
+    #[arg(long)]
+    goal: String,
+    /// Recurring interval, e.g. 30s, 15m, 6h, 2d.
+    #[arg(long, group = "trigger")]
+    every: Option<String>,
+    /// Cron expression. 5-field crontab ("0 */6 * * *") or 6-field
+    /// seconds-first.
+    #[arg(long, group = "trigger")]
+    cron: Option<String>,
+    /// One-shot: fire once at this unix timestamp.
+    #[arg(long, group = "trigger")]
+    at: Option<i64>,
+    /// Watcher: fire when this path appears.
+    #[arg(long, group = "trigger")]
+    watch_file: Option<PathBuf>,
+    /// Watcher: fire when another goal reaches --watch-goal-status.
+    #[arg(long, group = "trigger")]
+    watch_goal: Option<String>,
+    /// Status the watched goal must reach (default: completed).
+    #[arg(long, default_value = "completed")]
+    watch_goal_status: String,
+    /// Watcher: fire when this local graph database has grown to
+    /// --corpus-at-least entities.
+    #[arg(long, group = "trigger")]
+    watch_corpus: Option<PathBuf>,
+    /// Entity count the watched corpus must reach.
+    #[arg(long)]
+    corpus_at_least: Option<i64>,
+    /// Scope the corpus count to one tenant. Omit only on a single-tenant
+    /// node — an unscoped count mixes every tenant's rows.
+    #[arg(long)]
+    corpus_tenant: Option<String>,
+    /// Hard ceiling on how many times this schedule may resume the goal.
+    /// The one spend guard that works even when nothing reports a cost.
+    #[arg(long, default_value_t = 100)]
+    max_fires: u32,
+    /// Stop and report after this many consecutive wake-ups that produced
+    /// no progress.
+    #[arg(long, default_value_t = 3)]
+    max_no_progress: u32,
+}
+
+#[derive(Debug, Subcommand)]
+enum ScheduleCommands {
+    /// Create a schedule that wakes a goal back up. Exactly one trigger.
+    Create(Box<ScheduleCreateArgs>),
+    /// List every schedule with its state and last outcome.
+    List,
+    /// Cancel a schedule (it never fires again).
+    Cancel {
+        /// Schedule id from `schedule list`.
+        id: String,
+    },
+    /// Evaluate every schedule once and resume whatever is due. This is the
+    /// command an OS timer (launchd / systemd / cron) runs.
+    Tick,
+    /// Run `tick` in a loop in the foreground — for containers and pods where
+    /// the runtime's restart policy is the supervisor. Dies with this
+    /// process; on a normal host prefer `schedule install` + `tick`.
+    Daemon {
+        /// Seconds between ticks.
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+    },
+    /// Print (or write) the OS unit that owns the tick heartbeat.
+    Install {
+        /// Seconds between ticks.
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+        /// Write the unit to the user's agent/unit directory instead of
+        /// printing it, and print the command that activates it.
+        #[arg(long)]
+        write: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum NotebookCommands {
     /// Launch a Jupyter Lab server in the PRISM venv.
@@ -1069,6 +1166,22 @@ enum MarketplaceCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Publish PRISM's own materials tools to the MARC27 marketplace so
+    /// they are discoverable without installing all of PRISM.
+    ///
+    /// The catalog is `app/tools/marketplace_catalog.json`, held to account
+    /// against the live tool registry by `tests/test_marketplace_catalog.py`.
+    /// Each entry is created as a draft, has its tags/license set, then is
+    /// submitted for review — a platform reviewer still has to approve it
+    /// before it appears in the public listing.
+    Publish {
+        /// Show what would be published without calling the platform.
+        #[arg(long)]
+        dry_run: bool,
+        /// Publish only this slug (default: every entry in the catalog).
+        #[arg(long)]
+        slug: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1347,7 +1460,7 @@ fn command_needs_python(command: Option<&Commands>) -> bool {
             Commands::Status | Commands::Use { .. } | Commands::Agent | Commands::Provenance { .. },
         ) => false,
         // Reports on the venv — including its absence — rather than using it.
-        Some(Commands::Doctor) => false,
+        Some(Commands::Doctor { .. }) => false,
         // Pure platform HTTP: these talk to the API over reqwest and print
         // the answer. None of their handlers takes the interpreter path.
         Some(
@@ -1476,12 +1589,24 @@ async fn main() -> Result<()> {
     } else if let Some(p) = std::env::var_os("PRISM_PYTHON").filter(|p| !p.is_empty()) {
         PathBuf::from(p)
     } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        // HOME is not set on stock Windows, where the equivalent is
+        // USERPROFILE. Falling through to "." would silently put the venv in
+        // whatever directory the user happened to be in — and this runs
+        // before EVERY subcommand, so it is the one home-dir lookup that
+        // cannot be allowed to guess wrong.
+        // NOTE: the other `env::var("HOME")` sites in this file are still
+        // Unix-only; Windows support is not complete until they are too.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
         let prism_dir = PathBuf::from(&home).join(".prism");
         if command_needs_python(cli.command.as_ref()) {
             ensure_venv(&prism_dir, &project_root).await?
         } else {
-            prism_dir.join("venv/bin/python3")
+            // Pure-Rust commands, including `doctor`, must start even when the
+            // managed venv is absent or broken. Use the platform-specific path
+            // doctor should inspect without attempting to provision it.
+            prism_python_bridge::venv::venv_layout(&prism_dir.join("venv")).0
         }
     };
 
@@ -1854,6 +1979,12 @@ async fn main() -> Result<()> {
                             campaign.state().completion_reason
                         );
                     } else {
+                        // Whoever actually runs the loop holds the goal's
+                        // worker lock, so the scheduler can tell "still
+                        // working" from "its process died", and a second
+                        // worker over a healthy one is refused rather than
+                        // doubling the goal's spend.
+                        let _worker_lock = acquire_worker_lock(&id)?;
                         if let Some(store) = open_campaign_provenance().await {
                             campaign = campaign.with_provenance(store);
                         }
@@ -1886,6 +2017,11 @@ async fn main() -> Result<()> {
                         state.current_iteration, state.config.max_iterations
                     );
                     println!("Candidates evaluated: {}", state.total_evaluated());
+                    // Say what the USD ceiling can and cannot actually do for
+                    // this goal. A ceiling nothing is billing against reads
+                    // as "$0.00 of $25.00" otherwise, which is a green light
+                    // for a limit that cannot fire.
+                    println!("Budget: {}", state.budget_status());
                     println!("Avg reward: {:.4}", state.avg_reward());
                     if let Some(best) = state.best() {
                         println!("Best: {} (reward={:.4})", best.composition, best.reward);
@@ -1934,6 +2070,9 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        Commands::Schedule { command } => {
+            handle_schedule_command(command).await?;
         }
         Commands::Notebook { command } => match command {
             NotebookCommands::Start { port } => {
@@ -2275,8 +2414,8 @@ async fn main() -> Result<()> {
         Commands::McpServerNative => {
             mcp_server_native::run(project_root.clone(), python.clone()).await?;
         }
-        Commands::Doctor => {
-            doctor::run(&project_root, &python).await?;
+        Commands::Doctor { fix } => {
+            doctor::run(&project_root, &python, fix).await?;
         }
         Commands::Node { command } => match command {
             NodeCommands::Up {
@@ -3165,7 +3304,8 @@ async fn main() -> Result<()> {
                         .apply(client.get(format!("{api_base}/nodes/{node_id}/public-key")))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     if json {
@@ -3204,7 +3344,8 @@ async fn main() -> Result<()> {
                         }))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     if json {
@@ -3463,6 +3604,22 @@ async fn main() -> Result<()> {
                         );
                     }
 
+                    // Resources whose capability ships inside PRISM (the
+                    // materials tools) hold no artifact — `/install` 422s for
+                    // them. Say what to `pip install` instead of failing with
+                    // the platform's 422; an entry that only 422'd would be
+                    // worse than no entry at all.
+                    if let Ok(resource) = marketplace.get_tool(&name).await
+                        && let Some((command, note)) = resource.install_instructions()
+                    {
+                        println!("'{name}' ships inside PRISM — there is no artifact to download.");
+                        println!("\n    {command}\n");
+                        if let Some(note) = note {
+                            println!("{note}");
+                        }
+                        return Ok(());
+                    }
+
                     let url = marketplace.install_url(&name).await?;
                     let client = reqwest::Client::new();
                     // error_for_status() converts 4xx/5xx into Err so a 404
@@ -3606,6 +3763,58 @@ async fn main() -> Result<()> {
                         crate::tool_sync::print_report(&report);
                     }
                 }
+                MarketplaceCommands::Publish { dry_run, slug } => {
+                    let catalog = prism_client::marketplace::builtin_catalog()?;
+                    let selected: Vec<_> = catalog
+                        .entries
+                        .iter()
+                        .filter(|e| slug.as_ref().is_none_or(|s| *s == e.slug))
+                        .collect();
+                    if selected.is_empty() {
+                        anyhow::bail!(
+                            "no catalog entry matches '{}'. Known slugs: {}",
+                            slug.unwrap_or_default(),
+                            catalog
+                                .entries
+                                .iter()
+                                .map(|e| e.slug.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    for entry in &selected {
+                        let extras = if entry.requires_extras.is_empty() {
+                            "no extra required".to_string()
+                        } else {
+                            format!("needs [{}]", entry.requires_extras.join(", "))
+                        };
+                        println!(
+                            "  {} [{}]  {} — {}",
+                            entry.name, entry.slug, entry.license, extras
+                        );
+                    }
+                    if dry_run {
+                        println!(
+                            "\n{} entr(ies) would be published. \
+                             {} tool(s) stay bundled on purpose (see the catalog).",
+                            selected.len(),
+                            catalog.bundled.len()
+                        );
+                    } else {
+                        if token.is_none() {
+                            anyhow::bail!("publishing needs a login — run `prism login` first");
+                        }
+                        for entry in &selected {
+                            marketplace.publish_entry(entry).await?;
+                            println!("published {} (draft → pending_review)", entry.slug);
+                        }
+                        println!(
+                            "\n{} entr(ies) submitted. They stay invisible to the public \
+                             listing until a platform reviewer approves them.",
+                            selected.len()
+                        );
+                    }
+                }
             }
         }
         Commands::Research { query, depth, json } => {
@@ -3626,7 +3835,8 @@ async fn main() -> Result<()> {
                 .json(&serde_json::json!({ "question": query, "depth": depth }))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
             let run_id = created
@@ -3661,42 +3871,51 @@ async fn main() -> Result<()> {
                 let polled = auth
                     .apply(client.get(format!("{api_base}/agent-runs/{run_id}")))
                     .send()
-                    .await
-                    .and_then(|r| r.error_for_status());
+                    .await;
 
                 let run: serde_json::Value = match polled {
-                    Ok(r) => match r.json().await {
-                        Ok(v) => {
+                    Ok(response) if response.status().is_success() => match response.json().await {
+                        Ok(value) => {
                             consecutive_failures = 0;
-                            v
+                            value
                         }
-                        Err(e) => {
-                            // A body that will not parse is the same class of
-                            // problem as a 502: a proxy error page mid-restart.
+                        Err(error) => {
                             consecutive_failures += 1;
                             if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
                                 anyhow::bail!(
                                     "lost contact with the platform while polling run {run_id} \
-                                     ({consecutive_failures} consecutive failures, last: {e}). \
+                                     ({consecutive_failures} consecutive failures, last: {error}). \
                                      The run may still be going — check with: prism agent"
                                 );
                             }
                             continue;
                         }
                     },
-                    Err(e) => {
-                        // 4xx is a real answer (gone, forbidden, wrong id) and
-                        // retrying it just burns the deadline; only 5xx and
-                        // transport errors are worth waiting out.
-                        let transient = e.status().map(|s| s.is_server_error()).unwrap_or(true);
+                    Ok(response) => {
+                        let transient = response.status().is_server_error();
+                        let error = response
+                            .platform_error_for_status()
+                            .await
+                            .expect_err("non-success response must produce a platform error");
                         if !transient {
-                            return Err(e.into());
+                            return Err(error);
                         }
                         consecutive_failures += 1;
                         if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
                             anyhow::bail!(
                                 "lost contact with the platform while polling run {run_id} \
-                                 ({consecutive_failures} consecutive failures, last: {e}). \
+                                 ({consecutive_failures} consecutive failures, last: {error:#}). \
+                                 The run may still be going — check with: prism agent"
+                            );
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                            anyhow::bail!(
+                                "lost contact with the platform while polling run {run_id} \
+                                 ({consecutive_failures} consecutive failures, last: {error}). \
                                  The run may still be going — check with: prism agent"
                             );
                         }
@@ -4293,7 +4512,7 @@ async fn main() -> Result<()> {
                         .send()
                         .await?;
                     let resp: serde_json::Value =
-                        friendly_status(raw, "view billing balance")?.json().await?;
+                        raw.platform_error_for_status().await?.json().await?;
                     println!("\nCredits");
                     println!(
                         "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}"
@@ -4316,7 +4535,8 @@ async fn main() -> Result<()> {
                         .apply(client.get(format!("{api_base}/billing/usage?period=monthly")))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     println!("\nUsage (current period)\n");
@@ -4340,7 +4560,8 @@ async fn main() -> Result<()> {
                         .apply(client.get(format!("{api_base}/billing/history?page=1&per_page=20")))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     println!("\nTransaction History\n");
@@ -4364,7 +4585,8 @@ async fn main() -> Result<()> {
                         .get(format!("{api_base}/billing/prices"))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     println!("\nCredit Prices\n");
@@ -4387,7 +4609,8 @@ async fn main() -> Result<()> {
                         .get(format!("{api_base}/billing/packages"))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
                     println!("\nAvailable credit packs:\n");
@@ -4416,7 +4639,8 @@ async fn main() -> Result<()> {
                         .json(&serde_json::json!({"package": package}))
                         .send()
                         .await?
-                        .error_for_status()?
+                        .platform_error_for_status()
+                        .await?
                         .json()
                         .await?;
 
@@ -5516,6 +5740,19 @@ async fn extract_pdf_text_with_runtime(
     runtime_url: &str,
     path: &Path,
 ) -> Result<serde_json::Value> {
+    // Step 1 of ingest runs on this machine and needs the local runtime.
+    // Nothing else starts it, so start it here — or explain, once, why we
+    // can't. The alternative (and the old behaviour) is a raw connect error
+    // against a port no PRISM code path ever binds.
+    prism_node::runtime_service::ensure_running(runtime_url, |msg| eprintln!("  {msg}"))
+        .await
+        .with_context(|| {
+            format!(
+                "local text extraction failed for {} (nothing was sent to the platform)",
+                path.display()
+            )
+        })?;
+
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read PDF {}", path.display()))?;
     let request = serde_json::json!({
@@ -5540,7 +5777,13 @@ async fn extract_pdf_text_with_runtime(
         .json(&request)
         .send()
         .await
-        .with_context(|| format!("runtime PDF extraction failed for {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "local text extraction failed for {} — the runtime at {runtime_url} stopped \
+                 responding (nothing was sent to the platform)",
+                path.display()
+            )
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -5616,11 +5859,7 @@ async fn submit_platform_ingest_chunk(
         .send()
         .await?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!("platform ingest job submission failed ({status}): {body}");
-    }
+    let response = response.platform_error_for_status().await?;
 
     Ok(response.json().await?)
 }
@@ -6043,7 +6282,8 @@ async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> 
         .apply(client.get(format!("{api_base}/knowledge/graph/stats")))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
 
@@ -6051,7 +6291,8 @@ async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> 
         .apply(client.get(format!("{api_base}/knowledge/embeddings/stats")))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
 
@@ -6059,7 +6300,8 @@ async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> 
         .apply(client.get(format!("{api_base}/knowledge/ingest-jobs")))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
 
@@ -6075,7 +6317,8 @@ async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> 
             .query(&[("limit", "200")])
             .send()
             .await?
-            .error_for_status()?
+            .platform_error_for_status()
+            .await?
             .json()
             .await?;
 
@@ -6390,7 +6633,13 @@ async fn handle_ingest(
         if locality.is_local() {
             eprintln!("⚑ LOCAL — extracting on-device, nothing leaves your machine");
         } else {
-            eprintln!("☁ CLOUD — sent to the platform");
+            // Cloud ingest is two stages and the first one is LOCAL: document
+            // text is extracted by the runtime on this machine, and only that
+            // text is uploaded. Saying just "sent to the platform" made a
+            // localhost failure in stage 1 impossible to place.
+            eprintln!(
+                "☁ CLOUD — step 1: text extracted on-device · step 2: that text sent to the platform"
+            );
         }
         locality
     } else {
@@ -6716,31 +6965,6 @@ impl PlatformAuth {
     }
 }
 
-/// Friendlier replacement for `.error_for_status()` on platform calls.
-///
-/// Default reqwest error on 401 reads "HTTP status client error (401
-/// Unauthorized) for url ...", which leaves the user wondering what
-/// to do. This wrapper replaces that with an actionable message
-/// pointing at `prism login` and `prism status`. Other non-2xx
-/// responses fall through to the normal reqwest error.
-fn friendly_status(resp: reqwest::Response, action: &str) -> Result<reqwest::Response> {
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        let url = resp.url().to_string();
-        bail!(
-            "Not authorized to {action}.\n\
-             \n\
-             Your platform token may be expired or missing the required \
-             scope for this endpoint. Try:\n\
-             \x20 prism login              # refresh your platform session\n\
-             \x20 prism status             # check current auth state\n\
-             \n\
-             Endpoint: {url}"
-        );
-    }
-    Ok(resp.error_for_status()?)
-}
-
 /// Default `--platform-url` for `prism run --backend marc27`. Kept as a const so
 /// `handle_run` can tell an explicit override from the default and pick the
 /// agent-resolved base otherwise.
@@ -6830,7 +7054,8 @@ async fn handle_node_token_mint(paths: &PrismPaths, project: Option<&str>) -> Re
         }))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
 
@@ -7290,7 +7515,8 @@ async fn handle_predict(
         .apply(client.get(format!("{api_base}/compute/deployments")))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
     let running = list
@@ -7339,7 +7565,8 @@ async fn handle_predict(
             .json(&body)
             .send()
             .await?
-            .error_for_status()?
+            .platform_error_for_status()
+            .await?
             .json()
             .await?;
         let id = created["id"]
@@ -7357,7 +7584,8 @@ async fn handle_predict(
                 .apply(client.get(format!("{api_base}/compute/deployments/{id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
             let state = status["status"].as_str().unwrap_or("unknown");
@@ -7570,7 +7798,8 @@ async fn run_deploy_and_invoke(
         .json(&serde_json::Value::Object(body))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
     let deployment_id = created["id"]
@@ -7588,7 +7817,8 @@ async fn run_deploy_and_invoke(
             .apply(client.get(format!("{api_base}/compute/deployments/{deployment_id}")))
             .send()
             .await?
-            .error_for_status()?
+            .platform_error_for_status()
+            .await?
             .json()
             .await?;
         let state = status["status"].as_str().unwrap_or("unknown");
@@ -7736,7 +7966,8 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 .json(&serde_json::Value::Object(body))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -7752,10 +7983,13 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
             if let Some(status) = status.as_deref() {
                 request = request.query(&[("status", status)]);
             }
-            let response: serde_json::Value =
-                friendly_status(request.send().await?, "list compute deployments")?
-                    .json()
-                    .await?;
+            let response: serde_json::Value = request
+                .send()
+                .await?
+                .platform_error_for_status()
+                .await?
+                .json()
+                .await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -7768,7 +8002,8 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/compute/deployments/{id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -7783,7 +8018,8 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 .apply(client.delete(format!("{api_base}/compute/deployments/{id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .text()
                 .await?;
 
@@ -7809,7 +8045,8 @@ async fn handle_deploy_command(command: DeployCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/compute/deployments/{id}/health")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -7894,7 +8131,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             auth.apply(client.get(format!("{api_base}/compute/gpus")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7902,7 +8140,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             auth.apply(client.get(format!("{api_base}/compute/providers")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7924,7 +8163,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                 .json(&serde_json::Value::Object(body))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7932,7 +8172,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             auth.apply(client.get(format!("{api_base}/compute/{job_id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -7940,7 +8181,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             auth.apply(client.post(format!("{api_base}/compute/{job_id}/cancel")))
                 .send()
                 .await?
-                .error_for_status()?;
+                .platform_error_for_status()
+                .await?;
             serde_json::json!({ "job_id": job_id, "status": "cancel_requested" })
         }
         ComputeCommands::Submit {
@@ -7982,7 +8224,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                 .json(&serde_json::Value::Object(body))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -8089,7 +8332,8 @@ async fn run_compute_job(
         .json(&serde_json::Value::Object(body))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
     let job_id = value_string(&submitted, &["job_id", "id"])
@@ -8103,7 +8347,8 @@ async fn run_compute_job(
             .apply(client.get(format!("{api_base}/compute/{job_id}")))
             .send()
             .await?
-            .error_for_status()?
+            .platform_error_for_status()
+            .await?
             .json()
             .await?;
         let state = value_string(&status, &["status", "state"]).unwrap_or("unknown");
@@ -8204,7 +8449,8 @@ async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
                 .query(&[("limit", limit.to_string())])
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -8217,7 +8463,8 @@ async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
                 ])
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -8237,7 +8484,8 @@ async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
                 .query(&params)
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -8252,7 +8500,8 @@ async fn handle_knowledge_command(command: KnowledgeCommands) -> Result<()> {
                 .json(&body)
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?
         }
@@ -8320,7 +8569,8 @@ async fn run_ingest_job(
         .json(&body)
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
     let job_id = value_string(&submitted, &["job_id", "id"])
@@ -8334,7 +8584,8 @@ async fn run_ingest_job(
             .apply(client.get(format!("{api_base}/knowledge/ingest-jobs")))
             .send()
             .await?
-            .error_for_status()?
+            .platform_error_for_status()
+            .await?
             .json()
             .await?;
         let job_entry = value_array(&jobs, &["jobs", "items", "data"]).and_then(|list| {
@@ -8397,7 +8648,8 @@ async fn fetch_platform_catalog_live(paths: &PrismPaths) -> Result<Vec<serde_jso
         .apply(client.get(format!("{api_base}/projects/{project_id}/llm/models")))
         .send()
         .await?
-        .error_for_status()?
+        .platform_error_for_status()
+        .await?
         .json()
         .await?;
 
@@ -8607,9 +8859,7 @@ async fn fetch_gpu_catalog() -> Result<serde_json::Value> {
         .header("Authorization", auth_header)
         .send()
         .await?;
-    let value = friendly_status(response, "list GPU compute offers")?
-        .json()
-        .await?;
+    let value = response.platform_error_for_status().await?.json().await?;
     Ok(value)
 }
 
@@ -8706,7 +8956,8 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 }))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -8730,8 +8981,7 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/discourse/specs")))
                 .send()
                 .await?;
-            let response: serde_json::Value =
-                friendly_status(raw, "list discourse specs")?.json().await?;
+            let response: serde_json::Value = raw.platform_error_for_status().await?.json().await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -8744,7 +8994,8 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/discourse/specs/{spec_id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
             // YAML-backed specs are easier to inspect as pretty JSON than a lossy summary.
@@ -8763,7 +9014,8 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .json(&body)
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .text()
                 .await?;
             let events = normalize_stream_events(parse_sse_json_events(&response)?);
@@ -8801,7 +9053,8 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/discourse/{instance_id}")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -8816,7 +9069,8 @@ async fn handle_discourse_command(command: DiscourseCommands) -> Result<()> {
                 .apply(client.get(format!("{api_base}/discourse/{instance_id}/turns")))
                 .send()
                 .await?
-                .error_for_status()?
+                .platform_error_for_status()
+                .await?
                 .json()
                 .await?;
 
@@ -9141,6 +9395,252 @@ async fn handle_provenance_command(command: ProvenanceCommands) -> anyhow::Resul
     Ok(())
 }
 
+/// Take the goal's worker lock for the life of this process, refusing to
+/// start if another worker already holds it. The lock — not a pid file the
+/// OS might recycle out from under us — is what tells the scheduler whether
+/// this goal is being worked on; the kernel releases it even on SIGKILL.
+fn acquire_worker_lock(goal_id: &str) -> Result<prism_campaign::schedule::WorkerLock> {
+    match prism_campaign::schedule::WorkerLock::acquire(goal_id) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => anyhow::bail!(
+            "goal '{goal_id}' already has a worker running — refusing to start a second one \
+             (that would double its spend). Wait for it, or stop it first."
+        ),
+        Err(e) => Err(e.context(format!(
+            "could not take the worker lock for goal '{goal_id}'"
+        ))),
+    }
+}
+
+/// `prism schedule …` — the durable wake-up surface for long-running goals.
+///
+/// The registry lives in pod-local embedded libSQL; the heartbeat lives in
+/// whatever already supervises processes on this host. See
+/// `prism_campaign::schedule` for why the ticking is delegated rather than
+/// run in-process.
+async fn handle_schedule_command(command: ScheduleCommands) -> Result<()> {
+    use prism_campaign::schedule::{
+        Decision, ScheduleStore, Trigger, WorkerResumer, launchd_plist, parse_duration,
+        systemd_units, tick_once,
+    };
+
+    let store = ScheduleStore::open_default().await?;
+    let resumer = WorkerResumer {
+        exe: std::env::current_exe().context("failed to locate the prism executable")?,
+    };
+
+    match command {
+        ScheduleCommands::Create(args) => {
+            let ScheduleCreateArgs {
+                goal,
+                every,
+                cron,
+                at,
+                watch_file,
+                watch_goal,
+                watch_goal_status,
+                watch_corpus,
+                corpus_at_least,
+                corpus_tenant,
+                max_fires,
+                max_no_progress,
+            } = *args;
+            let trigger = if let Some(spec) = every {
+                Trigger::Every {
+                    seconds: parse_duration(&spec)?,
+                }
+            } else if let Some(expr) = cron {
+                Trigger::Cron { expr }
+            } else if let Some(unix_secs) = at {
+                Trigger::At { unix_secs }
+            } else if let Some(path) = watch_file {
+                Trigger::WatchFile { path }
+            } else if let Some(goal_id) = watch_goal {
+                Trigger::WatchGoal {
+                    goal_id,
+                    status: watch_goal_status,
+                }
+            } else if let Some(db) = watch_corpus {
+                let at_least = corpus_at_least.ok_or_else(|| {
+                    anyhow::anyhow!("--watch-corpus needs --corpus-at-least <entity count>")
+                })?;
+                Trigger::WatchCorpus {
+                    db,
+                    at_least,
+                    tenant: corpus_tenant,
+                }
+            } else {
+                anyhow::bail!(
+                    "a schedule needs a trigger: --every, --cron, --at, --watch-file, \
+                     --watch-goal, or --watch-corpus"
+                );
+            };
+            // Refuse to schedule a goal that does not exist — an id typo
+            // would otherwise create a schedule that wedges on its first tick.
+            let snapshot =
+                <WorkerResumer as prism_campaign::schedule::GoalResumer>::snapshot(&resumer, &goal)
+                    .with_context(|| format!("cannot schedule goal '{goal}'"))?;
+            let sched = store
+                .create(&goal, trigger, max_fires, max_no_progress)
+                .await?;
+            println!("Schedule created: {}", sched.id);
+            println!(
+                "  goal:      {} ({})",
+                sched.goal_id,
+                snapshot.status.as_str()
+            );
+            println!("  trigger:   {}", serde_json::to_string(&sched.trigger)?);
+            if let Some(due) = sched.next_due_at {
+                println!("  next due:  {due} (unix)");
+            } else {
+                println!("  next due:  on the watched condition becoming true");
+            }
+            println!(
+                "  ceilings:  {max_fires} wake-ups, wedged after {max_no_progress} with no progress"
+            );
+            // Say plainly whether anything will ever run this schedule.
+            // Derived from when a tick last actually ran, not from a unit
+            // file existing on disk — a written-but-never-loaded unit would
+            // have read as healthy.
+            println!(
+                "  {}",
+                store.heartbeat_status(chrono::Utc::now().timestamp()).await
+            );
+        }
+        ScheduleCommands::List => {
+            // Lead with the heartbeat: a schedule that reads `active` but
+            // that nothing is ticking is the whole reason someone runs this
+            // command, and it looks identical to a healthy one otherwise.
+            println!(
+                "{}",
+                store.heartbeat_status(chrono::Utc::now().timestamp()).await
+            );
+            let all = store.list().await?;
+            if all.is_empty() {
+                println!("No schedules.");
+                return Ok(());
+            }
+            for s in all {
+                println!(
+                    "  {} — {} — goal {} — {} fires/{} — {}",
+                    s.id,
+                    s.state.as_str(),
+                    s.goal_id,
+                    s.fires,
+                    s.max_fires,
+                    serde_json::to_string(&s.trigger)?
+                );
+                if !s.last_outcome.is_empty() {
+                    println!("      last: {}", s.last_outcome);
+                }
+            }
+        }
+        ScheduleCommands::Cancel { id } => {
+            if store.cancel(&id).await? {
+                println!("Cancelled {id}");
+            } else {
+                anyhow::bail!("no schedule '{id}' — nothing to cancel");
+            }
+        }
+        ScheduleCommands::Tick => {
+            let decisions = tick_once(&store, &resumer, chrono::Utc::now().timestamp()).await?;
+            if decisions.is_empty() {
+                println!("Nothing due.");
+            }
+            for (id, decision) in decisions {
+                let tag = match decision {
+                    Decision::Fired(_) => "FIRED",
+                    Decision::Skipped(_) => "skip",
+                    Decision::Stopped(_) => "STOP",
+                };
+                println!("{tag} {id}: {}", decision.reason());
+            }
+        }
+        ScheduleCommands::Daemon { interval } => {
+            if interval == 0 {
+                anyhow::bail!("--interval must be greater than zero");
+            }
+            println!(
+                "Schedule daemon running (tick every {interval}s). This loop dies with this \
+                 process — it is meant for a supervised container. On a normal host use \
+                 `prism schedule install`."
+            );
+            loop {
+                match tick_once(&store, &resumer, chrono::Utc::now().timestamp()).await {
+                    Ok(decisions) => {
+                        for (id, decision) in decisions {
+                            println!("{id}: {}", decision.reason());
+                        }
+                    }
+                    // A failing tick must be loud and must not kill the loop —
+                    // the next tick may well succeed.
+                    Err(e) => eprintln!("tick failed: {e:#}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            }
+        }
+        ScheduleCommands::Install { interval, write } => {
+            let exe = std::env::current_exe()?;
+            let unit_path = heartbeat_unit_path();
+            let (contents, activate) = if cfg!(target_os = "macos") {
+                // launchd opens StandardOutPath itself and refuses to spawn
+                // the job if the directory is missing — the unit would sit
+                // installed and never fire. Create it before writing.
+                if write {
+                    std::fs::create_dir_all(
+                        PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                            .join(".prism")
+                            .join("logs"),
+                    )?;
+                }
+                (
+                    launchd_plist(&exe, interval),
+                    "launchctl bootstrap gui/$(id -u)".to_string(),
+                )
+            } else {
+                let (service, timer) = systemd_units(&exe, interval);
+                if write && let Some(dir) = unit_path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                    std::fs::write(dir.join("prism-schedule.service"), &service)?;
+                    println!("Wrote {}", dir.join("prism-schedule.service").display());
+                }
+                // systemd wants the unit NAME once the file is in the user
+                // unit directory; a path works but is the awkward form.
+                (
+                    timer,
+                    "systemctl --user daemon-reload && systemctl --user enable --now \
+                     prism-schedule.timer #"
+                        .to_string(),
+                )
+            };
+            if write {
+                if let Some(parent) = unit_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&unit_path, &contents)?;
+                println!("Wrote {}", unit_path.display());
+                println!("Activate it with:\n  {activate} {}", unit_path.display());
+            } else {
+                println!("# {}", unit_path.display());
+                print!("{contents}");
+                println!("# Activate with: {activate} {}", unit_path.display());
+                println!("# Or re-run with --write to install it.");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Where this host's tick heartbeat unit lives.
+fn heartbeat_unit_path() -> PathBuf {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    if cfg!(target_os = "macos") {
+        home.join("Library/LaunchAgents/com.mirdyne.prism.schedule.plist")
+    } else {
+        home.join(".config/systemd/user/prism-schedule.timer")
+    }
+}
+
 /// Spawn the detached background worker that owns a campaign loop:
 /// `prism campaign continue <id>` with stdio detached, in its own process
 /// group so it survives the parent CLI (or an agent tool call) exiting. The
@@ -9162,6 +9662,15 @@ fn spawn_campaign_worker(campaign_id: &str) -> Result<()> {
     let child = cmd
         .spawn()
         .context("failed to spawn detached campaign worker")?;
+    // Record the live worker so the scheduler can tell "still running" from
+    // "its process died" without spawning a duplicate. Every spawn site must
+    // write this, or a scheduled tick would start a second worker alongside a
+    // healthy one.
+    if let Err(e) =
+        prism_campaign::schedule::WorkerResumer::write_worker_pid(campaign_id, child.id())
+    {
+        tracing::warn!(campaign_id, error = %e, "could not record campaign worker pid — the scheduler may spawn a duplicate worker");
+    }
     tracing::info!(
         campaign_id,
         worker_pid = child.id(),
@@ -9207,11 +9716,9 @@ async fn handle_platform_query(
             .apply(client.post(format!("{api_base}/knowledge/search")))
             .json(&serde_json::json!({"query": text, "limit": limit}))
             .send()
+            .await?
+            .platform_error_for_status()
             .await?;
-
-        if !resp.status().is_success() {
-            bail!("Platform API error: {}", resp.status());
-        }
 
         let results: Vec<serde_json::Value> = resp.json().await?;
         if json_output {
@@ -9241,11 +9748,9 @@ async fn handle_platform_query(
             .apply(client.get(format!("{api_base}/knowledge/graph/search")))
             .query(&[("q", text), ("limit", &limit.to_string())])
             .send()
+            .await?
+            .platform_error_for_status()
             .await?;
-
-        if !resp.status().is_success() {
-            bail!("Platform API error: {}", resp.status());
-        }
 
         let results: Vec<serde_json::Value> = resp.json().await?;
         if json_output {
@@ -9347,61 +9852,67 @@ async fn local_ontology_lookup(
     })
 }
 
-/// Semantic entity search over the bundled Turso store using the offline
-/// `prism-embed` backend (no Qdrant, no cloud) — the vectors that local
+/// Semantic entity search over the bundled Turso store, ranked by Turso's
+/// native `vector_distance_cos()`, using the offline `prism-embed` backend
+/// for the query vector (no Qdrant, no cloud) — the vectors that local
 /// ingest writes via `embed_entities_best_effort`.
 ///
-/// Never errors: an unopenable store, an empty store, an unavailable
-/// embedding backend, or zero hits all degrade to `None`, which the
-/// caller renders as "no results". The store is checked BEFORE the
-/// backend is built, so a fresh install never pays the embedding-model
-/// init just to return nothing.
+/// # Honesty contract
+///
+/// `Ok(vec![])` means **nothing is embedded locally yet**, and nothing
+/// else. Anything that makes the index unusable — an unopenable store, a
+/// missing embedding backend, a dimension mismatch — is an `Err` whose
+/// message names the problem, so a broken index is never printed as "no
+/// results". The store is counted BEFORE the backend is built, so a fresh
+/// install never pays the embedding-model init just to return nothing.
 async fn local_semantic_lookup(
     db_path: &Path,
     text: &str,
     limit: usize,
-) -> Option<Vec<(String, f32)>> {
-    let store = match prism_provenance::ProvenanceStore::open(db_path).await {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::debug!("local semantic store open failed: {e:#}");
-            return None;
-        }
-    };
-    match store.entity_embedding_count(LOCAL_ONTOLOGY_TENANT).await {
-        Ok(0) => return None,
-        Ok(_) => {}
-        Err(e) => {
-            tracing::debug!("local semantic embedding count failed: {e:#}");
-            return None;
-        }
+) -> Result<Vec<(String, f32)>> {
+    // No store file at all ⇒ nothing was ever ingested. That is an empty
+    // index, not a broken one, so it must not raise the alarm a fresh
+    // install would otherwise trip on (opening a path under a missing
+    // `~/.prism` fails outright).
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = prism_provenance::ProvenanceStore::open(db_path)
+        .await
+        .with_context(|| {
+            format!(
+                "local semantic store {} could not be opened",
+                db_path.display()
+            )
+        })?;
+    let embedded = store
+        .entity_embedding_count(LOCAL_ONTOLOGY_TENANT)
+        .await
+        .context("local semantic index could not be counted")?;
+    if embedded == 0 {
+        return Ok(Vec::new()); // nothing ingested yet — a real empty answer
     }
 
     // First ever native init may download the model — blocking pool.
     let backend = tokio::task::spawn_blocking(prism_embed::from_config)
         .await
-        .ok()
-        .flatten()?;
-    let query_vec = match backend.embed(std::slice::from_ref(&text.to_string())).await {
-        Ok(mut vecs) if !vecs.is_empty() => vecs.remove(0),
-        Ok(_) => return None,
-        Err(e) => {
-            tracing::debug!("local semantic query embedding failed: {e:#}");
-            return None;
-        }
-    };
+        .context("embedding backend initialization panicked")?
+        .context(
+            "no embedding backend available, so the query cannot be embedded — set \
+             PRISM_EMBED_BACKEND=native (the default) or =openai with \
+             PRISM_EMBED_ENDPOINT_URL",
+        )?;
+    let query_vec = backend
+        .embed(std::slice::from_ref(&text.to_string()))
+        .await
+        .context("embedding the query failed")?
+        .into_iter()
+        .next()
+        .context("embedding backend returned no vector for the query")?;
 
-    match store
+    store
         .semantic_search_entities(&query_vec, LOCAL_ONTOLOGY_TENANT, limit)
         .await
-    {
-        Ok(hits) if !hits.is_empty() => Some(hits),
-        Ok(_) => None,
-        Err(e) => {
-            tracing::debug!("local semantic search failed: {e:#}");
-            None
-        }
-    }
 }
 
 /// Render local-ontology matches in the same shape the retired Neo4j path
@@ -9448,17 +9959,20 @@ async fn handle_query(text: &str, semantic: bool, limit: usize) -> Result<()> {
     let turso_db = PathBuf::from(home).join(".prism/provenance.db");
 
     if semantic {
-        // Bundled Turso entity vectors written by local ingest (offline
-        // prism-embed query embedding — no services needed).
-        let results = local_semantic_lookup(&turso_db, text, limit)
-            .await
-            .unwrap_or_default();
+        // Bundled Turso entity vectors written by local ingest, ranked by
+        // the native `vector_distance_cos()` (offline prism-embed query
+        // embedding — no services needed). An unusable index errors out
+        // here rather than printing an empty, reassuring list.
+        let results = local_semantic_lookup(&turso_db, text, limit).await?;
         println!("\nSemantic search results ({} matches):\n", results.len());
         for (i, (id, score)) in results.iter().enumerate() {
             println!("  {}. {id}  (score: {score:.4})", i + 1);
         }
         if results.is_empty() {
-            println!("  (no results — ingest data first with: prism ingest <path>)");
+            println!(
+                "  (the local semantic index is empty — ingest data first with: \
+                 prism ingest <path>)"
+            );
         }
     } else {
         // Graph traversal over the bundled Turso provenance store

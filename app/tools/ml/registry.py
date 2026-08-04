@@ -40,11 +40,18 @@ class ModelRegistry:
 
         joblib.dump(model, model_path)
 
+        # Recorded here, not passed in, so no caller can forget it: the
+        # featurizer that produced X is always the in-process one, and a
+        # model whose features silently changed meaning is unusable
+        # (Predictor refuses to score against a different backend id).
+        from app.tools.ml.features import feature_backend_id
+
         meta = {
             "property": property_name,
             "algorithm": algorithm,
             "metrics": metrics,
             "saved_at": datetime.now().isoformat(),
+            "feature_backend_id": feature_backend_id(),
         }
         if feature_names:
             # Persist the exact training feature order so predict-time

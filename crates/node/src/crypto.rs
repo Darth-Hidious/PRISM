@@ -134,6 +134,43 @@ fn load_signing_key(path: &Path) -> Result<(SigningKey, VerifyingKey)> {
     Ok((signing, verifying))
 }
 
+/// Write 32 raw private-key bytes, owner-only from the moment the file
+/// exists.
+///
+/// `fs::write` + `set_permissions` is NOT equivalent: it creates the file
+/// at 0666 & ~umask (0644 under the usual 0022) and only narrows it
+/// afterwards, so the node's long-term secret is world-readable for a
+/// window on every write — and stays that way if the process dies in
+/// between. Passing the mode to `open` closes the window. This is the
+/// same pattern `daemon.rs` and `prism-runtime` already use.
+fn write_private_key(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        // An existing file keeps its old mode through `open`, so narrow
+        // it explicitly too — this covers keys written by earlier builds.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Save a private key as raw 32 bytes with restricted permissions.
 fn save_key(path: &Path, secret: &StaticSecret) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -141,20 +178,8 @@ fn save_key(path: &Path, secret: &StaticSecret) -> Result<()> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    // Serialize the secret key bytes
-    let bytes = secret.to_bytes();
-    std::fs::write(path, bytes)
-        .with_context(|| format!("failed to write node key to {}", path.display()))?;
-
-    // Set 0600 permissions (owner read/write only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-    }
-
-    Ok(())
+    write_private_key(path, &secret.to_bytes())
+        .with_context(|| format!("failed to write node key to {}", path.display()))
 }
 
 fn save_signing_key(path: &Path, signing: &SigningKey) -> Result<()> {
@@ -163,17 +188,8 @@ fn save_signing_key(path: &Path, signing: &SigningKey) -> Result<()> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    std::fs::write(path, signing.to_bytes())
-        .with_context(|| format!("failed to write node signing key to {}", path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-    }
-
-    Ok(())
+    write_private_key(path, &signing.to_bytes())
+        .with_context(|| format!("failed to write node signing key to {}", path.display()))
 }
 
 /// Rotate the keypair: generate new, overwrite old, zeroize.
