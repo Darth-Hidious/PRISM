@@ -13,6 +13,10 @@ Run as: ~/.prism/venv-sci/bin/python3 -m app.sidecar_server
 import json
 import sys
 
+from app.tools._offline import install_external_network_guard
+
+install_external_network_guard()
+
 # Same banner guard as tool_server: keep stdout pure JSON.
 _PROTOCOL_OUT = sys.stdout
 sys.stdout = sys.stderr

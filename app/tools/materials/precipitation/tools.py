@@ -24,6 +24,7 @@ def _missing_dep_error() -> dict:
             "install: kawin and/or pycalphad cannot be imported."
         ),
         "install_hint": "pip install 'prism-platform[precipitation]'",
+        "provision_command": "prism provision extra precipitation",
         "converged": False,
     }
 

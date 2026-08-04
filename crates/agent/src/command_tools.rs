@@ -140,6 +140,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         requires_approval: false,
     },
     CommandToolSpec {
+        name: "provision",
+        root: "provision",
+        aliases: &["prism_provision"],
+        kind: CommandToolKind::RootArgs,
+        description: "Provision a science dependency without asking a human to construct pip commands. Use `args=[\"extra\",\"mace\"]` for on-demand installation, or `args=[\"wheels\",\"--output\",\"/path\",\"--extra\",\"mace\"]` on a connected staging machine to vendor wheels for an offline node.",
+        permission_mode: PermissionMode::WorkspaceWrite,
+        requires_approval: true,
+    },
+    CommandToolSpec {
         name: "doctor",
         root: "doctor",
         aliases: &["prism_doctor"],
@@ -5592,6 +5601,7 @@ ValueError: boom\n";
         "ingest",
         "job-status",
         "publish",
+        "provision",
         "query",
         "research",
         "run",

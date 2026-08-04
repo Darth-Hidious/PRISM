@@ -64,6 +64,7 @@ def _mace_missing_error() -> dict[str, Any]:
     return {
         "error": "MACE foundation interatomic potential not available in this PRISM install.",
         "install_hint": "pip install 'prism-platform[mace]'",
+        "provision_command": "prism provision extra mace",
         "rationale": (
             "MACE-MH-1 is PyTorch-only as of 2026 (mace-jax does not yet support "
             "the multi-head MH-1 architecture). Installing the `[mace]` extra adds "

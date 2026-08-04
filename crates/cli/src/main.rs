@@ -184,6 +184,11 @@ enum Commands {
         #[command(subcommand)]
         command: PyironCommands,
     },
+    /// Provision science Python extras or vendor wheels for an offline node.
+    Provision {
+        #[command(subcommand)]
+        command: ProvisionCommands,
+    },
     /// List available Python tools.
     Tools,
     /// Run the native (Rust) MCP server — exposes PRISM's Rust-side tools
@@ -763,6 +768,27 @@ enum PyironCommands {
     Install,
     /// Update PyIron to the latest pinned-compatible version.
     Update,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProvisionCommands {
+    /// Install one science extra into the active PRISM Python environment.
+    Extra {
+        /// Extra name: qe, calphad, mace, precipitation, lpbf, simulation, or ml.
+        name: String,
+        /// Offline wheelhouse; defaults to ~/.prism/wheelhouse.
+        #[arg(long)]
+        wheelhouse: Option<PathBuf>,
+    },
+    /// Vendor the core package and science extra wheels on a connected machine.
+    Wheels {
+        /// Directory to receive the wheelhouse.
+        #[arg(long)]
+        output: PathBuf,
+        /// One or more science extras, comma-separated or repeated.
+        #[arg(long = "extra", value_delimiter = ',', required = true)]
+        extras: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1961,6 +1987,32 @@ async fn main() -> Result<()> {
             PyironCommands::Install => println!("{}", pyiron_cmd::install()?),
             PyironCommands::Update => println!("{}", pyiron_cmd::update()?),
         },
+        Commands::Provision { command } => match command {
+            ProvisionCommands::Extra { name, wheelhouse } => {
+                prism_python_bridge::venv::install_extra(
+                    &python,
+                    &project_root,
+                    &name,
+                    wheelhouse.as_deref(),
+                )
+                .await?;
+                println!("Provisioned PRISM extra [{name}].");
+            }
+            ProvisionCommands::Wheels { output, extras } => {
+                prism_python_bridge::venv::pre_stage_wheels(
+                    &python,
+                    &project_root,
+                    &output,
+                    &extras,
+                )
+                .await?;
+                println!(
+                    "Pre-staged PRISM wheels for [{}] in {}.",
+                    extras.join(", "),
+                    output.display()
+                );
+            }
+        },
         Commands::Backend {
             project_root: backend_pr,
         } => {
@@ -2115,6 +2167,16 @@ async fn main() -> Result<()> {
 
             let mut tool_server_env = std::collections::BTreeMap::new();
             tool_server_env.insert("PRISM_ENABLE_MCP".to_string(), "1".to_string());
+            if let Ok(binary) = std::env::current_exe() {
+                tool_server_env.insert(
+                    "PRISM_BINARY".to_string(),
+                    binary.to_string_lossy().into_owned(),
+                );
+            }
+            tool_server_env.insert(
+                "PRISM_PROJECT_ROOT".to_string(),
+                backend_pr.to_string_lossy().into_owned(),
+            );
 
             // Platform auth for the Python tool server: do NOT export the
             // session JWT as MARC27_API_KEY. That env var is the X-API-Key
@@ -2786,10 +2848,22 @@ async fn main() -> Result<()> {
                             .llm
                             .clone()
                             .expect("checked is_some before spawn");
+                        let mut tool_server_env =
+                            prism_agent::service::default_tool_server_env(&chat_api_base);
+                        if let Ok(binary) = std::env::current_exe() {
+                            tool_server_env.insert(
+                                "PRISM_BINARY".to_string(),
+                                binary.to_string_lossy().into_owned(),
+                            );
+                        }
+                        tool_server_env.insert(
+                            "PRISM_PROJECT_ROOT".to_string(),
+                            chat_project_root.to_string_lossy().into_owned(),
+                        );
                         let tool_server = prism_python_bridge::ToolServer {
                             python_bin: chat_python,
                             project_root: chat_project_root,
-                            env: prism_agent::service::default_tool_server_env(&chat_api_base),
+                            env: tool_server_env,
                         };
                         match prism_agent::service::ChatService::spawn(
                             llm_config,
@@ -12705,6 +12779,34 @@ data:\n\
         assert!(should_sync_tools(
             resume.command.as_ref(),
             Some(&creds_with("token-abc"))
+        ));
+    }
+
+    #[test]
+    fn provision_commands_parse_the_agent_actionable_forms() {
+        let extra = Cli::try_parse_from(["prism", "provision", "extra", "mace"]).unwrap();
+        assert!(matches!(
+            extra.command,
+            Some(Commands::Provision {
+                command: ProvisionCommands::Extra { name, wheelhouse: None }
+            }) if name == "mace"
+        ));
+
+        let wheels = Cli::try_parse_from([
+            "prism",
+            "provision",
+            "wheels",
+            "--output",
+            "/tmp/prism-wheels",
+            "--extra",
+            "mace,ml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            wheels.command,
+            Some(Commands::Provision {
+                command: ProvisionCommands::Wheels { extras, .. }
+            }) if extras == vec!["mace".to_string(), "ml".to_string()]
         ));
     }
 

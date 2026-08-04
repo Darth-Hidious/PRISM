@@ -53,33 +53,21 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Same pinned window as `prism pyiron install` (crates/cli/src/pyiron_cmd.rs)
-# — keep the two in sync. pyiron_atomistics >=0.6 is the line that ships
-# Python 3.9–3.14 wheels (brings pyiron_base); the old `pyiron` meta package
-# pins pre-3.14 deps that try to BUILD numpy/pandas from source — never
-# install that here.
-_PYIRON_SPEC = ["pyiron_atomistics>=0.5,<0.6"]
-
 # One-shot guard: a failed install (no network, no pip) must not re-run a
 # multi-minute pip attempt on every tool call in this process.
 _AUTO_PROVISION_ATTEMPTED = False
 
 
 def _try_auto_provision() -> bool:
-    """Best-effort pip install into the running interpreter. NEVER raises."""
+    """Ask the PRISM harness to install the simulation extra. NEVER raises."""
     global _AUTO_PROVISION_ATTEMPTED
     if _AUTO_PROVISION_ATTEMPTED:
         return False
     _AUTO_PROVISION_ATTEMPTED = True
     try:
-        import subprocess
-        import sys
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", *_PYIRON_SPEC],
-            capture_output=True,
-            timeout=600,
-        )
-        return result.returncode == 0
+        from app.tools._provision import provision_extra
+
+        return bool(provision_extra("simulation").get("provisioned"))
     except Exception:
         return False
 
@@ -120,10 +108,11 @@ def _pyiron_missing_error() -> dict:
     """Standard error dict when pyiron is not installed."""
     return {
         "error": (
-            "pyiron_atomistics is not installed and automatic installation "
-            "failed (offline?). Run `prism pyiron install`, or "
-            "`pip install prism-platform[simulation]`."
-        )
+            "pyiron_atomistics is not installed and automatic provisioning "
+            "failed."
+        ),
+        "install_hint": "pip install prism-platform[simulation]",
+        "provision_command": "prism provision extra simulation",
     }
 
 

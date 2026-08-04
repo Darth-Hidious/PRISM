@@ -97,6 +97,7 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         m.insert("read_bash_task", ReadOnly);
         m.insert("status", ReadOnly);
         m.insert("tools", ReadOnly);
+        m.insert("provision", WorkspaceWrite);
         m.insert("query", ReadOnly);
         m.insert("query_local", ReadOnly);
         m.insert("query_platform", ReadOnly);
@@ -416,9 +417,9 @@ mod tests {
 
     #[test]
     fn all_known_tools_mapped() {
-        // 54 read-only + 22 workspace-write + 18 full-access = 94
+        // 54 read-only + 23 workspace-write + 18 full-access = 95
         let perms = tool_permissions();
-        assert_eq!(perms.len(), 94);
+        assert_eq!(perms.len(), 95);
     }
 
     #[test]

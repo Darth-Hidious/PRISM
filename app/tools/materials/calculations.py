@@ -122,12 +122,15 @@ def _calphad_available() -> bool:
 def _missing_error() -> dict:
     return {
         "error": (
-            "pycalphad is not installed. This tool needs the [calphad] extra: "
-            "`pip install prism-platform[calphad]`. Note: pycalphad depends on "
+            "pycalphad is not installed. This tool needs the [calphad] extra. "
+            "Use `prism provision extra calphad` (or pip install "
+            "prism-platform[calphad]). Note: pycalphad depends on "
             "symengine, which has no Python 3.14 wheel yet — on 3.14 use the "
             "py3.12 sidecar (`prism doctor` checks it). On 3.12/3.13 it installs "
             "natively."
         ),
+        "install_hint": "pip install prism-platform[calphad]",
+        "provision_command": "prism provision extra calphad",
         "tool_available": False,
     }
 

@@ -22,6 +22,7 @@ def _lpbf_missing_error() -> dict:
             "LPBF scientific dependencies are not available in this PRISM install."
         ),
         "install_hint": "pip install 'prism-platform[lpbf]'",
+        "provision_command": "prism provision extra lpbf",
         "missing_capability": "LPBF printability and Kou cracking analysis",
     }
 

@@ -71,6 +71,7 @@ def _structure_import(**kwargs) -> dict:
         return {
             "error": "structure_import needs ase (Atomic Simulation Environment)",
             "install_hint": "pip install ase  (or the 'prism-platform[mace]' extra)",
+            "provision_command": "prism provision extra mace",
         }
 
     try:

@@ -299,6 +299,7 @@ const CLI_BACKED_ROOTS: &[&str] = &[
     "workflow",
     "backend",
     "tools",
+    "provision",
     "node",
     "ingest",
     "query",

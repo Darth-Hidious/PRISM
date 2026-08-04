@@ -14,6 +14,7 @@ these paths run inside tool calls.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -72,8 +73,21 @@ def ensure_sidecar(install: bool = True) -> Optional[str]:
                 capture_output=True,
                 timeout=120,
             )
+        pip_command = [str(_sidecar_python()), "-m", "pip", "install"]
+        wheelhouse = os.environ.get(
+            "PRISM_WHEELHOUSE", str(Path.home() / ".prism" / "wheelhouse")
+        )
+        if os.environ.get("PRISM_OFFLINE") == "1":
+            if not Path(wheelhouse).is_dir():
+                return (
+                    "offline mode: science sidecar is not provisioned and no "
+                    f"wheelhouse exists at {wheelhouse}; pre-stage it with "
+                    "`prism provision wheels` on a connected machine"
+                )
+            pip_command.extend(["--no-index", "--find-links", wheelhouse])
+        pip_command.extend(SIDECAR_PACKAGES)
         result = subprocess.run(
-            [str(_sidecar_python()), "-m", "pip", "install", *SIDECAR_PACKAGES],
+            pip_command,
             capture_output=True,
             timeout=_PROVISION_TIMEOUT_SECS,
         )

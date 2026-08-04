@@ -197,7 +197,12 @@ def _compute_descriptor_tool() -> Tool:
             from matminer.featurizers.composition import ElementProperty
             from pymatgen.core import Composition
         except ImportError:
-            return {"error": "matminer not installed (pip install prism-platform[ml])", "tool_available": False}
+            return {
+                "error": "matminer not installed",
+                "install_hint": "pip install prism-platform[ml]",
+                "provision_command": "prism provision extra ml",
+                "tool_available": False,
+            }
 
         ep = ElementProperty.from_preset("magpie")
         out = []

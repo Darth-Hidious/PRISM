@@ -21,6 +21,15 @@ const PYTHON_CANDIDATES: &[&str] = &[
 ];
 const OFFLINE_ENV: &str = "PRISM_OFFLINE";
 const WHEELHOUSE_ENV: &str = "PRISM_WHEELHOUSE";
+const SCIENCE_EXTRAS: &[&str] = &[
+    "qe",
+    "calphad",
+    "mace",
+    "precipitation",
+    "lpbf",
+    "simulation",
+    "ml",
+];
 
 /// Ensure a managed venv exists at `{prism_dir}/venv/` and return the path to
 /// its `python3` binary.  Creates the venv (and pip-installs PRISM) on first
@@ -44,7 +53,7 @@ pub async fn ensure_venv(
     if offline && !wheelhouse.is_dir() {
         return Err(PythonBridgeError::Spawn(std::io::Error::other(format!(
             "offline mode: PRISM Python is not installed and no wheelhouse exists at {}. \
-             Pre-stage it with `prism provision --wheels {}` before moving this node.",
+             Pre-stage it with `prism provision wheels --output {}` before moving this node.",
             wheelhouse.display(),
             wheelhouse.display()
         ))));
@@ -165,7 +174,7 @@ pub async fn ensure_venv(
         let message = if offline {
             format!(
                 "offline mode: could not install PRISM tools from {} — \
-                 pre-stage compatible wheels with `prism provision --wheels {}`; \
+                 pre-stage compatible wheels with `prism provision wheels --output {}`; \
                  attempted: {retry}",
                 wheelhouse.display(),
                 wheelhouse.display()
@@ -181,6 +190,144 @@ pub async fn ensure_venv(
 
     eprintln!("[prism] Venv ready at {}", venv_dir.display());
     Ok(venv_python)
+}
+
+/// Install one of PRISM's science extras into an existing Python environment.
+///
+/// This is the agent-actionable provisioning path: callers do not need to
+/// construct a pip command from an install hint. Online installs may use the
+/// configured index; offline installs require a local wheelhouse and use
+/// `--no-index` so pip cannot escape to the network.
+pub async fn install_extra(
+    python: &Path,
+    project_root: &Path,
+    extra: &str,
+    wheelhouse: Option<&Path>,
+) -> Result<(), PythonBridgeError> {
+    let extra = validate_extra(extra)?;
+    let offline = std::env::var(OFFLINE_ENV).is_ok_and(|value| value == "1");
+    let wheelhouse = wheelhouse
+        .map(Path::to_path_buf)
+        .unwrap_or_else(offline_wheelhouse_from_home);
+    if offline && !wheelhouse.is_dir() {
+        return Err(PythonBridgeError::Spawn(std::io::Error::other(format!(
+            "offline mode: extra '{extra}' needs a wheelhouse at {}",
+            wheelhouse.display()
+        ))));
+    }
+
+    let source = prism_source_root(project_root).or_else(build_source_root);
+    let requirement = source
+        .map(|root| format!("{}[{extra}]", root.display()))
+        .unwrap_or_else(|| format!("prism-platform[{extra}]=={}", env!("CARGO_PKG_VERSION")));
+    let mut args = vec!["-m", "pip", "install"];
+    if offline {
+        args.extend(["--no-index", "--find-links"]);
+    } else if wheelhouse.is_dir() {
+        args.push("--find-links");
+    }
+    let mut owned_args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+    if offline || wheelhouse.is_dir() {
+        owned_args.push(wheelhouse.to_string_lossy().into_owned());
+    }
+    owned_args.push(requirement);
+
+    eprintln!("[prism] provisioning [{extra}] into {}", python.display());
+    let status = Command::new(python)
+        .args(&owned_args)
+        .current_dir(project_root)
+        .status()
+        .await
+        .map_err(PythonBridgeError::Spawn)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(PythonBridgeError::Spawn(std::io::Error::other(format!(
+            "pip could not install PRISM extra '{extra}' (exit status {status})"
+        ))))
+    }
+}
+
+/// Vendor the core package plus requested extras into a portable wheelhouse.
+/// Run this on a connected staging machine, then copy the output directory to
+/// the offline node and set `PRISM_WHEELHOUSE` if it is not `~/.prism/wheelhouse`.
+pub async fn pre_stage_wheels(
+    python: &Path,
+    project_root: &Path,
+    output: &Path,
+    extras: &[String],
+) -> Result<(), PythonBridgeError> {
+    if std::env::var(OFFLINE_ENV).is_ok_and(|value| value == "1") {
+        return Err(PythonBridgeError::Spawn(std::io::Error::other(
+            "cannot pre-stage wheels in hard offline mode; run this command on a connected staging machine",
+        )));
+    }
+    if extras.is_empty() {
+        return Err(PythonBridgeError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "at least one --extra is required",
+        )));
+    }
+    let extras = extras
+        .iter()
+        .map(|extra| validate_extra(extra).map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+    std::fs::create_dir_all(output).map_err(PythonBridgeError::Spawn)?;
+
+    let source = prism_source_root(project_root).or_else(build_source_root);
+    let requirement = source
+        .map(|_| format!(".[{}]", extras.join(",")))
+        .unwrap_or_else(|| {
+            format!(
+                "prism-platform[{}]=={}",
+                extras.join(","),
+                env!("CARGO_PKG_VERSION")
+            )
+        });
+    let status = Command::new(python)
+        .args([
+            "-m",
+            "pip",
+            "wheel",
+            "--wheel-dir",
+            &output.to_string_lossy(),
+            "--prefer-binary",
+            &requirement,
+        ])
+        .current_dir(project_root)
+        .status()
+        .await
+        .map_err(PythonBridgeError::Spawn)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(PythonBridgeError::Spawn(std::io::Error::other(format!(
+            "pip could not pre-stage PRISM extras {} (exit status {status})",
+            extras.join(", ")
+        ))))
+    }
+}
+
+fn validate_extra(extra: &str) -> Result<&str, PythonBridgeError> {
+    let extra = extra.trim();
+    if SCIENCE_EXTRAS.contains(&extra) {
+        Ok(extra)
+    } else {
+        Err(PythonBridgeError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "unsupported PRISM extra '{extra}'; choose one of: {}",
+                SCIENCE_EXTRAS.join(", ")
+            ),
+        )))
+    }
+}
+
+fn offline_wheelhouse_from_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".prism/wheelhouse")
 }
 
 /// The directory holding *this crate's* `Cargo.toml`, baked in at compile
