@@ -24,6 +24,7 @@ prism-client = { path = "../client" }
 prism-frontend = { path = "../frontend" }
 prism-llm = { path = "../llm" }
 prism-python-bridge = { path = "../python-bridge" }
+prism-provenance = { path = "../provenance" }
 # Shared offline and retry policies.
 prism-runtime = { path = "../runtime" }
 

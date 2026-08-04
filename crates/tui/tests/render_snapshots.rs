@@ -321,7 +321,7 @@ fn snapshot_tool_success_100x30() {
         card_type: "results".into(),
         elapsed_ms: Some(292),
         provenance_id: Some("prov_001".into()),
-        data: None,
+        data: Some(serde_json::json!({"evidence_class": "screening"})),
     });
     app.apply_agent_msg(AgentMsg::TurnComplete);
     app.tokens_per_sec = 0.0;
@@ -330,6 +330,7 @@ fn snapshot_tool_success_100x30() {
     app.tokens_received = 0;
 
     let rendered = render_app_to_string(&app, 100, 30);
+    assert!(rendered.contains("[YELLOW screening]"), "{rendered}");
     insta::assert_snapshot!("tool_success_100x30", rendered);
 }
 
@@ -661,7 +662,9 @@ fn snapshot_approval_after_y_100x30() {
         card_type: "results".into(),
         elapsed_ms: Some(500),
         provenance_id: None,
-        data: None,
+        data: Some(serde_json::json!({
+            "evidence_class": "reference_validated"
+        })),
     });
     app.apply_agent_msg(AgentMsg::TurnComplete);
     freeze_metrics(&mut app);
@@ -736,7 +739,9 @@ fn snapshot_approval_after_a_100x30() {
         card_type: "results".into(),
         elapsed_ms: Some(500),
         provenance_id: None,
-        data: None,
+        data: Some(serde_json::json!({
+            "evidence_class": "reference_validated"
+        })),
     });
     app.apply_agent_msg(AgentMsg::TurnComplete);
     freeze_metrics(&mut app);
@@ -1201,7 +1206,7 @@ fn snapshot_workspace_activity_detail_100x30() {
         elapsed_ms: Some(292),
         call_id: None,
         provenance_id: None,
-        data: None,
+        data: Some(serde_json::json!({"evidence_class": "screening"})),
     });
     freeze_metrics(&mut app);
     app.focus = Focus::Workspace;

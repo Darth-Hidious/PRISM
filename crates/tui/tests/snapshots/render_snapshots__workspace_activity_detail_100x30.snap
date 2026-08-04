@@ -1,5 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 1219
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
@@ -8,17 +9,17 @@ expression: rendered
 ❯ You  │ Activity — 2. tool                                                                 │
 ▌ sampl│                                                                                    │" •
        │{                                                                                   │ ✓
-  ✓ sam│  "content": "W0.3 Mo0.2 Ta0.3 Nb0.2",                                              │
+  ✓ [YE│  "content": "W0.3 Mo0.2 Ta0.3 Nb0.2",                                              │
        │  "elapsed_ms": 292,                                                                │
        │  "event": "tool_result",                                                           │
+       │  "evidence_class": "screening",                                                    │
        │  "role": "tool",                                                                   │
        │  "success": true,                                                                  │
-       │  "text": "sample_material: W0.3 Mo0.2 Ta0.3 Nb0.2",                                │
+       │  "text": "[YELLOW screening] sample_material: W0.3 Mo0.2 Ta0.3 Nb0.2",             │
        │  "tool_name": "sample_material"                                                    │
        │}                                                                                   │
        │                                                                                    │
        │  j/k scroll · Esc close                                                            │
-       │                                                                                    │
        │                                                                                    │
        │                                                                                    │
        │                                                                                    │

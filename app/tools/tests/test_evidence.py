@@ -1,13 +1,12 @@
 """Focused tests for evidence-class propagation in computed tool results."""
 
 import json
-import sys
-from types import ModuleType
 
 from app.tools.evidence import (
     EvidenceClass,
     EvidenceSource,
     evidence_for_result,
+    roll_up_evidence,
 )
 
 
@@ -34,6 +33,23 @@ def test_agreement_cannot_upgrade_literature_extraction() -> None:
     assert result is EvidenceClass.RESEARCH
 
 
+def test_roll_up_uses_worst_reported_property_and_indeterminate_for_missing() -> None:
+    result: dict[str, object] = {}
+    evidence_class = roll_up_evidence(
+        result,
+        [
+            {"value": 1.0, "evidence_class": "screening"},
+            {"value": 2.0, "evidence_class": "research"},
+        ],
+    )
+    assert evidence_class is EvidenceClass.RESEARCH
+    assert result == {"evidence_class": "research", "evidence_color": "orange"}
+
+    missing: dict[str, object] = {}
+    assert roll_up_evidence(missing, [{"value": 3.0}]) is EvidenceClass.INDETERMINATE
+    assert missing["evidence_class"] == "indeterminate"
+
+
 def test_evaluator_result_inherits_orange_boundary_condition() -> None:
     from app.tools.evaluation import evaluate_candidate
 
@@ -49,20 +65,13 @@ def test_evaluator_result_inherits_orange_boundary_condition() -> None:
     assert result["evidence_class"] == "research"
 
 
-def test_polymer_computation_inherits_literature_input(monkeypatch) -> None:
-    rdkit = ModuleType("rdkit")
-    rdkit.__version__ = "fake-test"
-    rdkit.Chem = ModuleType("rdkit.Chem")
-    rdkit.Chem.MolFromSmiles = lambda value: object()
-    monkeypatch.setitem(sys.modules, "rdkit", rdkit)
-    monkeypatch.setitem(sys.modules, "rdkit.Chem", rdkit.Chem)
-
+def test_polymer_computation_inherits_literature_input() -> None:
     from app.tools.materials.polymer.tools import evaluate_polymer_insulation
 
     candidate = json.dumps(
         {
-            "representation": "repeat_unit",
-            "repeat_unit": "polystyrene",
+            "representation": "smiles",
+            "smiles": "CC",
             "evidence_class": "research",
             "fox_flory": {
                 "number_average_molar_mass_g_per_mol": 50000.0,
@@ -78,3 +87,5 @@ def test_polymer_computation_inherits_literature_input(monkeypatch) -> None:
     assert tg["unit"] == "QUDT:K"
     assert tg["evidence_class"] == "research"
     assert result["evidence_class"] == "research"
+    assert result["evidence_color"] == "orange"
+    assert result["rdkit_version"] == "2026.03.5"

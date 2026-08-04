@@ -449,6 +449,10 @@ impl FakeBackend {
                         "card_type": "results",
                         "elapsed_ms": 292,
                         "provenance_id": "prov_001",
+                        "data": {
+                            "evidence_class": "screening",
+                            "evidence_color": "yellow"
+                        },
                     }),
                 );
                 self.notify("ui.turn.complete", serde_json::json!({}));

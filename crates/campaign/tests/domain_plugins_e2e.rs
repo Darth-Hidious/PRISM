@@ -9,7 +9,7 @@ use axum::response::Json;
 use axum::routing::post;
 use serde_json::{Value, json};
 
-use prism_campaign::{Campaign, CampaignConfig, CampaignGoal, DomainKind};
+use prism_campaign::{Campaign, CampaignConfig, CampaignGoal, DomainKind, EvidenceClass};
 
 const FOX_FLORY_CITATION: &str = "T. G. Fox and P. J. Flory, Journal of Applied Physics 21 (1950) 581-591, DOI 10.1063/1.1699711";
 
@@ -79,7 +79,9 @@ async fn evaluate_alloy(headers: HeaderMap, Json(body): Json<Value>) -> (StatusC
                 "Tm_estimate_K": 3200.0,
                 "delta_S_mix_J_per_molK": 8.314 * 4.0_f64.ln(),
                 "fractions": [0.25, 0.25, 0.25, 0.25],
-                "method": "deterministic test boundary for existing alloy path"
+                "method": "deterministic test boundary for existing alloy path",
+                "evidence_class": "screening",
+                "evidence_color": "yellow"
             }}
         })),
     )
@@ -117,7 +119,9 @@ async fn evaluate_polymer(
                         "unit": "K",
                         "method": "Fox-Flory molecular-weight relation: Tg = Tg_infinity - K/Mn",
                         "citation": FOX_FLORY_CITATION,
-                        "parameter_citation": parameters["parameter_citation"]
+                        "parameter_citation": parameters["parameter_citation"],
+                        "evidence_class": "screening",
+                        "evidence_color": "yellow"
                     },
                     "dielectric_constant": {
                         "status": "unavailable",
@@ -131,7 +135,9 @@ async fn evaluate_polymer(
                         "status": "unavailable",
                         "reason": "No citable thermal-conductivity method is implemented for this candidate representation; morphology and measurement evidence are required."
                     }
-                }
+                },
+                "evidence_class": "screening",
+                "evidence_color": "yellow"
             }}
         })),
     )
@@ -198,9 +204,25 @@ async fn nbmotaw_alloy_campaign_transcript_is_unchanged() {
     println!("--- NbMoTaW alloy campaign ---\n{}", result.summary);
     assert_eq!(result.winners[0].composition, "Nb0.25 Mo0.25 Ta0.25 W0.25");
     assert_eq!(result.winners[0].reward, 3200.0);
+    assert_eq!(result.winners[0].evidence_class, EvidenceClass::Screening);
+    assert_eq!(result.evidence_class, EvidenceClass::Screening);
+    assert!(
+        result.summary.contains("[YELLOW screening]"),
+        "{}",
+        result.summary
+    );
     assert_eq!(
         result.winners[0].properties["hea_definition"]["name"],
         "permissive_rhea"
+    );
+
+    let checkpoint = checkpoint_dir.path().join("domain-e2e-nbmotaw.json");
+    let checkpoint_value: Value =
+        serde_json::from_str(&std::fs::read_to_string(&checkpoint).unwrap()).unwrap();
+    assert_eq!(checkpoint_value["evidence_class"], "screening");
+    assert_eq!(
+        checkpoint_value["candidates"][0]["evidence_class"],
+        "screening"
     );
 }
 
@@ -277,6 +299,13 @@ async fn polymer_campaign_computes_only_cited_tg_and_reports_other_targets_unava
         serde_json::to_string_pretty(&properties["property_status"]).unwrap()
     );
     assert_eq!(properties["glass_transition_temperature_k"], 448.0);
+    assert_eq!(result.winners[0].evidence_class, EvidenceClass::Screening);
+    assert_eq!(result.evidence_class, EvidenceClass::Screening);
+    assert!(
+        result.summary.contains("[YELLOW screening]"),
+        "{}",
+        result.summary
+    );
     assert_eq!(
         properties["property_status"]["glass_transition_temperature_k"]["citation"],
         FOX_FLORY_CITATION
@@ -299,10 +328,31 @@ async fn polymer_campaign_computes_only_cited_tg_and_reports_other_targets_unava
     }
 
     let checkpoint = checkpoint_dir.path().join("domain-e2e-polymer.json");
+    let mut legacy_checkpoint: Value =
+        serde_json::from_str(&std::fs::read_to_string(&checkpoint).unwrap()).unwrap();
+    legacy_checkpoint
+        .as_object_mut()
+        .unwrap()
+        .remove("evidence_class");
+    legacy_checkpoint["candidates"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("evidence_class");
+    std::fs::write(
+        &checkpoint,
+        serde_json::to_vec_pretty(&legacy_checkpoint).unwrap(),
+    )
+    .unwrap();
+
     let restored = Campaign::from_checkpoint(&checkpoint).unwrap();
     assert_eq!(restored.state().config.domain, DomainKind::Polymer);
+    assert_eq!(restored.state().evidence_class, EvidenceClass::Screening);
     assert_eq!(
         restored.state().candidates[0].properties["glass_transition_temperature_k"],
         448.0
+    );
+    assert_eq!(
+        restored.state().candidates[0].evidence_class,
+        EvidenceClass::Screening
     );
 }

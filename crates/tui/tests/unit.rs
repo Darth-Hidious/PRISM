@@ -388,7 +388,7 @@ fn tool_start_pushes_tool_message() {
 }
 
 #[test]
-fn tool_card_success_pushes_result() {
+fn tool_card_success_pushes_result_with_text_evidence_token() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
         tool_name: "evaluate_material".into(),
@@ -397,13 +397,32 @@ fn tool_card_success_pushes_result() {
         elapsed_ms: Some(150),
         call_id: None,
         provenance_id: None,
-        data: None,
+        data: Some(json!({"evidence_class": "screening"})),
     });
     let last = app.messages.last().unwrap();
     assert!(matches!(
         last.kind,
         LineKind::ToolResult { success: true, .. }
     ));
+    assert!(last.text.contains("[YELLOW screening]"), "{}", last.text);
+}
+
+#[test]
+fn tool_card_missing_or_unknown_evidence_is_indeterminate() {
+    for data in [None, Some(json!({"evidence_class": "unrecognized"}))] {
+        let mut app = test_app();
+        app.apply_agent_msg(AgentMsg::ToolCard {
+            tool_name: "evaluate_material".into(),
+            content: "reward=0.75".into(),
+            card_type: "results".into(),
+            elapsed_ms: Some(10),
+            call_id: None,
+            provenance_id: None,
+            data,
+        });
+        let last = app.messages.last().unwrap();
+        assert!(last.text.contains("[RED indeterminate]"), "{}", last.text);
+    }
 }
 
 #[test]
@@ -1539,7 +1558,7 @@ fn tool_start_humanized_verb_is_shown_verbatim() {
 }
 
 #[test]
-fn tool_card_result_still_pushes_same_visible_behavior() {
+fn tool_card_result_without_class_is_visibly_indeterminate() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
         tool_name: "evaluate_material".into(),
@@ -1555,8 +1574,10 @@ fn tool_card_result_still_pushes_same_visible_behavior() {
         last.kind,
         LineKind::ToolResult { success: true, .. }
     ));
-    // Visible text is still "evaluate_material: density=7.8"
-    assert_eq!(last.text, "evaluate_material: density=7.8");
+    assert_eq!(
+        last.text,
+        "[RED indeterminate] evaluate_material: density=7.8"
+    );
 }
 
 #[test]
@@ -1759,7 +1780,10 @@ fn tool_card_content_with_ansi_stores_sanitized_text() {
         data: None,
     });
     let last = app.messages.last().unwrap();
-    assert_eq!(last.text, "evaluate_material: density=7.8");
+    assert_eq!(
+        last.text,
+        "[RED indeterminate] evaluate_material: density=7.8"
+    );
     assert_no_terminal_controls(&last.text);
 }
 
@@ -1776,7 +1800,7 @@ fn tool_card_error_with_ansi_stores_sanitized_text() {
         data: None,
     });
     let last = app.messages.last().unwrap();
-    assert_eq!(last.text, "bash: exit 1");
+    assert_eq!(last.text, "[RED indeterminate] bash: exit 1");
     assert_no_terminal_controls(&last.text);
 }
 

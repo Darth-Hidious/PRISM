@@ -4,13 +4,14 @@
 //! `app.theme()`), never hardcoded — so the whole UI recolors uniformly
 //! when the theme changes.
 
-use crate::app::{App, Focus, LineKind, Modal, Role, WorkspaceTab, first_line};
+use crate::app::{App, Focus, LineKind, Modal, Role, WorkspaceTab, evidence_token, first_line};
 use crate::command;
 use crate::gh;
 use crate::keymap;
 use crate::markdown;
 use crate::theme::Theme;
 use crate::toast::ToastKind;
+use prism_provenance::EvidenceClass;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -259,13 +260,36 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     LineKind::ToolResult { .. } => ("✓", t.ok, Style::default().fg(t.dim)),
                     _ => ("⚙", t.warn, Style::default().fg(t.dim)),
                 };
+                let evidence_class = match kind {
+                    LineKind::ToolResult { evidence_class, .. } => Some(*evidence_class),
+                    LineKind::Error(_) => Some(EvidenceClass::Indeterminate),
+                    _ => None,
+                };
                 for (i, line_text) in msg.text.lines().enumerate() {
                     if i == 0 {
-                        lines.push(Line::from(vec![
+                        let mut spans = vec![
                             Span::raw("  "),
                             Span::styled(format!("{glyph} "), Style::default().fg(gcolor)),
-                            Span::styled(line_text.to_string(), style),
-                        ]));
+                        ];
+                        if let Some(evidence_class) = evidence_class {
+                            let token = evidence_token(evidence_class);
+                            spans.push(Span::styled(
+                                token.clone(),
+                                Style::default()
+                                    .fg(evidence_color(evidence_class, t))
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                            spans.push(Span::styled(
+                                line_text
+                                    .strip_prefix(&token)
+                                    .unwrap_or(line_text)
+                                    .to_string(),
+                                style,
+                            ));
+                        } else {
+                            spans.push(Span::styled(line_text.to_string(), style));
+                        }
+                        lines.push(Line::from(spans));
                     } else {
                         lines.push(Line::from(vec![
                             Span::raw("    "),
@@ -544,6 +568,7 @@ struct ToolEntry {
     status: ToolStatus,
     elapsed_ms: Option<u64>,
     finding: Option<String>,
+    evidence_class: EvidenceClass,
 }
 
 fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
@@ -623,6 +648,15 @@ fn status_glyph(status: ToolStatus, t: Theme) -> (&'static str, Color) {
     }
 }
 
+fn evidence_color(evidence_class: EvidenceClass, t: Theme) -> Color {
+    match evidence_class {
+        EvidenceClass::ReferenceValidated => t.ok,
+        EvidenceClass::Screening => t.warn,
+        EvidenceClass::Research => t.accent,
+        EvidenceClass::Indeterminate => t.err,
+    }
+}
+
 /// Human-friendly model label for the header — drops any path prefix and the
 /// `.gguf` extension so the header reads e.g. `PRISM · gemma-4-12B-it-…`.
 fn clean_model_name(model: &str) -> String {
@@ -680,6 +714,7 @@ fn derive_tools(app: &App) -> Vec<ToolEntry> {
                     status: ToolStatus::Running,
                     elapsed_ms: None,
                     finding: None,
+                    evidence_class: EvidenceClass::Indeterminate,
                 });
             }
             LineKind::ToolResult {
@@ -687,6 +722,7 @@ fn derive_tools(app: &App) -> Vec<ToolEntry> {
                 content,
                 elapsed_ms,
                 success,
+                evidence_class,
             } => {
                 let status = if *success {
                     ToolStatus::Ok
@@ -701,12 +737,14 @@ fn derive_tools(app: &App) -> Vec<ToolEntry> {
                     e.status = status;
                     e.elapsed_ms = Some(*elapsed_ms);
                     e.finding = Some(first_line(content));
+                    e.evidence_class = *evidence_class;
                 } else {
                     out.push(ToolEntry {
                         name: tool_name.clone(),
                         status,
                         elapsed_ms: Some(*elapsed_ms),
                         finding: Some(first_line(content)),
+                        evidence_class: *evidence_class,
                     });
                 }
             }
@@ -771,6 +809,13 @@ fn build_tools_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usi
             Span::styled(format!("{glyph} "), Style::default().fg(gcolor)),
             Span::styled(x.name.clone(), Style::default().fg(t.text)),
         ];
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            evidence_token(x.evidence_class),
+            Style::default()
+                .fg(evidence_color(x.evidence_class, t))
+                .add_modifier(Modifier::BOLD),
+        ));
         if let Some(ms) = x.elapsed_ms {
             spans.push(Span::styled(
                 format!("  {ms}ms"),

@@ -11,6 +11,7 @@ use crate::sanitize::{sanitize_code_for_preview, sanitize_for_render};
 use crate::theme;
 use crate::toast::{self, ToastKind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use prism_provenance::EvidenceClass;
 use ratatui_textarea::TextArea;
 use serde_json::Value;
 
@@ -44,6 +45,7 @@ pub enum LineKind {
         content: String,
         elapsed_ms: u64,
         success: bool,
+        evidence_class: EvidenceClass,
     },
     Approval {
         tool_name: String,
@@ -312,6 +314,56 @@ pub(crate) fn extract_path(content: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn evidence_class_from_str(value: &str) -> EvidenceClass {
+    match value {
+        "reference_validated" => EvidenceClass::ReferenceValidated,
+        "screening" => EvidenceClass::Screening,
+        "research" => EvidenceClass::Research,
+        _ => EvidenceClass::Indeterminate,
+    }
+}
+
+fn evidence_class_from_value(value: &Value) -> Option<EvidenceClass> {
+    let object = value.as_object()?;
+    for key in ["evidence_class", "claim_status"] {
+        if let Some(value) = object.get(key) {
+            return Some(
+                value
+                    .as_str()
+                    .map(evidence_class_from_str)
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    // Unwrap only known transport envelopes. Do not infer a class from an
+    // arbitrary nested candidate when the result-level class is absent.
+    for key in ["result", "data", "properties", "parsed_stdout"] {
+        if let Some(class) = object.get(key).and_then(evidence_class_from_value) {
+            return Some(class);
+        }
+    }
+    None
+}
+
+fn tool_result_evidence(data: Option<&Value>, content: &str) -> EvidenceClass {
+    data.and_then(evidence_class_from_value)
+        .or_else(|| {
+            serde_json::from_str::<Value>(content)
+                .ok()
+                .as_ref()
+                .and_then(evidence_class_from_value)
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn evidence_token(evidence_class: EvidenceClass) -> String {
+    format!(
+        "[{} {}]",
+        evidence_class.color().to_ascii_uppercase(),
+        evidence_class.as_str()
+    )
 }
 
 /// Link picker (`o` in chat focus) — collects http(s) URLs from the
@@ -3415,30 +3467,39 @@ impl App {
                 content,
                 card_type,
                 elapsed_ms,
+                data,
                 ..
             } => {
-                // `..` ignores call_id, provenance_id, data —
-                // current behavior only pushes a result/error line.
-                // Sanitize tool_name and content before storing.
+                // Every result card receives an explicit class token. The
+                // backend may supply either PRISM evidence_class or RHEA-JAX
+                // claim_status; missing, unknown, and failed results are RED.
+                let success = card_type != "error";
+                let evidence_class = if success {
+                    tool_result_evidence(data.as_ref(), &content)
+                } else {
+                    EvidenceClass::Indeterminate
+                };
+                let token = evidence_token(evidence_class);
                 let clean_name = sanitize_for_render(&tool_name);
                 let clean_content = sanitize_for_render(&content);
-                let success = card_type != "error";
                 let elapsed = elapsed_ms.unwrap_or(0);
+                let text = format!("{token} {clean_name}: {clean_content}");
                 if !success {
                     self.push_message(ChatLine {
                         role: Role::Tool,
-                        text: format!("{}: {}", clean_name, clean_content),
-                        kind: LineKind::Error(format!("{}: {}", clean_name, clean_content)),
+                        text: text.clone(),
+                        kind: LineKind::Error(text),
                     });
                 } else {
                     self.push_message(ChatLine {
                         role: Role::Tool,
-                        text: format!("{}: {}", clean_name, clean_content),
+                        text,
                         kind: LineKind::ToolResult {
                             tool_name: clean_name,
                             content: clean_content,
                             elapsed_ms: elapsed,
                             success,
+                            evidence_class,
                         },
                     });
                 }
@@ -3828,12 +3889,14 @@ fn chatline_detail_json(m: &ChatLine) -> Value {
             content,
             elapsed_ms,
             success,
+            evidence_class,
         } => {
             v["event"] = "tool_result".into();
             v["tool_name"] = tool_name.clone().into();
             v["content"] = content.clone().into();
             v["elapsed_ms"] = (*elapsed_ms).into();
             v["success"] = (*success).into();
+            v["evidence_class"] = evidence_class.as_str().into();
         }
         LineKind::Approval { tool_name, message } => {
             v["event"] = "approval".into();

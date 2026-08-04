@@ -20,7 +20,7 @@ use axum::response::Json;
 use axum::routing::post;
 use serde_json::{Value, json};
 
-use prism_campaign::{Campaign, CampaignConfig, CampaignGoal, GoalStatus};
+use prism_campaign::{Campaign, CampaignConfig, CampaignGoal, EvidenceClass, GoalStatus};
 use prism_provenance::ProvenanceStore;
 
 #[derive(Clone)]
@@ -387,6 +387,15 @@ async fn goal_executes_steps_persists_trail_and_result() {
     );
     assert!(result.summary.contains("Best:"));
     assert!(result.summary.contains("Tm_estimate_K="));
+    assert_eq!(result.evidence_class, EvidenceClass::Indeterminate);
+    assert!(
+        result
+            .state
+            .candidates
+            .iter()
+            .all(|candidate| candidate.evidence_class == EvidenceClass::Indeterminate)
+    );
+    assert!(result.summary.contains("[RED indeterminate]"));
     assert!(
         !result.provenance.is_empty(),
         "result must carry the provenance trail"
@@ -445,6 +454,14 @@ async fn goal_executes_steps_persists_trail_and_result() {
     assert_eq!(cp["status"], "completed");
     assert_eq!(cp["completed"], true);
     assert_eq!(cp["candidates"].as_array().unwrap().len(), 4);
+    assert_eq!(cp["evidence_class"], "indeterminate");
+    assert!(
+        cp["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["evidence_class"] == "indeterminate")
+    );
 }
 
 /// Honesty: when the evaluator is down, every step fails — the goal must

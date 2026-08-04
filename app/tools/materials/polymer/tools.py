@@ -39,6 +39,7 @@ from app.tools.evidence import (
     EvidenceClass,
     EvidenceSource,
     coerce_evidence_class,
+    roll_up_evidence,
     stamp_evidence,
 )
 from app.tools.materials.polymer import RDKIT_INSTALL_HINT
@@ -202,20 +203,10 @@ def evaluate_polymer_insulation(
         "candidate representation; morphology and measurement evidence are required."
     )
     result["property_status"] = status
-    computed_classes = [
-        item["evidence_class"]
-        for item in status.values()
-        if item["status"] == "computed"
+    reported_properties = [
+        item for item in status.values() if item["status"] == "computed"
     ]
-    stamp_evidence(
-        result,
-        (
-            EvidenceSource.CITED_COMPUTATION
-            if computed_classes
-            else EvidenceSource.MODEL_ASSERTION
-        ),
-        [input_evidence, *computed_classes],
-    )
+    roll_up_evidence(result, reported_properties)
     return result
 
 

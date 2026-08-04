@@ -5048,6 +5048,7 @@ dependencies = [
  "prism-client",
  "prism-frontend",
  "prism-llm",
+ "prism-provenance",
  "prism-python-bridge",
  "prism-runtime",
  "ratatui",

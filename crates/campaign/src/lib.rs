@@ -51,7 +51,11 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use prism_provenance::{ActionType, Actor, ProvenanceRecord, ProvenanceStore, new_record};
+pub use prism_provenance::EvidenceClass;
+use prism_provenance::{
+    ActionType, Actor, EvidenceSource, ProvenanceRecord, ProvenanceStore, evidence_for_result,
+    new_record,
+};
 
 mod domain;
 
@@ -85,6 +89,55 @@ fn reported_cost(value: &serde_json::Value) -> f64 {
         .find_map(|k| value.get(*k).and_then(serde_json::Value::as_f64))
         .unwrap_or(0.0)
         .max(0.0)
+}
+
+fn evidence_class_from_str(value: &str) -> EvidenceClass {
+    match value {
+        "reference_validated" => EvidenceClass::ReferenceValidated,
+        "screening" => EvidenceClass::Screening,
+        "research" => EvidenceClass::Research,
+        _ => EvidenceClass::Indeterminate,
+    }
+}
+
+fn evidence_class_from_properties(properties: &serde_json::Value) -> EvidenceClass {
+    properties
+        .get("evidence_class")
+        .and_then(serde_json::Value::as_str)
+        .map(evidence_class_from_str)
+        .unwrap_or_default()
+}
+
+fn rolled_up_evidence(classes: impl IntoIterator<Item = EvidenceClass>) -> EvidenceClass {
+    let mut classes = classes.into_iter();
+    let Some(first) = classes.next() else {
+        return EvidenceClass::Indeterminate;
+    };
+    evidence_for_result(
+        EvidenceSource::Execution,
+        std::iter::once(first).chain(classes),
+    )
+}
+
+fn deserialize_evidence_class<'de, D>(
+    deserializer: D,
+) -> std::result::Result<EvidenceClass, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(evidence_class_from_str)
+        .unwrap_or_default())
+}
+
+fn evidence_token(evidence_class: EvidenceClass) -> String {
+    format!(
+        "[{} {}]",
+        evidence_class.color().to_ascii_uppercase(),
+        evidence_class.as_str()
+    )
 }
 
 // ── Configuration ───────────────────────────────────────────────────
@@ -377,6 +430,10 @@ pub struct Candidate {
     pub properties: serde_json::Value,
     /// Scalarized reward score (higher = better).
     pub reward: f64,
+    /// Worst evidence class of the evaluator properties used for this reward.
+    /// Missing or unknown values in legacy checkpoints are indeterminate.
+    #[serde(default, deserialize_with = "deserialize_evidence_class")]
+    pub evidence_class: EvidenceClass,
     /// Which iteration produced this candidate.
     pub iteration: usize,
     /// How it was generated: "llm", "mcmc", "seed", "mutation".
@@ -479,6 +536,10 @@ pub struct CampaignState {
     /// All accepted candidates evaluated so far, ranked by reward (best first).
     /// (Materials campaigns only.)
     pub candidates: Vec<Candidate>,
+    /// Worst evidence class among ranked candidates. Persisted so checkpoint
+    /// readers never receive a reward summary without its class.
+    #[serde(default, deserialize_with = "deserialize_evidence_class")]
+    pub evidence_class: EvidenceClass,
     /// Candidates excluded by hard constraints, including invalid proposals
     /// stopped before evaluation. Persisted counts/reasons survive resume;
     /// malformed raw proposal strings are deliberately not checkpointed.
@@ -542,6 +603,7 @@ impl CampaignState {
             research_goal: None,
             research_outcomes: Vec::new(),
             candidates: Vec::new(),
+            evidence_class: EvidenceClass::Indeterminate,
             rejected_candidates: Vec::new(),
             current_iteration: 0,
             total_cost_usd: 0.0,
@@ -582,6 +644,7 @@ impl CampaignState {
             research_goal: Some(research_goal),
             research_outcomes: Vec::new(),
             candidates: Vec::new(),
+            evidence_class: EvidenceClass::Indeterminate,
             rejected_candidates: Vec::new(),
             current_iteration: 0,
             total_cost_usd: 0.0,
@@ -596,6 +659,25 @@ impl CampaignState {
             worker_pid: None,
             heartbeat_at: String::new(),
         }
+    }
+
+    fn refresh_evidence_class(&mut self) {
+        for candidate in &mut self.candidates {
+            candidate.evidence_class = evidence_class_from_properties(&candidate.properties);
+        }
+        self.evidence_class = rolled_up_evidence(
+            self.candidates
+                .iter()
+                .map(|candidate| candidate.evidence_class),
+        );
+    }
+
+    fn rolled_evidence_class(&self) -> EvidenceClass {
+        rolled_up_evidence(
+            self.candidates
+                .iter()
+                .map(|candidate| candidate.evidence_class),
+        )
     }
 
     /// The top-N candidates by reward.
@@ -720,7 +802,16 @@ impl CampaignState {
             }
         }
         s.push_str(&format!("Budget: {}\n", self.budget_status()));
-        s.push_str(&format!("Avg reward: {:.4}\n", self.avg_reward()));
+        let campaign_evidence = self.rolled_evidence_class();
+        s.push_str(&format!(
+            "Evidence class: {}\n",
+            evidence_token(campaign_evidence)
+        ));
+        s.push_str(&format!(
+            "Avg reward: {:.4} {}\n",
+            self.avg_reward(),
+            evidence_token(campaign_evidence)
+        ));
         let domain = domain_for(self.config.domain);
         let hard_constraints = configured_domain_constraints(&self.config);
         if !hard_constraints.is_empty() {
@@ -746,9 +837,10 @@ impl CampaignState {
         }
         if let Some(best) = self.best() {
             s.push_str(&format!(
-                "Best: {} (reward={:.4})\n",
+                "Best: {} (reward={:.4} {})\n",
                 display_recorded_candidate(self.config.domain, &best.composition, &best.properties),
-                best.reward
+                best.reward,
+                evidence_token(best.evidence_class)
             ));
         }
         if !winners.is_empty() {
@@ -756,10 +848,11 @@ impl CampaignState {
             for (i, c) in winners.iter().enumerate() {
                 let descriptors = domain.summarize_properties(&c.properties);
                 s.push_str(&format!(
-                    "  {}. {} — reward={:.4} (iter {}, {}){}\n",
+                    "  {}. {} — reward={:.4} {} (iter {}, {}){}\n",
                     i + 1,
                     display_recorded_candidate(self.config.domain, &c.composition, &c.properties),
                     c.reward,
+                    evidence_token(c.evidence_class),
                     c.iteration,
                     c.source,
                     descriptors
@@ -783,9 +876,10 @@ impl CampaignState {
                     rejection.display_composition().to_string()
                 };
                 s.push_str(&format!(
-                    "  - {candidate} (iter {}) — {}{}\n",
+                    "  - {candidate} (iter {}) — {} {}{}\n",
                     rejection.iteration,
                     rejection.reasons.join("; "),
+                    evidence_token(evidence_class_from_properties(&rejection.properties)),
                     domain.summarize_properties(&rejection.properties)
                 ));
             }
@@ -867,6 +961,8 @@ pub struct CampaignResult {
     pub campaign_id: String,
     pub goal: CampaignGoal,
     pub state: CampaignState,
+    /// Worst class among the candidate rewards in this result.
+    pub evidence_class: EvidenceClass,
     /// Top candidates by reward, limited to the requested number.
     pub winners: Vec<Candidate>,
     /// Summary text for display.
@@ -1140,6 +1236,10 @@ impl Campaign {
             .with_context(|| format!("failed to read campaign checkpoint: {}", path.display()))?;
         let mut state: CampaignState = serde_json::from_str(&text)
             .context("failed to parse campaign checkpoint (version mismatch?)")?;
+        // Legacy checkpoints did not persist campaign/candidate roll-ups.
+        // Recompute only from the evaluator's own property class; a missing or
+        // unknown property class remains indeterminate.
+        state.refresh_evidence_class();
         // Backfill the named policy for pre-policy checkpoints without
         // weakening their stored numeric thresholds.
         state.config.apply_goal_implied_constraints(&state.goal);
@@ -1249,6 +1349,7 @@ impl Campaign {
         }
 
         // Build result (state is now Completed or Paused).
+        self.state.refresh_evidence_class();
         let winners: Vec<Candidate> = self.state.top_n(10).to_vec();
 
         let summary = self.state.summary(&winners);
@@ -1265,6 +1366,7 @@ impl Campaign {
             campaign_id: self.state.campaign_id.clone(),
             goal: self.state.goal.clone(),
             state: self.state.clone(),
+            evidence_class: self.state.evidence_class,
             winners,
             summary,
             provenance,
@@ -1596,6 +1698,7 @@ impl Campaign {
             campaign_id: self.state.campaign_id.clone(),
             goal: self.state.goal.clone(),
             state: self.state.clone(),
+            evidence_class: self.state.evidence_class,
             winners: Vec::new(),
             summary,
             provenance,
@@ -1619,6 +1722,10 @@ impl Campaign {
         let mut lines = vec![
             format!("Research campaign: {}", self.state.goal.description),
             format!("Iterations: {}", self.state.current_iteration),
+            format!(
+                "Evidence class: {}",
+                evidence_token(self.state.evidence_class)
+            ),
             format!("Status: {}", {
                 if self.state.completed {
                     if self.state.completion_reason == "success_criteria_met" {
@@ -1637,9 +1744,10 @@ impl Campaign {
             lines.push("Steps:".into());
             for (i, o) in outcomes.iter().enumerate() {
                 lines.push(format!(
-                    "  {}. [progress {:.0}%] {}",
+                    "  {}. [progress {:.0}% {}] {}",
                     i + 1,
                     o.progress * 100.0,
+                    evidence_token(self.state.evidence_class),
                     o.summary
                 ));
             }
@@ -1769,6 +1877,7 @@ impl Campaign {
                 .partition_point(|c| c.reward > candidate.reward);
             self.state.candidates.insert(pos, candidate);
         }
+        self.state.refresh_evidence_class();
 
         self.state.current_iteration = iter + 1;
 
@@ -1785,6 +1894,8 @@ impl Campaign {
                 "evaluation_failures": evaluation_failures,
                 "total_evaluated": self.state.total_evaluated(),
                 "best_reward": self.state.best().map(|c| c.reward),
+                "best_evidence_class": self.state.best().map(|c| c.evidence_class),
+                "evidence_class": self.state.evidence_class,
                 "best": self.state.best().map(|c| c.composition.clone()),
             }),
         )
@@ -1796,6 +1907,7 @@ impl Campaign {
                 iteration = iter,
                 evaluated = self.state.total_evaluated(),
                 best_reward = best.reward,
+                evidence_class = best.evidence_class.as_str(),
                 best = %best.composition,
                 "iteration complete"
             );
@@ -2004,7 +2116,12 @@ impl Campaign {
                 ));
             }
             for c in self.state.top_n(5) {
-                prompt.push_str(&format!("  {} → {:.4}\n", c.composition, c.reward));
+                prompt.push_str(&format!(
+                    "  {} → {:.4} {}\n",
+                    c.composition,
+                    c.reward,
+                    evidence_token(c.evidence_class)
+                ));
             }
             prompt.push_str(&domain.improvement_prompt(batch));
         } else {
@@ -2153,6 +2270,7 @@ impl Campaign {
 
         Ok(CandidateEvaluation::Accepted(Candidate {
             composition: parsed.canonical,
+            evidence_class: evidence_class_from_properties(&resp_body),
             properties: resp_body,
             reward,
             iteration,
@@ -2214,6 +2332,7 @@ impl Campaign {
     /// file that `from_checkpoint` could not parse: the goal, its budget and
     /// all its accumulated work, gone. A rename either happens or does not.
     pub fn checkpoint(&mut self) -> Result<()> {
+        self.state.refresh_evidence_class();
         validate_checkpoint_compositions(&self.state)?;
         let now = Utc::now().to_rfc3339();
         self.state.last_checkpoint_at.clone_from(&now);
@@ -2306,6 +2425,7 @@ fn candidate_event_data(
     let mut event = serde_json::json!({
         "iteration": iteration,
         "properties": properties,
+        "evidence_class": evidence_class_from_properties(properties),
     });
     let object = event
         .as_object_mut()
@@ -2859,6 +2979,7 @@ mod tests {
             composition: "W0.6 Mo0.2 Ta0.4 Nb0.4 V0.4".into(),
             properties: json!({"Tm_estimate_K": 3042.7}),
             reward: 3042.7,
+            evidence_class: EvidenceClass::Indeterminate,
             iteration: 0,
             source: "llm".into(),
         });
@@ -3039,6 +3160,7 @@ mod tests {
             composition: "A".into(),
             properties: json!({}),
             reward: 0.3,
+            evidence_class: EvidenceClass::Indeterminate,
             iteration: 0,
             source: "llm".into(),
         });
@@ -3046,6 +3168,7 @@ mod tests {
             composition: "B".into(),
             properties: json!({}),
             reward: 0.9,
+            evidence_class: EvidenceClass::Indeterminate,
             iteration: 1,
             source: "llm".into(),
         });
@@ -3053,6 +3176,7 @@ mod tests {
             composition: "C".into(),
             properties: json!({}),
             reward: 0.5,
+            evidence_class: EvidenceClass::Indeterminate,
             iteration: 2,
             source: "llm".into(),
         });
@@ -3079,6 +3203,7 @@ mod tests {
             composition: "A".into(),
             properties: json!({}),
             reward: 0.4,
+            evidence_class: EvidenceClass::Indeterminate,
             iteration: 0,
             source: "llm".into(),
         });
@@ -3086,6 +3211,7 @@ mod tests {
             composition: "B".into(),
             properties: json!({}),
             reward: 0.8,
+            evidence_class: EvidenceClass::Indeterminate,
             iteration: 1,
             source: "llm".into(),
         });
@@ -3315,6 +3441,7 @@ mod tests {
             composition: "Ti0.8 Al0.2".into(),
             properties: json!({}),
             reward: 0.85,
+            evidence_class: EvidenceClass::Indeterminate,
             iteration: 2,
             source: "llm".into(),
         });
@@ -3343,6 +3470,7 @@ mod tests {
             composition: "Ti0.8 Al0.2".into(),
             properties: json!({}),
             reward: 0.9,
+            evidence_class: EvidenceClass::Indeterminate,
             iteration: 45,
             source: "llm".into(),
         });
@@ -3375,6 +3503,7 @@ mod tests {
             composition: "Ti0.8 Al0.2".into(),
             properties: json!({"density": 4.0}),
             reward: 0.8,
+            evidence_class: EvidenceClass::Indeterminate,
             iteration: 0,
             source: "seed".into(),
         });
@@ -3446,6 +3575,7 @@ mod tests {
             composition: "Ti0.9 Al0.1".into(),
             properties: json!({"density": 4.0}),
             reward: 0.7,
+            evidence_class: EvidenceClass::Indeterminate,
             iteration: 3,
             source: "llm".into(),
         });

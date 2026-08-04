@@ -59,6 +59,7 @@ from app.tools.evidence import (
     EvidenceClass,
     EvidenceSource,
     coerce_evidence_class,
+    roll_up_evidence,
     stamp_evidence,
 )
 
@@ -931,14 +932,12 @@ def evaluate_candidate(candidate: dict, tier: int = 0) -> dict:
         None if blocked_reason is None or highest_completed == tier
         else {"tier": highest_completed + 1, "reason": blocked_reason}
     )
-    tier_classes = [
-        block["evidence_class"] for block in result["tiers"].values()
+    reported_properties = [
+        block["properties"]
+        for block in result["tiers"].values()
+        if isinstance(block.get("properties"), dict) and block["properties"]
     ]
-    stamp_evidence(
-        result,
-        EvidenceSource.CITED_COMPUTATION,
-        [input_evidence, *tier_classes],
-    )
+    roll_up_evidence(result, reported_properties)
     return result
 
 
@@ -984,11 +983,7 @@ def escalate_candidates(candidates: list[dict], max_tier: int = MAX_TIER) -> dic
         "results": results,
         "summary": summary,
     }
-    stamp_evidence(
-        output,
-        EvidenceSource.CITED_COMPUTATION,
-        [result["evidence_class"] for result in results],
-    )
+    roll_up_evidence(output, results)
     return output
 
 
@@ -1080,7 +1075,7 @@ def _evaluate_candidate_tool(**kwargs: Any) -> dict:
 
 def _tier_status_tool(**kwargs: Any) -> dict:
     result = {"tiers": tier_status()}
-    stamp_evidence(result, EvidenceSource.EXECUTION)
+    roll_up_evidence(result, result["tiers"].values())
     return result
 
 

@@ -1,5 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 374
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
@@ -9,8 +10,8 @@ expression: rendered
 ▌ submit job                                                       │  1. prompt "submit job" •
                                                                    │
   ⚙ Running compute_submit                                         │
-  ✗ compute_submit: Error: budget exceeded ($50.00 limit)          │
-                                                                   │
+  ✗ [RED indeterminate] compute_submit: Error: budget exceeded     │
+($50.00 limit)                                                     │
                                                                    │
                                                                    │
                                                                    │

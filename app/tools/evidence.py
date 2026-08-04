@@ -15,6 +15,7 @@ GREEN evidence.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Iterable, MutableMapping
 
@@ -59,15 +60,14 @@ _SOURCE_CEILING = {
 }
 
 
-def coerce_evidence_class(value: EvidenceClass | str) -> EvidenceClass:
-    """Parse the stable RHEA-aligned value; reject unknown fifth vocabularies."""
+def coerce_evidence_class(value: EvidenceClass | str | None) -> EvidenceClass:
+    """Parse the stable RHEA-aligned value; unknown or missing means RED."""
     if isinstance(value, EvidenceClass):
         return value
     try:
         return EvidenceClass(value)
-    except (TypeError, ValueError) as exc:
-        allowed = ", ".join(item.value for item in EvidenceClass)
-        raise ValueError(f"evidence_class must be one of: {allowed}") from exc
+    except (TypeError, ValueError):
+        return EvidenceClass.INDETERMINATE
 
 
 def evidence_for_result(
@@ -99,3 +99,22 @@ def stamp_evidence(
     result["evidence_class"] = evidence_class.value
     result["evidence_color"] = evidence_class.color
     return evidence_class
+
+
+def roll_up_evidence(
+    result: MutableMapping[str, object],
+    reported_properties: Iterable[Mapping[str, object]],
+) -> EvidenceClass:
+    """Stamp the worst class across properties that actually report a value.
+
+    Callers select the property blocks that produced values; this function is
+    the single roll-up policy. A reported block with no recognized class is
+    indeterminate. An empty result is also indeterminate, never GREEN.
+    """
+    classes = [
+        coerce_evidence_class(property_result.get("evidence_class"))
+        for property_result in reported_properties
+    ]
+    if not classes:
+        return stamp_evidence(result, EvidenceSource.MODEL_ASSERTION)
+    return stamp_evidence(result, EvidenceSource.EXECUTION, classes)
