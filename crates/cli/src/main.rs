@@ -10186,6 +10186,18 @@ async fn handle_federated_query(
 
 // ── prism run ─────────────────────────────────────────────────────────
 
+fn validate_run_backend_target(
+    backend: &str,
+    ssh: Option<&str>,
+    k8s_context: Option<&str>,
+    slurm: Option<&str>,
+) -> Result<()> {
+    if backend == "byoc" && ssh.is_none() && k8s_context.is_none() && slurm.is_none() {
+        anyhow::bail!("--backend byoc requires a target flag: --ssh, --k8s-context, or --slurm");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_run(
     name: &str,
@@ -10215,6 +10227,8 @@ async fn handle_run(
     use prism_compute::ExperimentPlan;
     use prism_compute::backend::ComputeRouter;
     use prism_compute::byoc::{ByocTarget, SlurmJobConfig};
+
+    validate_run_backend_target(backend, ssh, k8s_context, slurm)?;
 
     // Parse key=value inputs into JSON
     let mut input_map = serde_json::Map::new();
@@ -11631,6 +11645,16 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected Research command"),
+        }
+    }
+
+    #[test]
+    fn byoc_backend_without_target_is_rejected() {
+        let error = validate_run_backend_target("byoc", None, None, None).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("--backend byoc"), "{message}");
+        for flag in ["--ssh", "--k8s-context", "--slurm"] {
+            assert!(message.contains(flag), "missing {flag} in: {message}");
         }
     }
 
