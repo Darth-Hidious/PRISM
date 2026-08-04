@@ -13,6 +13,7 @@ jobs:
   package-native:
     name: Package Native (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -120,6 +121,7 @@ jobs:
   python-wheel:
     name: Package Python wheel
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -143,6 +145,43 @@ jobs:
           files: |
             dist/*.whl
 
+  # Aggregate SHA256 hashes of every published asset into SHA256SUMS and
+  # attach it to the release. install.sh verifies downloads against it.
+  # Runs only when every builder succeeded, so a published SHA256SUMS always
+  # covers the complete asset set (v1.0.0 predates this job; install.sh
+  # degrades to a warning for releases that have no SHA256SUMS).
+  checksums:
+    name: Generate SHA256SUMS
+    needs: [package-native, python-wheel]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd assets
+          for f in *; do
+            sha256sum "$f"
+          done > ../SHA256SUMS
+          cat ../SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: SHA256SUMS
+          overwrite: true
+
+      - name: Publish SHA256SUMS to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SHA256SUMS
+
   # A release is all-or-nothing. `fail-fast: false` plus a per-job
   # `softprops/action-gh-release` means each platform publishes independently,
   # so when one job fails the tag still gets a release — just missing that
@@ -151,27 +190,33 @@ jobs:
   # Intel Macs: every such user got a 404 from the documented one-liner, and
   # nothing anywhere went red.
   #
-  # This job fails the workflow when an expected asset is absent, so an
-  # incomplete release is loud instead of silent.
+  # This job audits the ACTUAL release contents and fails when an expected
+  # asset is absent. `if: always()` is load-bearing: with plain `needs:`,
+  # a failed or skipped dependency skips this job too — exactly when the
+  # audit is most needed.
   verify-release-complete:
     name: Verify all release assets published
-    needs: [package-native, python-wheel]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [checksums]
+    if: always() && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Check every platform archive exists on the release
+      - name: Check every expected asset exists on the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # Must match the archive names install.sh computes from uname.
+          # Must match the archive names install.sh computes from uname,
+          # plus the checksum manifest and the pinned Python wheel.
           expected="prism-linux-x86_64.tar.gz
           prism-linux-aarch64.tar.gz
           prism-macos-aarch64.tar.gz
           prism-macos-x86_64.tar.gz
-          prism-windows-x86_64.zip"
+          prism-windows-x86_64.zip
+          prism_platform-${TAG#v}-py3-none-any.whl
+          SHA256SUMS"
 
           published=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
           echo "Published assets:"; echo "$published" | sed 's/^/  /'

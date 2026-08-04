@@ -35,6 +35,14 @@ else
     ARCHIVE="prism-${PLATFORM}-${ARCH}.tar.gz"
 fi
 
+# Windows on ARM: we ship no native aarch64 Windows build. Windows 11 runs
+# x86_64 binaries under emulation, so fall back to that archive instead of
+# computing prism-windows-aarch64.zip, which does not exist (404).
+if [ "$PLATFORM" = "windows" ] && [ "$ARCH" = "aarch64" ]; then
+    echo "Note: no native Windows ARM64 build; using the x86_64 build (runs under emulation)."
+    ARCHIVE="prism-windows-x86_64.zip"
+fi
+
 # --- Resolve version ---
 if [ "$VERSION" = "latest" ]; then
     echo "Fetching latest release..."
@@ -60,6 +68,54 @@ if ! curl -fSL "$URL" -o "${TMPDIR}/${ARCHIVE}"; then
     echo "Available at: https://github.com/${REPO}/releases" >&2
     exit 1
 fi
+
+# --- Verify integrity ---
+#
+# Releases publish a SHA256SUMS manifest next to the archives; verify the
+# download against it BEFORE extracting anything. Without this check a
+# tampered or corrupted download would be installed silently. v1.0.0
+# predates SHA256SUMS — for such releases we warn and continue. When the
+# manifest exists but does not cover our file, or the hash mismatches, we
+# hard-fail: the manifest is generated from the complete asset set.
+CHECKSUMS=""
+SHA_HTTP=$(curl -sSL -o "${TMPDIR}/SHA256SUMS" \
+    -w "%{http_code}" \
+    "https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS" \
+    2>/dev/null) || true
+[ -n "$SHA_HTTP" ] || SHA_HTTP=000
+if [ "$SHA_HTTP" = "200" ]; then
+    CHECKSUMS="${TMPDIR}/SHA256SUMS"
+elif [ "$SHA_HTTP" = "404" ]; then
+    echo "Warning: release ${VERSION} has no SHA256SUMS — skipping integrity verification."
+else
+    echo "Warning: could not fetch SHA256SUMS (HTTP ${SHA_HTTP}) — skipping integrity verification."
+fi
+
+verify_sha256() {
+    # Verify file $1 against CHECKSUMS. No CHECKSUMS -> no-op (warned above).
+    local file name line dir
+    file="$1"
+    name="$(basename "$file")"
+    dir="$(dirname "$file")"
+    [ -n "$CHECKSUMS" ] || return 0
+    line="$(awk -v f="$name" '$2 == f { print; exit }' "$CHECKSUMS")"
+    if [ -z "$line" ]; then
+        echo "Error: SHA256SUMS has no entry for ${name} — aborting." >&2
+        return 1
+    fi
+    printf '%s\n' "$line" > "${dir}/.sha256check"
+    if command -v sha256sum >/dev/null 2>&1; then
+        ( cd "$dir" && sha256sum -c .sha256check )
+    elif command -v shasum >/dev/null 2>&1; then
+        ( cd "$dir" && shasum -a 256 -c .sha256check )
+    else
+        echo "Error: neither sha256sum nor shasum found — cannot verify ${name}." >&2
+        return 1
+    fi
+}
+
+echo "Verifying checksum..."
+verify_sha256 "${TMPDIR}/${ARCHIVE}"
 
 # --- Extract ---
 #
@@ -181,12 +237,24 @@ setup_python_tools() {
     fi
 
     # Install the tool platform, pinned to this release. Wheel asset first
-    # (no git required); tagged-tree sdist as fallback for older releases.
+    # (no git required), verified against SHA256SUMS when the release has
+    # one; tagged-tree sdist as fallback for older releases.
     if ! "$VENV_DIR/bin/python3" -I -c "import app" >/dev/null 2>&1; then
         echo "Installing PRISM tools (Python) — this can take a few minutes..."
         "$VENV_DIR/bin/pip" install -q --upgrade pip 2>/dev/null || true
-        WHEEL_URL="https://github.com/${REPO}/releases/download/${VERSION}/prism_platform-${VERSION#v}-py3-none-any.whl"
-        if ! "$VENV_DIR/bin/pip" install -q "prism-platform @ ${WHEEL_URL}"; then
+        WHEEL_NAME="prism_platform-${VERSION#v}-py3-none-any.whl"
+        WHEEL_URL="https://github.com/${REPO}/releases/download/${VERSION}/${WHEEL_NAME}"
+        WHEEL_OK=0
+        if curl -fsSL "$WHEEL_URL" -o "${TMPDIR}/${WHEEL_NAME}" 2>/dev/null; then
+            # A checksum failure here is a security signal, not a transient
+            # error: hard-fail instead of falling through to the sdist path.
+            verify_sha256 "${TMPDIR}/${WHEEL_NAME}" || return 1
+            if "$VENV_DIR/bin/pip" install -q "${TMPDIR}/${WHEEL_NAME}"; then
+                WHEEL_OK=1
+            fi
+        fi
+        if [ "$WHEEL_OK" -eq 0 ]; then
+            echo "  Wheel unavailable — falling back to tagged source archive."
             if ! "$VENV_DIR/bin/pip" install -q "prism-platform @ https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz"; then
                 echo "  Warning: Python tools install failed — chat works, local tools disabled."
                 echo "  Retry later:  $VENV_DIR/bin/pip install \"prism-platform @ ${WHEEL_URL}\""
