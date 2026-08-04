@@ -500,7 +500,7 @@ impl Drop for WorkerLock {
 
 /// `Ok(false)` when another process holds the lock. Any other failure is an
 /// error: we cannot prove exclusivity, and guessing risks a duplicate worker.
-fn try_lock_exclusive(file: &std::fs::File) -> Result<bool> {
+pub(crate) fn try_lock_exclusive(file: &std::fs::File) -> Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;

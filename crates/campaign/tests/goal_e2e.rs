@@ -30,6 +30,7 @@ struct Boundary {
     eval_calls: Arc<AtomicUsize>,
     auth_headers: Arc<Mutex<Vec<Option<String>>>>,
     eval_fails: bool,
+    hea_constraint_scenario: bool,
     /// USD the evaluator reports per candidate. The proposal LLM has no
     /// equivalent — `LlmClient::chat` returns `Result<String>` — which is the
     /// whole point of `ceiling_declares_the_proposal_calls_it_cannot_price`.
@@ -119,17 +120,37 @@ async fn evaluate_material(
         );
     }
     let composition = body["inputs"]["composition"].as_str().unwrap_or("");
-    // Deterministic but call-varying physics so ranking is meaningful.
-    let mut properties = json!({
-        "composition": composition,
-        "Tm_estimate_K": 3000.0 + 10.0 * n as f64,
-        "delta_S_mix_J_per_molK": 12.0 + 0.5 * n as f64,
-        "delta_H_mix_kJ_per_mol": -5.0,
-        "omega": 8.0 + 0.1 * n as f64,
-        "VEC": 5.5,
-        "delta_radius_pct": 2.1,
-        "phase_prediction": "solid_solution",
-    });
+    // Reproduce the live objective-degeneration defect: nearly pure W has a
+    // higher melting point than the valid five-principal-element candidate.
+    let mut properties = if b.hea_constraint_scenario && composition.starts_with("W0.995") {
+        json!({
+            "composition": composition,
+            "Tm_estimate_K": 3693.8,
+            "delta_S_mix_J_per_molK": 1.63,
+            "fractions": [0.995, 0.005],
+            "n_elements": 2,
+        })
+    } else if b.hea_constraint_scenario {
+        json!({
+            "composition": composition,
+            "Tm_estimate_K": 3300.0,
+            "delta_S_mix_J_per_molK": 13.38,
+            "fractions": [0.2, 0.2, 0.2, 0.2, 0.2],
+            "n_elements": 5,
+        })
+    } else {
+        // Deterministic but call-varying physics so ranking is meaningful.
+        json!({
+            "composition": composition,
+            "Tm_estimate_K": 3000.0 + 10.0 * n as f64,
+            "delta_S_mix_J_per_molK": 12.0 + 0.5 * n as f64,
+            "delta_H_mix_kJ_per_mol": -5.0,
+            "omega": 8.0 + 0.1 * n as f64,
+            "VEC": 5.5,
+            "delta_radius_pct": 2.1,
+            "phase_prediction": "solid_solution",
+        })
+    };
     if b.eval_cost_usd > 0.0 {
         properties["cost_usd"] = json!(b.eval_cost_usd);
     }
@@ -143,13 +164,18 @@ async fn evaluate_material(
 }
 
 /// Serve the two external boundaries on an ephemeral port; return the base URL.
-async fn spawn_boundary(eval_fails: bool, eval_cost_usd: f64) -> (String, Boundary) {
+async fn spawn_boundary(
+    eval_fails: bool,
+    eval_cost_usd: f64,
+    hea_constraint_scenario: bool,
+) -> (String, Boundary) {
     let boundary = Boundary {
         llm_calls: Arc::new(AtomicUsize::new(0)),
         session_calls: Arc::new(AtomicUsize::new(0)),
         eval_calls: Arc::new(AtomicUsize::new(0)),
         auth_headers: Arc::new(Mutex::new(Vec::new())),
         eval_fails,
+        hea_constraint_scenario,
         eval_cost_usd,
     };
     let app = axum::Router::new()
@@ -163,6 +189,10 @@ async fn spawn_boundary(eval_fails: bool, eval_cost_usd: f64) -> (String, Bounda
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), boundary)
+}
+
+async fn spawn_hea_constraint_boundary() -> (String, Boundary) {
+    spawn_boundary(false, 0.0, true).await
 }
 
 fn test_goal() -> CampaignGoal {
@@ -192,6 +222,48 @@ fn checkpoint_json(dir: &std::path::Path, id: &str) -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
+/// Regression for objective degeneration: a higher-melting near-pure element
+/// must not outrank an actual HEA when the goal explicitly asks for an HEA.
+#[tokio::test]
+async fn hea_goal_rejects_near_pure_melting_point_exploit() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let test_home = tempfile::tempdir().unwrap();
+    let _home = install_test_identity(test_home.path());
+    let (base, _boundary) = spawn_hea_constraint_boundary().await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let goal = CampaignGoal {
+        description: "Find a refractory HEA with maximum melting point".into(),
+        elements: ["W", "Mo", "Ta", "Nb", "V", "Re", "Hf"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        objective: "maximize melting point".into(),
+        constraints: vec![],
+        seeds: vec![
+            "W0.995 Re0.005".into(),
+            "W0.2 Mo0.2 Ta0.2 Nb0.2 V0.2".into(),
+        ],
+    };
+    let mut cfg = config(&base, tmp.path());
+    cfg.max_iterations = 1;
+    let mut campaign = Campaign::new(goal, cfg, "goal-e2e-hea-constraints".into());
+
+    let result = campaign
+        .run()
+        .await
+        .expect("campaign should find a valid HEA");
+    let winner = result.state.best().expect("valid HEA should remain");
+
+    assert_eq!(winner.composition, "W0.2 Mo0.2 Ta0.2 Nb0.2 V0.2");
+    assert!(result.summary.contains("REJECTED"), "{}", result.summary);
+    assert!(
+        result.summary.contains("delta_S_mix_J_per_molK=1.6300"),
+        "{}",
+        result.summary
+    );
+}
+
 /// Happy path: a submitted goal really executes its steps, persists every
 /// progress transition to the store, and stores a real terminal result.
 #[tokio::test]
@@ -199,7 +271,7 @@ async fn goal_executes_steps_persists_trail_and_result() {
     let _env_lock = ENV_LOCK.lock().await;
     let test_home = tempfile::tempdir().unwrap();
     let _home = install_test_identity(test_home.path());
-    let (base, boundary) = spawn_boundary(false, 0.0).await;
+    let (base, boundary) = spawn_boundary(false, 0.0, false).await;
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("provenance.db");
     let store = ProvenanceStore::open(&db).await.unwrap();
@@ -305,7 +377,7 @@ async fn goal_must_not_complete_when_steps_cannot_run() {
     let _env_lock = ENV_LOCK.lock().await;
     let test_home = tempfile::tempdir().unwrap();
     let _home = install_test_identity(test_home.path());
-    let (base, boundary) = spawn_boundary(true, 0.0).await;
+    let (base, boundary) = spawn_boundary(true, 0.0, false).await;
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("provenance.db");
     let store = ProvenanceStore::open(&db).await.unwrap();
@@ -363,7 +435,7 @@ async fn goal_pauses_at_gate_and_resumes_to_completion() {
     let _env_lock = ENV_LOCK.lock().await;
     let test_home = tempfile::tempdir().unwrap();
     let _home = install_test_identity(test_home.path());
-    let (base, boundary) = spawn_boundary(false, 0.0).await;
+    let (base, boundary) = spawn_boundary(false, 0.0, false).await;
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("provenance.db");
 
@@ -432,7 +504,7 @@ async fn ceiling_declares_the_proposal_calls_it_cannot_price() {
     let _env_lock = ENV_LOCK.lock().await;
     let test_home = tempfile::tempdir().unwrap();
     let _home = install_test_identity(test_home.path());
-    let (base, boundary) = spawn_boundary(false, 0.05).await;
+    let (base, boundary) = spawn_boundary(false, 0.05, false).await;
     let tmp = tempfile::tempdir().unwrap();
     let store = ProvenanceStore::open(&tmp.path().join("provenance.db"))
         .await

@@ -54,6 +54,29 @@ use tracing::{debug, info, warn};
 use prism_provenance::{ActionType, Actor, ProvenanceRecord, ProvenanceStore, new_record};
 
 const EVALUATION_TOOL: &str = "hea_descriptors";
+const PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION: f64 = 0.05;
+
+/// Conventional lower bound for the ideal configurational entropy of an HEA:
+/// `1.5R`, conventionally rounded to 12.47 J/(mol K).
+///
+/// Source: D. B. Miracle and O. N. Senkov, "A critical review of high entropy
+/// alloys and related concepts," Acta Materialia 122 (2017) 448-511,
+/// <https://doi.org/10.1016/j.actamat.2016.08.081>.
+pub const DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K: f64 = 12.47;
+
+/// Conventional minimum number of principal elements in an HEA. A principal
+/// element is counted at 5 at.% or above; the original compositional
+/// definition uses at least five principal elements at 5-35 at.% each.
+///
+/// Source: J.-W. Yeh et al., "Nanostructured High-Entropy Alloys with Multiple
+/// Principal Elements: Novel Alloy Design Concepts and Outcomes," Advanced
+/// Engineering Materials 6 (2004) 299-303,
+/// <https://doi.org/10.1002/adem.200300567>.
+pub const DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS: usize = 5;
+
+const HEA_DEFAULTS_SOURCE: &str = "Miracle & Senkov, Acta Materialia 122 (2017), \
+DOI 10.1016/j.actamat.2016.08.081; principal-element definition: Yeh et al., \
+Advanced Engineering Materials 6 (2004), DOI 10.1002/adem.200300567";
 
 /// Durable schedules and watchers — what wakes a paused or crashed goal back
 /// up without a human. See [`schedule`] for the design rationale.
@@ -129,6 +152,17 @@ pub struct CampaignConfig {
     /// Negative = minimize, positive = maximize.
     #[serde(default)]
     pub reward_weights: BTreeMap<String, f64>,
+    /// Optional hard minimum for measured configurational entropy, in
+    /// J/(mol K). When the goal explicitly asks for an HEA and this is None,
+    /// the campaign stores [`DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K`].
+    #[serde(default)]
+    pub min_configurational_entropy_j_per_mol_k: Option<f64>,
+    /// Optional hard minimum number of principal elements. Elements whose
+    /// evaluated atomic fraction is at least 5 at.% count as principal. When
+    /// the goal explicitly asks for an HEA and this is None, the campaign
+    /// stores [`DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS`].
+    #[serde(default)]
+    pub min_principal_elements: Option<usize>,
     /// Base URL override for the proposal LLM. None = the configured chat
     /// target, unless `$LLM_API_BASE` is explicitly set.
     #[serde(default)]
@@ -163,11 +197,58 @@ impl Default for CampaignConfig {
             llm_model: String::new(),
             llm_temperature: 0.7,
             reward_weights: BTreeMap::new(),
+            min_configurational_entropy_j_per_mol_k: None,
+            min_principal_elements: None,
             llm_base_url: None,
             project_root: None,
             node_base_url: None,
         }
     }
+}
+
+impl CampaignConfig {
+    fn apply_goal_implied_constraints(&mut self, goal: &CampaignGoal) {
+        if !goal_explicitly_requests_hea(goal) {
+            return;
+        }
+        self.min_configurational_entropy_j_per_mol_k
+            .get_or_insert(DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K);
+        self.min_principal_elements
+            .get_or_insert(DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS);
+    }
+}
+
+fn goal_explicitly_requests_hea(goal: &CampaignGoal) -> bool {
+    let text = format!(
+        "{} {} {}",
+        goal.description,
+        goal.objective,
+        goal.constraints.join(" ")
+    )
+    .to_ascii_lowercase();
+    let words = text
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+
+    words.iter().any(|word| matches!(*word, "hea" | "heas"))
+        || words.windows(3).any(|window| {
+            window[0] == "high" && window[1] == "entropy" && matches!(window[2], "alloy" | "alloys")
+        })
+}
+
+fn configured_compositional_constraints(config: &CampaignConfig) -> Vec<String> {
+    let mut constraints = Vec::new();
+    if let Some(minimum) = config.min_configurational_entropy_j_per_mol_k {
+        constraints.push(format!("delta_S_mix_J_per_molK >= {minimum:.4} J/(mol K)"));
+    }
+    if let Some(minimum) = config.min_principal_elements {
+        constraints.push(format!(
+            "principal elements >= {minimum} (each >= {:.0} at.%)",
+            PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION * 100.0
+        ));
+    }
+    constraints
 }
 
 // ── Campaign State ──────────────────────────────────────────────────
@@ -189,6 +270,13 @@ pub enum GoalStatus {
     /// Terminal success — the loop finished AND at least one candidate was
     /// really evaluated. A goal can never be `Completed` otherwise.
     Completed,
+    /// The checkpoint said `running`, but its recorded worker pid is no
+    /// longer alive and no worker holds the campaign lock. This observation
+    /// is substantiated locally and is resumable.
+    Interrupted,
+    /// The checkpoint said `running`, but it predates liveness metadata or
+    /// liveness could not be verified. Resumable, but not mislabeled crashed.
+    Stale,
     /// Terminal failure — a step could not run (LLM/evaluator unreachable)
     /// or the loop ended without a single evaluated candidate. Retryable
     /// with `campaign continue` once the cause is fixed.
@@ -202,6 +290,8 @@ impl GoalStatus {
             Self::Running => "running",
             Self::Paused => "paused",
             Self::Completed => "completed",
+            Self::Interrupted => "interrupted",
+            Self::Stale => "stale",
             Self::Failed => "failed",
         }
     }
@@ -308,6 +398,22 @@ pub struct Candidate {
     pub source: String,
 }
 
+/// A candidate evaluated by the real descriptor tool but excluded from the
+/// ranking because it violated one or more configured hard constraints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstraintRejection {
+    pub composition: String,
+    pub properties: serde_json::Value,
+    pub iteration: usize,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug)]
+enum CandidateEvaluation {
+    Accepted(Candidate),
+    Rejected(ConstraintRejection),
+}
+
 /// Mutable state of a running campaign — checkpointed to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignState {
@@ -331,9 +437,13 @@ pub struct CampaignState {
     /// The materials analogue is `candidates`.
     #[serde(default)]
     pub research_outcomes: Vec<ResearchIterationOutcome>,
-    /// All candidates evaluated so far, ranked by reward (best first).
+    /// All accepted candidates evaluated so far, ranked by reward (best first).
     /// (Materials campaigns only.)
     pub candidates: Vec<Candidate>,
+    /// Evaluated candidates excluded by hard constraints. Persisted so a
+    /// rejection is visible in summaries and survives interruption/resume.
+    #[serde(default)]
+    pub rejected_candidates: Vec<ConstraintRejection>,
     /// Current iteration number (0-based).
     pub current_iteration: usize,
     /// Cumulative compute cost in USD, as reported by the steps that billed.
@@ -363,7 +473,8 @@ pub struct CampaignState {
     /// same gate forever.
     #[serde(default)]
     pub gates_hit: Vec<usize>,
-    /// Why the campaign reached a terminal status (reason or error).
+    /// Why the campaign reached a terminal status, or the evidence behind an
+    /// observed Interrupted/Stale status.
     #[serde(default)]
     pub completion_reason: String,
     /// ISO-8601 timestamp of when the campaign started.
@@ -371,10 +482,18 @@ pub struct CampaignState {
     /// ISO-8601 timestamp of the last checkpoint.
     #[serde(default)]
     pub last_checkpoint_at: String,
+    /// Worker pid recorded when entering `running`. This is a liveness signal,
+    /// not a durable process handle; the worker lock is checked first.
+    #[serde(default)]
+    pub worker_pid: Option<u32>,
+    /// ISO-8601 timestamp of the latest checkpoint written while Running.
+    #[serde(default)]
+    pub heartbeat_at: String,
 }
 
 impl CampaignState {
-    pub fn new(campaign_id: String, goal: CampaignGoal, config: CampaignConfig) -> Self {
+    pub fn new(campaign_id: String, goal: CampaignGoal, mut config: CampaignConfig) -> Self {
+        config.apply_goal_implied_constraints(&goal);
         Self {
             campaign_id,
             goal,
@@ -383,6 +502,7 @@ impl CampaignState {
             research_goal: None,
             research_outcomes: Vec::new(),
             candidates: Vec::new(),
+            rejected_candidates: Vec::new(),
             current_iteration: 0,
             total_cost_usd: 0.0,
             uncosted_llm_calls: 0,
@@ -393,6 +513,8 @@ impl CampaignState {
             completion_reason: String::new(),
             started_at: Utc::now().to_rfc3339(),
             last_checkpoint_at: String::new(),
+            worker_pid: None,
+            heartbeat_at: String::new(),
         }
     }
 
@@ -420,6 +542,7 @@ impl CampaignState {
             research_goal: Some(research_goal),
             research_outcomes: Vec::new(),
             candidates: Vec::new(),
+            rejected_candidates: Vec::new(),
             current_iteration: 0,
             total_cost_usd: 0.0,
             uncosted_llm_calls: 0,
@@ -430,6 +553,8 @@ impl CampaignState {
             completion_reason: String::new(),
             started_at: Utc::now().to_rfc3339(),
             last_checkpoint_at: String::new(),
+            worker_pid: None,
+            heartbeat_at: String::new(),
         }
     }
 
@@ -444,8 +569,14 @@ impl CampaignState {
         self.candidates.first()
     }
 
-    /// Total number of candidates evaluated.
+    /// Total number of candidates evaluated by the descriptor tool, including
+    /// candidates subsequently rejected by a hard constraint.
     pub fn total_evaluated(&self) -> usize {
+        self.candidates.len() + self.rejected_candidates.len()
+    }
+
+    /// Number of evaluated candidates admitted to the ranking.
+    pub fn total_accepted(&self) -> usize {
         self.candidates.len()
     }
 
@@ -506,6 +637,9 @@ impl CampaignState {
             GoalStatus::Failed => self.completion_reason.clone(),
             GoalStatus::Paused => "paused (approval gate)".to_string(),
             GoalStatus::Running => "running".to_string(),
+            GoalStatus::Interrupted | GoalStatus::Stale => {
+                format!("{} ({})", self.status.as_str(), self.completion_reason)
+            }
             GoalStatus::Submitted => "submitted".to_string(),
         };
         s.push_str(&format!("Status: {status_line}\n"));
@@ -517,8 +651,25 @@ impl CampaignState {
             "Candidates evaluated: {}\n",
             self.total_evaluated()
         ));
+        if !self.rejected_candidates.is_empty() {
+            s.push_str(&format!("Candidates accepted: {}\n", self.total_accepted()));
+            s.push_str(&format!(
+                "Candidates rejected by hard constraints: {}\n",
+                self.rejected_candidates.len()
+            ));
+        }
         s.push_str(&format!("Budget: {}\n", self.budget_status()));
         s.push_str(&format!("Avg reward: {:.4}\n", self.avg_reward()));
+        let hard_constraints = configured_compositional_constraints(&self.config);
+        if !hard_constraints.is_empty() {
+            s.push_str("Hard compositional constraints:\n");
+            for constraint in &hard_constraints {
+                s.push_str(&format!("  - {constraint}\n"));
+            }
+            if goal_explicitly_requests_hea(&self.goal) {
+                s.push_str(&format!("HEA defaults source: {HEA_DEFAULTS_SOURCE}\n"));
+            }
+        }
         if let Some(best) = self.best() {
             s.push_str(&format!(
                 "Best: {} (reward={:.4})\n",
@@ -537,6 +688,18 @@ impl CampaignState {
                     c.iteration,
                     c.source,
                     descriptors
+                ));
+            }
+        }
+        if !self.rejected_candidates.is_empty() {
+            s.push_str("\nREJECTED by hard compositional constraints:\n");
+            for rejection in &self.rejected_candidates {
+                s.push_str(&format!(
+                    "  - {} (iter {}) — {}{}\n",
+                    rejection.composition,
+                    rejection.iteration,
+                    rejection.reasons.join("; "),
+                    summarize_descriptors(&rejection.properties)
                 ));
             }
         }
@@ -715,6 +878,107 @@ struct LocalNodeIdentity {
     display_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+fn process_liveness(pid: u32) -> ProcessLiveness {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return ProcessLiveness::Unknown;
+        };
+        if pid <= 0 {
+            return ProcessLiveness::Unknown;
+        }
+        // SAFETY: signal 0 performs error checking only and sends no signal.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return ProcessLiveness::Alive;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => ProcessLiveness::Dead,
+            Some(libc::EPERM) => ProcessLiveness::Alive,
+            _ => ProcessLiveness::Unknown,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        ProcessLiveness::Unknown
+    }
+}
+
+fn worker_lock_held(checkpoint_path: &std::path::Path) -> Result<bool> {
+    let path = checkpoint_path.with_extension("worker");
+    match std::fs::OpenOptions::new().write(true).open(&path) {
+        Ok(file) => schedule::try_lock_exclusive(&file).map(|available| !available),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect worker lock {}", path.display()))
+        }
+    }
+}
+
+fn last_heartbeat(state: &CampaignState) -> &str {
+    if state.heartbeat_at.is_empty() {
+        if state.last_checkpoint_at.is_empty() {
+            "unknown"
+        } else {
+            &state.last_checkpoint_at
+        }
+    } else {
+        &state.heartbeat_at
+    }
+}
+
+fn normalize_running_liveness(state: &mut CampaignState, checkpoint_path: &std::path::Path) {
+    if state.status != GoalStatus::Running {
+        return;
+    }
+
+    match worker_lock_held(checkpoint_path) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            state.status = GoalStatus::Stale;
+            state.completion_reason = format!(
+                "worker liveness could not be verified ({error}); no heartbeat since {}",
+                last_heartbeat(state)
+            );
+            return;
+        }
+    }
+
+    match state.worker_pid.map(process_liveness) {
+        Some(ProcessLiveness::Alive) => {}
+        Some(ProcessLiveness::Dead) => {
+            state.status = GoalStatus::Interrupted;
+            state.completion_reason = format!(
+                "worker pid {} is no longer alive; last heartbeat {}",
+                state.worker_pid.unwrap_or_default(),
+                last_heartbeat(state)
+            );
+        }
+        Some(ProcessLiveness::Unknown) => {
+            state.status = GoalStatus::Stale;
+            state.completion_reason = format!(
+                "worker liveness cannot be verified; no heartbeat since {}",
+                last_heartbeat(state)
+            );
+        }
+        None => {
+            state.status = GoalStatus::Stale;
+            state.completion_reason = format!(
+                "checkpoint has no worker liveness metadata; no heartbeat since {}",
+                last_heartbeat(state)
+            );
+        }
+    }
+}
+
 impl Campaign {
     /// Create a new campaign with the given goal and config.
     pub fn new(goal: CampaignGoal, config: CampaignConfig, campaign_id: String) -> Self {
@@ -769,6 +1033,7 @@ impl Campaign {
                 state.status = GoalStatus::Running;
             }
         }
+        normalize_running_liveness(&mut state, path);
         let checkpoint_path = path.to_path_buf();
         Ok(Self {
             state,
@@ -815,6 +1080,14 @@ impl Campaign {
             max_iterations = self.state.config.max_iterations,
             "campaign started"
         );
+
+        if matches!(
+            self.state.status,
+            GoalStatus::Interrupted | GoalStatus::Stale
+        ) {
+            self.state.completion_reason.clear();
+        }
+        self.state.worker_pid = Some(std::process::id());
 
         if self.state.status == GoalStatus::Submitted {
             // First run of this goal: record the durable submission before
@@ -930,7 +1203,15 @@ impl Campaign {
     /// candidate did NOT do its work — that is a failure, not a completion,
     /// no matter which cap tripped.
     async fn finish(&mut self, reason: &str) -> Result<()> {
-        if self.state.total_evaluated() == 0 {
+        if self.state.candidates.is_empty() {
+            if let Some(last) = self.state.rejected_candidates.last() {
+                bail!(
+                    "{reason} reached with zero candidates satisfying the hard compositional constraints — {} evaluated proposals were REJECTED; last rejection: {} ({})",
+                    self.state.rejected_candidates.len(),
+                    last.composition,
+                    last.reasons.join("; ")
+                );
+            }
             bail!("{reason} reached with zero candidates evaluated — steps never ran");
         }
         self.state.completion_reason = reason.to_string();
@@ -975,15 +1256,29 @@ impl Campaign {
         self.checkpoint()
     }
 
-    /// Resume a paused campaign (after human approval at a gate).
+    /// Resume a campaign stopped at an approval gate or left recoverable by
+    /// an interrupted worker. A live Running campaign is never duplicated.
     pub async fn resume(&mut self) -> Result<CampaignResult> {
-        if self.state.status != GoalStatus::Paused {
-            bail!("campaign is not paused — nothing to resume");
-        }
+        let message = match self.state.status {
+            GoalStatus::Paused => "campaign resumed from approval gate",
+            GoalStatus::Interrupted => "campaign resumed after worker interruption",
+            GoalStatus::Stale => "campaign resumed from stale checkpoint",
+            GoalStatus::Running => {
+                bail!("campaign worker is still running — refusing to start a second worker")
+            }
+            GoalStatus::Completed => bail!(
+                "campaign '{}' already completed ({}) — nothing to resume",
+                self.state.campaign_id,
+                self.state.completion_reason
+            ),
+            GoalStatus::Submitted | GoalStatus::Failed => {
+                bail!("campaign is not paused or interrupted — use `campaign continue`")
+            }
+        };
         info!(
             campaign = %self.state.campaign_id,
             iteration = self.state.current_iteration,
-            "campaign resumed from approval gate"
+            "{message}"
         );
         self.run().await
     }
@@ -1234,10 +1529,27 @@ impl Campaign {
 
         // ── 2. Evaluate each candidate ───────────────────────────────
         let mut evaluated: Vec<Candidate> = Vec::new();
+        let mut rejected = 0;
+        let mut evaluation_failures = 0;
+        let mut iteration_cost = 0.0;
         let mut last_err: Option<anyhow::Error> = None;
         for comp in &proposals {
             match self.evaluate_candidate(comp, iter).await {
-                Ok(candidate) => evaluated.push(candidate),
+                Ok(CandidateEvaluation::Accepted(candidate)) => {
+                    iteration_cost += reported_cost(&candidate.properties);
+                    evaluated.push(candidate);
+                }
+                Ok(CandidateEvaluation::Rejected(rejection)) => {
+                    iteration_cost += reported_cost(&rejection.properties);
+                    rejected += 1;
+                    warn!(
+                        campaign = %self.state.campaign_id,
+                        composition = %rejection.composition,
+                        reasons = %rejection.reasons.join("; "),
+                        "candidate REJECTED by hard compositional constraints"
+                    );
+                    self.state.rejected_candidates.push(rejection);
+                }
                 Err(e) => {
                     warn!(
                         campaign = %self.state.campaign_id,
@@ -1245,15 +1557,17 @@ impl Campaign {
                         error = %e,
                         "evaluation failed for candidate"
                     );
+                    evaluation_failures += 1;
                     last_err = Some(e);
                 }
             }
         }
 
-        // An iteration where every single evaluation failed is not
-        // progress — it is the evaluator being down. Fail the goal instead
-        // of spinning to the iteration cap and "completing" with nothing.
-        if evaluated.is_empty() && !proposals.is_empty() {
+        // An iteration where every single evaluation call failed is not
+        // progress — it is the evaluator being down. Hard-constraint
+        // rejections are measured outcomes, not evaluator failures, and are
+        // kept visible without synthesizing replacement candidates.
+        if evaluation_failures == proposals.len() && !proposals.is_empty() {
             let detail = last_err
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_else(|| "unknown error".into());
@@ -1262,16 +1576,12 @@ impl Campaign {
                 proposals.len()
             );
         }
-        let n_evaluated = evaluated.len();
+        let n_accepted = evaluated.len();
 
-        // Accrue whatever the evaluator actually reported spending. Read, do
-        // not estimate: a made-up price would make the ceiling a fiction.
-        //
-        // This is the EVALUATOR's spend only. Step 1 above also billed a
-        // completion call whose price nothing reports; that one is counted in
-        // `state.uncosted_llm_calls` and disclosed by `budget_status` rather
-        // than folded in here at an invented rate.
-        let iteration_cost: f64 = evaluated.iter().map(|c| reported_cost(&c.properties)).sum();
+        // Accrue whatever the evaluator actually reported spending, including
+        // evaluations later rejected by a hard constraint. Read, do not
+        // estimate: a made-up price would make the ceiling a fiction.
+        // Proposal calls remain disclosed separately via `uncosted_llm_calls`.
         self.state.total_cost_usd += iteration_cost;
 
         // ── 3. Rank by reward (descending) ───────────────────────────
@@ -1301,7 +1611,9 @@ impl Campaign {
             serde_json::json!({
                 "iteration": iter,
                 "proposed": proposals.len(),
-                "evaluated": n_evaluated,
+                "accepted": n_accepted,
+                "rejected": rejected,
+                "evaluation_failures": evaluation_failures,
                 "total_evaluated": self.state.total_evaluated(),
                 "best_reward": self.state.best().map(|c| c.reward),
                 "best": self.state.best().map(|c| c.composition.clone()),
@@ -1472,6 +1784,27 @@ impl Campaign {
             ));
         }
 
+        let hard_constraints = configured_compositional_constraints(&self.state.config);
+        if !hard_constraints.is_empty() {
+            prompt.push_str("Hard compositional constraints (mandatory):\n");
+            for constraint in &hard_constraints {
+                prompt.push_str(&format!("  - {constraint}\n"));
+            }
+            prompt.push_str(
+                "A proposal that violates either hard constraint will be visibly REJECTED and excluded from ranking.\n",
+            );
+        }
+        if !self.state.rejected_candidates.is_empty() {
+            prompt.push_str("\nRecent hard-constraint rejections (do not repeat them):\n");
+            for rejection in self.state.rejected_candidates.iter().rev().take(5) {
+                prompt.push_str(&format!(
+                    "  {} — {}\n",
+                    rejection.composition,
+                    rejection.reasons.join("; ")
+                ));
+            }
+        }
+
         if self.state.current_iteration > 0 && !self.state.candidates.is_empty() {
             // Show the LLM the top performers so it can narrow the search.
             prompt.push_str("\nBest candidates so far (composition → reward):\n");
@@ -1536,7 +1869,11 @@ impl Campaign {
     ///
     /// Calls the registered HEA descriptor tool via the local PRISM node API
     /// and computes a scalarized reward from the returned physics descriptors.
-    async fn evaluate_candidate(&self, composition: &str, iteration: usize) -> Result<Candidate> {
+    async fn evaluate_candidate(
+        &self,
+        composition: &str,
+        iteration: usize,
+    ) -> Result<CandidateEvaluation> {
         // Call the PRISM node's registered HEA evaluation tool.
         let base = self.state.config.node_base_url.clone().unwrap_or_else(|| {
             let port = std::env::var("PRISM_NODE_PORT").unwrap_or_else(|_| "7327".to_string());
@@ -1548,7 +1885,28 @@ impl Campaign {
         let identity = load_local_node_identity(&paths)?;
         let resp_body = call_evaluate_material(&base, composition, Some(&identity)).await?;
 
-        // Compute scalarized reward from the properties.
+        let violations = self.constraint_violations(&resp_body);
+        if !violations.is_empty() {
+            self.record_event(
+                "campaign.reject",
+                serde_json::json!({
+                    "iteration": iteration,
+                    "composition": composition,
+                    "properties": &resp_body,
+                    "hard_constraint_violations": &violations,
+                }),
+            )
+            .await;
+            return Ok(CandidateEvaluation::Rejected(ConstraintRejection {
+                composition: composition.to_string(),
+                properties: resp_body,
+                iteration,
+                reasons: violations,
+            }));
+        }
+
+        // Only candidates satisfying every hard constraint receive a reward
+        // and enter the ranking.
         let reward = self.compute_reward(&resp_body)?;
 
         self.record_event(
@@ -1562,7 +1920,7 @@ impl Campaign {
         )
         .await;
 
-        Ok(Candidate {
+        Ok(CandidateEvaluation::Accepted(Candidate {
             composition: composition.to_string(),
             properties: resp_body,
             reward,
@@ -1572,7 +1930,59 @@ impl Campaign {
             } else {
                 "llm".into()
             },
-        })
+        }))
+    }
+
+    fn constraint_violations(&self, properties: &serde_json::Value) -> Vec<String> {
+        let mut violations = Vec::new();
+
+        if let Some(minimum) = self.state.config.min_configurational_entropy_j_per_mol_k {
+            let entropy = properties
+                .get("delta_S_mix_J_per_molK")
+                .and_then(serde_json::Value::as_f64)
+                .or_else(|| {
+                    properties
+                        .get("mixing_entropy")
+                        .or_else(|| properties.get("entropy"))
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|in_gas_constant_units| in_gas_constant_units * 8.314)
+                });
+            match entropy {
+                Some(value) if value < minimum => violations.push(format!(
+                    "delta_S_mix_J_per_molK={value:.4} J/(mol K) is below hard minimum {minimum:.4}"
+                )),
+                Some(_) => {}
+                None => violations.push(format!(
+                    "{EVALUATION_TOOL} returned no configurational-entropy descriptor required by hard minimum {minimum:.4} J/(mol K)"
+                )),
+            }
+        }
+
+        if let Some(minimum) = self.state.config.min_principal_elements {
+            let fractions = properties
+                .get("fractions")
+                .and_then(serde_json::Value::as_array);
+            match fractions {
+                Some(fractions) if fractions.iter().all(serde_json::Value::is_number) => {
+                    let count = fractions
+                        .iter()
+                        .filter_map(serde_json::Value::as_f64)
+                        .filter(|fraction| *fraction >= PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION)
+                        .count();
+                    if count < minimum {
+                        violations.push(format!(
+                            "principal-element count {count} is below hard minimum {minimum} ({:.0} at.% cutoff)",
+                            PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION * 100.0
+                        ));
+                    }
+                }
+                _ => violations.push(format!(
+                    "{EVALUATION_TOOL} returned no numeric composition fractions required to verify hard minimum {minimum} principal elements"
+                )),
+            }
+        }
+
+        violations
     }
 
     /// Compute a scalarized reward from physics descriptors.
@@ -1659,7 +2069,11 @@ impl Campaign {
     /// file that `from_checkpoint` could not parse: the goal, its budget and
     /// all its accumulated work, gone. A rename either happens or does not.
     pub fn checkpoint(&mut self) -> Result<()> {
-        self.state.last_checkpoint_at = Utc::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        self.state.last_checkpoint_at.clone_from(&now);
+        if self.state.status == GoalStatus::Running {
+            self.state.heartbeat_at = now;
+        }
         if let Some(parent) = self.checkpoint_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -2514,6 +2928,85 @@ mod tests {
         assert!(summary.contains("50"));
     }
 
+    /// Regression for an interrupted detached worker: a legacy checkpoint can
+    /// honestly say only that it was running when last written, but `resume`
+    /// must still re-enter the recoverable loop instead of requiring Paused.
+    #[tokio::test]
+    async fn resume_recovers_running_checkpoint_left_by_interruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = CampaignConfig {
+            max_iterations: 1,
+            checkpoint_dir: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        };
+        config.checkpoint_every = 1;
+        let id = "interrupted-resume";
+        let path = temp.path().join(format!("{id}.json"));
+        let mut campaign = Campaign::new(test_goal(), config, id.into());
+        campaign.state.status = GoalStatus::Running;
+        campaign.state.current_iteration = 1;
+        campaign.state.candidates.push(Candidate {
+            composition: "Ti0.8 Al0.2".into(),
+            properties: json!({"density": 4.0}),
+            reward: 0.8,
+            iteration: 0,
+            source: "seed".into(),
+        });
+        campaign.checkpoint().unwrap();
+
+        // Model the pre-liveness checkpoint observed in the live defect.
+        let mut checkpoint: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        checkpoint.as_object_mut().unwrap().remove("worker_pid");
+        checkpoint.as_object_mut().unwrap().remove("heartbeat_at");
+        std::fs::write(&path, serde_json::to_vec_pretty(&checkpoint).unwrap()).unwrap();
+
+        let mut resumed = Campaign::from_checkpoint(&path).unwrap();
+        let result = resumed
+            .resume()
+            .await
+            .expect("resume should recover an interrupted running checkpoint");
+
+        assert_eq!(result.state.status, GoalStatus::Completed);
+        assert_eq!(result.state.current_iteration, 1);
+    }
+
+    /// Regression for killed-worker status: a checkpoint's last persisted
+    /// `running` value must not override evidence that its worker pid died.
+    #[cfg(unix)]
+    #[test]
+    fn killed_worker_checkpoint_does_not_report_plain_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = CampaignConfig {
+            checkpoint_dir: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let id = "killed-worker-status";
+        let path = temp.path().join(format!("{id}.json"));
+        let mut campaign = Campaign::new(test_goal(), config, id.into());
+        campaign.state.status = GoalStatus::Running;
+        campaign.checkpoint().unwrap();
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        assert!(child.wait().unwrap().success());
+
+        let mut checkpoint: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        checkpoint["worker_pid"] = json!(dead_pid);
+        checkpoint["heartbeat_at"] = json!("2026-08-04T10:00:00Z");
+        std::fs::write(&path, serde_json::to_vec_pretty(&checkpoint).unwrap()).unwrap();
+
+        let loaded = Campaign::from_checkpoint(&path).unwrap();
+        assert_ne!(loaded.state().status, GoalStatus::Running);
+        assert_eq!(loaded.state().status.as_str(), "interrupted");
+        assert!(
+            loaded.state().completion_reason.contains("last heartbeat"),
+            "{}",
+            loaded.state().completion_reason
+        );
+    }
+
     #[test]
     fn checkpoint_roundtrip() {
         let temp = std::env::temp_dir().join("prism_campaign_checkpoint_test");
@@ -2548,6 +3041,48 @@ mod tests {
         assert_eq!(config.batch_size, 10);
         assert_eq!(config.checkpoint_every, 10);
         assert!(config.budget_usd.is_none());
+    }
+
+    #[test]
+    fn hea_defaults_are_goal_derived_configurable_and_not_global() {
+        let mut hea_goal = test_goal();
+        hea_goal.description = "Find a refractory high-entropy alloy".into();
+        let inferred = CampaignState::new("hea".into(), hea_goal.clone(), Default::default());
+        assert_eq!(
+            inferred.config.min_configurational_entropy_j_per_mol_k,
+            Some(DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K)
+        );
+        assert_eq!(
+            inferred.config.min_principal_elements,
+            Some(DEFAULT_HEA_MIN_PRINCIPAL_ELEMENTS)
+        );
+
+        let configured = CampaignState::new(
+            "configured-hea".into(),
+            hea_goal,
+            CampaignConfig {
+                min_configurational_entropy_j_per_mol_k: Some(10.0),
+                min_principal_elements: Some(4),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            configured.config.min_configurational_entropy_j_per_mol_k,
+            Some(10.0)
+        );
+        assert_eq!(configured.config.min_principal_elements, Some(4));
+
+        let mut binary_goal = test_goal();
+        binary_goal.description = "Find a refractory binary alloy".into();
+        binary_goal.objective = "maximize melting point".into();
+        let binary = CampaignState::new("binary".into(), binary_goal, Default::default());
+        assert!(
+            binary
+                .config
+                .min_configurational_entropy_j_per_mol_k
+                .is_none()
+        );
+        assert!(binary.config.min_principal_elements.is_none());
     }
 
     // ── Research-campaign generalization tests ──────────────────────────
