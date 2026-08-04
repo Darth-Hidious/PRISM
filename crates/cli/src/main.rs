@@ -10367,6 +10367,12 @@ async fn handle_run(
         .map_err(|_| {
             anyhow::anyhow!("Job submission timed out after 120s (image pull may be slow)")
         })??;
+    let submitted_record = router
+        .tracker()
+        .get(job_id)
+        .await
+        .context("submitted job is missing its tracking record")?;
+    let slurm_job_id = submitted_record.slurm_job_id;
 
     // Brief poll for initial status
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -10382,6 +10388,9 @@ async fn handle_run(
             "inputs": inputs_json,
         });
         if let Some(object) = payload.as_object_mut() {
+            if let Some(slurm_job_id) = slurm_job_id {
+                object.insert("slurm_job_id".to_string(), slurm_job_id.into());
+            }
             match status_result {
                 Ok(status) => {
                     object.insert("initial_status".to_string(), serde_json::to_value(status)?);
@@ -10397,6 +10406,9 @@ async fn handle_run(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("Job submitted: {job_id}");
+        if let Some(slurm_job_id) = slurm_job_id {
+            println!("SLURM job id: {slurm_job_id}");
+        }
         if let Some(hint) = run_job_status_hint(resolved_backend, job_id) {
             println!("{hint}");
         }
@@ -10431,7 +10443,11 @@ async fn handle_job_status(paths: &PrismPaths, job_id_str: &str) -> Result<()> {
                 marc27_auth_from(platform_auth),
             ))
         }
-        JobTarget::Byoc(target) => Box::new(prism_compute::byoc::ByocBackend::new(target)),
+        JobTarget::Byoc(target) => Box::new(prism_compute::byoc::ByocBackend::resume(
+            target,
+            job_id,
+            record.slurm_job_id,
+        )),
         JobTarget::Local => anyhow::bail!(
             "job {job_id} used local compute; cross-process local container status is not supported"
         ),

@@ -129,6 +129,20 @@ impl JobTracker {
         backend: &str,
         target: JobTarget,
     ) -> Result<JobRecord> {
+        self.register_with_slurm_job_id(job_id, name, image, backend, target, None)
+            .await
+    }
+
+    /// Register a job together with the scheduler id returned by `sbatch`.
+    pub async fn register_with_slurm_job_id(
+        &self,
+        job_id: Uuid,
+        name: &str,
+        image: &str,
+        backend: &str,
+        target: JobTarget,
+        slurm_job_id: Option<u64>,
+    ) -> Result<JobRecord> {
         let now = Utc::now();
         let record = JobRecord {
             job_id,
@@ -136,7 +150,7 @@ impl JobTracker {
             image: image.to_string(),
             backend: backend.to_string(),
             target,
-            slurm_job_id: None,
+            slurm_job_id,
             status: TrackedStatus::Queued,
             submitted_at: now,
             updated_at: now,
@@ -513,7 +527,14 @@ mod tests {
 
         let first = JobTracker::persistent(&data_dir).unwrap();
         first
-            .register(id, "hpc-job", "/shared/prism-worker.sif", "byoc", target)
+            .register_with_slurm_job_id(
+                id,
+                "hpc-job",
+                "/shared/prism-worker.sif",
+                "byoc",
+                target,
+                Some(98765),
+            )
             .await
             .unwrap();
         drop(first);
@@ -524,7 +545,7 @@ mod tests {
         assert_eq!(record.job_id, id);
         assert_eq!(record.backend, "byoc");
         assert!(record.submitted_at <= Utc::now());
-        assert!(record.slurm_job_id.is_none());
+        assert_eq!(record.slurm_job_id, Some(98765));
         assert!(matches!(
             record.target,
             JobTarget::Byoc(ByocTarget::Slurm { .. })

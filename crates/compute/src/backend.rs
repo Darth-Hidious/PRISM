@@ -171,19 +171,31 @@ impl ComputeRouter {
         let backend_name = self.backend_name(plan);
 
         let job_id = backend.submit(plan).await?;
+        let slurm_job_id = if backend_name == "byoc" {
+            match &self.byoc {
+                Some(byoc) => byoc.slurm_job_id(job_id).await,
+                None => None,
+            }
+        } else {
+            None
+        };
 
         self.tracker
-            .register(
+            .register_with_slurm_job_id(
                 job_id,
                 &plan.name,
                 &plan.image,
                 backend_name,
                 self.job_target(plan),
+                slurm_job_id,
             )
             .await
             .with_context(|| {
+                let scheduler = slurm_job_id
+                    .map(|id| format!(" (SLURM scheduler id {id})"))
+                    .unwrap_or_default();
                 format!(
-                    "job {job_id} was submitted via {backend_name} but its tracking record could not be persisted"
+                    "job {job_id}{scheduler} was submitted via {backend_name} but its tracking record could not be persisted"
                 )
             })?;
 

@@ -24,9 +24,13 @@
 //! then omitted entirely. Container images must be pulled or built on the
 //! login node before submission and supplied as a shared `.sif` path.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{ComputeBackend, ExperimentPlan, JobStatus};
@@ -131,11 +135,31 @@ impl Default for ByocTarget {
 /// Bring-your-own-compute backend.
 pub struct ByocBackend {
     target: ByocTarget,
+    slurm_job_ids: Arc<RwLock<HashMap<Uuid, u64>>>,
 }
 
 impl ByocBackend {
     pub fn new(target: ByocTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            slurm_job_ids: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Restore the scheduler id persisted for a previously submitted job.
+    pub fn resume(target: ByocTarget, job_id: Uuid, slurm_job_id: Option<u64>) -> Self {
+        let mut slurm_job_ids = HashMap::new();
+        if let Some(slurm_job_id) = slurm_job_id {
+            slurm_job_ids.insert(job_id, slurm_job_id);
+        }
+        Self {
+            target,
+            slurm_job_ids: Arc::new(RwLock::new(slurm_job_ids)),
+        }
+    }
+
+    pub async fn slurm_job_id(&self, job_id: Uuid) -> Option<u64> {
+        self.slurm_job_ids.read().await.get(&job_id).copied()
     }
 
     /// Build an SSH command prefix for the target host.
@@ -291,6 +315,17 @@ impl ComputeBackend for ByocBackend {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     bail!("sbatch submission failed: {stderr}");
                 }
+                let stdout = String::from_utf8(output.stdout).context("non-UTF-8 sbatch output")?;
+                let slurm_job_id = parse_sbatch_job_id(&stdout).with_context(|| {
+                    format!(
+                        "sbatch accepted PRISM job {job_id}, but its scheduler id could not be captured"
+                    )
+                })?;
+                self.slurm_job_ids
+                    .write()
+                    .await
+                    .insert(job_id, slurm_job_id);
+                tracing::info!(%job_id, slurm_job_id, "BYOC SLURM: scheduler id captured");
 
                 Ok(job_id)
             }
@@ -346,7 +381,8 @@ impl ComputeBackend for ByocBackend {
             ByocTarget::Slurm {
                 head_node, user, ..
             } => {
-                let squeue_command = format!("squeue --name=prism-{job_id} --noheader -o %T");
+                let slurm_job_id = self.slurm_job_id(job_id).await;
+                let squeue_command = slurm_squeue_command(job_id, slurm_job_id);
                 let squeue = Self::slurm_ssh(head_node, user, &squeue_command)
                     .output()
                     .await
@@ -364,10 +400,7 @@ impl ComputeBackend for ByocBackend {
                 // squeue only contains active jobs. sacct is authoritative
                 // after a job leaves the queue and distinguishes completion
                 // from a UUID the cluster has never seen.
-                let sacct_command = format!(
-                    "sacct -X --name=prism-{job_id} --starttime=1970-01-01 \
-                     --noheader --parsable2 --format=State"
-                );
+                let sacct_command = slurm_sacct_command(job_id, slurm_job_id);
                 let sacct = Self::slurm_ssh(head_node, user, &sacct_command)
                     .output()
                     .await
@@ -480,11 +513,11 @@ impl ComputeBackend for ByocBackend {
             ByocTarget::Slurm {
                 head_node, user, ..
             } => {
-                let output =
-                    Self::slurm_ssh(head_node, user, &format!("scancel --name=prism-{job_id}"))
-                        .output()
-                        .await
-                        .context("SSH scancel failed")?;
+                let cancel_command = slurm_cancel_command(job_id, self.slurm_job_id(job_id).await);
+                let output = Self::slurm_ssh(head_node, user, &cancel_command)
+                    .output()
+                    .await
+                    .context("SSH scancel failed")?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     bail!("scancel failed: {stderr}");
@@ -496,6 +529,50 @@ impl ComputeBackend for ByocBackend {
 }
 
 // ── SLURM script generation (pure, unit-tested) ─────────────────────────
+
+fn parse_sbatch_job_id(stdout: &str) -> Result<u64> {
+    let rendered_stdout: String = stdout.chars().take(512).collect();
+    let value = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Submitted batch job "))
+        .with_context(|| {
+            format!(
+                "sbatch output did not contain `Submitted batch job <id>`; stdout was {rendered_stdout:?}"
+            )
+        })?;
+    let id = value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("invalid scheduler id in sbatch output: {value:?}"))?;
+    if id == 0 {
+        bail!("invalid zero scheduler id in sbatch output");
+    }
+    Ok(id)
+}
+
+fn slurm_squeue_command(job_id: Uuid, slurm_job_id: Option<u64>) -> String {
+    match slurm_job_id {
+        Some(id) => format!("squeue --jobs={id} --noheader -o %T"),
+        None => format!("squeue --name=prism-{job_id} --noheader -o %T"),
+    }
+}
+
+fn slurm_sacct_command(job_id: Uuid, slurm_job_id: Option<u64>) -> String {
+    match slurm_job_id {
+        Some(id) => format!("sacct -X --jobs={id} --noheader --parsable2 --format=State"),
+        None => format!(
+            "sacct -X --name=prism-{job_id} --starttime=1970-01-01 \
+             --noheader --parsable2 --format=State"
+        ),
+    }
+}
+
+fn slurm_cancel_command(job_id: Uuid, slurm_job_id: Option<u64>) -> String {
+    match slurm_job_id {
+        Some(id) => format!("scancel {id}"),
+        None => format!("scancel --name=prism-{job_id}"),
+    }
+}
 
 /// Charset for any value interpolated into an `#SBATCH` directive or the
 /// script body: alphanumerics plus the separators real SLURM tokens use.
@@ -923,6 +1000,36 @@ mod tests {
             sif_path: sif_path.into(),
             ..SlurmJobConfig::default()
         }
+    }
+
+    #[test]
+    fn sbatch_stdout_yields_numeric_scheduler_id() {
+        assert_eq!(
+            parse_sbatch_job_id("Submitted batch job 98765\n").unwrap(),
+            98765
+        );
+    }
+
+    #[test]
+    fn sbatch_stdout_without_numeric_id_is_an_error() {
+        let error = parse_sbatch_job_id("submission accepted\n").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Submitted batch job"));
+        assert!(message.contains("submission accepted"));
+    }
+
+    #[test]
+    fn resumed_slurm_commands_use_numeric_scheduler_id() {
+        let job_id = Uuid::nil();
+        assert_eq!(
+            slurm_squeue_command(job_id, Some(98765)),
+            "squeue --jobs=98765 --noheader -o %T"
+        );
+        assert_eq!(
+            slurm_sacct_command(job_id, Some(98765)),
+            "sacct -X --jobs=98765 --noheader --parsable2 --format=State"
+        );
+        assert_eq!(slurm_cancel_command(job_id, Some(98765)), "scancel 98765");
     }
 
     #[test]
