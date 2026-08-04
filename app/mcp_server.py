@@ -283,8 +283,14 @@ def create_mcp_server(registry: Optional[ToolRegistry] = None):
     """Create a FastMCP server exposing all PRISM tools and resources."""
     from fastmcp import FastMCP
 
+    from app import __version__ as prism_version
+
     mcp = FastMCP(
         name="prism",
+        # Without this, FastMCP reports *its own* package version as ours, so
+        # every client's handshake shows PRISM at whatever fastmcp happens to
+        # be pinned at (3.4.2 today). The product version is 1.0.0.
+        version=prism_version,
         instructions=(
             "PRISM: Materials science research tools. Search OPTIMADE databases, "
             "query Materials Project, predict properties with ML, visualize results, "

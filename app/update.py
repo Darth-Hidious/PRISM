@@ -22,6 +22,8 @@ from typing import Optional
 
 from packaging.version import Version
 
+from app import __version__
+
 PRISM_DIR = Path.home() / ".prism"
 CACHE_PATH = PRISM_DIR / ".update_check"
 _DEFAULT_CACHE_TTL = 86400  # 24 hours
@@ -217,7 +219,15 @@ def download_tui_binary() -> Optional[str]:
 
     try:
         release = _latest_release_metadata()
-        tag = (release or {}).get("tag_name") or _latest_release_tag() or "v2.5.0"
+        # Last-resort tag. This was hardcoded to "v2.5.0", which has never been
+        # released -- when GitHub metadata was unavailable the updater built a
+        # download URL that could only 404. Derive it from the product version
+        # so it cannot drift away from a tag that actually exists.
+        tag = (
+            (release or {}).get("tag_name")
+            or _latest_release_tag()
+            or f"v{__version__}"
+        )
         assets = {
             asset.get("name"): asset.get("browser_download_url")
             for asset in (release or {}).get("assets", [])
