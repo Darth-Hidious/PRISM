@@ -176,12 +176,18 @@ jobs:
                 exit 1
               fi
 
-              export ORT_LIB_LOCATION="$ort_src/build/Linux"
+              # Point ort-sys at the directory containing the ORT archives.
+              # Given the build root, rc.12 chooses _deps/*/Release; build.py
+              # produced Release/_deps/*, so its dependency search paths miss.
+              export ORT_LIB_LOCATION="$(dirname "$ort_common")"
               export ORT_SKIP_DOWNLOAD=1
               # ORT is only a set of C++ archives at this point. Select the
               # static GCC 11 runtime where ort-sys performs the final link;
               # applying -static-libstdc++ to the ORT build would not do that.
               export ORT_CXX_STDLIB="static=stdc++"
+              # rustc resolves a requested static native archive before the
+              # final GCC link, so expose the SCL archive directory explicitly.
+              export RUSTFLAGS="-Lnative=$(dirname "$libstdcpp_a")"
               cargo build --locked --release --bin prism --bin prism-node \
                 --target "$RUST_TARGET"
 
