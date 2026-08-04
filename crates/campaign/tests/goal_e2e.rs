@@ -31,6 +31,7 @@ struct Boundary {
     auth_headers: Arc<Mutex<Vec<Option<String>>>>,
     eval_fails: bool,
     hea_constraint_scenario: bool,
+    llm_response: String,
     /// USD the evaluator reports per candidate. The proposal LLM has no
     /// equivalent — `LlmClient::chat` returns `Result<String>` — which is the
     /// whole point of `ceiling_declares_the_proposal_calls_it_cannot_price`.
@@ -86,7 +87,7 @@ async fn llm_chat(State(b): State<Boundary>, Json(_body): Json<Value>) -> Json<V
     // compositions, exactly what a real proposal model returns.
     Json(json!({
         "choices": [{
-            "message": { "content": "[\"W0.5 Mo0.5\", \"Ta0.6 Nb0.4\"]" }
+            "message": { "content": b.llm_response }
         }]
     }))
 }
@@ -164,10 +165,11 @@ async fn evaluate_material(
 }
 
 /// Serve the two external boundaries on an ephemeral port; return the base URL.
-async fn spawn_boundary(
+async fn spawn_boundary_with_llm(
     eval_fails: bool,
     eval_cost_usd: f64,
     hea_constraint_scenario: bool,
+    llm_response: &str,
 ) -> (String, Boundary) {
     let boundary = Boundary {
         llm_calls: Arc::new(AtomicUsize::new(0)),
@@ -176,6 +178,7 @@ async fn spawn_boundary(
         auth_headers: Arc::new(Mutex::new(Vec::new())),
         eval_fails,
         hea_constraint_scenario,
+        llm_response: llm_response.to_string(),
         eval_cost_usd,
     };
     let app = axum::Router::new()
@@ -189,6 +192,20 @@ async fn spawn_boundary(
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), boundary)
+}
+
+async fn spawn_boundary(
+    eval_fails: bool,
+    eval_cost_usd: f64,
+    hea_constraint_scenario: bool,
+) -> (String, Boundary) {
+    spawn_boundary_with_llm(
+        eval_fails,
+        eval_cost_usd,
+        hea_constraint_scenario,
+        "[\"W0.5 Mo0.5\", \"Ta0.6 Nb0.4\"]",
+    )
+    .await
 }
 
 async fn spawn_hea_constraint_boundary() -> (String, Boundary) {
@@ -220,6 +237,66 @@ fn config(base: &str, dir: &std::path::Path) -> CampaignConfig {
 fn checkpoint_json(dir: &std::path::Path, id: &str) -> Value {
     let text = std::fs::read_to_string(dir.join(format!("{id}.json"))).unwrap();
     serde_json::from_str(&text).unwrap()
+}
+
+/// A malformed model proposal must be a visible hard rejection, never an
+/// evaluator input, ranked candidate, or persisted composition.
+#[tokio::test]
+async fn non_unit_llm_composition_never_reaches_evaluator_or_checkpoint() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let test_home = tempfile::tempdir().unwrap();
+    let _home = install_test_identity(test_home.path());
+    let malformed = "W0.6 Mo0.2 Ta0.4 Nb0.4 V0.4";
+    let valid = "W0.2 Mo0.2 Ta0.2 Nb0.2 V0.2";
+    let response = serde_json::to_string(&[malformed, valid]).unwrap();
+    let (base, boundary) = spawn_boundary_with_llm(false, 0.0, false, &response).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let id = "goal-e2e-invalid-composition";
+    let goal = CampaignGoal {
+        description: "Find a refractory alloy with high melting point".into(),
+        elements: ["W", "Mo", "Ta", "Nb", "V"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        objective: "maximize melting point".into(),
+        constraints: vec![],
+        seeds: vec![],
+    };
+    let mut cfg = config(&base, tmp.path());
+    cfg.max_iterations = 1;
+    let mut campaign = Campaign::new(goal, cfg, id.into());
+
+    let result = campaign
+        .run()
+        .await
+        .expect("valid proposal should complete");
+
+    assert_eq!(boundary.eval_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.state.candidates.len(), 1);
+    assert_eq!(result.state.candidates[0].composition, valid);
+    assert_eq!(result.state.rejected_candidates.len(), 1);
+    assert_eq!(result.state.total_evaluated(), 1);
+    assert_eq!(result.state.total_rejected_before_evaluation(), 1);
+    assert!(result.summary.contains("REJECTED"), "{}", result.summary);
+    assert!(result.summary.contains(malformed), "{}", result.summary);
+    assert!(result.summary.contains("2.000000"), "{}", result.summary);
+
+    let checkpoint = std::fs::read_to_string(tmp.path().join(format!("{id}.json"))).unwrap();
+    assert!(!checkpoint.contains(malformed), "{checkpoint}");
+    assert!(
+        !checkpoint.contains("\"composition\": null"),
+        "{checkpoint}"
+    );
+    let persisted: Value = serde_json::from_str(&checkpoint).unwrap();
+    let rejection = &persisted["rejected_candidates"][0];
+    assert_eq!(rejection["evaluated"], false);
+    assert!(rejection.get("composition").is_none(), "{rejection}");
+    assert!(
+        rejection["reasons"][0]
+            .as_str()
+            .unwrap()
+            .contains("got 2.000000")
+    );
 }
 
 /// Regression for objective degeneration: a higher-melting near-pure element

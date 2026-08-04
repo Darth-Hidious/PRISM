@@ -121,16 +121,16 @@ TIER_INSTALL_HINTS = {
 # Small helpers
 # ---------------------------------------------------------------------------
 
-def _parse_candidate_composition(candidate: dict) -> tuple[list[str], list[float]] | None:
-    """Reuse the HEA module's composition parser (formula or fractions dict)."""
-    from app.tools.materials.hea import _parse_composition
+def _parse_candidate_composition(candidate: dict) -> tuple[list[str], list[float]]:
+    """Validate direct evaluator input without silently normalizing it."""
+    from app.tools.materials.hea import _parse_composition_or_raise
 
     fracs_dict = candidate.get("fractions")
     formula = candidate.get("composition")
     spec = fracs_dict if fracs_dict else formula
     if not spec:
-        return None
-    return _parse_composition(spec)
+        raise ValueError("candidate needs a composition or fractions dict")
+    return _parse_composition_or_raise(spec)
 
 
 def _reduced_formula(elems: list[str], fracs: list[float]) -> str:
@@ -826,13 +826,10 @@ def evaluate_candidate(candidate: dict, tier: int = 0) -> dict:
     """
     if not isinstance(tier, int) or not 0 <= tier <= MAX_TIER:
         return {"error": f"tier must be an int in 0..{MAX_TIER}, got {tier!r}"}
-    parsed = _parse_candidate_composition(candidate)
-    if parsed is None:
-        return {
-            "error": "candidate needs a composition (formula string or "
-                     "fractions dict) with >= 2 elements"
-        }
-    elems, fracs = parsed
+    try:
+        elems, fracs = _parse_candidate_composition(candidate)
+    except (TypeError, ValueError) as exc:
+        return {"error": f"invalid composition: {exc}"}
 
     result: dict[str, Any] = {
         "candidate": {
@@ -932,11 +929,18 @@ _EVAL_SCHEMA: dict = {
     "properties": {
         "composition": {
             "type": "string",
-            "description": "Reduced formula, e.g. 'W0.5Ta0.3Mo0.2'.",
+            "description": (
+                "Atomic-fraction composition with explicit finite, positive "
+                "fractions summing to 1.0 ± 1e-6, e.g. 'W0.5Ta0.3Mo0.2'. "
+                "Ratios and percentages are rejected, never normalized."
+            ),
         },
         "fractions": {
             "type": "object",
-            "description": "Alternative element→fraction dict, e.g. {\"W\":0.5,\"Ta\":0.3,\"Mo\":0.2}.",
+            "description": (
+                "Alternative element→fraction dict; values must be finite, "
+                "positive, and sum to 1.0 ± 1e-6."
+            ),
         },
         "tier": {
             "type": "integer",

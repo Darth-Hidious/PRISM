@@ -14,7 +14,7 @@ def test_parse_composition_formula():
 
 
 def test_parse_composition_dict():
-    elems, fracs = _parse_composition({"Nb": 1, "Mo": 1, "Ta": 1, "W": 1})
+    elems, fracs = _parse_composition({"Nb": 0.25, "Mo": 0.25, "Ta": 0.25, "W": 0.25})
     assert len(elems) == 4
     assert all(abs(f - 0.25) < 1e-6 for f in fracs)  # equal fractions
 
@@ -22,6 +22,38 @@ def test_parse_composition_dict():
 def test_parse_composition_rejects_invalid():
     assert _parse_composition("not_a_formula") is None or _parse_composition("Fe") is None
     assert _parse_composition({}) is None
+
+
+def test_parse_composition_rejects_non_unit_fractions_instead_of_normalizing():
+    malformed = "W0.6 Mo0.2 Ta0.4 Nb0.4 V0.4"
+    assert _parse_composition(malformed) is None
+    assert _parse_composition(
+        {"W": 0.6, "Mo": 0.2, "Ta": 0.4, "Nb": 0.4, "V": 0.4}
+    ) is None
+
+
+def test_composition_validation_enforces_symbols_finiteness_and_positivity():
+    assert _parse_composition("W0.5000005Mo0.4999995") is not None
+    assert _parse_composition({"W": float("nan"), "Mo": 0.5}) is None
+    assert _parse_composition({"W": 1.0, "Mo": 0.0}) is None
+    assert _parse_composition({"Xx": 0.5, "W": 0.5}) is None
+    with pytest.raises(ValueError, match="must sum to 1.0"):
+        compute_hea_descriptors(
+            ["W", "Mo", "Ta", "Nb", "V"], [0.6, 0.2, 0.4, 0.4, 0.4]
+        )
+
+
+def test_hea_tool_rejects_non_unit_composition_without_descriptors():
+    from app.tools.base import ToolRegistry
+    from app.tools.materials.hea import create_hea_tools
+
+    registry = ToolRegistry()
+    create_hea_tools(registry)
+    result = registry.get("hea_descriptors").func(
+        composition="W0.6 Mo0.2 Ta0.4 Nb0.4 V0.4"
+    )
+    assert "must sum to 1.0" in result["error"]
+    assert "Tm_estimate_K" not in result
 
 
 def test_cantor_alloy_is_solid_solution_fcc():
@@ -50,7 +82,7 @@ def test_cantor_alloy_is_solid_solution_fcc():
 
 def test_senkov_refractory_hea_is_solid_solution_bcc():
     """NbMoTaW is the canonical refractory BCC HEA (Senkov et al.)."""
-    elems, fracs = _parse_composition("NbMoTaW")
+    elems, fracs = _parse_composition("Nb0.25Mo0.25Ta0.25W0.25")
     d = compute_hea_descriptors(elems, fracs)
     assert d["phase_prediction"] == "solid_solution"
     # VEC = (5+6+5+6)/4 = 5.5 < 6.87 → BCC (Guo & Liu 2011)
@@ -80,10 +112,14 @@ def test_vec_thresholds_guo_liu_2011():
     real single-phase FCC) as mixed."""
     fcc = compute_hea_descriptors(*_parse_composition("Co0.2Cr0.2Fe0.2Mn0.2Ni0.2"))
     assert any("FCC favored" in n for n in fcc["rationale"])
-    bcc = compute_hea_descriptors(*_parse_composition("NbMoTaW"))
+    bcc = compute_hea_descriptors(*_parse_composition("Nb0.25Mo0.25Ta0.25W0.25"))
     assert any("BCC favored" in n for n in bcc["rationale"])
     # Al0.3CoCrFeNi: VEC = (0.3·3 + 9 + 6 + 8 + 10)/4.3 ≈ 7.88 → duplex window
-    mixed = compute_hea_descriptors(*_parse_composition("Al0.3CoCrFeNi"))
+    mixed = compute_hea_descriptors(
+        *_parse_composition(
+            "Al0.06976744Co0.23255814Cr0.23255814Fe0.23255814Ni0.23255814"
+        )
+    )
     assert 6.87 <= mixed["VEC"] < 8.0
     assert any("mixed" in n for n in mixed["rationale"])
 
@@ -107,7 +143,7 @@ def test_miedema_pairs_match_takeuchi_inoue():
 
 def test_binary_not_hea():
     """A simple binary (FeO) is NOT a solid-solution HEA."""
-    elems, fracs = _parse_composition("FeO")
+    elems, fracs = _parse_composition("Fe0.5O0.5")
     d = compute_hea_descriptors(elems, fracs)
     assert d["phase_prediction"] != "solid_solution"
     assert d["n_elements"] == 2
@@ -130,7 +166,7 @@ def test_vec_is_concentration_weighted():
 
 def test_delta_S_mix_bounded():
     """ΔS_mix for an n-element equimolar alloy = R·ln(n)."""
-    elems, fracs = _parse_composition("NbMoTaW")  # 4 elements, equimolar
+    elems, fracs = _parse_composition("Nb0.25Mo0.25Ta0.25W0.25")
     d = compute_hea_descriptors(elems, fracs)
     expected = 8.314 * math.log(4)  # R ln(4)
     assert abs(d["delta_S_mix_J_per_molK"] - expected) < 0.1

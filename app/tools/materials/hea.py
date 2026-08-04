@@ -35,6 +35,17 @@ from app.tools.base import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+# Atomic fractions are accepted as written only. This tolerance permits normal
+# decimal round-off without treating ratios or percentages as fractions.
+COMPOSITION_SUM_TOLERANCE = 1e-6
+_ELEMENT_SYMBOLS = frozenset(
+    "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co "
+    "Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb "
+    "Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re "
+    "Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es "
+    "Fm Md No Lr Rf Db Sg Bh Hs Mt Ds Rg Cn Nh Fl Mc Lv Ts Og".split()
+)
+
 # Valence electron concentration (VEC) per element — the Guo/Liu convention
 # used universally in HEA literature. For transition metals this is the group
 # number; for the common HEA p-block elements it's the standard value. A pure
@@ -106,37 +117,91 @@ def _dh_mix_for_pair(a: str, b: str) -> float:
     return _DH_MIX_PAIRS.get((a, b), 0.0)
 
 
-def _parse_composition(spec: str | dict[str, float]) -> tuple[list[str], list[float]] | None:
-    """Parse a composition spec into (elements, fractions).
+def _validate_composition_components(
+    elems: list[str],
+    fracs: list[float],
+    allowed_elements: set[str] | None = None,
+) -> tuple[list[str], list[float]]:
+    """Validate atomic fractions without normalizing or combining entries.
 
-    Accepts:
-      - "Cr0.2Fe0.2Ni0.2Co0.2Cu0.2" (reduced formula with explicit fractions)
-      - "NbMoTaW" (equal fractions assumed)
-      - {"Cr": 0.2, "Fe": 0.2, ...} (element-fraction dict)
-    Returns None if it can't parse (caller surfaces the error).
+    Fractions must be finite, strictly positive, and sum to 1.0 within an
+    absolute tolerance of ``1e-6``. Rejecting outside that tolerance preserves
+    the distinction between what a caller proposed and what was evaluated.
     """
+    if len(elems) < 2:
+        raise ValueError("composition must contain at least two elements")
+    if len(elems) != len(fracs):
+        raise ValueError("element and fraction counts differ")
+    if len(set(elems)) != len(elems):
+        raise ValueError("each element may appear only once")
+
+    invalid = [element for element in elems if element not in _ELEMENT_SYMBOLS]
+    if invalid:
+        raise ValueError(f"invalid element symbols: {', '.join(invalid)}")
+    if allowed_elements is not None:
+        outside = [element for element in elems if element not in allowed_elements]
+        if outside:
+            raise ValueError(
+                "elements outside allowed set: " + ", ".join(outside)
+            )
+
+    checked: list[float] = []
+    for element, value in zip(elems, fracs):
+        if isinstance(value, bool):
+            raise ValueError(f"fraction for {element} must be numeric, not boolean")
+        try:
+            fraction = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"fraction for {element} must be numeric") from exc
+        if not math.isfinite(fraction):
+            raise ValueError(f"fraction for {element} must be finite")
+        if fraction <= 0:
+            raise ValueError(f"fraction for {element} must be strictly positive")
+        checked.append(fraction)
+
+    total = math.fsum(checked)
+    if abs(total - 1.0) > COMPOSITION_SUM_TOLERANCE:
+        raise ValueError(
+            f"composition fractions must sum to 1.0 ± "
+            f"{COMPOSITION_SUM_TOLERANCE:.6f}; got {total:.6f}"
+        )
+    return list(elems), checked
+
+
+def _parse_composition_or_raise(
+    spec: str | dict[str, float],
+) -> tuple[list[str], list[float]]:
     if isinstance(spec, dict):
         elems = list(spec.keys())
-        fracs = [float(spec[e]) for e in elems]
+        fracs = list(spec.values())
     elif isinstance(spec, str):
         try:
             from pymatgen.core import Composition
 
-            c = Composition(spec)
-            elems = [str(e) for e in c.elements]
-            fracs = [c.get_atomic_fraction(e) for e in c.elements]
-        except Exception:
-            return None
+            # get_el_amt_dict preserves the caller's raw coefficients. Using
+            # get_atomic_fraction here would silently turn a sum-2 proposal
+            # into a different, apparently valid material.
+            amounts = Composition(spec).get_el_amt_dict()
+        except Exception as exc:
+            raise ValueError(f"could not parse composition: {spec}") from exc
+        elems = list(amounts)
+        fracs = list(amounts.values())
     else:
+        raise ValueError("composition must be a formula string or fractions dict")
+    return _validate_composition_components(elems, fracs)
+
+
+def _parse_composition(spec: str | dict[str, float]) -> tuple[list[str], list[float]] | None:
+    """Parse a strict unit-sum atomic-fraction composition.
+
+    Returns ``None`` for invalid input for backward-compatible internal callers.
+    Use ``_parse_composition_or_raise`` at user-facing boundaries that need the
+    exact rejection reason.
+    """
+    try:
+        return _parse_composition_or_raise(spec)
+    except (TypeError, ValueError):
         return None
-    if not elems or len(elems) < 2:
-        return None
-    # Normalize fractions to sum to 1.
-    total = sum(fracs)
-    if total <= 0:
-        return None
-    fracs = [f / total for f in fracs]
-    return elems, fracs
 
 
 def _metallic_radius(sym: str) -> float | None:
@@ -174,6 +239,7 @@ def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, A
         intermetallic_or_segregated) via Yang Ω+δ, with a demixing flag for
         positive-ΔH_mix compositions (e.g. Cu-bearing 3d HEAs)
     """
+    elems, fracs = _validate_composition_components(elems, fracs)
     n = len(elems)
     R = 8.314  # J/(mol·K) gas constant
 
@@ -325,9 +391,10 @@ _HEA_SCHEMA: dict = {
         "composition": {
             "type": "string",
             "description": (
-                "Composition as a reduced formula with explicit fractions, e.g. "
-                "'Co0.2Cr0.2Fe0.2Mn0.2Ni0.2' (the Cantor alloy), or 'NbMoTaW' "
-                "(equal fractions assumed), or a space-separated list."
+                "Atomic-fraction composition with every fraction explicit and "
+                "summing to 1.0 ± 1e-6, e.g. "
+                "'Co0.2Cr0.2Fe0.2Mn0.2Ni0.2' (the Cantor alloy). "
+                "Ratios and percentages are rejected, never normalized."
             ),
         },
         "fractions": {
@@ -335,7 +402,7 @@ _HEA_SCHEMA: dict = {
             "description": (
                 "Alternative: pass element→fraction directly, e.g. "
                 "{\"Co\":0.2,\"Cr\":0.2,\"Fe\":0.2,\"Mn\":0.2,\"Ni\":0.2}. "
-                "Use this when fractions aren't expressible in a formula string."
+                "Values must be finite, positive, and sum to 1.0 ± 1e-6."
             ),
         },
     },
@@ -349,11 +416,11 @@ def _hea_descriptors_tool() -> Tool:
         fracs_dict = kwargs.get("fractions")
         if not comp and not fracs_dict:
             return {"error": "provide a composition (formula string or fractions dict)"}
-        parsed = _parse_composition(fracs_dict if fracs_dict else comp)
-        if parsed is None:
-            return {"error": f"could not parse composition: {comp or fracs_dict}"}
-        elems, fracs = parsed
-        return compute_hea_descriptors(elems, fracs)
+        try:
+            elems, fracs = _parse_composition_or_raise(fracs_dict if fracs_dict else comp)
+            return compute_hea_descriptors(elems, fracs)
+        except (TypeError, ValueError) as exc:
+            return {"error": f"invalid composition: {exc}"}
 
     return Tool(
         name="hea_descriptors",
@@ -374,11 +441,11 @@ def _hea_descriptors_tool() -> Tool:
                 "output_note": "the Cantor alloy (CoCrFeMnNi) — solid_solution, VEC=8.0 → FCC, δ≈1.1%",
             },
             {
-                "input": {"composition": "NbMoTaW"},
+                "input": {"composition": "Nb0.25Mo0.25Ta0.25W0.25"},
                 "output_note": "Senkov refractory HEA — solid_solution, VEC=5.5 → BCC",
             },
             {
-                "input": {"composition": "CrFeNiCoCu"},
+                "input": {"composition": "Cr0.2Fe0.2Ni0.2Co0.2Cu0.2"},
                 "output_note": "Cu-bearing (ΔH_mix=+3.2 kJ/mol) — flagged solid_solution_segregation_risk (Cu-rich demixing), NOT the Cantor alloy",
             },
         ],

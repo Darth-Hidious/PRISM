@@ -28,21 +28,21 @@ logger = logging.getLogger(__name__)
 # None where not reported. This is the synthesized hea-mpea corpus.
 _CANONICAL_HEAS = [
     # Refractory HEAs (Senkov 2011, Yao 2016) — BCC
-    {"composition": "Nb25Mo25Ta25W25", "family": "refractory", "phase": "BCC", "hardness_HV": 542, "density_g_cm3": 12.8, "lattice_param_A": 3.213, "source": "Senkov2011"},
-    {"composition": "Nb20Mo20Ta20W20V20", "family": "refractory", "phase": "BCC", "hardness_HV": 535, "density_g_cm3": 11.7, "lattice_param_A": 3.185, "source": "Senkov2011"},
-    {"composition": "V20Nb20Mo20Ta20W20", "family": "refractory", "phase": "BCC", "hardness_HV": 535, "density_g_cm3": 11.7, "lattice_param_A": 3.185, "source": "Senkov2011"},
-    {"composition": "Nb20Mo20Ta20W20Hf20", "family": "refractory_Hf", "phase": "BCC", "hardness_HV": 590, "density_g_cm3": 13.2, "lattice_param_A": 3.245, "source": "Yao2016"},
-    {"composition": "Mo20Nb20Ta20W20Hf20", "family": "refractory_Hf", "phase": "BCC", "hardness_HV": 590, "density_g_cm3": 13.2, "lattice_param_A": 3.245, "source": "Yao2016"},
+    {"composition": "Nb0.25Mo0.25Ta0.25W0.25", "family": "refractory", "phase": "BCC", "hardness_HV": 542, "density_g_cm3": 12.8, "lattice_param_A": 3.213, "source": "Senkov2011"},
+    {"composition": "Nb0.2Mo0.2Ta0.2W0.2V0.2", "family": "refractory", "phase": "BCC", "hardness_HV": 535, "density_g_cm3": 11.7, "lattice_param_A": 3.185, "source": "Senkov2011"},
+    {"composition": "V0.2Nb0.2Mo0.2Ta0.2W0.2", "family": "refractory", "phase": "BCC", "hardness_HV": 535, "density_g_cm3": 11.7, "lattice_param_A": 3.185, "source": "Senkov2011"},
+    {"composition": "Nb0.2Mo0.2Ta0.2W0.2Hf0.2", "family": "refractory_Hf", "phase": "BCC", "hardness_HV": 590, "density_g_cm3": 13.2, "lattice_param_A": 3.245, "source": "Yao2016"},
+    {"composition": "Mo0.2Nb0.2Ta0.2W0.2Hf0.2", "family": "refractory_Hf", "phase": "BCC", "hardness_HV": 590, "density_g_cm3": 13.2, "lattice_param_A": 3.245, "source": "Yao2016"},
     # 3d-transition-metal HEAs (Cantor family) — FCC
-    {"composition": "Cr20Fe20Ni20Co20Cu20", "family": "cantor", "phase": "FCC", "hardness_HV": None, "density_g_cm3": 8.3, "lattice_param_A": 3.593, "source": "Cantor2004"},
-    {"composition": "Cr20Mn20Fe20Co20Ni20", "family": "cantor", "phase": "FCC", "hardness_HV": 240, "density_g_cm3": 8.0, "lattice_param_A": 3.592, "source": "Cantor2004"},
-    {"composition": "Co20Cr20Fe20Ni20Mn20", "family": "cantor", "phase": "FCC", "hardness_HV": 240, "density_g_cm3": 8.0, "lattice_param_A": 3.592, "source": "Cantor2004"},
-    {"composition": "CoCrFeNi", "family": "3d_TM_quaternary", "phase": "FCC", "hardness_HV": 180, "density_g_cm3": 8.1, "lattice_param_A": 3.575, "source": "Wu2014"},
-    {"composition": "CoCrFeMnNi", "family": "3d_TM", "phase": "FCC", "hardness_HV": 240, "density_g_cm3": 8.0, "lattice_param_A": 3.592, "source": "Cantor2004"},
-    {"composition": "Al10CoCrFeNi", "family": "Al_doped", "phase": "BCC", "hardness_HV": 520, "density_g_cm3": 7.1, "lattice_param_A": 2.870, "source": "Wang2014"},
-    {"composition": "Al15CoCrFeNi", "family": "Al_doped", "phase": "BCC_B2", "hardness_HV": 530, "density_g_cm3": 6.9, "lattice_param_A": 2.870, "source": "Wang2014"},
+    {"composition": "Cr0.2Fe0.2Ni0.2Co0.2Cu0.2", "family": "cantor", "phase": "FCC", "hardness_HV": None, "density_g_cm3": 8.3, "lattice_param_A": 3.593, "source": "Cantor2004"},
+    {"composition": "Cr0.2Mn0.2Fe0.2Co0.2Ni0.2", "family": "cantor", "phase": "FCC", "hardness_HV": 240, "density_g_cm3": 8.0, "lattice_param_A": 3.592, "source": "Cantor2004"},
+    {"composition": "Co0.2Cr0.2Fe0.2Ni0.2Mn0.2", "family": "cantor", "phase": "FCC", "hardness_HV": 240, "density_g_cm3": 8.0, "lattice_param_A": 3.592, "source": "Cantor2004"},
+    {"composition": "Co0.25Cr0.25Fe0.25Ni0.25", "family": "3d_TM_quaternary", "phase": "FCC", "hardness_HV": 180, "density_g_cm3": 8.1, "lattice_param_A": 3.575, "source": "Wu2014"},
+    {"composition": "Co0.2Cr0.2Fe0.2Mn0.2Ni0.2", "family": "3d_TM", "phase": "FCC", "hardness_HV": 240, "density_g_cm3": 8.0, "lattice_param_A": 3.592, "source": "Cantor2004"},
+    {"composition": "Al0.1Co0.225Cr0.225Fe0.225Ni0.225", "family": "Al_doped", "phase": "BCC", "hardness_HV": 520, "density_g_cm3": 7.1, "lattice_param_A": 2.870, "source": "Wang2014"},
+    {"composition": "Al0.15Co0.2125Cr0.2125Fe0.2125Ni0.2125", "family": "Al_doped", "phase": "BCC_B2", "hardness_HV": 530, "density_g_cm3": 6.9, "lattice_param_A": 2.870, "source": "Wang2014"},
     # Dual-phase / eutectic HEAs
-    {"composition": "AlCoCrFeNi2.1", "family": "eutectic", "phase": "FCC_BCC", "hardness_HV": 350, "density_g_cm3": 7.4, "lattice_param_A": None, "source": "Lu2014"},
+    {"composition": "Al0.16393443Co0.16393443Cr0.16393443Fe0.16393443Ni0.34426230", "family": "eutectic", "phase": "FCC_BCC", "hardness_HV": 350, "density_g_cm3": 7.4, "lattice_param_A": None, "source": "Lu2014"},
 ]
 
 

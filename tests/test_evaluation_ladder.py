@@ -72,6 +72,15 @@ def test_invalid_tier_and_bad_composition_rejected():
     assert "error" in ev.evaluate_candidate({}, tier=0)
 
 
+def test_non_unit_composition_never_enters_tier_zero():
+    result = ev.evaluate_candidate(
+        {"composition": "W0.6 Mo0.2 Ta0.4 Nb0.4 V0.4"}, tier=0
+    )
+    assert "error" in result
+    assert "sum to 1.0" in result["error"]
+    assert "tiers" not in result
+
+
 # ---------------------------------------------------------------------------
 # 2. Escalation order: survivors only, cheap first
 # ---------------------------------------------------------------------------

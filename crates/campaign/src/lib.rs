@@ -43,7 +43,7 @@
 //! # });
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -55,6 +55,152 @@ use prism_provenance::{ActionType, Actor, ProvenanceRecord, ProvenanceStore, new
 
 const EVALUATION_TOOL: &str = "hea_descriptors";
 const PRINCIPAL_ELEMENT_MIN_ATOMIC_FRACTION: f64 = 0.05;
+
+/// Maximum absolute error accepted for `sum(fractions) == 1.0`.
+///
+/// `1e-6` admits ordinary decimal round-off (for example, three fractions
+/// written as `0.333333`, `0.333333`, `0.333334`) without accepting ratios,
+/// percentages, or model output that needs normalization. PRISM rejects
+/// outside this tolerance; it never silently changes the proposed material.
+pub const COMPOSITION_SUM_TOLERANCE: f64 = 1e-6;
+
+const ELEMENT_SYMBOLS: &str = "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg Bh Hs Mt Ds Rg Cn Nh Fl Mc Lv Ts Og";
+
+fn is_element_symbol(symbol: &str) -> bool {
+    ELEMENT_SYMBOLS
+        .split_ascii_whitespace()
+        .any(|candidate| candidate == symbol)
+}
+
+/// Validate the campaign's strict atomic-fraction syntax without rewriting it.
+/// Every element must carry an explicit positive fraction, and duplicate
+/// symbols are rejected rather than combined behind the caller's back.
+fn validate_composition(
+    composition: &str,
+    allowed_elements: &[String],
+) -> std::result::Result<(), String> {
+    let composition = composition.trim();
+    if composition.is_empty() {
+        return Err("composition is empty".into());
+    }
+
+    let bytes = composition.as_bytes();
+    let mut index = 0;
+    let mut elements = BTreeSet::new();
+    let mut fractions = Vec::new();
+
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index == bytes.len() {
+            break;
+        }
+
+        let symbol_start = index;
+        if !bytes[index].is_ascii_uppercase() {
+            return Err(format!(
+                "expected an element symbol at byte {index} in '{composition}'"
+            ));
+        }
+        index += 1;
+        if index < bytes.len() && bytes[index].is_ascii_lowercase() {
+            index += 1;
+        }
+        let symbol = &composition[symbol_start..index];
+        if !is_element_symbol(symbol) {
+            return Err(format!("'{symbol}' is not a real element symbol"));
+        }
+        if !allowed_elements.is_empty() && !allowed_elements.iter().any(|item| item == symbol) {
+            return Err(format!(
+                "element {symbol} is outside the allowed set [{}]",
+                allowed_elements.join(", ")
+            ));
+        }
+        if !elements.insert(symbol.to_string()) {
+            return Err(format!("element {symbol} appears more than once"));
+        }
+
+        let fraction_start = index;
+        let mut digits = 0;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+            digits += 1;
+        }
+        if index < bytes.len() && bytes[index] == b'.' {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+                digits += 1;
+            }
+        }
+        if digits == 0 {
+            return Err(format!(
+                "element {symbol} must have an explicit numeric fraction"
+            ));
+        }
+        if index < bytes.len() && matches!(bytes[index], b'e' | b'E') {
+            index += 1;
+            if index < bytes.len() && matches!(bytes[index], b'+' | b'-') {
+                index += 1;
+            }
+            let exponent_start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if exponent_start == index {
+                return Err(format!("invalid exponent for element {symbol}"));
+            }
+        }
+
+        let token = &composition[fraction_start..index];
+        let fraction = token
+            .parse::<f64>()
+            .map_err(|_| format!("invalid fraction '{token}' for element {symbol}"))?;
+        if !fraction.is_finite() {
+            return Err(format!("fraction for element {symbol} must be finite"));
+        }
+        if fraction <= 0.0 {
+            return Err(format!(
+                "fraction for element {symbol} must be strictly positive"
+            ));
+        }
+        fractions.push(fraction);
+
+        if index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && !bytes[index].is_ascii_uppercase()
+        {
+            return Err(format!(
+                "unexpected character after fraction for element {symbol}"
+            ));
+        }
+    }
+
+    let sum: f64 = fractions.iter().sum();
+    if !sum.is_finite() {
+        return Err("composition fraction sum must be finite".into());
+    }
+    if (sum - 1.0).abs() > COMPOSITION_SUM_TOLERANCE {
+        return Err(format!(
+            "composition fractions must sum to 1.0 ± {COMPOSITION_SUM_TOLERANCE:.6}; got {sum:.6}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_allowed_elements(elements: &[String]) -> std::result::Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for symbol in elements {
+        if !is_element_symbol(symbol) {
+            return Err(format!("'{symbol}' is not a real allowed element symbol"));
+        }
+        if !seen.insert(symbol) {
+            return Err(format!("allowed element {symbol} appears more than once"));
+        }
+    }
+    Ok(())
+}
 
 /// Conventional lower bound for the ideal configurational entropy of an HEA:
 /// `1.5R`, conventionally rounded to 12.47 J/(mol K).
@@ -398,14 +544,65 @@ pub struct Candidate {
     pub source: String,
 }
 
-/// A candidate evaluated by the real descriptor tool but excluded from the
-/// ranking because it violated one or more configured hard constraints.
+/// A candidate excluded by a hard compositional constraint. The `evaluated`
+/// field distinguishes descriptor-based rejection from strict composition
+/// validation that stopped before evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConstraintRejection {
+    /// Present only when a syntactically valid composition reached the
+    /// evaluator. Invalid raw proposals are intentionally not checkpointed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub composition: String,
     pub properties: serde_json::Value,
     pub iteration: usize,
     pub reasons: Vec<String>,
+    /// Whether the descriptor evaluator actually received this composition.
+    /// Defaults to true so checkpoints from before this field remain honest.
+    #[serde(default = "rejection_was_evaluated")]
+    pub evaluated: bool,
+    /// Live-run evidence for logs and the terminal summary. Serde must never
+    /// put a malformed composition into a checkpoint.
+    #[serde(skip)]
+    raw_proposal: Option<String>,
+}
+
+fn rejection_was_evaluated() -> bool {
+    true
+}
+
+impl ConstraintRejection {
+    fn invalid_proposal(raw_proposal: String, iteration: usize, reason: String) -> Self {
+        Self {
+            composition: String::new(),
+            properties: serde_json::json!({ "evaluation_skipped": true }),
+            iteration,
+            reasons: vec![reason],
+            evaluated: false,
+            raw_proposal: Some(raw_proposal),
+        }
+    }
+
+    fn display_composition(&self) -> &str {
+        self.raw_proposal
+            .as_deref()
+            .filter(|raw| !raw.is_empty())
+            .or_else(|| (!self.composition.is_empty()).then_some(self.composition.as_str()))
+            .unwrap_or("<invalid proposal; raw value not checkpointed>")
+    }
+
+    fn durable_composition_label(&self) -> &str {
+        if self.evaluated {
+            &self.composition
+        } else {
+            "<invalid proposal; raw value not checkpointed>"
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompositionProposal {
+    raw: String,
+    rejection_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -440,8 +637,9 @@ pub struct CampaignState {
     /// All accepted candidates evaluated so far, ranked by reward (best first).
     /// (Materials campaigns only.)
     pub candidates: Vec<Candidate>,
-    /// Evaluated candidates excluded by hard constraints. Persisted so a
-    /// rejection is visible in summaries and survives interruption/resume.
+    /// Candidates excluded by hard constraints, including invalid proposals
+    /// stopped before evaluation. Persisted counts/reasons survive resume;
+    /// malformed raw proposal strings are deliberately not checkpointed.
     #[serde(default)]
     pub rejected_candidates: Vec<ConstraintRejection>,
     /// Current iteration number (0-based).
@@ -570,9 +768,24 @@ impl CampaignState {
     }
 
     /// Total number of candidates evaluated by the descriptor tool, including
-    /// candidates subsequently rejected by a hard constraint.
+    /// candidates subsequently rejected by a descriptor-based hard constraint.
+    /// Invalid proposals rejected before evaluation are deliberately excluded.
     pub fn total_evaluated(&self) -> usize {
-        self.candidates.len() + self.rejected_candidates.len()
+        self.candidates.len()
+            + self
+                .rejected_candidates
+                .iter()
+                .filter(|rejection| rejection.evaluated)
+                .count()
+    }
+
+    /// Number of proposals rejected by composition validation before any
+    /// descriptor calculation could score them.
+    pub fn total_rejected_before_evaluation(&self) -> usize {
+        self.rejected_candidates
+            .iter()
+            .filter(|rejection| !rejection.evaluated)
+            .count()
     }
 
     /// Number of evaluated candidates admitted to the ranking.
@@ -657,6 +870,12 @@ impl CampaignState {
                 "Candidates rejected by hard constraints: {}\n",
                 self.rejected_candidates.len()
             ));
+            let before_evaluation = self.total_rejected_before_evaluation();
+            if before_evaluation > 0 {
+                s.push_str(&format!(
+                    "Candidates rejected before evaluation: {before_evaluation}\n"
+                ));
+            }
         }
         s.push_str(&format!("Budget: {}\n", self.budget_status()));
         s.push_str(&format!("Avg reward: {:.4}\n", self.avg_reward()));
@@ -696,7 +915,7 @@ impl CampaignState {
             for rejection in &self.rejected_candidates {
                 s.push_str(&format!(
                     "  - {} (iter {}) — {}{}\n",
-                    rejection.composition,
+                    rejection.display_composition(),
                     rejection.iteration,
                     rejection.reasons.join("; "),
                     summarize_descriptors(&rejection.properties)
@@ -739,6 +958,42 @@ fn summarize_descriptors(properties: &serde_json::Value) -> String {
     } else {
         format!("; descriptors: {}", descriptors.join(", "))
     }
+}
+
+/// Final persistence guard. Proposal and evaluator checks are the primary
+/// boundary; this prevents a future constructor or a legacy/corrupt checkpoint
+/// from publishing an invalid candidate as resumable campaign state.
+fn validate_checkpoint_compositions(state: &CampaignState) -> Result<()> {
+    validate_allowed_elements(&state.goal.elements)
+        .map_err(|reason| anyhow::anyhow!("invalid campaign allowed-element set: {reason}"))?;
+
+    for seed in &state.goal.seeds {
+        validate_composition(seed, &state.goal.elements)
+            .map_err(|reason| anyhow::anyhow!("invalid campaign seed '{seed}': {reason}"))?;
+    }
+    for candidate in &state.candidates {
+        validate_composition(&candidate.composition, &state.goal.elements).map_err(|reason| {
+            anyhow::anyhow!(
+                "invalid accepted candidate '{}': {reason}",
+                candidate.composition
+            )
+        })?;
+    }
+    for rejection in &state.rejected_candidates {
+        if rejection.evaluated {
+            validate_composition(&rejection.composition, &state.goal.elements).map_err(
+                |reason| {
+                    anyhow::anyhow!(
+                        "invalid evaluated rejection '{}': {reason}",
+                        rejection.composition
+                    )
+                },
+            )?;
+        } else if !rejection.composition.is_empty() {
+            bail!("invalid pre-evaluation rejection must not retain a checkpointed composition");
+        }
+    }
+    Ok(())
 }
 
 // ── Campaign Result ─────────────────────────────────────────────────
@@ -1022,6 +1277,12 @@ impl Campaign {
             .with_context(|| format!("failed to read campaign checkpoint: {}", path.display()))?;
         let mut state: CampaignState = serde_json::from_str(&text)
             .context("failed to parse campaign checkpoint (version mismatch?)")?;
+        validate_checkpoint_compositions(&state).with_context(|| {
+            format!(
+                "campaign checkpoint {} contains an invalid composition",
+                path.display()
+            )
+        })?;
         // Back-compat: checkpoints written before `status` existed carry
         // only the legacy flags — derive the status from them.
         if state.status == GoalStatus::Submitted {
@@ -1206,9 +1467,9 @@ impl Campaign {
         if self.state.candidates.is_empty() {
             if let Some(last) = self.state.rejected_candidates.last() {
                 bail!(
-                    "{reason} reached with zero candidates satisfying the hard compositional constraints — {} evaluated proposals were REJECTED; last rejection: {} ({})",
+                    "{reason} reached with zero candidates satisfying the hard compositional constraints — {} proposals were REJECTED; last rejection: {} ({})",
                     self.state.rejected_candidates.len(),
-                    last.composition,
+                    last.durable_composition_label(),
                     last.reasons.join("; ")
                 );
             }
@@ -1530,11 +1791,41 @@ impl Campaign {
         // ── 2. Evaluate each candidate ───────────────────────────────
         let mut evaluated: Vec<Candidate> = Vec::new();
         let mut rejected = 0;
+        let mut evaluation_attempts = 0;
         let mut evaluation_failures = 0;
         let mut iteration_cost = 0.0;
         let mut last_err: Option<anyhow::Error> = None;
         for comp in &proposals {
-            match self.evaluate_candidate(comp, iter).await {
+            if let Some(reason) = &comp.rejection_reason {
+                self.record_event(
+                    "campaign.reject",
+                    serde_json::json!({
+                        "iteration": iter,
+                        "composition": &comp.raw,
+                        "evaluation_skipped": true,
+                        "hard_constraint_violations": [reason],
+                    }),
+                )
+                .await;
+                rejected += 1;
+                warn!(
+                    campaign = %self.state.campaign_id,
+                    composition = %comp.raw,
+                    reason,
+                    "candidate REJECTED by composition validation before evaluation"
+                );
+                self.state
+                    .rejected_candidates
+                    .push(ConstraintRejection::invalid_proposal(
+                        comp.raw.clone(),
+                        iter,
+                        reason.clone(),
+                    ));
+                continue;
+            }
+
+            evaluation_attempts += 1;
+            match self.evaluate_candidate(&comp.raw, iter).await {
                 Ok(CandidateEvaluation::Accepted(candidate)) => {
                     iteration_cost += reported_cost(&candidate.properties);
                     evaluated.push(candidate);
@@ -1544,7 +1835,7 @@ impl Campaign {
                     rejected += 1;
                     warn!(
                         campaign = %self.state.campaign_id,
-                        composition = %rejection.composition,
+                        composition = %rejection.display_composition(),
                         reasons = %rejection.reasons.join("; "),
                         "candidate REJECTED by hard compositional constraints"
                     );
@@ -1553,7 +1844,7 @@ impl Campaign {
                 Err(e) => {
                     warn!(
                         campaign = %self.state.campaign_id,
-                        composition = %comp,
+                        composition = %comp.raw,
                         error = %e,
                         "evaluation failed for candidate"
                     );
@@ -1567,13 +1858,12 @@ impl Campaign {
         // progress — it is the evaluator being down. Hard-constraint
         // rejections are measured outcomes, not evaluator failures, and are
         // kept visible without synthesizing replacement candidates.
-        if evaluation_failures == proposals.len() && !proposals.is_empty() {
+        if evaluation_attempts > 0 && evaluation_failures == evaluation_attempts {
             let detail = last_err
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_else(|| "unknown error".into());
             bail!(
-                "iteration {iter}: all {} candidate evaluations failed — {detail}",
-                proposals.len()
+                "iteration {iter}: all {evaluation_attempts} candidate evaluations failed — {detail}"
             );
         }
         let n_accepted = evaluated.len();
@@ -1613,6 +1903,7 @@ impl Campaign {
                 "proposed": proposals.len(),
                 "accepted": n_accepted,
                 "rejected": rejected,
+                "evaluation_attempts": evaluation_attempts,
                 "evaluation_failures": evaluation_failures,
                 "total_evaluated": self.state.total_evaluated(),
                 "best_reward": self.state.best().map(|c| c.reward),
@@ -1640,13 +1931,21 @@ impl Campaign {
     /// On iteration 0, uses seed data or asks the LLM to propose.
     /// On later iterations, asks the LLM to propose variations around
     /// the best-performing candidates so far (adaptive narrowing).
-    async fn propose_candidates(&mut self) -> Result<Vec<String>> {
+    async fn propose_candidates(&mut self) -> Result<Vec<CompositionProposal>> {
         let batch = self.state.config.batch_size;
         let iter = self.state.current_iteration;
 
         if iter == 0 && !self.state.goal.seeds.is_empty() {
             // Use provided seeds for the first iteration.
-            let seeds: Vec<String> = self.state.goal.seeds.iter().take(batch).cloned().collect();
+            let seeds = self
+                .state
+                .goal
+                .seeds
+                .iter()
+                .take(batch)
+                .cloned()
+                .map(|raw| self.validate_proposal(raw))
+                .collect();
             return Ok(seeds);
         }
 
@@ -1799,7 +2098,7 @@ impl Campaign {
             for rejection in self.state.rejected_candidates.iter().rev().take(5) {
                 prompt.push_str(&format!(
                     "  {} — {}\n",
-                    rejection.composition,
+                    rejection.display_composition(),
                     rejection.reasons.join("; ")
                 ));
             }
@@ -1826,43 +2125,46 @@ impl Campaign {
         prompt
     }
 
-    /// Parse composition strings from an LLM response.
-    /// Handles JSON arrays, newline-separated lists, and free text.
-    fn parse_compositions(&self, text: &str) -> Vec<String> {
-        // Try JSON array first.
-        if let Ok(arr) = serde_json::from_str::<Vec<String>>(text.trim()) {
-            return arr;
-        }
-
-        // Try to find a JSON array anywhere in the text.
-        if let Some(start) = text.find('[')
+    /// Extract and validate composition strings from an LLM response.
+    /// Handles JSON arrays, newline-separated lists, and free text. Malformed
+    /// strings remain in the returned batch as visible rejection records.
+    fn parse_compositions(&self, text: &str) -> Vec<CompositionProposal> {
+        let raw_compositions = if let Ok(arr) = serde_json::from_str::<Vec<String>>(text.trim()) {
+            arr
+        } else if let Some(start) = text.find('[')
             && let Some(end) = text[start..].find(']')
+            && let Ok(arr) = serde_json::from_str::<Vec<String>>(&text[start..start + end + 1])
         {
-            let json = &text[start..start + end + 1];
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json) {
-                return arr;
-            }
-        }
+            arr
+        } else {
+            text.lines()
+                .filter_map(|line| {
+                    let line = line.trim().trim_start_matches(|c: char| {
+                        c == '-' || c == '*' || c == '•' || c == '.' || c == ' '
+                    });
+                    if line.is_empty() || line.len() < 3 {
+                        return None;
+                    }
+                    let looks_like_comp = line.chars().any(|c| c.is_ascii_uppercase())
+                        && line.chars().any(|c| c.is_ascii_digit() || c == '.');
+                    (looks_like_comp && !line.starts_with("Propose") && !line.starts_with("Goal"))
+                        .then(|| line.to_string())
+                })
+                .collect()
+        };
 
-        // Fall back to line-by-line parsing — each non-empty line that
-        // looks like a composition (contains an element symbol + fraction).
-        let mut comps = Vec::new();
-        for line in text.lines() {
-            let line = line.trim().trim_start_matches(|c: char| {
-                c == '-' || c == '*' || c == '•' || c == '.' || c == ' '
-            });
-            if line.is_empty() || line.len() < 3 {
-                continue;
-            }
-            // Heuristic: contains at least one uppercase letter followed by
-            // a digit or another uppercase letter.
-            let looks_like_comp = line.chars().any(|c| c.is_ascii_uppercase())
-                && line.chars().any(|c| c.is_ascii_digit() || c == '.');
-            if looks_like_comp && !line.starts_with("Propose") && !line.starts_with("Goal") {
-                comps.push(line.to_string());
-            }
+        raw_compositions
+            .into_iter()
+            .map(|raw| self.validate_proposal(raw))
+            .collect()
+    }
+
+    fn validate_proposal(&self, raw: String) -> CompositionProposal {
+        let rejection_reason = validate_composition(&raw, &self.state.goal.elements).err();
+        CompositionProposal {
+            raw,
+            rejection_reason,
         }
-        comps
     }
 
     /// Evaluate a single candidate composition.
@@ -1874,6 +2176,14 @@ impl Campaign {
         composition: &str,
         iteration: usize,
     ) -> Result<CandidateEvaluation> {
+        // Defensive evaluator boundary: callers inside this crate must not be
+        // able to bypass proposal validation and score a different material.
+        if let Err(reason) = validate_composition(composition, &self.state.goal.elements) {
+            return Ok(CandidateEvaluation::Rejected(
+                ConstraintRejection::invalid_proposal(composition.to_string(), iteration, reason),
+            ));
+        }
+
         // Call the PRISM node's registered HEA evaluation tool.
         let base = self.state.config.node_base_url.clone().unwrap_or_else(|| {
             let port = std::env::var("PRISM_NODE_PORT").unwrap_or_else(|_| "7327".to_string());
@@ -1902,6 +2212,8 @@ impl Campaign {
                 properties: resp_body,
                 iteration,
                 reasons: violations,
+                evaluated: true,
+                raw_proposal: None,
             }));
         }
 
@@ -2069,6 +2381,7 @@ impl Campaign {
     /// file that `from_checkpoint` could not parse: the goal, its budget and
     /// all its accumulated work, gone. A rename either happens or does not.
     pub fn checkpoint(&mut self) -> Result<()> {
+        validate_checkpoint_compositions(&self.state)?;
         let now = Utc::now().to_rfc3339();
         self.state.last_checkpoint_at.clone_from(&now);
         if self.state.status == GoalStatus::Running {
@@ -2287,7 +2600,7 @@ mod tests {
         *model.lock().unwrap() = body["model"].as_str().map(str::to_string);
         Json(json!({
             "choices": [{
-                "message": { "content": "[\"W0.5 Mo0.5\"]" }
+                "message": { "content": "[\"Ti0.5 Al0.5\"]" }
             }]
         }))
     }
@@ -2466,6 +2779,97 @@ mod tests {
         assert!(!state.completed);
         assert!(!state.paused);
         assert_eq!(state.total_evaluated(), 0);
+    }
+
+    #[test]
+    fn composition_validation_enforces_symbols_fractions_sum_and_allowed_set() {
+        let allowed = ["W", "Mo", "Ta", "Nb", "V"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        validate_composition("W0.5000005 Mo0.4999995", &allowed)
+            .expect("ordinary decimal round-off is inside the 1e-6 tolerance");
+        assert!(
+            validate_composition("Xx0.5 W0.5", &allowed)
+                .unwrap_err()
+                .contains("real element")
+        );
+        assert!(
+            validate_composition("W0.5 Re0.5", &allowed)
+                .unwrap_err()
+                .contains("allowed set")
+        );
+        assert!(
+            validate_composition("W1.0 Mo0", &allowed)
+                .unwrap_err()
+                .contains("strictly positive")
+        );
+        assert!(
+            validate_composition("W1e309 Mo0.1", &allowed)
+                .unwrap_err()
+                .contains("finite")
+        );
+        assert!(
+            validate_composition("W0.6 Mo0.2 Ta0.4 Nb0.4 V0.4", &allowed)
+                .unwrap_err()
+                .contains("got 2.000000")
+        );
+
+        let rejection = ConstraintRejection::invalid_proposal(
+            "W0.6 Mo0.2 Ta0.4 Nb0.4 V0.4".into(),
+            0,
+            "unit sum violation".into(),
+        );
+        assert_eq!(
+            rejection.durable_composition_label(),
+            "<invalid proposal; raw value not checkpointed>"
+        );
+    }
+
+    #[test]
+    fn checkpoint_writer_refuses_an_invalid_ranked_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut campaign = Campaign::new(
+            CampaignGoal {
+                description: "refractory alloy".into(),
+                elements: ["W", "Mo", "Ta", "Nb", "V"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                objective: "maximize melting point".into(),
+                constraints: vec![],
+                seeds: vec![],
+            },
+            CampaignConfig {
+                checkpoint_dir: Some(tmp.path().to_path_buf()),
+                ..Default::default()
+            },
+            "invalid-checkpoint".into(),
+        );
+        campaign.state.candidates.push(Candidate {
+            composition: "W0.6 Mo0.2 Ta0.4 Nb0.4 V0.4".into(),
+            properties: json!({"Tm_estimate_K": 3042.7}),
+            reward: 3042.7,
+            iteration: 0,
+            source: "llm".into(),
+        });
+
+        let error = campaign
+            .checkpoint()
+            .expect_err("invalid ranked candidates must not be checkpointed");
+
+        assert!(error.to_string().contains("invalid accepted candidate"));
+        let path = tmp.path().join("invalid-checkpoint.json");
+        assert!(!path.exists());
+
+        // A legacy/corrupt file containing the live defect cannot be loaded
+        // and reported as a winner either.
+        std::fs::write(&path, serde_json::to_vec(&campaign.state).unwrap()).unwrap();
+        let load_error = Campaign::from_checkpoint(&path)
+            .err()
+            .expect("invalid legacy checkpoint must be rejected");
+        assert!(load_error.to_string().contains("invalid composition"));
     }
 
     #[test]
@@ -2683,9 +3087,14 @@ mod tests {
     #[test]
     fn parse_compositions_json_array() {
         let campaign = Campaign::new(test_goal(), CampaignConfig::default(), "c1".into());
-        let parsed = campaign.parse_compositions("[\"W0.3 Mo0.2\", \"Ta0.5 Nb0.5\"]");
+        let parsed = campaign.parse_compositions("[\"Ti0.8 Al0.2\", \"Cr0.5 V0.5\"]");
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0], "W0.3 Mo0.2");
+        assert_eq!(parsed[0].raw, "Ti0.8 Al0.2");
+        assert!(
+            parsed
+                .iter()
+                .all(|proposal| proposal.rejection_reason.is_none())
+        );
     }
 
     #[tokio::test]
@@ -2744,7 +3153,9 @@ mod tests {
             .await
             .expect("LLM_API_BASE should override the campaign endpoint");
 
-        assert_eq!(proposals, vec!["W0.5 Mo0.5"]);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].raw, "Ti0.5 Al0.5");
+        assert!(proposals[0].rejection_reason.is_none());
         server.abort();
     }
 
@@ -2789,7 +3200,9 @@ mod tests {
             .await
             .expect("configured target should serve proposals");
 
-        assert_eq!(proposals, vec!["W0.5 Mo0.5"]);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].raw, "Ti0.5 Al0.5");
+        assert!(proposals[0].rejection_reason.is_none());
         assert_eq!(
             captured_model.lock().unwrap().as_deref(),
             Some("target-model")
@@ -2803,7 +3216,12 @@ mod tests {
         let text = "Here are my suggestions:\n[\"Ti0.8 Al0.2\", \"Ti0.7 V0.3\"]\nGood luck!";
         let parsed = campaign.parse_compositions(text);
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0], "Ti0.8 Al0.2");
+        assert_eq!(parsed[0].raw, "Ti0.8 Al0.2");
+        assert!(
+            parsed
+                .iter()
+                .all(|proposal| proposal.rejection_reason.is_none())
+        );
     }
 
     #[test]
