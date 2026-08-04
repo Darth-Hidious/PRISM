@@ -243,9 +243,9 @@ class TestCalphadComputeDispatcher:
         r = calphad_registry.get("calphad_compute").execute()
         assert "error" in r and "Missing 'action'" in r["error"]
 
-    def test_phase_diagram_requires_db(self, calphad_registry):
+    def test_phase_diagram_requires_components(self, calphad_registry):
         r = calphad_registry.get("calphad_compute").execute(action="phase_diagram")
-        assert "error" in r and "database_name" in r["error"]
+        assert "error" in r and "components" in r["error"]
 
     def test_equilibrium_requires_conditions(self, calphad_registry):
         r = calphad_registry.get("calphad_compute").execute(
@@ -259,11 +259,31 @@ class TestCalphadComputeDispatcher:
         )
         assert "error" in r and "temperature" in r["error"]
 
-    def test_phase_diagram_dispatches(self, calphad_registry):
-        with patch("app.tools.calphad._calculate_phase_diagram", return_value={"diagram": {}}) as m:
+    def test_phase_diagram_dispatches_after_source_resolution(
+        self, calphad_registry, tmp_path
+    ):
+        synthetic_tdb = tmp_path / "synthetic.tdb"
+        synthetic_tdb.write_text("$ synthetic test TDB\n")
+        source = MagicMock(
+            access_kind="file",
+            path=synthetic_tdb,
+            source_id="alni",
+        )
+        resolver = MagicMock()
+        resolver.resolve.return_value = source
+        with (
+            patch(
+                "app.tools.licensed_sources.get_licensed_source_resolver",
+                return_value=resolver,
+            ),
+            patch(
+                "app.tools.calphad._calculate_phase_diagram",
+                return_value={"diagram": {}},
+            ) as calculation,
+        ):
             calphad_registry.get("calphad_compute").execute(
                 action="phase_diagram",
                 database_name="alni",
                 components=["Al", "Ni"],
             )
-            m.assert_called_once()
+            calculation.assert_called_once()

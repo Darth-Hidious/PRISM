@@ -43,6 +43,8 @@ def _calculate_phase_diagram(**kwargs) -> dict:
             phases=phases,
             temperature_range=temperature_range,
             pressure=pressure,
+            database_path=kwargs.get("_database_path"),
+            licensed_source=kwargs.get("_licensed_source"),
         )
     except Exception as e:
         return {"error": str(e)}
@@ -66,6 +68,8 @@ def _calculate_equilibrium(**kwargs) -> dict:
             components=components,
             phases=phases,
             conditions=conditions,
+            database_path=kwargs.get("_database_path"),
+            licensed_source=kwargs.get("_licensed_source"),
         )
     except Exception as e:
         return {"error": str(e)}
@@ -91,6 +95,8 @@ def _calculate_gibbs_energy(**kwargs) -> dict:
             phases=phases,
             temperature=temperature,
             pressure=pressure,
+            database_path=kwargs.get("_database_path"),
+            licensed_source=kwargs.get("_licensed_source"),
         )
     except Exception as e:
         return {"error": str(e)}
@@ -140,7 +146,15 @@ def _import_database(**kwargs) -> dict:
         source_path = kwargs["source_path"]
         name = kwargs.get("name")
 
-        return bridge.databases.import_database(source_path, name)
+        result = bridge.databases.import_database(source_path, name)
+        if result.get("imported"):
+            result["coverage_validated"] = False
+            result["install_hint"] = (
+                "Declare this owned file's elements, validated systems, version, "
+                "licence and evidence class in ~/.prism/licensed_sources.json "
+                "before computing. Import alone does not establish coverage."
+            )
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -184,42 +198,86 @@ def _calphad(**kwargs) -> dict:
 
 
 def _calphad_compute(**kwargs) -> dict:
-    """Compute-heavy local CALPHAD dispatcher (pycalphad). Approval-gated —
-    runs locally, no credits charged.
-
-    Replaces calculate_phase_diagram / calculate_equilibrium /
-    calculate_gibbs_energy. All three are real CALPHAD calculations
-    that take seconds to minutes and produce structured results.
-    """
+    """Resolve a coverage-validated TDB, then dispatch a real calculation."""
     action = kwargs.pop("action", None)
     if not action:
         return {
             "error": "Missing 'action'. Valid: phase_diagram, equilibrium, gibbs",
             "hint": (
-                "calphad_compute(action='phase_diagram', database_name='...', components=[...]) / "
-                "calphad_compute(action='equilibrium', database_name='...', components=[...], conditions={...}) / "
-                "calphad_compute(action='gibbs', database_name='...', components=[...], phases=[...], temperature=...)"
+                "calphad_compute(action='phase_diagram', components=[...]) / "
+                "calphad_compute(action='equilibrium', components=[...], conditions={...}) / "
+                "calphad_compute(action='gibbs', components=[...], phases=[...], temperature=...)"
             ),
         }
-
-    if not kwargs.get("database_name"):
-        return {"error": f"Action '{action}' requires `database_name`"}
+    if action not in {"phase_diagram", "equilibrium", "gibbs"}:
+        return {
+            "error": f"Unknown action '{action}'. Valid: phase_diagram, equilibrium, gibbs"
+        }
     if not kwargs.get("components"):
         return {"error": f"Action '{action}' requires `components` (list)"}
-
-    if action == "phase_diagram":
-        return _calculate_phase_diagram(**kwargs)
-    if action == "equilibrium":
-        if not kwargs.get("conditions"):
-            return {"error": "Action 'equilibrium' requires `conditions` dict"}
-        return _calculate_equilibrium(**kwargs)
+    if action == "equilibrium" and not kwargs.get("conditions"):
+        return {"error": "Action 'equilibrium' requires `conditions` dict"}
     if action == "gibbs":
         if not kwargs.get("phases"):
             return {"error": "Action 'gibbs' requires `phases` list"}
         if "temperature" not in kwargs:
             return {"error": "Action 'gibbs' requires `temperature`"}
-        return _calculate_gibbs_energy(**kwargs)
-    return {"error": f"Unknown action '{action}'. Valid: phase_diagram, equilibrium, gibbs"}
+
+    from app.tools.licensed_sources import (
+        SourceRefusal,
+        SourceRequest,
+        get_licensed_source_resolver,
+    )
+
+    request = SourceRequest.thermodynamic_database(
+        kwargs["components"],
+        preferred_source=kwargs.get("database_name"),
+    )
+    resolved = get_licensed_source_resolver().resolve(request)
+    if isinstance(resolved, SourceRefusal):
+        return resolved.as_dict()
+    if resolved.access_kind != "file" or resolved.path is None:
+        return {
+            "status": "refused",
+            "error": (
+                f"Entitled TDB '{resolved.name}' is not attached as a readable "
+                "file for local pycalphad execution"
+            ),
+            "refusal": {
+                "code": "licensed_source_access_unavailable",
+                "source_type": resolved.source_type.value,
+                "source": resolved.provenance(),
+                "access_kind": resolved.access_kind,
+            },
+            "install_hint": (
+                "Attach the entitled source through the platform as a file mount, "
+                "or configure an already-owned local TDB file. No database was "
+                "downloaded or substituted."
+            ),
+        }
+    if not resolved.path.is_file():
+        return {
+            "status": "refused",
+            "error": f"Resolved TDB file is unavailable: {resolved.path}",
+            "refusal": {
+                "code": "licensed_source_file_unavailable",
+                "source_type": resolved.source_type.value,
+                "source": resolved.provenance(),
+            },
+            "install_hint": (
+                "Restore the configured file or platform mount. No database was "
+                "downloaded or substituted."
+            ),
+        }
+
+    kwargs["database_name"] = resolved.source_id
+    kwargs["_database_path"] = resolved.path
+    kwargs["_licensed_source"] = resolved
+    if action == "phase_diagram":
+        return _calculate_phase_diagram(**kwargs)
+    if action == "equilibrium":
+        return _calculate_equilibrium(**kwargs)
+    return _calculate_gibbs_energy(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -229,14 +287,15 @@ def _calphad_compute(**kwargs) -> dict:
 _CALPHAD_DESCRIPTION = (
     "CALPHAD database catalog + IO operations (read-only / no compute). "
     "ONE tool, three actions:\n"
-    "  • action='list_databases' — show available TDB thermodynamic database "
-    "files in the PRISM-managed directory. No args.\n"
+    "  • action='list_databases' — show raw TDB files in the PRISM-managed "
+    "directory. Presence here does not establish validated coverage. No args.\n"
     "  • action='list_phases' — list phases available in a database, "
     "optionally filtered by components. Required: `database_name`. "
     "Optional: `components` to filter.\n"
     "  • action='import' — import a TDB database file into PRISM's managed "
     "directory. Required: `source_path`. Optional: `name` (default: file "
-    "stem).\n"
+    "stem). Import does not assert coverage; configure source metadata before "
+    "compute.\n"
     "For actual CALPHAD calculations (phase diagrams, equilibrium, Gibbs "
     "energy), use the separate `calphad_compute` tool — those are "
     "approval-gated because they spend compute budget."
@@ -246,25 +305,26 @@ _CALPHAD_DESCRIPTION = (
 _CALPHAD_COMPUTE_DESCRIPTION = (
     "CALPHAD thermodynamic calculations. ONE tool, three actions. "
     "COMPUTE-HEAVY (runs locally via pycalphad, no credits charged) — "
-    "requires_approval=True; the harness will prompt before each call.\n"
+    "requires_approval=True; the harness will prompt before each call. "
+    "Before computing, PRISM resolves a source in strict order: configured "
+    "owned file, server-confirmed entitled source, structured refusal. A TDB "
+    "must declare a validated system covering every requested component; "
+    "element presence alone is insufficient. `database_name` is an optional "
+    "preferred source id/name, never an entitlement assertion.\n"
     "  • action='phase_diagram' — calculate a binary/ternary phase diagram. "
-    "Required: `database_name`, `components` (e.g. ['Al', 'Ni']). "
-    "Optional: `phases`, `temperature_range` (default [300, 2000, 50]), "
-    "`pressure` (default 101325 Pa).\n"
+    "Required: `components` (e.g. ['Al', 'Ni']). Optional: `database_name`, "
+    "`phases`, `temperature_range` (default [300, 2000, 50]), `pressure` "
+    "(default 101325 Pa).\n"
     "  • action='equilibrium' — calculate equilibrium at specific T/P/X. "
-    "Required: `database_name`, `components`, `conditions` (dict like "
-    "{T: 1000, P: 101325, 'X(AL)': 0.3}). Optional: `phases`.\n"
+    "Required: `components`, `conditions` (dict like {T: 1000, P: 101325, "
+    "'X(AL)': 0.3}). Optional: `database_name`, `phases`.\n"
     "  • action='gibbs' — Gibbs energy surface for specified phases at a "
-    "given temperature. Required: `database_name`, `components`, `phases`, "
-    "`temperature`. Optional: `pressure`.\n"
-    "Use `calphad(action='list_databases')` first to discover what's "
-    "available, then `calphad(action='list_phases')` to see what phases "
-    "the database covers.\n"
-    "Every successful result carries a `provenance` block: pycalphad "
-    "version, the SHA-256 of the TDB file used, the exact conditions, the "
-    "units (Gibbs energy J/mol-atom, T in K, P in Pa) and a `reproduce` "
-    "string. Quote it when reporting a number — it is what makes the "
-    "number checkable."
+    "given temperature. Required: `components`, `phases`, `temperature`. "
+    "Optional: `database_name`, `pressure`.\n"
+    "Every successful result carries source id, database version, licence, "
+    "coverage, source evidence class, TDB SHA-256, pycalphad version, exact "
+    "conditions, units and a reproduce string. Licensed input never promotes "
+    "its evidence class."
 )
 
 
@@ -329,7 +389,11 @@ def create_calphad_tools(registry: ToolRegistry) -> None:
                 },
                 "database_name": {
                     "type": "string",
-                    "description": "TDB database name. Required for all actions.",
+                    "description": (
+                        "Optional preferred licensed-source id or name. The source "
+                        "must still pass local-file or server-side entitlement and "
+                        "coverage checks."
+                    ),
                 },
                 "components": {
                     "type": "array",

@@ -106,23 +106,29 @@ class DatabaseStore:
             "imported": True,
         }
 
-    def load(self, name: str) -> Any:
+    def load(self, name: str, database_path: Optional[Path] = None) -> Any:
         """Load and cache a pycalphad Database object. Returns None if not found."""
-        if name in self._cache:
-            return self._cache[name]
-
-        db_path = self._base_dir / f"{name}.tdb"
-        if not db_path.exists():
+        db_path = Path(database_path) if database_path else self._base_dir / f"{name}.tdb"
+        cache_key = str(db_path.resolve())
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        if not db_path.is_file():
             return None
 
         from pycalphad import Database
+
         db = Database(str(db_path))
-        self._cache[name] = db
+        self._cache[cache_key] = db
         return db
 
-    def get_phases(self, name: str, components: Optional[List[str]] = None) -> Optional[List[str]]:
+    def get_phases(
+        self,
+        name: str,
+        components: Optional[List[str]] = None,
+        database_path: Optional[Path] = None,
+    ) -> Optional[List[str]]:
         """List phases in a database, optionally filtered by components."""
-        db = self.load(name)
+        db = self.load(name, database_path)
         if db is None:
             return None
 
@@ -211,6 +217,24 @@ def _serialize_calc_result(calc_result) -> dict:
     return data
 
 
+def _attach_calphad_result(
+    result: dict,
+    provenance: dict,
+    licensed_source: Any = None,
+) -> dict:
+    """Attach provenance and cap evidence at the licensed source's class."""
+    result = prov.attach(result, provenance)
+    if licensed_source is not None and "error" not in result:
+        from app.tools.evidence import EvidenceSource, stamp_evidence
+
+        stamp_evidence(
+            result,
+            EvidenceSource.EXECUTION,
+            [licensed_source.evidence_class],
+        )
+    return result
+
+
 class CalphadBridge:
     """Thin bridge between PRISM tools and pycalphad.
 
@@ -227,6 +251,8 @@ class CalphadBridge:
         database_name: str,
         inputs: Dict[str, Any],
         reproduce: str,
+        database_path: Optional[Path] = None,
+        licensed_source: Any = None,
     ) -> Dict[str, Any]:
         """Provenance for one pycalphad call.
 
@@ -234,7 +260,16 @@ class CalphadBridge:
         thermodynamics after an edit, and a number is only reproducible if
         the reader can tell which bytes produced it.
         """
-        tdb_path = self.databases.base_dir / f"{database_name}.tdb"
+        tdb_path = (
+            Path(database_path)
+            if database_path
+            else self.databases.base_dir / f"{database_name}.tdb"
+        )
+        database_ref = prov.file_ref(tdb_path, role="thermodynamic_database")
+        source_metadata = None
+        if licensed_source is not None:
+            source_metadata = licensed_source.provenance()
+            database_ref["licensed_source"] = source_metadata
         return prov.build(
             tool_name="calphad_compute",
             engine="pycalphad",
@@ -242,8 +277,13 @@ class CalphadBridge:
             activity=activity,
             inputs=inputs,
             units=CALPHAD_UNITS,
-            derived_from=[prov.file_ref(tdb_path, role="thermodynamic_database")],
+            derived_from=[database_ref],
             reproduce=reproduce,
+            extra=(
+                {"licensed_source": source_metadata}
+                if source_metadata is not None
+                else None
+            ),
         )
 
     def calculate_equilibrium(
@@ -252,9 +292,12 @@ class CalphadBridge:
         components: List[str],
         phases: Optional[List[str]],
         conditions: Dict[str, Any],
+        *,
+        database_path: Optional[Path] = None,
+        licensed_source: Any = None,
     ) -> dict:
         """Calculate thermodynamic equilibrium at specific conditions."""
-        db = self.databases.load(database_name)
+        db = self.databases.load(database_name, database_path)
         if db is None:
             return {"error": f"Database '{database_name}' not found"}
 
@@ -267,7 +310,7 @@ class CalphadBridge:
 
         comps = _ensure_vacancy(components)
         if phases is None:
-            phase_list = self.databases.get_phases(database_name, comps)
+            phase_list = self.databases.get_phases(database_name, comps, database_path)
         else:
             phase_list = list(phases)
 
@@ -289,23 +332,29 @@ class CalphadBridge:
             result = _serialize_eq_result(eq_result)
             result["database"] = database_name
             result["components"] = comps
-            return prov.attach(result, self._provenance(
-                activity="pycalphad.equilibrium",
-                database_name=database_name,
-                inputs={
-                    "components_requested": list(components),
-                    "components_used": comps,
-                    "vacancy_added": "VA" not in components,
-                    "phases": phase_list,
-                    "conditions": conditions,
-                },
-                reproduce=(
-                    f"calphad_compute(action='equilibrium', "
-                    f"database_name={database_name!r}, "
-                    f"components={list(components)!r}, "
-                    f"phases={phases!r}, conditions={conditions!r})"
+            return _attach_calphad_result(
+                result,
+                self._provenance(
+                    activity="pycalphad.equilibrium",
+                    database_name=database_name,
+                    inputs={
+                        "components_requested": list(components),
+                        "components_used": comps,
+                        "vacancy_added": "VA" not in components,
+                        "phases": phase_list,
+                        "conditions": conditions,
+                    },
+                    reproduce=(
+                        f"calphad_compute(action='equilibrium', "
+                        f"database_name={database_name!r}, "
+                        f"components={list(components)!r}, "
+                        f"phases={phases!r}, conditions={conditions!r})"
+                    ),
+                    database_path=database_path,
+                    licensed_source=licensed_source,
                 ),
-            ))
+                licensed_source,
+            )
         except Exception as e:
             return {"error": f"Equilibrium calculation failed: {e}"}
 
@@ -316,11 +365,14 @@ class CalphadBridge:
         phases: Optional[List[str]] = None,
         temperature_range: Optional[List[float]] = None,
         pressure: float = 101325,
+        *,
+        database_path: Optional[Path] = None,
+        licensed_source: Any = None,
     ) -> dict:
         """Compute equilibrium across a temperature range for phase diagram data."""
         import numpy as np
 
-        db = self.databases.load(database_name)
+        db = self.databases.load(database_name, database_path)
         if db is None:
             return {"error": f"Database '{database_name}' not found"}
 
@@ -333,7 +385,7 @@ class CalphadBridge:
 
         comps = _ensure_vacancy(components)
         if phases is None:
-            phase_list = self.databases.get_phases(database_name, comps)
+            phase_list = self.databases.get_phases(database_name, comps, database_path)
         else:
             phase_list = list(phases)
 
@@ -366,24 +418,30 @@ class CalphadBridge:
             "n_failed_points": n_failed,
             "data_points": data_points,
         }
-        return prov.attach(result, self._provenance(
-            activity="pycalphad.equilibrium (temperature scan)",
-            database_name=database_name,
-            inputs={
-                "components_requested": list(components),
-                "components_used": comps,
-                "vacancy_added": "VA" not in components,
-                "phases": phase_list,
-                "temperature_range_K": list(temperature_range),
-                "pressure_Pa": pressure,
-            },
-            reproduce=(
-                f"calphad_compute(action='phase_diagram', "
-                f"database_name={database_name!r}, components={list(components)!r}, "
-                f"phases={phases!r}, temperature_range={list(temperature_range)!r}, "
-                f"pressure={pressure!r})"
+        return _attach_calphad_result(
+            result,
+            self._provenance(
+                activity="pycalphad.equilibrium (temperature scan)",
+                database_name=database_name,
+                inputs={
+                    "components_requested": list(components),
+                    "components_used": comps,
+                    "vacancy_added": "VA" not in components,
+                    "phases": phase_list,
+                    "temperature_range_K": list(temperature_range),
+                    "pressure_Pa": pressure,
+                },
+                reproduce=(
+                    f"calphad_compute(action='phase_diagram', "
+                    f"database_name={database_name!r}, components={list(components)!r}, "
+                    f"phases={phases!r}, temperature_range={list(temperature_range)!r}, "
+                    f"pressure={pressure!r})"
+                ),
+                database_path=database_path,
+                licensed_source=licensed_source,
             ),
-        ))
+            licensed_source,
+        )
 
     def calculate_gibbs_energy(
         self,
@@ -392,9 +450,12 @@ class CalphadBridge:
         phases: List[str],
         temperature: float,
         pressure: float = 101325,
+        *,
+        database_path: Optional[Path] = None,
+        licensed_source: Any = None,
     ) -> dict:
         """Calculate Gibbs energy surface for given phases."""
-        db = self.databases.load(database_name)
+        db = self.databases.load(database_name, database_path)
         if db is None:
             return {"error": f"Database '{database_name}' not found"}
 
@@ -408,25 +469,31 @@ class CalphadBridge:
             result["phases"] = phases
             result["temperature"] = temperature
             result["database"] = database_name
-            return prov.attach(result, self._provenance(
-                activity="pycalphad.calculate",
-                database_name=database_name,
-                inputs={
-                    "components_requested": list(components),
-                    "components_used": comps,
-                    "vacancy_added": "VA" not in components,
-                    "phases": list(phases),
-                    "temperature_K": temperature,
-                    "pressure_Pa": pressure,
-                },
-                reproduce=(
-                    f"calphad_compute(action='gibbs', "
-                    f"database_name={database_name!r}, "
-                    f"components={list(components)!r}, "
-                    f"phases={list(phases)!r}, temperature={temperature!r}, "
-                    f"pressure={pressure!r})"
+            return _attach_calphad_result(
+                result,
+                self._provenance(
+                    activity="pycalphad.calculate",
+                    database_name=database_name,
+                    inputs={
+                        "components_requested": list(components),
+                        "components_used": comps,
+                        "vacancy_added": "VA" not in components,
+                        "phases": list(phases),
+                        "temperature_K": temperature,
+                        "pressure_Pa": pressure,
+                    },
+                    reproduce=(
+                        f"calphad_compute(action='gibbs', "
+                        f"database_name={database_name!r}, "
+                        f"components={list(components)!r}, "
+                        f"phases={list(phases)!r}, temperature={temperature!r}, "
+                        f"pressure={pressure!r})"
+                    ),
+                    database_path=database_path,
+                    licensed_source=licensed_source,
                 ),
-            ))
+                licensed_source,
+            )
         except Exception as e:
             return {"error": f"Gibbs energy calculation failed: {e}"}
 
