@@ -4,7 +4,7 @@
 //! `app.theme()`), never hardcoded — so the whole UI recolors uniformly
 //! when the theme changes.
 
-use crate::app::{App, ChatLine, Focus, LineKind, Modal, Role, WorkspaceTab, first_line};
+use crate::app::{App, Focus, LineKind, Modal, Role, WorkspaceTab, first_line};
 use crate::command;
 use crate::gh;
 use crate::keymap;
@@ -1157,7 +1157,7 @@ fn draw_view_panel(f: &mut Frame, app: &App) {
 
     let ntabs = app.view.tabs.len().max(1);
     let active = app.view.active_tab.min(ntabs - 1);
-    let (tab_title, body) = app.view.tabs.get(active).cloned().unwrap_or_default();
+    let (_, body) = app.view.tabs.get(active).cloned().unwrap_or_default();
 
     // Header: title + tab bar.
     let mut header_spans: Vec<Span> = vec![Span::styled(

@@ -4,6 +4,15 @@
 //! Provides [`PrismPaths`] (XDG-based directory discovery), [`PrismCliState`]
 //! (credential persistence), and [`PlatformEndpoints`] (URL derivation for
 //! the MARC27 platform API, WebSocket, and dashboard).
+//!
+//! # Naming: this is *not* a process/execution runtime
+//!
+//! The crate name `runtime` is historical and can mislead. This crate holds
+//! **no** event loop, scheduler, task spawn, or process supervision — it is
+//! purely configuration / path / credential resolution ([`PrismPaths`],
+//! [`PrismCliState`], [`PlatformEndpoints`] are plain data + file I/O).
+//! Tokio runtimes live in the binaries/crates that actually need async;
+//! nothing here drives execution.
 
 pub mod llm_resolve;
 

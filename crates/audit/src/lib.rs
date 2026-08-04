@@ -9,6 +9,20 @@
 //! party (auditor, regulator, or the other org) can verify after
 //! the fact without coordinating with the signer.
 //!
+//! # Distinct from `prism_core::audit`
+//!
+//! PRISM has **two unrelated audit systems that never reference each other**:
+//!
+//! - **This crate (`prism-audit`)**: signed cross-org federation envelopes —
+//!   Ed25519-signed JSON records, append-only **JSONL** on disk, used by the
+//!   mesh federation layer (Fabric F5).
+//! - **`prism_core::audit`**: a node-local **SQLite** append-only log of node
+//!   operations (tool executions, data queries, config changes).
+//!
+//! Different stores (JSONL vs SQLite), different scopes (cross-org vs
+//! node-local), different trust models (cryptographically signed vs
+//! trusted-local). They share no code and no data — do not conflate them.
+//!
 //! # Trust model
 //!
 //! Verification needs three things:

@@ -6,6 +6,21 @@
 //! which LLM, what data was read, what data was produced, and what
 //! the chain of reasoning was.
 //!
+//! # Two distinct concerns share this crate
+//!
+//! 1. **Provenance ledger** (this file): an append-only Turso log of every
+//!    agent/tool action — the compliance/traceability record of *what
+//!    happened*.
+//! 2. **Materials knowledge graph** ([`emmo`], ~1.7k LOC — larger than the
+//!    ledger beside it): EMMO-ontology entities + PROV-O assertions on the
+//!    same Turso store. This is a queryable graph of materials *facts*
+//!    (matter, measurements, properties, phases) with noisy-OR
+//!    corroboration, i.e. a knowledge base, not an audit trail.
+//!
+//! They are deliberately separate: the ledger records *what happened*; the
+//! graph records *what is believed to be true about materials*. Both persist
+//! to the same database file but use disjoint tables.
+//!
 //! Backed by Turso — a ground-up Rust rewrite of SQLite. Local-first,
 //! async-native, optionally synced to Turso Cloud for cross-device
 //! provenance sharing. Every PRISM session gets its own Turso database

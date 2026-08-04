@@ -2,9 +2,8 @@
 
 use crate::backend::BackendHandle;
 use crate::command;
-use crate::form::{self, Form, FormField, FormOutcome};
+use crate::form::{Form, FormField, FormOutcome};
 use crate::gh::{self, GhPanel, GhTab};
-use crate::keymap;
 use crate::knowledge::{self, IngestPhase, KnowledgePane, KnowledgeTab};
 use crate::msg::{AgentMsg, parse_notification};
 use crate::notebook::{self, NotebookCell, NotebookPane};
@@ -3168,7 +3167,11 @@ impl App {
 
     /// Handle an agent backend JSON-RPC message.
     pub fn handle_backend_message(&mut self, msg: &Value) {
-        eprintln!("[tui-dbg] value kind={} method={:?}", if msg.is_string() {"STRING"} else {"OBJ"}, msg.get("method").and_then(|m| m.as_str()).unwrap_or("-"));
+        eprintln!(
+            "[tui-dbg] value kind={} method={:?}",
+            if msg.is_string() { "STRING" } else { "OBJ" },
+            msg.get("method").and_then(|m| m.as_str()).unwrap_or("-")
+        );
         let agent_msg = parse_notification(msg);
         self.apply_agent_msg(agent_msg);
     }

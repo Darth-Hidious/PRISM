@@ -1,7 +1,11 @@
 // Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Core domain logic for a PRISM node.
 //!
-//! This crate is the shared foundation that every other crate depends on:
+//! This crate holds node-level domain types shared across the binaries that
+//! need them. It is **not** a universal base: only a minority of workspace
+//! crates depend on it (the CLI, server, node daemon, frontend, and runtime);
+//! leaf crates (`llm`, `mesh`, `policy`, `compute`, `audit`, `agent`, …)
+//! deliberately do not, to keep their dependency graphs small. It exposes:
 //!
 //! - [`config`]: Node configuration (`prism.toml` schema).
 //! - [`session`]: Multi-user session management (SQLite-backed).
@@ -14,9 +18,9 @@
 pub mod audit;
 pub mod brand;
 pub mod chat_config;
-pub mod providers;
 pub mod config;
 pub mod execution;
+pub mod providers;
 pub mod rbac;
 pub mod registry;
 pub mod session;

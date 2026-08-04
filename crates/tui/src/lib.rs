@@ -3,12 +3,6 @@
 //!
 //! Architecture: The Elm Architecture (TEA)
 //!
-//! NOTE: the TUI is still being wired up — several enum-variant fields
-//! (tool_name, elapsed_ms, content, etc.) and the `ChatLine` import in
-//! render.rs are retained for the upcoming render passes but not yet
-//! read.  Silence the dead-code warnings crate-wide until they are.
-#![allow(dead_code, unused_imports, unused_variables)]
-
 //!   - App state holds all model data (messages, input, scroll, status)
 //!   - Msg enum: every input (key, agent event, tick) becomes a Msg
 //!   - update(app, msg) → applies transition, returns nothing

@@ -2,6 +2,19 @@
 //!
 //! Every action (tool execution, data query, config change, subscription event)
 //! is recorded as an immutable `AuditEntry`.
+//!
+//! # Distinct from the `prism-audit` crate
+//!
+//! PRISM has **two unrelated audit systems that never reference each other**:
+//!
+//! - **This module (`prism_core::audit`)**: a node-local **SQLite**
+//!   append-only log of node operations. Trusted-local; no signatures.
+//! - **The `prism-audit` crate**: signed cross-org federation envelopes —
+//!   Ed25519-signed JSON records, append-only **JSONL**, used by the mesh
+//!   federation layer (Fabric F5).
+//!
+//! Different stores (SQLite vs JSONL), different scopes (node-local vs
+//! cross-org), different trust models. They share no code and no data.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};

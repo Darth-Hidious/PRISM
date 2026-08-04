@@ -82,26 +82,16 @@ impl ToolServerHandle {
         // wedged/looping tool could pin the agent forever. 60s is generous —
         // it only fires when something is genuinely broken (the tool ignored
         // its own deadline), in which case surfacing the timeout is correct.
-        let bytes_read = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            self.stdout.read_line(&mut response_line),
-        )
-        .await
-        .map_err(|_| {
-            PythonBridgeError::Spawn(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "tool server did not respond within 60s",
-            ))
-        })??;
+        let timeout_dur = std::time::Duration::from_secs(60);
+        let bytes_read =
+            tokio::time::timeout(timeout_dur, self.stdout.read_line(&mut response_line))
+                .await
+                .map_err(|_| PythonBridgeError::Timeout(timeout_dur))??;
         if bytes_read == 0 {
-            return Err(PythonBridgeError::Spawn(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "tool server process closed stdout",
-            )));
+            return Err(PythonBridgeError::WorkerExited);
         }
 
-        serde_json::from_str(&response_line)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e).into())
+        serde_json::from_str(&response_line).map_err(PythonBridgeError::Parse)
     }
 
     /// List all available tools from the Python registry.

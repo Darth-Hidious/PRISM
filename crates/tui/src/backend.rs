@@ -748,7 +748,10 @@ impl BackendHandle {
     /// signed in and no local endpoint configured) so callers can fall
     /// back to the subprocess path or surface the honest error.
     pub fn spawn_native(project_root: &str, python_bin: &str) -> Result<Self> {
-        Ok(Self::Native(NativeBackend::spawn(project_root, python_bin)?))
+        Ok(Self::Native(NativeBackend::spawn(
+            project_root,
+            python_bin,
+        )?))
     }
 
     /// Test-only constructor: assemble a real backend from pre-spawned
@@ -879,7 +882,10 @@ impl NativeBackend {
     }
 
     pub async fn init(&mut self) -> Result<()> {
-        self.send_request("init", serde_json::json!({"auto_approve": false, "resume": ""}))?;
+        self.send_request(
+            "init",
+            serde_json::json!({"auto_approve": false, "resume": ""}),
+        )?;
         if let Some(resp) = self.rx.recv().await
             && (resp.get("result").is_some() || resp.get("method").is_some())
         {

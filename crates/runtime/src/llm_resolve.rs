@@ -63,7 +63,11 @@ pub fn resolve_unauth_llm_url(fallback_url: &str) -> Result<String> {
 
 /// LLM_BASE_URL env → signed-in project `/llm` endpoint → explicit
 /// `[llm].url` (refusing the localhost default).
-pub fn marc27_llm_base_url(paths: &PrismPaths, api_base: &str, fallback_url: &str) -> Result<String> {
+pub fn marc27_llm_base_url(
+    paths: &PrismPaths,
+    api_base: &str,
+    fallback_url: &str,
+) -> Result<String> {
     if let Ok(explicit) = std::env::var("LLM_BASE_URL") {
         return Ok(explicit);
     }
@@ -257,7 +261,11 @@ pub fn resolve_python_bin() -> PathBuf {
         return PathBuf::from(p);
     }
     if let Ok(home) = std::env::var("HOME") {
-        let venv = PathBuf::from(home).join(".prism").join("venv").join("bin").join("python3");
+        let venv = PathBuf::from(home)
+            .join(".prism")
+            .join("venv")
+            .join("bin")
+            .join("python3");
         if venv.exists() {
             return venv;
         }
