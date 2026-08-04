@@ -5,7 +5,7 @@
 //!
 //! A campaign is a budget-limited, checkpointable loop that:
 //! 1. Proposes candidate materials (via LLM, MCMC, or seed data)
-//! 2. Evaluates each candidate (via tools: evaluate_material, predict, DFT)
+//! 2. Evaluates each candidate (via tools such as `hea_descriptors`)
 //! 3. Ranks by a scalarized reward function
 //! 4. Narrows the search around top performers (adaptive sampling)
 //! 5. Checkpoints state for resume after interruption
@@ -52,6 +52,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use prism_provenance::{ActionType, Actor, ProvenanceRecord, ProvenanceStore, new_record};
+
+const EVALUATION_TOOL: &str = "hea_descriptors";
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -193,7 +195,7 @@ impl GoalStatus {
 pub struct Candidate {
     /// Composition string (e.g. "W0.3 Mo0.2 Ta0.3 Nb0.2").
     pub composition: String,
-    /// Physics descriptors from evaluate_material or similar.
+    /// Physics descriptors from the configured evaluation tool.
     #[serde(default)]
     pub properties: serde_json::Value,
     /// Scalarized reward score (higher = better).
@@ -375,17 +377,53 @@ impl CampaignState {
         if !winners.is_empty() {
             s.push_str("\nTop candidates:\n");
             for (i, c) in winners.iter().enumerate() {
+                let descriptors = summarize_descriptors(&c.properties);
                 s.push_str(&format!(
-                    "  {}. {} — reward={:.4} (iter {}, {})\n",
+                    "  {}. {} — reward={:.4} (iter {}, {}){}\n",
                     i + 1,
                     c.composition,
                     c.reward,
                     c.iteration,
-                    c.source
+                    c.source,
+                    descriptors
                 ));
             }
         }
         s
+    }
+}
+
+fn summarize_descriptors(properties: &serde_json::Value) -> String {
+    const KEYS: [&str; 8] = [
+        "Tm_estimate_K",
+        "delta_S_mix_J_per_molK",
+        "delta_H_mix_kJ_per_mol",
+        "omega",
+        "VEC",
+        "delta_radius_pct",
+        "mixing_entropy",
+        "density",
+    ];
+    let mut descriptors = KEYS
+        .iter()
+        .filter_map(|key| {
+            properties
+                .get(key)
+                .and_then(serde_json::Value::as_f64)
+                .map(|value| format!("{key}={value:.4}"))
+        })
+        .collect::<Vec<_>>();
+    if let Some(phase) = properties
+        .get("phase_prediction")
+        .and_then(serde_json::Value::as_str)
+    {
+        descriptors.push(format!("phase_prediction={phase}"));
+    }
+
+    if descriptors.is_empty() {
+        String::new()
+    } else {
+        format!("; descriptors: {}", descriptors.join(", "))
     }
 }
 
@@ -511,6 +549,12 @@ pub struct Campaign {
     state: CampaignState,
     provenance: Option<ProvenanceStore>,
     checkpoint_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct LocalNodeIdentity {
+    user_id: String,
+    display_name: Option<String>,
 }
 
 impl Campaign {
@@ -1276,43 +1320,22 @@ impl Campaign {
 
     /// Evaluate a single candidate composition.
     ///
-    /// In the current implementation, this calls the `evaluate_material` tool
-    /// via the local PRISM node API and computes a scalarized reward from
-    /// the returned physics descriptors.
+    /// Calls the registered HEA descriptor tool via the local PRISM node API
+    /// and computes a scalarized reward from the returned physics descriptors.
     async fn evaluate_candidate(&self, composition: &str, iteration: usize) -> Result<Candidate> {
-        // Call the PRISM node's evaluate_material tool.
+        // Call the PRISM node's registered HEA evaluation tool.
         let base = self.state.config.node_base_url.clone().unwrap_or_else(|| {
             let port = std::env::var("PRISM_NODE_PORT").unwrap_or_else(|_| "7327".to_string());
             format!("http://127.0.0.1:{port}")
         });
-        let url = format!(
-            "{}/api/tools/evaluate_material/run",
-            base.trim_end_matches('/')
-        );
-        let body = serde_json::json!({
-            "inputs": { "composition": composition },
-        });
-
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .context("failed to call evaluate_material")?;
-
-        let status = resp.status();
-        let resp_body: serde_json::Value = resp
-            .json()
-            .await
-            .unwrap_or_else(|_| serde_json::json!({"error": "failed to parse response"}));
-
-        if !status.is_success() {
-            bail!("evaluate_material returned {}: {}", status, resp_body);
-        }
+        let paths = prism_runtime::PrismPaths::discover().context(
+            "failed to locate PRISM state directories; authenticate with `prism login --no-browser` and retry",
+        )?;
+        let identity = load_local_node_identity(&paths)?;
+        let resp_body = call_evaluate_material(&base, composition, Some(&identity)).await?;
 
         // Compute scalarized reward from the properties.
-        let reward = self.compute_reward(&resp_body);
+        let reward = self.compute_reward(&resp_body)?;
 
         self.record_event(
             "campaign.evaluate",
@@ -1330,7 +1353,7 @@ impl Campaign {
             properties: resp_body,
             reward,
             iteration,
-            source: if iteration == 0 {
+            source: if iteration == 0 && !self.state.goal.seeds.is_empty() {
                 "seed".into()
             } else {
                 "llm".into()
@@ -1343,28 +1366,71 @@ impl Campaign {
     /// Uses `config.reward_weights` to combine multiple properties into
     /// a single score. If no weights are configured, uses a default
     /// heuristic: higher mixing entropy and lower density = better.
-    fn compute_reward(&self, props: &serde_json::Value) -> f64 {
+    fn compute_reward(&self, props: &serde_json::Value) -> Result<f64> {
         if self.state.config.reward_weights.is_empty() {
-            // Default heuristic: reward high entropy, penalize high density.
+            let objective = self.state.goal.objective.to_ascii_lowercase();
+            if objective.contains("melting point") {
+                let melting_point = props
+                    .get("Tm_estimate_K")
+                    .or_else(|| props.get("melting_point_k"))
+                    .or_else(|| props.get("melting_point"))
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{EVALUATION_TOOL} returned no numeric melting-point descriptor for objective '{}'",
+                            self.state.goal.objective
+                        )
+                    })?;
+                return Ok(if objective.contains("minimize") {
+                    -melting_point
+                } else {
+                    melting_point
+                });
+            }
+
+            // Default heuristic: reward high entropy and, when available,
+            // lower density. Missing descriptors are not replaced with
+            // invented defaults.
             let entropy = props
                 .get("mixing_entropy")
                 .or_else(|| props.get("entropy"))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let density = props.get("density").and_then(|v| v.as_f64()).unwrap_or(8.0);
-            // Normalize: entropy typically 0-2 R, density 2-20 g/cm³.
-            let entropy_score = entropy / 2.0;
-            let density_score = 1.0 - (density / 20.0).clamp(0.0, 1.0);
-            return entropy_score * 0.6 + density_score * 0.4;
+                .and_then(serde_json::Value::as_f64)
+                .or_else(|| {
+                    props
+                        .get("delta_S_mix_J_per_molK")
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|value| value / 8.314)
+                });
+            let density = props.get("density").and_then(serde_json::Value::as_f64);
+            return match (entropy, density) {
+                (Some(entropy), Some(density)) => {
+                    let entropy_score = entropy / 2.0;
+                    let density_score = 1.0 - (density / 20.0).clamp(0.0, 1.0);
+                    Ok(entropy_score * 0.6 + density_score * 0.4)
+                }
+                (Some(entropy), None) => Ok(entropy / 2.0),
+                (None, Some(density)) => Ok(1.0 - (density / 20.0).clamp(0.0, 1.0)),
+                (None, None) => bail!(
+                    "{EVALUATION_TOOL} returned no numeric descriptors supported by the campaign reward function"
+                ),
+            };
         }
 
-        // Weighted sum of named properties.
+        // Weighted sum of named properties. Every configured property must be
+        // present; silently substituting zero would fabricate a ranking.
         let mut reward = 0.0;
         for (prop, weight) in &self.state.config.reward_weights {
-            let value = props.get(prop).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let value = props
+                .get(prop)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{EVALUATION_TOOL} returned no numeric value for weighted property '{prop}'"
+                    )
+                })?;
             reward += value * weight;
         }
-        reward
+        Ok(reward)
     }
 
     /// Save campaign state to a checkpoint file.
@@ -1407,16 +1473,125 @@ impl Campaign {
     }
 }
 
+fn load_local_node_identity(paths: &prism_runtime::PrismPaths) -> Result<LocalNodeIdentity> {
+    let state = paths.load_cli_state().with_context(|| {
+        "failed to read PRISM credentials; authenticate with `prism login --no-browser` and retry"
+    })?;
+    let credentials = state.credentials.ok_or_else(|| {
+        anyhow::anyhow!(
+            "campaign evaluation requires a PRISM identity; authenticate with `prism login --no-browser` (or `prism login --token <PAT>` for non-interactive authentication) and retry"
+        )
+    })?;
+    let user_id = credentials.user_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "stored PRISM credentials have no user identity; re-authenticate with `prism login --no-browser` and retry"
+        )
+    })?;
+
+    Ok(LocalNodeIdentity {
+        user_id,
+        display_name: credentials.display_name,
+    })
+}
+
+async fn call_evaluate_material(
+    base: &str,
+    composition: &str,
+    identity: Option<&LocalNodeIdentity>,
+) -> Result<serde_json::Value> {
+    let identity = identity.ok_or_else(|| {
+        anyhow::anyhow!(
+            "campaign evaluation has no PRISM identity; authenticate with `prism login --no-browser` (or `prism login --token <PAT>` for non-interactive authentication) and retry"
+        )
+    })?;
+    let node_token = prism_client::node_session::mint_local_session(
+        base,
+        &identity.user_id,
+        identity.display_name.as_deref(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "could not establish an authenticated session with the PRISM node at {base}; run `prism node up` and retry. If the stored identity is no longer valid, re-authenticate with `prism login --no-browser`"
+        )
+    })?;
+
+    let url = format!(
+        "{}/api/tools/{EVALUATION_TOOL}/run",
+        base.trim_end_matches('/')
+    );
+    let body = serde_json::json!({
+        "inputs": { "composition": composition },
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("Bearer {node_token}"))
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| {
+            format!("failed to reach the PRISM node at {base}; run `prism node up` and retry")
+        })?;
+
+    let status = resp.status();
+    let response_text = resp
+        .text()
+        .await
+        .with_context(|| format!("failed to read {EVALUATION_TOOL} response"))?;
+    let resp_body: serde_json::Value = serde_json::from_str(&response_text).with_context(|| {
+        format!("{EVALUATION_TOOL} returned a non-JSON response (HTTP {status})")
+    })?;
+
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        bail!(
+            "the PRISM node rejected the campaign's minted session (HTTP {status}): {resp_body}. Re-authenticate with `prism login --no-browser`, run `prism node up`, and retry"
+        );
+    }
+    if !status.is_success() {
+        bail!("{EVALUATION_TOOL} returned HTTP {status}: {resp_body}");
+    }
+
+    extract_evaluation_result(resp_body)
+}
+
+fn extract_evaluation_result(mut value: serde_json::Value) -> Result<serde_json::Value> {
+    loop {
+        if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+            bail!("{EVALUATION_TOOL} failed: {error}");
+        }
+        if value.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+            bail!("{EVALUATION_TOOL} reported an unsuccessful evaluation: {value}");
+        }
+
+        let Some(object) = value.as_object() else {
+            bail!("{EVALUATION_TOOL} returned an invalid descriptor payload: {value}");
+        };
+        let is_node_envelope = object.contains_key("tool") && object.contains_key("result");
+        let is_python_envelope = object.len() == 1 && object.contains_key("result");
+        if is_node_envelope || is_python_envelope {
+            let Some(result) = object.get("result").cloned() else {
+                bail!("{EVALUATION_TOOL} returned an invalid result envelope: {value}");
+            };
+            value = result;
+            continue;
+        }
+        return Ok(value);
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
     use axum::response::Json;
     use axum::routing::post;
     use serde_json::{Value, json};
     use std::ffi::OsString;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1464,6 +1639,157 @@ mod tests {
                 "message": { "content": "[\"W0.5 Mo0.5\"]" }
             }]
         }))
+    }
+
+    #[derive(Clone, Default)]
+    struct GatedEvaluationNode {
+        session_calls: Arc<AtomicUsize>,
+        auth_headers: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    async fn mint_test_node_session(State(node): State<GatedEvaluationNode>) -> Json<Value> {
+        node.session_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({"session_id": "campaign-node-session"}))
+    }
+
+    async fn gated_evaluate_material(
+        State(node): State<GatedEvaluationNode>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let auth = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        node.auth_headers.lock().unwrap().push(auth.clone());
+        if auth.as_deref() != Some("Bearer campaign-node-session") {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "missing or invalid session token"})),
+            );
+        }
+
+        (
+            StatusCode::OK,
+            Json(json!({
+                "tool": "hea_descriptors",
+                "result": {
+                    "result": {
+                        "composition": body["inputs"]["composition"],
+                        "mixing_entropy": 1.5,
+                        "density": 12.0,
+                    }
+                }
+            })),
+        )
+    }
+
+    async fn tool_error_evaluate_material() -> Json<Value> {
+        Json(json!({
+            "tool": "hea_descriptors",
+            "result": {
+                "error": "descriptor engine failed"
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn evaluation_mints_local_session_and_sends_bearer() {
+        let node = GatedEvaluationNode::default();
+        let app = axum::Router::new()
+            .route("/api/sessions", post(mint_test_node_session))
+            .route(
+                "/api/tools/hea_descriptors/run",
+                post(gated_evaluate_material),
+            )
+            .with_state(node.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let identity = LocalNodeIdentity {
+            user_id: "campaign-user".into(),
+            display_name: Some("Campaign User".into()),
+        };
+
+        let properties = call_evaluate_material(&base, "W0.5 Mo0.5", Some(&identity))
+            .await
+            .expect("authenticated evaluation should succeed");
+
+        assert_eq!(properties["mixing_entropy"], 1.5);
+        assert_eq!(node.session_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            node.auth_headers.lock().unwrap().as_slice(),
+            &[Some("Bearer campaign-node-session".into())]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn evaluation_rejects_tool_error_payload() {
+        let app = axum::Router::new()
+            .route("/api/sessions", post(mint_test_node_session))
+            .route(
+                "/api/tools/hea_descriptors/run",
+                post(tool_error_evaluate_material),
+            )
+            .with_state(GatedEvaluationNode::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let identity = LocalNodeIdentity {
+            user_id: "campaign-user".into(),
+            display_name: None,
+        };
+
+        let error = call_evaluate_material(&base, "W0.5 Mo0.5", Some(&identity))
+            .await
+            .expect_err("a tool error payload must halt evaluation");
+
+        assert!(
+            error.to_string().contains("descriptor engine failed"),
+            "error: {error:#}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn evaluation_without_local_identity_has_authentication_guidance() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = prism_runtime::PrismPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            data_dir: temp.path().join("data"),
+            state_dir: temp.path().join("state"),
+        };
+
+        let error =
+            load_local_node_identity(&paths).expect_err("missing credentials must halt evaluation");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("prism login --no-browser"),
+            "error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_node_has_startup_guidance() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let identity = LocalNodeIdentity {
+            user_id: "campaign-user".into(),
+            display_name: None,
+        };
+
+        let error = call_evaluate_material(&base, "W0.5 Mo0.5", Some(&identity))
+            .await
+            .expect_err("an unreachable node must halt evaluation");
+        let message = format!("{error:#}");
+        assert!(message.contains("prism node up"), "error: {message}");
     }
 
     fn test_goal() -> CampaignGoal {
@@ -1698,7 +2024,7 @@ mod tests {
             "mixing_entropy": 1.5,
             "density": 4.5,
         });
-        let reward = campaign.compute_reward(&props);
+        let reward = campaign.compute_reward(&props).unwrap();
         // entropy_score = 1.5/2.0 = 0.75, density_score = 1 - 4.5/20 = 0.775
         // reward = 0.75*0.6 + 0.775*0.4 = 0.45 + 0.31 = 0.76
         assert!(reward > 0.0 && reward < 1.0);
@@ -1714,9 +2040,33 @@ mod tests {
             "mixing_entropy": 1.0,
             "density": 5.0,
         });
-        let reward = campaign.compute_reward(&props);
+        let reward = campaign.compute_reward(&props).unwrap();
         // reward = 1.0*2.0 + 5.0*(-1.0) = 2.0 - 5.0 = -3.0
         assert!((reward - (-3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn melting_point_objective_uses_evaluated_descriptor() {
+        let mut goal = test_goal();
+        goal.objective = "maximize melting point".into();
+        let campaign = Campaign::new(goal, CampaignConfig::default(), "c1".into());
+
+        let reward = campaign
+            .compute_reward(&json!({"Tm_estimate_K": 3123.4}))
+            .unwrap();
+
+        assert_eq!(reward, 3123.4);
+    }
+
+    #[test]
+    fn missing_reward_descriptors_halt_evaluation() {
+        let campaign = Campaign::new(test_goal(), CampaignConfig::default(), "c1".into());
+
+        let error = campaign
+            .compute_reward(&json!({"error": "unknown tool"}))
+            .expect_err("missing descriptors must not produce a fallback reward");
+
+        assert!(error.to_string().contains("no numeric descriptors"));
     }
 
     #[test]

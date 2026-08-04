@@ -5,16 +5,17 @@
 //! pause/resume — except the two external boundaries the engine has:
 //!
 //! 1. the proposal LLM (`POST /v1/chat/completions`)
-//! 2. the node's evaluate_material tool (`POST /api/tools/evaluate_material/run`)
+//! 2. the node's HEA evaluator (`POST /api/tools/hea_descriptors/run`)
 //!
 //! which are served by an in-process HTTP fake, injected through the real
 //! `CampaignConfig::{llm_base_url, node_base_url}` config knobs.
 
-use std::sync::Arc;
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Json;
 use axum::routing::post;
 use serde_json::{Value, json};
@@ -25,8 +26,53 @@ use prism_provenance::ProvenanceStore;
 #[derive(Clone)]
 struct Boundary {
     llm_calls: Arc<AtomicUsize>,
+    session_calls: Arc<AtomicUsize>,
     eval_calls: Arc<AtomicUsize>,
+    auth_headers: Arc<Mutex<Vec<Option<String>>>>,
     eval_fails: bool,
+}
+
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvGuard {
+    previous_home: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set_test_home(home: &std::path::Path) -> Self {
+        let previous_home = std::env::var_os("HOME");
+        // SAFETY: every test in this integration-test process holds ENV_LOCK.
+        unsafe { std::env::set_var("HOME", home) };
+        Self { previous_home }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: every test in this integration-test process holds ENV_LOCK.
+        unsafe {
+            match &self.previous_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+}
+
+fn install_test_identity(home: &std::path::Path) -> EnvGuard {
+    let guard = EnvGuard::set_test_home(home);
+    let paths = prism_runtime::PrismPaths::discover().unwrap();
+    paths
+        .save_cli_state(&prism_runtime::PrismCliState {
+            credentials: Some(prism_runtime::StoredCredentials {
+                user_id: Some("campaign-test-user".into()),
+                display_name: Some("Campaign Test User".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    guard
 }
 
 async fn llm_chat(State(b): State<Boundary>, Json(_body): Json<Value>) -> Json<Value> {
@@ -40,11 +86,28 @@ async fn llm_chat(State(b): State<Boundary>, Json(_body): Json<Value>) -> Json<V
     }))
 }
 
+async fn create_session(State(b): State<Boundary>, Json(_body): Json<Value>) -> Json<Value> {
+    b.session_calls.fetch_add(1, Ordering::SeqCst);
+    Json(json!({"session_id": "goal-e2e-node-session"}))
+}
+
 async fn evaluate_material(
     State(b): State<Boundary>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    let auth = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    b.auth_headers.lock().unwrap().push(auth.clone());
     let n = b.eval_calls.fetch_add(1, Ordering::SeqCst);
+    if auth.as_deref() != Some("Bearer goal-e2e-node-session") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "missing or invalid session token"})),
+        );
+    }
     if b.eval_fails {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -56,9 +119,19 @@ async fn evaluate_material(
     (
         StatusCode::OK,
         Json(json!({
-            "composition": composition,
-            "mixing_entropy": 1.0 + 0.1 * n as f64,
-            "density": 10.0 - 0.5 * n as f64,
+            "tool": "hea_descriptors",
+            "result": {
+                "result": {
+                    "composition": composition,
+                    "Tm_estimate_K": 3000.0 + 10.0 * n as f64,
+                    "delta_S_mix_J_per_molK": 12.0 + 0.5 * n as f64,
+                    "delta_H_mix_kJ_per_mol": -5.0,
+                    "omega": 8.0 + 0.1 * n as f64,
+                    "VEC": 5.5,
+                    "delta_radius_pct": 2.1,
+                    "phase_prediction": "solid_solution",
+                }
+            }
         })),
     )
 }
@@ -67,12 +140,15 @@ async fn evaluate_material(
 async fn spawn_boundary(eval_fails: bool) -> (String, Boundary) {
     let boundary = Boundary {
         llm_calls: Arc::new(AtomicUsize::new(0)),
+        session_calls: Arc::new(AtomicUsize::new(0)),
         eval_calls: Arc::new(AtomicUsize::new(0)),
+        auth_headers: Arc::new(Mutex::new(Vec::new())),
         eval_fails,
     };
     let app = axum::Router::new()
         .route("/v1/chat/completions", post(llm_chat))
-        .route("/api/tools/evaluate_material/run", post(evaluate_material))
+        .route("/api/sessions", post(create_session))
+        .route("/api/tools/hea_descriptors/run", post(evaluate_material))
         .with_state(boundary.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -113,6 +189,9 @@ fn checkpoint_json(dir: &std::path::Path, id: &str) -> Value {
 /// progress transition to the store, and stores a real terminal result.
 #[tokio::test]
 async fn goal_executes_steps_persists_trail_and_result() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let test_home = tempfile::tempdir().unwrap();
+    let _home = install_test_identity(test_home.path());
     let (base, boundary) = spawn_boundary(false).await;
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("provenance.db");
@@ -125,16 +204,33 @@ async fn goal_executes_steps_persists_trail_and_result() {
     drop(campaign);
 
     // The steps really ran at the boundary: one LLM proposal per iteration,
-    // batch_size evaluations per iteration.
+    // batch_size authenticated evaluations per iteration.
     assert_eq!(boundary.llm_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(boundary.session_calls.load(Ordering::SeqCst), 4);
     assert_eq!(boundary.eval_calls.load(Ordering::SeqCst), 4);
+    assert!(
+        boundary
+            .auth_headers
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|header| header.as_deref() == Some("Bearer goal-e2e-node-session"))
+    );
 
     // Real terminal result.
     assert_eq!(result.state.status, GoalStatus::Completed);
     assert_eq!(result.state.completion_reason, "iteration_limit");
     assert_eq!(result.state.total_evaluated(), 4);
     assert!(!result.winners.is_empty());
+    assert!(
+        result
+            .state
+            .candidates
+            .iter()
+            .all(|candidate| candidate.properties["Tm_estimate_K"].is_number())
+    );
     assert!(result.summary.contains("Best:"));
+    assert!(result.summary.contains("Tm_estimate_K="));
     assert!(
         !result.provenance.is_empty(),
         "result must carry the provenance trail"
@@ -199,6 +295,9 @@ async fn goal_executes_steps_persists_trail_and_result() {
 /// end Failed with the error persisted, never "completed".
 #[tokio::test]
 async fn goal_must_not_complete_when_steps_cannot_run() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let test_home = tempfile::tempdir().unwrap();
+    let _home = install_test_identity(test_home.path());
     let (base, boundary) = spawn_boundary(true).await;
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("provenance.db");
@@ -254,6 +353,9 @@ async fn goal_must_not_complete_when_steps_cannot_run() {
 /// the gate to real completion.
 #[tokio::test]
 async fn goal_pauses_at_gate_and_resumes_to_completion() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let test_home = tempfile::tempdir().unwrap();
+    let _home = install_test_identity(test_home.path());
     let (base, boundary) = spawn_boundary(false).await;
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("provenance.db");
