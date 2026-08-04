@@ -2,7 +2,7 @@
   "name": "prism-vscode",
   "displayName": "PRISM",
   "description": "VS Code client for PRISM materials-science workflows.",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "publisher": "mirdyne",
   "private": true,
   "license": "UNLICENSED",
