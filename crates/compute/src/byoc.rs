@@ -867,6 +867,7 @@ fn sbatch_script(
         body.push('\n');
     }
     body.push_str(&format!("export PRISM_JOB_ID={job_id}\n"));
+    body.push_str("export PRISM_TASK_ID=\"${PRISM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}\"\n");
     body.push_str(&format!(
         "export PRISM_INPUTS={}\n",
         sh_single_quote(inputs_json)
@@ -1163,6 +1164,61 @@ mod tests {
             sif_path: sif_path.into(),
             ..SlurmJobConfig::default()
         }
+    }
+
+    fn task_identity_from_script(script: &str, array_task_id: Option<&str>) -> String {
+        let exports = script
+            .lines()
+            .filter(|line| {
+                line.starts_with("export PRISM_JOB_ID=")
+                    || line.starts_with("export PRISM_TASK_ID=")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg(format!("set -u\n{exports}\nprintf '%s' \"$PRISM_TASK_ID\""));
+        command.env_remove("SLURM_ARRAY_TASK_ID");
+        if let Some(array_task_id) = array_task_id {
+            command.env("SLURM_ARRAY_TASK_ID", array_task_id);
+        }
+        let output = command
+            .output()
+            .expect("bash should evaluate sbatch exports");
+        assert!(
+            output.status.success(),
+            "failed to evaluate sbatch exports: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("task identity should be UTF-8")
+    }
+
+    #[test]
+    fn slurm_script_yields_distinct_array_task_identities() {
+        let job_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let mut config = slurm_config("/shared/prism.sif");
+        config.array = Some("3,9".into());
+        let script = sbatch_script(&job_id, "gpu", &config, "{}").unwrap();
+
+        let task_3 = task_identity_from_script(&script, Some("3"));
+        let task_9 = task_identity_from_script(&script, Some("9"));
+
+        assert_eq!(task_3, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa_3");
+        assert_eq!(task_9, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa_9");
+        assert_ne!(task_3, task_9);
+    }
+
+    #[test]
+    fn slurm_script_yields_valid_non_array_task_identity() {
+        let job_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let config = slurm_config("/shared/prism.sif");
+        let script = sbatch_script(&job_id, "gpu", &config, "{}").unwrap();
+
+        let task_id = task_identity_from_script(&script, None);
+
+        assert_eq!(task_id, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa_0");
+        assert!(!task_id.is_empty());
     }
 
     #[test]
