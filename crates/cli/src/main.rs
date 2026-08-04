@@ -1372,6 +1372,9 @@ fn should_sync_tools(
     command: Option<&Commands>,
     credentials: Option<&prism_runtime::StoredCredentials>,
 ) -> bool {
+    if prism_runtime::offline::enabled() {
+        return false;
+    }
     matches!(
         command,
         Some(
@@ -1415,6 +1418,15 @@ async fn main() -> Result<()> {
     prism_ingest::llm::hydrate_env_from_api_keys();
 
     let mut cli = Cli::parse();
+    // Apply the environment policy before resolving Python or constructing
+    // any detached task. The environment variable is the hard-offline
+    // control plane; the flag is only a convenient way to set it.
+    if cli.offline || prism_runtime::offline::enabled() {
+        cli.offline = true;
+        unsafe {
+            std::env::set_var(prism_runtime::offline::ENV, "1");
+        }
+    }
     let project_root = cli.project_root.clone();
     let endpoints = PlatformEndpoints::from_env();
     let paths = PrismPaths::discover()?;
@@ -1447,24 +1459,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    // ── Env-var mutations happen HERE, before ANY task is detached ──
-    // POSIX setenv is not thread-safe against concurrent getenv; the first
-    // detached task (tool auto-sync below) could read env while we write
-    // (audit T3d: UB/torn reads). Hoisting also FIXES --offline for the
-    // sync task itself: it checks PRISM_OFFLINE, which used to be set only
-    // AFTER the task had already spawned.
-    //
-    // --offline applies to EVERY command, not just the bare-TUI shortcut:
-    // it sets PRISM_OFFLINE=1, which PlatformClient's request helpers and
-    // resolve_agent_auth() check before any platform HTTP. Pre-fix the flag
-    // was parsed but never enforced — `prism --offline billing` happily hit
-    // the live API (break-test defect H-3). The env var also propagates to
-    // the spawned Python tool server so its platform client obeys too.
-    if cli.offline {
-        unsafe {
-            std::env::set_var("PRISM_OFFLINE", "1");
-        }
-    }
+    // The offline policy was applied immediately after argument parsing,
+    // before venv resolution and before this startup sync decision.
 
     // Top-level flag shortcuts (--resume, --model, --auto-approve) when no
     // subcommand is given: they launch the TUI with the specified options.
@@ -12678,6 +12674,21 @@ data:\n\
         );
         // A credentials file left behind by a logout is not a credential.
         assert!(!should_sync_tools(None, Some(&creds_with("   "))));
+    }
+
+    #[test]
+    fn hard_offline_mode_never_starts_marketplace_sync() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        boot_checks::clear_platform_env();
+        unsafe {
+            std::env::set_var(prism_runtime::offline::ENV, "1");
+        }
+        assert!(!should_sync_tools(None, Some(&creds_with("token-abc"))));
+        unsafe {
+            std::env::remove_var(prism_runtime::offline::ENV);
+        }
     }
 
     /// …but a signed-in user still gets fresh tools. The fix must not have

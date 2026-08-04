@@ -723,6 +723,12 @@ async fn run_http_step(
     // and leak IAM creds; url: http://localhost:7327/api/users would
     // hit PRISM's own admin API. See Bug #56.
     let url_str = url.as_str().unwrap_or_default();
+    prism_runtime::offline::check_url(url_str).map_err(|reason| {
+        anyhow!(
+            "workflow step {} rejected by offline mode: {reason}",
+            step.id
+        )
+    })?;
     if let Some(reason) = ssrf_block_reason(url_str) {
         bail!(
             "workflow step {} url {url_str:?} rejected by SSRF guard: {reason}",

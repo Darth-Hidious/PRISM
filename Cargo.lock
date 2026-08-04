@@ -4735,6 +4735,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "fastembed",
+ "prism-runtime",
  "reqwest",
  "serde",
  "serde_json",
@@ -4800,6 +4801,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "prism-runtime",
  "reqwest",
  "serde",
  "serde_json",
@@ -5020,6 +5022,7 @@ dependencies = [
  "prism-llm",
  "prism-policy",
  "prism-provenance",
+ "prism-runtime",
  "reqwest",
  "serde",
  "serde_json",

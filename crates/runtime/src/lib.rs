@@ -15,6 +15,7 @@
 //! nothing here drives execution.
 
 pub mod llm_resolve;
+pub mod offline;
 
 use std::env;
 use std::fs;

@@ -19,6 +19,10 @@ import sys
 _PROTOCOL_OUT = sys.stdout
 sys.stdout = sys.stderr
 
+from app.tools._offline import install_external_network_guard
+
+install_external_network_guard()
+
 from app.plugins.bootstrap import build_full_registry
 
 

@@ -95,6 +95,7 @@ impl OpenAiCompat {
 #[async_trait]
 impl EmbedBackend for OpenAiCompat {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        prism_runtime::offline::check_url(&self.url).map_err(anyhow::Error::msg)?;
         if texts.is_empty() {
             return Ok(Vec::new());
         }

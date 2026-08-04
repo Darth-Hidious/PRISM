@@ -638,6 +638,7 @@ impl LlmClient {
                 "max_tokens": self.effective_max_tokens(est),
             });
             // Use a direct request (not the retry-wrapper post()) so we control headers
+            prism_runtime::offline::check_url(&url).map_err(anyhow::Error::msg)?;
             let mut req = self
                 .client
                 .post(&url)
@@ -778,6 +779,7 @@ impl LlmClient {
             body["tools"] = serde_json::to_value(tools)?;
         }
 
+        prism_runtime::offline::check_url(&url).map_err(anyhow::Error::msg)?;
         let mut req = self.client.post(&url).json(&body);
         if let Some((name, value)) = self.auth_header() {
             req = req.header(name, value);
@@ -922,6 +924,7 @@ impl LlmClient {
     /// Health check — verify the LLM backend is reachable.
     pub async fn health_check(&self) -> Result<()> {
         let url = format!("{}/v1/models", self.config.base_url);
+        prism_runtime::offline::check_url(&url).map_err(anyhow::Error::msg)?;
         let mut req = self.client.get(&url);
         if let Some((name, value)) = self.auth_header() {
             req = req.header(name, value);
@@ -957,6 +960,7 @@ impl LlmClient {
     }
 
     async fn post(&self, url: &str, body: &serde_json::Value) -> Result<reqwest::Response> {
+        prism_runtime::offline::check_url(url).map_err(anyhow::Error::msg)?;
         debug!(%url, "LLM request");
         for attempt in 0..3u32 {
             let mut req = self.client.post(url).json(body);

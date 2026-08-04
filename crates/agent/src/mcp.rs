@@ -162,6 +162,10 @@ impl McpManager {
     /// Connect from `~/.prism/mcp.json`. A malformed config is loud but
     /// non-fatal: the agent still starts, with zero MCP servers.
     pub async fn connect_from_default_config() -> Self {
+        if prism_runtime::offline::enabled() {
+            tracing::info!("offline mode: external MCP connections disabled");
+            return Self::default();
+        }
         let path = default_config_path();
         match load_config(&path) {
             Ok(configs) => Self::connect(configs).await,

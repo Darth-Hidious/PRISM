@@ -1,6 +1,7 @@
 """Central bootstrap: build a fully loaded ToolRegistry in one call."""
 
 import logging
+import os
 
 from app.tools.base import ToolRegistry
 
@@ -264,7 +265,12 @@ def build_full_registry(
     )
 
     try:
-        provider_reg = build_registry()
+        # A stale/missing provider cache must never trigger OPTIMADE discovery
+        # while hard offline mode is enabled. Bundled overrides and a cached
+        # registry remain usable; only the refresh is disabled.
+        provider_reg = build_registry(
+            skip_network=os.environ.get("PRISM_OFFLINE") == "1"
+        )
     except Exception:
         provider_reg = ProviderRegistry()
 
