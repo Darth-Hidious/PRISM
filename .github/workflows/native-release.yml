@@ -209,9 +209,11 @@ jobs:
 
       - name: Assemble package
         shell: bash
+        env:
+          PACKAGE_LABEL: ${{ matrix.label }}
         run: |
           mkdir -p package
-          if [[ "${{ matrix.label }}" == *"windows"* ]]; then
+          if [[ "$PACKAGE_LABEL" == *windows* ]]; then
             cp target/${{ matrix.rust_target }}/release/prism.exe package/
             cp target/${{ matrix.rust_target }}/release/prism-node.exe package/
             cd package && 7z a -tzip ../${{ matrix.archive }} . && cd ..
@@ -219,7 +221,7 @@ jobs:
             cp target/${{ matrix.rust_target }}/release/prism package/
             cp target/${{ matrix.rust_target }}/release/prism-node package/
             # macOS: ad-hoc sign binaries so users only need to clear quarantine
-            if [[ "${{ matrix.label }}" == *"macos"* ]]; then
+            if [[ "$PACKAGE_LABEL" == *macos* ]]; then
               codesign -s - -f package/prism
               codesign -s - -f package/prism-node
             fi
@@ -232,12 +234,6 @@ jobs:
           path: ${{ matrix.archive }}
           overwrite: true
 
-      - name: Publish release assets
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            ${{ matrix.archive }}
 
   # Pure-python wheel for the tool platform. install.sh pip-installs this
   # from the release assets (no git needed on the target box).
@@ -261,100 +257,68 @@ jobs:
           path: dist/*.whl
           overwrite: true
 
-      - name: Publish wheel to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.whl
-
-  # Aggregate SHA256 hashes of every published asset into SHA256SUMS and
-  # attach it to the release. install.sh verifies downloads against it.
-  # Runs only when every builder succeeded, so a published SHA256SUMS always
-  # covers the complete asset set (v1.0.0 predates this job; install.sh
-  # degrades to a warning for releases that have no SHA256SUMS).
-  checksums:
-    name: Generate SHA256SUMS
+  # This is the only job permitted to create a release. GitHub only schedules
+  # jobs whose `needs` succeeded; the explicit success() check makes that
+  # requirement visible and prevents a failed, cancelled, or queued native leg
+  # from ever reaching the release API.
+  publish-release:
+    name: Publish complete release
     needs: [package-native, python-wheel]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: success() && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
         with:
           path: assets
           merge-multiple: true
 
-      - name: Generate SHA256SUMS
+      - name: Verify complete asset set and generate SHA256SUMS
+        shell: bash
         run: |
           set -euo pipefail
-          cd assets
-          for f in *; do
-            sha256sum "$f"
-          done > ../SHA256SUMS
-          cat ../SHA256SUMS
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SHA256SUMS
-          path: SHA256SUMS
-          overwrite: true
-
-      - name: Publish SHA256SUMS to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: SHA256SUMS
-
-  # A release is all-or-nothing. `fail-fast: false` plus a per-job
-  # `softprops/action-gh-release` means each platform publishes independently,
-  # so when one job fails the tag still gets a release — just missing that
-  # archive. That is exactly how v1.0.0 shipped without
-  # prism-macos-x86_64.tar.gz while install.sh computed that very name for
-  # Intel Macs: every such user got a 404 from the documented one-liner, and
-  # nothing anywhere went red.
-  #
-  # This job audits the ACTUAL release contents and fails when an expected
-  # asset is absent. `if: always()` is load-bearing: with plain `needs:`,
-  # a failed or skipped dependency skips this job too — exactly when the
-  # audit is most needed.
-  verify-release-complete:
-    name: Verify all release assets published
-    needs: [checksums]
-    if: always() && startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Check every expected asset exists on the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # Must match the archive names install.sh computes from uname,
-          # plus the checksum manifest and the pinned Python wheel.
-          expected="prism-linux-x86_64.tar.gz
-          prism-linux-aarch64.tar.gz
-          prism-macos-aarch64.tar.gz
-          prism-macos-x86_64.tar.gz
-          prism-windows-x86_64.zip
-          prism_platform-${TAG#v}-py3-none-any.whl
-          SHA256SUMS"
-
-          published=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')
-          echo "Published assets:"; echo "$published" | sed 's/^/  /'
-
-          missing=0
-          while read -r asset; do
-            [ -z "$asset" ] && continue
-            if ! echo "$published" | grep -qx "$asset"; then
-              echo "::error::release $TAG is missing $asset — install.sh will 404 for that platform"
-              missing=1
+          # Keep this pinned to the declared 1.0.0 package version rather
+          # than deriving an asset name from a tag. The manifest is generated
+          # only after these exact six build assets are present, and it hashes
+          # exactly the six files subsequently uploaded with it.
+          expected_assets=(
+            prism-linux-x86_64.tar.gz
+            prism-linux-aarch64.tar.gz
+            prism-macos-x86_64.tar.gz
+            prism-macos-aarch64.tar.gz
+            prism-windows-x86_64.zip
+            prism_platform-1.0.0-py3-none-any.whl
+          )
+          printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort > expected-assets
+          shopt -s dotglob nullglob
+          actual_assets=(assets/*)
+          for asset in "${actual_assets[@]}"; do
+            if [[ ! -f "$asset" ]]; then
+              echo "::error::downloaded artifact is not a file: $asset"
+              exit 1
             fi
-          done <<< "$(echo "$expected" | sed 's/^[[:space:]]*//')"
-
-          if [ "$missing" -ne 0 ]; then
-            echo "Incomplete release. Re-run the failed platform job, then re-run this check."
+          done
+          printf '%s\n' "${actual_assets[@]##*/}" | LC_ALL=C sort > actual-assets
+          if ! diff -u expected-assets actual-assets; then
+            echo "::error::downloaded artifacts are not the complete expected release set"
             exit 1
           fi
-          echo "All platform archives present."
+          (
+            cd assets
+            sha256sum "${expected_assets[@]}" > ../SHA256SUMS
+          )
+          cat SHA256SUMS
+
+      - name: Create release and upload complete asset set
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            assets/prism-linux-x86_64.tar.gz
+            assets/prism-linux-aarch64.tar.gz
+            assets/prism-macos-x86_64.tar.gz
+            assets/prism-macos-aarch64.tar.gz
+            assets/prism-windows-x86_64.zip
+            assets/prism_platform-1.0.0-py3-none-any.whl
+            SHA256SUMS
