@@ -3,11 +3,13 @@
 //! Routes experiment plans to the appropriate compute backend based on
 //! configuration, resource requirements, and availability.
 
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use crate::byoc::{ByocBackend, ByocTarget};
-use crate::job::JobTracker;
+use crate::job::{JobTarget, JobTracker};
 use crate::local::LocalBackend;
 use crate::marc27::{Marc27Auth, Marc27Backend};
 use crate::{ComputeBackend, ExperimentPlan, JobStatus};
@@ -32,11 +34,20 @@ pub struct ComputeRouter {
 impl ComputeRouter {
     /// Create a router with only the local backend.
     pub fn local_only() -> Self {
+        Self::local_with_tracker(JobTracker::new())
+    }
+
+    /// Create a local router backed by the persistent job tracker.
+    pub fn local_only_persistent(data_dir: &Path) -> Result<Self> {
+        Ok(Self::local_with_tracker(JobTracker::persistent(data_dir)?))
+    }
+
+    fn local_with_tracker(tracker: JobTracker) -> Self {
         Self {
             local: LocalBackend::new(),
             marc27: None,
             byoc: None,
-            tracker: JobTracker::new(),
+            tracker,
             default_backend: BackendKind::Local,
         }
     }
@@ -46,11 +57,28 @@ impl ComputeRouter {
     /// `api_base` is normalised by [`Marc27Backend`] so the `/api/v1` prefix
     /// appears exactly once (a bare host or a prefixed base both work).
     pub fn with_marc27(api_base: &str, auth: Marc27Auth) -> Self {
+        Self::marc27_with_tracker(api_base, auth, JobTracker::new())
+    }
+
+    /// Create a MARC27 router backed by the persistent job tracker.
+    pub fn with_marc27_persistent(
+        api_base: &str,
+        auth: Marc27Auth,
+        data_dir: &Path,
+    ) -> Result<Self> {
+        Ok(Self::marc27_with_tracker(
+            api_base,
+            auth,
+            JobTracker::persistent(data_dir)?,
+        ))
+    }
+
+    fn marc27_with_tracker(api_base: &str, auth: Marc27Auth, tracker: JobTracker) -> Self {
         Self {
             local: LocalBackend::new(),
             marc27: Some(Marc27Backend::new(api_base, auth.clone())),
             byoc: None,
-            tracker: JobTracker::new(),
+            tracker,
             default_backend: BackendKind::Marc27 {
                 api_base: api_base.to_string(),
                 auth,
@@ -120,6 +148,23 @@ impl ComputeRouter {
         }
     }
 
+    fn job_target(&self, plan: &ExperimentPlan) -> JobTarget {
+        if (plan.image.contains("marc27") || plan.image.contains("platform"))
+            && let BackendKind::Marc27 { api_base, .. } = &self.default_backend
+        {
+            return JobTarget::Marc27 {
+                api_base: api_base.clone(),
+            };
+        }
+        match &self.default_backend {
+            BackendKind::Local => JobTarget::Local,
+            BackendKind::Marc27 { api_base, .. } => JobTarget::Marc27 {
+                api_base: api_base.clone(),
+            },
+            BackendKind::Byoc(target) => JobTarget::Byoc(target.clone()),
+        }
+    }
+
     /// Submit a job through the router.
     pub async fn submit(&self, plan: &ExperimentPlan) -> Result<Uuid> {
         let backend = self.resolve_backend(plan);
@@ -128,8 +173,19 @@ impl ComputeRouter {
         let job_id = backend.submit(plan).await?;
 
         self.tracker
-            .register(job_id, &plan.name, &plan.image, backend_name)
-            .await;
+            .register(
+                job_id,
+                &plan.name,
+                &plan.image,
+                backend_name,
+                self.job_target(plan),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "job {job_id} was submitted via {backend_name} but its tracking record could not be persisted"
+                )
+            })?;
 
         tracing::info!(%job_id, backend = backend_name, "job routed");
         Ok(job_id)
@@ -201,7 +257,7 @@ impl ComputeRouter {
             use crate::job::TrackedStatus;
             self.tracker
                 .update_status(job_id, TrackedStatus::Cancelled)
-                .await;
+                .await?;
         }
         Ok(())
     }

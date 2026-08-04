@@ -3276,6 +3276,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             handle_run(
+                &paths.data_dir,
                 &name,
                 &image,
                 &input,
@@ -3303,7 +3304,7 @@ async fn main() -> Result<()> {
             .await?;
         }
         Commands::JobStatus { job_id } => {
-            handle_job_status(&job_id).await?;
+            handle_job_status(&paths, &job_id).await?;
         }
         Commands::Mesh { command } => {
             handle_mesh_command(command, &paths).await?;
@@ -10199,11 +10200,12 @@ fn validate_run_backend_target(
 }
 
 fn run_job_status_hint(resolved_backend: &str, job_id: uuid::Uuid) -> Option<String> {
-    (resolved_backend == "marc27").then(|| format!("Check status:  prism job-status {job_id}"))
+    (resolved_backend != "local").then(|| format!("Check status:  prism job-status {job_id}"))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_run(
+    data_dir: &Path,
     name: &str,
     image: &str,
     inputs: &[String],
@@ -10263,7 +10265,7 @@ async fn handle_run(
             port: ssh_port,
         };
         (
-            ComputeRouter::local_only().with_byoc(target),
+            ComputeRouter::local_only_persistent(data_dir)?.with_byoc(target),
             "byoc",
             serde_json::json!({
                 "kind": "ssh",
@@ -10277,7 +10279,7 @@ async fn handle_run(
             namespace: k8s_namespace.to_string(),
         };
         (
-            ComputeRouter::local_only().with_byoc(target),
+            ComputeRouter::local_only_persistent(data_dir)?.with_byoc(target),
             "byoc",
             serde_json::json!({
                 "kind": "kubernetes",
@@ -10312,7 +10314,7 @@ async fn handle_run(
             }),
         };
         (
-            ComputeRouter::local_only().with_byoc(target),
+            ComputeRouter::local_only_persistent(data_dir)?.with_byoc(target),
             "byoc",
             serde_json::json!({
                 "kind": "slurm",
@@ -10337,7 +10339,7 @@ async fn handle_run(
                     platform_url.to_string()
                 };
                 (
-                    ComputeRouter::with_marc27(&api_base, auth),
+                    ComputeRouter::with_marc27_persistent(&api_base, auth, data_dir)?,
                     "marc27",
                     serde_json::json!({
                         "kind": "marc27",
@@ -10346,7 +10348,7 @@ async fn handle_run(
                 )
             }
             _ => (
-                ComputeRouter::local_only(),
+                ComputeRouter::local_only_persistent(data_dir)?,
                 "local",
                 serde_json::json!({
                     "kind": "local",
@@ -10407,24 +10409,41 @@ async fn handle_run(
     Ok(())
 }
 
-async fn handle_job_status(job_id_str: &str) -> Result<()> {
+async fn handle_job_status(paths: &PrismPaths, job_id_str: &str) -> Result<()> {
+    use prism_compute::job::{JobTarget, JobTracker, TrackedStatus};
+
     let job_id: uuid::Uuid = job_id_str
         .parse()
         .with_context(|| format!("invalid job UUID: {job_id_str}"))?;
+    let tracker = JobTracker::persistent(&paths.data_dir)?;
+    let record = tracker.get(job_id).await.with_context(|| {
+        format!(
+            "job {job_id} is not in the local compute job registry at {}",
+            paths.data_dir.display()
+        )
+    })?;
 
-    // Jobs submitted via `prism run --backend marc27` (and the run/run_submit
-    // agent tools) live on the MARC27 compute broker, so query the live API.
-    // The local JobTracker is in-memory only and empty in a fresh process, so
-    // it cannot answer for a platform job.
-    let (api_base, platform_auth) = resolve_agent_auth()?;
-    let backend = prism_compute::Marc27Backend::new(&api_base, marc27_auth_from(platform_auth));
-    use prism_compute::ComputeBackend as _;
+    let backend: Box<dyn prism_compute::ComputeBackend> = match record.target {
+        JobTarget::Marc27 { api_base } => {
+            let (_, platform_auth) = resolve_agent_auth()?;
+            Box::new(prism_compute::Marc27Backend::new(
+                &api_base,
+                marc27_auth_from(platform_auth),
+            ))
+        }
+        JobTarget::Byoc(target) => Box::new(prism_compute::byoc::ByocBackend::new(target)),
+        JobTarget::Local => anyhow::bail!(
+            "job {job_id} used local compute; cross-process local container status is not supported"
+        ),
+    };
 
     println!("Job: {job_id}");
+    println!("Backend: {}", record.backend);
     let status = backend.status(job_id).await?;
+    tracker
+        .update_status(job_id, TrackedStatus::from(&status))
+        .await?;
     println!("Status: {status:?}");
-    // Surface the output inline when the job is done, so `prism job-status`
-    // works end-to-end (status + result) the way the run hint promises.
     if matches!(status, prism_compute::JobStatus::Completed) {
         match backend.results(job_id).await {
             Ok(output) => println!("Output: {output}"),
@@ -11655,9 +11674,10 @@ mod tests {
     }
 
     #[test]
-    fn byoc_run_omits_unusable_cross_process_status_hint() {
-        assert_eq!(run_job_status_hint("byoc", uuid::Uuid::nil()), None);
+    fn persisted_remote_runs_have_cross_process_status_hints() {
+        assert!(run_job_status_hint("byoc", uuid::Uuid::nil()).is_some());
         assert!(run_job_status_hint("marc27", uuid::Uuid::nil()).is_some());
+        assert_eq!(run_job_status_hint("local", uuid::Uuid::nil()), None);
     }
 
     #[test]
