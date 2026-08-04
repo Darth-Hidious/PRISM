@@ -35,6 +35,12 @@ import math
 from typing import Any
 
 from app.tools.base import Tool, ToolRegistry
+from app.tools.evidence import (
+    EvidenceClass,
+    EvidenceSource,
+    coerce_evidence_class,
+    stamp_evidence,
+)
 from app.tools.materials.polymer import RDKIT_INSTALL_HINT
 
 FOX_FLORY_CITATION = (
@@ -111,7 +117,9 @@ def _load_identity(candidate_identity: str, chem: Any) -> dict[str, Any]:
 
 
 def _unavailable(reason: str) -> dict[str, str]:
-    return {"status": "unavailable", "reason": reason}
+    result = {"status": "unavailable", "reason": reason}
+    stamp_evidence(result, EvidenceSource.MODEL_ASSERTION)
+    return result
 
 
 def evaluate_polymer_insulation(
@@ -132,6 +140,11 @@ def evaluate_polymer_insulation(
         raise RuntimeError(RDKIT_INSTALL_HINT) from exc
 
     candidate = _load_identity(candidate_identity, Chem)
+    input_evidence = coerce_evidence_class(
+        candidate.get("evidence_class", EvidenceClass.INDETERMINATE)
+    )
+    candidate["evidence_class"] = input_evidence.value
+    candidate["evidence_color"] = input_evidence.color
     status: dict[str, dict[str, Any]] = {}
     result: dict[str, Any] = {
         "candidate_identity": candidate,
@@ -164,11 +177,16 @@ def evaluate_polymer_insulation(
         status["glass_transition_temperature_k"] = {
             "status": "computed",
             "value": tg,
-            "unit": "K",
+            "unit": "QUDT:K",
             "method": "Fox-Flory molecular-weight relation: Tg = Tg_infinity - K/Mn",
             "citation": FOX_FLORY_CITATION,
             "parameter_citation": parameter_citation,
         }
+        stamp_evidence(
+            status["glass_transition_temperature_k"],
+            EvidenceSource.CITED_COMPUTATION,
+            [input_evidence],
+        )
 
     status["dielectric_constant"] = _unavailable(
         "No citable dielectric-constant method is implemented for this "
@@ -184,6 +202,20 @@ def evaluate_polymer_insulation(
         "candidate representation; morphology and measurement evidence are required."
     )
     result["property_status"] = status
+    computed_classes = [
+        item["evidence_class"]
+        for item in status.values()
+        if item["status"] == "computed"
+    ]
+    stamp_evidence(
+        result,
+        (
+            EvidenceSource.CITED_COMPUTATION
+            if computed_classes
+            else EvidenceSource.MODEL_ASSERTION
+        ),
+        [input_evidence, *computed_classes],
+    )
     return result
 
 

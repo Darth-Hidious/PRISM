@@ -55,6 +55,12 @@ from typing import Any, Callable, Optional
 
 from app.tools import _provenance as prov
 from app.tools.base import Tool, ToolRegistry
+from app.tools.evidence import (
+    EvidenceClass,
+    EvidenceSource,
+    coerce_evidence_class,
+    stamp_evidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +79,13 @@ TIER_NAMES = {
     TIER_MACE: "mace_mlip",
     TIER_CALPHAD: "calphad_equilibrium",
     TIER_QE: "quantum_espresso",
+}
+
+TIER_EVIDENCE_SOURCES = {
+    TIER_EMPIRICAL: EvidenceSource.CITED_COMPUTATION,
+    TIER_MACE: EvidenceSource.EXECUTION,
+    TIER_CALPHAD: EvidenceSource.EXECUTION,
+    TIER_QE: EvidenceSource.EXECUTION,
 }
 
 TIER_METHODS = {
@@ -163,17 +176,27 @@ def _unavailable(reason: str, install_hint: str | None = None) -> dict:
     block = {"status": "unavailable", "reason": reason}
     if install_hint:
         block["install_hint"] = install_hint
+    stamp_evidence(block, EvidenceSource.MODEL_ASSERTION)
     return block
 
 
 def _not_attempted(reason: str) -> dict:
-    return {"status": "not_attempted", "reason": reason}
+    block = {"status": "not_attempted", "reason": reason}
+    stamp_evidence(block, EvidenceSource.MODEL_ASSERTION)
+    return block
 
 
 def _failed(error: str, **extra: Any) -> dict:
     block = {"status": "failed", "error": error}
     block.update(extra)
+    stamp_evidence(block, EvidenceSource.MODEL_ASSERTION)
     return block
+
+
+def _error_result(message: str) -> dict:
+    result = {"error": message}
+    stamp_evidence(result, EvidenceSource.MODEL_ASSERTION)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +279,8 @@ def tier_status() -> dict[str, dict]:
             "install_hint": TIER_INSTALL_HINTS[TIER_QE],
         }),
     }
+    for block in status.values():
+        stamp_evidence(block, EvidenceSource.EXECUTION)
     return status
 
 
@@ -277,7 +302,13 @@ _TIER0_UNITS = {
 def _run_tier0(candidate: dict, elems: list[str], fracs: list[float]) -> dict:
     from app.tools.materials.hea import compute_hea_descriptors
 
-    props = compute_hea_descriptors(elems, fracs)
+    props = compute_hea_descriptors(
+        elems,
+        fracs,
+        input_evidence_class=candidate.get(
+            "evidence_class", EvidenceClass.INDETERMINATE
+        ),
+    )
     # The empirical screen cannot fail on missing deps, but a composition
     # missing radii yields omega=None → no Yang verdict. That is an absent
     # prediction, not a pass.
@@ -825,17 +856,22 @@ def evaluate_candidate(candidate: dict, tier: int = 0) -> dict:
     via ``tier`` — the default is the empirical screen only.
     """
     if not isinstance(tier, int) or not 0 <= tier <= MAX_TIER:
-        return {"error": f"tier must be an int in 0..{MAX_TIER}, got {tier!r}"}
+        return _error_result(f"tier must be an int in 0..{MAX_TIER}, got {tier!r}")
     try:
+        input_evidence = coerce_evidence_class(
+            candidate.get("evidence_class", EvidenceClass.INDETERMINATE)
+        )
         elems, fracs = _parse_candidate_composition(candidate)
     except (TypeError, ValueError) as exc:
-        return {"error": f"invalid composition: {exc}"}
+        return _error_result(f"invalid candidate: {exc}")
 
     result: dict[str, Any] = {
         "candidate": {
             "composition": _reduced_formula(elems, fracs),
             "elements": elems,
             "fractions": [round(f, 6) for f in fracs],
+            "evidence_class": input_evidence.value,
+            "evidence_color": input_evidence.color,
         },
         "requested_tier": tier,
         "tiers": {},
@@ -855,6 +891,23 @@ def evaluate_candidate(candidate: dict, tier: int = 0) -> dict:
                 block = _failed(f"tier {t} crashed: {e}")
             block.setdefault("tier", t)
             block.setdefault("name", label)
+            production_source = (
+                TIER_EVIDENCE_SOURCES[t]
+                if block.get("status") == "ok"
+                else EvidenceSource.MODEL_ASSERTION
+            )
+            properties = block.get("properties")
+            if (
+                isinstance(properties, dict)
+                and properties
+                and "evidence_class" not in properties
+            ):
+                stamp_evidence(properties, production_source, [input_evidence])
+            block_class = stamp_evidence(block, production_source, [input_evidence])
+            provenance = block.get("provenance")
+            if isinstance(provenance, dict):
+                provenance["evidence_class"] = block_class.value
+                provenance["evidence_color"] = block_class.color
             if block.get("status") == "ok":
                 highest_completed = t
                 gate = block.get("gate", {})
@@ -878,6 +931,14 @@ def evaluate_candidate(candidate: dict, tier: int = 0) -> dict:
         None if blocked_reason is None or highest_completed == tier
         else {"tier": highest_completed + 1, "reason": blocked_reason}
     )
+    tier_classes = [
+        block["evidence_class"] for block in result["tiers"].values()
+    ]
+    stamp_evidence(
+        result,
+        EvidenceSource.CITED_COMPUTATION,
+        [input_evidence, *tier_classes],
+    )
     return result
 
 
@@ -889,7 +950,7 @@ def escalate_candidates(candidates: list[dict], max_tier: int = MAX_TIER) -> dic
     each tier received, completed, and passed on.
     """
     results = [evaluate_candidate(c, tier=max_tier) for c in candidates]
-    summary: dict[str, dict[str, int]] = {}
+    summary: dict[str, dict[str, Any]] = {}
     for t in range(0, max_tier + 1):
         key = str(t)
         entered = completed = survived = 0
@@ -908,7 +969,27 @@ def escalate_candidates(candidates: list[dict], max_tier: int = MAX_TIER) -> dic
             "completed": completed,
             "survived": survived,
         }
-    return {"requested_max_tier": max_tier, "results": results, "summary": summary}
+        contributing = [
+            result["tiers"][key]["evidence_class"]
+            for result in results
+            if key in result.get("tiers", {})
+        ]
+        stamp_evidence(
+            summary[key],
+            EvidenceSource.CITED_COMPUTATION,
+            contributing,
+        )
+    output = {
+        "requested_max_tier": max_tier,
+        "results": results,
+        "summary": summary,
+    }
+    stamp_evidence(
+        output,
+        EvidenceSource.CITED_COMPUTATION,
+        [result["evidence_class"] for result in results],
+    )
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -940,6 +1021,15 @@ _EVAL_SCHEMA: dict = {
             "description": (
                 "Alternative element→fraction dict; values must be finite, "
                 "positive, and sum to 1.0 ± 1e-6."
+            ),
+        },
+        "evidence_class": {
+            "type": "string",
+            "enum": [item.value for item in EvidenceClass],
+            "default": EvidenceClass.INDETERMINATE.value,
+            "description": (
+                "RHEA-aligned class of the candidate/boundary-condition "
+                "inputs. No tier result can outrank this class."
             ),
         },
         "tier": {
@@ -984,12 +1074,14 @@ def _evaluate_candidate_tool(**kwargs: Any) -> dict:
     try:
         tier = int(tier)
     except (TypeError, ValueError):
-        return {"error": f"tier must be an integer, got {tier!r}"}
+        return _error_result(f"tier must be an integer, got {tier!r}")
     return evaluate_candidate(kwargs, tier=tier)
 
 
 def _tier_status_tool(**kwargs: Any) -> dict:
-    return {"tiers": tier_status()}
+    result = {"tiers": tier_status()}
+    stamp_evidence(result, EvidenceSource.EXECUTION)
+    return result
 
 
 def create_evaluation_tools(registry: ToolRegistry) -> None:

@@ -53,6 +53,7 @@ def build_hea_dataset():
     ΔH_mix, ΔS_mix, phase_prediction). This is the synthesized hea-mpea corpus.
     """
     import pandas as pd
+    from app.tools.evidence import EvidenceClass
     from app.tools.materials.hea import compute_hea_descriptors, _parse_composition
 
     rows = []
@@ -62,7 +63,11 @@ def build_hea_dataset():
         if parsed is None:
             continue
         elems, fracs = parsed
-        desc = compute_hea_descriptors(elems, fracs)
+        desc = compute_hea_descriptors(
+            elems,
+            fracs,
+            input_evidence_class=EvidenceClass.RESEARCH,
+        )
         row = {
             "composition": comp,
             "family": hea["family"],
@@ -78,6 +83,8 @@ def build_hea_dataset():
             "omega": desc["omega"],
             "predicted_phase": desc["phase_prediction"],
             "n_elements": desc["n_elements"],
+            "evidence_class": desc["evidence_class"],
+            "evidence_color": desc["evidence_color"],
         }
         rows.append(row)
     return pd.DataFrame(rows)

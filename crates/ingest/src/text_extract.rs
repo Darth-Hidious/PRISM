@@ -8,13 +8,13 @@
 
 use anyhow::Result;
 use prism_llm::LlmClient;
-use prism_provenance::LocalFact;
+use prism_provenance::{EvidenceSource, MaterialFact, evidence_for_result};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct ExtractionOutput {
     #[serde(default)]
-    facts: Vec<LocalFact>,
+    facts: Vec<MaterialFact>,
 }
 
 /// Extract EMMO facts from `text` using the local LLM. The document text is
@@ -26,7 +26,7 @@ pub async fn extract_facts_from_text(
     llm: &LlmClient,
     title: &str,
     text: &str,
-) -> Result<Vec<LocalFact>> {
+) -> Result<Vec<MaterialFact>> {
     let raw = llm
         .generate_json(&build_extraction_prompt(title, text))
         .await?;
@@ -56,19 +56,29 @@ PAPER>>>
 
 Reply with ONLY this JSON:
 {{"facts": [
-  {{"subject": "Ti-6Al-4V", "predicate": "has_measurement", "object": "UTS", "value": 1140.0, "unit": "MPa", "confidence": 0.9, "kind": "measurement"}},
-  {{"subject": "Ti-6Al-4V", "predicate": "has_phase", "object": "alpha-beta", "confidence": 0.8, "kind": "phase"}}
+  {{"subject": "Ti-6Al-4V", "predicate": "has_measurement", "object": "UTS", "value": 1140.0, "unit": "QUDT:MegaPA", "conditions": [{{"name": "temperature", "value": 298.15, "unit": "QUDT:K"}}, {{"name": "atmosphere", "value": "air", "unit": null}}], "confidence": 0.9, "kind": "measurement", "evidence_class": "research"}},
+  {{"subject": "Ti-6Al-4V", "predicate": "has_phase", "object": "alpha-beta", "conditions": [], "confidence": 0.8, "kind": "phase", "evidence_class": "research"}}
 ]}}
+
+`unit` and every numerical condition unit MUST use an existing QUDT identifier with the `QUDT:` prefix; do not invent unit names. Each condition is structured as `name`, numeric-or-text `value`, and `unit` (null only for categorical values such as atmosphere). A measurement without its stated conditions is incomplete: preserve temperature, pressure, frequency, thickness, atmosphere, electrode geometry, and other conditions explicitly present in the paper. Literature extraction is always evidence_class `research` (ORANGE/unverified), regardless of confidence or corroborating sources.
 
 Use "kind" to classify: measurement | phase | composition | processing | structure | application. Only extract facts you are confident about (confidence > 0.3)."#
     )
 }
 
 /// Parse the LLM's extraction output. Tolerant of fenced JSON.
-fn parse_extraction(raw: &str) -> Vec<LocalFact> {
+fn parse_extraction(raw: &str) -> Vec<MaterialFact> {
     let json_str = extract_json_block(raw);
     match serde_json::from_str::<ExtractionOutput>(json_str) {
-        Ok(out) => out.facts,
+        Ok(mut out) => {
+            for fact in &mut out.facts {
+                fact.evidence_class = evidence_for_result(
+                    EvidenceSource::LiteratureExtraction,
+                    [fact.evidence_class],
+                );
+            }
+            out.facts
+        }
         Err(e) => {
             tracing::warn!(error = %e, "extraction output unparseable — no facts extracted");
             Vec::new()
@@ -106,12 +116,15 @@ mod tests {
 
     #[test]
     fn parse_extraction_valid_json() {
-        let raw = r#"{"facts": [{"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":1140.0,"unit":"MPa","confidence":0.9,"kind":"measurement"}]}"#;
+        let raw = r#"{"facts": [{"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":1140.0,"unit":"QUDT:MegaPA","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}]}"#;
         let facts = parse_extraction(raw);
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].subject, "Ti-6Al-4V");
         assert_eq!(facts[0].predicate, "has_measurement");
-        assert_eq!(facts[0].unit.as_deref(), Some("MPa"));
+        assert_eq!(
+            facts[0].unit.as_ref().map(|unit| unit.as_str()),
+            Some("QUDT:MegaPA")
+        );
         assert_eq!(facts[0].kind.as_deref(), Some("measurement"));
         assert!((facts[0].value.unwrap() - 1140.0).abs() < 1e-9);
     }
@@ -131,6 +144,70 @@ mod tests {
     fn parse_extraction_garbage_returns_empty() {
         assert!(parse_extraction("not json at all").is_empty());
         assert!(parse_extraction("").is_empty());
+    }
+
+    #[test]
+    fn literature_extractor_cannot_claim_green() {
+        let raw = r#"{"facts":[{"subject":"steel","predicate":"has_phase","object":"bcc","conditions":[],"kind":"phase","evidence_class":"reference_validated"}]}"#;
+        let facts = parse_extraction(raw);
+        assert_eq!(
+            facts[0].evidence_class,
+            prism_provenance::EvidenceClass::Research
+        );
+    }
+
+    #[tokio::test]
+    async fn conditioned_measurement_survives_extraction_storage_and_read_back() {
+        use prism_provenance::{EvidenceClass, LocalProvenance, ProvenanceStore};
+
+        let text = "The thermal conductivity was 22 W/m/K at 1200 K in air.";
+        let prompt = build_extraction_prompt("Thermal test", text);
+        assert!(
+            prompt.contains(text),
+            "the source measurement must reach extraction"
+        );
+
+        // Deterministic fake-LLM response: no provider or network is used in tests.
+        let raw = r#"{"facts":[{"subject":"test ceramic","predicate":"has_measurement","object":"thermal conductivity","value":22.0,"unit":"QUDT:W-PER-M-K","conditions":[{"name":"temperature","value":1200.0,"unit":"QUDT:K"},{"name":"atmosphere","value":"air","unit":null}],"confidence":0.9,"kind":"measurement","evidence_class":"research"}]}"#;
+        let facts = parse_extraction(raw);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].conditions.len(), 2);
+        assert_eq!(facts[0].evidence_class, EvidenceClass::Research);
+
+        let path = std::env::temp_dir().join(format!(
+            "prism_conditioned_measurement_{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ProvenanceStore::open(&path).await.unwrap();
+        let prov = LocalProvenance {
+            activity_id: "conditioned-extraction".into(),
+            agent_id: "fake-local-extractor".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: "doc:thermal-test".into(),
+            source_kind: "Document".into(),
+            tenant: "local".into(),
+            started_at: "2026-08-04T00:00:00Z".into(),
+            ended_at: "2026-08-04T00:00:01Z".into(),
+            locality: "local".into(),
+        };
+        store.write_fact(&facts[0], &prov).await.unwrap();
+
+        let recalled = store
+            .recall_with_context("thermal conductivity", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].value, Some(22.0));
+        assert_eq!(recalled[0].unit.as_deref(), Some("QUDT:W-PER-M-K"));
+        assert_eq!(recalled[0].conditions, facts[0].conditions);
+        assert_eq!(recalled[0].evidence_class, EvidenceClass::Research);
+
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = path.clone().into_os_string();
+            candidate.push(suffix);
+            let _ = std::fs::remove_file(candidate);
+        }
     }
 
     #[test]

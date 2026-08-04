@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use polars::prelude::*;
-use prism_provenance::{LocalProvenance, ProvenanceStore};
+use prism_provenance::{EvidenceClass, LocalProvenance, ProvenanceStore};
 use serde::{Deserialize, Serialize};
 use tracing;
 
@@ -288,7 +288,9 @@ impl IngestPipeline {
 
         let facts = to_local_facts(entity_set);
         for fact in &facts {
-            store.write_fact(fact, &prov).await?;
+            store
+                .write_fact_with_evidence(fact, &prov, EvidenceClass::Research)
+                .await?;
         }
         // Best-effort: vectorize the freshly written entity names into the
         // same Turso store so `prism query --semantic` works without Qdrant.
@@ -515,10 +517,19 @@ mod tests {
             .unwrap();
         assert!(tr.edges.iter().any(|e| e.rel_type == "CONTAINS_ELEMENT"));
         assert!(tr.edges.iter().any(|e| e.rel_type == "HAS_MEASUREMENT"));
-        let facts = store.recall("Steel", "local", 10).await.unwrap();
+        let facts = store
+            .recall_with_context("Steel", "local", 10)
+            .await
+            .unwrap();
         assert_eq!(facts.len(), 2);
         assert!(facts.iter().all(|f| f.source == "/tmp/alloys.csv"));
         assert!(facts.iter().all(|f| f.agent == "prism-ingest"));
+        assert!(
+            facts
+                .iter()
+                .all(|f| f.evidence_class == EvidenceClass::Research),
+            "LLM-extracted tabular facts must be ORANGE/research, never promoted by confidence",
+        );
 
         for suffix in ["", "-wal", "-shm"] {
             let mut p = db_path.clone().into_os_string();

@@ -32,6 +32,12 @@ import math
 from typing import Any
 
 from app.tools.base import Tool, ToolRegistry
+from app.tools.evidence import (
+    EvidenceClass,
+    EvidenceSource,
+    coerce_evidence_class,
+    stamp_evidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -316,7 +322,12 @@ def _metallic_radius(sym: str) -> float | None:
         return None
 
 
-def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, Any]:
+def compute_hea_descriptors(
+    elems: list[str],
+    fracs: list[float],
+    *,
+    input_evidence_class: EvidenceClass | str = EvidenceClass.INDETERMINATE,
+) -> dict[str, Any]:
     """Compute the full HEA formability descriptor set.
 
     Pure math — no network, no ML, no database. Returns a dict with:
@@ -442,7 +453,7 @@ def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, A
         else:
             criterion_notes.append(f"VEC={vec:.2f} ≥ 8.0 → FCC favored (Guo & Liu 2011)")
 
-    return {
+    result = {
         "delta_H_mix_kJ_per_mol": round(dH_mix, 2),
         "delta_S_mix_J_per_molK": round(dS_mix, 2),
         "omega": round(omega, 3) if omega is not None else None,
@@ -461,6 +472,12 @@ def compute_hea_descriptors(elems: list[str], fracs: list[float]) -> dict[str, A
         "fractions": fracs,
         "expanded_composition": _explicit_composition(elems, fracs),
     }
+    stamp_evidence(
+        result,
+        EvidenceSource.CITED_COMPUTATION,
+        [coerce_evidence_class(input_evidence_class)],
+    )
+    return result
 
 
 def create_hea_tools(registry: ToolRegistry) -> None:
@@ -502,6 +519,15 @@ _HEA_SCHEMA: dict = {
                 "Values must be finite, positive, and sum to 1.0 ± 1e-6."
             ),
         },
+        "evidence_class": {
+            "type": "string",
+            "enum": [item.value for item in EvidenceClass],
+            "default": EvidenceClass.INDETERMINATE.value,
+            "description": (
+                "RHEA-aligned class of the supplied composition/parameters. "
+                "The computed descriptors cannot outrank this input."
+            ),
+        },
     },
     "additionalProperties": False,
 }
@@ -512,10 +538,18 @@ def _hea_descriptors_tool() -> Tool:
         comp = kwargs.get("composition")
         fracs_dict = kwargs.get("fractions")
         if not comp and not fracs_dict:
-            return {"error": "provide a composition (formula string or fractions dict)"}
+            error = {"error": "provide a composition (formula string or fractions dict)"}
+            stamp_evidence(error, EvidenceSource.MODEL_ASSERTION)
+            return error
         try:
             elems, fracs = _parse_composition_or_raise(fracs_dict if fracs_dict else comp)
-            result = compute_hea_descriptors(elems, fracs)
+            result = compute_hea_descriptors(
+                elems,
+                fracs,
+                input_evidence_class=kwargs.get(
+                    "evidence_class", EvidenceClass.INDETERMINATE
+                ),
+            )
             # The formula parser expands only documented shorthand. Keep the
             # submitted string beside that explicit material record so users
             # can inspect exactly what was interpreted.
@@ -524,7 +558,9 @@ def _hea_descriptors_tool() -> Tool:
                 result["input_fractions"] = fracs_dict
             return result
         except (TypeError, ValueError) as exc:
-            return {"error": f"invalid composition: {exc}"}
+            error = {"error": f"invalid composition: {exc}"}
+            stamp_evidence(error, EvidenceSource.MODEL_ASSERTION)
+            return error
 
     return Tool(
         name="hea_descriptors",

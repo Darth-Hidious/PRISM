@@ -43,6 +43,229 @@ pub struct LocalFact {
     pub kind: Option<String>,
 }
 
+/// A QUDT unit identifier such as `QUDT:K` or `QUDT:W-PER-M-K`.
+///
+/// This is deliberately an identifier newtype, not a PRISM-specific unit
+/// enum: QUDT is the vocabulary, and accepting its open identifier space
+/// avoids creating a second, inevitably incomplete unit taxonomy here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct QudtUnit(String);
+
+impl QudtUnit {
+    pub fn new(identifier: impl Into<String>) -> Result<Self> {
+        let identifier = identifier.into();
+        if !identifier.starts_with("QUDT:") || identifier.len() == "QUDT:".len() {
+            anyhow::bail!("unit must be a QUDT identifier such as QUDT:K");
+        }
+        Ok(Self(identifier))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for QudtUnit {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let identifier = String::deserialize(deserializer)?;
+        Self::new(identifier).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A numerical or categorical boundary-condition value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConditionValue {
+    Number(f64),
+    Text(String),
+}
+
+/// One solver-consumable measurement condition. Numerical conditions carry
+/// a QUDT unit; categorical conditions (for example atmosphere=`air`) carry
+/// `unit: null` rather than smuggling the condition into prose.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeasurementCondition {
+    pub name: String,
+    pub value: ConditionValue,
+    #[serde(default)]
+    pub unit: Option<QudtUnit>,
+}
+
+/// The shared four-level evidence vocabulary, aligned with RHEA-JAX
+/// `ClaimStatus`. Colors are presentation labels; these serialized values are
+/// the stable machine contract used by facts and computed results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceClass {
+    /// RED: model assertion with no grounding.
+    #[default]
+    Indeterminate,
+    /// ORANGE: extracted from literature, not independently verified.
+    Research,
+    /// YELLOW: computed by a cited method.
+    Screening,
+    /// GREEN: executed or measured with reference evidence.
+    ReferenceValidated,
+}
+
+impl EvidenceClass {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Indeterminate => "indeterminate",
+            Self::Research => "research",
+            Self::Screening => "screening",
+            Self::ReferenceValidated => "reference_validated",
+        }
+    }
+
+    #[must_use]
+    pub fn color(self) -> &'static str {
+        match self {
+            Self::Indeterminate => "red",
+            Self::Research => "orange",
+            Self::Screening => "yellow",
+            Self::ReferenceValidated => "green",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Indeterminate => 0,
+            Self::Research => 1,
+            Self::Screening => 2,
+            Self::ReferenceValidated => 3,
+        }
+    }
+
+    fn from_stored(value: &str) -> Self {
+        match value {
+            "research" => Self::Research,
+            "screening" => Self::Screening,
+            "reference_validated" => Self::ReferenceValidated,
+            _ => Self::Indeterminate,
+        }
+    }
+}
+
+/// How a result was produced. This sets the best class the producer is
+/// allowed to claim before input evidence is considered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceSource {
+    Execution,
+    CitedComputation,
+    LiteratureExtraction,
+    ModelAssertion,
+}
+
+/// Classify a result conservatively: only execution has a GREEN ceiling, and
+/// the result can never outrank its worst input.
+#[must_use]
+pub fn evidence_for_result(
+    source: EvidenceSource,
+    inputs: impl IntoIterator<Item = EvidenceClass>,
+) -> EvidenceClass {
+    let ceiling = match source {
+        EvidenceSource::Execution => EvidenceClass::ReferenceValidated,
+        EvidenceSource::CitedComputation => EvidenceClass::Screening,
+        EvidenceSource::LiteratureExtraction => EvidenceClass::Research,
+        EvidenceSource::ModelAssertion => EvidenceClass::Indeterminate,
+    };
+    inputs.into_iter().fold(ceiling, |worst, input| {
+        if input.rank() < worst.rank() {
+            input
+        } else {
+            worst
+        }
+    })
+}
+
+/// New extraction/storage contract. The legacy [`LocalFact`] remains source
+/// compatible for CLI/server/mesh callers, while all new text extraction uses
+/// this type so conditions and QUDT units cannot be omitted from the path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterialFact {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    #[serde(default)]
+    pub value: Option<f64>,
+    #[serde(default)]
+    pub unit: Option<QudtUnit>,
+    #[serde(default)]
+    pub conditions: Vec<MeasurementCondition>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub evidence_class: EvidenceClass,
+}
+
+/// Common storage view implemented by both the additive conditioned contract
+/// and the source-compatible legacy fact.
+pub trait FactPayload {
+    fn to_local_fact(&self) -> LocalFact;
+    fn conditions(&self) -> &[MeasurementCondition];
+    fn evidence_class(&self) -> EvidenceClass;
+}
+
+impl FactPayload for LocalFact {
+    fn to_local_fact(&self) -> LocalFact {
+        self.clone()
+    }
+
+    fn conditions(&self) -> &[MeasurementCondition] {
+        &[]
+    }
+
+    fn evidence_class(&self) -> EvidenceClass {
+        EvidenceClass::Indeterminate
+    }
+}
+
+fn validate_conditions(conditions: &[MeasurementCondition]) -> Result<()> {
+    for condition in conditions {
+        if condition.name.trim().is_empty() {
+            anyhow::bail!("measurement condition name cannot be empty");
+        }
+        if matches!(&condition.value, ConditionValue::Number(_)) && condition.unit.is_none() {
+            anyhow::bail!(
+                "numerical measurement condition '{}' requires a QUDT unit",
+                condition.name
+            );
+        }
+    }
+    Ok(())
+}
+
+impl FactPayload for MaterialFact {
+    fn to_local_fact(&self) -> LocalFact {
+        LocalFact {
+            subject: self.subject.clone(),
+            predicate: self.predicate.clone(),
+            object: self.object.clone(),
+            value: self.value,
+            unit: self.unit.as_ref().map(|unit| unit.as_str().to_string()),
+            confidence: self.confidence,
+            kind: self.kind.clone(),
+        }
+    }
+
+    fn conditions(&self) -> &[MeasurementCondition] {
+        &self.conditions
+    }
+
+    fn evidence_class(&self) -> EvidenceClass {
+        self.evidence_class
+    }
+}
+
 /// Who ran the extraction and over what (mirrors core's `Provenance`, plus
 /// `locality` = "local" | "cloud" recording where the write happened).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +328,24 @@ pub struct RecalledFact {
     pub agent: String,
 }
 
+/// Additive read shape for conditioned, evidence-classed facts. The legacy
+/// [`RecalledFact`] remains unchanged so external struct literals and old
+/// consumers continue to compile; new scientific reads use this complete
+/// shape and therefore never render a fact without its class.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RecalledMaterialFact {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub value: Option<f64>,
+    pub unit: Option<String>,
+    pub conditions: Vec<MeasurementCondition>,
+    pub evidence_class: EvidenceClass,
+    pub confidence: f64,
+    pub source: String,
+    pub agent: String,
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Canonicalization + assertion identity
 // ─────────────────────────────────────────────────────────────────────────
@@ -148,6 +389,40 @@ pub fn assertion_id(subject: &str, predicate: &str, object: &str) -> String {
     h.update(b"|");
     h.update(canonical_key(object).as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn conditioned_assertion_id(
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    value: Option<f64>,
+    unit: Option<&str>,
+    conditions: &[MeasurementCondition],
+) -> Result<String> {
+    if value.is_none() && unit.is_none() && conditions.is_empty() {
+        return Ok(assertion_id(subject, predicate, object));
+    }
+
+    use sha2::{Digest, Sha256};
+    let mut canonical_conditions = conditions.to_vec();
+    canonical_conditions.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut h = Sha256::new();
+    h.update(canonical_key(subject).as_bytes());
+    h.update(b"|");
+    h.update(predicate.as_bytes());
+    h.update(b"|");
+    h.update(canonical_key(object).as_bytes());
+    h.update(b"|");
+    if let Some(value) = value {
+        h.update(value.to_bits().to_le_bytes());
+    }
+    h.update(b"|");
+    if let Some(unit) = unit {
+        h.update(unit.as_bytes());
+    }
+    h.update(b"|");
+    h.update(serde_json::to_vec(&canonical_conditions)?);
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Combine independent evidence for the same fact (noisy-OR): each new
@@ -248,6 +523,10 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
             subject TEXT,
             predicate TEXT,
             object TEXT,
+            value REAL,
+            unit TEXT,
+            conditions_json TEXT NOT NULL DEFAULT '[]',
+            evidence_class TEXT NOT NULL DEFAULT 'indeterminate',
             confidence REAL,
             corroborations INTEGER,
             activity_id TEXT,
@@ -271,6 +550,26 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_prov_assertion_object ON prov_assertion(object)",
         (),
+    )
+    .await?;
+
+    // Additive migration for databases created before conditioned facts and
+    // evidence classes existed. Defaults keep every legacy row readable and
+    // conservatively RED; no old value is rewritten or dropped.
+    crate::add_column_if_absent(conn, "prov_assertion", "value", "REAL").await?;
+    crate::add_column_if_absent(conn, "prov_assertion", "unit", "TEXT").await?;
+    crate::add_column_if_absent(
+        conn,
+        "prov_assertion",
+        "conditions_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    crate::add_column_if_absent(
+        conn,
+        "prov_assertion",
+        "evidence_class",
+        "TEXT NOT NULL DEFAULT 'indeterminate'",
     )
     .await?;
 
@@ -450,7 +749,32 @@ impl ProvenanceStore {
     /// Write one fact as typed EMMO entities + edges, routing on `fact.kind`
     /// exactly like core's typed `write_*_fact` writers, then reify it as a
     /// PROV-O assertion so graph and audit trail stay consistent.
-    pub async fn write_fact(&self, fact: &LocalFact, prov: &LocalProvenance) -> Result<()> {
+    pub async fn write_fact<F: FactPayload>(&self, fact: &F, prov: &LocalProvenance) -> Result<()> {
+        self.write_fact_as(fact, prov, fact.evidence_class()).await
+    }
+
+    /// Store a source-compatible legacy fact with an explicit class. This is
+    /// used by the tabular LLM ingest path, whose old `LocalFact` shape cannot
+    /// carry the new field but whose origin is known to be literature/data
+    /// extraction (ORANGE), not an ungrounded model assertion (RED).
+    pub async fn write_fact_with_evidence(
+        &self,
+        fact: &LocalFact,
+        prov: &LocalProvenance,
+        evidence_class: EvidenceClass,
+    ) -> Result<()> {
+        self.write_fact_as(fact, prov, evidence_class).await
+    }
+
+    async fn write_fact_as<F: FactPayload>(
+        &self,
+        payload: &F,
+        prov: &LocalProvenance,
+        evidence_class: EvidenceClass,
+    ) -> Result<()> {
+        let conditions = payload.conditions().to_vec();
+        validate_conditions(&conditions)?;
+        let fact = payload.to_local_fact();
         let confidence = fact.confidence.unwrap_or(0.5);
         let tenant = prov.tenant.as_str();
 
@@ -469,7 +793,12 @@ impl ProvenanceStore {
                     canonical_key(&fact.object)
                 );
                 let props = serde_json::json!({
-                    "value": value, "unit": unit, "confidence": confidence
+                    "value": value,
+                    "unit": unit,
+                    "conditions": conditions,
+                    "evidence_class": evidence_class,
+                    "evidence_color": evidence_class.color(),
+                    "confidence": confidence,
                 });
                 let subj_key = self
                     .upsert_entity(&fact.subject, "Matter", tenant, None)
@@ -647,7 +976,7 @@ impl ProvenanceStore {
             }
         }
 
-        self.record_assertion(
+        self.record_assertion_with_context(
             &LocalAssertion {
                 subject: fact.subject.clone(),
                 predicate: fact.predicate.clone(),
@@ -655,6 +984,10 @@ impl ProvenanceStore {
                 confidence: fact.confidence,
             },
             prov,
+            fact.value,
+            fact.unit.as_deref(),
+            &conditions,
+            evidence_class,
         )
         .await
     }
@@ -702,24 +1035,39 @@ impl ProvenanceStore {
     /// of the same triple (stable SHA-256 id over canonical forms) combines
     /// confidence noisy-OR and increments `corroborations`.
     pub async fn record_assertion(&self, a: &LocalAssertion, prov: &LocalProvenance) -> Result<()> {
+        self.record_assertion_with_context(a, prov, None, None, &[], EvidenceClass::Indeterminate)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_assertion_with_context(
+        &self,
+        a: &LocalAssertion,
+        prov: &LocalProvenance,
+        value: Option<f64>,
+        unit: Option<&str>,
+        conditions: &[MeasurementCondition],
+        evidence_class: EvidenceClass,
+    ) -> Result<()> {
         self.record_activity(prov).await?;
 
-        let id = assertion_id(&a.subject, &a.predicate, &a.object);
-        let evidence = a.confidence.unwrap_or(1.0);
+        let id =
+            conditioned_assertion_id(&a.subject, &a.predicate, &a.object, value, unit, conditions)?;
+        let confidence_evidence = a.confidence.unwrap_or(1.0);
+        let conditions_json = serde_json::to_string(conditions)?;
 
-        // Read current belief, then corroborate or insert. The id is a
-        // tenant-independent hash and the table's PRIMARY KEY (per schema),
-        // so identical triples share one row; reads stay tenant-filtered.
-        //
-        // The read cursor is fully consumed and dropped BEFORE the write:
-        // turso (pre-release) mishandles a write issued while a read
-        // statement is still open on the same connection — the write lands
-        // but later table scans can see the stale row.
+        // Read current belief, then corroborate or insert. Confidence and
+        // evidence class are independent: noisy-OR may increase confidence,
+        // but the stored class remains the WORST class ever attached to this
+        // assertion. Agreement therefore cannot turn literature into GREEN.
+        // The cursor is fully consumed before the write (Turso pre-release is
+        // sensitive to interleaved statements on one connection).
         let existing = {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT confidence, corroborations FROM prov_assertion WHERE id = ?1",
+                    "SELECT confidence, corroborations, evidence_class \
+                     FROM prov_assertion WHERE id = ?1",
                     [Value::Text(id.clone())],
                 )
                 .await?;
@@ -735,25 +1083,37 @@ impl ProvenanceStore {
                         .ok()
                         .and_then(|v| v.as_integer().copied())
                         .unwrap_or(1);
+                    let old_class = match row.get_value(2).ok() {
+                        Some(Value::Text(value)) => EvidenceClass::from_stored(&value),
+                        _ => EvidenceClass::Indeterminate,
+                    };
                     while rows.next().await?.is_some() {}
-                    Some((old_conf, old_corr))
+                    Some((old_conf, old_corr, old_class))
                 }
                 None => None,
             }
         };
-        if let Some((old_conf, old_corr)) = existing {
+        if let Some((old_conf, old_corr, old_class)) = existing {
+            let retained_class =
+                evidence_for_result(EvidenceSource::Execution, [old_class, evidence_class]);
             self.conn
                 .execute(
                     r#"UPDATE prov_assertion
                        SET confidence = ?1, corroborations = ?2,
-                           activity_id = ?3, source = ?4, agent = ?5
-                       WHERE id = ?6"#,
+                           activity_id = ?3, source = ?4, agent = ?5,
+                           value = ?6, unit = ?7, conditions_json = ?8,
+                           evidence_class = ?9
+                       WHERE id = ?10"#,
                     [
-                        Value::Real(corroborate_confidence(old_conf, evidence)),
+                        Value::Real(corroborate_confidence(old_conf, confidence_evidence)),
                         Value::Integer(old_corr + 1),
                         Value::Text(prov.activity_id.clone()),
                         Value::Text(prov.source_entity_id.clone()),
                         Value::Text(prov.agent_id.clone()),
+                        value.map_or(Value::Null, Value::Real),
+                        unit.map_or(Value::Null, |unit| Value::Text(unit.to_string())),
+                        Value::Text(conditions_json),
+                        Value::Text(retained_class.as_str().to_string()),
                         Value::Text(id),
                     ],
                 )
@@ -762,15 +1122,21 @@ impl ProvenanceStore {
             self.conn
                 .execute(
                     r#"INSERT INTO prov_assertion
-                       (id, subject, predicate, object, confidence, corroborations,
+                       (id, subject, predicate, object, value, unit,
+                        conditions_json, evidence_class, confidence, corroborations,
                         activity_id, source, agent, tenant)
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                               ?11, ?12, ?13, ?14)"#,
                     [
                         Value::Text(id),
                         Value::Text(a.subject.clone()),
                         Value::Text(a.predicate.clone()),
                         Value::Text(a.object.clone()),
-                        Value::Real(evidence),
+                        value.map_or(Value::Null, Value::Real),
+                        unit.map_or(Value::Null, |unit| Value::Text(unit.to_string())),
+                        Value::Text(conditions_json),
+                        Value::Text(evidence_class.as_str().to_string()),
+                        Value::Real(confidence_evidence),
                         Value::Integer(1),
                         Value::Text(prov.activity_id.clone()),
                         Value::Text(prov.source_entity_id.clone()),
@@ -958,14 +1324,40 @@ impl ProvenanceStore {
         Ok(TraversalResult { nodes, edges })
     }
 
-    /// Recall assertions whose subject or object matches the query,
-    /// highest-confidence first.
+    /// Legacy cloud-shaped recall. New scientific consumers should use
+    /// [`Self::recall_with_context`], which also returns value, unit,
+    /// conditions, and evidence class.
     pub async fn recall(&self, query: &str, tenant: &str, limit: i64) -> Result<Vec<RecalledFact>> {
+        Ok(self
+            .recall_with_context(query, tenant, limit)
+            .await?
+            .into_iter()
+            .map(|fact| RecalledFact {
+                subject: fact.subject,
+                predicate: fact.predicate,
+                object: fact.object,
+                confidence: fact.confidence,
+                source: fact.source,
+                agent: fact.agent,
+            })
+            .collect())
+    }
+
+    /// Recall complete assertions, highest-confidence first. Every returned
+    /// row includes the additive condition and evidence fields; legacy rows
+    /// read as empty conditions with RED/indeterminate evidence.
+    pub async fn recall_with_context(
+        &self,
+        query: &str,
+        tenant: &str,
+        limit: i64,
+    ) -> Result<Vec<RecalledMaterialFact>> {
         let pattern = format!("%{query}%");
         let mut rows = self
             .conn
             .query(
-                r#"SELECT subject, predicate, object, confidence, source, agent
+                r#"SELECT subject, predicate, object, value, unit, conditions_json,
+                          evidence_class, confidence, source, agent
                    FROM prov_assertion
                    WHERE tenant = ?1 AND (subject LIKE ?2 OR object LIKE ?3)
                    ORDER BY confidence DESC LIMIT ?4"#,
@@ -979,17 +1371,31 @@ impl ProvenanceStore {
             .await?;
         let mut facts = Vec::new();
         while let Some(row) = rows.next().await? {
-            facts.push(RecalledFact {
+            let conditions_json = get_str(&row, 5)?;
+            let conditions = serde_json::from_str(&conditions_json).map_err(|error| {
+                anyhow::anyhow!("stored fact has invalid conditions_json: {error}")
+            })?;
+            facts.push(RecalledMaterialFact {
                 subject: get_str(&row, 0)?,
                 predicate: get_str(&row, 1)?,
                 object: get_str(&row, 2)?,
-                confidence: row
+                value: row
                     .get_value(3)
                     .ok()
-                    .and_then(|v| v.as_real().copied())
+                    .and_then(|value| value.as_real().copied()),
+                unit: match row.get_value(4)? {
+                    Value::Text(unit) if !unit.is_empty() => Some(unit),
+                    _ => None,
+                },
+                conditions,
+                evidence_class: EvidenceClass::from_stored(&get_str(&row, 6)?),
+                confidence: row
+                    .get_value(7)
+                    .ok()
+                    .and_then(|value| value.as_real().copied())
                     .unwrap_or(0.0),
-                source: get_str(&row, 4)?,
-                agent: get_str(&row, 5)?,
+                source: get_str(&row, 8)?,
+                agent: get_str(&row, 9)?,
             });
         }
         Ok(facts)
@@ -1032,19 +1438,20 @@ impl ProvenanceStore {
     /// Like `embed_and_store`, deliberately NOT part of `write_fact`:
     /// graph writes must never wait on (or fail because of) an embedding
     /// model. Callers run this after the fact writes succeed.
-    pub async fn embed_and_store_entities(
+    pub async fn embed_and_store_entities<F: FactPayload>(
         &self,
-        facts: &[LocalFact],
+        facts: &[F],
         tenant: &str,
         backend: &dyn prism_embed::EmbedBackend,
     ) -> Result<usize> {
         // Distinct display names, first-seen order.
         let mut seen = std::collections::HashSet::new();
         let mut names: Vec<String> = Vec::new();
-        for fact in facts {
-            for name in [&fact.subject, &fact.object] {
-                if seen.insert(canonical_key(name)) {
-                    names.push(name.clone());
+        for payload in facts {
+            let fact = payload.to_local_fact();
+            for name in [fact.subject, fact.object] {
+                if seen.insert(canonical_key(&name)) {
+                    names.push(name);
                 }
             }
         }
@@ -1085,7 +1492,7 @@ impl ProvenanceStore {
     /// ever native init downloads the model) and stores one vector per
     /// entity. Failures are logged and swallowed — an ingest must never
     /// fail because of the embedding model.
-    pub async fn embed_entities_best_effort(&self, facts: &[LocalFact], tenant: &str) {
+    pub async fn embed_entities_best_effort<F: FactPayload>(&self, facts: &[F], tenant: &str) {
         if facts.is_empty() {
             return;
         }
@@ -1626,6 +2033,132 @@ mod tests {
         assert_eq!(a, b, "spelling variants must corroborate one assertion");
         assert_ne!(a, c, "direction matters");
         assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn computed_evidence_inherits_the_worst_input() {
+        assert_eq!(
+            evidence_for_result(
+                EvidenceSource::Execution,
+                [EvidenceClass::ReferenceValidated, EvidenceClass::Research],
+            ),
+            EvidenceClass::Research,
+            "executing a solver must not launder an orange boundary condition",
+        );
+        assert_eq!(
+            evidence_for_result(
+                EvidenceSource::CitedComputation,
+                [EvidenceClass::ReferenceValidated],
+            ),
+            EvidenceClass::Screening,
+            "a cited computation is yellow even with green inputs",
+        );
+        assert_eq!(
+            evidence_for_result(EvidenceSource::LiteratureExtraction, []),
+            EvidenceClass::Research,
+            "literature extraction is orange regardless of confidence",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_assertion_rows_migrate_to_empty_conditions_and_red() {
+        let db = TempDb::new();
+        {
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"CREATE TABLE prov_assertion (
+                    id TEXT PRIMARY KEY,
+                    subject TEXT,
+                    predicate TEXT,
+                    object TEXT,
+                    confidence REAL,
+                    corroborations INTEGER,
+                    activity_id TEXT,
+                    source TEXT,
+                    agent TEXT,
+                    tenant TEXT
+                )"#,
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                r#"INSERT INTO prov_assertion
+                   (id, subject, predicate, object, confidence, corroborations,
+                    activity_id, source, agent, tenant)
+                   VALUES ('legacy', 'steel', 'has_phase', 'bcc', 0.7, 1,
+                           'activity', 'legacy.csv', 'legacy-agent', 't1')"#,
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let recalled = store.recall_with_context("steel", "t1", 10).await.unwrap();
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].value, None);
+        assert_eq!(recalled[0].unit, None);
+        assert!(recalled[0].conditions.is_empty());
+        assert_eq!(recalled[0].evidence_class, EvidenceClass::Indeterminate);
+    }
+
+    #[tokio::test]
+    async fn conditions_distinguish_measurements_and_corroboration_cannot_upgrade_them() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+        let measurement = |temperature, evidence_class| MaterialFact {
+            subject: "test ceramic".into(),
+            predicate: "has_measurement".into(),
+            object: "thermal conductivity".into(),
+            value: Some(22.0),
+            unit: Some(QudtUnit::new("QUDT:W-PER-M-K").unwrap()),
+            conditions: vec![MeasurementCondition {
+                name: "temperature".into(),
+                value: ConditionValue::Number(temperature),
+                unit: Some(QudtUnit::new("QUDT:K").unwrap()),
+            }],
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+            evidence_class,
+        };
+
+        let at_1200 = measurement(1200.0, EvidenceClass::Research);
+        let at_1300 = measurement(1300.0, EvidenceClass::Research);
+        store.write_fact(&at_1200, &prov).await.unwrap();
+        store.write_fact(&at_1300, &prov).await.unwrap();
+        // A later execution that agrees with the 1200 K value raises
+        // confidence but must not upgrade the literature-derived class.
+        store
+            .write_fact(
+                &measurement(1200.0, EvidenceClass::ReferenceValidated),
+                &prov,
+            )
+            .await
+            .unwrap();
+
+        let recalled = store
+            .recall_with_context("thermal conductivity", "t1", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            recalled.len(),
+            2,
+            "different conditions are different facts"
+        );
+        assert!(
+            recalled
+                .iter()
+                .all(|fact| fact.evidence_class == EvidenceClass::Research)
+        );
+        assert!(recalled.iter().any(|fact| {
+            fact.conditions[0].value == ConditionValue::Number(1200.0) && fact.confidence > 0.9
+        }));
     }
 
     // ── Entity vectors ───────────────────────────────────────────────────
