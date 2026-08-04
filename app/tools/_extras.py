@@ -36,6 +36,7 @@ EXTRA_MODULES: dict[str, tuple[str, ...]] = {
     "lpbf": ("numpy", "scipy"),
     "calphad": ("pycalphad", "scheil"),
     "precipitation": ("kawin",),
+    "polymer": ("rdkit",),
     "mace": ("mace", "torch", "ase", "numpy", "huggingface_hub", "phonopy"),
     "data": ("datasets",),
     "reports": ("markdown", "weasyprint"),
@@ -57,6 +58,7 @@ EXTRA_DISTRIBUTIONS: dict[str, tuple[str, ...]] = {
     "lpbf": ("numpy", "scipy"),
     "calphad": ("pycalphad", "scheil"),
     "precipitation": ("kawin",),
+    "polymer": ("rdkit",),
     "mace": ("mace-torch", "torch", "ase", "numpy", "huggingface-hub", "phonopy"),
     "data": ("datasets",),
     "reports": ("markdown", "weasyprint"),
@@ -75,6 +77,7 @@ GATE_IMPORTS: dict[str, tuple[str, ...]] = {
     # remain usable when pycalphad is installed without that optional helper.
     "calphad": ("pycalphad",),
     "precipitation": ("kawin",),
+    "polymer": ("rdkit",),
     "mace": ("mace", "ase"),
     "data": ("datasets",),
     "reports": ("markdown",),

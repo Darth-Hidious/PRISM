@@ -65,7 +65,7 @@
       "author": "Mirdyne (PRISM)",
       "version": "1.0.0",
       "requires_extras": [],
-      "optional_extras": ["ml", "calphad", "precipitation", "lpbf", "qe", "simulation", "mace", "data", "reports"],
+      "optional_extras": ["ml", "calphad", "precipitation", "polymer", "lpbf", "qe", "simulation", "mace", "data", "reports"],
       "tools": [],
       "modules": ["app.mcp_server"],
       "metadata": {
@@ -73,7 +73,7 @@
         "kind": "mcp_server",
         "tools": [],
         "requires_extras": [],
-        "optional_extras": ["ml", "calphad", "precipitation", "lpbf", "qe", "simulation", "mace", "data", "reports"],
+        "optional_extras": ["ml", "calphad", "precipitation", "polymer", "lpbf", "qe", "simulation", "mace", "data", "reports"],
         "transport": "stdio",
         "command": ["python3", "-m", "app.mcp_server"],
         "install": {

@@ -114,6 +114,15 @@ calphad = [
     # scheil_solidification tool for non-equilibrium solidification paths.
     "scheil>=0.2.0; python_version<'3.15'",
 ]
+polymer = [
+    # RDKit validates polymer identity (repeat unit / monomer / SMILES) for
+    # app/tools/materials/polymer. Registration is already gated on
+    # check_polymer_available(), so without this the tool degrades honestly --
+    # but there was no extra a user could install to GET it, which made the
+    # install hint unactionable. Declaring it closes that.
+    "rdkit>=2024.3.1",
+]
+
 precipitation = [
     # Kampmann-Wagner Numerical precipitation kinetics (the TC-PRISMA
     # capability) via kawin, used by app/tools/materials/precipitation.
