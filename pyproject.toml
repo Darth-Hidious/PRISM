@@ -112,6 +112,17 @@ calphad = [
     # scheil_solidification tool for non-equilibrium solidification paths.
     "scheil>=0.2.0; python_version<'3.15'",
 ]
+precipitation = [
+    # Kampmann-Wagner Numerical precipitation kinetics (the TC-PRISMA
+    # capability) via kawin, used by app/tools/materials/precipitation.
+    # kawin 0.5.0 declares pycalphad>=0.11, which intersects this repo's
+    # calphad-extra pin (pycalphad>=0.10,<0.12) at 0.11.x -- no conflicting
+    # second pin is declared here; pip resolves the shared constraint.
+    # kawin requires Python >= 3.11; upper-capped at 0.6 because its API
+    # is still churning (upstream: "There has been a lot of changes in the
+    # API").
+    "kawin>=0.5.0,<0.6; python_version>='3.11' and python_version<'3.15'",
+]
 mace = [
     # MACE foundation interatomic potentials (MACE-MP-0, MACE-MH-1).
     #
@@ -138,7 +149,7 @@ reports = [
     "weasyprint>=60.0",
 ]
  all = [
-    "prism-platform[ml,calphad,mace,qe,lpbf,data,reports]",
+    "prism-platform[ml,calphad,precipitation,mace,qe,lpbf,data,reports]",
  ]
 full = [
     "prism-platform[all,simulation]",

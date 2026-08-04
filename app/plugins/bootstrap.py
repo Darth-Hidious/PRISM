@@ -209,6 +209,23 @@ def build_full_registry(
     except Exception:
         logger.debug("qe tools not registered", exc_info=True)
 
+    # Precipitation kinetics (Kampmann-Wagner Numerical) via kawin — the
+    # TC-PRISMA-equivalent capability: coupled nucleation, growth and
+    # coarsening of a precipitate size distribution against a CALPHAD
+    # database. Registered ONLY when kawin + pycalphad import; like the QE
+    # block above, no ghost registrations when the deps are missing.
+    try:
+        from app.tools.materials.precipitation import check_precipitation_available
+
+        if check_precipitation_available():
+            from app.tools.materials.precipitation.tools import (
+                create_precipitation_tools,
+            )
+
+            create_precipitation_tools(registry)
+    except Exception:
+        logger.debug("precipitation tools not registered", exc_info=True)
+
     # LPBF manufacturing physics (optional `[lpbf]` extra): analytical
     # Rosenthal printability maps and Kou cracking susceptibility. Registered
     # only when NumPy + SciPy import; there is no sidecar or ghost tool.
