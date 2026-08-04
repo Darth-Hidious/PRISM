@@ -9,7 +9,13 @@ from app.tools.search_engine.providers.base import Provider, ProviderCapabilitie
 from app.tools.search_engine.providers.endpoint import ProviderEndpoint
 from app.tools.search_engine.query import MaterialSearchQuery
 from app.tools.search_engine.resilience.retries import with_transient_retry
-from app.tools.search_engine.result import Material, PropertyValue, ProviderQueryLog
+from app.tools.search_engine.result import (
+    ExtractionProvenance,
+    Material,
+    MaterialIdentity,
+    PropertyValue,
+    ProviderQueryLog,
+)
 from app.tools.search_engine.translator import QueryTranslator
 
 logger = logging.getLogger(__name__)
@@ -169,23 +175,39 @@ class OptimadeProvider(Provider):
         nelements = attrs.get("nelements") or len(elements)
 
         source = f"optimade:{self.id}"
+        extraction = ExtractionProvenance(
+            extractor_id="optimade_jsonapi",
+            kind="structured_api",
+        )
 
         space_group = None
         sg_val = attrs.get("space_group_symbol")
         if sg_val:
-            space_group = PropertyValue(value=sg_val, source=source)
+            space_group = PropertyValue(
+                value=sg_val,
+                source=source,
+                extraction=extraction,
+            )
 
         lattice = None
         lv_val = attrs.get("lattice_vectors")
         if lv_val:
-            lattice = PropertyValue(value=lv_val, source=source)
+            lattice = PropertyValue(
+                value=lv_val,
+                source=source,
+                extraction=extraction,
+            )
 
         # Provider-specific fields (prefixed with _)
         extra = {}
         for key, val in attrs.items():
             if key.startswith("_") and val is not None:
                 try:
-                    extra[key] = PropertyValue(value=val, source=source)
+                    extra[key] = PropertyValue(
+                        value=val,
+                        source=source,
+                        extraction=extraction,
+                    )
                 except Exception:
                     logger.debug("Skipping unparseable field %s for %s", key, entry_id)
 
@@ -195,6 +217,14 @@ class OptimadeProvider(Provider):
             elements=sorted(elements),
             n_elements=nelements,
             sources=[self.id],
+            identity=MaterialIdentity(
+                domain="crystal",
+                representation="formula_space_group",
+                attributes={
+                    "formula": formula,
+                    "space_group": str(space_group.value) if space_group else "unknown",
+                },
+            ),
             space_group=space_group,
             lattice_vectors=lattice,
             extra_properties=extra,

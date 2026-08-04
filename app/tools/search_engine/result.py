@@ -8,12 +8,54 @@ from pydantic import BaseModel, Field
 from app.tools.search_engine.query import MaterialSearchQuery
 
 
+class ExtractionProvenance(BaseModel):
+    """How a value was transcribed from its underlying source.
+
+    ``source`` on :class:`PropertyValue` names the provider, paper, or other
+    authority that made the claim.  This separate record names the extraction
+    path, so an LLM transcription error is not attributed to the paper itself.
+    """
+
+    extractor_id: str = "unknown"
+    kind: Literal["structured_api", "llm_literature", "other", "unknown"] = "unknown"
+
+
 class PropertyValue(BaseModel):
-    """A single property with tracked provenance."""
+    """A single property with source and extraction provenance."""
+
     value: float | str | list | dict[str, Any] | None = None
     source: str = ""
     method: str | None = None
     unit: str | None = None
+    extraction: ExtractionProvenance = Field(default_factory=ExtractionProvenance)
+
+
+class MaterialIdentity(BaseModel):
+    """A domain-supplied identity payload consumed by an identity plugin."""
+
+    domain: str
+    representation: str
+    attributes: dict[str, str]
+
+
+class FusionCandidate(BaseModel):
+    """One audited input to a reliability-weighted property decision."""
+
+    property_value: PropertyValue
+    source: str
+    extractor_id: str
+    source_reliability: float
+    extraction_reliability: float
+    combined_weight: float
+    selected: bool
+
+
+class PropertyFusionAudit(BaseModel):
+    """All candidates and weights used to select one fused property value."""
+
+    resolved: bool
+    selected_source: str | None = None
+    candidates: list[FusionCandidate]
 
 
 class Material(BaseModel):
@@ -23,6 +65,9 @@ class Material(BaseModel):
     elements: list[str]
     n_elements: int
     sources: list[str]
+    # None is retained only for legacy records.  Fusion leaves such a record
+    # unfused rather than guessing it is a crystal from its formula.
+    identity: MaterialIdentity | None = None
 
     space_group: PropertyValue | None = None
     crystal_system: PropertyValue | None = None
@@ -34,6 +79,8 @@ class Material(BaseModel):
     debye_temperature: PropertyValue | None = None
 
     extra_properties: dict[str, PropertyValue] = Field(default_factory=dict)
+    # Present whenever multiple candidates for a property were considered.
+    fusion_audit: dict[str, PropertyFusionAudit] = Field(default_factory=dict)
     raw: dict = Field(default_factory=dict, exclude=True)
 
 

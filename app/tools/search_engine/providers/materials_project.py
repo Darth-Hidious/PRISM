@@ -8,7 +8,12 @@ import os
 from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
 from app.tools.search_engine.providers.endpoint import ProviderEndpoint
 from app.tools.search_engine.query import MaterialSearchQuery
-from app.tools.search_engine.result import Material, PropertyValue
+from app.tools.search_engine.result import (
+    ExtractionProvenance,
+    Material,
+    MaterialIdentity,
+    PropertyValue,
+)
 from app.tools.search_engine.translator import QueryTranslator
 
 logger = logging.getLogger(__name__)
@@ -136,6 +141,10 @@ class MaterialsProjectProvider(Provider):
     def _parse_doc(self, doc: dict) -> Material:
         """Parse an MPRester result document into a Material."""
         source = "mp_native"
+        extraction = ExtractionProvenance(
+            extractor_id="materials_project_api",
+            kind="structured_api",
+        )
         mid = str(doc.get("material_id", ""))
         formula = doc.get("formula_pretty", "")
         elements = sorted(doc.get("elements", []))
@@ -144,7 +153,11 @@ class MaterialsProjectProvider(Provider):
         band_gap = None
         if doc.get("band_gap") is not None:
             band_gap = PropertyValue(
-                value=doc["band_gap"], source=source, method="DFT-PBE", unit="eV"
+                value=doc["band_gap"],
+                source=source,
+                method="DFT-PBE",
+                unit="eV",
+                extraction=extraction,
             )
 
         formation_energy = None
@@ -154,6 +167,7 @@ class MaterialsProjectProvider(Provider):
                 source=source,
                 method="DFT-PBE",
                 unit="eV/atom",
+                extraction=extraction,
             )
 
         energy_above_hull = None
@@ -163,12 +177,17 @@ class MaterialsProjectProvider(Provider):
                 source=source,
                 method="DFT-PBE",
                 unit="eV/atom",
+                extraction=extraction,
             )
 
         space_group = None
         sym = doc.get("symmetry")
         if isinstance(sym, dict) and sym.get("symbol"):
-            space_group = PropertyValue(value=sym["symbol"], source=source)
+            space_group = PropertyValue(
+                value=sym["symbol"],
+                source=source,
+                extraction=extraction,
+            )
 
         return Material(
             id=mid,
@@ -176,6 +195,14 @@ class MaterialsProjectProvider(Provider):
             elements=elements,
             n_elements=nelements,
             sources=["mp_native"],
+            identity=MaterialIdentity(
+                domain="crystal",
+                representation="formula_space_group",
+                attributes={
+                    "formula": formula,
+                    "space_group": str(space_group.value) if space_group else "unknown",
+                },
+            ),
             band_gap=band_gap,
             formation_energy=formation_energy,
             energy_above_hull=energy_above_hull,
