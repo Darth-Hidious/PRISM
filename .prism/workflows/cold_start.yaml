@@ -1,0 +1,172 @@
+kind: skill_workflow
+name: cold_start
+command_name: cold-start
+description: >
+  PRISM Addendum E cold-start workflow, Version 1.0. Phase 0 initializes and
+  replay-fine-tunes a target head from MIT-licensed MACE-MP-0 artifacts;
+  MACE-MP-0 replaces the specified MACE-MH-1 because MACE-MH-1's ASL weights
+  are not permitted for this commercial prediction service. Full foundation
+  pre-training remains a GPU/HPC workload. Phase 1 generates only real
+  CALPHAD pseudo-labels from a covering TDB, Phase 2 performs provenance-bound
+  acquisition and D-optimal selection, and Phase 3 prepares a handoff to the
+  existing durable campaign loop. Missing data, engines, or databases are
+  reported as unavailable; no thermodynamic or candidate data is fabricated.
+version: "1.0.0"
+author: MARC27
+
+inputs:
+  - name: elements
+    type: list
+    description: Element set for the composition simplex.
+    default: [Mo, Nb, Ta, W, Hf]
+  - name: temperature_K
+    type: number
+    description: CALPHAD equilibrium temperature in kelvin.
+    default: 1773
+  - name: n_samples
+    type: integer
+    description: Number of uniform simplex samples for Algorithm 2.
+    default: 10000
+  - name: seed
+    type: integer
+    description: Deterministic simplex and replay sampler seed.
+    default: 0
+  - name: pressure_Pa
+    type: number
+    default: 101325
+  - name: calphad_database
+    type: string
+    description: Optional managed TDB name; otherwise select the first covering database.
+    required: false
+  - name: foundation_head_path
+    type: string
+    description: Optional local MACE-MP-0 Head-A .npz artifact.
+    required: false
+  - name: target_data_path
+    type: string
+    description: Optional sparse-target MACE-MP-0 descriptor .npz artifact.
+    required: false
+  - name: foundation_replay_path
+    type: string
+    description: Optional foundation replay MACE-MP-0 descriptor .npz artifact.
+    required: false
+  - name: phase0_output_path
+    type: string
+    description: Optional output .npz path for fine-tuned Head-B.
+    required: false
+  - name: phase0_epochs
+    type: integer
+    default: 5
+  - name: phase0_steps_per_epoch
+    type: integer
+    default: 10
+  - name: phase0_batch_size
+    type: integer
+    default: 20
+  - name: phase0_learning_rate
+    type: number
+    default: 0.001
+  - name: acquisition_candidates
+    type: list
+    description: >
+      Optional Mutator candidate pool. Every candidate must provide a real
+      y_stability=1 CALPHAD label plus sigma, mu, d_pareto, rho, descriptor,
+      composition, and input provenance.
+    required: false
+  - name: acquisition_batch_size
+    type: integer
+    default: 16
+  - name: acquisition_weights
+    type: object
+    default:
+      uncertainty: 0.4
+      exploitation: 0.2
+      improvement: 0.3
+      diversity: 0.1
+  - name: stagnation_batches
+    type: integer
+    default: 0
+  - name: budget_fraction_remaining
+    type: number
+    default: 1.0
+  - name: breakthrough_detected
+    type: boolean
+    default: false
+  - name: objective
+    type: string
+    default: maximize high-temperature refractory HEA performance
+
+steps:
+  - name: phase0_foundation_bootstrap
+    skill: cold_start_foundation_bootstrap
+    description: >
+      Record Stage 1 as an external GPU/HPC requirement. When local,
+      provenance-bearing MACE-MP-0 artifacts are supplied, copy Head-A into
+      Head-B and update Head-B only with exact 80/20 target/foundation replay.
+    approve: true
+    inputs:
+      foundation_head_path: "$foundation_head_path"
+      target_data_path: "$target_data_path"
+      foundation_replay_path: "$foundation_replay_path"
+      output_path: "$phase0_output_path"
+      epochs: "$phase0_epochs"
+      steps_per_epoch: "$phase0_steps_per_epoch"
+      batch_size: "$phase0_batch_size"
+      learning_rate: "$phase0_learning_rate"
+      seed: "$seed"
+    outputs:
+      phase0: "$phase0"
+
+  - name: phase1_calphad_augmentation
+    skill: cold_start_calphad_augmentation
+    description: >
+      Execute Addendum E Algorithm 2 with the existing CALPHAD evaluator:
+      SampleSimplex, global equilibrium, BCC-constrained driving force, strict
+      phi_BCC > 0.95 label, provenance, and hard filtering. Stop before
+      sampling when no local TDB covers the complete element set.
+    approve: true
+    inputs:
+      elements: "$elements"
+      temperature_K: "$temperature_K"
+      n_samples: "$n_samples"
+      seed: "$seed"
+      pressure_Pa: "$pressure_Pa"
+      database_name: "$calphad_database"
+    outputs:
+      phase1: "$phase1"
+
+  - name: phase2_active_learning
+    skill: cold_start_active_learning
+    description: >
+      Compute the Addendum E acquisition score from supplied, provenance-bearing
+      signals, apply playbook-controlled adaptation, and perform exact
+      D-optimal batch selection for tractable pools. Report unavailable rather
+      than create missing uncertainty, prediction, Pareto, density, or
+      descriptor values.
+    inputs:
+      candidates: "$acquisition_candidates"
+      batch_size: "$acquisition_batch_size"
+      weights: "$acquisition_weights"
+      stagnation_batches: "$stagnation_batches"
+      budget_fraction_remaining: "$budget_fraction_remaining"
+      breakthrough_detected: "$breakthrough_detected"
+    outputs:
+      phase2: "$phase2"
+
+  - name: phase3_campaign_handoff
+    skill: cold_start_campaign_handoff
+    description: >
+      If the bootstrap is complete, construct a provenance-bearing CampaignGoal
+      and CampaignConfig handoff for the existing crates/campaign loop. Do not
+      start or reimplement the campaign here; a blocked bootstrap emits no
+      handoff.
+    inputs:
+      elements: "$elements"
+      temperature_K: "$temperature_K"
+      phase1: "$phase1"
+      phase2: "$phase2"
+      objective: "$objective"
+    outputs:
+      phase3: "$phase3"
+
+on_fail: stabilize

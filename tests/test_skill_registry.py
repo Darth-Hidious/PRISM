@@ -21,11 +21,16 @@ class TestSkillRegistry:
         assert "materials_discovery" in names
         assert "plan_simulations" in names
         assert "analyze_phases" in names
+        # Addendum E cold-start workflow phases.
+        assert "cold_start_foundation_bootstrap" in names
+        assert "cold_start_calphad_augmentation" in names
+        assert "cold_start_active_learning" in names
+        assert "cold_start_campaign_handoff" in names
         # Dataset-shaped skills GONE — collapsed into the `dataset` Tool
         assert "validate_dataset" not in names
         assert "review_dataset" not in names
         assert "visualize_dataset" not in names
-        assert len(skills) == 7  # 10 - 3 (dataset trio collapsed out)
+        assert len(skills) == 11  # 7 materials skills + 4 cold-start phases
 
     def test_all_convert_to_tools(self):
         reg = load_builtin_skills()
@@ -33,7 +38,7 @@ class TestSkillRegistry:
         reg.register_all_as_tools(tool_reg)
 
         tools = tool_reg.list_tools()
-        assert len(tools) == 7
+        assert len(tools) == 11
         for tool in tools:
             assert tool.name
             assert tool.description

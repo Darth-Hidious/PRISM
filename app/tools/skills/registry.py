@@ -21,6 +21,12 @@ def load_builtin_skills() -> SkillRegistry:
     from app.tools.skills.discovery import DISCOVER_SKILL
     from app.tools.skills.simulation_plan import SIM_PLAN_SKILL
     from app.tools.skills.phase_analysis import PHASE_ANALYSIS_SKILL
+    from app.tools.skills.cold_start import (
+        PHASE0_BOOTSTRAP_SKILL,
+        PHASE1_CALPHAD_SKILL,
+        PHASE2_ACTIVE_LEARNING_SKILL,
+        PHASE3_CAMPAIGN_HANDOFF_SKILL,
+    )
 
     registry.register(ACQUIRE_SKILL)
     registry.register(PREDICT_SKILL)
@@ -29,5 +35,9 @@ def load_builtin_skills() -> SkillRegistry:
     registry.register(DISCOVER_SKILL)
     registry.register(SIM_PLAN_SKILL)
     registry.register(PHASE_ANALYSIS_SKILL)
+    registry.register(PHASE0_BOOTSTRAP_SKILL)
+    registry.register(PHASE1_CALPHAD_SKILL)
+    registry.register(PHASE2_ACTIVE_LEARNING_SKILL)
+    registry.register(PHASE3_CAMPAIGN_HANDOFF_SKILL)
 
     return registry
