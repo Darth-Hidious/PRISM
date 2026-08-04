@@ -115,7 +115,7 @@ jobs:
             -v "$HOME/.cargo/registry:/root/.cargo/registry" \
             -v "$HOME/.cargo/git:/root/.cargo/git" \
             -w /work \
-            rockylinux:8.10 \
+            rockylinux/rockylinux:8.10 \
             bash -euxo pipefail -c '
               dnf -y module enable python39
               dnf -y install \
