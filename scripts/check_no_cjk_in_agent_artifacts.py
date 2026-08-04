@@ -90,6 +90,22 @@ ALLOWLIST_LINES: dict[str, list[str]] = {
         # Unicode preservation snapshot test:
         "café",
     ],
+    "tests/test_eastern_literature_collector.py": [
+        # Intentional source-language fixtures for script detection, metadata
+        # parsing, transliteration, and alloy-designation extraction.
+        "JA_TITLE =",
+        "<author><ja><name>",
+        "c._search_jstage(",
+        "rec[\"authors\"]",
+        "hits[0][\"authors\"]",
+        "detect_script(",
+        "infer_language(",
+        "find_designations(",
+        "{\"source_id\": \"ja1\"",
+        "back.iloc[1][\"authors\"]",
+        "max_results=3)",
+        "J-STAGE returned nothing",
+    ],
 }
 
 # ── Implementation ──────────────────────────────────────────────────

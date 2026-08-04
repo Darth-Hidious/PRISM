@@ -119,12 +119,21 @@ pub fn canonical_key(name: &str) -> String {
         .to_lowercase()
 }
 
-/// Label-qualified entity key ("{label}:{canonical name}"). Qualifying by
-/// label keeps one node per (label, name) — the same name extracted as e.g.
-/// both a Phase and a Matter stays two nodes instead of one label-churning
-/// row (mirrors core, which keeps a node per label).
-fn entity_key(label: &str, name: &str) -> String {
-    format!("{label}:{}", canonical_key(name))
+/// Tenant- and label-qualified entity key
+/// ("{tenant}|{label}:{canonical name}").
+///
+/// Qualifying by label keeps one node per (label, name) — the same name
+/// extracted as e.g. both a Phase and a Matter stays two nodes instead of
+/// one label-churning row (mirrors core, which keeps a node per label).
+///
+/// Qualifying by TENANT is what keeps tenants from destroying each other.
+/// Every read filters `WHERE tenant = ?`, and `upsert_entity` merges on
+/// this key, so a tenant-blind key meant whichever tenant wrote last owned
+/// the row and the other one's entity silently disappeared from its own
+/// view. `upsert_edge` has always qualified its id by tenant; entities
+/// were the outlier.
+fn entity_key(tenant: &str, label: &str, name: &str) -> String {
+    format!("{tenant}|{label}:{}", canonical_key(name))
 }
 
 /// Stable assertion id: SHA-256 of `canonical(subject)|predicate|canonical(object)`,
@@ -270,6 +279,19 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     // written lazily by `embed_and_store_entities` — never on the
     // `write_fact` path. Turso-side counterpart of the Qdrant collection so
     // a local ingest is semantically searchable without any services.
+    //
+    // `vector` is a plain BLOB on purpose, and it is already Turso's native
+    // vector wire format: the engine reads the vector type off the blob
+    // ("even-sized blobs are always float32"), not off the column
+    // declaration, so `vector_distance_cos(vector, ?)` scores these rows
+    // directly. Declaring `F32_BLOB(384)` instead would buy nothing —
+    // Turso 0.7 attaches no meaning to it — while baking one embedding
+    // model's dimensionality into the schema, which is exactly the thing
+    // `semantic_search_entities` has to stay honest about when the backend
+    // changes. There is likewise no vector index: `libsql_vector_idx` does
+    // not exist in this engine, whose only index method is an experimental
+    // sparse-only one, so ranking is a scan — correct, and fine at
+    // local-ingest scale.
     conn.execute(
         r#"CREATE TABLE IF NOT EXISTS emmo_embedding (
             key TEXT PRIMARY KEY,
@@ -286,6 +308,49 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     )
     .await?;
 
+    migrate_keys_to_tenant_qualified(conn).await?;
+
+    Ok(())
+}
+
+/// Rewrite pre-existing `{label}:{name}` keys to `{tenant}|{label}:{name}`.
+///
+/// Entity keys used to omit the tenant, which let one tenant's write take
+/// ownership of another's row. Now that the tenant is part of the key, a
+/// legacy database would keep its old rows under the old keys: the next
+/// re-ingest would write a SECOND row for the same entity, and edges would
+/// split across the two key spaces. Rewriting them keeps one row per
+/// (tenant, label, name) across the change.
+///
+/// Idempotent: keys already containing `|` are left alone, so reopening a
+/// migrated database is a no-op. Rows whose tenant is NULL/empty are also
+/// left alone — there is no tenant to qualify them with, and inventing one
+/// would be a worse guess than leaving them where the old readers expect.
+async fn migrate_keys_to_tenant_qualified(conn: &turso::Connection) -> Result<()> {
+    // `instr(key, '|') = 0` ⇒ not yet qualified. Entities and vectors
+    // first, then the edge endpoints that reference them.
+    for sql in [
+        "UPDATE emmo_entity SET key = tenant || '|' || key
+           WHERE instr(key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+        "UPDATE emmo_embedding SET key = tenant || '|' || key
+           WHERE instr(key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+        "UPDATE emmo_edge SET source_key = tenant || '|' || source_key
+           WHERE instr(source_key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+        "UPDATE emmo_edge SET target_key = tenant || '|' || target_key
+           WHERE instr(target_key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+        // `emmo_edge.id` is derived from (tenant, source_key, rel_type,
+        // target_key), so rewriting the endpoints invalidates it — the
+        // next `upsert_edge` would compute a different id and insert a
+        // duplicate. Recompute it from its components, which is exactly
+        // what `upsert_edge` does and is therefore idempotent.
+        "UPDATE emmo_edge
+            SET id = tenant || '|' || source_key || '|' || rel_type || '|' || target_key
+          WHERE tenant IS NOT NULL AND tenant <> ''",
+    ] {
+        conn.execute(sql, ())
+            .await
+            .map_err(|e| anyhow::anyhow!(e).context("tenant-qualified key migration failed"))?;
+    }
     Ok(())
 }
 
@@ -305,7 +370,11 @@ impl ProvenanceStore {
         tenant: &str,
         props_json: Option<String>,
     ) -> Result<String> {
-        let key = entity_key(label, name);
+        let key = entity_key(tenant, label, name);
+        // `tenant` is deliberately NOT in the DO UPDATE set: the key now
+        // carries it, so a conflict can only ever be the same tenant
+        // re-ingesting. Reassigning it here is what let one tenant take
+        // ownership of another's row.
         self.conn
             .execute(
                 r#"INSERT INTO emmo_entity
@@ -315,7 +384,6 @@ impl ProvenanceStore {
                        name = excluded.name,
                        label = excluded.label,
                        entity_type = excluded.entity_type,
-                       tenant = excluded.tenant,
                        props_json = COALESCE(excluded.props_json, emmo_entity.props_json)"#,
                 [
                     Value::Text(key.clone()),
@@ -1062,49 +1130,93 @@ impl ProvenanceStore {
         })
     }
 
-    /// Brute-force cosine search over stored entity vectors (fine at
-    /// local-ingest scale — same pattern as `semantic_search` over
-    /// `provenance_embeddings`). Returns up to `limit` distinct
-    /// `(display name, score)` pairs, best first, scores in `[-1, 1]`.
-    /// Vectors whose dimensionality differs from the query (mixed models)
-    /// are skipped; the same name under two labels is reported once.
+    /// Distinct stored vector widths (in bytes) for `tenant`, read from the
+    /// blobs themselves rather than the `dim` column, so a NULL or stale
+    /// `dim` cannot misreport what the index actually holds.
+    async fn entity_vector_widths(&self, tenant: &str) -> Result<Vec<usize>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT LENGTH(vector) FROM emmo_embedding WHERE tenant = ?1",
+                [Value::Text(tenant.to_string())],
+            )
+            .await?;
+        let mut widths = Vec::new();
+        while let Some(row) = rows.next().await? {
+            if let Some(bytes) = row.get_value(0)?.as_integer().copied() {
+                widths.push(bytes.max(0) as usize);
+            }
+        }
+        Ok(widths)
+    }
+
+    /// Semantic entity search ranked by Turso's **native** vector support:
+    /// `vector_distance_cos()` scores the stored f32 blobs inside the
+    /// database, and `GROUP BY` collapses the same display name under two
+    /// labels to its best-scoring row. Returns up to `limit` distinct
+    /// `(display name, similarity)` pairs, best first, similarities in
+    /// `[-1, 1]`.
+    ///
+    /// # Honesty contract
+    ///
+    /// `Ok(vec![])` means exactly one thing: **nothing is embedded for this
+    /// tenant**. It never means "the index is broken". Every unusable-index
+    /// condition is an `Err` naming the problem — above all a dimension
+    /// mismatch, which used to be skipped row-by-row and so was
+    /// indistinguishable from "no matches".
     pub async fn semantic_search_entities(
         &self,
         query_vec: &[f32],
         tenant: &str,
         limit: usize,
     ) -> Result<Vec<(String, f32)>> {
+        let stored = self.entity_vector_widths(tenant).await?;
+        if stored.is_empty() {
+            return Ok(Vec::new()); // genuinely empty index — not a failure
+        }
+        // A mismatch silently matches nothing, so refuse loudly instead.
+        // Checked up front so the message can name both dimensionalities;
+        // Turso's own error ("Vectors must have the same dimensions")
+        // names neither.
+        let want = query_vec.len() * 4;
+        if stored.iter().any(|w| *w != want) {
+            let mut dims: Vec<usize> = stored.iter().map(|w| w / 4).collect();
+            dims.sort_unstable();
+            let dims: Vec<String> = dims.iter().map(usize::to_string).collect();
+            anyhow::bail!(
+                "local semantic index is unusable: tenant '{tenant}' holds {}-dimension \
+                 vectors but the query embedding is {}-dimension. The embedding backend \
+                 changed since those vectors were written — re-ingest with the current \
+                 backend, or point PRISM_EMBED_BACKEND back at the one that wrote them.",
+                dims.join("/"),
+                query_vec.len(),
+            );
+        }
+
         let mut rows = self
             .conn
             .query(
-                "SELECT n.name, e.vector FROM emmo_embedding e \
-                 JOIN emmo_entity n ON n.key = e.key \
-                 WHERE e.tenant = ?1",
-                [Value::Text(tenant.to_string())],
+                "SELECT n.name, MIN(vector_distance_cos(e.vector, ?2)) AS distance \
+                 FROM emmo_embedding e JOIN emmo_entity n ON n.key = e.key \
+                 WHERE e.tenant = ?1 \
+                 GROUP BY n.name ORDER BY distance ASC LIMIT ?3",
+                [
+                    Value::Text(tenant.to_string()),
+                    Value::Blob(prism_embed::vec_to_le_bytes(query_vec)),
+                    Value::Integer(limit.max(1) as i64),
+                ],
             )
             .await?;
-        let mut scored: Vec<(String, f32)> = Vec::new();
+        let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             let name = get_str(&row, 0)?;
-            let vector = match row.get_value(1)? {
-                Value::Blob(bytes) => prism_embed::le_bytes_to_vec(&bytes),
-                _ => continue,
+            // `vector_distance_cos` is `1 - cosine_similarity`, in [0, 2].
+            let distance = match row.get_value(1)? {
+                Value::Real(d) => d,
+                Value::Integer(d) => d as f64,
+                other => anyhow::bail!("vector_distance_cos returned {other:?}, expected a number"),
             };
-            if vector.len() != query_vec.len() {
-                continue; // different embedding model — not comparable
-            }
-            scored.push((name, prism_embed::cosine_similarity(query_vec, &vector)));
-        }
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for (name, score) in scored {
-            if seen.insert(name.clone()) {
-                out.push((name, score));
-                if out.len() == limit {
-                    break;
-                }
-            }
+            out.push((name, 1.0 - distance as f32));
         }
         Ok(out)
     }
@@ -1326,7 +1438,7 @@ mod tests {
         assert_eq!(
             count(
                 &store,
-                "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Matter:alpha'"
+                "SELECT COUNT(*) FROM emmo_entity WHERE key = 't1|Matter:alpha'"
             )
             .await,
             1
@@ -1334,7 +1446,7 @@ mod tests {
         assert_eq!(
             count(
                 &store,
-                "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Phase:alpha'"
+                "SELECT COUNT(*) FROM emmo_entity WHERE key = 't1|Phase:alpha'"
             )
             .await,
             1
@@ -1373,7 +1485,7 @@ mod tests {
         assert_eq!(
             count(
                 &store,
-                "SELECT COUNT(*) FROM emmo_entity WHERE key = 'Element:nb'"
+                "SELECT COUNT(*) FROM emmo_entity WHERE key = 't1|Element:nb'"
             )
             .await,
             1
@@ -1543,6 +1655,8 @@ mod tests {
         }
     }
 
+    /// An empty index is a legitimate empty ANSWER, not a failure — and it
+    /// is the only condition allowed to produce `Ok(vec![])`.
     #[tokio::test]
     async fn semantic_search_entities_empty_store_is_empty() {
         let db = TempDb::new();
@@ -1551,7 +1665,7 @@ mod tests {
         let hits = store
             .semantic_search_entities(&[1.0, 0.0, 0.0], "t1", 5)
             .await
-            .unwrap();
+            .expect("an empty index must not be reported as a broken one");
         assert!(hits.is_empty());
     }
 
@@ -1645,8 +1759,11 @@ mod tests {
         );
     }
 
+    /// A dimension mismatch matches nothing, so it must be an error that
+    /// names both dimensionalities — never an empty list, which the caller
+    /// cannot tell apart from "the index is empty".
     #[tokio::test]
-    async fn semantic_search_entities_skips_mismatched_dims() {
+    async fn semantic_search_entities_errors_on_mismatched_dims() {
         let db = TempDb::new();
         let store = ProvenanceStore::open(&db.path).await.unwrap();
         let prov = test_prov();
@@ -1656,16 +1773,24 @@ mod tests {
             .unwrap();
 
         store
-            .store_entity_embedding(&entity_key("Matter", "Ti-6Al-4V"), "t1", &[1.0, 0.0, 0.0])
+            .store_entity_embedding(
+                &entity_key("t1", "Matter", "Ti-6Al-4V"),
+                "t1",
+                &[1.0, 0.0, 0.0],
+            )
             .await
             .unwrap();
 
         // 4-dim query cannot compare against the 3-dim vector.
-        let hits = store
+        let err = store
             .semantic_search_entities(&[1.0, 0.0, 0.0, 0.0], "t1", 10)
             .await
-            .unwrap();
-        assert!(hits.is_empty());
+            .expect_err("a dimension mismatch must be loud, not an empty list");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains('3') && msg.contains('4'),
+            "error must name the stored and query dimensionality: {msg}"
+        );
 
         // Matching dimensionality finds it.
         let hits = store
@@ -1674,5 +1799,320 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "Ti-6Al-4V");
+    }
+
+    /// Similarity must come back on the documented `[-1, 1]` scale after
+    /// the conversion from Turso's `[0, 2]` cosine *distance*.
+    #[tokio::test]
+    async fn semantic_search_entities_similarity_scale() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+        store
+            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "alpha"), &prov)
+            .await
+            .unwrap();
+        store
+            .store_entity_embedding(
+                &entity_key("t1", "Matter", "Ti-6Al-4V"),
+                "t1",
+                &[1.0, 0.0, 0.0],
+            )
+            .await
+            .unwrap();
+
+        let same = store
+            .semantic_search_entities(&[1.0, 0.0, 0.0], "t1", 1)
+            .await
+            .unwrap();
+        assert!((same[0].1 - 1.0).abs() < 1e-5, "identical → +1: {same:?}");
+
+        let orthogonal = store
+            .semantic_search_entities(&[0.0, 1.0, 0.0], "t1", 1)
+            .await
+            .unwrap();
+        assert!(
+            orthogonal[0].1.abs() < 1e-5,
+            "orthogonal → 0: {orthogonal:?}"
+        );
+
+        let opposite = store
+            .semantic_search_entities(&[-1.0, 0.0, 0.0], "t1", 1)
+            .await
+            .unwrap();
+        assert!(
+            (opposite[0].1 + 1.0).abs() < 1e-5,
+            "opposite → -1: {opposite:?}"
+        );
+    }
+
+    /// Retrieval by MEANING with the real on-device model: a paraphrase
+    /// that shares **no word at all** with any stored entity must still
+    /// rank the metal-joining entities above the bread-making ones. A
+    /// keyword index scores this query 0 against everything.
+    ///
+    /// `#[ignore]`d: needs the ~90 MB ONNX model in `~/.prism/models/embed/`.
+    /// Run with `cargo test -p prism-provenance -- --ignored`.
+    /// Not compiled on Intel macOS, which has no ONNX Runtime build and so
+    /// no `NativeOnnx` (see `prism_embed`).
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    #[tokio::test]
+    #[ignore = "downloads/uses the local ONNX embedding model"]
+    async fn native_embeddings_retrieve_by_meaning_not_keywords() {
+        use prism_embed::EmbedBackend as _;
+
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        let facts = vec![
+            fact(
+                "processing",
+                "aluminium bicycle frame welding",
+                "processed_by",
+                "friction stir welding",
+            ),
+            fact(
+                "phase",
+                "sourdough bread fermentation",
+                "has_phase",
+                "wild yeast starter",
+            ),
+        ];
+        for f in &facts {
+            store.write_fact(f, &prov).await.unwrap();
+        }
+        let backend = prism_embed::NativeOnnx::new().expect("local ONNX model");
+        store
+            .embed_and_store_entities(&facts, "t1", &backend)
+            .await
+            .unwrap();
+
+        let query = "joining two pieces of metal together without melting them";
+        let query_vec = backend
+            .embed(std::slice::from_ref(&query.to_string()))
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(query_vec.len(), 384, "BGE-small-en-v1.5 is 384-dimension");
+
+        let hits = store
+            .semantic_search_entities(&query_vec, "t1", 4)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 4, "all four entities are scored: {hits:?}");
+
+        // The premise: this is retrieval by meaning, not by keyword. Assert
+        // it rather than trusting the wording — no query word occurs in any
+        // entity name, so lexical search has nothing to match on.
+        let query_words: std::collections::HashSet<&str> = query.split_whitespace().collect();
+        for (name, _) in &hits {
+            for word in name.split_whitespace() {
+                assert!(
+                    !query_words.contains(word),
+                    "'{word}' is shared with the query — the test would no longer \
+                     distinguish semantic retrieval from keyword matching"
+                );
+            }
+        }
+
+        let metal_joining = ["aluminium bicycle frame welding", "friction stir welding"];
+        assert!(
+            metal_joining.contains(&hits[0].0.as_str())
+                && metal_joining.contains(&hits[1].0.as_str()),
+            "both metal-joining entities must outrank both bread-making ones: {hits:?}"
+        );
+        assert!(
+            hits[1].1 > hits[2].1,
+            "the two domains must be separated, not tied: {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|(_, s)| (-1.0..=1.0).contains(s)),
+            "similarities must stay in [-1, 1]: {hits:?}"
+        );
+    }
+
+    // ── Tenant isolation ───────────────────────────────────────────────
+
+    /// `crates/mesh/src/sync.rs` writes every peer-supplied entity under
+    /// the `"mesh"` tenant precisely "so peer-synced data never blends
+    /// with locally [ingested data]". A mesh peer chooses the entity
+    /// `name` verbatim, so if the entity primary key is not
+    /// tenant-qualified, naming an entity the user already has hands the
+    /// peer that row: the ON CONFLICT branch reassigns `tenant`, and
+    /// every local read filters `WHERE tenant = 'local'`, so the user's
+    /// own knowledge silently disappears.
+    #[tokio::test]
+    async fn peer_tenant_cannot_capture_a_local_entity() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        // The user ingests a paper locally.
+        let mut local = test_prov();
+        local.tenant = "local".into();
+        store
+            .write_fact(
+                &fact("phase", "Ti-6Al-4V", "has_phase", "alpha-beta"),
+                &local,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .graph_search("Ti-6Al-4V", "local", 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|n| n.name == "Ti-6Al-4V"),
+            "precondition: the local entity must exist before the peer syncs"
+        );
+
+        // A subscribed mesh peer returns a dataset row whose `name` is
+        // the same material, spelled its way. This is peer-controlled
+        // input: sync.rs takes `row["name"]` straight off the wire.
+        let mut mesh = test_prov();
+        mesh.tenant = "mesh".into();
+        store
+            .write_fact(
+                &LocalFact {
+                    subject: "TI-6AL-4V".into(),
+                    predicate: "SYNCED_FROM".into(),
+                    object: "peer-dataset".into(),
+                    value: None,
+                    unit: None,
+                    confidence: None,
+                    kind: None,
+                },
+                &mesh,
+            )
+            .await
+            .unwrap();
+
+        // The user's own entity must still be theirs.
+        let local_hits = store.graph_search("Ti-6Al-4V", "local", 10).await.unwrap();
+        assert!(
+            local_hits.iter().any(|n| n.name == "Ti-6Al-4V"),
+            "a mesh peer captured the local tenant's entity — the user's own \
+             ingested knowledge vanished from every `tenant = 'local'` read"
+        );
+    }
+
+    /// A database written before entity keys carried the tenant must be
+    /// rewritten on open, or the next re-ingest writes a SECOND row for
+    /// the same entity and edges split across two key spaces.
+    #[tokio::test]
+    async fn legacy_unqualified_keys_migrate_on_open() {
+        let db = TempDb::new();
+        {
+            let store = ProvenanceStore::open(&db.path).await.unwrap();
+            let mut prov = test_prov();
+            prov.tenant = "local".into();
+            store
+                .write_fact(
+                    &fact("phase", "Ti-6Al-4V", "has_phase", "alpha-beta"),
+                    &prov,
+                )
+                .await
+                .unwrap();
+            // Rewind to the pre-fix on-disk shape.
+            for sql in [
+                "UPDATE emmo_entity SET key = replace(key, 'local|', '')",
+                "UPDATE emmo_edge SET source_key = replace(source_key, 'local|', ''),
+                     target_key = replace(target_key, 'local|', ''),
+                     id = tenant || '|' || replace(source_key, 'local|', '') || '|'
+                          || rel_type || '|' || replace(target_key, 'local|', '')",
+            ] {
+                store.conn.execute(sql, ()).await.unwrap();
+            }
+            assert_eq!(
+                count(
+                    &store,
+                    "SELECT COUNT(*) FROM emmo_entity WHERE instr(key, '|') = 0",
+                )
+                .await,
+                2,
+                "precondition: the legacy shape must have unqualified keys"
+            );
+        }
+
+        // Reopening runs init_schema, which must migrate.
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE instr(key, '|') = 0",
+            )
+            .await,
+            0,
+            "legacy entity keys were not tenant-qualified on open"
+        );
+
+        // Re-ingesting the same fact must merge, not duplicate.
+        let mut prov = test_prov();
+        prov.tenant = "local".into();
+        store
+            .write_fact(
+                &fact("phase", "Ti-6Al-4V", "has_phase", "alpha-beta"),
+                &prov,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM emmo_entity").await,
+            2,
+            "re-ingest duplicated entities across the key-format change"
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM emmo_edge").await,
+            1,
+            "re-ingest duplicated the edge across the key-format change"
+        );
+    }
+
+    /// The same name under two tenants must be two rows, each keeping its
+    /// own owner. `emmo_embedding` is keyed by the entity key, so once the
+    /// entity key separates, entity vectors separate with it.
+    #[tokio::test]
+    async fn same_name_under_two_tenants_stays_two_owned_rows() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        let mut local = test_prov();
+        local.tenant = "local".into();
+        store
+            .write_fact(
+                &fact("phase", "Ti-6Al-4V", "has_phase", "alpha-beta"),
+                &local,
+            )
+            .await
+            .unwrap();
+        let mut mesh = test_prov();
+        mesh.tenant = "mesh".into();
+        store
+            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "beta"), &mesh)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE label = 'Matter' \
+                 AND tenant = 'local'",
+            )
+            .await,
+            1,
+            "the local tenant lost its Matter row to the peer"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE label = 'Matter' \
+                 AND tenant = 'mesh'",
+            )
+            .await,
+            1,
+            "the peer tenant has no Matter row of its own"
+        );
     }
 }

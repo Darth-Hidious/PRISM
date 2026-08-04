@@ -10,6 +10,10 @@ server). One agent-visible catalog, two interpreters, zero user setup.
 
 Contract: everything here returns {"error": ...} dicts instead of raising —
 these paths run inside tool calls.
+
+Every child here goes through `app.tools.spawn`, never bare subprocess: these
+run in the tool-server process, which by then has almost certainly served a
+materials search, and any fork() after that SIGSEGVs. See app/tools/spawn.py.
 """
 from __future__ import annotations
 
@@ -21,6 +25,8 @@ import sys
 import threading
 from pathlib import Path
 from typing import Any, Optional
+
+from app.tools import spawn
 
 SIDECAR_VENV = Path.home() / ".prism" / "venv-sci"
 # Newest first; 3.13 excluded on purpose — the point is escaping >=3.13 caps.
@@ -67,7 +73,7 @@ def ensure_sidecar(install: bool = True) -> Optional[str]:
         )
     try:
         if not _sidecar_python().exists():
-            subprocess.run(
+            spawn.run(
                 [base, "-m", "venv", str(SIDECAR_VENV)],
                 check=True,
                 capture_output=True,
@@ -86,7 +92,7 @@ def ensure_sidecar(install: bool = True) -> Optional[str]:
                 )
             pip_command.extend(["--no-index", "--find-links", wheelhouse])
         pip_command.extend(SIDECAR_PACKAGES)
-        result = subprocess.run(
+        result = spawn.run(
             pip_command,
             capture_output=True,
             timeout=_PROVISION_TIMEOUT_SECS,
@@ -112,7 +118,7 @@ class _SidecarProcess:
     def _spawn(self) -> Optional[str]:
         repo_root = Path(__file__).resolve().parents[2]
         try:
-            self._proc = subprocess.Popen(
+            self._proc = spawn.popen(
                 [str(_sidecar_python()), "-m", "app.sidecar_server"],
                 cwd=str(repo_root),
                 stdin=subprocess.PIPE,

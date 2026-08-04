@@ -53,21 +53,45 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Same pinned window as `prism pyiron install` (crates/cli/src/pyiron_cmd.rs)
+# — keep the two in sync. The direct-pip fallback is used only when the Rust
+# provisioning harness is unavailable (for example, in a standalone worker).
+_PYIRON_SPEC = ["pyiron_atomistics>=0.5,<0.6"]
+
 # One-shot guard: a failed install (no network, no pip) must not re-run a
 # multi-minute pip attempt on every tool call in this process.
 _AUTO_PROVISION_ATTEMPTED = False
 
 
 def _try_auto_provision() -> bool:
-    """Ask the PRISM harness to install the simulation extra. NEVER raises."""
+    """Provision the simulation extra without ever forking or raising.
+
+    A PRISM-launched worker delegates to the Rust harness, which owns offline
+    wheelhouse policy. A standalone worker falls back to pip through
+    ``app.tools.spawn`` so a prior materials search cannot trigger the macOS
+    fork crash.
+    """
     global _AUTO_PROVISION_ATTEMPTED
     if _AUTO_PROVISION_ATTEMPTED:
         return False
     _AUTO_PROVISION_ATTEMPTED = True
     try:
-        from app.tools._provision import provision_extra
+        import os
+        import sys
 
-        return bool(provision_extra("simulation").get("provisioned"))
+        if os.environ.get("PRISM_BINARY"):
+            from app.tools._provision import provision_extra
+
+            return bool(provision_extra("simulation").get("provisioned"))
+
+        from app.tools import spawn
+
+        result = spawn.run(
+            [sys.executable, "-m", "pip", "install", *_PYIRON_SPEC],
+            capture_output=True,
+            timeout=600,
+        )
+        return result.returncode == 0
     except Exception:
         return False
 
@@ -106,14 +130,12 @@ def check_pyiron_available(auto_provision: bool = False) -> bool:
 
 def _pyiron_missing_error() -> dict:
     """Standard error dict when pyiron is not installed."""
-    return {
-        "error": (
-            "pyiron_atomistics is not installed and automatic provisioning "
-            "failed."
-        ),
-        "install_hint": "pip install prism-platform[simulation]",
-        "provision_command": "prism provision extra simulation",
-    }
+    from app.tools._extras import missing_extra_error
+
+    return missing_extra_error(
+        "simulation",
+        "pyiron_atomistics is not installed and automatic provisioning failed.",
+    )
 
 
 class StructureStore:

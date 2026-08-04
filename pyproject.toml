@@ -55,9 +55,11 @@ dependencies = [
     "duckduckgo-search>=7.0.0",
     "beautifulsoup4>=4.12.0",
     # VS2-P2: symbolic_check grounds verification in sympy. Pin at top level so
-    # a pymatgen refactor can't silently drop the transitive (mp-api → pymatgen
-    # → sympy) chain. Pure-python, ~0 install cost; already 1.14.0 in the venv.
+    # a pymatgen refactor cannot silently drop the transitive dependency.
     "sympy>=1.12",
+    # CORE, not a `[mace]` extra. Torch-free MACE modules import ULID at module
+    # scope, so a default install must provide this small pure-Python package.
+    "python-ulid>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -136,10 +138,22 @@ mace = [
     "mace-torch>=0.3.12",
     "torch>=2.5.0",
     "ase>=3.23.0",
-    "python-ulid>=2.0.0",
+    # python-ulid moved to core `dependencies` — see the note there.
     # numpy is already a transitive dep but pin it explicitly so mace
     # primitive code has a known floor.
     "numpy>=1.26,<3.0",
+    # Undeclared until 2026-07-27, when the marketplace dependency-drift
+    # test caught them: both are hard function-scope imports that raise
+    # ModuleNotFoundError on an otherwise-complete `[mace]` install.
+    #   huggingface_hub — app/tools/simulation/mace/core/calculator.py and
+    #     .../backends/hf_jobs.py fetch the MACE weights with it. It is NOT
+    #     a mace-torch dependency (mace-torch 0.3.16 requires_dist has no
+    #     huggingface-hub), so it has to be declared here.
+    #   phonopy — app/tools/simulation/mace/core/phonons.py needs it for
+    #     the harmonic phonon primitive.
+    # Left unpinned deliberately: no floor is claimed that has been tested.
+    "huggingface-hub",
+    "phonopy",
 ]
 data = [
     "datasets>=3.0.0",
@@ -171,6 +185,7 @@ asyncio_mode = "auto"
 markers = [
     "live: requires HF_TOKEN and real HF Jobs (skipped unless MACE_MCP_LIVE=1)",
     "needs_mace: requires mace-torch installed (skipped if missing)",
+    "network: hits real third-party sources (skipped unless PRISM_LIVE_SOURCES=1)",
 ]
 
 [project.urls]

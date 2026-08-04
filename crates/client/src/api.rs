@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use prism_runtime::retry;
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -72,6 +73,10 @@ struct ErrorBody {
     #[serde(default)]
     code: Option<String>,
 }
+
+// Platform failures are translated inside `send_retrying`, which needs the
+// typed error before the response body is consumed.
+use crate::platform_error::PlatformError;
 
 /// Response type for the current user endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +194,58 @@ impl PlatformClient {
         Ok(())
     }
 
+    /// Send a request, retrying only transient failures.
+    ///
+    /// Every platform call in PRISM funnels through here, so this is the one
+    /// place that has to get "worth another attempt?" right. The request is
+    /// rebuilt per attempt (`send` consumes the builder) and
+    /// [`prism_runtime::retry`] owns the verdict: a 503 or a reset socket
+    /// comes back, a 401 or a 402 does not.
+    ///
+    /// A failed response has to answer two different questions, and ownership
+    /// forces the order:
+    ///
+    /// 1. **Is it worth another attempt?** [`retry::HttpStatus::from_response`]
+    ///    borrows, so it must run *first* — reading the body consumes the
+    ///    response, and the status and `Retry-After` go with it.
+    /// 2. **What does the user need to know?** Only the body carries the
+    ///    platform's own `code`, `message` and `help`, so answering this
+    ///    consumes the response.
+    ///
+    /// The two are then combined the way [`prism_runtime::retry`] documents:
+    /// the human-readable [`PlatformError`] on top, [`retry::HttpStatus`]
+    /// attached as its cause. That ordering is load-bearing in both
+    /// directions. `retry::is_retryable` walks the cause chain and takes the
+    /// verdict of the first link it recognises; `PlatformError` is not one of
+    /// the types it knows, so classification still reaches the `HttpStatus`
+    /// underneath and a 401 keeps failing on the first attempt. Meanwhile the
+    /// message the user sees is the platform's own words instead of a bare
+    /// "returned error status 401".
+    async fn send_retrying(
+        &self,
+        method: &str,
+        url: &str,
+        idem: retry::Idempotency,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        retry::retrying(&format!("platform.{method}"), idem, || async {
+            let resp = build()
+                .headers(self.auth_headers()?)
+                .send()
+                .await
+                .with_context(|| format!("{method} {url} failed"))?;
+            if !resp.status().is_success() {
+                // Borrow for the retry verdict…
+                let classified = retry::HttpStatus::from_response(&resp);
+                // …then consume for the platform's own reason.
+                let reason = PlatformError::from_response(resp).await;
+                return Err(classified).context(reason);
+            }
+            Ok(resp)
+        })
+        .await
+    }
+
     /// Perform an authenticated GET request and deserialise the JSON response.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         self.offline_guard("GET", path)?;
@@ -196,14 +253,10 @@ impl PlatformClient {
         debug!(%url, "GET");
 
         let resp = self
-            .client
-            .get(&url)
-            .headers(self.auth_headers()?)
-            .send()
-            .await
-            .with_context(|| format!("GET {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url} returned error status"))?;
+            .send_retrying("GET", &url, retry::Idempotency::Safe, || {
+                self.client.get(&url)
+            })
+            .await?;
 
         resp.json::<T>()
             .await
@@ -217,15 +270,16 @@ impl PlatformClient {
         debug!(%url, "POST");
 
         let resp = self
-            .client
-            .post(&url)
-            .headers(self.auth_headers()?)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("POST {url} returned error status"))?;
+            .send_retrying(
+                "POST",
+                &url,
+                // A platform POST creates something (a project, a node
+                // registration, a key exchange). Replaying one that may
+                // already have landed is how you get two of everything.
+                retry::Idempotency::Billable,
+                || self.client.post(&url).json(body),
+            )
+            .await?;
 
         resp.json::<T>()
             .await
@@ -297,20 +351,41 @@ impl PlatformClient {
         }
     }
 
+    /// Perform an authenticated PATCH request with a JSON body and
+    /// deserialise the response.
+    ///
+    /// `Safe` idempotency: PATCH bodies here carry the full desired value of
+    /// each field they set, so replaying one lands the same state.
+    pub async fn patch<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.offline_guard("PATCH", path)?;
+        let url = format!("{}{path}", self.base_url);
+        debug!(%url, "PATCH");
+
+        let resp = self
+            .send_retrying("PATCH", &url, retry::Idempotency::Safe, || {
+                self.client.patch(&url).json(body)
+            })
+            .await?;
+
+        resp.json::<T>()
+            .await
+            .with_context(|| format!("failed to parse JSON from PATCH {url}"))
+    }
+
     /// Perform an authenticated DELETE request. Returns `Ok(())` on success.
     pub async fn delete(&self, path: &str) -> Result<()> {
         self.offline_guard("DELETE", path)?;
         let url = format!("{}{path}", self.base_url);
         debug!(%url, "DELETE");
 
-        self.client
-            .delete(&url)
-            .headers(self.auth_headers()?)
-            .send()
-            .await
-            .with_context(|| format!("DELETE {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("DELETE {url} returned error status"))?;
+        self.send_retrying("DELETE", &url, retry::Idempotency::Safe, || {
+            self.client.delete(&url)
+        })
+        .await?;
 
         Ok(())
     }
@@ -333,24 +408,13 @@ impl PlatformClient {
     }
 
     /// List projects filtered by organisation.
+    ///
+    /// Goes through [`Self::get`] rather than hand-rolling the request, so it
+    /// inherits the same offline guard and the same retry policy as every
+    /// other platform call.
     pub async fn list_projects_for_org(&self, org_id: &str) -> Result<Vec<ProjectInfo>> {
-        let url = format!("{}/projects", self.base_url);
-        debug!(%url, org_id, "GET (filtered)");
-
-        let resp = self
-            .client
-            .get(&url)
-            .query(&[("org_id", org_id)])
-            .headers(self.auth_headers()?)
-            .send()
+        self.get(&format!("/projects?org_id={}", urlencoding::encode(org_id)))
             .await
-            .with_context(|| format!("GET {url} failed"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url} returned error status"))?;
-
-        resp.json::<Vec<ProjectInfo>>()
-            .await
-            .with_context(|| format!("failed to parse JSON from GET {url}"))
     }
 
     /// Get a project by ID.

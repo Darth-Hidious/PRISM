@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use prism_client::PlatformResponseExt;
 use prism_proto::{NodeCapabilities, NodeMessage, PlatformMessage};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use serde::Serialize;
@@ -1239,6 +1240,41 @@ fn resolve_local_deployment_base(state_dir: &Path, deployment_id: Uuid) -> Optio
     })
 }
 
+/// Join a platform-supplied request path onto this node's LOCAL deployment
+/// base, keeping the host the base named.
+///
+/// `path` comes off the wire in `PlatformMessage::InvokeDeployment`, and
+/// the relay hands back status, headers and body — so whatever host this
+/// URL ends up naming, the caller can read the response from. Plain
+/// string concatenation is not safe for that: everything after the
+/// authority in a URL is negotiable, and a `path` beginning with `@`
+/// turns the base's `host:port` into *userinfo* and promotes the rest to
+/// the host. `http://127.0.0.1:9001` + `@169.254.169.254/latest/meta-data/`
+/// parses with host `169.254.169.254`, which is a read/write SSRF pivot
+/// out of the node owner's network (cloud metadata, LAN devices, and the
+/// node's own loopback services — including the deployment control API).
+///
+/// So: require a rooted, non-protocol-relative path, and let the `url`
+/// crate set it on a parsed base rather than splicing strings.
+fn relay_url(local_base: &str, path: &str) -> std::result::Result<String, String> {
+    if !path.starts_with('/') || path.starts_with("//") {
+        return Err(format!(
+            "invalid deployment request path {path:?}: must be a rooted path \
+             like \"/v1/chat/completions\""
+        ));
+    }
+    let mut url = reqwest::Url::parse(local_base)
+        .map_err(|e| format!("invalid local deployment base {local_base:?}: {e}"))?;
+    // Split off the query so it does not get percent-encoded into the path.
+    let (raw_path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    url.set_path(raw_path);
+    url.set_query(query);
+    Ok(url.to_string())
+}
+
 /// Relay one buffered HTTP request to a deployment's LOCAL endpoint and collect
 /// the response as the inference relay's `(status, headers, body)`. Failures
 /// (unsupported method, unreachable endpoint, unreadable body) surface as the
@@ -1262,7 +1298,7 @@ async fn relay_deployment_invoke(
 > {
     let http_method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|_| format!("unsupported HTTP method: {method}"))?;
-    let url = format!("{}{}", local_base.trim_end_matches('/'), path);
+    let url = relay_url(local_base, path)?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(INVOKE_RELAY_TIMEOUT_SECS))
@@ -1618,7 +1654,7 @@ fn looks_like_weights_source(image: &str) -> bool {
 }
 
 fn deployment_runtime_url() -> String {
-    std::env::var("PRISM_RUNTIME_URL").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string())
+    crate::runtime_service::default_runtime_url()
 }
 
 fn resolve_public_endpoint_url(port: u16, config: &DeploymentLaunchConfig) -> String {
@@ -1698,6 +1734,11 @@ async fn start_runtime_deployment(
     gpu: bool,
     config: &DeploymentLaunchConfig,
 ) -> Result<()> {
+    // Same hole the ingest path had: this used to POST straight at a runtime
+    // nothing ever started, so a weights-source deployment died on a raw
+    // connect error.
+    crate::runtime_service::ensure_running(runtime_url, |msg| tracing::info!("{msg}")).await?;
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .build()?;
@@ -1978,8 +2019,8 @@ async fn refresh_token(
         .send()
         .await
         .context("failed to refresh token")?
-        .error_for_status()
-        .context("token refresh returned error")?;
+        .platform_error_for_status()
+        .await?;
 
     #[derive(serde::Deserialize)]
     struct RefreshResponse {
@@ -2343,14 +2384,18 @@ mod tests {
         let health_port = reqwest::Url::parse(&health_base).unwrap().port().unwrap();
         let runtime_requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let runtime_requests_clone = runtime_requests.clone();
+        // Three requests now: `start_runtime_deployment` first probes /health
+        // (start-or-explain) before it deploys, then the stop tears down.
         let (runtime_url, runtime_server) = spawn_stub_http_server(
-            2,
+            3,
             Arc::new(move |request| {
                 runtime_requests_clone
                     .lock()
                     .unwrap()
                     .push(request.lines().next().unwrap_or("").to_string());
-                if request.starts_with("POST /deploy ") {
+                if request.starts_with("GET /health ") {
+                    (200, r#"{"status":"ok"}"#.to_string(), "application/json")
+                } else if request.starts_with("POST /deploy ") {
                     (
                         200,
                         serde_json::json!({
@@ -2447,9 +2492,12 @@ mod tests {
         }
 
         let requests = runtime_requests.lock().unwrap().clone();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with("POST /deploy "));
-        assert!(requests[1].starts_with("DELETE /deploy/"));
+        assert_eq!(requests.len(), 3);
+        // The health probe must come first and, since it answered, no container
+        // may be started — the deploy goes straight to the runtime already up.
+        assert!(requests[0].starts_with("GET /health "));
+        assert!(requests[1].starts_with("POST /deploy "));
+        assert!(requests[2].starts_with("DELETE /deploy/"));
     }
 
     fn test_paths(tmp: &TempDir) -> PrismPaths {
@@ -2870,5 +2918,60 @@ mod tests {
             }
             other => panic!("expected DeploymentInvokeResult, got {other:?}"),
         }
+    }
+
+    // ── Relay URL construction (SSRF) ──────────────────────────────
+
+    /// `path` arrives from the platform in `InvokeDeployment`, and the
+    /// relay returns the response body — so if `path` can move the host,
+    /// it is a read/write SSRF pivot out of the node owner's network.
+    /// Everything after the authority in a URL is negotiable; a leading
+    /// `@` demotes the base's `host:port` to userinfo.
+    #[test]
+    fn relay_path_cannot_move_the_host() {
+        let base = "http://127.0.0.1:9001";
+        for path in [
+            "@169.254.169.254/latest/meta-data/",
+            "@127.0.0.1:8090/deploy",
+            "@evil.example/x",
+            "//evil.example/x",
+            "http://evil.example/x",
+            "relative/path",
+        ] {
+            match relay_url(base, path) {
+                Err(_) => {}
+                Ok(url) => {
+                    let parsed = reqwest::Url::parse(&url).expect("built URL parses");
+                    assert_eq!(
+                        parsed.host_str(),
+                        Some("127.0.0.1"),
+                        "relay path {path:?} moved the host: {url}"
+                    );
+                    assert_eq!(
+                        parsed.port(),
+                        Some(9001),
+                        "relay path {path:?} moved the port: {url}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The ordinary shapes the platform actually sends must still work.
+    #[test]
+    fn relay_path_keeps_normal_requests_intact() {
+        let base = "http://127.0.0.1:9001";
+        assert_eq!(
+            relay_url(base, "/v1/chat/completions").unwrap(),
+            "http://127.0.0.1:9001/v1/chat/completions"
+        );
+        assert_eq!(
+            relay_url(base, "/health").unwrap(),
+            "http://127.0.0.1:9001/health"
+        );
+        assert_eq!(
+            relay_url(base, "/v1/models?limit=10").unwrap(),
+            "http://127.0.0.1:9001/v1/models?limit=10"
+        );
     }
 }

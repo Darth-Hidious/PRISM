@@ -1,4 +1,16 @@
-"""Version update checker for PRISM."""
+"""Version update checker for PRISM.
+
+STATUS (verified 2026-07-27): nothing outside tests/test_update.py imports this
+module. The Python CLI that called it was deleted in f93eccc5 ("Python is
+tools-only"), and the Rust CLI does its own update check
+(crates/cli/src/tool_sync.rs). Kept rather than deleted — that is the owner's
+call, not this branch's.
+
+Its subprocesses still go through app.tools.spawn rather than bare subprocess:
+the moment anything re-wires this into the tool-server process it inherits that
+process's fork() hazard, and the failure would be silent, because every spawn
+below swallows exceptions and answers "unknown" / False.
+"""
 
 import json
 import shutil
@@ -78,8 +90,8 @@ def detect_install_method() -> str:
     # Check uv
     if shutil.which("uv"):
         try:
-            import subprocess
-            result = subprocess.run(
+            from app.tools import spawn
+            result = spawn.run(
                 ["uv", "tool", "list"],
                 capture_output=True, text=True, timeout=5,
             )
@@ -91,8 +103,8 @@ def detect_install_method() -> str:
     # Check pipx
     if shutil.which("pipx"):
         try:
-            import subprocess
-            result = subprocess.run(
+            from app.tools import spawn
+            result = spawn.run(
                 ["pipx", "list", "--short"],
                 capture_output=True, text=True, timeout=5,
             )
@@ -246,7 +258,7 @@ def download_tui_binary() -> Optional[str]:
 
 def run_upgrade(method: Optional[str] = None) -> bool:
     """Actually run the upgrade command. Returns True on success."""
-    import subprocess
+    from app.tools import spawn
 
     method = method or detect_install_method()
     cmd = upgrade_command(method)
@@ -256,7 +268,7 @@ def run_upgrade(method: Optional[str] = None) -> bool:
         return False
 
     try:
-        result = subprocess.run(
+        result = spawn.run(
             cmd.split(),
             capture_output=True,
             text=True,

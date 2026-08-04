@@ -38,6 +38,13 @@ def memory_env(tmp_path: Path):
         embedder=embedder,
         session_id="test-session",
         embed_async=False,  # synchronous for deterministic test outcome
+        # State it explicitly: recording is what this file exercises, and
+        # `configure()` leaves unpassed fields alone. `build_full_registry()`
+        # (exercised by test_bootstrap.py) configures the recorder with
+        # record_enabled=False — the production default since the Rust
+        # provenance store became the canonical recorder — and that setting
+        # then persists in module state for the rest of the session.
+        record_enabled=True,
     )
     registry = ToolRegistry()
     create_memory_tools(registry)

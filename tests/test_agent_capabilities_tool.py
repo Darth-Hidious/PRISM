@@ -3,13 +3,14 @@
 Wraps the MARC27 platform's GET /agent/capabilities self-discovery
 endpoint. Tests verify registration shape + clean failure when no
 auth is configured + that the dispatcher hits the right URL when
-credentials are present (network mocked at the `requests` level).
+credentials are present (the socket under `PlatformClient` is stubbed
+by the shared `platform_http` fixture).
 
 The platform route itself is tested in marc27-core's own suite.
 """
-from unittest.mock import patch
-
 import pytest
+
+from tests.conftest import assert_not_connected
 
 from app.tools.base import ToolRegistry
 from app.tools.agent_capabilities import (
@@ -47,34 +48,18 @@ class TestRegistration:
 class TestAgentCapabilities:
     def test_no_credentials_returns_login_hint(self):
         result = _agent_capabilities()
-        assert "error" in result
-        assert "Not authenticated" in result["error"]
-        assert "prism login" in result.get("hint", "")
+        assert_not_connected(result)
 
-    def test_hits_correct_endpoint_url(self, monkeypatch):
+    def test_hits_correct_endpoint_url(self, monkeypatch, platform_http):
         """With credentials present, the tool should GET exactly
-        `<api_url>/agent/capabilities`. Mock `requests.get` so we don't
-        depend on platform network reachability, and inspect the URL."""
-        called_urls = []
-
-        class _StubResp:
-            status_code = 200
-
-            def json(self):
-                return {"platform": "MARC27", "total_endpoints": 0}
-
-        def _stub_get(url, **_kwargs):
-            called_urls.append(url)
-            return _StubResp()
-
+        `<api_url>/agent/capabilities`, authenticated with `X-API-Key`."""
         monkeypatch.setenv("MARC27_API_KEY", "fake-token")
         monkeypatch.setenv("MARC27_API_URL", "https://example.invalid/api/v1")
-        monkeypatch.setattr(
-            "app.tools.agent_capabilities.requests.get", _stub_get
-        )
+        platform_http.payload = {"platform": "MARC27", "total_endpoints": 0}
 
         result = _agent_capabilities()
         assert result == {"platform": "MARC27", "total_endpoints": 0}
-        assert called_urls == [
+        assert platform_http.urls_for("GET") == [
             "https://example.invalid/api/v1/agent/capabilities"
         ]
+        assert platform_http.calls[0]["headers"]["X-API-Key"] == "fake-token"

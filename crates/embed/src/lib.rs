@@ -8,6 +8,9 @@
 //! - [`NativeOnnx`] (**default**): fully local, BGE-small-en-v1.5 (384-dim)
 //!   running on the bundled ONNX Runtime via `fastembed`. First use downloads
 //!   ~90 MB into `~/.prism/models/embed/`; afterwards it is fully offline.
+//!   **Not available on Intel macOS** — ONNX Runtime ships no
+//!   `x86_64-apple-darwin` build, so it is not compiled in there and the
+//!   `native` choice degrades to keyword-only search.
 //! - [`OpenAiCompat`]: any `/v1/embeddings`-shaped HTTP endpoint (hosted
 //!   provider, Hugging Face TEI, or the MARC27 API).
 //!
@@ -40,10 +43,26 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+// Intel macOS is the one target without a native backend: ONNX Runtime
+// publishes no `x86_64-apple-darwin` binaries, so `fastembed` is excluded
+// there (see this crate's Cargo.toml). Everything else compiles it in.
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 mod native;
 mod openai;
 
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 pub use native::{NativeOnnx, default_cache_dir};
+
+/// `~/.prism/models/embed/` remains discoverable on Intel macOS even though
+/// that target cannot compile the ONNX backend itself.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub fn default_cache_dir() -> Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .ok_or_else(|| {
+            anyhow::anyhow!("cannot resolve home directory for the embedding model cache")
+        })?
+        .join(".prism/models/embed"))
+}
 pub use openai::OpenAiCompat;
 
 /// The embedding port. Implementations must be cheap to share (`Arc`) and
@@ -136,16 +155,34 @@ pub fn from_config() -> Option<Box<dyn EmbedBackend>> {
                 None
             }
         },
-        BackendChoice::Native => match NativeOnnx::new() {
-            Ok(b) => Some(Box::new(b)),
-            Err(e) => {
-                tracing::warn!(
-                    "native embedding backend unavailable: {e:#} — semantic search disabled"
-                );
-                None
-            }
-        },
+        BackendChoice::Native => native_backend(),
     }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+fn native_backend() -> Option<Box<dyn EmbedBackend>> {
+    match NativeOnnx::new() {
+        Ok(b) => Some(Box::new(b)),
+        Err(e) => {
+            tracing::warn!(
+                "native embedding backend unavailable: {e:#} — semantic search disabled"
+            );
+            None
+        }
+    }
+}
+
+/// Intel macOS: the native backend is not compiled in (no ONNX Runtime build
+/// exists for `x86_64-apple-darwin`). Set `PRISM_EMBED_BACKEND=openai` plus
+/// `PRISM_EMBED_ENDPOINT_URL` for semantic search; otherwise search stays
+/// keyword-only, which is what `None` means to every caller.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn native_backend() -> Option<Box<dyn EmbedBackend>> {
+    tracing::warn!(
+        "native embeddings are not available on Intel macOS (no ONNX Runtime build for \
+         x86_64-apple-darwin) — set PRISM_EMBED_BACKEND=openai for semantic search"
+    );
+    None
 }
 
 // ── Vector helpers ──────────────────────────────────────────────────

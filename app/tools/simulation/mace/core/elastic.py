@@ -37,8 +37,10 @@ class ElasticResult:
     nu_Poisson: float
     pugh_G_over_B: float
     cauchy_pressure_GPa: float
-    pugh_verdict: str  # "ductile" | "brittle"
-    am_manufacturability_passed: bool
+    pugh_verdict: str  # "ductile" | "brittle" | "indeterminate"
+    #: None when the VRH averaging did not converge — never False-by-default,
+    #: which would read as "assessed and failed".
+    am_manufacturability_passed: bool | None
     wall_time_s: float = 0.0
     extras: dict = field(default_factory=dict)
 
@@ -148,8 +150,21 @@ def summarize_elastic(C_GPa: np.ndarray, wall_time_s: float = 0.0) -> ElasticRes
     """Compute the full structured summary from a 6×6 stiffness tensor."""
     K, G, E, nu, pugh = voigt_reuss_hill(C_GPa)
     P_c = cauchy_pressure(C_GPa)
-    verdict = "ductile" if pugh < PUGH_THRESHOLD_DUCTILE else "brittle"
-    am_pass = pugh < PUGH_THRESHOLD_AM_MANUFACTURABILITY
+    # A failed compliance inversion (or a non-positive Reuss average) makes
+    # pugh NaN — and `NaN < threshold` is False, so the old code turned an
+    # arithmetic failure into a confident "brittle" plus
+    # am_manufacturability_passed=False. That is a materials decision with
+    # nothing behind it. Report indeterminate.
+    indeterminate = not np.isfinite(pugh)
+    verdict = (
+        "indeterminate" if indeterminate
+        else "ductile" if pugh < PUGH_THRESHOLD_DUCTILE
+        else "brittle"
+    )
+    am_pass = (
+        None if indeterminate
+        else bool(pugh < PUGH_THRESHOLD_AM_MANUFACTURABILITY)
+    )
     return ElasticResult(
         C_GPa=C_GPa.tolist(),
         K_VRH_GPa=K,
@@ -164,5 +179,11 @@ def summarize_elastic(C_GPa: np.ndarray, wall_time_s: float = 0.0) -> ElasticRes
         extras={
             "pugh_threshold_ductile": PUGH_THRESHOLD_DUCTILE,
             "pugh_threshold_am_manufacturability": PUGH_THRESHOLD_AM_MANUFACTURABILITY,
+            **({"error": (
+                "Voigt-Reuss-Hill averaging did not produce a finite G/B — "
+                "the stiffness tensor is singular or not positive definite. "
+                "No ductility verdict can be drawn from this run; check the "
+                "reference cell is properly relaxed."
+            )} if indeterminate else {}),
         },
     )

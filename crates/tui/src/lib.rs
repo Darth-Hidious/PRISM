@@ -192,31 +192,45 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // The first `terminal.draw()` will render the full frame anyway,
     // so the explicit clear is unnecessary.
 
-    // Spawn backend — real subprocess or fake deterministic player.
-    let mut backend_handle = match &config.backend_mode {
+    // Spawn backend — real subprocess or fake deterministic player. The real
+    // path spawns *and* handshakes under the retry policy; the fake one has
+    // no subprocess to race with, so it just inits.
+    let backend_handle = match &config.backend_mode {
         BackendMode::Real {
             prism_binary,
             project_root,
             python_bin,
         } => {
             // Native in-process agent by default; the subprocess JSON-RPC
-            // path remains as an explicit fallback (PRISM_BACKEND=rpc) and as
-            // a recovery when native resolution fails (e.g. missing creds).
+            // path remains an explicit fallback and uses the shared retry
+            // policy while establishing its init handshake.
             if std::env::var("PRISM_BACKEND").as_deref() == Ok("rpc") {
-                backend::BackendHandle::spawn(prism_binary, project_root, python_bin)?
+                backend::BackendHandle::spawn_and_init(prism_binary, project_root, python_bin)
+                    .await?
             } else {
                 match backend::BackendHandle::spawn_native(project_root, python_bin) {
-                    Ok(h) => h,
+                    Ok(mut handle) => {
+                        handle.init().await?;
+                        handle
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "native backend unavailable — falling back to subprocess");
-                        backend::BackendHandle::spawn(prism_binary, project_root, python_bin)?
+                        backend::BackendHandle::spawn_and_init(
+                            prism_binary,
+                            project_root,
+                            python_bin,
+                        )
+                        .await?
                     }
                 }
             }
         }
-        BackendMode::Fake { scenario } => backend::BackendHandle::fake(*scenario),
+        BackendMode::Fake { scenario } => {
+            let mut handle = backend::BackendHandle::fake(*scenario);
+            handle.init().await?;
+            handle
+        }
     };
-    backend_handle.init().await?;
 
     // Build app state
     let mut app = app::App::new(backend_handle);

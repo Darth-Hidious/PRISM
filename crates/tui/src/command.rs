@@ -228,6 +228,14 @@ pub static CATALOG: &[Command] = &[
         keybind: "palette",
         suggested: false,
     },
+    Command {
+        id: "marketplace.publish",
+        title: "Marketplace publish",
+        description: "PRISM's own tools: licences, required extras, publish",
+        category: "Marketplace",
+        keybind: "palette",
+        suggested: false,
+    },
     // ── Skills (self-authored reusable snippets) ──────────────────────
     Command {
         id: "skills.list",

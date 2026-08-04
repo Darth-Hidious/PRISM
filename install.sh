@@ -62,7 +62,9 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "Downloading ${URL}..."
-if ! curl -fSL "$URL" -o "${TMPDIR}/${ARCHIVE}"; then
+# --progress-bar instead of the default meter: the multi-column table
+# redraws over itself when piped through `| bash` and looks like breakage.
+if ! curl -fSL --progress-bar "$URL" -o "${TMPDIR}/${ARCHIVE}"; then
     echo "Error: Download failed." >&2
     echo "Check that ${VERSION} has a release for ${PLATFORM}-${ARCH}." >&2
     echo "Available at: https://github.com/${REPO}/releases" >&2
@@ -189,82 +191,29 @@ if [ "$PLATFORM" = "linux" ]; then
     chmod +x "${INSTALL_DIR}/prism" "${INSTALL_DIR}/prism-node" 2>/dev/null || true
 fi
 
-# --- Setup Python venv + install the PRISM tool platform ---
-# The binary is self-sufficient for chat; the Python venv provides the
-# local tool server. A venv that exists but has no pip (Debian/Ubuntu
-# without python3-venv) or no `app` package is BROKEN, not "done" —
-# heal it or remove it so a re-run can start clean. Never fail the
-# binary install over Python; degrade with honest, actionable messages.
-VENV_DIR="$HOME/.prism/venv"
-setup_python_tools() {
-    PYTHON=""
-    for py in python3.14 python3.13 python3.12 python3.11 python3; do
-        if command -v "$py" >/dev/null 2>&1; then
-            PYTHON="$py"
-            break
-        fi
-    done
-    if [ -z "$PYTHON" ]; then
-        echo "  Warning: No Python 3 found — local tools disabled (chat still works)."
-        echo "  Install python3 + python3-venv, then re-run this installer."
-        return 0
+# --- Check the Python prerequisite ---
+#
+# We deliberately do NOT create the venv here. `prism` provisions
+# ~/.prism/venv itself on every launch (crates/python-bridge/src/venv.rs
+# ensure_venv, called from crates/cli/src/main.rs) and that implementation
+# is strictly better than a shell copy of it: it self-heals a pipless venv,
+# falls back to `uv python find`, installs the version-matched wheel with a
+# git fallback, and verifies every declared core dependency rather than
+# trusting that a directory exists. Duplicating it here only created a second thing to keep
+# in sync. The installer's job is to make sure the PREREQUISITE is present
+# and to say so plainly if it is not.
+#
+# The floor is Python 3.11 (pyproject requires-python = ">=3.11"). This is
+# not optional: with anything older, `prism` exits immediately with
+# "No Python 3.11+ found" — so a silent pass here would be a lying check.
+PYTHON_OK=""
+for py in python3.14 python3.13 python3.12 python3.11 python3; do
+    command -v "$py" >/dev/null 2>&1 || continue
+    if "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+        PYTHON_OK="$py"
+        break
     fi
-
-    if [ ! -d "$VENV_DIR" ]; then
-        echo "Setting up Python environment..."
-        "$PYTHON" -m venv "$VENV_DIR" 2>/dev/null || true
-    fi
-    # Stock Debian/Ubuntu ships python3 without ensurepip (python3-venv
-    # package). `venv` then half-creates: interpreter present, no pip.
-    if [ ! -x "$VENV_DIR/bin/python3" ]; then
-        "$PYTHON" -m venv --without-pip "$VENV_DIR" 2>/dev/null || true
-    fi
-    # Heal a pipless venv: ensurepip first, then pypa's get-pip bootstrap
-    # (works without python3-venv and without sudo).
-    if [ ! -x "$VENV_DIR/bin/pip" ] && [ -x "$VENV_DIR/bin/python3" ]; then
-        "$VENV_DIR/bin/python3" -m ensurepip --upgrade >/dev/null 2>&1 || true
-    fi
-    if [ ! -x "$VENV_DIR/bin/pip" ] && [ -x "$VENV_DIR/bin/python3" ]; then
-        curl -fsSL https://bootstrap.pypa.io/get-pip.py \
-            | "$VENV_DIR/bin/python3" - --quiet >/dev/null 2>&1 || true
-    fi
-    if [ ! -x "$VENV_DIR/bin/pip" ]; then
-        rm -rf "$VENV_DIR"
-        echo "  Warning: could not create a working Python venv (pip unavailable)."
-        echo "  On Debian/Ubuntu:  sudo apt-get install -y python3-venv"
-        echo "  then re-run:       curl -fsSL https://prism.marc27.com/install.sh | bash"
-        return 0
-    fi
-
-    # Install the tool platform, pinned to this release. Wheel asset first
-    # (no git required), verified against SHA256SUMS when the release has
-    # one; tagged-tree sdist as fallback for older releases.
-    if ! "$VENV_DIR/bin/python3" -I -c "import app" >/dev/null 2>&1; then
-        echo "Installing PRISM tools (Python) — this can take a few minutes..."
-        "$VENV_DIR/bin/pip" install -q --upgrade pip 2>/dev/null || true
-        WHEEL_NAME="prism_platform-${VERSION#v}-py3-none-any.whl"
-        WHEEL_URL="https://github.com/${REPO}/releases/download/${VERSION}/${WHEEL_NAME}"
-        WHEEL_OK=0
-        if curl -fsSL "$WHEEL_URL" -o "${TMPDIR}/${WHEEL_NAME}" 2>/dev/null; then
-            # A checksum failure here is a security signal, not a transient
-            # error: hard-fail instead of falling through to the sdist path.
-            verify_sha256 "${TMPDIR}/${WHEEL_NAME}" || return 1
-            if "$VENV_DIR/bin/pip" install -q "${TMPDIR}/${WHEEL_NAME}"; then
-                WHEEL_OK=1
-            fi
-        fi
-        if [ "$WHEEL_OK" -eq 0 ]; then
-            echo "  Wheel unavailable — falling back to tagged source archive."
-            if ! "$VENV_DIR/bin/pip" install -q "prism-platform @ https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz"; then
-                echo "  Warning: Python tools install failed — chat works, local tools disabled."
-                echo "  Retry later:  $VENV_DIR/bin/pip install \"prism-platform @ ${WHEEL_URL}\""
-                return 0
-            fi
-        fi
-        echo "  PRISM tools installed."
-    fi
-}
-setup_python_tools
+done
 
 # --- Add to PATH ---
 SHELL_NAME="$(basename "${SHELL:-bash}")"
@@ -286,20 +235,51 @@ fi
 # --- Create config directory ---
 mkdir -p "$HOME/.prism"
 
-# --- Done ---
+# --- Stage 1 done: the app itself is installed and runnable ---
 echo ""
-echo "PRISM ${VERSION} installed successfully!"
+echo "[1/2] PRISM ${VERSION} installed — $("${INSTALL_DIR}/prism" --version 2>/dev/null || echo 'binary in place')"
+
+# --- Stage 2: the Python tool platform ---
+#
+# Provisioning is the binary's job, so trigger it once here with `prism tools`.
+# (`prism doctor` intentionally reports a missing/broken venv without first
+# changing it.) Re-running this installer resumes through ensure_venv's verified
+# marker fast path.
+if [ -z "$PYTHON_OK" ]; then
+    echo ""
+    echo "[2/2] SKIPPED — no Python 3.11+ on this machine."
+    echo ""
+    echo "  PRISM will not start without it: the agent runs its tools in a"
+    echo "  Python worker and exits with 'No Python 3.11+ found' otherwise."
+    echo ""
+    case "$PLATFORM" in
+        macos) echo "    brew install python@3.12" ;;
+        *)     echo "    sudo apt-get install -y python3.12 python3.12-venv    # Debian/Ubuntu"
+               echo "    sudo dnf install -y python3.12                        # Fedora/RHEL" ;;
+    esac
+    echo ""
+    echo "  Then re-run:  curl -fsSL https://prism.marc27.com/install.sh | bash"
+elif [ "${PRISM_SKIP_TOOLS:-0}" = "1" ]; then
+    echo "[2/2] SKIPPED — PRISM_SKIP_TOOLS=1. Tools install on your first \`prism\` run."
+else
+    echo "[2/2] Setting up the Python tool platform (first run takes a few minutes)..."
+    echo ""
+    # Never fail the install over this — the binary retries on every launch.
+    "${INSTALL_DIR}/prism" tools 2>&1 || {
+        echo ""
+        echo "  Note: setup did not finish cleanly. It retries automatically on your"
+        echo "  next \`prism\` run; \`prism doctor\` shows what is still missing."
+    }
+fi
+
+# --- Done ---
 echo ""
 echo "  prism            Launch the interactive chat"
 echo "  prism login      Authenticate with MARC27"
-echo "  prism setup      First-time setup"
-echo "  prism doctor     Diagnose local + platform health"
+echo "  prism doctor     Re-check local + platform health"
 echo "  prism --help     See all commands"
 echo ""
 
-# Verify install
-if command -v prism >/dev/null 2>&1; then
-    echo "Verified: $(prism --version 2>/dev/null || echo 'installed')"
-else
-    echo "Note: Run 'source ${RC_FILE}' or open a new terminal to use prism."
+if ! command -v prism >/dev/null 2>&1; then
+    echo "Run 'source ${RC_FILE}' or open a new terminal to use prism."
 fi

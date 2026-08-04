@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use prism_client::PlatformError;
 use prism_runtime::{PlatformEndpoints, StoredCredentials};
 
 use crate::boot;
@@ -20,6 +21,30 @@ use crate::boot;
 /// identifiers — see `brand.rs` for why they are not routed through the
 /// brand definition.
 const PLATFORM_TOKEN_ENV: [&str; 3] = ["MARC27_API_KEY", "MARC27_TOKEN", "MARC27_API_TOKEN"];
+
+/// One boot-banner line for a rejected credential: the platform's own
+/// `error.code` plus the action that code implies.
+async fn rejection_line(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let url = resp.url().to_string();
+    let body = match resp.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            return format!("HTTP {} — response unreadable: {error}", status.as_u16());
+        }
+    };
+    let error = PlatformError::parse(status, &url, &body);
+    let reason = error
+        .code
+        .clone()
+        .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+    let action = match error.action() {
+        Some(action) if action.contains("prism login") => "run prism login",
+        Some(_) => "credential not permitted here",
+        None => "see prism doctor",
+    };
+    format!("{reason} — {action}")
+}
 
 /// Whether this install has a platform credential at all.
 ///
@@ -124,15 +149,20 @@ async fn run_boot_checks_with(
                     .unwrap_or("authenticated");
                 (true, name.to_string())
             }
-            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                (false, "token rejected — run prism login".into())
+            // The platform names the reason (`token_expired`, `token_invalid`,
+            // …). Show its word, not our guess — the boot line is one line, so
+            // the code plus the implied action is the most that fits.
+            Ok(r) if r.status().is_client_error() || r.status().is_server_error() => {
+                (false, rejection_line(r).await)
             }
-            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => {
-                (false, "token lacks user scope (agent key?)".into())
-            }
+            // Only 3xx can reach here now; redirects are followed by default,
+            // so one arriving is unexpected rather than an "error".
             Ok(r) => (
                 false,
-                format!("platform error (HTTP {})", r.status().as_u16()),
+                format!(
+                    "unexpected HTTP {} from {api}/users/me",
+                    r.status().as_u16()
+                ),
             ),
             Err(e) if e.is_timeout() => (false, "platform unreachable (timeout)".into()),
             Err(_) => (false, "platform unreachable".into()),
