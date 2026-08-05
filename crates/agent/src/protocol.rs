@@ -5052,6 +5052,22 @@ fn build_tool_card_payload(
     (display_content, Value::Object(data.clone()))
 }
 
+/// How much of a fetched body a tool card carries.
+///
+/// The whole point of the app's Web artifact viewer is to show what was really
+/// fetched; carrying nothing forced it to render an honest "body not carried"
+/// notice instead. Bounded so a card never ships a whole page over the wire —
+/// `content_length` still reports the true size, so the viewer can say how much
+/// of how much it is showing.
+const CARD_EXCERPT_CHARS: usize = 4_000;
+
+/// How many result entries a tool card carries structured.
+///
+/// The prose summary shows five; the structured payload carries more so a
+/// viewer can list them without re-parsing text, while `entries_truncated`
+/// says plainly when there were more than this.
+const CARD_ENTRY_LIMIT: usize = 20;
+
 fn build_tool_card_content(
     tool_name: &str,
     content: &str,
@@ -5523,7 +5539,15 @@ fn build_tool_card_content(
                 }
 
                 // Search-style results: {query, results: [...], count, source}
-                if let Some(results) = object.get("results").and_then(|v| v.as_array()) {
+                // `prior_art_search` returns {papers:[…]} rather than
+                // {results:[…]}, so it fell through to the generic one-line
+                // summary and the app's Paper viewer had a hit count with no
+                // hits. Same shape, same rendering — accept both keys.
+                if let Some(results) = object
+                    .get("results")
+                    .or_else(|| object.get("papers"))
+                    .and_then(|v| v.as_array())
+                {
                     let source = object.get("source").and_then(|v| v.as_str()).unwrap_or("");
                     let count = object
                         .get("count")
@@ -5575,11 +5599,48 @@ fn build_tool_card_content(
                         }
                     }
 
+                    // Entries used to live ONLY in the prose sections, so the
+                    // app's Paper viewer had to parse them back out of text and
+                    // authors never survived at all. Carry them structured and
+                    // bounded, so a viewer reads data rather than re-parsing a
+                    // summary.
+                    let entries: Vec<serde_json::Value> = results
+                        .iter()
+                        .take(CARD_ENTRY_LIMIT)
+                        .map(|r| {
+                            let authors: Vec<String> = r
+                                .get("authors")
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|x| {
+                                            x.as_str().map(str::to_string).or_else(|| {
+                                                x.get("name")
+                                                    .and_then(|n| n.as_str())
+                                                    .map(str::to_string)
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            serde_json::json!({
+                                "title": r.get("title").or_else(|| r.get("name")),
+                                "url": r.get("url"),
+                                "snippet": r.get("snippet").or_else(|| r.get("abstract")),
+                                "authors": authors,
+                                "doi": r.get("doi"),
+                                "year": r.get("year"),
+                            })
+                        })
+                        .collect();
+
                     return (
                         sections.join("\n"),
                         serde_json::json!({
                             "count": count,
                             "source": source,
+                            "entries": entries,
+                            "entries_truncated": count > entries.len() as u64,
                         }),
                     );
                 }
@@ -5604,12 +5665,34 @@ fn build_tool_card_content(
                         sections.push(format!("{content_len} chars"));
                     }
 
+                    // The readable body used to be dropped here, so the app's
+                    // Web artifact viewer could only ever show metadata and an
+                    // honest "body not carried" notice. Carry a bounded
+                    // excerpt: enough for a person to see what was actually
+                    // fetched, capped so a card never ships a whole page.
+                    // `content_length` stays the TRUE length, so the viewer can
+                    // say how much it is showing of how much there was.
+                    let excerpt: String = object
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|body| {
+                            let mut end = CARD_EXCERPT_CHARS.min(body.len());
+                            while end > 0 && !body.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            body[..end].to_string()
+                        })
+                        .unwrap_or_default();
+
                     return (
                         sections.join("\n"),
                         serde_json::json!({
                             "url": url,
+                            "title": title,
                             "source": source,
                             "content_length": content_len,
+                            "excerpt": excerpt,
+                            "excerpt_truncated": (excerpt.chars().count() as u64) < content_len,
                         }),
                     );
                 }
@@ -9184,5 +9267,88 @@ mod tests {
         assert!(parse_title_json("no json here at all").is_none());
         assert!(parse_title_json("{\"title\":\"\"}").is_none());
         assert!(parse_title_json("{\"summary\":\"only a summary\"}").is_none());
+    }
+}
+
+#[cfg(test)]
+mod card_payload_tests {
+    use super::*;
+
+    /// The app's Web artifact viewer could only render metadata and an honest
+    /// "body not carried" notice, because the readable body was dropped here.
+    #[test]
+    fn a_fetched_page_carries_a_bounded_body_excerpt() {
+        let body = "x".repeat(CARD_EXCERPT_CHARS * 2);
+        let result = serde_json::json!({
+            "url": "https://example.org/a",
+            "title": "A Page",
+            "source": "web",
+            "content_length": body.len(),
+            "content": body,
+        });
+        let (_text, payload) = build_tool_card_content("web", &result.to_string(), None, None);
+        assert_eq!(
+            payload["title"], "A Page",
+            "title was parsed but never carried"
+        );
+        let excerpt = payload["excerpt"].as_str().expect("excerpt carried");
+        assert!(!excerpt.is_empty(), "the body must reach the viewer");
+        assert!(
+            excerpt.chars().count() <= CARD_EXCERPT_CHARS,
+            "a card must not ship a whole page: {}",
+            excerpt.chars().count()
+        );
+        assert_eq!(payload["excerpt_truncated"], true);
+        assert_eq!(
+            payload["content_length"],
+            serde_json::json!(CARD_EXCERPT_CHARS * 2),
+            "content_length must stay the TRUE size, not the excerpt size"
+        );
+    }
+
+    /// `prior_art_search` returns {papers:[…]}; the formatter only knew
+    /// {results:[…]}, so it collapsed to a one-line summary and the Paper
+    /// viewer showed a hit count with no hits.
+    #[test]
+    fn a_papers_list_renders_like_a_results_list() {
+        let result = serde_json::json!({
+            "papers": [
+                {"title": "Ti-6Al-4V fatigue", "url": "https://doi.org/10.1/x",
+                 "snippet": "We report...", "authors": ["A. One", {"name": "B. Two"}]},
+            ],
+            "count": 1,
+            "source": "prior_art",
+        });
+        let (text, payload) =
+            build_tool_card_content("prior_art_search", &result.to_string(), None, None);
+        assert!(
+            text.contains("Ti-6Al-4V fatigue"),
+            "entry must reach the summary: {text}"
+        );
+        let entries = payload["entries"].as_array().expect("structured entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["title"], "Ti-6Al-4V fatigue");
+        let authors = entries[0]["authors"].as_array().expect("authors carried");
+        assert_eq!(authors.len(), 2, "authors never reached the wire before");
+        assert_eq!(
+            authors[1], "B. Two",
+            "object-shaped authors resolve to their name"
+        );
+    }
+
+    /// A viewer must be able to say how many of how many it is showing.
+    #[test]
+    fn entries_truncated_is_honest_about_what_was_dropped() {
+        let many: Vec<serde_json::Value> = (0..CARD_ENTRY_LIMIT + 5)
+            .map(|i| serde_json::json!({"title": format!("p{i}"), "url": "u"}))
+            .collect();
+        let n = many.len();
+        let result = serde_json::json!({"results": many, "count": n, "source": "s"});
+        let (_t, payload) = build_tool_card_content("web", &result.to_string(), None, None);
+        assert_eq!(
+            payload["entries"].as_array().unwrap().len(),
+            CARD_ENTRY_LIMIT
+        );
+        assert_eq!(payload["entries_truncated"], true);
     }
 }
