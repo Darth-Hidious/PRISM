@@ -599,7 +599,7 @@ expires = "2126-12-31"
         // about sbatch/ssh, not licences).
         let router = ComputeRouter::local_only()
             .with_byoc(slurm_target(Some("01:00:00"), "/shared/prism-worker.sif"))
-            .with_licence_registry(LicenceRegistry::from_str(VASP_DECL).unwrap());
+            .with_licence_registry(LicenceRegistry::from_toml(VASP_DECL).unwrap());
         let error = router.submit(&licensed_plan("ansys")).await.unwrap_err();
         let licence_error = error
             .downcast_ref::<LicenceError>()
@@ -646,7 +646,7 @@ expires = "2126-12-31"
         // released again.
         let router = ComputeRouter::local_only()
             .with_byoc(slurm_target(Some("01:00:00"), "/shared/prism-worker.sif"))
-            .with_licence_registry(LicenceRegistry::from_str(VASP_DECL).unwrap());
+            .with_licence_registry(LicenceRegistry::from_toml(VASP_DECL).unwrap());
 
         let error = router.submit(&licensed_plan("vasp-6")).await.unwrap_err();
         assert!(
@@ -704,7 +704,7 @@ expires = "2126-12-31"
         // drop hold. The seat then follows the job's lifecycle.
         let router = ComputeRouter::local_only()
             .with_byoc(slurm_target(Some("01:00:00"), "/shared/prism-worker.sif"))
-            .with_licence_registry(LicenceRegistry::from_str(VASP_DECL).unwrap());
+            .with_licence_registry(LicenceRegistry::from_toml(VASP_DECL).unwrap());
 
         let request = LicenceRequest {
             id: "vasp-6".into(),

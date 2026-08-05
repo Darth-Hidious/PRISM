@@ -1419,7 +1419,7 @@ host = "flexlm.example.org"
 port = 27000
 "#
         );
-        let registry = LicenceRegistry::from_str(&decl).unwrap();
+        let registry = LicenceRegistry::from_toml(&decl).unwrap();
         let licence = registry.get("vasp-6").unwrap();
         assert_eq!(licence.secret.as_deref(), Some(SECRET));
 

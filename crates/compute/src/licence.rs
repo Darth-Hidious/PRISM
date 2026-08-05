@@ -185,7 +185,7 @@ pub struct LicenceRegistry {
 
 impl LicenceRegistry {
     /// Parse declarations from TOML text.
-    pub fn from_str(text: &str) -> Result<Self> {
+    pub fn from_toml(text: &str) -> Result<Self> {
         let file: LicencesFile =
             toml::from_str(text).context("failed to parse licence declarations")?;
         let mut licences = Vec::with_capacity(file.licence.len());
@@ -203,7 +203,7 @@ impl LicenceRegistry {
     pub fn from_file(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        Self::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+        Self::from_toml(&text).with_context(|| format!("failed to parse {}", path.display()))
     }
 
     /// `~/.prism/licences.toml`. A missing file is *not* an error — it is
@@ -913,7 +913,7 @@ expires = "2026-08-09T12:00:00Z"
 
     #[test]
     fn registry_parses_declarations_with_server_and_secret() {
-        let registry = LicenceRegistry::from_str(DECL).unwrap();
+        let registry = LicenceRegistry::from_toml(DECL).unwrap();
         assert_eq!(registry.len(), 2);
 
         let vasp = registry.get("vasp-6").unwrap();
@@ -943,7 +943,7 @@ expires = "2026-08-09T12:00:00Z"
 
     #[test]
     fn empty_registry_when_nothing_declared() {
-        let registry = LicenceRegistry::from_str("").unwrap();
+        let registry = LicenceRegistry::from_toml("").unwrap();
         assert!(registry.is_empty());
         assert_eq!(registry.get("vasp-6"), None);
         assert!(registry.ids().is_empty());
@@ -960,7 +960,7 @@ expires = "2026-08-09T12:00:00Z"
         // …but the *default* load with no file present is an empty registry.
         // (Whatever this machine's real ~/.prism state is, load_default
         // must never panic; we test the documented no-file behavior via
-        // from_str("") above and the loader's contract here.)
+        // from_toml("") above and the loader's contract here.)
     }
 
     #[test]
@@ -972,7 +972,7 @@ name = "X"
 seats = 0
 expires = "2026-12-31"
 "#;
-        let err = LicenceRegistry::from_str(zero_seats).unwrap_err();
+        let err = LicenceRegistry::from_toml(zero_seats).unwrap_err();
         assert!(err.to_string().contains("zero seats"), "{err}");
 
         let dup = r#"
@@ -987,7 +987,7 @@ name = "X2"
 seats = 1
 expires = "2026-12-31"
 "#;
-        let err = LicenceRegistry::from_str(dup).unwrap_err();
+        let err = LicenceRegistry::from_toml(dup).unwrap_err();
         assert!(err.to_string().contains("duplicate licence id"), "{err}");
 
         let bad_date = r#"
@@ -997,12 +997,12 @@ name = "X"
 seats = 1
 expires = "next tuesday"
 "#;
-        assert!(LicenceRegistry::from_str(bad_date).is_err());
+        assert!(LicenceRegistry::from_toml(bad_date).is_err());
     }
 
     #[test]
     fn registry_secret_is_never_serialized() {
-        let registry = LicenceRegistry::from_str(DECL).unwrap();
+        let registry = LicenceRegistry::from_toml(DECL).unwrap();
         let json = serde_json::to_string(&registry.licences).unwrap();
         assert!(
             !json.contains("serial-9f2a-SECRET"),
@@ -1012,7 +1012,7 @@ expires = "next tuesday"
 
     #[test]
     fn licence_expiry_detection() {
-        let registry = LicenceRegistry::from_str(DECL).unwrap();
+        let registry = LicenceRegistry::from_toml(DECL).unwrap();
         let gaussian = registry.get("gaussian-16").unwrap();
         let before = chrono::DateTime::parse_from_rfc3339("2026-08-09T11:59:59Z")
             .unwrap()
@@ -1026,7 +1026,7 @@ expires = "next tuesday"
 
     #[test]
     fn refusal_messages_name_licence_seats_and_next_free_time() {
-        let registry = LicenceRegistry::from_str(DECL).unwrap();
+        let registry = LicenceRegistry::from_toml(DECL).unwrap();
         let vasp = registry.get("vasp-6").unwrap();
 
         let earliest = chrono::DateTime::parse_from_rfc3339("2026-08-10T14:32:00Z")
@@ -1054,7 +1054,7 @@ expires = "next tuesday"
         // Repo-wide guard crates/server/tests/no_exit_to_cli.rs bans the
         // imperative form in human-facing strings; keep licence refusals
         // compliant at the source.
-        let registry = LicenceRegistry::from_str(DECL).unwrap();
+        let registry = LicenceRegistry::from_toml(DECL).unwrap();
         let vasp = registry.get("vasp-6").unwrap();
         let messages = [
             LicenceError::no_seats(vasp, 32, Some(Utc::now())).to_string(),
@@ -1136,7 +1136,7 @@ secret = "serial-9f2a-SECRET"
 "#;
 
     fn manager_with(decl: &str) -> LicenceManager {
-        let registry = LicenceRegistry::from_str(decl);
+        let registry = LicenceRegistry::from_toml(decl);
         LicenceManager::new(registry, JobTracker::new(), None)
     }
 
@@ -1254,7 +1254,7 @@ expires = "{expiry_date}"
 "#
         );
         let manager = manager_with(&decl);
-        let registry = LicenceRegistry::from_str(&decl).unwrap();
+        let registry = LicenceRegistry::from_toml(&decl).unwrap();
         let licence = registry.get("vasp-6").unwrap();
 
         // Walltime longer than the licence lifetime: licence expiry wins.
@@ -1467,7 +1467,7 @@ expires = "{expiry_date}"
             std::env::temp_dir().join(format!("prism-licence-tracker-{}", Uuid::new_v4()));
         let tracker = JobTracker::persistent(&data_dir).unwrap();
         let manager = LicenceManager::new(
-            LicenceRegistry::from_str(ONE_LICENCE),
+            LicenceRegistry::from_toml(ONE_LICENCE),
             tracker.clone(),
             None,
         );
@@ -1477,7 +1477,7 @@ expires = "{expiry_date}"
 
         // A fresh process instance sees the bound lease and counts the seat.
         let tracker = JobTracker::persistent(&data_dir).unwrap();
-        let manager = LicenceManager::new(LicenceRegistry::from_str(ONE_LICENCE), tracker, None);
+        let manager = LicenceManager::new(LicenceRegistry::from_toml(ONE_LICENCE), tracker, None);
         let summary = manager.held_summary("vasp-6").await;
         assert_eq!(summary.seats_held, 1, "seat lost across process restart");
         let record = manager.tracker().get(job_id).await.unwrap();
