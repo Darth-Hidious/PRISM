@@ -6400,6 +6400,25 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     "  Graph: {nodes} nodes, {edges} edges written to the local knowledge graph"
                 );
             }
+            // Refused facts must be visible, not silent: name the count and
+            // each drop with its reason (mirrors the local-text route).
+            if let Some(dropped) = result
+                .get("facts_dropped")
+                .and_then(|value| value.as_array())
+            {
+                if !dropped.is_empty() {
+                    println!(
+                        "  Dropped: {} fact(s) refused before the store — their value is not in any source cell",
+                        dropped.len()
+                    );
+                    for entry in dropped {
+                        let subject = value_string(entry, &["subject"]).unwrap_or("?");
+                        let object = value_string(entry, &["object"]).unwrap_or("?");
+                        let reason = value_string(entry, &["reason"]).unwrap_or("?");
+                        println!("    - {subject} / {object}: {reason}");
+                    }
+                }
+            }
             if let Some(embeddings) = result.get("embeddings") {
                 let count = embeddings
                     .get("vectors")
