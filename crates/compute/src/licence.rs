@@ -44,7 +44,9 @@
 //! A [`LicenceRequest`] against an empty registry is refused with a
 //! message naming what is missing.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -53,7 +55,10 @@ use chrono::{DateTime, NaiveDate, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::RwLock;
 use uuid::Uuid;
+
+use crate::job::JobTracker;
 
 /// Default location of the licence declarations file.
 pub const LICENCES_FILE: &str = "licences.toml";
@@ -263,6 +268,9 @@ pub enum LicenceError {
         seats_held: u32,
         held_are: &'static str,
         earliest: String,
+        /// Machine-readable copy of the earliest free time, for callers
+        /// that want to act on it rather than render it.
+        earliest_free: Option<DateTime<Utc>>,
     },
 
     #[error("licence request is invalid: {reason}")]
@@ -307,6 +315,7 @@ impl LicenceError {
             seats_held,
             held_are: if seats_held == 1 { "is" } else { "are" },
             earliest,
+            earliest_free,
         }
     }
 }
@@ -389,6 +398,7 @@ const LEASE_PUB_FILE: &str = "lease-signing.pub";
 /// check the assertion offline. It is *not* the licence secret: a licence
 /// secret (serial, key, server credential) grants the licence against the
 /// vendor; this keypair only proves PRISM minted the lease.
+#[derive(Clone)]
 pub struct LeaseKeys {
     signing: SigningKey,
 }
@@ -588,6 +598,244 @@ pub fn bound_lease_expiry(
         }
     }
     expiry
+}
+
+// ── Seat accounting ──────────────────────────────────────────────────
+
+/// A seat reservation held between checkout and dispatch. The job id is
+/// not known yet (or, on platform backends, is assigned by the platform),
+/// so no signed lease exists yet — but the seats are already held, and a
+/// concurrent checkout sees them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatHold {
+    pub lease_id: Uuid,
+    pub licence_id: String,
+    pub seats: u32,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Live seat usage for one licence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeatSummary {
+    pub seats_held: u32,
+    pub earliest_free: Option<DateTime<Utc>>,
+}
+
+/// Issues leases and accounts for seats.
+///
+/// Seat state is *derived*, not duplicated: a bound lease lives on the
+/// job record inside the existing persistent [`JobTracker`]
+/// (`compute-jobs.json`), and a seat counts as held while its job is
+/// non-terminal and its lease unexpired. When a job reaches a terminal
+/// state its seat returns automatically; a job that is killed, crashes,
+/// or vanishes stops holding its seat when the lease expires (bounded by
+/// the job's walltime). This module keeps no parallel job store.
+///
+/// The only transient state is the checkout→dispatch window, where seats
+/// must be held before any job record exists; those holds live in memory
+/// and die with the process — the safe direction (a lost hold frees a
+/// seat, never leaks one).
+pub struct LicenceManager {
+    registry: Result<LicenceRegistry>,
+    tracker: JobTracker,
+    pending: Arc<RwLock<HashMap<Uuid, SeatHold>>>,
+    keys: Arc<RwLock<Option<LeaseKeys>>>,
+    keys_dir: Option<PathBuf>,
+}
+
+impl LicenceManager {
+    /// `registry` is passed as a `Result` so a broken `licences.toml`
+    /// fails loudly at the first licence request but never blocks the
+    /// unlicensed path.
+    pub fn new(
+        registry: Result<LicenceRegistry>,
+        tracker: JobTracker,
+        keys_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            registry,
+            tracker,
+            pending: Arc::new(RwLock::new(HashMap::new())),
+            keys: Arc::new(RwLock::new(None)),
+            keys_dir,
+        }
+    }
+
+    pub fn tracker(&self) -> &JobTracker {
+        &self.tracker
+    }
+
+    /// Acquire seats before dispatch. Refuses — with an actionable,
+    /// non-imperative message — when the licence is undeclared, expired,
+    /// or out of seats. On success the seats are held until the hold is
+    /// bound to a job record ([`Self::mint`] + tracker attach) or dropped
+    /// ([`Self::drop_hold`]).
+    pub async fn checkout(
+        &self,
+        request: &LicenceRequest,
+        walltime: Option<Duration>,
+    ) -> Result<SeatHold> {
+        let registry = self
+            .registry
+            .as_ref()
+            .map_err(|e| LicenceError::ConfigBroken(format!("{e:#}")))?;
+        let Some(licence) = registry.get(&request.id) else {
+            return Err(LicenceError::not_declared(&request.id, &registry.ids()).into());
+        };
+        if request.seats == 0 {
+            return Err(LicenceError::InvalidRequest {
+                reason: "seat count must be at least 1".into(),
+            }
+            .into());
+        }
+        let now = Utc::now();
+        if licence.is_expired(now) {
+            return Err(LicenceError::LicenceExpired {
+                licence_id: licence.id.clone(),
+                licence_name: licence.name.clone(),
+                expired_at: licence.expires,
+            }
+            .into());
+        }
+        let expires_at = bound_lease_expiry(licence.expires, now, walltime);
+        if expires_at <= now {
+            return Err(LicenceError::InvalidRequest {
+                reason: "the lease would expire before the job could run \
+                         (licence expired or walltime is effectively zero)"
+                    .into(),
+            }
+            .into());
+        }
+
+        // Critical section: count + decide + insert under one write lock,
+        // so concurrent checkouts of the last seat can never both win.
+        let mut pending = self.pending.write().await;
+        let summary = self.held_summary_locked(&request.id, now, &pending).await;
+        if summary.seats_held.saturating_add(request.seats) > licence.seats {
+            return Err(LicenceError::no_seats(licence, summary.seats_held, summary.earliest_free)
+                .into());
+        }
+        let hold = SeatHold {
+            lease_id: Uuid::new_v4(),
+            licence_id: request.id.clone(),
+            seats: request.seats,
+            expires_at,
+        };
+        pending.insert(hold.lease_id, hold.clone());
+        tracing::info!(
+            licence = %request.id, seats = request.seats, lease_id = %hold.lease_id,
+            expires_at = %expires_at,
+            "licence seats held pre-dispatch"
+        );
+        Ok(hold)
+    }
+
+    /// Mint the signed lease once the job id is known. The hold must
+    /// still be live; the seats stay held through the job record after
+    /// the lease is attached there and the hold is dropped.
+    pub async fn mint(&self, hold: &SeatHold, job_id: Uuid) -> Result<Lease> {
+        {
+            let pending = self.pending.read().await;
+            let Some(live) = pending.get(&hold.lease_id) else {
+                bail!("licence hold {} was already released", hold.lease_id);
+            };
+            if *live != *hold {
+                bail!("licence hold {} does not match its reservation", hold.lease_id);
+            }
+        }
+        let keys = self.keys().await?;
+        Ok(sign_lease(
+            &keys,
+            &hold.licence_id,
+            hold.seats,
+            job_id,
+            Utc::now(),
+            hold.expires_at,
+        ))
+    }
+
+    /// Release a pre-dispatch hold (submission failed or was refused
+    /// after checkout). Never called for bound leases — those free their
+    /// seats through the job's terminal state or lease expiry.
+    pub async fn drop_hold(&self, lease_id: Uuid) {
+        self.pending.write().await.remove(&lease_id);
+    }
+
+    /// Seat usage for one licence right now: pending holds plus bound
+    /// leases on non-terminal jobs, ignoring anything expired.
+    pub async fn held_summary(&self, licence_id: &str) -> SeatSummary {
+        let pending = self.pending.read().await;
+        self.held_summary_locked(licence_id, Utc::now(), &pending)
+            .await
+    }
+
+    async fn held_summary_locked(
+        &self,
+        licence_id: &str,
+        now: DateTime<Utc>,
+        pending: &HashMap<Uuid, SeatHold>,
+    ) -> SeatSummary {
+        let mut summary = SeatSummary::default();
+        let mut account = |seats: u32, expires_at: DateTime<Utc>| {
+            summary.seats_held += seats;
+            summary.earliest_free = Some(match summary.earliest_free {
+                Some(earliest) => earliest.min(expires_at),
+                None => expires_at,
+            });
+        };
+        for hold in pending.values() {
+            if hold.licence_id == licence_id && hold.expires_at > now {
+                account(hold.seats, hold.expires_at);
+            }
+        }
+        for record in self.tracker.list(false).await {
+            if let Some(lease) = &record.licence
+                && lease.licence_id == licence_id
+                && !record.status.is_terminal()
+                && lease.expires_at > now
+            {
+                account(lease.seats, lease.expires_at);
+            }
+        }
+        summary
+    }
+
+    /// Reclaim seats from jobs that no longer deserve them: bound leases
+    /// whose job reached a terminal state or whose lease expired. Returns
+    /// how many records were cleaned. Seat counting already ignores such
+    /// records — this is hygiene that keeps the persisted store honest.
+    pub async fn reclaim_expired(&self) -> Result<usize> {
+        let now = Utc::now();
+        let mut reclaimed = 0;
+        for record in self.tracker.list(false).await {
+            let Some(lease) = &record.licence else {
+                continue;
+            };
+            if record.status.is_terminal() || lease.is_expired(now) {
+                self.tracker.clear_licence(record.job_id).await?;
+                reclaimed += 1;
+            }
+        }
+        if reclaimed > 0 {
+            tracing::info!(reclaimed, "reclaimed expired/terminal licence leases");
+        }
+        Ok(reclaimed)
+    }
+
+    /// Lazy keypair: created at first mint, not at startup, so the
+    /// zero-config path never writes key material.
+    async fn keys(&self) -> Result<LeaseKeys> {
+        let mut guard = self.keys.write().await;
+        if let Some(keys) = &*guard {
+            return Ok(keys.clone());
+        }
+        let keys = match &self.keys_dir {
+            Some(dir) => LeaseKeys::load_or_create(dir)?,
+            None => LeaseKeys::generate(),
+        };
+        *guard = Some(keys.clone());
+        Ok(keys)
+    }
 }
 
 #[cfg(test)]
@@ -816,6 +1064,328 @@ expires = "next tuesday"
     fn licence_request_defaults_to_one_seat() {
         let parsed: LicenceRequest = serde_json::from_str(r#"{"id": "vasp-6"}"#).unwrap();
         assert_eq!(parsed.seats, 1);
+    }
+
+    // ── Seat accounting (LicenceManager over JobTracker) ───────────────
+
+    const ONE_LICENCE: &str = r#"
+[[licence]]
+id = "vasp-6"
+name = "VASP 6 (ESA pool)"
+seats = 2
+expires = "2126-12-31"
+secret = "serial-9f2a-SECRET"
+"#;
+
+    fn manager_with(decl: &str) -> LicenceManager {
+        let registry = LicenceRegistry::from_str(decl);
+        LicenceManager::new(registry, JobTracker::new(), None)
+    }
+
+    fn request(id: &str, seats: u32) -> LicenceRequest {
+        LicenceRequest {
+            id: id.into(),
+            seats,
+        }
+    }
+
+    /// Checkout + mint + bind to a registered job record, mirroring the
+    /// dispatch path.
+    async fn bind_lease(
+        manager: &LicenceManager,
+        request: &LicenceRequest,
+        walltime: Option<Duration>,
+    ) -> (Uuid, Lease) {
+        let hold = manager.checkout(request, walltime).await.unwrap();
+        let job_id = Uuid::new_v4();
+        let lease = manager.mint(&hold, job_id).await.unwrap();
+        manager
+            .tracker()
+            .register(job_id, "licensed-job", "vasp6.sif", "byoc", crate::job::JobTarget::Local)
+            .await
+            .unwrap();
+        manager
+            .tracker()
+            .attach_licence(job_id, lease.clone())
+            .await
+            .unwrap();
+        manager.drop_hold(hold.lease_id).await;
+        (job_id, lease)
+    }
+
+    #[tokio::test]
+    async fn concurrent_checkout_of_last_seat_never_oversubscribes() {
+        let manager = Arc::new(manager_with(ONE_LICENCE));
+        let mut set = tokio::task::JoinSet::new();
+        // 16 racers for 2 seats.
+        for _ in 0..16 {
+            let manager = Arc::clone(&manager);
+            set.spawn(async move {
+                manager.checkout(&request("vasp-6", 1), None).await
+            });
+        }
+        let mut granted = 0;
+        let mut refused = 0;
+        while let Some(result) = set.join_next().await {
+            match result.unwrap() {
+                Ok(_) => granted += 1,
+                Err(error) => {
+                    refused += 1;
+                    assert!(
+                        error.downcast_ref::<LicenceError>().is_some(),
+                        "refusal must be a LicenceError: {error}"
+                    );
+                }
+            }
+        }
+        assert_eq!(granted, 2, "seats were oversubscribed");
+        assert_eq!(refused, 14);
+
+        let summary = manager.held_summary("vasp-6").await;
+        assert_eq!(summary.seats_held, 2);
+        assert!(summary.earliest_free.is_some());
+    }
+
+    #[tokio::test]
+    async fn expired_licence_never_issues_a_lease() {
+        let decl = r#"
+[[licence]]
+id = "gaussian-16"
+name = "Gaussian 16"
+seats = 4
+expires = "2020-01-01"
+"#;
+        let manager = manager_with(decl);
+        let error = manager
+            .checkout(&request("gaussian-16", 1), None)
+            .await
+            .unwrap_err();
+        let licence_error = error.downcast_ref::<LicenceError>().unwrap();
+        assert!(
+            matches!(licence_error, LicenceError::LicenceExpired { .. }),
+            "{licence_error}"
+        );
+        let message = licence_error.to_string();
+        assert!(message.contains("expired on"), "{message}");
+        assert!(message.contains("gaussian-16"), "{message}");
+        // No hold escaped the refusal.
+        assert_eq!(
+            manager.held_summary("gaussian-16").await,
+            SeatSummary::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_bounds_lease_expiry_by_licence_and_walltime() {
+        // Licence expires ~30 days from now, so this test does not depend
+        // on the machine clock relative to a hardcoded date.
+        let expiry_date = (Utc::now() + chrono::Duration::days(30))
+            .format("%Y-%m-%d")
+            .to_string();
+        let decl = format!(
+            r#"
+[[licence]]
+id = "vasp-6"
+name = "VASP 6 (ESA pool)"
+seats = 2
+expires = "{expiry_date}"
+"#
+        );
+        let manager = manager_with(&decl);
+        let registry = LicenceRegistry::from_str(&decl).unwrap();
+        let licence = registry.get("vasp-6").unwrap();
+
+        // Walltime longer than the licence lifetime: licence expiry wins.
+        let hold = manager
+            .checkout(&request("vasp-6", 1), Some(Duration::from_secs(500 * 86_400)))
+            .await
+            .unwrap();
+        let lease = manager.mint(&hold, Uuid::new_v4()).await.unwrap();
+        assert!(lease.expires_at <= licence.expires);
+        assert_eq!(hold.expires_at, licence.expires);
+        manager.drop_hold(hold.lease_id).await;
+
+        // Walltime shorter than the licence lifetime: walltime wins.
+        let before = Utc::now();
+        let hold = manager
+            .checkout(&request("vasp-6", 1), Some(Duration::from_secs(600)))
+            .await
+            .unwrap();
+        let lease = manager.mint(&hold, Uuid::new_v4()).await.unwrap();
+        assert!(
+            lease.expires_at <= before + chrono::Duration::seconds(600 + 5),
+            "{}", lease.expires_at
+        );
+        assert!(lease.expires_at > before);
+        lease.verify().unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_job_returns_its_seat() {
+        let manager = manager_with(ONE_LICENCE);
+        let (job_id, _lease) = bind_lease(&manager, &request("vasp-6", 2), None).await;
+        assert_eq!(manager.held_summary("vasp-6").await.seats_held, 2);
+
+        // A full house refuses.
+        assert!(manager.checkout(&request("vasp-6", 1), None).await.is_err());
+
+        // The job dies — killed, crashed, or cancelled — and the tracker
+        // records the terminal state.
+        manager
+            .tracker()
+            .update_status(job_id, crate::job::TrackedStatus::Failed { error: "NODE_FAIL".into() })
+            .await
+            .unwrap();
+
+        // Seats are back to full without anyone releasing explicitly.
+        assert_eq!(manager.held_summary("vasp-6").await.seats_held, 0);
+        let hold = manager.checkout(&request("vasp-6", 2), None).await.unwrap();
+        manager.drop_hold(hold.lease_id).await;
+    }
+
+    #[tokio::test]
+    async fn vanished_job_seat_is_reclaimed_when_lease_expires() {
+        let manager = manager_with(ONE_LICENCE);
+        // Lease bounded by a 50ms walltime: the job vanishes without ever
+        // releasing, and no status update ever arrives.
+        let (job_id, lease) = bind_lease(&manager, &request("vasp-6", 2), Some(Duration::from_millis(50))).await;
+        assert_eq!(manager.held_summary("vasp-6").await.seats_held, 2);
+        assert!(!lease.is_expired(Utc::now()));
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // The expired lease no longer holds seats…
+        assert_eq!(manager.held_summary("vasp-6").await.seats_held, 0);
+        // …and reclaim clears the stale record so the store stays honest.
+        assert_eq!(manager.reclaim_expired().await.unwrap(), 1);
+        assert!(manager.tracker().get(job_id).await.unwrap().licence.is_none());
+
+        // Seat count is back to full: both seats can be taken again.
+        let hold = manager.checkout(&request("vasp-6", 2), None).await.unwrap();
+        manager.drop_hold(hold.lease_id).await;
+    }
+
+    #[tokio::test]
+    async fn reclaim_also_clears_terminal_records_with_live_leases() {
+        let manager = manager_with(ONE_LICENCE);
+        let (job_id, _lease) = bind_lease(&manager, &request("vasp-6", 1), None).await;
+        manager
+            .tracker()
+            .update_status(job_id, crate::job::TrackedStatus::Cancelled)
+            .await
+            .unwrap();
+        assert_eq!(manager.reclaim_expired().await.unwrap(), 1);
+        assert!(manager.tracker().get(job_id).await.unwrap().licence.is_none());
+        // Second sweep finds nothing left to reclaim.
+        assert_eq!(manager.reclaim_expired().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_licences_licensed_request_refuses_naming_what_is_missing() {
+        let manager = manager_with("");
+        let error = manager.checkout(&request("vasp-6", 1), None).await.unwrap_err();
+        let licence_error = error.downcast_ref::<LicenceError>().unwrap();
+        let message = licence_error.to_string();
+        assert!(
+            matches!(licence_error, LicenceError::NotDeclared { .. }),
+            "{message}"
+        );
+        assert!(message.contains("vasp-6"), "{message}");
+        assert!(message.contains("no licences are declared"), "{message}");
+        assert!(message.contains("licences.toml"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn unknown_licence_id_names_what_is_declared() {
+        let manager = manager_with(ONE_LICENCE);
+        let error = manager.checkout(&request("ansys", 1), None).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ansys"), "{message}");
+        assert!(message.contains("vasp-6"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn broken_config_refuses_licensed_requests() {
+        let manager = LicenceManager::new(
+            Err(anyhow::anyhow!("failed to parse licences.toml: bad TOML")),
+            JobTracker::new(),
+            None,
+        );
+        let error = manager.checkout(&request("vasp-6", 1), None).await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<LicenceError>(),
+                Some(LicenceError::ConfigBroken(_))
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("licences.toml"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_a_dropped_or_mismatched_hold() {
+        let manager = manager_with(ONE_LICENCE);
+        let hold = manager.checkout(&request("vasp-6", 1), None).await.unwrap();
+        manager.drop_hold(hold.lease_id).await;
+        assert!(manager.mint(&hold, Uuid::new_v4()).await.is_err());
+
+        let hold = manager.checkout(&request("vasp-6", 1), None).await.unwrap();
+        let mut mismatched = hold.clone();
+        mismatched.seats = 99;
+        assert!(manager.mint(&mismatched, Uuid::new_v4()).await.is_err());
+        manager.drop_hold(hold.lease_id).await;
+    }
+
+    #[tokio::test]
+    async fn no_seats_refusal_reports_held_count_and_next_free_time() {
+        let manager = manager_with(ONE_LICENCE);
+        let (_job_id, lease) = bind_lease(&manager, &request("vasp-6", 2), None).await;
+        let error = manager.checkout(&request("vasp-6", 1), None).await.unwrap_err();
+        let licence_error = error.downcast_ref::<LicenceError>().unwrap();
+        let (message, earliest_free) = match licence_error {
+            LicenceError::NoSeats {
+                earliest_free, ..
+            } => (licence_error.to_string(), *earliest_free),
+            other => panic!("expected NoSeats, got {other}"),
+        };
+        assert!(message.contains("2 seat(s) exist"), "{message}");
+        assert!(message.contains("2 are held"), "{message}");
+        // The named free time is the expiring lease's expiry.
+        assert!(message.contains("due to free"), "{message}");
+        assert_eq!(earliest_free.unwrap(), lease.expires_at);
+    }
+
+    #[tokio::test]
+    async fn bound_lease_survives_tracker_roundtrip() {
+        use crate::job::JobTracker;
+
+        let data_dir =
+            std::env::temp_dir().join(format!("prism-licence-tracker-{}", Uuid::new_v4()));
+        let tracker = JobTracker::persistent(&data_dir).unwrap();
+        let manager = LicenceManager::new(
+            LicenceRegistry::from_str(ONE_LICENCE),
+            tracker.clone(),
+            None,
+        );
+        let (job_id, lease) = bind_lease(&manager, &request("vasp-6", 1), None).await;
+        drop(tracker);
+        drop(manager);
+
+        // A fresh process instance sees the bound lease and counts the seat.
+        let tracker = JobTracker::persistent(&data_dir).unwrap();
+        let manager = LicenceManager::new(
+            LicenceRegistry::from_str(ONE_LICENCE),
+            tracker,
+            None,
+        );
+        let summary = manager.held_summary("vasp-6").await;
+        assert_eq!(summary.seats_held, 1, "seat lost across process restart");
+        let record = manager.tracker().get(job_id).await.unwrap();
+        let persisted = record.licence.unwrap();
+        assert_eq!(persisted, lease);
+        persisted.verify().unwrap();
+
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 
     // ── Signed leases ──────────────────────────────────────────────────

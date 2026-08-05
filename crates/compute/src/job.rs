@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::JobStatus;
 use crate::byoc::ByocTarget;
+use crate::licence::Lease;
 
 const JOBS_FILE: &str = "compute-jobs.json";
 
@@ -41,6 +42,13 @@ pub struct JobRecord {
     pub status: TrackedStatus,
     pub submitted_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Bound licence lease, when the job needed a licensed code. Its
+    /// presence is what holds the seats: seats count against a licence
+    /// while the job is non-terminal and the lease is unexpired, so a
+    /// killed, crashed, or vanished job can never leak its seat forever.
+    /// Carries no licence secret — only the signed, opaque lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licence: Option<Lease>,
 }
 
 /// Serializable version of JobStatus with timestamps.
@@ -154,6 +162,7 @@ impl JobTracker {
             status: TrackedStatus::Queued,
             submitted_at: now,
             updated_at: now,
+            licence: None,
         };
         let mut jobs = self.jobs.write().await;
         jobs.insert(job_id, record.clone());
@@ -172,6 +181,34 @@ impl JobTracker {
         } else {
             Ok(false)
         }
+    }
+
+    /// Bind a licence lease to a registered job and persist it. This is
+    /// what holds the seats for the job's lifetime.
+    pub async fn attach_licence(&self, job_id: Uuid, lease: Lease) -> Result<bool> {
+        let mut jobs = self.jobs.write().await;
+        if let Some(record) = jobs.get_mut(&job_id) {
+            record.licence = Some(lease);
+            record.updated_at = Utc::now();
+            self.persist(&jobs)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Drop the lease from a job record (explicit release / reclaim).
+    /// Idempotent; returns whether a lease was present.
+    pub async fn clear_licence(&self, job_id: Uuid) -> Result<bool> {
+        let mut jobs = self.jobs.write().await;
+        if let Some(record) = jobs.get_mut(&job_id)
+            && record.licence.take().is_some()
+        {
+            record.updated_at = Utc::now();
+            self.persist(&jobs)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Get a job record by ID.
