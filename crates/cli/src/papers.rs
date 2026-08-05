@@ -357,10 +357,11 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     // supports the fact. Facts with no supporting span cannot
                     // become claims — stamping them would record provenance a
                     // document never gave (extractor prompt examples included).
-                    let quote = prism_retrieval::claims::supporting_quote(
+                    let quote = prism_retrieval::claims::supporting_quote_with_unit(
                         &fact.subject,
                         &fact.object,
                         fact.value,
+                        fact.unit.as_ref().map(|u| u.as_str()),
                         &block.text,
                     );
                     let claim = claim_from_fact(
