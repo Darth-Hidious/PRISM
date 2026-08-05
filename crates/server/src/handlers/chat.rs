@@ -207,9 +207,15 @@ pub async fn get_session(
 #[cfg(test)]
 mod tests {
     use super::{anonymous_caller_id, chat_owner};
+    use crate::NodeState;
     use crate::middleware::{AuthenticatedUser, SessionToken};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode, header};
     use prism_agent::service::{ChatRequest, ChatService};
+    use serde_json::json;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tower::ServiceExt;
 
     const STUB_TOOL_SERVER: &str = r#"
 import json
@@ -377,5 +383,166 @@ for line in sys.stdin:
             .expect("resume solo session after restart");
         assert_eq!(resumed.session_id, first_turn.session_id);
         assert_eq!(resumed.answer, "SOLO_OK");
+    }
+
+    // ── Round 7: literal POST /api/chat ────────────────────────────────
+
+    /// `PRISM_SKILLS_DIR` is process-global; restore it on drop so a failed
+    /// assertion cannot leak the temp dir into sibling tests.
+    struct SkillsEnvGuard;
+
+    impl Drop for SkillsEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: test-only process-global cleanup.
+            unsafe { std::env::remove_var("PRISM_SKILLS_DIR") };
+        }
+    }
+
+    /// Stub LLM that calls `run_skill(name=probe)` until a tool result is the
+    /// last message, then answers.
+    async fn start_skill_probe_llm() -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(
+                |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let last_is_tool = body["messages"]
+                        .as_array()
+                        .and_then(|msgs| msgs.last())
+                        .map(|m| m["role"] == "tool")
+                        .unwrap_or(false);
+                    let chunk = if last_is_tool {
+                        json!({"choices": [{"delta": {"content": "CHAT_DONE"}}]})
+                    } else {
+                        json!({"choices": [{"delta": {"tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "run_skill",
+                                "arguments": "{\"name\": \"probe\"}"
+                            }
+                        }]}}]})
+                    };
+                    let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(body))
+                        .expect("stub response")
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub LLM");
+        let address = listener.local_addr().expect("stub LLM address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}/v1")
+    }
+
+    /// Round 7, end to end through the real route: an authenticated non-owner
+    /// of a LINKED node resolves to LocalOnly (`command_tool_platform_access`),
+    /// and a `/api/chat` turn whose model calls `run_skill` — pre-approved by
+    /// the caller itself, the headless equivalent of clicking "allow" — is
+    /// refused with the owner-only message. The skill must NOT execute.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_owner_cannot_reach_run_skill_via_api_chat() {
+        let Some(python) = find_python() else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+
+        // Isolated skill store + a pre-planted skill whose body writes a
+        // marker file if it EVER executes.
+        let skills_dir =
+            std::env::temp_dir().join(format!("prism-api-chat-skills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&skills_dir);
+        std::fs::create_dir_all(&skills_dir).expect("create temp skills dir");
+        // SAFETY: test-only process-global setup; restored by SkillsEnvGuard.
+        unsafe { std::env::set_var("PRISM_SKILLS_DIR", &skills_dir) };
+        let _skills_guard = SkillsEnvGuard;
+        let marker = skills_dir.join("run_marker");
+        prism_agent::skills::store(&prism_agent::skills::AuthoredSkill::new(
+            "probe",
+            "probe skill for the access-gate test",
+            "shell",
+            &format!("echo PWNED > {}", marker.to_string_lossy()),
+            true,
+        ))
+        .expect("store probe skill");
+
+        // Chat service backed by the stub LLM + stub tool server.
+        let project = tempfile::tempdir().expect("create tool project");
+        write_stub_tool_server(project.path());
+        let sessions_dir = tempfile::tempdir().expect("sessions dir");
+        let base_url = start_skill_probe_llm().await;
+        let service = ChatService::spawn(
+            llm_config(&base_url),
+            tool_server(project.path(), &python),
+            Some(sessions_dir.path().to_path_buf()),
+        )
+        .await
+        .expect("spawn chat service");
+
+        // A LINKED node (platform client configured) + an authenticated
+        // session for a user who is NOT the node owner → LocalOnly.
+        let session_db = tempfile::NamedTempFile::new().expect("create session database");
+        let manager = prism_core::session::SessionManager::new(
+            session_db.path(),
+            chrono::Duration::hours(24),
+        )
+        .expect("open session manager");
+        let session = manager
+            .create_session("authenticated:non-owner", None, None)
+            .expect("create authenticated non-owner session");
+
+        let mut node = NodeState::new("test-node".into());
+        node.session_db_path = Some(session_db.path().to_path_buf());
+        node.platform_client = Some(prism_client::PlatformClient::new("http://127.0.0.1:1"));
+        node.platform_owner_id
+            .set("owner-user".into())
+            .expect("set platform owner");
+        assert!(node.chat.set(Arc::new(service)).is_ok());
+        let app = crate::router::build_router(Arc::new(node));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/chat")
+            .header(header::AUTHORIZATION, format!("Bearer {}", session.id))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "message": "run my probe skill",
+                    "approve": ["run_skill"]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("run request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8_lossy(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read SSE body"),
+        )
+        .to_string();
+
+        // The streamed tool_result carries the owner-only refusal.
+        assert!(
+            body.contains("run_skill"),
+            "the turn must show the run_skill attempt: {body}"
+        );
+        assert!(
+            body.contains("owner-only"),
+            "the refusal must reach the HTTP client: {body}"
+        );
+        assert!(body.contains("verified node-owner session"), "{body}");
+        // The skill did NOT execute, and the store is untouched.
+        assert!(
+            !marker.exists(),
+            "run_skill must not execute for a non-owner /api/chat caller"
+        );
+        assert!(prism_agent::skills::load("probe").is_ok());
     }
 }
