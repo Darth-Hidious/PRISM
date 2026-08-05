@@ -1380,6 +1380,9 @@ mod tests {
     /// green "completed" card. We store a failing body directly (the same
     /// `skills::store` path write_skill uses after verification) to reach the
     /// "stored-then-broke" state deterministically.
+    // The env guard is held across `.await` only to serialize `PRISM_SKILLS_DIR`
+    // between tests; `#[tokio::test]` is single-threaded so this can't deadlock.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_skill_failure_emits_success_error_contract() {
         let (_g, _dir) = crate::skills::test_env_guard("meta-runskill-fail");
