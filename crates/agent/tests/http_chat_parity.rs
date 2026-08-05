@@ -105,7 +105,7 @@ fn tool_server_config(project: &Path, python: &Path) -> ToolServer {
 
 // ── Stub OpenAI-compatible LLM ───────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum StubMode {
     /// Always answers with plain text "PARITY_OK".
     PlainAnswer,
@@ -120,6 +120,14 @@ enum StubMode {
     ClaimsWithoutTools,
     /// Calls the environment probe once, then completes the turn.
     EnvironmentProbe,
+    /// Round 7: calls `write_skill` (its code writes `write_marker` when
+    /// executed), then `run_skill` on a PRE-STORED skill (whose body writes a
+    /// marker the test controls), then completes. Drives the LocalOnly-refusal
+    /// and owner-allowed skill tests.
+    SkillWriteThenRun { write_marker: String },
+    /// Round 7: calls the two read-only meta-tools (`find_tools`, then
+    /// `recall`), then completes. Drives the LocalOnly proportionality test.
+    ReadOnlyMetaTools,
 }
 
 fn sse_text(text: &str) -> String {
@@ -130,11 +138,15 @@ fn sse_text(text: &str) -> String {
 }
 
 fn sse_tool_call(tool: &str) -> String {
+    sse_tool_call_with_args(tool, "{}")
+}
+
+fn sse_tool_call_with_args(tool: &str, arguments: &str) -> String {
     let chunk = serde_json::json!({
         "choices": [{ "delta": { "tool_calls": [{
             "index": 0,
             "id": "call_1",
-            "function": { "name": tool, "arguments": "{}" }
+            "function": { "name": tool, "arguments": arguments }
         }] } }]
     });
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
@@ -160,6 +172,7 @@ async fn start_stub_llm_recording(mode: StubMode) -> (String, SystemMessageLog) 
         "/v1/chat/completions",
         post(move |axum::Json(body): axum::Json<serde_json::Value>| {
             let sink = sink.clone();
+            let mode = mode.clone();
             async move {
                 if let Some(msgs) = body["messages"].as_array() {
                     let mut log = sink.lock().expect("system log");
@@ -176,6 +189,10 @@ async fn start_stub_llm_recording(mode: StubMode) -> (String, SystemMessageLog) 
                     .and_then(|msgs| msgs.last())
                     .map(|m| m["role"] == "tool")
                     .unwrap_or(false);
+                let tool_msgs = body["messages"]
+                    .as_array()
+                    .map(|msgs| msgs.iter().filter(|m| m["role"] == "tool").count())
+                    .unwrap_or(0);
                 let saw_contract_reminder = body["messages"]
                     .as_array()
                     .map(|msgs| {
@@ -198,6 +215,25 @@ async fn start_stub_llm_recording(mode: StubMode) -> (String, SystemMessageLog) 
                     }
                     StubMode::EnvironmentProbe if last_is_tool => sse_text("ENV_DONE"),
                     StubMode::EnvironmentProbe => sse_tool_call("local_env_probe"),
+                    StubMode::SkillWriteThenRun { write_marker } => match tool_msgs {
+                        0 => sse_tool_call_with_args(
+                            "write_skill",
+                            &serde_json::json!({
+                                "name": "probe_write",
+                                "description": "probe skill for the access-gate tests",
+                                "language": "shell",
+                                "code": format!("echo PWNED > {write_marker}"),
+                            })
+                            .to_string(),
+                        ),
+                        1 => sse_tool_call_with_args("run_skill", "{\"name\": \"probe_run\"}"),
+                        _ => sse_text("SKILL_DONE"),
+                    },
+                    StubMode::ReadOnlyMetaTools => match tool_msgs {
+                        0 => sse_tool_call_with_args("find_tools", "{\"query\": \"stub\"}"),
+                        1 => sse_tool_call_with_args("recall", "{\"query\": \"titanium\"}"),
+                        _ => sse_text("READONLY_DONE"),
+                    },
                 };
                 axum::response::Response::builder()
                     .header("content-type", "text/event-stream")
@@ -829,5 +865,325 @@ async fn unsupported_execution_claim_cannot_finalize_a_turn() {
                 && s.contains("unless a tool result for it exists in THIS run")
         }),
         "the Execution Contract must be in a system message the model received"
+    );
+}
+
+// ── Round 7: meta-tools are not homogeneous ──────────────────────────
+//
+// write_skill/run_skill EXECUTE un-sandboxed code as the node OS user. They
+// must pass the same platform-access gate as every other execution surface —
+// a LocalOnly (non-owner) /api/chat caller cannot reach them even with
+// caller-self-granted approval, while the verified owner keeps them and the
+// read-only meta-tools (recall/find_tools) stay open to LocalOnly callers.
+
+/// `PRISM_SKILLS_DIR` is process-global; serialize the tests that point it at
+/// a temp dir so parallel turns cannot read each other's skill store.
+static SKILLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct SkillsEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for SkillsEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: test-only process-global cleanup, serialized by SKILLS_ENV_LOCK.
+        unsafe { std::env::remove_var("PRISM_SKILLS_DIR") };
+    }
+}
+
+/// Point the skill store at a fresh temp dir for the lifetime of the guard.
+fn isolate_skills_dir(tag: &str) -> (SkillsEnvGuard, std::path::PathBuf) {
+    let lock = SKILLS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("prism-chat-skills-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp skills dir");
+    // SAFETY: test-only process-global setup, serialized by SKILLS_ENV_LOCK.
+    unsafe { std::env::set_var("PRISM_SKILLS_DIR", &dir) };
+    (SkillsEnvGuard { _lock: lock }, dir)
+}
+
+/// The attack scenario from the round-7 brief: a LocalOnly (non-owner) caller
+/// reaches `/api/chat`, pre-approves the executing meta-tools themselves (the
+/// headless `approve` list is caller-self-granted), and has the model call
+/// `write_skill` then `run_skill`. BOTH must be refused with the owner-only
+/// message, and neither may execute or store anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_only_caller_cannot_write_or_run_skills_via_chat() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let (_skills_guard, _skills_dir) = isolate_skills_dir("localonly-attack");
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let write_marker = project.path().join("write_marker");
+    let run_marker = project.path().join("run_marker");
+    let base_url = start_stub_llm(StubMode::SkillWriteThenRun {
+        write_marker: write_marker.to_string_lossy().into_owned(),
+    })
+    .await;
+    let sessions = tempfile::tempdir().expect("sessions dir");
+    let service = ChatService::spawn(
+        llm_config(base_url),
+        tool_server_config(project.path(), &python),
+        Some(sessions.path().to_path_buf()),
+    )
+    .await
+    .expect("spawn chat service");
+
+    // Pre-store the skill run_skill targets: if the gate FAILS, its body
+    // writes run_marker — a concrete execution proof independent of the store.
+    prism_agent::skills::store(&prism_agent::skills::AuthoredSkill::new(
+        "probe_run",
+        "probe skill for the access-gate tests",
+        "shell",
+        &format!("echo PWNED > {}", run_marker.to_string_lossy()),
+        true,
+    ))
+    .expect("store probe skill");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = service
+        .chat_with_platform_access(
+            ChatRequest {
+                message: "write and run my skills".into(),
+                session_id: None,
+                // The attacker self-grants approval — the exact mechanism the
+                // refusal declares insufficient.
+                approve: vec!["write_skill".into(), "run_skill".into()],
+            },
+            "authenticated-non-owner",
+            prism_agent::command_tools::CommandToolPlatformAccess::LocalOnly,
+            tx,
+        )
+        .await
+        .expect("the turn completes even when skill execution is refused");
+    assert_eq!(outcome.answer, "SKILL_DONE");
+
+    let events = drain(&mut rx);
+    for tool in ["write_skill", "run_skill"] {
+        let (content, is_error) = events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::ToolResult {
+                    tool_name,
+                    content,
+                    is_error,
+                    ..
+                } if tool_name == tool => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing {tool} tool_result"));
+        assert!(is_error, "{tool} must be an error result: {content}");
+        assert!(
+            content.contains("owner-only"),
+            "{tool} refusal must say why approval is insufficient: {content}"
+        );
+        assert!(
+            content.contains("verified node-owner session"),
+            "{tool}: {content}"
+        );
+    }
+
+    // Neither tool executed, and nothing NEW was stored: the probe skill the
+    // attacker pre-planted for run_skill is untouched, and write_skill's
+    // probe_write never landed.
+    assert!(
+        !write_marker.exists(),
+        "write_skill's verification run must NOT execute for a LocalOnly caller"
+    );
+    assert!(
+        !run_marker.exists(),
+        "run_skill must NOT execute for a LocalOnly caller"
+    );
+    let names: Vec<String> = prism_agent::skills::load_all()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert!(
+        !names.contains(&"probe_write".to_string()),
+        "write_skill must not store for a LocalOnly caller: {names:?}"
+    );
+    assert!(
+        names.contains(&"probe_run".to_string()),
+        "the pre-planted skill is untouched: {names:?}"
+    );
+}
+
+/// The verified owner keeps the full self-authoring loop through the same
+/// chat path: write_skill verifies-then-stores, run_skill re-executes.
+#[tokio::test(flavor = "multi_thread")]
+async fn verified_owner_can_write_and_run_skills_via_chat() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let (_skills_guard, skills_dir) = isolate_skills_dir("owner-flow");
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let write_marker = project.path().join("write_marker");
+    let run_marker = project.path().join("run_marker");
+    let base_url = start_stub_llm(StubMode::SkillWriteThenRun {
+        write_marker: write_marker.to_string_lossy().into_owned(),
+    })
+    .await;
+    let sessions = tempfile::tempdir().expect("sessions dir");
+    let service = ChatService::spawn(
+        llm_config(base_url),
+        tool_server_config(project.path(), &python),
+        Some(sessions.path().to_path_buf()),
+    )
+    .await
+    .expect("spawn chat service");
+
+    prism_agent::skills::store(&prism_agent::skills::AuthoredSkill::new(
+        "probe_run",
+        "probe skill for the access-gate tests",
+        "shell",
+        &format!("echo PWNED > {}", run_marker.to_string_lossy()),
+        true,
+    ))
+    .expect("store probe skill");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = service
+        .chat_with_platform_access(
+            ChatRequest {
+                message: "write and run my skills".into(),
+                session_id: None,
+                approve: vec!["write_skill".into(), "run_skill".into()],
+            },
+            "owner-user",
+            prism_agent::command_tools::CommandToolPlatformAccess::VerifiedNodeOwner,
+            tx,
+        )
+        .await
+        .expect("owner chat turn");
+    assert_eq!(outcome.answer, "SKILL_DONE");
+
+    let events = drain(&mut rx);
+    let result_of = |tool: &str| {
+        events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::ToolResult {
+                    tool_name,
+                    content,
+                    is_error,
+                    ..
+                } if tool_name == tool => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing {tool} tool_result"))
+    };
+
+    let (write_content, write_error) = result_of("write_skill");
+    assert!(!write_error, "owner write_skill succeeds: {write_content}");
+    assert!(
+        write_content.contains("\"stored\":true"),
+        "owner write_skill stores: {write_content}"
+    );
+    let (run_content, run_error) = result_of("run_skill");
+    assert!(!run_error, "owner run_skill succeeds: {run_content}");
+    assert!(
+        run_content.contains("\"ok\":true"),
+        "owner run_skill executes cleanly: {run_content}"
+    );
+
+    // Both really ran: the verification run and the stored skill each wrote
+    // their marker, and the new skill landed in the store.
+    assert!(write_marker.exists(), "write_skill verification must run");
+    assert!(run_marker.exists(), "run_skill must execute for the owner");
+    let names: Vec<String> = prism_agent::skills::load_all()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert!(names.contains(&"probe_write".to_string()), "{names:?}");
+    assert!(
+        skills_dir.join("probe_write.json").exists(),
+        "the skill file lands in the skills dir"
+    );
+}
+
+/// Proportionality: the gate must not regress read-only meta-tools for
+/// LocalOnly callers. find_tools must return matches; recall must not be
+/// access-refused (its result may degrade gracefully when durable memory is
+/// unavailable, but it must NOT be an owner-only refusal).
+#[tokio::test(flavor = "multi_thread")]
+async fn local_only_caller_keeps_read_only_meta_tools_via_chat() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let base_url = start_stub_llm(StubMode::ReadOnlyMetaTools).await;
+    let sessions = tempfile::tempdir().expect("sessions dir");
+    let service = ChatService::spawn(
+        llm_config(base_url),
+        tool_server_config(project.path(), &python),
+        Some(sessions.path().to_path_buf()),
+    )
+    .await
+    .expect("spawn chat service");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = service
+        .chat_with_platform_access(
+            ChatRequest {
+                message: "search the catalog and recall the past".into(),
+                session_id: None,
+                // Headless approval is name-based and meta-tools live outside
+                // the catalog, so read-only meta-tools are approved like any
+                // other tool here — the point under test is that the PLATFORM
+                // gate lets them through for LocalOnly callers (execution-class
+                // meta-tools are refused even WITH self-granted approval).
+                approve: vec!["find_tools".into(), "recall".into()],
+            },
+            "authenticated-non-owner",
+            prism_agent::command_tools::CommandToolPlatformAccess::LocalOnly,
+            tx,
+        )
+        .await
+        .expect("LocalOnly chat turn");
+    assert_eq!(outcome.answer, "READONLY_DONE");
+    assert!(
+        outcome.approvals_required.is_empty(),
+        "read-only meta-tools must not be skipped pending approval"
+    );
+
+    let events = drain(&mut rx);
+    let result_of = |tool: &str| {
+        events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::ToolResult {
+                    tool_name,
+                    content,
+                    is_error,
+                    ..
+                } if tool_name == tool => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing {tool} tool_result"))
+    };
+
+    // find_tools returns real matches under LocalOnly.
+    let (find_content, find_error) = result_of("find_tools");
+    assert!(!find_error, "find_tools must succeed: {find_content}");
+    assert!(
+        find_content.contains("stub_gated"),
+        "find_tools must surface catalog matches: {find_content}"
+    );
+
+    // recall is NOT access-refused. Without durable memory it degrades to an
+    // honest "unavailable"; on a node with the provenance store it returns a
+    // (possibly empty) match list — neither is an owner gate.
+    let (recall_content, _) = result_of("recall");
+    assert!(
+        !recall_content.contains("owner-only")
+            && !recall_content.contains("verified node-owner session")
+            && !recall_content.contains("Platform access denied"),
+        "recall must not hit the access gate: {recall_content}"
     );
 }
