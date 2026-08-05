@@ -76,6 +76,16 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+// Same reasoning as `NodeCommands` below: this is clap's command table. Exactly
+// one variant is ever constructed, once, at startup — it is never stored in a
+// collection or moved in a hot path, so the size spread costs nothing. Boxing
+// the fields would only add indirection between clap and the match arms.
+//
+// It first tripped when `prism run` gained `--licence`/`--licence-seats`, which
+// pushed `Run` to 479 bytes. Worth knowing: neither contributing branch saw it,
+// because both gated per-crate (`-p prism-compute`, `-p prism-retrieval`) and
+// this lint only fires on the workspace build.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Run first-time native setup and platform login.
     Setup {
