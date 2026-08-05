@@ -757,6 +757,10 @@ enum CampaignCommands {
         /// Campaign ID to continue.
         id: String,
     },
+    /// Run PRISM's campaign workload as a signal-aware batch entrypoint.
+    /// Reads the campaign specification from PRISM_INPUTS and addresses its
+    /// durable checkpoint by PRISM_TASK_ID.
+    BatchEntrypoint,
     /// Show the status of a campaign (from its checkpoint).
     Status {
         /// Campaign ID.
@@ -764,6 +768,52 @@ enum CampaignCommands {
     },
     /// List all campaign checkpoints on this machine.
     List,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum BatchStringList {
+    List(Vec<String>),
+    CommaSeparated(String),
+}
+
+impl Default for BatchStringList {
+    fn default() -> Self {
+        Self::List(Vec::new())
+    }
+}
+
+impl BatchStringList {
+    fn into_vec(self) -> Vec<String> {
+        let values = match self {
+            Self::List(values) => values,
+            Self::CommaSeparated(values) => values.split(',').map(str::to_string).collect(),
+        };
+        values
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BatchCampaignInputs {
+    goal: String,
+    #[serde(default)]
+    elements: BatchStringList,
+    #[serde(default)]
+    objective: String,
+    #[serde(default)]
+    constraints: BatchStringList,
+    #[serde(default)]
+    seeds: BatchStringList,
+    max_iterations: Option<usize>,
+    batch_size: Option<usize>,
+    budget: Option<f64>,
+    checkpoint_every: Option<usize>,
+    #[serde(default)]
+    approval_gates: Vec<usize>,
 }
 
 /// Arguments for `schedule create`. A named struct (rather than inline
@@ -2032,6 +2082,13 @@ async fn main() -> Result<()> {
                             campaign.run().await?
                         };
                         println!("\n{}", result.summary);
+                    }
+                }
+                CampaignCommands::BatchEntrypoint => {
+                    if run_batch_campaign_entrypoint(&project_root).await? {
+                        // The BYOC sbatch wrapper interprets 140 as "the
+                        // checkpoint is durable; requeue this allocation".
+                        std::process::exit(140);
                     }
                 }
                 CampaignCommands::Status { id } => {
@@ -9391,6 +9448,131 @@ async fn handle_provenance_command(command: ProvenanceCommands) -> anyhow::Resul
         }
     }
     Ok(())
+}
+
+fn batch_task_id() -> Result<String> {
+    let task_id = std::env::var("PRISM_TASK_ID")
+        .context("PRISM_TASK_ID is required for the campaign batch entrypoint")?;
+    if task_id.is_empty()
+        || task_id.len() > 128
+        || !task_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || matches!(task_id.as_str(), "." | "..")
+    {
+        bail!(
+            "invalid PRISM_TASK_ID {task_id:?}: expected 1-128 ASCII letters, digits, '.', '-', or '_'"
+        );
+    }
+    Ok(task_id)
+}
+
+/// Run the PRISM-owned campaign entrypoint. `Ok(true)` means SIGUSR1 was
+/// received and the existing atomic campaign checkpoint was published, so
+/// the caller must exit 140 to request requeue. Arbitrary image entrypoints
+/// remain governed by the separate BYOC contract in `prism-compute`.
+#[cfg(unix)]
+async fn run_batch_campaign_entrypoint(project_root: &Path) -> Result<bool> {
+    use prism_campaign::{Campaign, CampaignConfig, CampaignGoal, GoalStatus};
+    use tokio::signal::unix::{SignalKind, signal};
+
+    // Register before loading or creating campaign state. Once campaign work
+    // starts, USR1 is queued for this stream instead of taking the default
+    // process-termination path.
+    let mut usr1 = signal(SignalKind::user_defined1()).context("failed to install SIGUSR1 trap")?;
+    let task_id = batch_task_id()?;
+    let checkpoint_dir = prism_campaign::schedule::campaigns_dir();
+    let checkpoint_path = checkpoint_dir.join(format!("{task_id}.json"));
+
+    let mut campaign = if checkpoint_path.is_file() {
+        Campaign::from_checkpoint(&checkpoint_path)?
+    } else {
+        let inputs_json = std::env::var("PRISM_INPUTS")
+            .context("PRISM_INPUTS is required to start a batch campaign")?;
+        let inputs: BatchCampaignInputs = serde_json::from_str(&inputs_json)
+            .context("PRISM_INPUTS is not a valid PRISM campaign specification")?;
+        let mut config = CampaignConfig::default();
+        if let Some(max_iterations) = inputs.max_iterations {
+            config.max_iterations = max_iterations;
+        }
+        if let Some(batch_size) = inputs.batch_size {
+            config.batch_size = batch_size;
+        }
+        config.budget_usd = inputs.budget;
+        if let Some(checkpoint_every) = inputs.checkpoint_every {
+            config.checkpoint_every = checkpoint_every;
+        }
+        config.approval_gate_at = inputs.approval_gates;
+        config.checkpoint_dir = Some(checkpoint_dir);
+        config.project_root = Some(project_root.to_path_buf());
+        Campaign::new(
+            CampaignGoal {
+                description: inputs.goal,
+                elements: inputs.elements.into_vec(),
+                objective: inputs.objective,
+                constraints: inputs.constraints.into_vec(),
+                seeds: inputs.seeds.into_vec(),
+            },
+            config,
+            task_id.clone(),
+        )
+    };
+
+    match campaign.state().status {
+        GoalStatus::Completed => {
+            println!(
+                "Campaign '{task_id}' already completed: {}",
+                campaign.state().completion_reason
+            );
+            return Ok(false);
+        }
+        GoalStatus::Paused => {
+            println!(
+                "Campaign '{task_id}' is paused at an approval gate; scheduler requeue cannot approve it"
+            );
+            return Ok(false);
+        }
+        _ => {}
+    }
+
+    let _worker_lock = acquire_worker_lock(&task_id)?;
+    if let Some(store) = open_campaign_provenance().await {
+        campaign = campaign.with_provenance(store);
+    }
+    let run_result = {
+        let run = campaign.run();
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => Some(result),
+            received = usr1.recv() => {
+                if received.is_none() {
+                    bail!("SIGUSR1 trap closed before the campaign finished");
+                }
+                None
+            }
+        }
+    };
+
+    match run_result {
+        Some(result) => {
+            println!("\n{}", result?.summary);
+            Ok(false)
+        }
+        None => {
+            campaign
+                .checkpoint()
+                .context("SIGUSR1 received but campaign checkpoint failed; refusing requeue")?;
+            eprintln!(
+                "Campaign '{task_id}' checkpointed after SIGUSR1; requesting scheduler requeue"
+            );
+            Ok(true)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn run_batch_campaign_entrypoint(_project_root: &Path) -> Result<bool> {
+    bail!("the campaign batch entrypoint requires Unix signal support")
 }
 
 /// Take the goal's worker lock for the life of this process, refusing to

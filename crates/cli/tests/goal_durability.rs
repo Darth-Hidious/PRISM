@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PRISM: &str = env!("CARGO_BIN_EXE_prism");
+const CAMPAIGN_ENTRYPOINT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/campaign-entrypoint.sh");
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct HomeGuard(Option<OsString>);
@@ -229,8 +230,11 @@ fn spend(state: &serde_json::Value) -> f64 {
     state["total_cost_usd"].as_f64().unwrap_or(0.0)
 }
 
-fn prism(home: &Path, port: u16) -> std::process::Command {
-    let mut cmd = std::process::Command::new(PRISM);
+fn configure_prism_command(
+    mut cmd: std::process::Command,
+    home: &Path,
+    port: u16,
+) -> std::process::Command {
     cmd.env("HOME", home)
         .env("LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
         .env("LLM_MODEL", "stub-model")
@@ -246,6 +250,60 @@ fn prism(home: &Path, port: u16) -> std::process::Command {
         .env_remove("LLM_API_KEY")
         .env_remove("MARC27_TOKEN");
     cmd
+}
+
+fn prism(home: &Path, port: u16) -> std::process::Command {
+    configure_prism_command(std::process::Command::new(PRISM), home, port)
+}
+
+fn slurm_campaign(
+    home: &Path,
+    port: u16,
+    task_id: &str,
+    goal: &str,
+    max_iterations: usize,
+) -> std::process::Command {
+    let inputs = serde_json::json!({
+        "goal": goal,
+        "elements": ["W", "Mo", "Ta", "Cr", "V", "Ti"],
+        "objective": "maximize mixing entropy",
+        "max_iterations": max_iterations,
+        "batch_size": 2,
+        "budget": 1000.0,
+        "checkpoint_every": 1
+    });
+    let mut cmd =
+        configure_prism_command(std::process::Command::new(CAMPAIGN_ENTRYPOINT), home, port);
+    cmd.env("PRISM_BIN", PRISM)
+        .env("PRISM_TASK_ID", task_id)
+        .env("PRISM_INPUTS", inputs.to_string())
+        .env("PRISM_CAMPAIGNS_DIR", home.join(".prism/campaigns"))
+        .args(["campaign", "batch-entrypoint"]);
+    cmd
+}
+
+fn wait_for_child_checkpoint(
+    child: &mut std::process::Child,
+    home: &Path,
+    id: &str,
+    label: &str,
+    predicate: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = None;
+    while Instant::now() < deadline {
+        if let Some(state) = checkpoint(home, id) {
+            if predicate(&state) {
+                return state;
+            }
+            last = Some(state);
+        }
+        if let Some(status) = child.try_wait().expect("poll batch campaign") {
+            panic!("batch campaign exited before {label}: {status}; last checkpoint: {last:#?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {label}; last checkpoint: {last:#?}");
 }
 
 fn system_python() -> PathBuf {
@@ -367,6 +425,115 @@ fn a_killed_goal_resumes_where_it_left_off() {
         "resume redid work: {evals_after} evaluations for {} candidates",
         candidates(&after)
     );
+}
+
+/// Simulate SLURM's signal/relaunch cycle against the real campaign worker.
+#[cfg(unix)]
+#[test]
+fn slurm_signal_checkpoint_requeue_resumes_without_repeating_completed_work() {
+    let temp = tempfile::tempdir().expect("temp home");
+    let home: PathBuf = temp.path().to_path_buf();
+    install_test_identity(&home);
+    let stub = start_stub();
+    let task_id = "scheduler-job_7";
+
+    let mut child = slurm_campaign(&home, stub.port, task_id, "signal recovery alloy", 12)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start batch campaign");
+    let before = wait_for_child_checkpoint(
+        &mut child,
+        &home,
+        task_id,
+        "two completed iterations",
+        |state| iteration(state) >= 2,
+    );
+    let completed_before = before["candidates"]
+        .as_array()
+        .expect("candidate array")
+        .clone();
+    assert!(!completed_before.is_empty(), "campaign did no work");
+
+    // Model SLURM's pre-walltime warning. The process must persist via the
+    // production Campaign::checkpoint path before requesting requeue.
+    let signal_result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGUSR1) };
+    assert_eq!(signal_result, 0, "failed to send SIGUSR1");
+    let status = child.wait().expect("reap signalled campaign");
+    assert_eq!(
+        status.code(),
+        Some(140),
+        "checkpointed SIGUSR1 exit must request requeue"
+    );
+
+    let at_requeue = checkpoint(&home, task_id).expect("signal checkpoint");
+    assert!(iteration(&at_requeue) >= iteration(&before));
+    assert!(spend(&at_requeue) >= spend(&before));
+    let evals_before_restart = stub.evaluations.load(Ordering::SeqCst);
+
+    // Model SLURM requeue: a fresh process receives the same task identity.
+    let restarted = slurm_campaign(&home, stub.port, task_id, "ignored on resume", 12)
+        .output()
+        .expect("restart batch campaign");
+    assert!(
+        restarted.status.success(),
+        "requeued campaign failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let after = checkpoint(&home, task_id).expect("checkpoint after requeue");
+    assert_eq!(after["status"], "completed");
+    assert_eq!(after["goal"]["description"], "signal recovery alloy");
+    assert!(iteration(&after) > iteration(&at_requeue));
+    assert!(spend(&after) >= spend(&at_requeue));
+    for prior in &completed_before {
+        assert!(
+            after["candidates"]
+                .as_array()
+                .expect("candidate array after resume")
+                .contains(prior),
+            "completed candidate disappeared across requeue: {prior}"
+        );
+    }
+
+    let evals_after = stub.evaluations.load(Ordering::SeqCst);
+    assert!(evals_after > evals_before_restart, "resume did no new work");
+    assert!(
+        evals_after <= candidates(&after) + 1,
+        "resume repeated completed work: {evals_after} evaluations for {} durable candidates",
+        candidates(&after)
+    );
+}
+
+/// Array identities address separate checkpoint files even when tasks overlap.
+#[cfg(unix)]
+#[test]
+fn slurm_array_task_ids_do_not_clobber_campaign_checkpoints() {
+    let temp = tempfile::tempdir().expect("temp home");
+    let home: PathBuf = temp.path().to_path_buf();
+    install_test_identity(&home);
+    let stub = start_stub();
+
+    let first = slurm_campaign(&home, stub.port, "scheduler-job_3", "array alloy alpha", 2)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("start first array task");
+    let second = slurm_campaign(&home, stub.port, "scheduler-job_4", "array alloy beta", 2)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("start second array task");
+    let first_status = first.wait_with_output().expect("wait first array task");
+    let second_status = second.wait_with_output().expect("wait second array task");
+    assert!(first_status.status.success());
+    assert!(second_status.status.success());
+
+    let first_state = checkpoint(&home, "scheduler-job_3").expect("first task checkpoint");
+    let second_state = checkpoint(&home, "scheduler-job_4").expect("second task checkpoint");
+    assert_eq!(first_state["campaign_id"], "scheduler-job_3");
+    assert_eq!(second_state["campaign_id"], "scheduler-job_4");
+    assert_eq!(first_state["goal"]["description"], "array alloy alpha");
+    assert_eq!(second_state["goal"]["description"], "array alloy beta");
+    assert_eq!(first_state["status"], "completed");
+    assert_eq!(second_state["status"], "completed");
 }
 
 /// The scheduler — not a human — is what restarts a dead goal.
