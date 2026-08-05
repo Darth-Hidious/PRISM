@@ -185,11 +185,27 @@ fn quote_in_block(quote: &str, block_text: &str) -> bool {
 /// contain the fact's salient evidence — such a fact cannot become a claim
 /// without fabricating provenance.
 ///
-/// Support criteria (all case-insensitive, within one sentence/row span):
-/// * numeric fact: the value's number appears together with the subject or
-///   the object (a bare number could be a citation, so the number alone is
-///   not enough);
-/// * non-numeric fact: both subject and object appear.
+/// Support criteria (all case-insensitive):
+///
+/// * **numeric fact** — all four must hold:
+///   1. the subject appears somewhere in the **block** (not necessarily the
+///      same span: papers say "Ti-6Al-4V samples were prepared. The alloy
+///      showed a UTS of 1140 MPa.");
+///   2. the value's number appears in the span at **digit boundaries**, so
+///      `1140` is not found inside `11140` or `11,140`;
+///   3. that number is **not inside a bracketed citation marker** — `[1140]`
+///      is a reference, not a measurement;
+///   4. the **property is mentioned before the number** in the same span,
+///      either literally (`UTS`) or as the acronym of consecutive words
+///      (`ultimate tensile strength`). This is what binds the number to
+///      *this* claim: in "batch 1140 showed a UTS of 950 MPa" the property
+///      follows the number, so 1140 is not its value.
+/// * **non-numeric fact** — subject and object both appear in one span.
+///
+/// Two independent reviewers stamped seven fabricated blocks through the
+/// previous version of this function, which required only that the number and
+/// (subject *or* object) co-occur anywhere in the span. Each rule above kills
+/// at least one of them; the tests name them A1–A7.
 #[must_use]
 pub fn supporting_quote(
     subject: &str,
@@ -199,13 +215,24 @@ pub fn supporting_quote(
 ) -> Option<String> {
     let subject_n = normalize_for_containment(subject);
     let object_n = normalize_for_containment(object);
+
+    // A numeric fact whose subject is nowhere in the document cannot be
+    // supported by it, however well the number matches.
+    if value.is_some()
+        && (subject_n.is_empty() || !normalize_for_containment(block_text).contains(&subject_n))
+    {
+        return None;
+    }
+
     for span in supporting_spans(block_text) {
         let hay = normalize_for_containment(span);
         let supported = match value {
             Some(v) => {
-                number_needles(v).iter().any(|n| hay.contains(&n[..]))
-                    && ((!subject_n.is_empty() && hay.contains(&subject_n))
-                        || (!object_n.is_empty() && hay.contains(&object_n)))
+                let masked = mask_bracketed(&hay);
+                number_needles(v)
+                    .iter()
+                    .filter_map(|n| find_at_digit_boundary(&masked, n))
+                    .any(|pos| property_mentioned_before(&object_n, &masked, pos))
             }
             None => {
                 !subject_n.is_empty()
@@ -219,6 +246,88 @@ pub fn supporting_quote(
         }
     }
     None
+}
+
+/// Blank out `[...]` spans so digits inside a citation marker cannot be read
+/// as a measurement. Characters are replaced one-for-one with spaces, so byte
+/// offsets stay meaningful *within the returned string*.
+fn mask_bracketed(hay: &str) -> String {
+    let mut out = String::with_capacity(hay.len());
+    let mut depth = 0usize;
+    for c in hay.chars() {
+        match c {
+            '[' => {
+                depth += 1;
+                out.push(' ');
+            }
+            ']' => {
+                depth = depth.saturating_sub(1);
+                out.push(' ');
+            }
+            _ if depth > 0 => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Find `needle` in `hay` where neither side continues a longer number.
+///
+/// Without this, `1140` matches inside `11140` (a sample id) and `1,140`
+/// matches inside `11,140` (a component count) — reviewer bypasses A6 and A7.
+fn find_at_digit_boundary(hay: &str, needle: &str) -> Option<usize> {
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = hay[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_digit());
+        // A trailing `.5` or `,000` means the real number is longer.
+        let mut after = hay[end..].chars();
+        let after_ok = match after.next() {
+            None => true,
+            Some(c) if c.is_ascii_digit() => false,
+            Some(c) if c == '.' || c == ',' => after.next().is_none_or(|d| !d.is_ascii_digit()),
+            Some(_) => true,
+        };
+        if before_ok && after_ok {
+            return Some(start);
+        }
+        from = start + 1;
+    }
+    None
+}
+
+/// Is the claim's property named before byte offset `pos`?
+///
+/// Accepts the literal form (`uts`) or the acronym of consecutive words
+/// (`ultimate tensile strength` → `uts`), so a paper spelling the property out
+/// in full still supports its own measurement.
+fn property_mentioned_before(object_n: &str, hay: &str, pos: usize) -> bool {
+    if object_n.is_empty() {
+        return false;
+    }
+    let head = &hay[..pos];
+    if head.contains(object_n) {
+        return true;
+    }
+    // Acronym expansion only makes sense for a single alphabetic token.
+    if object_n.contains(' ') || !object_n.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let n = object_n.chars().count();
+    if n < 2 || words.len() < n {
+        return false;
+    }
+    words.windows(n).any(|w| {
+        w.iter()
+            .filter_map(|word| word.chars().find(|c| c.is_ascii_alphanumeric()))
+            .collect::<String>()
+            == object_n
+    })
 }
 
 /// Split `block_text` into candidate supporting spans: sentences and table
@@ -236,7 +345,9 @@ fn supporting_spans(text: &str) -> Vec<&str> {
                 && i + 1 < bytes.len()
                 && bytes[i - 1].is_ascii_digit()
                 && bytes[i + 1].is_ascii_digit();
-            if matches!(b, b'.' | b'!' | b'?' | b';') && !is_decimal_point {
+            // `|` splits a table row into cells. A whole row as one span let
+            // the elongation column support a UTS claim (reviewer bypass A4).
+            if matches!(b, b'.' | b'!' | b'?' | b';' | b'|') && !is_decimal_point {
                 spans.push(&line[start..=i]);
                 start = i + 1;
             }
@@ -523,15 +634,25 @@ mod tests {
 
     fn no_support(block: &str) {
         assert!(
-            supporting_quote(SALIENCE_SUBJECT, SALIENCE_OBJECT, Some(SALIENCE_VALUE), block)
-                .is_none(),
+            supporting_quote(
+                SALIENCE_SUBJECT,
+                SALIENCE_OBJECT,
+                Some(SALIENCE_VALUE),
+                block
+            )
+            .is_none(),
             "block must NOT support Ti-6Al-4V / UTS / 1140 MPa: {block:?}"
         );
     }
 
     fn support(block: &str) -> String {
-        supporting_quote(SALIENCE_SUBJECT, SALIENCE_OBJECT, Some(SALIENCE_VALUE), block)
-            .unwrap_or_else(|| panic!("block MUST support Ti-6Al-4V / UTS / 1140 MPa: {block:?}"))
+        supporting_quote(
+            SALIENCE_SUBJECT,
+            SALIENCE_OBJECT,
+            Some(SALIENCE_VALUE),
+            block,
+        )
+        .unwrap_or_else(|| panic!("block MUST support Ti-6Al-4V / UTS / 1140 MPa: {block:?}"))
     }
 
     /// A1: `[1140]` is a citation marker, not a measurement.
@@ -600,8 +721,7 @@ mod tests {
     /// the case it exists for.
     #[test]
     fn legit_anaphora_subject_in_block_not_in_span_stamps() {
-        let quote =
-            support("Ti-6Al-4V samples were prepared. The alloy showed a UTS of 1140 MPa.");
+        let quote = support("Ti-6Al-4V samples were prepared. The alloy showed a UTS of 1140 MPa.");
         assert_eq!(quote, "The alloy showed a UTS of 1140 MPa.");
     }
 
