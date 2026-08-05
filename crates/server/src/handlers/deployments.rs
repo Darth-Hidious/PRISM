@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::NodeState;
 use crate::middleware::AuthenticatedUser;
+use prism_agent::command_tools::CommandToolPlatformAccess;
 
 type HandlerError = (StatusCode, Json<Value>);
 
@@ -77,6 +78,23 @@ async fn authorized_platform_client<'a>(
     }
 
     Ok(client)
+}
+
+/// Resolve the credential boundary for agent/HTTP tool execution. This is
+/// intentionally capability-based rather than a list of platform tool names:
+/// every CLI child gets the same result, including tools added later.
+pub(crate) async fn command_tool_platform_access(
+    state: &NodeState,
+    caller: &AuthenticatedUser,
+) -> CommandToolPlatformAccess {
+    if state.platform_client.is_none() {
+        return CommandToolPlatformAccess::LocalOnly;
+    }
+    if authorized_platform_client(state, caller).await.is_ok() {
+        CommandToolPlatformAccess::VerifiedNodeOwner
+    } else {
+        CommandToolPlatformAccess::UnverifiedHttp
+    }
 }
 
 fn upstream(e: anyhow::Error) -> HandlerError {

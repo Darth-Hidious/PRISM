@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::NodeState;
+use crate::handlers::deployments::command_tool_platform_access;
 use crate::middleware::AuthenticatedUser;
 use axum::Extension;
 
@@ -72,13 +73,15 @@ async fn run_goal_tool(
     };
     // This endpoint is authenticated + RBAC-gated (ExecuteTools); hitting it
     // IS the explicit approval — same contract as `approve: true` on
-    // /api/tools/{name}/run.
+    // /api/tools/{name}/run. It does not upgrade platform authority.
+    let platform_access = command_tool_platform_access(state, user).await;
     match service
-        .invoke_tool_with_actor(
+        .invoke_tool_with_actor_and_platform_access(
             tool,
             args,
             Some(&user.user_id),
             user.provenance_actor(),
+            platform_access,
             true,
         )
         .await

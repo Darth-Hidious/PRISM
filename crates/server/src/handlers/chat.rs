@@ -28,6 +28,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::NodeState;
+use crate::handlers::deployments::command_tool_platform_access;
 use crate::middleware::AuthenticatedUser;
 use prism_agent::service::{ChatError, ChatEvent, ChatRequest, ChatService};
 
@@ -98,6 +99,7 @@ pub async fn chat(
         session_id: body.session_id,
         approve: body.approve,
     };
+    let platform_access = command_tool_platform_access(&state, &user).await;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
 
     if params.stream {
@@ -105,7 +107,9 @@ pub async fn chat(
         // `error` event, so clients never hang on failures.
         let user_id = user.user_id.clone();
         tokio::spawn(async move {
-            let _ = service.chat(request, &user_id, tx).await;
+            let _ = service
+                .chat_with_platform_access(request, &user_id, platform_access, tx)
+                .await;
         });
         let stream = UnboundedReceiverStream::new(rx).map(|event| {
             Ok::<_, Infallible>(
@@ -125,7 +129,10 @@ pub async fn chat(
     } else {
         // Non-streaming: drain events into the void, return the outcome.
         drop(rx);
-        match service.chat(request, &user.user_id, tx).await {
+        match service
+            .chat_with_platform_access(request, &user.user_id, platform_access, tx)
+            .await
+        {
             Ok(outcome) => Json(serde_json::json!({
                 "session_id": outcome.session_id,
                 "answer": outcome.answer,

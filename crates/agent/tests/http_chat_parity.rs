@@ -390,6 +390,81 @@ async fn http_chat_service_and_backend_share_loop_and_catalog() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn anonymous_sessions_cannot_be_listed_read_or_resumed() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let base_url = start_stub_llm(StubMode::PlainAnswer).await;
+    let sessions = tempfile::tempdir().expect("sessions dir");
+    let service = ChatService::spawn(
+        llm_config(base_url),
+        tool_server_config(project.path(), &python),
+        Some(sessions.path().to_path_buf()),
+    )
+    .await
+    .expect("spawn chat service");
+
+    let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+    let first = service
+        .chat(
+            ChatRequest {
+                message: "anonymous one".into(),
+                session_id: None,
+                approve: vec![],
+            },
+            "anonymous-local",
+            tx1,
+        )
+        .await
+        .expect("first anonymous session");
+    let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+    let second = service
+        .chat(
+            ChatRequest {
+                message: "anonymous two".into(),
+                session_id: None,
+                approve: vec![],
+            },
+            "anonymous-local",
+            tx2,
+        )
+        .await
+        .expect("second anonymous session");
+    assert_ne!(first.session_id, second.session_id);
+    assert!(service.list_sessions("anonymous-local").is_empty());
+    assert!(
+        service
+            .read_session(&first.session_id, "anonymous-local")
+            .is_err()
+    );
+    assert!(
+        service
+            .read_session(&second.session_id, "anonymous-local")
+            .is_err()
+    );
+
+    let (tx3, _rx3) = tokio::sync::mpsc::unbounded_channel();
+    let resume = service
+        .chat(
+            ChatRequest {
+                message: "try to resume".into(),
+                session_id: Some(second.session_id),
+                approve: vec![],
+            },
+            "anonymous-local",
+            tx3,
+        )
+        .await;
+    assert!(matches!(
+        resume,
+        Err(prism_agent::service::ChatError::SessionNotFound(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn gated_tool_is_skipped_then_runs_when_approved() {
     let Some(python) = find_python() else {
         eprintln!("SKIP: python3 not on PATH");

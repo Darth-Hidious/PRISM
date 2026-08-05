@@ -34,7 +34,9 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::agent_loop::{self, ApprovalResponse};
-use crate::command_tools::CommandToolRuntime;
+use crate::command_tools::{
+    CommandToolPlatformAccess, CommandToolRuntime, PLATFORM_ACCESS_REFUSAL,
+};
 use crate::hooks::HookRegistry;
 use crate::permissions::ToolPermissionContext;
 use crate::protocol::{AgentSeed, build_agent_seed, restore_history_and_transcript_from_messages};
@@ -43,6 +45,11 @@ use crate::session::{SessionInfo, SessionStore};
 use crate::tool_catalog::ToolCatalog;
 use crate::transcript::TranscriptStore;
 use crate::types::{AgentConfig, AgentEvent};
+
+/// Stable principal used by the standalone HTTP seam when no account session
+/// exists. Anonymous sessions deliberately cannot be listed, read, or resumed
+/// because this principal is shared by all such requests.
+pub const ANONYMOUS_LOCAL_USER_ID: &str = "anonymous-local";
 
 // ── Wire types ───────────────────────────────────────────────────────
 
@@ -301,15 +308,21 @@ impl ChatService {
         caller: Option<&str>,
         approve: bool,
     ) -> Result<serde_json::Value> {
-        self.invoke_tool_with_actor(name, args, caller, prism_provenance::Actor::User, approve)
-            .await
+        self.invoke_tool_with_actor_and_platform_access(
+            name,
+            args,
+            caller,
+            prism_provenance::Actor::User,
+            CommandToolPlatformAccess::LocalOnly,
+            approve,
+        )
+        .await
     }
 
     /// Execute a one-shot tool with an actor classification derived by the
     /// authenticated transport. The legacy [`Self::invoke_tool`] entry point
-    /// remains for non-HTTP callers; server handlers use this method so
-    /// anonymous-local and session-authenticated requests are not recorded as
-    /// an unqualified user.
+    /// remains for non-HTTP callers; server handlers use the explicit platform
+    /// access method so a bearer token cannot select the child credential.
     pub async fn invoke_tool_with_actor(
         &self,
         name: &str,
@@ -318,34 +331,60 @@ impl ChatService {
         actor: prism_provenance::Actor,
         approve: bool,
     ) -> Result<serde_json::Value> {
+        self.invoke_tool_with_actor_and_platform_access(
+            name,
+            args,
+            caller,
+            actor,
+            CommandToolPlatformAccess::LocalOnly,
+            approve,
+        )
+        .await
+    }
+
+    /// Execute a one-shot tool with an explicit platform-credential boundary.
+    /// Approval remains a separate confirmation bit: it never upgrades this
+    /// authorization context.
+    pub async fn invoke_tool_with_actor_and_platform_access(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        caller: Option<&str>,
+        actor: prism_provenance::Actor,
+        platform_access: CommandToolPlatformAccess,
+        approve: bool,
+    ) -> Result<serde_json::Value> {
         // Pre-execution rejections. Computed (not early-returned) so REFUSALS
         // reach the audit trail below — a denied attempt is at least as
         // audit-worthy as a successful run.
-        let rejection: Option<String> = if crate::meta_tools::is_meta_tool(name) {
-            Some(format!(
-                "'{name}' is a meta-tool that operates on live agent state; \
-                 it is not invocable through the single-tool executor"
-            ))
-        } else {
-            // Approval gate. Catalog lookup covers Python + offered command
-            // tools; the command-tool fallback covers specs hidden from the
-            // catalog (hidden ≠ unexecutable — see LOCAL_NODE_TOOLS).
-            let gated = self
-                .tools
-                .find(name)
-                .map(|tool| tool.requires_approval)
-                .or_else(|| crate::command_tools::command_tool_requires_approval(name));
-            if gated == Some(true) && !approve {
+        let rejection: Option<String> =
+            if matches!(platform_access, CommandToolPlatformAccess::UnverifiedHttp) {
+                Some(PLATFORM_ACCESS_REFUSAL.to_string())
+            } else if crate::meta_tools::is_meta_tool(name) {
                 Some(format!(
-                    "'{name}' is approval-gated and cannot run through the \
+                    "'{name}' is a meta-tool that operates on live agent state; \
+                 it is not invocable through the single-tool executor"
+                ))
+            } else {
+                // Approval gate. Catalog lookup covers Python + offered command
+                // tools; the command-tool fallback covers specs hidden from the
+                // catalog (hidden ≠ unexecutable — see LOCAL_NODE_TOOLS).
+                let gated = self
+                    .tools
+                    .find(name)
+                    .map(|tool| tool.requires_approval)
+                    .or_else(|| crate::command_tools::command_tool_requires_approval(name));
+                if gated == Some(true) && !approve {
+                    Some(format!(
+                        "'{name}' is approval-gated and cannot run through the \
                      single-tool executor without explicit approval \
                      (pass approve=true from an authenticated local caller; \
                      remote relay callers cannot approve)"
-                ))
-            } else {
-                None
-            }
-        };
+                    ))
+                } else {
+                    None
+                }
+            };
 
         tracing::info!(
             tool = %name,
@@ -366,11 +405,12 @@ impl ChatService {
             } = &mut *inner;
 
             if crate::command_tools::is_command_tool(name) {
-                crate::command_tools::execute_command_tool(
+                crate::command_tools::execute_command_tool_with_platform_access(
                     command_tool_runtime,
                     name,
                     &args,
                     policy.as_mut(),
+                    platform_access,
                 )
                 .await
             } else {
@@ -452,7 +492,33 @@ impl ChatService {
         user_id: &str,
         events: mpsc::UnboundedSender<ChatEvent>,
     ) -> Result<ChatOutcome, ChatError> {
-        let result = self.chat_inner(request, user_id, &events).await;
+        self.chat_with_platform_access(
+            request,
+            user_id,
+            CommandToolPlatformAccess::LocalOnly,
+            events,
+        )
+        .await
+    }
+
+    /// Run an HTTP chat turn with the platform credential boundary established
+    /// by the server. `approve` is intentionally not part of this decision.
+    pub async fn chat_with_platform_access(
+        &self,
+        request: ChatRequest,
+        user_id: &str,
+        platform_access: CommandToolPlatformAccess,
+        events: mpsc::UnboundedSender<ChatEvent>,
+    ) -> Result<ChatOutcome, ChatError> {
+        let result = if matches!(platform_access, CommandToolPlatformAccess::UnverifiedHttp) {
+            Err(ChatError::Turn(anyhow::anyhow!(PLATFORM_ACCESS_REFUSAL)))
+        } else {
+            crate::command_tools::with_platform_access(
+                platform_access,
+                self.chat_inner(request, user_id, &events),
+            )
+            .await
+        };
         if let Err(ref e) = result {
             let _ = events.send(ChatEvent::Error {
                 message: e.to_string(),
@@ -479,7 +545,10 @@ impl ChatService {
 
         let session_id = match &request.session_id {
             Some(sid) => {
-                if !self.user_owns(sid, user_id) {
+                // All anonymous HTTP requests share one transport principal.
+                // Refuse every anonymous resume rather than allowing one
+                // connection to resume another connection's history.
+                if user_id == ANONYMOUS_LOCAL_USER_ID || !self.user_owns(sid, user_id) {
                     // Unknown AND not-owned collapse to the same error so
                     // the API doesn't leak which session ids exist.
                     return Err(ChatError::SessionNotFound(sid.clone()));
@@ -649,6 +718,9 @@ impl ChatService {
 
     /// Sessions owned by `user_id`, newest first.
     pub fn list_sessions(&self, user_id: &str) -> Vec<SessionInfo> {
+        if user_id == ANONYMOUS_LOCAL_USER_ID {
+            return Vec::new();
+        }
         let owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
         SessionStore::new(Some(self.sessions_dir.clone()))
             .list_sessions(usize::MAX)
@@ -663,7 +735,7 @@ impl ChatService {
         session_id: &str,
         user_id: &str,
     ) -> Result<Vec<serde_json::Value>, ChatError> {
-        if !self.user_owns(session_id, user_id) {
+        if user_id == ANONYMOUS_LOCAL_USER_ID || !self.user_owns(session_id, user_id) {
             return Err(ChatError::SessionNotFound(session_id.to_string()));
         }
         SessionStore::new(Some(self.sessions_dir.clone()))

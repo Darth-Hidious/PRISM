@@ -16,6 +16,40 @@ use tokio::time::timeout;
 use crate::permissions::PermissionMode;
 use crate::tool_catalog::LoadedTool;
 
+pub const PLATFORM_ACCESS_REFUSAL: &str =
+    "Platform access denied: this request requires a verified node-owner session.";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CommandToolPlatformAccess {
+    /// The request identity was verified against the node's linked platform
+    /// credential. The child may use the node credential.
+    VerifiedNodeOwner,
+    /// No linked platform credential is available. Local commands may run, but
+    /// the child must not inherit platform credentials or platform config.
+    #[default]
+    LocalOnly,
+    /// An HTTP caller reached a linked node without proving node ownership.
+    /// CLI command tools are refused before a child process is spawned.
+    UnverifiedHttp,
+}
+
+tokio::task_local! {
+    static PLATFORM_ACCESS: CommandToolPlatformAccess;
+}
+
+pub(crate) async fn with_platform_access<F, T>(access: CommandToolPlatformAccess, future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    PLATFORM_ACCESS.scope(access, future).await
+}
+
+fn current_platform_access() -> CommandToolPlatformAccess {
+    PLATFORM_ACCESS
+        .try_with(|access| *access)
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CommandToolRuntime {
     pub current_exe: PathBuf,
@@ -3858,12 +3892,64 @@ fn structured_failure(root: &str, invocation: &str, error: &anyhow::Error) -> Va
     })
 }
 
+fn platform_access_refusal() -> anyhow::Error {
+    anyhow::anyhow!(PLATFORM_ACCESS_REFUSAL)
+}
+
+fn strip_platform_credentials(cmd: &mut TokioCommand) {
+    // The child must not be able to recover the node credential from either
+    // environment inheritance or the normal PRISM credential/config paths.
+    // This is deliberately a credential boundary, not a list of platform
+    // tools: newly added CLI commands get the same safe default.
+    for key in [
+        "MARC27_API_KEY",
+        "MARC27_TOKEN",
+        "MARC27_API_TOKEN",
+        "PRISM_LOGIN_TOKEN",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd.env("PRISM_OFFLINE", "1");
+
+    // `prism` resolves stored credentials through platform-specific config
+    // directories and the SDK mirror under HOME. Point all of those lookups at
+    // an intentionally absent location rather than the node owner's home.
+    for key in [
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ] {
+        cmd.env(key, "/__prism_no_platform_credentials__");
+    }
+    cmd.env("HOMEDRIVE", "/");
+    cmd.env("HOMEPATH", "/__prism_no_platform_credentials__");
+}
+
+fn offline_platform_failure(value: &Value) -> bool {
+    if value.get("success").and_then(Value::as_bool) != Some(false) {
+        return false;
+    }
+    ["stdout", "stderr"]
+        .into_iter()
+        .filter_map(|key| value.get(key).and_then(Value::as_str))
+        .any(|text| text.contains("offline mode"))
+}
+
 async fn execute_cli_command(
     runtime: &CommandToolRuntime,
     root: &'static str,
     args: &[String],
     invocation: &str,
+    platform_access: CommandToolPlatformAccess,
 ) -> Result<Value> {
+    if matches!(platform_access, CommandToolPlatformAccess::UnverifiedHttp) {
+        return Err(platform_access_refusal());
+    }
+
     // Chokepoint: every `CommandExecution::Cli` lands here, including the
     // ones whose args are assembled by the typed builders rather than
     // taken from `args`. The trusted --project-root/--python are laid
@@ -3883,6 +3969,9 @@ async fn execute_cli_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if matches!(platform_access, CommandToolPlatformAccess::LocalOnly) {
+        strip_platform_credentials(&mut cmd);
+    }
 
     let timeout_window = command_timeout_for_root(root);
     let timeout_secs = timeout_window.as_secs();
@@ -3896,14 +3985,14 @@ async fn execute_cli_command(
                 "timed_out": true,
                 "exit_code": Value::Null,
                 "stdout": "",
-                "stderr": format!("`{invocation}` is still running after {timeout_secs} seconds. Run the command directly if you need an interactive or long-lived session."),
+                "stderr": format!("`{invocation}` is still running after {timeout_secs} seconds; interactive or long-lived sessions are not supported here."),
             }));
         }
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    Ok(json!({
+    let result = json!({
         "root": root,
         "args": args,
         "invocation": invocation,
@@ -3912,7 +4001,13 @@ async fn execute_cli_command(
         "exit_code": output.status.code(),
         "stdout": truncate_for_ui(stdout.trim(), 30_000),
         "stderr": truncate_for_ui(stderr.trim(), 30_000),
-    }))
+    });
+    if matches!(platform_access, CommandToolPlatformAccess::LocalOnly)
+        && offline_platform_failure(&result)
+    {
+        return Err(platform_access_refusal());
+    }
+    Ok(result)
 }
 
 /// Mint a best-effort loopback session token so a workflow's `tool` steps can
@@ -4188,6 +4283,23 @@ pub async fn execute_command_tool(
     args: &Value,
     policy: Option<&mut prism_policy::PolicyEngine>,
 ) -> Result<Value> {
+    execute_command_tool_with_platform_access(
+        runtime,
+        tool_name,
+        args,
+        policy,
+        current_platform_access(),
+    )
+    .await
+}
+
+pub async fn execute_command_tool_with_platform_access(
+    runtime: &CommandToolRuntime,
+    tool_name: &str,
+    args: &Value,
+    policy: Option<&mut prism_policy::PolicyEngine>,
+    platform_access: CommandToolPlatformAccess,
+) -> Result<Value> {
     let spec = spec_by_name(tool_name)
         .ok_or_else(|| anyhow::anyhow!("unknown internal command tool: {tool_name}"))?;
     let execution = build_execution(spec, args)?;
@@ -4197,10 +4309,17 @@ pub async fn execute_command_tool(
         CommandExecution::Cli { root, args }
             if *root == "node" && is_node_lifecycle_subcommand(args) =>
         {
-            execute_node_lifecycle(runtime, args, &invocation).await
+            if !matches!(
+                platform_access,
+                CommandToolPlatformAccess::VerifiedNodeOwner
+            ) {
+                Err(platform_access_refusal())
+            } else {
+                execute_node_lifecycle(runtime, args, &invocation).await
+            }
         }
         CommandExecution::Cli { root, args } => {
-            execute_cli_command(runtime, root, args, &invocation).await
+            execute_cli_command(runtime, root, args, &invocation, platform_access).await
         }
         CommandExecution::WorkflowList
         | CommandExecution::WorkflowShow { .. }
@@ -4492,6 +4611,72 @@ pub fn to_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_only_cli_child_cannot_inherit_platform_environment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executable = dir.path().join("fake-prism");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+if [ "$PRISM_OFFLINE" != "1" ]; then
+  echo "missing offline boundary" >&2
+  exit 1
+fi
+if [ "$HOME" != "/__prism_no_platform_credentials__" ]; then
+  echo "real home inherited" >&2
+  exit 1
+fi
+if [ -n "$MARC27_API_KEY" ] || [ -n "$MARC27_TOKEN" ] || [ -n "$MARC27_API_TOKEN" ] || [ -n "$PRISM_LOGIN_TOKEN" ]; then
+  echo "platform credential inherited" >&2
+  exit 1
+fi
+printf 'local command succeeded\n'
+"#,
+        )
+        .expect("write fake executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("stat fake executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("make executable");
+
+        let runtime = CommandToolRuntime {
+            current_exe: executable,
+            project_root: dir.path().to_path_buf(),
+            python_bin: "python3".into(),
+            ..Default::default()
+        };
+        let result = execute_command_tool_with_platform_access(
+            &runtime,
+            "status",
+            &json!({"args": []}),
+            None,
+            CommandToolPlatformAccess::LocalOnly,
+        )
+        .await
+        .expect("local-only command should run");
+        assert_eq!(result["success"], true);
+        assert_eq!(result["stdout"], "local command succeeded");
+    }
+
+    #[tokio::test]
+    async fn unverified_http_cli_tool_is_refused_before_spawn() {
+        let result = execute_command_tool_with_platform_access(
+            &CommandToolRuntime::default(),
+            "deploy_list",
+            &json!({}),
+            None,
+            CommandToolPlatformAccess::UnverifiedHttp,
+        )
+        .await;
+        let error = result.expect_err("unverified HTTP caller must be refused");
+        assert!(error.to_string().contains("verified node-owner session"));
+        assert!(!error.to_string().contains("prism login"));
+    }
 
     // ── VS2-P1a: filter_notebook_traceback ─────────────────────────────
 

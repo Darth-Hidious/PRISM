@@ -36,3 +36,5 @@ ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { workspace = true, features = ["util"] }
+prism-python-bridge = { path = "../python-bridge" }

@@ -30,7 +30,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::agent_loop;
-use crate::command_tools::{self, CommandToolRuntime};
+use crate::command_tools::{self, CommandToolPlatformAccess, CommandToolRuntime};
 use crate::commands::{builtin_help_text, is_cli_backed_slash_root};
 use crate::hooks::{HookRegistry, build_default_hooks};
 use crate::permissions::{
@@ -5662,45 +5662,48 @@ fn spawn_agent_turn(
             &profile,
         );
 
-        let turn_result = agent_loop::run_turn(
-            &llm,
-            &mut runtime.tool_server,
-            &runtime.command_tool_runtime,
-            &mut runtime.history,
-            tools.as_ref(),
-            &turn_config,
-            &user_text,
-            None, // task-driven research context (chat path — no task)
-            &mut runtime.transcript,
-            hooks.as_ref(),
-            &runtime.permissions,
-            Some(live_permission_overrides),
-            &mut runtime.scratchpad,
-            &mut |event| {
-                match &event {
-                    AgentEvent::TurnComplete {
-                        text: Some(text), ..
-                    } if !text.is_empty() => {
-                        runtime
-                            .session_store
-                            .append_message("assistant", text, "", "", None);
+        let turn_result = command_tools::with_platform_access(
+            CommandToolPlatformAccess::VerifiedNodeOwner,
+            agent_loop::run_turn(
+                &llm,
+                &mut runtime.tool_server,
+                &runtime.command_tool_runtime,
+                &mut runtime.history,
+                tools.as_ref(),
+                &turn_config,
+                &user_text,
+                None, // task-driven research context (chat path — no task)
+                &mut runtime.transcript,
+                hooks.as_ref(),
+                &runtime.permissions,
+                Some(live_permission_overrides),
+                &mut runtime.scratchpad,
+                &mut |event| {
+                    match &event {
+                        AgentEvent::TurnComplete {
+                            text: Some(text), ..
+                        } if !text.is_empty() => {
+                            runtime
+                                .session_store
+                                .append_message("assistant", text, "", "", None);
+                        }
+                        AgentEvent::ToolCallResult {
+                            call_id,
+                            tool_name,
+                            content,
+                            ..
+                        } => {
+                            runtime
+                                .session_store
+                                .append_message("tool", content, tool_name, call_id, None);
+                        }
+                        _ => {}
                     }
-                    AgentEvent::ToolCallResult {
-                        call_id,
-                        tool_name,
-                        content,
-                        ..
-                    } => {
-                        runtime
-                            .session_store
-                            .append_message("tool", content, tool_name, call_id, None);
-                    }
-                    _ => {}
-                }
-                emit_agent_event(event);
-            },
-            Some(approval_rx),
-            runtime.policy_engine.as_mut(),
+                    emit_agent_event(event);
+                },
+                Some(approval_rx),
+                runtime.policy_engine.as_mut(),
+            ),
         )
         .await;
 

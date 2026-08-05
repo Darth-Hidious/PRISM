@@ -5275,6 +5275,7 @@ dependencies = [
  "prism-mesh",
  "prism-policy",
  "prism-provenance",
+ "prism-python-bridge",
  "prism-workflows",
  "rust-embed",
  "serde",

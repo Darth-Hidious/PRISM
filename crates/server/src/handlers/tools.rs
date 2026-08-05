@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use crate::NodeState;
+use crate::handlers::deployments::command_tool_platform_access;
 use crate::middleware::AuthenticatedUser;
 
 #[derive(Serialize)]
@@ -151,6 +152,7 @@ pub async fn run_tool(
             .into_response();
     };
 
+    let platform_access = command_tool_platform_access(&state, &user).await;
     let body = body
         .map(|Json(v)| v)
         .unwrap_or_else(|| Value::Object(Default::default()));
@@ -164,11 +166,12 @@ pub async fn run_tool(
     let args = build_tool_args(&body);
 
     match service
-        .invoke_tool_with_actor(
+        .invoke_tool_with_actor_and_platform_access(
             &name,
             args,
             Some(&user.user_id),
             user.provenance_actor(),
+            platform_access,
             approve,
         )
         .await
@@ -187,7 +190,86 @@ pub async fn run_tool(
 #[cfg(test)]
 mod tests {
     use super::build_tool_args;
+    use crate::NodeState;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode, header};
     use serde_json::json;
+    use std::path::Path;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const STUB_TOOL_SERVER: &str = r#"
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("method") == "list_tools":
+        response = {"tools": [{
+            "name": "local_only_test",
+            "description": "A local-only test tool.",
+            "input_schema": {"type": "object", "properties": {}},
+            "requires_approval": False,
+        }]}
+    elif request.get("method") == "call_tool":
+        response = {"result": {"ok": True, "tool": request.get("tool")}}
+    else:
+        response = {"error": "unknown method"}
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#;
+
+    fn write_stub_project(dir: &Path) {
+        let app = dir.join("app");
+        std::fs::create_dir_all(&app).expect("create app directory");
+        std::fs::write(app.join("__init__.py"), "").expect("write package marker");
+        std::fs::write(app.join("tool_server.py"), STUB_TOOL_SERVER)
+            .expect("write stub tool server");
+    }
+
+    async fn router_with_service(linked_platform: bool) -> Option<axum::Router> {
+        let python = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|_| std::path::PathBuf::from("python3"))?;
+        let project = tempfile::tempdir().expect("create tool project");
+        write_stub_project(project.path());
+        let tool_server = prism_python_bridge::ToolServer {
+            python_bin: python,
+            project_root: project.path().to_path_buf(),
+            env: std::collections::BTreeMap::new(),
+        };
+        // Keep the project alive for the service child for the duration of the
+        // test by moving it into a leaked test-owned allocation.
+        let project = Box::leak(Box::new(project));
+        let tool_server = prism_python_bridge::ToolServer {
+            project_root: project.path().to_path_buf(),
+            ..tool_server
+        };
+        let service = prism_agent::service::ChatService::spawn(
+            prism_ingest::LlmConfig::default(),
+            tool_server,
+            Some(project.path().join("sessions")),
+        )
+        .await
+        .expect("spawn chat service");
+
+        let mut node = NodeState::new("test-node".into());
+        if linked_platform {
+            node.platform_client = Some(prism_client::PlatformClient::new("http://127.0.0.1:1"));
+        }
+        assert!(node.chat.set(Arc::new(service)).is_ok());
+        Some(crate::router::build_router(Arc::new(node)))
+    }
+
+    async fn response_text(response: axum::response::Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        String::from_utf8(bytes.to_vec()).expect("response is utf8")
+    }
 
     #[test]
     fn explicit_args_used_verbatim() {
@@ -232,5 +314,77 @@ mod tests {
         // clobber it (the tool author's explicit value takes precedence).
         let body = json!({ "command": "train", "inputs": { "command": "predict" } });
         assert_eq!(build_tool_args(&body), json!({ "command": "predict" }));
+    }
+
+    #[tokio::test]
+    async fn post_tool_deploy_list_arbitrary_bearer_is_refused() {
+        let Some(app) = router_with_service(true).await else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/tools/deploy_list/run")
+            .header(header::AUTHORIZATION, "Bearer arbitrary-not-an-identity")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"approve":true}"#))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("run request");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = response_text(response).await;
+        assert!(body.contains("verified node-owner session"), "body: {body}");
+        assert!(
+            !body.contains("prism login"),
+            "body must not suggest CLI login: {body}"
+        );
+        assert!(
+            !body.contains("run `prism"),
+            "body must not suggest a CLI command: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_deploy_create_approval_does_not_authorize_anonymous_caller() {
+        let Some(app) = router_with_service(true).await else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/tools/deploy_create/run")
+            .header(header::AUTHORIZATION, "Bearer arbitrary-not-an-identity")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"name":"test-deployment","image":"example/image","approve":true}"#,
+            ))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("run request");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = response_text(response).await;
+        assert!(body.contains("verified node-owner session"), "body: {body}");
+        assert!(
+            !body.contains("prism login"),
+            "body must not suggest CLI login: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_standalone_local_tool_still_succeeds() {
+        let Some(app) = router_with_service(false).await else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/tools/local_only_test/run")
+            .header(header::AUTHORIZATION, "Bearer arbitrary-local-capability")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("run request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("local_only_test"), "body: {body}");
+        assert!(body.contains(r#""ok":true"#), "body: {body}");
     }
 }
