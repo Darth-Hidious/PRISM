@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+local-inference = ["prism-llm/local-inference"]
+local-inference-cuda = ["prism-llm/local-inference-cuda"]
+
 [dependencies]
 prism-ingest = { path = "../ingest" }
 prism-llm = { path = "../llm" }

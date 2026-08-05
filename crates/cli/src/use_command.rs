@@ -101,6 +101,9 @@ pub async fn apply(
             validate_url(&url)?;
             let model = match model {
                 Some(model) => model,
+                None if prism_ingest::llm::is_local_gguf_url(&url) => bail!(
+                    "embedded GGUF inference requires --model <path-or-name>; names are resolved below ~/.prism/models and PRISM never downloads weights"
+                ),
                 None => resolve_model_from_server(&url).await?,
             };
             ChatTarget::Local {
@@ -417,8 +420,13 @@ fn render_provider_list(
 }
 
 fn validate_url(url: &str) -> Result<()> {
+    if prism_ingest::llm::is_local_gguf_url(url) {
+        return Ok(());
+    }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        bail!("URL must start with http:// or https:// (got {url:?})");
+        bail!(
+            "URL must start with http:// or https://, or equal gguf://local for embedded weights (got {url:?})"
+        );
     }
     // Heuristic: a typical OpenAI-compat endpoint ends in `/v1`. Don't
     // hard-fail without it (some local servers expose at /, others
@@ -595,6 +603,48 @@ mod tests {
             ChatTarget::Local { ref model, .. } => assert_eq!(model, "qwen2.5"),
             other => panic!("expected Local in live target, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn embedded_gguf_target_persists_without_a_server_probe() {
+        let _h = isolated_home();
+        let out = apply(
+            UseAction::Local {
+                url: prism_ingest::llm::LOCAL_GGUF_URL.into(),
+                model: Some("functiongemma-270m.gguf".into()),
+                api_key: None,
+            },
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(out.message.contains("gguf://local"));
+        assert!(out.message.contains("functiongemma-270m.gguf"));
+        match chat_config::load().unwrap().chat {
+            ChatTarget::Local { url, model, .. } => {
+                assert_eq!(url, prism_ingest::llm::LOCAL_GGUF_URL);
+                assert_eq!(model, "functiongemma-270m.gguf");
+            }
+            other => panic!("expected local GGUF target, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_gguf_target_requires_a_model() {
+        let _h = isolated_home();
+        let error = apply(
+            UseAction::Local {
+                url: prism_ingest::llm::LOCAL_GGUF_URL.into(),
+                model: None,
+                api_key: None,
+            },
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("--model <path-or-name>"));
     }
 
     #[tokio::test]

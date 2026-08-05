@@ -1401,8 +1401,8 @@ enum UseCommands {
     /// llama.cpp, vLLM, etc.). Hosted platform tools stay available
     /// when the user is logged in.
     Local {
-        /// Base URL of the local server, including `/v1`. Examples:
-        /// `http://localhost:11434/v1`, `http://127.0.0.1:8080/v1`.
+        /// Base URL of a local server, or `gguf://local` for PRISM's embedded
+        /// runtime. Examples: `http://localhost:11434/v1`, `gguf://local`.
         #[arg(long)]
         url: String,
         /// Model name to send in chat requests (whatever the local

@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::debug;
 
+mod local;
+pub use local::{LOCAL_GGUF_URL, default_model_dir, is_local_gguf_url, resolve_model_path};
+
 // ── Configuration ────────────────────────────────────────────────────
 
 /// Configuration for connecting to an LLM backend.
@@ -261,18 +264,34 @@ impl ToolCallAccumulator {
     }
 }
 
-/// Unified LLM client — all backends via OpenAI-compatible API.
-///
-/// Works with:
-/// - **llama.cpp** (`llama-server --port 8080`) — local inference
-/// - **Ollama** (`http://localhost:11434/v1/`) — local inference
-/// - **vLLM** — local or remote inference
-/// - **MARC27 platform** — managed cloud inference
-/// - **OpenAI** — cloud inference
-/// - **Anthropic** (via OpenAI proxy) — cloud inference
-/// - **LiteLLM** — proxy to any provider
+/// Which adapter a configured client selects. Selection is exact and never
+/// changes in response to an adapter failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendChoice {
+    Http,
+    LocalGguf,
+}
+
+/// Pure adapter selection. Only the explicit `gguf://local` sentinel selects
+/// embedded inference; every HTTP/provider URL remains on the existing path.
+#[must_use]
+pub fn choose_backend(base_url: &str) -> BackendChoice {
+    if is_local_gguf_url(base_url) {
+        BackendChoice::LocalGguf
+    } else {
+        BackendChoice::Http
+    }
+}
+
+enum LlmBackend {
+    Http(reqwest::Client),
+    LocalGguf(local::LocalGguf),
+}
+
+/// Unified LLM client. HTTP and embedded GGUF adapters satisfy the same public
+/// chat/streaming surface; unsupported local capabilities fail explicitly.
 pub struct LlmClient {
-    client: reqwest::Client,
+    backend: LlmBackend,
     config: LlmConfig,
 }
 
@@ -303,13 +322,79 @@ pub fn chat_completions_url(base_url: &str) -> String {
 }
 
 impl LlmClient {
-    pub fn new(config: LlmConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
-        Self { client, config }
+    pub fn new(mut config: LlmConfig) -> Self {
+        let backend = match choose_backend(&config.base_url) {
+            BackendChoice::Http => LlmBackend::Http(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(config.timeout_secs))
+                    .connect_timeout(Duration::from_secs(30))
+                    .build()
+                    .expect("failed to build HTTP client"),
+            ),
+            BackendChoice::LocalGguf => {
+                let local = local::LocalGguf::new(config.model.clone());
+                if config.context_window.is_none() {
+                    config.context_window = local.trained_context_window();
+                }
+                LlmBackend::LocalGguf(local)
+            }
+        };
+        Self { backend, config }
+    }
+
+    fn local_backend(&self) -> Option<&local::LocalGguf> {
+        match &self.backend {
+            LlmBackend::LocalGguf(local) => Some(local),
+            LlmBackend::Http(_) => None,
+        }
+    }
+
+    fn http_client(&self) -> Result<&reqwest::Client> {
+        match &self.backend {
+            LlmBackend::Http(client) => Ok(client),
+            LlmBackend::LocalGguf(_) => bail!(
+                "internal adapter error: an HTTP operation was attempted for {LOCAL_GGUF_URL}; no remote request was sent"
+            ),
+        }
+    }
+
+    fn reject_local_tools(tools: &[ToolDefinition]) -> Result<()> {
+        if tools.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "embedded GGUF inference does not currently support tool calling, so this {}-tool request was refused before generation. Select an HTTP backend for tool-driven sessions. No remote endpoint was tried.",
+            tools.len()
+        )
+    }
+
+    fn effective_local_max_tokens(&self, estimated_prompt_tokens: u64) -> u64 {
+        let configured = self.config.max_output_tokens.unwrap_or(512);
+        match self.config.context_window {
+            Some(context) => configured.min(
+                context
+                    .saturating_sub(estimated_prompt_tokens)
+                    .saturating_sub(CONTEXT_MARGIN_TOKENS),
+            ),
+            None => configured,
+        }
+    }
+
+    fn local_chat_response(generation: local::LocalGeneration) -> ChatResponse {
+        let usage = UsageInfo {
+            prompt_tokens: generation.prompt_tokens,
+            completion_tokens: generation.completion_tokens,
+            total_tokens: generation.prompt_tokens + generation.completion_tokens,
+        };
+        ChatResponse {
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: (!generation.text.is_empty()).then_some(generation.text),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            usage: Some(usage),
+        }
     }
 
     /// The configuration this client was built with. Lets callers derive a
@@ -354,6 +439,31 @@ impl LlmClient {
 
     /// Generate text with a system + user message.
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
+        let local_messages = [
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(system.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(user.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        if let Some(local) = self.local_backend() {
+            let serialized = serde_json::to_value(&local_messages)?;
+            let generation = local
+                .generate_streaming(
+                    &local_messages,
+                    self.effective_local_max_tokens(Self::estimate_tokens(&serialized)),
+                    |_| {},
+                )
+                .await?;
+            return Ok(generation.text);
+        }
         let messages = serde_json::json!([
             {"role": "system", "content": system},
             {"role": "user", "content": user}
@@ -423,6 +533,18 @@ impl LlmClient {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<ChatResponse> {
+        if let Some(local) = self.local_backend() {
+            Self::reject_local_tools(tools)?;
+            let serialized = serde_json::to_value(messages)?;
+            let generation = local
+                .generate_streaming(
+                    messages,
+                    self.effective_local_max_tokens(Self::estimate_tokens(&serialized)),
+                    |_| {},
+                )
+                .await?;
+            return Ok(Self::local_chat_response(generation));
+        }
         // MARC27 platform proxy: use /stream, collect text. This branch DROPS
         // `tools` — unlike `chat_with_tools_streaming`, which sends them
         // natively. Nothing in the workspace calls this method today; use the
@@ -554,6 +676,25 @@ impl LlmClient {
 
     /// Generate text and parse as JSON (uses response_format).
     pub async fn generate_json(&self, prompt: &str) -> Result<String> {
+        if let Some(local) = self.local_backend() {
+            let messages = [ChatMessage {
+                role: "user".to_string(),
+                content: Some(format!(
+                    "Return one valid JSON object and no Markdown fences.\n\n{prompt}"
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+            }];
+            let serialized = serde_json::to_value(&messages)?;
+            let generation = local
+                .generate_streaming(
+                    &messages,
+                    self.effective_local_max_tokens(Self::estimate_tokens(&serialized)),
+                    |_| {},
+                )
+                .await?;
+            return Ok(Self::strip_json_fences(&generation.text).to_string());
+        }
         // MARC27 platform: this method used to skip the is_marc27() branch
         // that chat()/chat_with_tools() have, so ingest ontology extraction
         // against a platform URL hit `{base}/v1/chat/completions` → 404
@@ -606,6 +747,11 @@ impl LlmClient {
 
     /// Batch embedding. Returns one vector per input text.
     pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if self.local_backend().is_some() {
+            bail!(
+                "embedded GGUF inference provides text generation, not embeddings. Configure prism-embed's native ONNX or OpenAI-compatible adapter. No remote endpoint was tried."
+            );
+        }
         let base = self.config.base_url.trim_end_matches('/');
         let url = if base.ends_with("/v1") {
             format!("{base}/embeddings")
@@ -639,6 +785,18 @@ impl LlmClient {
         tools: &[ToolDefinition],
         mut on_delta: impl FnMut(&str, bool),
     ) -> Result<ChatResponse> {
+        if let Some(local) = self.local_backend() {
+            Self::reject_local_tools(tools)?;
+            let serialized = serde_json::to_value(messages)?;
+            let generation = local
+                .generate_streaming(
+                    messages,
+                    self.effective_local_max_tokens(Self::estimate_tokens(&serialized)),
+                    |delta| on_delta(delta, false),
+                )
+                .await?;
+            return Ok(Self::local_chat_response(generation));
+        }
         // MARC27 platform: use /stream with SSE.
         // The platform forwards `tools` verbatim to the upstream provider and
         // streams OpenAI-style `tool_calls` deltas back, so this path sends the
@@ -1007,9 +1165,12 @@ impl LlmClient {
 
     /// Health check — verify the LLM backend is reachable.
     pub async fn health_check(&self) -> Result<()> {
+        if let Some(local) = self.local_backend() {
+            return local.health_check().await;
+        }
         let url = format!("{}/v1/models", self.config.base_url);
         prism_runtime::offline::check_url(&url).map_err(anyhow::Error::msg)?;
-        let mut req = self.client.get(&url);
+        let mut req = self.http_client()?.get(&url);
         if let Some((name, value)) = self.auth_header() {
             req = req.header(name, value);
         }
@@ -1072,7 +1233,7 @@ impl LlmClient {
         // 503) or a connection that never opened is replayed. A read timeout
         // is NOT — see `retry::Idempotency`.
         retry::retrying(label, retry::Idempotency::Billable, || async {
-            let mut req = self.client.post(url).json(body);
+            let mut req = self.http_client()?.post(url).json(body);
             if sse {
                 req = req.header("Accept", "text/event-stream");
             }
@@ -1542,6 +1703,57 @@ mod tests {
     fn llm_client_constructs_with_defaults() {
         let config = LlmConfig::default();
         let _client = LlmClient::new(config);
+    }
+
+    #[test]
+    fn provider_selection_requires_the_explicit_gguf_sentinel() {
+        assert_eq!(choose_backend(LOCAL_GGUF_URL), BackendChoice::LocalGguf);
+        assert_eq!(choose_backend("gguf://local/"), BackendChoice::LocalGguf);
+        assert_eq!(
+            choose_backend("http://localhost:8080/v1"),
+            BackendChoice::Http
+        );
+        assert_eq!(
+            choose_backend("https://api.openai.com/v1"),
+            BackendChoice::Http
+        );
+    }
+
+    #[cfg(not(feature = "local-inference"))]
+    #[tokio::test]
+    async fn selected_gguf_backend_never_falls_back_when_feature_is_absent() {
+        let client = LlmClient::new(LlmConfig {
+            base_url: LOCAL_GGUF_URL.to_string(),
+            model: "missing.gguf".to_string(),
+            ..LlmConfig::default()
+        });
+        let error = client.generate("hello").await.unwrap_err().to_string();
+        assert!(error.contains("built without embedded inference"));
+        assert!(error.contains("No remote endpoint was tried"));
+    }
+
+    #[tokio::test]
+    async fn selected_gguf_backend_refuses_tools_explicitly() {
+        let client = LlmClient::new(LlmConfig {
+            base_url: LOCAL_GGUF_URL.to_string(),
+            model: "missing.gguf".to_string(),
+            ..LlmConfig::default()
+        });
+        let tool = ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "lookup".to_string(),
+                description: "Look something up".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        };
+        let error = client
+            .chat_with_tools(&[], &[tool])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not currently support tool calling"));
+        assert!(error.contains("No remote endpoint was tried"));
     }
 
     /// The base URL is data, not a hint. Whatever path a vendor mounts its

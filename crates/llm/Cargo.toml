@@ -6,9 +6,28 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Opt-in because llama.cpp adds a measured ~35 seconds / ~0.3 GiB to a clean
+# Apple Silicon debug build. Metal is enabled by llama-cpp-2 on that target.
+local-inference = [
+    "dep:encoding_rs",
+    "dep:llama-cpp-2",
+    "dep:llama-cpp-sys-2",
+]
+local-inference-cuda = [
+    "local-inference",
+    "llama-cpp-2/cuda",
+    "llama-cpp-sys-2/cuda",
+]
+
 [dependencies]
 anyhow.workspace = true
+dirs.workspace = true
+encoding_rs = { workspace = true, optional = true }
 futures-util.workspace = true
+llama-cpp-2 = { workspace = true, optional = true }
+llama-cpp-sys-2 = { workspace = true, optional = true }
 # Shared offline and retry policies.
 prism-runtime = { path = "../runtime" }
 reqwest.workspace = true
@@ -16,3 +35,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

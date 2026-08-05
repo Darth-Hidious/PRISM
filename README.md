@@ -109,6 +109,28 @@ Run `prism` to launch a slash-command-driven AI agent with:
 - Streaming AI responses with markdown rendering
 - Boot diagnostics (Platform, Auth, Knowledge Graph, LLM Models, Compute, Marketplace, Local Node, Policy Engine) on every launch — run `prism doctor` for the full report
 
+### Embedded GGUF inference (opt-in)
+
+PRISM can load user-supplied `.gguf` weights directly; no Ollama, vLLM, or
+llama-server process is involved. The llama.cpp build is opt-in so default
+builds remain lightweight:
+
+```bash
+cargo build --release -p prism-cli --features local-inference
+# Linux NVIDIA build:
+cargo build --release -p prism-cli --features local-inference-cuda
+
+prism use local --url gguf://local --model my-model.gguf
+# Names resolve below ~/.prism/models; absolute/relative .gguf paths also work.
+```
+
+PRISM never downloads or substitutes generation weights. A missing file is a
+structured error and never falls back to HTTP. `PRISM_LOCAL_CONTEXT_SIZE`
+controls the allocated KV context (default 4096, capped by GGUF metadata).
+Streaming and cancellation are supported. Tool calling is not yet supported by
+the embedded adapter; tool-bearing turns are refused before generation rather
+than silently dropping tools.
+
 ## CLI Commands
 
 ### Setup & Auth

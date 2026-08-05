@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+local-inference = ["prism-agent/local-inference"]
+local-inference-cuda = ["prism-agent/local-inference-cuda"]
+
 [[bin]]
 name = "prism"
 path = "src/main.rs"
