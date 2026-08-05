@@ -344,9 +344,25 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                         .await
                         .with_context(|| "LLM fact extraction failed")?;
                 for fact in facts {
-                    let claim =
-                        claim_from_fact(fact, &document_id, &document_url, &source, &block.locator);
-                    match prism_retrieval::claims::validate_and_stamp(claim) {
+                    // Containment: find the verbatim span of THIS block that
+                    // supports the fact. Facts with no supporting span cannot
+                    // become claims — stamping them would record provenance a
+                    // document never gave (extractor prompt examples included).
+                    let quote = prism_retrieval::claims::supporting_quote(
+                        &fact.subject,
+                        &fact.object,
+                        fact.value,
+                        &block.text,
+                    );
+                    let claim = claim_from_fact(
+                        fact,
+                        &document_id,
+                        &document_url,
+                        &source,
+                        &block.locator,
+                        quote,
+                    );
+                    match prism_retrieval::claims::validate_and_stamp(claim, &block.text) {
                         Ok(stamped) => claims.push(stamped),
                         Err(reason) => rejected.push(json!({
                             "reason": reason,
@@ -403,13 +419,16 @@ fn probe_endpoint(base_url: &str) -> Result<(), String> {
 }
 
 /// Convert one extracted `MaterialFact` into a provenance-carrying claim.
-/// Evidence is stamped by `validate_and_stamp` (ceiling: research).
+/// `quote` is the verbatim supporting span found in the cited block (see
+/// `supporting_quote`); evidence is stamped by `validate_and_stamp`
+/// (ceiling: research).
 fn claim_from_fact(
     fact: prism_provenance::MaterialFact,
     document_id: &str,
     document_url: &str,
     source: &str,
     locator: &prism_retrieval::Locator,
+    quote: Option<String>,
 ) -> prism_retrieval::claims::ExtractedClaim {
     use prism_provenance::FactPayload;
     use prism_retrieval::claims::{ConditionValue, MeasurementCondition};
@@ -443,7 +462,7 @@ fn claim_from_fact(
             document_url: document_url.to_string(),
             source: source.to_string(),
             locator: locator.clone(),
-            quote: None,
+            quote,
         },
     }
 }
