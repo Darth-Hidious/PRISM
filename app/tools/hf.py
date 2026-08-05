@@ -80,18 +80,50 @@ def _request_json(path: str, params: Optional[dict] = None) -> Any:
     return r.json()
 
 
-def _download_file(url: str, dest: Path) -> Dict[str, Any]:
-    """Stream one file from a Hub resolve URL to ``dest``; return size."""
+def _safe_dest(root: Path, rfilename: str) -> Path:
+    """Resolve ``rfilename`` under ``root``, refusing anything that escapes.
+
+    The Hub supplies ``rfilename``; we were joining it straight onto the
+    destination and calling ``mkdir(parents=True)`` before any I/O, so a
+    sibling named ``../../x`` or ``/tmp/x`` wrote outside the target — a
+    reviewer reproduced both, creating a directory outside the root without
+    downloading a byte. Trusting a remote server for a local write path is the
+    bug, regardless of how unlikely such a name is in a git-backed repo.
+    """
+    root = root.resolve()
+    candidate = (root / rfilename).resolve()
+    if not candidate.is_relative_to(root):
+        raise ValueError(f"refusing path outside the download root: {rfilename!r}")
+    return candidate
+
+
+def _download_file(url: str, dest: Path, budget: int) -> Dict[str, Any]:
+    """Stream one file to ``dest``, aborting once ``budget`` bytes are written.
+
+    The size cap used to be checked only AFTER a file finished, so a single
+    100 GB sibling was written in full before truncation. The budget is now
+    enforced mid-stream, and a partial file is removed rather than left behind
+    looking complete.
+    """
     import httpx
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     n = 0
+    over = False
     with httpx.stream("GET", url, headers=_HEADERS, timeout=120, follow_redirects=True) as r:
         r.raise_for_status()
         with open(dest, "wb") as fh:
             for chunk in r.iter_bytes():
+                if n + len(chunk) > budget:
+                    over = True
+                    break
                 fh.write(chunk)
                 n += len(chunk)
+    if over:
+        dest.unlink(missing_ok=True)
+        raise ValueError(
+            f"file exceeds the remaining {budget} byte budget; nothing kept for this file"
+        )
     return {"path": str(dest), "bytes": n}
 
 
@@ -266,20 +298,36 @@ def _pull(
     max_files = max(1, min(int(max_files or 50), 5000))
     cap = max(1, int(max_bytes_mb or 500)) * 1024 * 1024
 
-    plural = _plurals_for(kind)[0]
-    try:
-        obj = _request_json(f"/api/{plural}/{repo}")
-    except _HFError as exc:
-        if exc.status == 401:
-            return {
-                "error": "repo is not anonymously accessible (gated or org-restricted); "
-                "PRISM will not fetch it",
-                "repo": repo, "gated": "anonymous-blocked",
-            }
-        return {"error": exc.message, "repo": repo, "status": exc.status}
+    # `kind="auto"` must try BOTH kinds, as search and details do. Taking only
+    # `_plurals_for(kind)[0]` meant auto never looked at datasets, so pulling a
+    # dataset that exists returned "repo not found" -- contradicting this
+    # tool's own schema text ("'auto' tries both").
+    obj = None
+    plural = ""
+    last_err: Optional[Dict[str, Any]] = None
+    for candidate in _plurals_for(kind):
+        try:
+            obj = _request_json(f"/api/{candidate}/{repo}")
+            plural = candidate
+            break
+        except _HFError as exc:
+            if exc.status == 401:
+                return {
+                    "error": "repo is not anonymously accessible (gated or org-restricted); "
+                    "PRISM will not fetch it",
+                    "repo": repo, "gated": "anonymous-blocked",
+                }
+            if exc.status == 404:
+                last_err = {"error": exc.message, "repo": repo, "status": exc.status}
+                continue
+            return {"error": exc.message, "repo": repo, "status": exc.status}
+    if obj is None:
+        return last_err or {"error": "repo not found on the Hub", "repo": repo}
 
     gated = obj.get("gated")
-    if gated in _GATED_BLOCKING:
+    # Truthiness, not set membership: an unrecognised value such as
+    # "restricted" previously fell through the set and proceeded to download.
+    if gated:
         return {
             "error": f"repo is gated ({gated!r}); PRISM operates anonymously and will not fetch gated repos",
             "repo": repo, "gated": _gate(gated),
@@ -299,7 +347,7 @@ def _pull(
     for fn in files[:max_files]:
         url = f"{base}/resolve/main/{fn}"
         try:
-            info = _download_file(url, dest_root / fn)
+            info = _download_file(url, _safe_dest(dest_root, fn), cap - total)
         except Exception as exc:
             manifest.append({"file": fn, "error": f"{type(exc).__name__}: {exc}"})
             continue
@@ -432,8 +480,11 @@ def create_hf_tools(registry: ToolRegistry) -> None:
         },
         func=_hf,
         # Pure network reads against a public registry; no destructive op.
-        # 'pull' writes under the cache dir but never outside it, so it stays
-        # off the approval gate (same posture as web/browser tools).
+        # 'pull' writes only under its resolved download root -- ENFORCED by
+        # `_safe_dest`, not merely asserted (a reviewer escaped the old
+        # unvalidated join) -- so it stays off the approval gate, same posture
+        # as web/browser tools. Note `target` is still caller-chosen; the
+        # guarantee is containment within whatever root is given.
         requires_approval=False,
         examples=[
             {

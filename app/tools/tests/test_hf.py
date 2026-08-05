@@ -252,7 +252,9 @@ def test_pull_downloads_files_and_returns_manifest(monkeypatch, tmp_path):
         "siblings": [{"rfilename": "README.md"}, {"rfilename": "data.json.bz2"}],
     }
     monkeypatch.setattr(hf_mod, "_request_json", lambda path, params=None: details)
-    monkeypatch.setattr(hf_mod, "_download_file", lambda url, dest: {"path": str(dest), "bytes": 42})
+    monkeypatch.setattr(
+        hf_mod, "_download_file", lambda url, dest, budget: {"path": str(dest), "bytes": 42}
+    )
 
     out = hf_mod._pull("atomind/alexandria", kind="dataset", target=str(tmp_path))
     assert out["file_count"] == 2
@@ -293,7 +295,11 @@ def test_pull_byte_cap_truncates(monkeypatch, tmp_path):
                "siblings": [{"rfilename": f"f{i}"} for i in range(100)]}
     monkeypatch.setattr(hf_mod, "_request_json", lambda path, params=None: details)
     # Each file is 1 MB; cap at 3 MB → truncated after ~3 files.
-    monkeypatch.setattr(hf_mod, "_download_file", lambda url, dest: {"path": str(dest), "bytes": 1024 * 1024})
+    monkeypatch.setattr(
+        hf_mod,
+        "_download_file",
+        lambda url, dest, budget: {"path": str(dest), "bytes": 1024 * 1024},
+    )
     out = hf_mod._pull("x/y", kind="model", target=str(tmp_path), max_bytes_mb=3)
     assert out["truncated"] is True
     assert out["file_count"] <= 4
@@ -341,3 +347,91 @@ def test_tool_registered_in_full_registry():
     # Smoke-execute through the registry (no network: action missing → help).
     out = tool.execute()
     assert "error" in out
+
+
+# ── Reviewer findings F1-F4 ───────────────────────────────────────────────
+# Two independent reviewers reproduced these against the real module. Each
+# test fails against the pre-fix code.
+
+
+def test_a_sibling_path_cannot_escape_the_download_root(tmp_path):
+    """F1: `rfilename` comes from the Hub and was joined unvalidated, then
+    `mkdir(parents=True)` ran before any I/O — a reviewer created a directory
+    outside the root without downloading a byte. `requires_approval=False` is
+    justified by the claim that pull never writes outside its root, so that
+    claim has to be enforced, not asserted."""
+    from app.tools import hf as hf_mod
+
+    root = tmp_path / "cache"
+    root.mkdir()
+    for evil in ("../escape.txt", "../../escape.txt", "/tmp/hf_abs_escape.txt"):
+        with pytest.raises(ValueError):
+            hf_mod._safe_dest(root, evil)
+    # the legitimate case still resolves
+    ok = hf_mod._safe_dest(root, "weights/model.safetensors")
+    assert str(ok).startswith(str(root.resolve()))
+
+
+def test_one_huge_file_cannot_blow_the_byte_cap(tmp_path, monkeypatch):
+    """F2: the cap was checked only AFTER a file completed, so a single
+    100 GB sibling was written in full before truncation."""
+    from app.tools import hf as hf_mod
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            for _ in range(10):
+                yield b"x" * 1024
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("httpx.stream", lambda *a, **k: _Resp())
+    dest = tmp_path / "big.bin"
+    with pytest.raises(ValueError):
+        hf_mod._download_file("https://example.invalid/x", dest, budget=2048)
+    assert not dest.exists(), "a partial file must not be left looking complete"
+
+
+def test_pull_auto_tries_datasets_not_only_models(monkeypatch):
+    """F3: `_plurals_for(kind)[0]` meant auto never looked at datasets, so
+    pulling a dataset that exists returned 'repo not found' — contradicting
+    this tool's own schema text."""
+    from app.tools import hf as hf_mod
+
+    tried = []
+
+    def fake_request(path, params=None):
+        tried.append(path)
+        if path.startswith("/api/models/"):
+            raise hf_mod._HFError(404, "repo not found on the Hub")
+        return {"id": "atomind/alexandria", "gated": False, "siblings": []}
+
+    monkeypatch.setattr(hf_mod, "_request_json", fake_request)
+    out = hf_mod._pull("atomind/alexandria", kind="auto")
+    assert any(p.startswith("/api/datasets/") for p in tried), tried
+    assert "error" not in out or "not found" not in str(out.get("error", ""))
+
+
+def test_an_unrecognised_gated_value_still_blocks(monkeypatch):
+    """F4: the check was set-membership, so `gated="restricted"` fell through
+    and proceeded to download."""
+    from app.tools import hf as hf_mod
+
+    monkeypatch.setattr(
+        hf_mod,
+        "_request_json",
+        lambda path, params=None: {"id": "x/y", "gated": "restricted", "siblings": []},
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("must not download a gated repo")
+
+    monkeypatch.setattr(hf_mod, "_download_file", _boom)
+    out = hf_mod._pull("x/y", kind="model")
+    assert "error" in out and "gated" in out["error"]
