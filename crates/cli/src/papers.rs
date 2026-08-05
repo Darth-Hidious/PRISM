@@ -339,11 +339,20 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     break;
                 }
                 blocks_extracted += 1;
-                let facts =
+                let outcome =
                     prism_ingest::text_extract::extract_facts_from_text(&llm, &title, &block.text)
                         .await
                         .with_context(|| "LLM fact extraction failed")?;
-                for fact in facts {
+                // Facts refused by the containment gate (quote missing or not
+                // in this block) are reported, never silently dropped.
+                for dropped in &outcome.dropped {
+                    rejected.push(json!({
+                        "reason": dropped.reason.as_label(),
+                        "subject": dropped.subject,
+                        "object": dropped.object,
+                    }));
+                }
+                for fact in outcome.facts {
                     // Containment: find the verbatim span of THIS block that
                     // supports the fact. Facts with no supporting span cannot
                     // become claims — stamping them would record provenance a

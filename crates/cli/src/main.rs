@@ -6260,7 +6260,7 @@ async fn run_local_text_ingest_file(
         .and_then(|value| value.to_str())
         .unwrap_or("untitled");
 
-    let facts = prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
+    let outcome = prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let db_path = PathBuf::from(home).join(".prism/provenance.db");
@@ -6280,13 +6280,19 @@ async fn run_local_text_ingest_file(
         locality: "local".into(),
     };
     store.record_activity(&prov).await?;
-    for fact in &facts {
+    // Only facts that passed the containment gate (their verbatim quote
+    // occurs in the source text) reach the store. Refused facts are never
+    // downgraded or repaired — and never dropped silently: they ride in the
+    // summary below so the user sees them.
+    for fact in &outcome.facts {
         store.write_fact(fact, &prov).await?;
     }
     // Best-effort: vectorize the freshly written entity names into the same
     // Turso store so `prism query --semantic` works without Qdrant.
     // Failures are logged inside and never fail the ingest.
-    store.embed_entities_best_effort(&facts, &prov.tenant).await;
+    store
+        .embed_entities_best_effort(&outcome.facts, &prov.tenant)
+        .await;
 
     Ok(serde_json::json!({
         "backend": "local_text",
@@ -6294,7 +6300,9 @@ async fn run_local_text_ingest_file(
         "format": ingest_format(path),
         "schema_only": false,
         "chars": chars,
-        "facts_written": facts.len(),
+        "facts_written": outcome.facts.len(),
+        "facts_dropped": outcome.dropped.len(),
+        "dropped_facts": prism_ingest::text_extract::drop_report(&outcome.dropped),
         "model": agent_id,
         "store": db_path.display().to_string(),
         "warning": warning,
@@ -6458,6 +6466,28 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     let store =
                         value_string(summary, &["store"]).unwrap_or("~/.prism/provenance.db");
                     println!("  Facts: {facts} written to local store ({store})");
+                    // Refused facts must be visible, not silent: name the
+                    // count and each drop with its reason.
+                    let dropped = summary
+                        .get("facts_dropped")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    if dropped > 0 {
+                        println!(
+                            "  Dropped: {dropped} fact(s) refused before the store — quote missing or not found in the source text"
+                        );
+                        if let Some(entries) = summary
+                            .get("dropped_facts")
+                            .and_then(|value| value.as_array())
+                        {
+                            for entry in entries {
+                                let subject = value_string(entry, &["subject"]).unwrap_or("?");
+                                let object = value_string(entry, &["object"]).unwrap_or("?");
+                                let reason = value_string(entry, &["reason"]).unwrap_or("?");
+                                println!("    - {subject} / {object}: {reason}");
+                            }
+                        }
+                    }
                     if let Some(model) = value_string(summary, &["model"]) {
                         println!("  Model: {model}");
                     }

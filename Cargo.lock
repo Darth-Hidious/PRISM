@@ -5046,6 +5046,7 @@ dependencies = [
  "polars",
  "prism-llm",
  "prism-provenance",
+ "prism-retrieval",
  "reqwest",
  "serde",
  "serde_json",
