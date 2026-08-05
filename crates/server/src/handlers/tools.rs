@@ -210,6 +210,11 @@ for line in sys.stdin:
             "description": "A local-only test tool.",
             "input_schema": {"type": "object", "properties": {}},
             "requires_approval": False,
+        }, {
+            "name": "execute_python",
+            "description": "Execute arbitrary Python (test only).",
+            "input_schema": {"type": "object", "properties": {"code": {"type": "string"}}},
+            "requires_approval": True,
         }]}
     elif request.get("method") == "call_tool":
         response = {"result": {"ok": True, "tool": request.get("tool")}}
@@ -263,6 +268,49 @@ for line in sys.stdin:
         assert!(node.chat.set(Arc::new(service)).is_ok());
         let token = node.mint_offline_session_token();
         Some((crate::router::build_router(Arc::new(node)), token))
+    }
+
+    async fn router_with_authenticated_non_owner() -> Option<(axum::Router, String)> {
+        let python = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|_| std::path::PathBuf::from("python3"))?;
+        let project = Box::leak(Box::new(tempfile::tempdir().expect("create tool project")));
+        write_stub_project(project.path());
+        let service = prism_agent::service::ChatService::spawn(
+            prism_ingest::LlmConfig::default(),
+            prism_python_bridge::ToolServer {
+                python_bin: python,
+                project_root: project.path().to_path_buf(),
+                env: std::collections::BTreeMap::new(),
+            },
+            Some(project.path().join("sessions")),
+        )
+        .await
+        .expect("spawn chat service");
+
+        let session_db = Box::leak(Box::new(
+            tempfile::NamedTempFile::new().expect("create session database"),
+        ));
+        let manager = prism_core::session::SessionManager::new(
+            session_db.path(),
+            chrono::Duration::hours(24),
+        )
+        .expect("open session manager");
+        let session = manager
+            .create_session("authenticated:non-owner", None, None)
+            .expect("create authenticated non-owner session");
+
+        let mut node = NodeState::new("test-node".into());
+        node.session_db_path = Some(session_db.path().to_path_buf());
+        node.platform_client = Some(prism_client::PlatformClient::new("http://127.0.0.1:1"));
+        node.platform_owner_id
+            .set("owner-user".into())
+            .expect("set platform owner");
+        assert!(node.chat.set(Arc::new(service)).is_ok());
+        Some((crate::router::build_router(Arc::new(node)), session.id))
     }
 
     async fn response_text(response: axum::response::Response) -> String {
@@ -366,6 +414,36 @@ for line in sys.stdin:
         assert!(
             !body.contains("prism login"),
             "body must not suggest CLI login: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_owner_cannot_read_home_credentials_via_execute_python() {
+        let Some((app, token)) = router_with_authenticated_non_owner().await else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/tools/execute_python/run")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "approve": true,
+                    "code": "from pathlib import Path; print((Path.home() / '.prism' / 'credentials.json').read_text())"
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("run request");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = response_text(response).await;
+        assert!(body.contains("owner-only"), "body: {body}");
+        assert!(
+            body.contains("arbitrary code as the node OS user"),
+            "body must state why environment filtering is insufficient: {body}"
         );
     }
 

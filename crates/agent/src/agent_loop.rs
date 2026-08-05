@@ -1724,10 +1724,19 @@ pub async fn run_turn(
                 // always requires_approval, never in the auto-approve set.
                 crate::mcp::call_global_tool(tool_name, &args).await
             } else {
-                tool_server
-                    .call_tool(tool_name, args.clone())
-                    .await
-                    .map_err(Into::into)
+                // Purpose-built Python tools remain available to LocalOnly
+                // callers, but arbitrary execute_python/execute_bash dispatch
+                // must prove node ownership before signaling the worker.
+                match command_tools::gate_external_tool_execution(
+                    tool_name,
+                    command_tools::current_platform_access(),
+                ) {
+                    Ok(_) => tool_server
+                        .call_tool(tool_name, args.clone())
+                        .await
+                        .map_err(Into::into),
+                    Err(error) => Err(error),
+                }
             };
 
             // Auto-pin tools surfaced by find_tools so their full definitions

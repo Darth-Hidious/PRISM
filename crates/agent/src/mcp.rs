@@ -393,8 +393,32 @@ pub fn global() -> Option<Arc<McpManager>> {
 }
 
 /// Dispatch entry used by the agent loop for catalog tools with
-/// `source == "mcp"`.
+/// `source == "mcp"`. Access is resolved before the process-global manager is
+/// consulted, so a LocalOnly turn cannot signal a credentialed MCP child.
 pub async fn call_global_tool(namespaced: &str, args: &Value) -> Result<Value> {
+    call_global_tool_with_platform_access(
+        namespaced,
+        args,
+        crate::command_tools::current_platform_access(),
+    )
+    .await
+}
+
+pub(crate) async fn call_global_tool_with_platform_access(
+    namespaced: &str,
+    args: &Value,
+    platform_access: crate::command_tools::CommandToolPlatformAccess,
+) -> Result<Value> {
+    let execution_access =
+        crate::command_tools::gate_external_tool_execution(namespaced, platform_access)?;
+    call_global_tool_gated(namespaced, args, execution_access.verified_node_owner()?).await
+}
+
+async fn call_global_tool_gated(
+    namespaced: &str,
+    args: &Value,
+    _owner_access: crate::command_tools::VerifiedNodeOwnerExecutionAccess,
+) -> Result<Value> {
     match global() {
         Some(manager) => manager.call_tool(namespaced, args).await,
         None => bail!("no MCP servers are connected (missing ~/.prism/mcp.json?)"),
@@ -440,6 +464,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         let malformed = dir.join("nope.json");
         assert!(load_config(&malformed).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_only_caller_cannot_reach_globally_installed_mcp_server() {
+        let error = crate::command_tools::with_platform_access(
+            crate::command_tools::CommandToolPlatformAccess::LocalOnly,
+            call_global_tool("mcp__credentialed__read_secret", &json!({})),
+        )
+        .await
+        .expect_err("LocalOnly must be refused before global MCP dispatch");
+
+        assert!(
+            error.to_string().contains("verified node-owner session"),
+            "the access gate must run before consulting the global manager: {error:#}"
+        );
     }
 
     #[test]

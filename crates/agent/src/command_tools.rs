@@ -18,6 +18,11 @@ use crate::tool_catalog::LoadedTool;
 
 pub const PLATFORM_ACCESS_REFUSAL: &str =
     "Platform access denied: this request requires a verified node-owner session.";
+const CODE_EXECUTION_ACCESS_REFUSAL: &str = "Un-sandboxed code execution is owner-only: execute_python and execute_bash run arbitrary \
+     code as the node OS user, so caller approval and environment filtering cannot authorize a \
+     non-owner. This request requires a verified node-owner session.";
+const MCP_ACCESS_REFUSAL: &str = "External MCP execution is owner-only: globally installed MCP servers may inherit node \
+     credentials. This request requires a verified node-owner session.";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CommandToolPlatformAccess {
@@ -44,7 +49,7 @@ where
     PLATFORM_ACCESS.scope(access, future).await
 }
 
-fn current_platform_access() -> CommandToolPlatformAccess {
+pub(crate) fn current_platform_access() -> CommandToolPlatformAccess {
     PLATFORM_ACCESS
         .try_with(|access| *access)
         .unwrap_or_default()
@@ -1137,7 +1142,17 @@ struct GatedCommandExecutionAccess {
 /// Capability accepted by un-sandboxed notebook operations. The only minting
 /// path is the central gate after it has verified node-owner access.
 #[derive(Debug, Clone, Copy)]
-struct VerifiedNodeOwnerExecutionAccess;
+pub(crate) struct VerifiedNodeOwnerExecutionAccess {
+    _private: (),
+}
+
+/// Capability minted before dispatch to a Python or MCP executor. Arbitrary
+/// code and globally connected MCP tools require verified node ownership;
+/// ordinary purpose-built Python tools remain available to LocalOnly callers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GatedExternalToolExecutionAccess {
+    platform_access: CommandToolPlatformAccess,
+}
 
 impl GatedCommandExecutionAccess {
     fn platform_access(self) -> CommandToolPlatformAccess {
@@ -1149,8 +1164,44 @@ impl GatedCommandExecutionAccess {
             self.platform_access,
             CommandToolPlatformAccess::VerifiedNodeOwner
         )
-        .then_some(VerifiedNodeOwnerExecutionAccess)
+        .then_some(VerifiedNodeOwnerExecutionAccess { _private: () })
         .ok_or_else(platform_access_refusal)
+    }
+}
+
+impl GatedExternalToolExecutionAccess {
+    pub(crate) fn verified_node_owner(self) -> Result<VerifiedNodeOwnerExecutionAccess> {
+        matches!(
+            self.platform_access,
+            CommandToolPlatformAccess::VerifiedNodeOwner
+        )
+        .then_some(VerifiedNodeOwnerExecutionAccess { _private: () })
+        .ok_or_else(platform_access_refusal)
+    }
+}
+
+/// Gate dispatch paths that do not produce a [`CommandExecution`]. This uses
+/// the same transport-established access state as command tools, but keeps the
+/// exhaustive command gate focused on its closed enum.
+pub(crate) fn gate_external_tool_execution(
+    tool_name: &str,
+    platform_access: CommandToolPlatformAccess,
+) -> Result<GatedExternalToolExecutionAccess> {
+    let refusal = if matches!(tool_name, "execute_python" | "execute_bash") {
+        Some(CODE_EXECUTION_ACCESS_REFUSAL)
+    } else if tool_name.starts_with(crate::mcp::MCP_TOOL_PREFIX) {
+        Some(MCP_ACCESS_REFUSAL)
+    } else {
+        None
+    };
+
+    match (platform_access, refusal) {
+        (CommandToolPlatformAccess::VerifiedNodeOwner, _)
+        | (CommandToolPlatformAccess::LocalOnly, None) => {
+            Ok(GatedExternalToolExecutionAccess { platform_access })
+        }
+        (CommandToolPlatformAccess::LocalOnly, Some(message)) => bail!(message),
+        (CommandToolPlatformAccess::UnverifiedHttp, _) => Err(platform_access_refusal()),
     }
 }
 

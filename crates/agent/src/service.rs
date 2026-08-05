@@ -385,6 +385,11 @@ impl ChatService {
                     "'{name}' is a meta-tool that operates on live agent state; \
                  it is not invocable through the single-tool executor"
                 ))
+            } else if !crate::command_tools::is_command_tool(name)
+                && let Err(error) =
+                    crate::command_tools::gate_external_tool_execution(name, platform_access)
+            {
+                Some(error.to_string())
             } else {
                 // Approval gate. Catalog lookup covers Python + offered command
                 // tools; the command-tool fallback covers specs hidden from the
@@ -434,16 +439,28 @@ impl ChatService {
                     platform_access,
                 )
                 .await
-            } else {
-                let worker = match platform_access {
-                    CommandToolPlatformAccess::VerifiedNodeOwner => tool_server,
-                    CommandToolPlatformAccess::LocalOnly
-                    | CommandToolPlatformAccess::UnverifiedHttp => local_only_tool_server,
-                };
-                worker
-                    .call_tool(name, args.clone())
+            } else if self
+                .tools
+                .find(name)
+                .is_some_and(|tool| tool.source.as_deref() == Some("mcp"))
+            {
+                crate::mcp::call_global_tool_with_platform_access(name, &args, platform_access)
                     .await
-                    .map_err(Into::into)
+            } else {
+                match crate::command_tools::gate_external_tool_execution(name, platform_access) {
+                    Ok(_) => {
+                        let worker = match platform_access {
+                            CommandToolPlatformAccess::VerifiedNodeOwner => tool_server,
+                            CommandToolPlatformAccess::LocalOnly
+                            | CommandToolPlatformAccess::UnverifiedHttp => local_only_tool_server,
+                        };
+                        worker
+                            .call_tool(name, args.clone())
+                            .await
+                            .map_err(Into::into)
+                    }
+                    Err(error) => Err(error),
+                }
             }
         };
 
