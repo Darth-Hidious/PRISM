@@ -72,7 +72,7 @@ pub async fn get_workflow(
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 pub struct RunWorkflowRequest {
     /// Argument values keyed by argument name.
     #[serde(default)]
@@ -84,6 +84,15 @@ pub struct RunWorkflowRequest {
 
 fn default_true() -> bool {
     true
+}
+
+impl Default for RunWorkflowRequest {
+    fn default() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            execute: default_true(),
+        }
+    }
 }
 
 /// POST /api/workflows/{name}/run — execute a workflow with the real engine
