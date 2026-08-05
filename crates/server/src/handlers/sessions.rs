@@ -142,12 +142,12 @@ pub async fn create_session(
     }
 
     let Some(ref db_path) = state.session_db_path else {
-        // Offline auth is a local capability gate, not an identity system.
-        // Return a fresh, unpersisted bearer for same-process follow-up calls;
-        // chat ownership does not use this value, so one caller cannot choose
-        // another caller's persisted session owner key.
+        // Offline auth is a process-lifetime capability gate, not an identity
+        // system. The server remembers this unguessable bearer so repeated
+        // requests can resume their own chat while caller-chosen strings fail.
+        let session_id = state.mint_offline_session_token();
         return Ok(Json(SessionResponse {
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id,
             user_id: ANONYMOUS_LOCAL_USER_ID.to_string(),
             expires_at: (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
         }));
@@ -330,6 +330,9 @@ mod tests {
             }
         };
         assert_ne!(first.session_id, second.session_id);
+        assert!(state.is_valid_offline_session_token(&first.session_id));
+        assert!(state.is_valid_offline_session_token(&second.session_id));
+        assert!(!state.is_valid_offline_session_token("caller-chosen-token"));
         assert_eq!(first.user_id, ANONYMOUS_LOCAL_USER_ID);
         assert_eq!(second.user_id, ANONYMOUS_LOCAL_USER_ID);
     }

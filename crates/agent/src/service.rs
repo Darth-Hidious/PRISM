@@ -27,10 +27,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use prism_ingest::LlmConfig;
 use prism_ingest::llm::{ChatMessage, LlmClient};
 use prism_python_bridge::{ToolServer, ToolServerHandle};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::agent_loop::{self, ApprovalResponse};
@@ -51,10 +53,13 @@ use crate::types::{AgentConfig, AgentEvent};
 /// so anonymous callers can resume their own session without sharing access.
 pub const ANONYMOUS_LOCAL_USER_ID: &str = "anonymous-local";
 
-/// Bind an anonymous HTTP caller to its validated transport token. The token
-/// is a bearer capability issued/validated by the server, not request JSON.
+/// Bind an anonymous HTTP caller to its validated transport token without
+/// persisting the bearer itself in the session-owner map. The token is a
+/// server-issued capability, not request JSON or a caller-selected identity.
 pub fn anonymous_caller_id(transport_token: &str) -> String {
-    format!("{ANONYMOUS_LOCAL_USER_ID}:{transport_token}")
+    let digest = Sha256::digest(transport_token.as_bytes());
+    let owner_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    format!("{ANONYMOUS_LOCAL_USER_ID}:{owner_key}")
 }
 
 // ── Wire types ───────────────────────────────────────────────────────
@@ -236,7 +241,7 @@ impl ChatService {
             permissions,
         } = build_agent_seed(&tool_server_config, &llm_config).await?;
         let local_only_tool_server = local_only_tool_server_config(&tool_server_config)
-            .spawn()
+            .spawn_with_clean_environment()
             .await
             .context("failed to spawn LocalOnly Python tool server")?;
 
@@ -536,7 +541,7 @@ impl ChatService {
         } else {
             crate::command_tools::with_platform_access(
                 platform_access,
-                self.chat_inner(request, user_id, &events),
+                self.chat_inner(request, user_id, platform_access, &events),
             )
             .await
         };
@@ -552,6 +557,7 @@ impl ChatService {
         &self,
         request: ChatRequest,
         user_id: &str,
+        platform_access: CommandToolPlatformAccess,
         events: &mpsc::UnboundedSender<ChatEvent>,
     ) -> Result<ChatOutcome, ChatError> {
         let mut inner = self.inner.lock().await;
@@ -624,6 +630,7 @@ impl ChatService {
         // callback appends to the session store.
         let ChatInner {
             tool_server,
+            local_only_tool_server,
             command_tool_runtime,
             hooks,
             permissions,
@@ -631,6 +638,13 @@ impl ChatService {
             store,
             ..
         } = &mut *inner;
+        let selected_tool_server = match platform_access {
+            CommandToolPlatformAccess::VerifiedNodeOwner => tool_server,
+            CommandToolPlatformAccess::LocalOnly => local_only_tool_server,
+            CommandToolPlatformAccess::UnverifiedHttp => {
+                unreachable!("UnverifiedHttp is refused before chat_inner")
+            }
+        };
 
         let tools = Arc::clone(&self.tools);
         let mut emit = |event: AgentEvent| match event {
@@ -701,7 +715,7 @@ impl ChatService {
 
         agent_loop::run_turn(
             &llm,
-            tool_server,
+            selected_tool_server,
             command_tool_runtime,
             &mut history,
             tools.as_ref(),
@@ -796,30 +810,18 @@ fn approval_decision(approved: &BTreeSet<String>, tool_name: &str) -> ApprovalRe
 }
 
 fn local_only_tool_server_config(config: &ToolServer) -> ToolServer {
-    let mut env = config.env.clone();
-    for key in [
-        "MARC27_API_KEY",
-        "MARC27_TOKEN",
-        "MARC27_API_TOKEN",
-        "PRISM_LOGIN_TOKEN",
-        "MARC27_API_URL",
-        "MARC27_PROJECT_ID",
-        "LLM_API_KEY",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GOOGLE_API_KEY",
-        "GEMINI_API_KEY",
-        "ZAI_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "GROQ_API_KEY",
-        "MP_API_KEY",
-        "LENS_API_TOKEN",
-        "FIRECRAWL_API_KEY",
-    ] {
-        env.insert(key.to_string(), String::new());
+    // Allowlist, not a denylist: combined with `env_clear`, a new credential
+    // variable added next month stays out by default. PATH is operational, not
+    // authority; the worker needs it for local subprocess-backed tools.
+    let mut env = BTreeMap::new();
+    if let Some(path) = config
+        .env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+    {
+        env.insert("PATH".to_string(), path);
     }
-    // Python platform clients check this before resolving credentials or
-    // making a network request. HOME remains intact for local data/tools.
     env.insert("PRISM_OFFLINE".to_string(), "1".to_string());
     ToolServer {
         python_bin: config.python_bin.clone(),

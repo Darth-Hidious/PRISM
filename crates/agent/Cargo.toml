@@ -36,6 +36,7 @@ dirs = "6"
 chrono.workspace = true
 directories.workspace = true
 shlex = "1"
+sha2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # killpg() to reap a wedged notebook kernel's whole process group.

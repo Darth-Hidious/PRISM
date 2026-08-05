@@ -227,7 +227,7 @@ for line in sys.stdin:
             .expect("write stub tool server");
     }
 
-    async fn router_with_service(linked_platform: bool) -> Option<axum::Router> {
+    async fn router_with_service(linked_platform: bool) -> Option<(axum::Router, String)> {
         let python = std::process::Command::new("python3")
             .arg("--version")
             .output()
@@ -261,7 +261,8 @@ for line in sys.stdin:
             node.platform_client = Some(prism_client::PlatformClient::new("http://127.0.0.1:1"));
         }
         assert!(node.chat.set(Arc::new(service)).is_ok());
-        Some(crate::router::build_router(Arc::new(node)))
+        let token = node.mint_offline_session_token();
+        Some((crate::router::build_router(Arc::new(node)), token))
     }
 
     async fn response_text(response: axum::response::Response) -> String {
@@ -317,15 +318,15 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn post_tool_deploy_list_arbitrary_bearer_is_refused() {
-        let Some(app) = router_with_service(true).await else {
+    async fn post_tool_deploy_list_anonymous_capability_is_refused() {
+        let Some((app, token)) = router_with_service(true).await else {
             eprintln!("SKIP: python3 not on PATH");
             return;
         };
         let request = Request::builder()
             .method("POST")
             .uri("/api/tools/deploy_list/run")
-            .header(header::AUTHORIZATION, "Bearer arbitrary-not-an-identity")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"approve":true}"#))
             .expect("build request");
@@ -345,14 +346,14 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn post_tool_deploy_create_approval_does_not_authorize_anonymous_caller() {
-        let Some(app) = router_with_service(true).await else {
+        let Some((app, token)) = router_with_service(true).await else {
             eprintln!("SKIP: python3 not on PATH");
             return;
         };
         let request = Request::builder()
             .method("POST")
             .uri("/api/tools/deploy_create/run")
-            .header(header::AUTHORIZATION, "Bearer arbitrary-not-an-identity")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 r#"{"name":"test-deployment","image":"example/image","approve":true}"#,
@@ -370,14 +371,14 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn anonymous_standalone_local_tool_still_succeeds() {
-        let Some(app) = router_with_service(false).await else {
+        let Some((app, token)) = router_with_service(false).await else {
             eprintln!("SKIP: python3 not on PATH");
             return;
         };
         let request = Request::builder()
             .method("POST")
             .uri("/api/tools/local_only_test/run")
-            .header(header::AUTHORIZATION, "Bearer arbitrary-local-capability")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from("{}"))
             .expect("build request");

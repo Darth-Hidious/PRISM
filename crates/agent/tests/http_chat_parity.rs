@@ -55,11 +55,25 @@ for line in sys.stdin:
                 "input_schema": {"type": "object", "properties": {}},
                 "requires_approval": True,
             },
+            {
+                "name": "local_env_probe",
+                "description": "Report the LocalOnly worker environment (test only).",
+                "input_schema": {"type": "object", "properties": {}},
+                "requires_approval": False,
+            },
         ]}
     elif method == "call_tool":
         with open(LOG, "a") as f:
             f.write(json.dumps(req) + "\n")
-        resp = {"result": {"ok": True, "tool": req.get("tool")}}
+        if req.get("tool") == "local_env_probe":
+            resp = {"result": {
+                "offline": os.environ.get("PRISM_OFFLINE"),
+                "home": os.environ.get("HOME"),
+                "platform_credential": os.environ.get("MARC27_TOKEN"),
+                "unlisted_credential": os.environ.get("ROUND5_UNLISTED_CREDENTIAL"),
+            }}
+        else:
+            resp = {"result": {"ok": True, "tool": req.get("tool")}}
     else:
         resp = {"error": "unknown method"}
     sys.stdout.write(json.dumps(resp) + "\n")
@@ -104,6 +118,8 @@ enum StubMode {
     /// the test suite…") until the execution-contract reminder shows up in the
     /// history, then answers honestly. Drives the finalization-gate test.
     ClaimsWithoutTools,
+    /// Calls the environment probe once, then completes the turn.
+    EnvironmentProbe,
 }
 
 fn sse_text(text: &str) -> String {
@@ -180,6 +196,8 @@ async fn start_stub_llm_recording(mode: StubMode) -> (String, SystemMessageLog) 
                     StubMode::ClaimsWithoutTools => {
                         sse_text("I ran the test suite and everything passes.")
                     }
+                    StubMode::EnvironmentProbe if last_is_tool => sse_text("ENV_DONE"),
+                    StubMode::EnvironmentProbe => sse_tool_call("local_env_probe"),
                 };
                 axum::response::Response::builder()
                     .header("content-type", "text/event-stream")
@@ -390,7 +408,7 @@ async fn http_chat_service_and_backend_share_loop_and_catalog() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn anonymous_caller_can_resume_own_session_but_not_anothers() {
+async fn offline_caller_resumes_own_session_and_cannot_resume_anothers() {
     let Some(python) = find_python() else {
         eprintln!("SKIP: python3 not on PATH");
         return;
@@ -533,6 +551,67 @@ async fn authenticated_non_owner_can_run_a_local_python_tool_and_chat() {
         "the local Python tool must run under LocalOnly"
     );
     assert!(calls_log.exists(), "the local Python tool must be called");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_only_chat_path_uses_tool_server_without_credential_environment() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let base_url = start_stub_llm(StubMode::EnvironmentProbe).await;
+    let sessions = tempfile::tempdir().expect("sessions dir");
+    let mut tool_server = tool_server_config(project.path(), &python);
+    tool_server
+        .env
+        .insert("MARC27_TOKEN".into(), "node-platform-secret".into());
+    tool_server.env.insert(
+        "ROUND5_UNLISTED_CREDENTIAL".into(),
+        "node-unlisted-secret".into(),
+    );
+    let service = ChatService::spawn(
+        llm_config(base_url),
+        tool_server,
+        Some(sessions.path().to_path_buf()),
+    )
+    .await
+    .expect("spawn chat service");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = service
+        .chat_with_platform_access(
+            ChatRequest {
+                message: "inspect the local worker environment".into(),
+                session_id: None,
+                approve: vec!["local_env_probe".into()],
+            },
+            "authenticated-non-owner",
+            prism_agent::command_tools::CommandToolPlatformAccess::LocalOnly,
+            tx,
+        )
+        .await
+        .expect("LocalOnly chat turn");
+    assert_eq!(outcome.answer, "ENV_DONE");
+
+    let content = drain(&mut rx)
+        .into_iter()
+        .find_map(|event| match event {
+            ChatEvent::ToolResult {
+                tool_name, content, ..
+            } if tool_name == "local_env_probe" => Some(content),
+            _ => None,
+        })
+        .expect("environment probe result");
+    let result: serde_json::Value = serde_json::from_str(&content)
+        .unwrap_or_else(|error| panic!("probe result is not JSON ({error}): {content:?}"));
+    assert_eq!(result["offline"], "1");
+    assert!(result["home"].is_null(), "result: {result}");
+    assert!(result["platform_credential"].is_null(), "result: {result}");
+    assert!(result["unlisted_credential"].is_null(), "result: {result}");
+    assert!(!content.contains("node-platform-secret"));
+    assert!(!content.contains("node-unlisted-secret"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

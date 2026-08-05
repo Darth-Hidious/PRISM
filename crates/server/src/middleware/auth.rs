@@ -103,8 +103,9 @@ struct ErrorBody {
 ///
 /// When `session_db_path` is configured, validates the token against the
 /// [`SessionManager`]. When not configured (standalone/local mode), accepts
-/// the transport token only as a local capability gate and records the caller
-/// as [`ANONYMOUS_LOCAL_USER_ID`]. The token is never an identity.
+/// only a capability minted by this server process and records the caller as
+/// [`ANONYMOUS_LOCAL_USER_ID`]. The token scopes local resources but is never
+/// upgraded into an account identity.
 pub async fn auth_layer(
     State(state): State<Arc<NodeState>>,
     mut req: Request,
@@ -157,10 +158,18 @@ pub async fn auth_layer(
         }
     }
 
-    // Standalone/local mode: the token proves only that the caller reached the
-    // local API seam. It is not an identity and cannot grant platform-owner
-    // authority.
-    tracing::debug!("session DB not configured, treating caller as anonymous-local");
+    // Standalone/local mode: validate the unguessable, process-lifetime
+    // capability minted by POST /api/sessions. This keeps one local process
+    // from choosing another process's chat owner key while preserving resume
+    // for repeated requests carrying the same server-issued token.
+    if !state.is_valid_offline_session_token(&t) {
+        let body = ErrorBody {
+            error: "unauthorized",
+            message: "Session expired or invalid.",
+        };
+        return (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
+    }
+    tracing::debug!("validated standalone process capability");
     let user = AuthenticatedUser::anonymous_local();
     req.extensions_mut().insert(SessionToken(t));
     req.extensions_mut().insert(user);
@@ -256,7 +265,12 @@ mod tests {
     }
 
     #[test]
-    fn standalone_token_never_becomes_identity() {
+    fn standalone_accepts_only_server_issued_process_capabilities() {
+        let state = crate::NodeState::new("offline-test".into());
+        let issued = state.mint_offline_session_token();
+        assert!(state.is_valid_offline_session_token(&issued));
+        assert!(!state.is_valid_offline_session_token("caller-chosen"));
+
         let user = AuthenticatedUser::anonymous_local();
         assert!(user.is_anonymous_local());
         assert!(!user.is_authenticated());

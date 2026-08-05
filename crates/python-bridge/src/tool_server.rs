@@ -35,6 +35,24 @@ pub struct ToolServerHandle {
 impl ToolServer {
     /// Spawn `python3 -m app.tool_server` and return a handle for communication.
     pub async fn spawn(&self) -> Result<ToolServerHandle, PythonBridgeError> {
+        self.spawn_inner(false).await
+    }
+
+    /// Spawn with an empty inherited environment, adding only [`Self::env`].
+    ///
+    /// This is the LocalOnly credential boundary. Callers must construct
+    /// `env` as an allowlist; unlike [`Self::spawn`], a credential added to the
+    /// parent process next month cannot silently appear in this child.
+    pub async fn spawn_with_clean_environment(
+        &self,
+    ) -> Result<ToolServerHandle, PythonBridgeError> {
+        self.spawn_inner(true).await
+    }
+
+    async fn spawn_inner(
+        &self,
+        clear_environment: bool,
+    ) -> Result<ToolServerHandle, PythonBridgeError> {
         let mut cmd = Command::new(&self.python_bin);
         cmd.arg("-m")
             .arg(TOOL_SERVER_MODULE)
@@ -42,10 +60,10 @@ impl ToolServer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        for (key, value) in &self.env {
-            cmd.env(key, value);
+        if clear_environment {
+            cmd.env_clear();
         }
+        cmd.envs(&self.env);
 
         let mut child = cmd.spawn()?;
 
@@ -115,5 +133,67 @@ impl ToolServerHandle {
         self.child.kill().await?;
         tracing::info!("tool server shut down");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn python_executable() -> Option<PathBuf> {
+        let output = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string()))
+    }
+
+    #[tokio::test]
+    async fn clean_environment_worker_inherits_nothing_and_keeps_explicit_offline_flag() {
+        let Some(python_bin) = python_executable() else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+        let project = tempfile::tempdir().expect("temp project");
+        let app = project.path().join("app");
+        std::fs::create_dir_all(&app).expect("create app package");
+        std::fs::write(app.join("__init__.py"), "").expect("write package marker");
+        std::fs::write(
+            app.join("tool_server.py"),
+            r#"import json
+import os
+import sys
+for line in sys.stdin:
+    request = json.loads(line)
+    response = {"result": {
+        "offline": os.environ.get("PRISM_OFFLINE"),
+        "home": os.environ.get("HOME"),
+    }}
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .expect("write worker");
+
+        let server = ToolServer {
+            python_bin,
+            project_root: project.path().to_path_buf(),
+            env: BTreeMap::from([("PRISM_OFFLINE".to_string(), "1".to_string())]),
+        };
+        let mut worker = server
+            .spawn_with_clean_environment()
+            .await
+            .expect("spawn clean worker");
+        let response = worker
+            .call_tool("environment_probe", serde_json::json!({}))
+            .await
+            .expect("call environment probe");
+
+        assert_eq!(response["result"]["offline"], "1");
+        assert!(response["result"]["home"].is_null(), "response: {response}");
+        worker.shutdown().await.expect("shutdown worker");
     }
 }

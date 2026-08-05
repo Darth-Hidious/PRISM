@@ -1120,6 +1120,76 @@ enum CommandExecution {
     NotebookReset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandExecutionAccessRequirement {
+    LocalOnlyAllowed,
+    VerifiedNodeOwner,
+}
+
+/// Access token minted only after the exhaustive command-execution gate.
+/// Executors accept this token rather than raw caller state, so dispatch
+/// cannot grow a privileged arm that bypasses access resolution.
+#[derive(Debug, Clone, Copy)]
+struct GatedCommandExecutionAccess {
+    platform_access: CommandToolPlatformAccess,
+}
+
+/// Capability accepted by un-sandboxed notebook operations. The only minting
+/// path is the central gate after it has verified node-owner access.
+#[derive(Debug, Clone, Copy)]
+struct VerifiedNodeOwnerExecutionAccess;
+
+impl GatedCommandExecutionAccess {
+    fn platform_access(self) -> CommandToolPlatformAccess {
+        self.platform_access
+    }
+
+    fn verified_node_owner(self) -> Result<VerifiedNodeOwnerExecutionAccess> {
+        matches!(
+            self.platform_access,
+            CommandToolPlatformAccess::VerifiedNodeOwner
+        )
+        .then_some(VerifiedNodeOwnerExecutionAccess)
+        .ok_or_else(platform_access_refusal)
+    }
+}
+
+/// Exhaustive by design. Adding a new [`CommandExecution`] variant is a type
+/// error until its required access level is declared here; there is no default
+/// arm and no privileged fallback.
+fn gate_command_execution(
+    execution: &CommandExecution,
+    platform_access: CommandToolPlatformAccess,
+) -> Result<GatedCommandExecutionAccess> {
+    let requirement = match execution {
+        CommandExecution::Cli { .. }
+        | CommandExecution::WorkflowList
+        | CommandExecution::WorkflowShow { .. }
+        | CommandExecution::WorkflowRun { .. }
+        | CommandExecution::NotebookStatus => CommandExecutionAccessRequirement::LocalOnlyAllowed,
+        CommandExecution::NotebookExec { .. } | CommandExecution::NotebookReset => {
+            CommandExecutionAccessRequirement::VerifiedNodeOwner
+        }
+    };
+
+    match (platform_access, requirement) {
+        (CommandToolPlatformAccess::UnverifiedHttp, _)
+        | (
+            CommandToolPlatformAccess::LocalOnly,
+            CommandExecutionAccessRequirement::VerifiedNodeOwner,
+        ) => Err(platform_access_refusal()),
+        (
+            CommandToolPlatformAccess::VerifiedNodeOwner,
+            CommandExecutionAccessRequirement::LocalOnlyAllowed
+            | CommandExecutionAccessRequirement::VerifiedNodeOwner,
+        )
+        | (
+            CommandToolPlatformAccess::LocalOnly,
+            CommandExecutionAccessRequirement::LocalOnlyAllowed,
+        ) => Ok(GatedCommandExecutionAccess { platform_access }),
+    }
+}
+
 fn empty_schema() -> Value {
     json!({
         "type": "object",
@@ -3947,11 +4017,9 @@ async fn execute_cli_command(
     root: &'static str,
     args: &[String],
     invocation: &str,
-    platform_access: CommandToolPlatformAccess,
+    execution_access: GatedCommandExecutionAccess,
 ) -> Result<Value> {
-    if matches!(platform_access, CommandToolPlatformAccess::UnverifiedHttp) {
-        return Err(platform_access_refusal());
-    }
+    let platform_access = execution_access.platform_access();
 
     // Chokepoint: every `CommandExecution::Cli` lands here, including the
     // ones whose args are assembled by the typed builders rather than
@@ -4042,8 +4110,9 @@ async fn execute_workflow_command(
     execution: &CommandExecution,
     invocation: &str,
     policy: Option<&mut prism_policy::PolicyEngine>,
-    platform_access: CommandToolPlatformAccess,
+    execution_access: GatedCommandExecutionAccess,
 ) -> Result<Value> {
+    let platform_access = execution_access.platform_access();
     let result = match execution {
         CommandExecution::WorkflowList => {
             let specs = discover_workflows(Some(&runtime.project_root))?;
@@ -4343,24 +4412,24 @@ pub async fn execute_command_tool_with_platform_access(
         .ok_or_else(|| anyhow::anyhow!("unknown internal command tool: {tool_name}"))?;
     let execution = build_execution(spec, args)?;
     let invocation = format_execution_invocation(&execution);
+    // Resolve access ONCE before dispatch. `gate_command_execution` is an
+    // exhaustive match over CommandExecution, so a newly added dispatch arm
+    // cannot compile until its access requirement is declared.
+    let execution_access = gate_command_execution(&execution, platform_access)?;
 
     match &execution {
         CommandExecution::Cli { root, args }
             if *root == "node" && is_node_lifecycle_subcommand(args) =>
         {
-            if !node_lifecycle_allowed(platform_access) {
-                Err(platform_access_refusal())
-            } else {
-                execute_node_lifecycle(runtime, args, &invocation, platform_access).await
-            }
+            execute_node_lifecycle(runtime, args, &invocation, execution_access).await
         }
         CommandExecution::Cli { root, args } => {
-            execute_cli_command(runtime, root, args, &invocation, platform_access).await
+            execute_cli_command(runtime, root, args, &invocation, execution_access).await
         }
         CommandExecution::WorkflowList
         | CommandExecution::WorkflowShow { .. }
         | CommandExecution::WorkflowRun { .. } => {
-            execute_workflow_command(runtime, &execution, &invocation, policy, platform_access)
+            execute_workflow_command(runtime, &execution, &invocation, policy, execution_access)
                 .await
         }
         CommandExecution::NotebookExec {
@@ -4376,11 +4445,16 @@ pub async fn execute_command_tool_with_platform_access(
                 *reset,
                 *include_images_base64,
                 &invocation,
+                execution_access.verified_node_owner()?,
             )
             .await
         }
-        CommandExecution::NotebookStatus => Ok(notebook_status_result(&invocation)),
-        CommandExecution::NotebookReset => Ok(notebook_reset_result(&invocation).await),
+        CommandExecution::NotebookStatus => {
+            Ok(notebook_status_result(&invocation, execution_access))
+        }
+        CommandExecution::NotebookReset => {
+            Ok(notebook_reset_result(&invocation, execution_access.verified_node_owner()?).await)
+        }
     }
 }
 
@@ -4396,6 +4470,7 @@ async fn execute_notebook(
     reset: bool,
     include_images_base64: bool,
     invocation: &str,
+    _owner_access: VerifiedNodeOwnerExecutionAccess,
 ) -> Result<Value> {
     // Point the kernel at PRISM's managed interpreter + the project root, the
     // same environment the Python tool server runs in.
@@ -4540,7 +4615,10 @@ fn compose_notebook_result(
     })
 }
 
-fn notebook_status_result(invocation: &str) -> Value {
+fn notebook_status_result(
+    invocation: &str,
+    _execution_access: GatedCommandExecutionAccess,
+) -> Value {
     let status = crate::notebook::status();
     let summary = if status.running {
         format!(
@@ -4571,7 +4649,10 @@ fn notebook_status_result(invocation: &str) -> Value {
     })
 }
 
-async fn notebook_reset_result(invocation: &str) -> Value {
+async fn notebook_reset_result(
+    invocation: &str,
+    _owner_access: VerifiedNodeOwnerExecutionAccess,
+) -> Value {
     // Surface the real reason on failure (e.g. "kernel is busy running a
     // cell") — a generic "encountered an error" would hide the fix.
     let (success, stdout, stderr) = match crate::notebook::reset().await {
@@ -4610,16 +4691,13 @@ fn is_node_lifecycle_subcommand(args: &[String]) -> bool {
     )
 }
 
-fn node_lifecycle_allowed(platform_access: CommandToolPlatformAccess) -> bool {
-    !matches!(platform_access, CommandToolPlatformAccess::UnverifiedHttp)
-}
-
 async fn execute_node_lifecycle(
     runtime: &CommandToolRuntime,
     args: &[String],
     invocation: &str,
-    platform_access: CommandToolPlatformAccess,
+    execution_access: GatedCommandExecutionAccess,
 ) -> Result<Value> {
+    let platform_access = execution_access.platform_access();
     let result = match args[0].as_str() {
         "up" => crate::node_supervisor::node_up(runtime, &args[1..], platform_access).await,
         // "down" (the CLI verb) and "stop" (the palette verb) are synonyms.
@@ -4672,12 +4750,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn non_owner_cannot_reach_notebook_exec_with_node_privilege() {
+        let error = execute_command_tool_with_platform_access(
+            &CommandToolRuntime::default(),
+            "notebook_exec",
+            &json!({"code": "1 + 1"}),
+            None,
+            CommandToolPlatformAccess::LocalOnly,
+        )
+        .await
+        .expect_err("LocalOnly callers must be refused before a notebook kernel can spawn");
+
+        assert!(
+            error.to_string().contains("verified node-owner session"),
+            "refusal must identify the missing owner verification: {error:#}"
+        );
+    }
+
     #[test]
-    fn standalone_node_up_does_not_require_platform_access() {
-        assert!(node_lifecycle_allowed(CommandToolPlatformAccess::LocalOnly));
-        assert!(!node_lifecycle_allowed(
-            CommandToolPlatformAccess::UnverifiedHttp
-        ));
+    fn new_dispatch_arm_cannot_skip_the_central_access_gate() {
+        let executions = [
+            CommandExecution::Cli {
+                root: "node",
+                args: vec!["up".into()],
+            },
+            CommandExecution::WorkflowList,
+            CommandExecution::WorkflowShow {
+                name: "example".into(),
+            },
+            CommandExecution::WorkflowRun {
+                name: "example".into(),
+                values: BTreeMap::new(),
+                execute: true,
+            },
+            CommandExecution::NotebookExec {
+                code: "1 + 1".into(),
+                timeout: None,
+                reset: false,
+                include_images_base64: false,
+            },
+            CommandExecution::NotebookStatus,
+            CommandExecution::NotebookReset,
+        ];
+
+        for execution in &executions {
+            assert!(
+                gate_command_execution(execution, CommandToolPlatformAccess::UnverifiedHttp)
+                    .is_err(),
+                "every dispatch arm must fail closed for unverified HTTP: {execution:?}"
+            );
+        }
+        assert!(
+            gate_command_execution(&executions[0], CommandToolPlatformAccess::LocalOnly).is_ok(),
+            "standalone node lifecycle remains available"
+        );
+        assert!(
+            gate_command_execution(&executions[4], CommandToolPlatformAccess::LocalOnly).is_err(),
+            "un-sandboxed notebook execution is owner-only"
+        );
+        assert!(
+            gate_command_execution(&executions[6], CommandToolPlatformAccess::LocalOnly).is_err(),
+            "shared notebook reset is owner-only"
+        );
     }
 
     #[cfg(unix)]

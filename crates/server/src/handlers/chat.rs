@@ -76,22 +76,12 @@ fn chat_service(state: &NodeState) -> Option<Arc<ChatService>> {
     state.chat.get().cloned()
 }
 
-fn chat_owner(user: &AuthenticatedUser, token: &SessionToken, persistent_sessions: bool) -> String {
+fn chat_owner(user: &AuthenticatedUser, token: &SessionToken) -> String {
     if user.is_anonymous_local() {
-        if persistent_sessions {
-            // The session database validated this bearer token, so it is a
-            // real transport capability and can safely scope anonymous chat.
-            anonymous_caller_id(&token.0)
-        } else {
-            // Offline auth accepts any non-empty bearer string. It therefore
-            // cannot establish caller identity. Use a fresh, non-resumable
-            // owner key instead of persisting a caller-chosen bearer token.
-            format!(
-                "{}:offline:{}",
-                prism_agent::service::ANONYMOUS_LOCAL_USER_ID,
-                uuid::Uuid::new_v4()
-            )
-        }
+        // auth_layer has validated either a durable session row or an
+        // unguessable process-lifetime standalone capability. Hash it into a
+        // stable owner key without persisting the bearer itself.
+        anonymous_caller_id(&token.0)
     } else {
         user.user_id.clone()
     }
@@ -127,7 +117,7 @@ pub async fn chat(
     if params.stream {
         // The service always terminates the stream with a `done` or
         // `error` event, so clients never hang on failures.
-        let owner = chat_owner(&user, &token, state.session_db_path.is_some());
+        let owner = chat_owner(&user, &token);
         tokio::spawn(async move {
             let _ = service
                 .chat_with_platform_access(request, &owner, platform_access, tx)
@@ -151,7 +141,7 @@ pub async fn chat(
     } else {
         // Non-streaming: drain events into the void, return the outcome.
         drop(rx);
-        let owner = chat_owner(&user, &token, state.session_db_path.is_some());
+        let owner = chat_owner(&user, &token);
         match service
             .chat_with_platform_access(request, &owner, platform_access, tx)
             .await
@@ -185,7 +175,7 @@ pub async fn list_sessions(
     let Some(service) = chat_service(&state) else {
         return service_unavailable();
     };
-    let owner = chat_owner(&user, &token, state.session_db_path.is_some());
+    let owner = chat_owner(&user, &token);
     Json(serde_json::json!({ "sessions": service.list_sessions(&owner) })).into_response()
 }
 
@@ -199,7 +189,7 @@ pub async fn get_session(
     let Some(service) = chat_service(&state) else {
         return service_unavailable();
     };
-    let owner = chat_owner(&user, &token, state.session_db_path.is_some());
+    let owner = chat_owner(&user, &token);
     match service.read_session(&id, &owner) {
         Ok(messages) => Json(serde_json::json!({
             "session_id": id,
@@ -220,15 +210,22 @@ mod tests {
     use crate::middleware::{AuthenticatedUser, SessionToken};
 
     #[test]
-    fn offline_chat_owner_is_not_derived_from_a_caller_chosen_bearer() {
+    fn offline_chat_owner_is_stable_for_own_capability_and_scoped_from_anothers() {
+        let state = crate::NodeState::new("offline-test".into());
+        let token_a = state.mint_offline_session_token();
+        let token_b = state.mint_offline_session_token();
         let user = AuthenticatedUser::anonymous_local();
-        let owner_a = chat_owner(&user, &SessionToken("caller-a".into()), false);
-        let owner_b = chat_owner(&user, &SessionToken("caller-b".into()), false);
+        let owner_a = chat_owner(&user, &SessionToken(token_a.clone()));
+        let owner_a_again = chat_owner(&user, &SessionToken(token_a.clone()));
+        let owner_b = chat_owner(&user, &SessionToken(token_b.clone()));
 
+        assert!(state.is_valid_offline_session_token(&token_a));
+        assert!(state.is_valid_offline_session_token(&token_b));
+        assert_eq!(owner_a, owner_a_again);
         assert_ne!(owner_a, owner_b);
-        assert!(!owner_a.contains("caller-a"));
-        assert!(!owner_b.contains("caller-b"));
-        assert_ne!(owner_a, anonymous_caller_id("caller-a"));
-        assert_ne!(owner_b, anonymous_caller_id("caller-b"));
+        assert!(!owner_a.contains(&token_a));
+        assert!(!owner_b.contains(&token_b));
+        assert_eq!(owner_a, anonymous_caller_id(&token_a));
+        assert_eq!(owner_b, anonymous_caller_id(&token_b));
     }
 }

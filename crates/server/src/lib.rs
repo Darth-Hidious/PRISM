@@ -18,6 +18,7 @@ pub mod middleware;
 pub mod router;
 pub mod ws;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
@@ -71,6 +72,10 @@ pub struct NodeState {
     pub rbac_db_path: Option<PathBuf>,
     /// Path to the session SQLite database.
     pub session_db_path: Option<PathBuf>,
+    /// Server-issued bearer capabilities for standalone mode. They live only
+    /// for this process: stable enough for chat resume, unguessable by another
+    /// local process, and intentionally invalid after a server restart.
+    offline_session_tokens: RwLock<HashSet<String>>,
     /// In-memory tool registry (populated by scanning tool directories).
     pub tool_registry: RwLock<prism_core::registry::ToolRegistry>,
     /// Mesh handle for peer discovery.
@@ -124,6 +129,7 @@ impl NodeState {
             audit_db_path: None,
             rbac_db_path: None,
             session_db_path: None,
+            offline_session_tokens: RwLock::new(HashSet::new()),
             tool_registry: RwLock::new(prism_core::registry::ToolRegistry::new()),
             mesh: RwLock::new(prism_mesh::MeshHandle::Offline),
             subscriptions: Arc::new(RwLock::new(
@@ -140,6 +146,22 @@ impl NodeState {
             chat: OnceLock::new(),
             federation_audit: None,
         }
+    }
+
+    pub(crate) fn mint_offline_session_token(&self) -> String {
+        let token = Uuid::new_v4().to_string();
+        self.offline_session_tokens
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(token.clone());
+        token
+    }
+
+    pub(crate) fn is_valid_offline_session_token(&self, token: &str) -> bool {
+        self.offline_session_tokens
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(token)
     }
 
     /// Broadcast a [`WsEvent`] to all connected WebSocket clients.
