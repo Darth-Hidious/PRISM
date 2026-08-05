@@ -8,17 +8,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::NodeState;
+use crate::middleware::{ANONYMOUS_LOCAL_USER_ID, VERIFIED_SESSION_PREFIX};
 
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
+    /// Compatibility hint retained for older clients. It is never used as an
+    /// identity; loopback requests without a verifiable platform token become
+    /// [`ANONYMOUS_LOCAL_USER_ID`].
     #[serde(default)]
-    pub user_id: String,
+    pub user_id: Option<String>,
     pub display_name: Option<String>,
     pub platform_role: Option<String>,
     /// MARC27 platform token (from `prism login` / the platform device flow).
-    /// REQUIRED for non-loopback callers: the node verifies it against the
-    /// platform and mints the session for the VERIFIED identity — a remote
-    /// caller can never just claim a user_id.
+    /// The node verifies it against the platform and mints the session for the
+    /// VERIFIED identity — a caller can never just claim a user_id.
     #[serde(default)]
     pub platform_token: Option<String>,
 }
@@ -39,11 +42,11 @@ pub struct ErrorResponse {
 /// connects from and what they presented. Pure so it's unit-testable.
 #[derive(Debug, PartialEq, Eq)]
 enum SessionGate {
-    /// Loopback caller — the same-machine trust that has always existed
-    /// (TUI, dashboard, local chat app). Claimed user_id is accepted.
-    LocalTrust,
-    /// Remote caller with a platform token — verify it, mint for the
-    /// verified identity.
+    /// Loopback caller without an independently verifiable account. This is
+    /// local capability access only; submitted user_id is ignored.
+    AnonymousLocal,
+    /// Caller with a platform token — verify it, then mint for the verified
+    /// identity.
     VerifyPlatformToken,
     /// Remote caller with no token — refused. This is the gate that keeps
     /// the port safe when it leaves localhost.
@@ -51,10 +54,10 @@ enum SessionGate {
 }
 
 fn session_gate(is_loopback: bool, platform_token: Option<&str>) -> SessionGate {
-    if is_loopback {
-        SessionGate::LocalTrust
-    } else if platform_token.is_some_and(|t| !t.trim().is_empty()) {
+    if platform_token.is_some_and(|t| !t.trim().is_empty()) {
         SessionGate::VerifyPlatformToken
+    } else if is_loopback {
+        SessionGate::AnonymousLocal
     } else {
         SessionGate::Refuse
     }
@@ -62,11 +65,11 @@ fn session_gate(is_loopback: bool, platform_token: Option<&str>) -> SessionGate 
 
 /// POST /api/sessions — create a new session (login).
 ///
-/// Loopback callers keep the same-machine trust that always existed. Any
-/// OTHER caller must present a MARC27 platform token (device flow via
+/// Loopback callers keep local capability access without an account, but the
+/// submitted `user_id` is ignored. Any caller that needs an authenticated
+/// account session must present a MARC27 platform token (device flow via
 /// `prism login`); the node verifies it against the platform and mints the
-/// session for the VERIFIED identity — no remote caller can mint a session
-/// by merely claiming a user_id.
+/// session for the VERIFIED identity.
 pub async fn create_session(
     State(state): State<Arc<NodeState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -76,14 +79,14 @@ pub async fn create_session(
         addr.ip().is_loopback(),
         body.platform_token.as_deref(),
     ) {
-        SessionGate::LocalTrust => body.user_id.clone(),
+        SessionGate::AnonymousLocal => ANONYMOUS_LOCAL_USER_ID.to_string(),
         SessionGate::Refuse => {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse {
                     error: "Remote session creation requires a `platform_token` \
                             (obtain one with `prism login` — the platform device \
-                            flow); a bare user_id is only trusted from localhost."
+                            flow); a bare user_id never establishes identity."
                         .into(),
                 }),
             ));
@@ -158,11 +161,23 @@ pub async fn create_session(
             )
         })?;
 
+    let session_user_id = if verified_user_id == ANONYMOUS_LOCAL_USER_ID {
+        ANONYMOUS_LOCAL_USER_ID.to_string()
+    } else {
+        format!("{VERIFIED_SESSION_PREFIX}{verified_user_id}")
+    };
+
     let session = mgr
         .create_session(
-            &verified_user_id,
+            &session_user_id,
             body.display_name.as_deref(),
-            body.platform_role.as_deref(),
+            // A submitted platform role is also only metadata. Do not attach
+            // caller-asserted authority to an anonymous-local session.
+            if verified_user_id == ANONYMOUS_LOCAL_USER_ID {
+                None
+            } else {
+                body.platform_role.as_deref()
+            },
         )
         .map_err(|e| {
             tracing::error!(error = %e, "failed to create session");
@@ -181,8 +196,8 @@ pub async fn create_session(
         user_id: verified_user_id.clone(),
         action: prism_core::audit::AuditAction::UserLogin,
         target: "session".into(),
-        detail: Some(if addr.ip().is_loopback() {
-            "loopback local trust".into()
+        detail: Some(if verified_user_id == ANONYMOUS_LOCAL_USER_ID {
+            "anonymous-local session; submitted identity ignored".into()
         } else {
             format!("platform-verified remote session from {addr}")
         }),
@@ -191,7 +206,8 @@ pub async fn create_session(
 
     Ok(Json(SessionResponse {
         session_id: session.id,
-        user_id: session.user_id,
+        // Return the verified external identity, not the internal marker.
+        user_id: verified_user_id,
         expires_at: session.expires_at.to_rfc3339(),
     }))
 }
@@ -245,12 +261,22 @@ pub async fn destroy_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionGate, session_gate};
+    use super::{CreateSessionRequest, SessionGate, create_session, session_gate};
+    use crate::NodeState;
+    use crate::middleware::ANONYMOUS_LOCAL_USER_ID;
+    use axum::Json;
 
     #[test]
-    fn loopback_keeps_local_trust_with_or_without_token() {
-        assert_eq!(session_gate(true, None), SessionGate::LocalTrust);
-        assert_eq!(session_gate(true, Some("tok")), SessionGate::LocalTrust);
+    fn loopback_without_token_is_anonymous_local() {
+        assert_eq!(session_gate(true, None), SessionGate::AnonymousLocal);
+    }
+
+    #[test]
+    fn a_platform_token_is_verified_even_from_loopback() {
+        assert_eq!(
+            session_gate(true, Some("tok")),
+            SessionGate::VerifyPlatformToken
+        );
     }
 
     #[test]
@@ -268,5 +294,41 @@ mod tests {
             session_gate(false, Some("m27_realtoken")),
             SessionGate::VerifyPlatformToken
         );
+    }
+
+    #[tokio::test]
+    async fn submitted_user_id_does_not_become_session_identity() {
+        use axum::extract::{ConnectInfo, State};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let mut node = NodeState::new("test-node".into());
+        let db = tempfile::NamedTempFile::new().unwrap();
+        node.session_db_path = Some(db.path().to_path_buf());
+        let state = std::sync::Arc::new(node);
+        let response = create_session(
+            State(state),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234)),
+            Json(CreateSessionRequest {
+                user_id: Some("victim@example.com".into()),
+                display_name: Some("local".into()),
+                platform_role: Some("owner".into()),
+                platform_token: None,
+            }),
+        )
+        .await;
+        let response = match response {
+            Ok(Json(response)) => response,
+            Err((_status, Json(error))) => panic!("session creation failed: {}", error.error),
+        };
+
+        assert_eq!(response.user_id, ANONYMOUS_LOCAL_USER_ID);
+        let manager =
+            prism_core::session::SessionManager::new(db.path(), chrono::Duration::hours(24))
+                .unwrap();
+        let stored = manager
+            .validate_session(&response.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.user_id, ANONYMOUS_LOCAL_USER_ID);
     }
 }

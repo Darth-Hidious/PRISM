@@ -164,7 +164,13 @@ pub async fn run_tool(
     let args = build_tool_args(&body);
 
     match service
-        .invoke_tool(&name, args, Some(&user.user_id), approve)
+        .invoke_tool_with_actor(
+            &name,
+            args,
+            Some(&user.user_id),
+            user.provenance_actor(),
+            approve,
+        )
         .await
     {
         Ok(result) => Json(serde_json::json!({ "tool": name, "result": result })).into_response(),

@@ -81,6 +81,10 @@ pub struct NodeState {
     pub llm: Option<prism_ingest::LlmConfig>,
     /// Platform API client (set when node is registered with MARC27 platform).
     pub platform_client: Option<prism_client::PlatformClient>,
+    /// Identity returned by the linked platform credential's `/users/me`.
+    /// Cached after the first owner-authorized request; it is never supplied
+    /// by an HTTP caller.
+    pub platform_owner_id: OnceLock<String>,
     /// Broadcast channel for live WebSocket updates to the dashboard.
     pub ws_broadcast: broadcast::Sender<String>,
     /// Current number of active WebSocket connections (used to enforce concurrency limit).
@@ -127,6 +131,7 @@ impl NodeState {
             )),
             llm: None,
             platform_client: None,
+            platform_owner_id: OnceLock::new(),
             ws_broadcast,
             ws_connections: AtomicUsize::new(0),
             kafka_producer: OnceLock::new(),

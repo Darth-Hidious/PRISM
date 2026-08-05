@@ -301,6 +301,23 @@ impl ChatService {
         caller: Option<&str>,
         approve: bool,
     ) -> Result<serde_json::Value> {
+        self.invoke_tool_with_actor(name, args, caller, prism_provenance::Actor::User, approve)
+            .await
+    }
+
+    /// Execute a one-shot tool with an actor classification derived by the
+    /// authenticated transport. The legacy [`Self::invoke_tool`] entry point
+    /// remains for non-HTTP callers; server handlers use this method so
+    /// anonymous-local and session-authenticated requests are not recorded as
+    /// an unqualified user.
+    pub async fn invoke_tool_with_actor(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        caller: Option<&str>,
+        actor: prism_provenance::Actor,
+        approve: bool,
+    ) -> Result<serde_json::Value> {
         // Pre-execution rejections. Computed (not early-returned) so REFUSALS
         // reach the audit trail below — a denied attempt is at least as
         // audit-worthy as a successful run.
@@ -372,7 +389,7 @@ impl ChatService {
             let mut record = prism_provenance::new_record(
                 &format!("invoke:{}", caller.unwrap_or("unspecified")),
                 prism_provenance::ActionType::ToolCall,
-                prism_provenance::Actor::User,
+                actor,
                 Some(name),
                 None,
                 args,

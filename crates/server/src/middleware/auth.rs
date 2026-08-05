@@ -25,10 +25,72 @@ use crate::NodeState;
 #[derive(Debug, Clone)]
 pub struct SessionToken(pub String);
 
-/// Newtype inserted into request extensions representing the authenticated user.
+/// Stable principal used when the node has no session database. This is an
+/// honest local capability identity, not a user-selected or token-selected id.
+pub const ANONYMOUS_LOCAL_USER_ID: &str = "anonymous-local";
+/// Internal marker written only after a platform token has been verified.
+/// Legacy/raw session rows are therefore never upgraded into authenticated
+/// identities by merely existing in the session database.
+pub const VERIFIED_SESSION_PREFIX: &str = "authenticated:";
+
+/// How the node established the caller identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallerIdentity {
+    /// The request is local, but no authenticated account identity is known.
+    AnonymousLocal,
+    /// The session database validated this account identity.
+    Authenticated { user_id: String },
+}
+
+/// Newtype inserted into request extensions representing the caller.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedUser {
+    /// Stable principal used by local ownership and audit scoping. For an
+    /// anonymous-local caller this is always [`ANONYMOUS_LOCAL_USER_ID`].
     pub user_id: String,
+    identity: CallerIdentity,
+}
+
+impl AuthenticatedUser {
+    pub fn anonymous_local() -> Self {
+        Self {
+            user_id: ANONYMOUS_LOCAL_USER_ID.to_string(),
+            identity: CallerIdentity::AnonymousLocal,
+        }
+    }
+
+    pub(crate) fn from_session_user_id(session_user_id: String) -> Self {
+        let Some(user_id) = session_user_id.strip_prefix(VERIFIED_SESSION_PREFIX) else {
+            return Self::anonymous_local();
+        };
+        if user_id.is_empty() || user_id == ANONYMOUS_LOCAL_USER_ID {
+            return Self::anonymous_local();
+        }
+        Self {
+            identity: CallerIdentity::Authenticated {
+                user_id: user_id.to_string(),
+            },
+            user_id: user_id.to_string(),
+        }
+    }
+
+    /// True only when a session database established the account identity.
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self.identity, CallerIdentity::Authenticated { .. })
+    }
+
+    pub fn is_anonymous_local(&self) -> bool {
+        matches!(self.identity, CallerIdentity::AnonymousLocal)
+    }
+
+    /// Actor classification derived by the server, never from request JSON.
+    pub fn provenance_actor(&self) -> prism_provenance::Actor {
+        if self.is_anonymous_local() {
+            prism_provenance::Actor::AnonymousLocal
+        } else {
+            prism_provenance::Actor::AuthenticatedUser
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -40,8 +102,9 @@ struct ErrorBody {
 /// Axum middleware that extracts and validates a session token.
 ///
 /// When `session_db_path` is configured, validates the token against the
-/// [`SessionManager`]. When not configured (e.g. during startup or tests),
-/// falls back to treating the token as the user_id directly.
+/// [`SessionManager`]. When not configured (standalone/local mode), accepts
+/// the transport token only as a local capability gate and records the caller
+/// as [`ANONYMOUS_LOCAL_USER_ID`]. The token is never an identity.
 pub async fn auth_layer(
     State(state): State<Arc<NodeState>>,
     mut req: Request,
@@ -62,9 +125,7 @@ pub async fn auth_layer(
         match prism_core::session::SessionManager::new(db_path, chrono::Duration::hours(24)) {
             Ok(mgr) => match mgr.validate_session(&t) {
                 Ok(Some(session)) => {
-                    let user = AuthenticatedUser {
-                        user_id: session.user_id,
-                    };
+                    let user = AuthenticatedUser::from_session_user_id(session.user_id);
                     req.extensions_mut().insert(SessionToken(t));
                     req.extensions_mut().insert(user);
                     return next.run(req).await;
@@ -96,9 +157,11 @@ pub async fn auth_layer(
         }
     }
 
-    // Fallback: no session DB configured — treat token as user_id (localhost-only mode).
-    tracing::debug!("session DB not configured, using token as user_id");
-    let user = AuthenticatedUser { user_id: t.clone() };
+    // Standalone/local mode: the token proves only that the caller reached the
+    // local API seam. It is not an identity and cannot grant platform-owner
+    // authority.
+    tracing::debug!("session DB not configured, treating caller as anonymous-local");
+    let user = AuthenticatedUser::anonymous_local();
     req.extensions_mut().insert(SessionToken(t));
     req.extensions_mut().insert(user);
     next.run(req).await
@@ -190,5 +253,31 @@ mod tests {
     fn none_when_missing() {
         let headers = HeaderMap::new();
         assert_eq!(extract_token(&headers, None), None);
+    }
+
+    #[test]
+    fn standalone_token_never_becomes_identity() {
+        let user = AuthenticatedUser::anonymous_local();
+        assert!(user.is_anonymous_local());
+        assert!(!user.is_authenticated());
+        assert_eq!(user.user_id, ANONYMOUS_LOCAL_USER_ID);
+        assert_ne!(user.user_id, "attacker-selected-token");
+        assert_eq!(
+            user.provenance_actor(),
+            prism_provenance::Actor::AnonymousLocal
+        );
+    }
+
+    #[test]
+    fn validated_session_identity_is_distinct_from_anonymous_local() {
+        let user =
+            AuthenticatedUser::from_session_user_id(format!("{VERIFIED_SESSION_PREFIX}owner-123"));
+        assert!(user.is_authenticated());
+        assert!(!user.is_anonymous_local());
+        assert_eq!(user.user_id, "owner-123");
+        assert_eq!(
+            user.provenance_actor(),
+            prism_provenance::Actor::AuthenticatedUser
+        );
     }
 }

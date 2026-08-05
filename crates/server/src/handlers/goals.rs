@@ -74,7 +74,13 @@ async fn run_goal_tool(
     // IS the explicit approval — same contract as `approve: true` on
     // /api/tools/{name}/run.
     match service
-        .invoke_tool(tool, args, Some(&user.user_id), true)
+        .invoke_tool_with_actor(
+            tool,
+            args,
+            Some(&user.user_id),
+            user.provenance_actor(),
+            true,
+        )
         .await
     {
         Ok(result) => (

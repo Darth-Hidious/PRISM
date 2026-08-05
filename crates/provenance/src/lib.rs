@@ -101,7 +101,15 @@ impl ActionType {
 #[serde(rename_all = "snake_case")]
 pub enum Actor {
     Agent,
+    /// Legacy unqualified user actor. New request-bound records should use
+    /// [`Actor::AnonymousLocal`] or [`Actor::AuthenticatedUser`].
     User,
+    /// A local caller whose identity was not established by a session.
+    AnonymousLocal,
+    /// A caller whose identity was established by a validated node session.
+    AuthenticatedUser,
+    /// A caller whose validated identity matched the node owner.
+    AuthenticatedOwner,
     System,
     Scheduler,
 }
@@ -111,6 +119,9 @@ impl Actor {
         match self {
             Self::Agent => "agent",
             Self::User => "user",
+            Self::AnonymousLocal => "anonymous_local",
+            Self::AuthenticatedUser => "authenticated_user",
+            Self::AuthenticatedOwner => "authenticated_owner",
             Self::System => "system",
             Self::Scheduler => "scheduler",
         }
@@ -331,15 +342,25 @@ impl ProvenanceStore {
         Ok(records)
     }
 
-    pub async fn query_chain(&self, record_id: &str) -> Result<Vec<ProvenanceRecord>> {
+    /// Return a record's parent chain without crossing a session boundary.
+    ///
+    /// The session is caller-provided context established by the authenticated
+    /// agent/session path; the record id alone is not an authorization proof.
+    /// A missing record in that session returns an empty chain, so an id from a
+    /// different session is indistinguishable from an unknown id.
+    pub async fn query_chain(
+        &self,
+        record_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<ProvenanceRecord>> {
         let mut chain = Vec::new();
         let mut current_id = Some(record_id.to_string());
         while let Some(id) = current_id {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT * FROM provenance_records WHERE id = ?1",
-                    [Value::Text(id)],
+                    "SELECT * FROM provenance_records WHERE id = ?1 AND session_id = ?2",
+                    [Value::Text(id), Value::Text(session_id.to_string())],
                 )
                 .await?;
             if let Some(row) = rows.next().await? {
@@ -592,6 +613,9 @@ fn row_to_record(row: &turso::Row) -> Result<ProvenanceRecord> {
     let actor = match get_str(row, 4)?.as_str() {
         "agent" => Actor::Agent,
         "user" => Actor::User,
+        "anonymous_local" => Actor::AnonymousLocal,
+        "authenticated_user" => Actor::AuthenticatedUser,
+        "authenticated_owner" => Actor::AuthenticatedOwner,
         "system" => Actor::System,
         "scheduler" => Actor::Scheduler,
         _ => Actor::System,
@@ -748,10 +772,42 @@ mod tests {
         child.material_ref = Some("Ni0.5 Cr0.3 Co0.2".to_string());
         store.record(&child).await.unwrap();
 
-        let chain = store.query_chain(&child.id).await.unwrap();
+        let chain = store.query_chain(&child.id, "s1").await.unwrap();
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].id, parent.id);
         assert_eq!(chain[1].id, child.id);
+
+        // A caller in another session cannot use a record id to traverse this
+        // chain. The boundary is enforced at every parent lookup.
+        assert!(store.query_chain(&child.id, "s2").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn actor_scope_round_trips_without_unqualified_identity() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        for actor in [Actor::AnonymousLocal, Actor::AuthenticatedOwner] {
+            let rec = new_record(
+                "actor-session",
+                ActionType::ToolCall,
+                actor.clone(),
+                Some("test_tool"),
+                None,
+                serde_json::json!({}),
+            );
+            store.record(&rec).await.unwrap();
+        }
+
+        let records = store.query_by_session("actor-session").await.unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.actor == Actor::AnonymousLocal)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.actor == Actor::AuthenticatedOwner)
+        );
     }
 
     /// Deterministic test backend: axis 0 counts "alloy", axis 1 counts

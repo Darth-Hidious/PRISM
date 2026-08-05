@@ -508,9 +508,9 @@ async fn recall_with_backend(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        // `query_chain` starts at `id` and walks parents; the record itself
-        // is included, so find it in the returned chain.
-        let chain = store.query_chain(id).await?;
+        // `query_chain` starts at `id` and walks parents within this session;
+        // the record itself is included, so find it in the returned chain.
+        let chain = store.query_chain(id, session_id).await?;
         return Ok(match chain.into_iter().find(|r| r.id == id) {
             Some(rec) => json!({
                 "id": rec.id,
@@ -1042,7 +1042,7 @@ mod tests {
 
         // Embed r1 (keyword AND semantic match → must dedupe) and r3.
         for id in [&r1_id, &r3.id] {
-            let recs = store.query_chain(id).await.unwrap();
+            let recs = store.query_chain(id, "sess-recall").await.unwrap();
             let rec = recs.into_iter().find(|r| &r.id == id).unwrap();
             store
                 .embed_and_store(id, &prism_provenance::embedding_text(&rec), &backend)

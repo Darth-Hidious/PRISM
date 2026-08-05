@@ -22,6 +22,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::NodeState;
+use crate::middleware::ANONYMOUS_LOCAL_USER_ID;
 
 /// Maximum WebSocket message size (64 KB).
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
@@ -39,8 +40,9 @@ pub struct WsParams {
 /// Accepts the auth token from `Authorization: Bearer <token>` (preferred; keeps
 /// the secret out of the URL — CWE-598) or the `?token=` query parameter
 /// (browser fallback). If `session_db_path` is configured, validates against
-/// SessionManager. Otherwise falls back to treating the token as a user_id
-/// (localhost mode).
+/// SessionManager. Otherwise the token is only a local capability gate and
+/// the connection is recorded as anonymous-local; the token is never treated
+/// as a user_id.
 pub async fn ws_upgrade(
     State(state): State<Arc<NodeState>>,
     headers: axum::http::HeaderMap,
@@ -96,7 +98,7 @@ pub async fn ws_upgrade(
             }
         }
     } else {
-        t.clone()
+        ANONYMOUS_LOCAL_USER_ID.to_string()
     };
 
     // Enforce the connection concurrency limit ATOMICALLY: reserve the slot
