@@ -39,6 +39,18 @@ def _acquire_materials(**kwargs) -> dict:
         try:
             collector = collector_reg.get(src)
         except KeyError:
+            # A source the registry does not know used to `continue`, so the
+            # caller asked for it, got nothing, and was never told -- while
+            # every OTHER failure path here records a skip. `literature` was
+            # advertised in this tool's own schema and has no collector at
+            # all, so it failed exactly this way, invisibly.
+            skipped.append({
+                "source": src,
+                "reason": (
+                    f"no collector named '{src}' is registered; "
+                    f"available: {', '.join(sorted(c.name for c in collector_reg.list_collectors()))}"
+                ),
+            })
             continue
         try:
             if src == "optimade":
@@ -124,7 +136,7 @@ ACQUIRE_SKILL = Skill(
     name="acquire_materials",
     description=(
         "Search and collect materials data from multiple sources "
-        "(OPTIMADE, Materials Project, OMAT24, literature, patents), "
+        "(OPTIMADE, Materials Project, OMAT24, patents, eastern literature), "
         "normalize records, and save as a named dataset for downstream analysis."
     ),
     steps=[
@@ -153,7 +165,7 @@ ACQUIRE_SKILL = Skill(
             "sources": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Data sources to query: optimade, mp, omat24, literature, patents, eastern_literature (default from preferences)",
+                "description": "Data sources to query: optimade, mp, omat24, patents, eastern_literature (default from preferences). An unknown name is reported in `skipped`, never silently dropped.",
             },
             "max_results": {
                 "type": "integer",
