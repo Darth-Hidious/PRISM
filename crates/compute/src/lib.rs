@@ -32,7 +32,20 @@ pub use marc27::Marc27Backend;
 /// Trait for compute dispatch backends.
 #[async_trait]
 pub trait ComputeBackend: Send + Sync {
-    async fn submit(&self, plan: &ExperimentPlan) -> Result<Uuid>;
+    /// Submit a job.
+    ///
+    /// `job_id` is the caller's tracking id; backends that dispatch
+    /// locally use it as the job id. Backends whose platform assigns its
+    /// own id (MARC27) ignore it and return the platform's. `lease` is
+    /// the signed licence lease when the job needed one; backends that
+    /// generate job scripts embed it, and it is the only licence
+    /// artefact that ever reaches the execution side.
+    async fn submit(
+        &self,
+        job_id: Uuid,
+        plan: &ExperimentPlan,
+        lease: Option<&licence::Lease>,
+    ) -> Result<Uuid>;
     async fn status(&self, job_id: Uuid) -> Result<JobStatus>;
     async fn results(&self, job_id: Uuid) -> Result<serde_json::Value>;
     async fn cancel(&self, job_id: Uuid) -> Result<()>;

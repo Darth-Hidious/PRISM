@@ -557,6 +557,41 @@ impl Lease {
     }
 }
 
+/// Full provenance record for a licence checkout, shaped exactly like a
+/// `prism_provenance::ProvenanceRecord` (that crate is not a dependency
+/// of prism-compute; the ledger stores these fields as JSON).
+///
+/// Provenance is permanent, so it carries only lease facts — licence id,
+/// seats, job id, expiry, signature validity. A licence secret must never
+/// appear here.
+pub fn lease_provenance_record(session_id: &str, lease: &Lease) -> serde_json::Value {
+    serde_json::json!({
+        "id": Uuid::new_v4().to_string(),
+        "timestamp": Utc::now().to_rfc3339(),
+        "session_id": session_id,
+        "action_type": "compute",
+        "actor": "system",
+        "tool_name": "licence_checkout",
+        "llm_model": null,
+        "input_json": {
+            "licence_id": lease.licence_id,
+            "seats": lease.seats,
+            "job_id": lease.job_id.to_string(),
+        },
+        "output_json": {
+            "issued_at": lease.issued_at.to_rfc3339(),
+            "expires_at": lease.expires_at.to_rfc3339(),
+            "signature_valid": lease.verify().is_ok(),
+        },
+        "parent_id": null,
+        "material_ref": null,
+        "confidence": 1.0,
+        "tags": ["licence", "compute"],
+        "status": "ok",
+        "exit_code": null,
+    })
+}
+
 /// Mint a signed lease. Caller decides the expiry; see
 /// [`bound_lease_expiry`] for the bounding rule.
 pub fn sign_lease(

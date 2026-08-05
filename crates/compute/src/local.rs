@@ -63,8 +63,12 @@ impl Default for LocalBackend {
 
 #[async_trait]
 impl ComputeBackend for LocalBackend {
-    async fn submit(&self, plan: &ExperimentPlan) -> Result<Uuid> {
-        let job_id = Uuid::new_v4();
+    async fn submit(
+        &self,
+        job_id: Uuid,
+        plan: &ExperimentPlan,
+        _lease: Option<&crate::licence::Lease>,
+    ) -> Result<Uuid> {
         let container_name = Self::container_name(job_id);
 
         // Write inputs to a temp file that gets mounted into the container.
