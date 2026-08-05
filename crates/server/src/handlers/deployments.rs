@@ -26,7 +26,7 @@ fn error(status: StatusCode, message: impl Into<String>) -> HandlerError {
 fn no_platform() -> HandlerError {
     error(
         StatusCode::SERVICE_UNAVAILABLE,
-        "No linked platform session is available — run `prism login` on this node first.",
+        "No linked platform session is available on this node.",
     )
 }
 
@@ -37,7 +37,8 @@ fn platform_denied(message: impl Into<String>) -> HandlerError {
 fn platform_verification_failed() -> HandlerError {
     error(
         StatusCode::SERVICE_UNAVAILABLE,
-        "Unable to verify the node owner with the linked platform session — run `prism login` again before accessing platform resources.",
+        "Unable to verify the node owner with the linked platform session; \
+         re-authentication is required before accessing platform resources.",
     )
 }
 
