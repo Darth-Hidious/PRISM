@@ -13,6 +13,7 @@ default = []
 local-inference = [
     "dep:encoding_rs",
     "dep:llama-cpp-2",
+    "llama-cpp-2/common",
     "dep:llama-cpp-sys-2",
 ]
 local-inference-cuda = [

@@ -3,9 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "local-inference")]
+use anyhow::Context;
 use anyhow::{Result, bail};
 
-use crate::ChatMessage;
+use crate::{ChatMessage, ToolDefinition};
 
 /// Explicit base URL sentinel selecting embedded GGUF inference.
 pub const LOCAL_GGUF_URL: &str = "gguf://local";
@@ -73,6 +75,7 @@ fn missing_weights_refusal(requested: &str, model_dir: &Path, searched: &[PathBu
     let body = serde_json::json!({
         "status": "refused",
         "error": format!("No readable local GGUF weights were found for {requested:?}"),
+        "network": "No remote endpoint was tried.",
         "refusal": {
             "code": "local_llm_weights_unavailable",
             "requested_model": requested,
@@ -149,10 +152,12 @@ impl LocalGguf {
     pub(crate) async fn generate_streaming(
         &self,
         messages: &[ChatMessage],
+        tools: &[ToolDefinition],
         max_tokens: u64,
         mut on_delta: impl FnMut(&str),
     ) -> Result<LocalGeneration> {
         let messages = messages.to_vec();
+        let tools = tools.to_vec();
         let model_spec = self.model_spec.clone();
         let model_cache = std::sync::Arc::clone(&self.model);
         let context_size = self.context_size;
@@ -165,6 +170,7 @@ impl LocalGguf {
                 &model_spec,
                 &model_cache,
                 &messages,
+                &tools,
                 context_size,
                 max_tokens,
                 &cancelled,
@@ -194,6 +200,7 @@ impl LocalGguf {
     pub(crate) async fn generate_streaming(
         &self,
         _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
         _max_tokens: u64,
         _on_delta: impl FnMut(&str),
     ) -> Result<LocalGeneration> {
@@ -303,10 +310,393 @@ fn load_model(
 }
 
 #[cfg(feature = "local-inference")]
+fn native_escape(value: &str) -> String {
+    format!("<escape>{value}<escape>")
+}
+
+#[cfg(feature = "local-inference")]
+fn native_type(schema: &serde_json::Value) -> &'static str {
+    match schema.get("type").and_then(serde_json::Value::as_str) {
+        Some("string") => "STRING",
+        Some("number") => "NUMBER",
+        Some("integer") => "INTEGER",
+        Some("boolean") => "BOOLEAN",
+        Some("array") => "ARRAY",
+        Some("null") => "NULL",
+        _ => "OBJECT",
+    }
+}
+
+#[cfg(feature = "local-inference")]
+fn native_declaration(tool: &ToolDefinition) -> String {
+    let schema = &tool.function.parameters;
+    let mut declaration = format!(
+        "<start_function_declaration>declaration:{}{{description:{},parameters:{{",
+        tool.function.name,
+        native_escape(&tool.function.description)
+    );
+    if let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    {
+        declaration.push_str("properties:{");
+        for (index, (name, property)) in properties.iter().enumerate() {
+            if index > 0 {
+                declaration.push(',');
+            }
+            let description = property
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            declaration.push_str(name);
+            declaration.push_str("{description:");
+            declaration.push_str(&native_escape(description));
+            declaration.push_str(",type:");
+            declaration.push_str(&native_escape(native_type(property)));
+            declaration.push('}');
+        }
+        declaration.push_str("},");
+    }
+    if let Some(required) = schema.get("required").and_then(serde_json::Value::as_array) {
+        declaration.push_str("required:[");
+        for (index, name) in required
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .enumerate()
+        {
+            if index > 0 {
+                declaration.push(',');
+            }
+            declaration.push_str(&native_escape(name));
+        }
+        declaration.push_str("],");
+    }
+    declaration.push_str("type:");
+    declaration.push_str(&native_escape(native_type(schema)));
+    declaration.push_str("}}<end_function_declaration>");
+    declaration
+}
+
+#[cfg(feature = "local-inference")]
+fn native_tool_declarations(tools: &[ToolDefinition]) -> String {
+    tools.iter().map(native_declaration).collect()
+}
+
+#[cfg(feature = "local-inference")]
+fn native_tool_call_text(tool_calls: &[crate::ToolCallResponse]) -> Result<String> {
+    let mut result = String::new();
+    for call in tool_calls {
+        let arguments: serde_json::Value = serde_json::from_str(&call.function.arguments)
+            .context("prior local tool call arguments were not valid JSON")?;
+        let object = arguments
+            .as_object()
+            .context("prior local tool call arguments were not an object")?;
+        result.push_str("<start_function_call>call:");
+        result.push_str(&call.function.name);
+        result.push('{');
+        for (index, (key, value)) in object.iter().enumerate() {
+            if index > 0 {
+                result.push(',');
+            }
+            result.push_str(key);
+            result.push(':');
+            result.push_str(&native_value(value));
+        }
+        result.push_str("}<end_function_call>");
+    }
+    Ok(result)
+}
+
+#[cfg(feature = "local-inference")]
+fn native_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => native_escape(value),
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(native_value)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        serde_json::Value::Object(values) => format!(
+            "{{{}}}",
+            values
+                .iter()
+                .map(|(key, value)| format!("{key}:{}", native_value(value)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(feature = "local-inference")]
+fn native_tool_result(name: &str, content: &str) -> String {
+    format!(
+        "<start_function_response>response:{name}{{value:{}}}<end_function_response>",
+        native_escape(content)
+    )
+}
+
+#[cfg(feature = "local-inference")]
+fn native_value_rule(schema: &serde_json::Value) -> &'static str {
+    match schema.get("type").and_then(serde_json::Value::as_str) {
+        Some("string") => "escaped",
+        Some("object") => "object",
+        Some("array") => "array",
+        Some("number") | Some("integer") => "number",
+        Some("boolean") => "boolean",
+        _ => "value",
+    }
+}
+
+#[cfg(feature = "local-inference")]
+fn native_tool_call_grammar(tools: &[ToolDefinition]) -> String {
+    let call_rules = tools
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("call{}", grammar_label(index)))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut grammar = format!(
+        concat!(
+            "root ::= {}\n",
+            "value ::= escaped | object | array | number | boolean | \"null\"\n",
+            "boolean ::= \"true\" | \"false\"\n",
+            "escaped ::= \"<escape>\" [^<}},]+ \"<escape>\"\n",
+            "object ::= \"{{\" ws members ws \"}}\"\n",
+            "array ::=\n",
+            "  \"[\" ws (\n",
+            "    value\n",
+            "    (ws \",\" ws value)*\n",
+            "  )? \"]\"\n",
+            "members ::= pair (ws \",\" ws pair)* | \"\"\n",
+            "pair ::= key ws \":\" ws value\n",
+            "key ::= [a-zA-Z_] [a-zA-Z0-9_-]*\n",
+            "number ::= [+-]? [0-9]+ (\".\" [0-9]+)? ([eE] [+-]? [0-9]+)?\n",
+            "ws ::= [ \\t\\n]*\n"
+        ),
+        call_rules
+    );
+    for (index, tool) in tools.iter().enumerate() {
+        let label = grammar_label(index);
+        let required = tool
+            .function
+            .parameters
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        grammar.push_str(&format!(
+            "call{label} ::= \"<start_function_call>\" \"call:\" \"{}\" \"{{\" ws args{label} ws \"}}<end_function_call>\"\n",
+            grammar_literal(&tool.function.name)
+        ));
+        let sequence = required
+            .iter()
+            .enumerate()
+            .map(|(required_index, _)| format!("arg{}{}", label, grammar_label(required_index)))
+            .collect::<Vec<_>>()
+            .join(" ws \",\" ws ");
+        if required.is_empty() {
+            grammar.push_str(&format!(
+                "args{label} ::= pair (ws \",\" ws pair)* | \"\"\n"
+            ));
+        } else {
+            grammar.push_str(&format!("args{label} ::= {sequence} (ws \",\" ws pair)*\n"));
+            for (required_index, name) in required.iter().enumerate() {
+                let value_rule = tool
+                    .function
+                    .parameters
+                    .pointer(&format!("/properties/{name}"))
+                    .map(native_value_rule)
+                    .unwrap_or("value");
+                grammar.push_str(&format!(
+                    "arg{}{} ::= \"{}\" ws \":\" ws {value_rule}\n",
+                    label,
+                    grammar_label(required_index),
+                    grammar_literal(name)
+                ));
+            }
+        }
+    }
+    grammar
+}
+
+#[cfg(feature = "local-inference")]
+fn grammar_label(index: usize) -> char {
+    char::from_u32(u32::from(b'a') + u32::try_from(index).unwrap_or(25).min(25)).unwrap_or('z')
+}
+
+#[cfg(feature = "local-inference")]
+fn grammar_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(feature = "local-inference")]
+fn render_messages(
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+    native_tools: bool,
+) -> Result<Vec<llama_cpp_2::model::LlamaChatMessage>> {
+    use llama_cpp_2::model::LlamaChatMessage;
+
+    let has_tool_result = messages.iter().any(|message| message.role == "tool");
+    let instructions = if tools.is_empty() {
+        None
+    } else if native_tools {
+        Some(format!(
+            "{}\n{}",
+            if has_tool_result {
+                "A function result is already supplied. Do not call any function; return only the final natural-language answer."
+            } else {
+                "Use the declared functions when needed. Fill arguments from the user's exact request; never use placeholder values. Return a final natural-language answer after a function result."
+            },
+            native_tool_declarations(tools)
+        ))
+    } else if has_tool_result {
+        Some(
+            "A tool result is already in this conversation. Return only the final natural-language answer; do not call a function or repeat the tool protocol."
+                .to_string(),
+        )
+    } else {
+        let tool_json = serde_json::to_string_pretty(tools)?;
+        Some(format!(
+            concat!(
+                "Tool protocol for this turn. Return exactly one JSON object and no Markdown, commentary, or code fence.\n\n",
+                "If the user request needs a function, return {{\"kind\":\"tool_call\",\"name\":\"EXACT_FUNCTION_NAME\",\"arguments\":{{...}}}}. The name must be one of the listed functions and arguments must follow its schema.\n",
+                "If no function is needed, return {{\"kind\":\"final\",\"content\":\"answer\"}}. Never invent a tool result.\n\n",
+                "Available functions:\n{}\n\nCall a function when it is needed to answer the user."
+            ),
+            tool_json
+        ))
+    };
+
+    let names_by_id: std::collections::HashMap<&str, &str> = messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .map(|call| (call.id.as_str(), call.function.name.as_str()))
+        .collect();
+    let results_by_id: std::collections::HashMap<&str, &str> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| {
+            message
+                .tool_call_id
+                .as_deref()
+                .zip(message.content.as_deref())
+        })
+        .collect();
+    let mut rendered = Vec::with_capacity(messages.len() + usize::from(instructions.is_some()));
+    let mut injected = false;
+    for message in messages {
+        let mut role = message.role.clone();
+        let mut content = message.content.clone().unwrap_or_default();
+
+        if let Some(tool_calls) = &message.tool_calls {
+            let native_history = native_tools && !has_tool_result;
+            let mut calls = if native_history {
+                native_tool_call_text(tool_calls)?
+            } else if has_tool_result {
+                String::new()
+            } else {
+                format!(
+                    "Previous function call completed: {}",
+                    serde_json::to_string(tool_calls)?
+                )
+            };
+            if native_history {
+                for call in tool_calls {
+                    if let Some(result) = results_by_id.get(call.id.as_str()) {
+                        calls.push_str(&native_tool_result(&call.function.name, result));
+                    }
+                }
+            }
+            if !content.is_empty() {
+                content.push_str("\n\n");
+            }
+            content.push_str(&calls);
+        }
+        if message.role == "tool" {
+            let id = message.tool_call_id.as_deref().unwrap_or("local_tool");
+            if native_tools && !has_tool_result {
+                if !names_by_id.contains_key(id) {
+                    bail!("local GGUF tool result {id:?} has no matching prior tool call");
+                }
+                continue;
+            }
+            role = "user".to_string();
+            content = format!("Tool result for {id}:\n{content}");
+        }
+
+        if !injected
+            && let Some(instructions) = &instructions
+            && role == "system"
+        {
+            content.push_str("\n\n");
+            content.push_str(instructions);
+            injected = true;
+        }
+
+        rendered.push(LlamaChatMessage::new(role, content).map_err(anyhow::Error::from)?);
+    }
+    if let Some(instructions) = instructions
+        && !injected
+    {
+        rendered.insert(
+            0,
+            LlamaChatMessage::new("system".to_string(), instructions)
+                .map_err(anyhow::Error::from)?,
+        );
+    }
+    Ok(rendered)
+}
+
+#[cfg(feature = "local-inference")]
+fn local_tool_response_schema(
+    tools: &[ToolDefinition],
+    has_tool_result: bool,
+) -> serde_json::Value {
+    let final_response = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["final"]},
+            "content": {"type": "string"}
+        },
+        "required": ["kind", "content"],
+        "additionalProperties": false
+    });
+    if has_tool_result {
+        return final_response;
+    }
+
+    let mut alternatives = Vec::with_capacity(tools.len() + 1);
+    for tool in tools {
+        alternatives.push(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["tool_call"]},
+                "name": {"type": "string", "enum": [tool.function.name]},
+                "arguments": tool.function.parameters
+            },
+            "required": ["kind", "name", "arguments"],
+            "additionalProperties": false
+        }));
+    }
+    alternatives.push(final_response);
+    serde_json::json!({"oneOf": alternatives})
+}
+
+#[cfg(feature = "local-inference")]
+#[allow(clippy::too_many_arguments)]
 fn generate(
     model_spec: &str,
     model_cache: &std::sync::OnceLock<std::sync::Arc<llama_cpp_2::model::LlamaModel>>,
     messages: &[ChatMessage],
+    tools: &[ToolDefinition],
     requested_context_size: u32,
     requested_max_tokens: u64,
     cancelled: &std::sync::atomic::AtomicBool,
@@ -314,19 +704,11 @@ fn generate(
 ) -> Result<LocalGeneration> {
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_batch::LlamaBatch;
-    use llama_cpp_2::model::{AddBos, LlamaChatMessage};
+    use llama_cpp_2::model::AddBos;
     use llama_cpp_2::sampling::LlamaSampler;
     use std::num::NonZeroU32;
     use std::sync::atomic::Ordering;
 
-    if messages
-        .iter()
-        .any(|message| message.tool_calls.is_some() || message.tool_call_id.is_some())
-    {
-        bail!(
-            "embedded GGUF inference cannot render prior tool-call messages yet; no model request was made"
-        );
-    }
     if cancelled.load(Ordering::Acquire) {
         bail!("local GGUF generation cancelled");
     }
@@ -334,19 +716,45 @@ fn generate(
     let model = load_model(model_spec, model_cache)?;
     let template = model.chat_template(None).map_err(|error| {
         anyhow::anyhow!(
-            "local GGUF model has no usable embedded chat template: {error}. Use an instruct/chat GGUF with tokenizer.chat_template metadata."
+            "local GGUF model {model_spec:?} has no usable embedded chat template: {error}. Use an instruct/chat GGUF with tokenizer.chat_template metadata. No remote endpoint was tried."
         )
     })?;
-    let chat = messages
-        .iter()
-        .map(|message| {
-            LlamaChatMessage::new(
-                message.role.clone(),
-                message.content.clone().unwrap_or_default(),
+    let template_source = template
+        .to_string()
+        .map_err(|error| anyhow::anyhow!("local GGUF model {model_spec:?} has invalid chat template metadata: {error}. No remote endpoint was tried."))?;
+    let has_tool_result = messages.iter().any(|message| message.role == "tool");
+    let native_tools = !tools.is_empty()
+        && !has_tool_result
+        && template_source.contains("<start_function_declaration>")
+        && template_source.contains("<start_function_call>");
+    let chat = render_messages(messages, tools, native_tools)?;
+    let tool_grammar = if native_tools && !has_tool_result {
+        let grammar = native_tool_call_grammar(tools);
+        Some(
+            LlamaSampler::grammar(&model, &grammar, "root").map_err(|error| {
+                anyhow::anyhow!(
+                    "local GGUF model {model_spec:?} cannot initialize its embedded chat-template tool grammar: {error}. Tool calling was refused before generation. No remote endpoint was tried."
+                )
+            })?,
+        )
+    } else if !native_tools && !tools.is_empty() && !has_tool_result {
+        let schema = local_tool_response_schema(tools, false);
+        let schema_json = serde_json::to_string(&schema)?;
+        let grammar = llama_cpp_2::json_schema_to_grammar(&schema_json).map_err(|error| {
+            anyhow::anyhow!(
+                "local GGUF model {model_spec:?} cannot constrain its tool response with llama.cpp JSON grammar: {error}. Tool calling was refused before generation. No remote endpoint was tried."
             )
-            .map_err(anyhow::Error::from)
-        })
-        .collect::<Result<Vec<_>>>()?;
+        })?;
+        Some(
+            LlamaSampler::grammar(&model, &grammar, "root").map_err(|error| {
+                anyhow::anyhow!(
+                    "local GGUF model {model_spec:?} cannot initialize llama.cpp tool grammar: {error}. Tool calling was refused before generation. No remote endpoint was tried."
+                )
+            })?,
+        )
+    } else {
+        None
+    };
     let prompt = model
         .apply_chat_template(&template, &chat, true)
         .map_err(|error| anyhow::anyhow!("failed to apply the GGUF chat template: {error}"))?;
@@ -400,7 +808,10 @@ fn generate(
             .map_err(|error| anyhow::anyhow!("failed to evaluate local prompt: {error}"))?;
     }
 
-    let mut sampler = LlamaSampler::greedy();
+    let mut sampler = match tool_grammar {
+        Some(grammar) => LlamaSampler::chain_simple([grammar, LlamaSampler::greedy()]),
+        None => LlamaSampler::greedy(),
+    };
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut text = String::new();
     let mut completion_tokens = 0_u64;
@@ -413,12 +824,11 @@ fn generate(
             bail!("local GGUF generation cancelled");
         }
         let token = sampler.sample(&context, logits_index);
-        sampler.accept(token);
         if model.is_eog_token(token) {
             break;
         }
         let piece = model
-            .token_to_piece(token, &mut decoder, false, None)
+            .token_to_piece(token, &mut decoder, true, None)
             .map_err(|error| anyhow::anyhow!("failed to decode a local output token: {error}"))?;
         completion_tokens += 1;
         if !piece.is_empty() {

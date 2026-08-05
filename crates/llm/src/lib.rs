@@ -358,16 +358,6 @@ impl LlmClient {
         }
     }
 
-    fn reject_local_tools(tools: &[ToolDefinition]) -> Result<()> {
-        if tools.is_empty() {
-            return Ok(());
-        }
-        bail!(
-            "embedded GGUF inference does not currently support tool calling, so this {}-tool request was refused before generation. Select an HTTP backend for tool-driven sessions. No remote endpoint was tried.",
-            tools.len()
-        )
-    }
-
     fn effective_local_max_tokens(&self, estimated_prompt_tokens: u64) -> u64 {
         let configured = self.config.max_output_tokens.unwrap_or(512);
         match self.config.context_window {
@@ -380,20 +370,155 @@ impl LlmClient {
         }
     }
 
-    fn local_chat_response(generation: local::LocalGeneration) -> ChatResponse {
+    fn local_tool_call_response(
+        name: &str,
+        arguments: &serde_json::Value,
+        tools: &[ToolDefinition],
+        model: &str,
+        usage: UsageInfo,
+    ) -> Result<ChatResponse> {
+        let tool = tools.iter().find(|tool| tool.function.name == name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "local GGUF model {model:?} requested unknown tool {name:?}; the call was rejected and no remote endpoint was tried."
+            )
+        })?;
+        if !arguments.is_object() {
+            bail!(
+                "local GGUF model {model:?} returned non-object arguments for tool {name:?}; the call was rejected and no remote endpoint was tried."
+            );
+        }
+        validate_json_schema(arguments, &tool.function.parameters, "$arguments").map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "local GGUF model {model:?} returned invalid arguments for tool {name:?}: {error}; the call was rejected and no remote endpoint was tried."
+                )
+            },
+        )?;
+        Ok(ChatResponse {
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCallResponse {
+                    id: "local_call_0".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: name.to_string(),
+                        arguments: serde_json::to_string(arguments)?,
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            usage: Some(usage),
+        })
+    }
+
+    fn local_chat_response(
+        generation: local::LocalGeneration,
+        tools: &[ToolDefinition],
+        model: &str,
+        has_tool_result: bool,
+    ) -> Result<ChatResponse> {
         let usage = UsageInfo {
             prompt_tokens: generation.prompt_tokens,
             completion_tokens: generation.completion_tokens,
             total_tokens: generation.prompt_tokens + generation.completion_tokens,
         };
-        ChatResponse {
-            message: ChatMessage {
-                role: "assistant".to_string(),
-                content: (!generation.text.is_empty()).then_some(generation.text),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            usage: Some(usage),
+        if tools.is_empty() {
+            return Ok(ChatResponse {
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: (!generation.text.is_empty()).then_some(generation.text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                usage: Some(usage),
+            });
+        }
+
+        let text = generation.text.trim();
+        if text.starts_with("<start_function_call>") {
+            let (name, arguments) = parse_native_tool_call(text).map_err(|error| {
+                anyhow::anyhow!(
+                    "local GGUF model {model:?} produced an invalid embedded-template tool call {text:?}: {error}; the call was rejected and no remote endpoint was tried."
+                )
+            })?;
+            return Self::local_tool_call_response(&name, &arguments, tools, model, usage);
+        }
+        if has_tool_result && !text.starts_with('{') {
+            return Ok(ChatResponse {
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(text.to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                usage: Some(usage),
+            });
+        }
+        let value: serde_json::Value = serde_json::from_str(text).map_err(|error| {
+            anyhow::anyhow!(
+                "local GGUF model {model:?} produced an invalid tool response {text:?}: {error}; expected one strict JSON object. No tool call was guessed and no remote endpoint was tried."
+            )
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            anyhow::anyhow!(
+                "local GGUF model {model:?} produced a non-object tool response; no tool call was guessed and no remote endpoint was tried."
+            )
+        })?;
+        let kind = object.get("kind").and_then(serde_json::Value::as_str);
+        match kind {
+            Some("final") => {
+                if object.len() != 2 || !object.contains_key("content") {
+                    bail!(
+                        "local GGUF model {model:?} produced an invalid final response shape {text:?}; no tool call was guessed and no remote endpoint was tried."
+                    );
+                }
+                let content = object
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "local GGUF model {model:?} produced non-string final content; no tool call was guessed and no remote endpoint was tried."
+                        )
+                    })?;
+                Ok(ChatResponse {
+                    message: ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some(content.to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    usage: Some(usage),
+                })
+            }
+            Some("tool_call") => {
+                if object.len() != 3
+                    || !object.contains_key("name")
+                    || !object.contains_key("arguments")
+                {
+                    bail!(
+                        "local GGUF model {model:?} produced an invalid tool-call shape {text:?}; no tool call was guessed and no remote endpoint was tried."
+                    );
+                }
+                let name = object
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "local GGUF model {model:?} produced an invalid tool name; no tool call was guessed and no remote endpoint was tried."
+                        )
+                    })?;
+                let arguments = object.get("arguments").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "local GGUF model {model:?} omitted arguments for tool {name:?}; the call was rejected and no remote endpoint was tried."
+                    )
+                })?;
+                Self::local_tool_call_response(name, arguments, tools, model, usage)
+            }
+            _ => bail!(
+                "local GGUF model {model:?} produced an invalid tool-response kind; no tool call was guessed and no remote endpoint was tried."
+            ),
         }
     }
 
@@ -458,6 +583,7 @@ impl LlmClient {
             let generation = local
                 .generate_streaming(
                     &local_messages,
+                    &[],
                     self.effective_local_max_tokens(Self::estimate_tokens(&serialized)),
                     |_| {},
                 )
@@ -534,16 +660,22 @@ impl LlmClient {
         tools: &[ToolDefinition],
     ) -> Result<ChatResponse> {
         if let Some(local) = self.local_backend() {
-            Self::reject_local_tools(tools)?;
-            let serialized = serde_json::to_value(messages)?;
+            let messages_estimate = Self::estimate_tokens(&serde_json::to_value(messages)?);
+            let tools_estimate = Self::estimate_tokens(&serde_json::to_value(tools)?);
             let generation = local
                 .generate_streaming(
                     messages,
-                    self.effective_local_max_tokens(Self::estimate_tokens(&serialized)),
+                    tools,
+                    self.effective_local_max_tokens(messages_estimate + tools_estimate),
                     |_| {},
                 )
                 .await?;
-            return Ok(Self::local_chat_response(generation));
+            return Self::local_chat_response(
+                generation,
+                tools,
+                &self.config.model,
+                messages.iter().any(|message| message.role == "tool"),
+            );
         }
         // MARC27 platform proxy: use /stream, collect text. This branch DROPS
         // `tools` — unlike `chat_with_tools_streaming`, which sends them
@@ -689,6 +821,7 @@ impl LlmClient {
             let generation = local
                 .generate_streaming(
                     &messages,
+                    &[],
                     self.effective_local_max_tokens(Self::estimate_tokens(&serialized)),
                     |_| {},
                 )
@@ -786,16 +919,55 @@ impl LlmClient {
         mut on_delta: impl FnMut(&str, bool),
     ) -> Result<ChatResponse> {
         if let Some(local) = self.local_backend() {
-            Self::reject_local_tools(tools)?;
-            let serialized = serde_json::to_value(messages)?;
+            let messages_estimate = Self::estimate_tokens(&serde_json::to_value(messages)?);
+            let tools_estimate = Self::estimate_tokens(&serde_json::to_value(tools)?);
+            let has_tool_result = messages.iter().any(|message| message.role == "tool");
+            if tools.is_empty() {
+                let generation = local
+                    .generate_streaming(
+                        messages,
+                        tools,
+                        self.effective_local_max_tokens(messages_estimate + tools_estimate),
+                        |delta| on_delta(delta, false),
+                    )
+                    .await?;
+                return Self::local_chat_response(generation, tools, &self.config.model, false);
+            }
+
+            // Tool-call syntax is buffered so control markers never leak into
+            // visible assistant text. Once a result is present, ordinary
+            // final prose streams immediately; only a possible protocol
+            // prefix remains buffered until the response is classified.
+            let mut pending = String::new();
+            let mut visible_started = false;
             let generation = local
                 .generate_streaming(
                     messages,
-                    self.effective_local_max_tokens(Self::estimate_tokens(&serialized)),
-                    |delta| on_delta(delta, false),
+                    tools,
+                    self.effective_local_max_tokens(messages_estimate + tools_estimate),
+                    |delta| {
+                        if !has_tool_result {
+                            return;
+                        }
+                        pending.push_str(delta);
+                        let is_protocol = ["{", "<start_function_call>"].iter().any(|marker| {
+                            marker.starts_with(&pending) || pending.starts_with(marker)
+                        });
+                        if !visible_started && is_protocol {
+                            return;
+                        }
+                        visible_started = true;
+                        on_delta(&pending, false);
+                        pending.clear();
+                    },
                 )
                 .await?;
-            return Ok(Self::local_chat_response(generation));
+            let response =
+                Self::local_chat_response(generation, tools, &self.config.model, has_tool_result)?;
+            if !visible_started && let Some(content) = response.message.content.as_deref() {
+                on_delta(content, false);
+            }
+            return Ok(response);
         }
         // MARC27 platform: use /stream with SSE.
         // The platform forwards `tools` verbatim to the upstream provider and
@@ -1543,6 +1715,291 @@ fn find_bare_json_tool_call(text: &str) -> Option<(usize, String, String)> {
     None
 }
 
+fn parse_native_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
+    let prefix = "<start_function_call>call:";
+    let suffix = "<end_function_call>";
+    let body = text
+        .strip_prefix(prefix)
+        .context("missing native function-call prefix")?
+        .strip_suffix(suffix)
+        .context("missing native function-call terminator")?;
+    let open = body.find('{').context("missing native argument object")?;
+    let name = body[..open].trim();
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        bail!("native function name is empty or contains whitespace");
+    }
+    let mut parser = NativeValueParser::new(&body[open..]);
+    let arguments = parser.object()?;
+    parser.skip_whitespace();
+    if parser.position != parser.input.len() {
+        bail!("native argument object has trailing characters");
+    }
+    Ok((name.to_string(), arguments))
+}
+
+struct NativeValueParser<'a> {
+    input: &'a str,
+    position: usize,
+}
+
+impl<'a> NativeValueParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, position: 0 }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .input
+            .as_bytes()
+            .get(self.position)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.position += 1;
+        }
+    }
+
+    fn take(&mut self, expected: u8) -> Result<()> {
+        self.skip_whitespace();
+        if self.input.as_bytes().get(self.position) != Some(&expected) {
+            bail!(
+                "native tool call expected {:?} at byte {}",
+                expected as char,
+                self.position
+            );
+        }
+        self.position += 1;
+        Ok(())
+    }
+
+    fn object(&mut self) -> Result<serde_json::Value> {
+        self.take(b'{')?;
+        let mut result = serde_json::Map::new();
+        self.skip_whitespace();
+        if self.input.as_bytes().get(self.position) == Some(&b'}') {
+            self.position += 1;
+            return Ok(serde_json::Value::Object(result));
+        }
+        loop {
+            self.skip_whitespace();
+            let key_start = self.position;
+            while let Some(byte) = self.input.as_bytes().get(self.position) {
+                if *byte == b':' || byte.is_ascii_whitespace() {
+                    break;
+                }
+                self.position += 1;
+            }
+            let key = self.input[key_start..self.position].trim();
+            if key.is_empty() || result.contains_key(key) {
+                bail!("native tool call has an empty or duplicate argument key");
+            }
+            self.take(b':')?;
+            let value = self.value()?;
+            result.insert(key.to_string(), value);
+            self.skip_whitespace();
+            match self.input.as_bytes().get(self.position) {
+                Some(b',') => self.position += 1,
+                Some(b'}') => {
+                    self.position += 1;
+                    break;
+                }
+                _ => bail!("native tool call expected ',' or '}}' after an argument"),
+            }
+        }
+        Ok(serde_json::Value::Object(result))
+    }
+
+    fn array(&mut self) -> Result<serde_json::Value> {
+        self.take(b'[')?;
+        let mut result = Vec::new();
+        self.skip_whitespace();
+        if self.input.as_bytes().get(self.position) == Some(&b']') {
+            self.position += 1;
+            return Ok(serde_json::Value::Array(result));
+        }
+        loop {
+            result.push(self.value()?);
+            self.skip_whitespace();
+            match self.input.as_bytes().get(self.position) {
+                Some(b',') => self.position += 1,
+                Some(b']') => {
+                    self.position += 1;
+                    break;
+                }
+                _ => bail!("native tool call expected ',' or ']' after an array value"),
+            }
+        }
+        Ok(serde_json::Value::Array(result))
+    }
+
+    fn value(&mut self) -> Result<serde_json::Value> {
+        self.skip_whitespace();
+        if self.input[self.position..].starts_with("<escape>") {
+            self.position += "<escape>".len();
+            let end = self.input[self.position..]
+                .find("<escape>")
+                .map(|offset| self.position + offset)
+                .context("unterminated native escaped string")?;
+            let value = self.input[self.position..end].to_string();
+            self.position = end + "<escape>".len();
+            return Ok(serde_json::Value::String(value));
+        }
+        match self.input.as_bytes().get(self.position) {
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(_) => {
+                let start = self.position;
+                while let Some(byte) = self.input.as_bytes().get(self.position) {
+                    if matches!(byte, b',' | b'}' | b']') || byte.is_ascii_whitespace() {
+                        break;
+                    }
+                    self.position += 1;
+                }
+                let raw = self.input[start..self.position].trim();
+                if raw.is_empty() {
+                    bail!("native tool call has an empty argument value");
+                }
+                serde_json::from_str(raw)
+                    .map_err(|error| anyhow::anyhow!("native argument is not valid JSON: {error}"))
+            }
+            None => bail!("native tool call ended before an argument value"),
+        }
+    }
+}
+
+/// Validate a model-produced argument object against the tool's JSON schema.
+///
+/// llama.cpp's grammar is the first line of defence. This second check is
+/// deliberately strict about the parts of JSON Schema that describe the
+/// shape of tool arguments, so a malformed or hallucinated call cannot be
+/// repaired into a plausible one after generation.
+fn validate_json_schema(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+) -> Result<()> {
+    if let Some(constant) = schema.get("const")
+        && value != constant
+    {
+        bail!("{path} does not equal the schema const");
+    }
+    if let Some(enum_values) = schema.get("enum") {
+        let values = enum_values
+            .as_array()
+            .context("tool schema enum must be an array")?;
+        if !values.iter().any(|candidate| candidate == value) {
+            bail!("{path} is not one of the allowed enum values");
+        }
+    }
+
+    if let Some(any_of) = schema.get("anyOf").or_else(|| schema.get("oneOf")) {
+        let variants = any_of
+            .as_array()
+            .context("tool schema anyOf/oneOf must be an array")?;
+        if !variants
+            .iter()
+            .any(|variant| validate_json_schema(value, variant, path).is_ok())
+        {
+            bail!("{path} does not match any schema alternative");
+        }
+    }
+    if let Some(all_of) = schema.get("allOf") {
+        for variant in all_of
+            .as_array()
+            .context("tool schema allOf must be an array")?
+        {
+            validate_json_schema(value, variant, path)?;
+        }
+    }
+
+    if let Some(type_value) = schema.get("type") {
+        let type_matches = if let Some(type_name) = type_value.as_str() {
+            json_type_matches(value, type_name)
+        } else if let Some(type_names) = type_value.as_array() {
+            type_names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|type_name| json_type_matches(value, type_name))
+        } else {
+            bail!("tool schema type at {path} must be a string or array");
+        };
+        if !type_matches {
+            bail!("{path} has the wrong JSON type");
+        }
+    }
+
+    if let Some(properties) = schema.get("properties") {
+        let properties = properties
+            .as_object()
+            .context("tool schema properties must be an object")?;
+        let object = value
+            .as_object()
+            .context(format!("{path} must be an object"))?;
+        if let Some(required) = schema.get("required") {
+            for name in required
+                .as_array()
+                .context("tool schema required must be an array")?
+            {
+                let name = name
+                    .as_str()
+                    .context("tool schema required names must be strings")?;
+                if !object.contains_key(name) {
+                    bail!("{path} is missing required property {name:?}");
+                }
+            }
+        }
+        for (name, child_schema) in properties {
+            if let Some(child) = object.get(name) {
+                validate_json_schema(child, child_schema, &format!("{path}.{name}"))?;
+            }
+        }
+        if schema
+            .get("additionalProperties")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        {
+            for name in object.keys() {
+                if !properties.contains_key(name) {
+                    bail!("{path} contains unexpected property {name:?}");
+                }
+            }
+        } else if let Some(additional_schema) = schema
+            .get("additionalProperties")
+            .filter(|value| value.is_object())
+        {
+            for (name, child) in object {
+                if !properties.contains_key(name) {
+                    validate_json_schema(child, additional_schema, &format!("{path}.{name}"))?;
+                }
+            }
+        }
+    } else if schema.get("required").is_some() {
+        bail!("tool schema required is present without object properties at {path}");
+    }
+
+    if let Some(items) = schema.get("items") {
+        let array = value
+            .as_array()
+            .context(format!("{path} must be an array"))?;
+        for (index, child) in array.iter().enumerate() {
+            validate_json_schema(child, items, &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
+fn json_type_matches(value: &serde_json::Value, type_name: &str) -> bool {
+    match type_name {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    }
+}
+
 fn parse_text_tool_calls(text: &str) -> Vec<ToolCallResponse> {
     let mut calls = Vec::new();
     let mut call_idx = 0;
@@ -1732,8 +2189,9 @@ mod tests {
         assert!(error.contains("No remote endpoint was tried"));
     }
 
+    #[cfg(not(feature = "local-inference"))]
     #[tokio::test]
-    async fn selected_gguf_backend_refuses_tools_explicitly() {
+    async fn selected_gguf_tool_turn_reports_local_capability_without_remote_fallback() {
         let client = LlmClient::new(LlmConfig {
             base_url: LOCAL_GGUF_URL.to_string(),
             model: "missing.gguf".to_string(),
@@ -1752,8 +2210,122 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("does not currently support tool calling"));
+        assert!(!error.contains("does not currently support tool calling"));
+        assert!(error.contains("built without embedded inference"));
         assert!(error.contains("No remote endpoint was tried"));
+    }
+
+    #[cfg(not(feature = "local-inference"))]
+    #[tokio::test]
+    async fn local_tool_turn_never_reaches_an_http_client() {
+        let client = LlmClient::new(LlmConfig {
+            base_url: LOCAL_GGUF_URL.to_string(),
+            model: "missing.gguf".to_string(),
+            ..LlmConfig::default()
+        });
+        assert!(client.http_client().is_err());
+        let error = client
+            .chat_with_tools(
+                &[],
+                &[ToolDefinition {
+                    tool_type: "function".to_string(),
+                    function: FunctionDef {
+                        name: "lookup".to_string(),
+                        description: "Look something up".to_string(),
+                        parameters: serde_json::json!({"type": "object"}),
+                    },
+                }],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("No remote endpoint was tried"));
+    }
+
+    #[test]
+    fn local_tool_response_maps_only_a_strict_known_call() {
+        let tool = ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "lookup".to_string(),
+                description: "Look something up".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            },
+        };
+        let response = LlmClient::local_chat_response(
+            local::LocalGeneration {
+                text: r#"{"kind":"tool_call","name":"lookup","arguments":{"query":"titanium"}}"#
+                    .to_string(),
+                prompt_tokens: 3,
+                completion_tokens: 4,
+            },
+            std::slice::from_ref(&tool),
+            "test-model",
+            false,
+        )
+        .unwrap();
+        let call = &response.message.tool_calls.unwrap()[0];
+        assert_eq!(call.function.name, "lookup");
+        assert_eq!(call.function.arguments, r#"{"query":"titanium"}"#);
+
+        let error = LlmClient::local_chat_response(
+            local::LocalGeneration {
+                text: r#"{"kind":"tool_call","name":"hallucinated","arguments":{}}"#.to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            },
+            std::slice::from_ref(&tool),
+            "test-model",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown tool"));
+        assert!(error.contains("no remote endpoint was tried"));
+    }
+
+    #[test]
+    fn native_tool_call_parser_is_strict_and_preserves_json_types() {
+        let (name, arguments) = parse_native_tool_call(
+            "<start_function_call>call:lookup{query:<escape>titanium<escape>,limit:2}<end_function_call>",
+        )
+        .unwrap();
+        assert_eq!(name, "lookup");
+        assert_eq!(arguments["query"], "titanium");
+        assert_eq!(arguments["limit"], 2);
+        assert!(parse_native_tool_call(
+            "<start_function_call>call:lookup{query:<escape>titanium<escape>}<end_function_call>trailing"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn local_tool_response_maps_a_strict_final_answer() {
+        let response = LlmClient::local_chat_response(
+            local::LocalGeneration {
+                text: r#"{"kind":"final","content":"done"}"#.to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 2,
+            },
+            &[ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDef {
+                    name: "lookup".to_string(),
+                    description: "Look something up".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            }],
+            "test-model",
+            true,
+        )
+        .unwrap();
+        assert_eq!(response.message.content.as_deref(), Some("done"));
+        assert!(response.message.tool_calls.is_none());
     }
 
     /// The base URL is data, not a hint. Whatever path a vendor mounts its
