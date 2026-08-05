@@ -3971,12 +3971,10 @@ async fn handle_notebook_slash_command(
     {
         return Ok(false);
     }
-    // Point the kernel at PRISM's managed interpreter + the project root.
-    crate::notebook::configure(slash_ctx.python_bin.clone(), slash_ctx.project_root.clone());
-
     match args.get(1).map(String::as_str) {
         None | Some("open") => {
-            emit_notebook_state();
+            let (status, cells) = command_tools::stdio_notebook_snapshot()?;
+            emit_notebook_state(&status, &cells);
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
@@ -3992,7 +3990,18 @@ async fn handle_notebook_slash_command(
                 emit_notification("ui.turn.complete", serde_json::json!({}));
                 return Ok(true);
             }
-            match crate::notebook::execute(&code, timeout, "user").await {
+            match command_tools::execute_stdio_notebook(
+                &CommandToolRuntime {
+                    current_exe: slash_ctx.current_exe.clone(),
+                    project_root: slash_ctx.project_root.clone(),
+                    python_bin: slash_ctx.python_bin.clone(),
+                    ..Default::default()
+                },
+                &code,
+                timeout,
+            )
+            .await
+            {
                 Ok(cell) => emit_notebook_cell(&cell),
                 Err(error) => {
                     emit_notification(
@@ -4001,17 +4010,19 @@ async fn handle_notebook_slash_command(
                     );
                     // A spawn failure produced no cell, so the pane would stay
                     // stuck at "running…". Push state to clear the flag.
-                    emit_notebook_state();
+                    let (status, cells) = command_tools::stdio_notebook_snapshot()?;
+                    emit_notebook_state(&status, &cells);
                 }
             }
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
         Some("status") => {
+            let status = command_tools::stdio_notebook_status()?;
             emit_view(
                 "notebook",
                 "Notebook kernel",
-                &notebook_status_body(),
+                &notebook_status_body(&status),
                 "info",
             );
             emit_notification("ui.turn.complete", serde_json::json!({}));
@@ -4021,12 +4032,13 @@ async fn handle_notebook_slash_command(
             // reset() bails while a cell is in flight (a reset then would be
             // silently undone by the in-flight cell) — report that honestly
             // instead of claiming a clean slate.
-            let text = match crate::notebook::reset().await {
+            let text = match command_tools::reset_stdio_notebook().await {
                 Ok(()) => "Notebook kernel reset — cell state cleared.".to_string(),
                 Err(error) => format!("Notebook reset failed: {error:#}"),
             };
             emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
-            emit_notebook_state();
+            let (status, cells) = command_tools::stdio_notebook_snapshot()?;
+            emit_notebook_state(&status, &cells);
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
@@ -4059,8 +4071,7 @@ fn parse_notebook_run_args(rest: &[String]) -> (String, Option<u64>) {
 }
 
 /// Push the full notebook state (kernel status + cell log) to the pane.
-fn emit_notebook_state() {
-    let status = crate::notebook::status();
+fn emit_notebook_state(status: &crate::notebook::KernelStatus, cells: &[crate::notebook::Cell]) {
     emit_notification(
         "ui.notebook.state",
         serde_json::json!({
@@ -4069,7 +4080,7 @@ fn emit_notebook_state() {
             "python": status.python,
             "detail": status.detail,
             "cell_count": status.cell_count,
-            "cells": crate::notebook::cells(),
+            "cells": cells,
         }),
     );
 }
@@ -4090,8 +4101,7 @@ fn emit_notebook_cell(cell: &crate::notebook::Cell) {
 }
 
 /// Body for the `/notebook status` view.
-fn notebook_status_body() -> String {
-    let status = crate::notebook::status();
+fn notebook_status_body(status: &crate::notebook::KernelStatus) -> String {
     let mut lines = Vec::new();
     if status.running {
         lines.push(format!(
@@ -7857,23 +7867,26 @@ async fn run_server_core(
                 }
 
                 let runtime_ref = runtime.as_mut().expect("runtime should exist");
-                let handled = match handle_command(
-                    command,
-                    silent,
-                    &slash_ctx,
-                    config.as_ref(),
-                    &mut runtime_ref.tool_server,
-                    &mut runtime_ref.session_store,
-                    &mut runtime_ref.history,
-                    &mut runtime_ref.llm_config,
-                    &mut runtime_ref.transcript,
-                    &mut runtime_ref.permissions,
-                    &mut runtime_ref.permission_overrides,
-                    &mut runtime_ref.scratchpad,
-                    tools.as_ref(),
-                    &mut runtime_ref.session_mode,
-                    &mut runtime_ref.plan_state,
-                    &mut runtime_ref.policy_engine,
+                let handled = match command_tools::with_platform_access(
+                    CommandToolPlatformAccess::VerifiedNodeOwner,
+                    handle_command(
+                        command,
+                        silent,
+                        &slash_ctx,
+                        config.as_ref(),
+                        &mut runtime_ref.tool_server,
+                        &mut runtime_ref.session_store,
+                        &mut runtime_ref.history,
+                        &mut runtime_ref.llm_config,
+                        &mut runtime_ref.transcript,
+                        &mut runtime_ref.permissions,
+                        &mut runtime_ref.permission_overrides,
+                        &mut runtime_ref.scratchpad,
+                        tools.as_ref(),
+                        &mut runtime_ref.session_mode,
+                        &mut runtime_ref.plan_state,
+                        &mut runtime_ref.policy_engine,
+                    ),
                 )
                 .await
                 {
@@ -8084,9 +8097,9 @@ mod tests {
         BashSlashAction, DiffSlashAction, EditSlashAction, PlanRuntimeState, PythonSlashAction,
         SessionMode, SlashCommandContext, WriteSlashAction, assemble_workflow_run_values,
         build_effective_permission_context, build_tool_card_payload, build_ui_card_payload,
-        format_skill_create, format_skill_run, format_skills_list, handle_skills_slash_command,
-        humanize_tool_verb, inline_list, load_plan_snapshot, notification_value,
-        parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
+        format_skill_create, format_skill_run, format_skills_list, handle_notebook_slash_command,
+        handle_skills_slash_command, humanize_tool_verb, inline_list, load_plan_snapshot,
+        notification_value, parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
         parse_edit_slash_action, parse_notebook_run_args, parse_python_slash_action,
         parse_read_slash_path, parse_skill_create_args, parse_slash_command, parse_title_json,
         parse_write_slash_action, persist_plan_snapshot, pick_organization, pick_project,
@@ -8348,6 +8361,38 @@ mod tests {
     fn parse_command_tail_handles_quotes() {
         let parsed = parse_command_tail(r#"--model "gemma 4""#).expect("tail args should parse");
         assert_eq!(parsed, vec!["--model", "gemma 4"]);
+    }
+
+    #[tokio::test]
+    async fn notebook_stdio_entry_points_go_through_gate() {
+        let slash_ctx = SlashCommandContext {
+            current_exe: std::path::PathBuf::from("/tmp/prism"),
+            project_root: std::path::PathBuf::from("/tmp"),
+            python_bin: std::path::PathBuf::from("python3"),
+        };
+        let commands = [
+            vec!["notebook".to_string(), "open".to_string()],
+            vec![
+                "notebook".to_string(),
+                "run".to_string(),
+                "--code".to_string(),
+                "1 + 1".to_string(),
+            ],
+            vec!["notebook".to_string(), "reset".to_string()],
+        ];
+
+        for command in commands {
+            let error = crate::command_tools::with_platform_access(
+                crate::command_tools::CommandToolPlatformAccess::LocalOnly,
+                handle_notebook_slash_command(&command, &slash_ctx),
+            )
+            .await
+            .expect_err("LocalOnly stdio notebook entry point must fail at the central gate");
+            assert!(
+                error.to_string().contains("verified node-owner session"),
+                "refusal must identify the owner gate: {error:#}"
+            );
+        }
     }
 
     #[test]

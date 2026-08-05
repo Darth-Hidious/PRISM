@@ -4436,6 +4436,57 @@ pub fn command_tool_preview(tool_name: &str, args: &Value) -> Option<String> {
     Some(format_execution_invocation(&execution))
 }
 
+/// Read the stdio notebook pane through the central execution gate. The
+/// complete cell log can contain arbitrary prior output, so it requires the
+/// same owner capability as executing a cell.
+pub(crate) fn stdio_notebook_snapshot()
+-> Result<(crate::notebook::KernelStatus, Vec<crate::notebook::Cell>)> {
+    let execution_access =
+        gate_command_execution(&CommandExecution::NotebookStatus, current_platform_access())?;
+    let _owner_access = execution_access.verified_node_owner()?;
+    Ok((crate::notebook::status(), crate::notebook::cells()))
+}
+
+/// Execute a human-entered stdio notebook cell only after the same gate used
+/// by the agent-facing `notebook_exec` command tool has minted owner access.
+pub(crate) async fn execute_stdio_notebook(
+    runtime: &CommandToolRuntime,
+    code: &str,
+    timeout: Option<u64>,
+) -> Result<crate::notebook::Cell> {
+    let execution = CommandExecution::NotebookExec {
+        code: code.to_string(),
+        timeout,
+        reset: false,
+        include_images_base64: false,
+    };
+    let execution_access = gate_command_execution(&execution, current_platform_access())?;
+    let _owner_access = execution_access.verified_node_owner()?;
+    crate::notebook::configure(runtime.python_bin.clone(), runtime.project_root.clone());
+    crate::notebook::execute(code, timeout, "user").await
+}
+
+/// Reset the shared stdio notebook kernel through the command-execution gate.
+pub(crate) async fn reset_stdio_notebook() -> Result<()> {
+    let execution_access =
+        gate_command_execution(&CommandExecution::NotebookReset, current_platform_access())?;
+    let _owner_access = execution_access.verified_node_owner()?;
+    crate::notebook::reset().await
+}
+
+/// Read the non-sensitive kernel status through the command-execution gate.
+pub(crate) fn stdio_notebook_status() -> Result<crate::notebook::KernelStatus> {
+    let execution_access =
+        gate_command_execution(&CommandExecution::NotebookStatus, current_platform_access())?;
+    Ok(notebook_status(execution_access))
+}
+
+fn notebook_status(
+    _execution_access: GatedCommandExecutionAccess,
+) -> crate::notebook::KernelStatus {
+    crate::notebook::status()
+}
+
 pub async fn execute_command_tool(
     runtime: &CommandToolRuntime,
     tool_name: &str,
