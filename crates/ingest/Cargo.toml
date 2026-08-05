@@ -22,6 +22,7 @@ uuid = { workspace = true }
 polars = { workspace = true }
 prism-llm = { path = "../llm" }
 prism-provenance = { path = "../provenance" }
+prism-retrieval = { path = "../retrieval" }
 
 [dev-dependencies]
 tokio = { workspace = true }
