@@ -310,8 +310,35 @@ fn load_model(
 }
 
 #[cfg(feature = "local-inference")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeToolProtocol {
+    /// The original Liquid function-call tokens used by compatible GGUFs.
+    Legacy,
+    /// LiquidAI LFM 2.5's embedded Jinja tool-call format.
+    Lfm,
+}
+
+#[cfg(feature = "local-inference")]
+fn native_tool_protocol(template: &str) -> Option<NativeToolProtocol> {
+    if template.contains("<|tool_call_start|>") && template.contains("<|tool_call_end|>") {
+        Some(NativeToolProtocol::Lfm)
+    } else if template.contains("<start_function_declaration>")
+        && template.contains("<start_function_call>")
+    {
+        Some(NativeToolProtocol::Legacy)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "local-inference")]
 fn native_escape(value: &str) -> String {
-    format!("<escape>{value}<escape>")
+    // Legacy templates use `<escape>` delimiters. The payload itself is JSON
+    // escaped so punctuation remains data and a literal '<' cannot terminate
+    // the delimiter before its matching `<escape>` marker.
+    let encoded = serde_json::to_string(value).expect("strings are JSON serializable");
+    let payload = &encoded[1..encoded.len() - 1];
+    format!("<escape>{}<escape>", payload.replace('<', "\\u003C"))
 }
 
 #[cfg(feature = "local-inference")]
@@ -378,12 +405,25 @@ fn native_declaration(tool: &ToolDefinition) -> String {
 }
 
 #[cfg(feature = "local-inference")]
-fn native_tool_declarations(tools: &[ToolDefinition]) -> String {
-    tools.iter().map(native_declaration).collect()
+fn native_tool_declarations(tools: &[ToolDefinition], protocol: NativeToolProtocol) -> String {
+    match protocol {
+        NativeToolProtocol::Legacy => tools.iter().map(native_declaration).collect(),
+        // This is the exact template-native declaration shape embedded in the
+        // official LFM 2.5 GGUF. llama-cpp-2 currently only takes rendered
+        // messages, not a separate `tools` parameter, so it is injected into
+        // the system message rather than silently omitted.
+        NativeToolProtocol::Lfm => format!(
+            "List of tools: {}",
+            serde_json::to_string(tools).expect("tool definitions are serializable")
+        ),
+    }
 }
 
 #[cfg(feature = "local-inference")]
-fn native_tool_call_text(tool_calls: &[crate::ToolCallResponse]) -> Result<String> {
+fn native_tool_call_text(
+    tool_calls: &[crate::ToolCallResponse],
+    protocol: NativeToolProtocol,
+) -> Result<String> {
     let mut result = String::new();
     for call in tool_calls {
         let arguments: serde_json::Value = serde_json::from_str(&call.function.arguments)
@@ -391,31 +431,49 @@ fn native_tool_call_text(tool_calls: &[crate::ToolCallResponse]) -> Result<Strin
         let object = arguments
             .as_object()
             .context("prior local tool call arguments were not an object")?;
-        result.push_str("<start_function_call>call:");
-        result.push_str(&call.function.name);
-        result.push('{');
-        for (index, (key, value)) in object.iter().enumerate() {
-            if index > 0 {
-                result.push(',');
+        match protocol {
+            NativeToolProtocol::Legacy => {
+                result.push_str("<start_function_call>call:");
+                result.push_str(&call.function.name);
+                result.push('{');
+                for (index, (key, value)) in object.iter().enumerate() {
+                    if index > 0 {
+                        result.push(',');
+                    }
+                    result.push_str(key);
+                    result.push(':');
+                    result.push_str(&legacy_native_value(value));
+                }
+                result.push_str("}<end_function_call>");
             }
-            result.push_str(key);
-            result.push(':');
-            result.push_str(&native_value(value));
+            NativeToolProtocol::Lfm => {
+                result.push_str("<|tool_call_start|>[");
+                result.push_str(&call.function.name);
+                result.push('(');
+                for (index, (key, value)) in object.iter().enumerate() {
+                    if index > 0 {
+                        result.push_str(", ");
+                    }
+                    result.push_str(key);
+                    result.push('=');
+                    result.push_str(&serde_json::to_string(value)?);
+                }
+                result.push_str(")]<|tool_call_end|>");
+            }
         }
-        result.push_str("}<end_function_call>");
     }
     Ok(result)
 }
 
 #[cfg(feature = "local-inference")]
-fn native_value(value: &serde_json::Value) -> String {
+fn legacy_native_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => native_escape(value),
         serde_json::Value::Array(values) => format!(
             "[{}]",
             values
                 .iter()
-                .map(native_value)
+                .map(legacy_native_value)
                 .collect::<Vec<_>>()
                 .join(",")
         ),
@@ -423,7 +481,7 @@ fn native_value(value: &serde_json::Value) -> String {
             "{{{}}}",
             values
                 .iter()
-                .map(|(key, value)| format!("{key}:{}", native_value(value)))
+                .map(|(key, value)| format!("{key}:{}", legacy_native_value(value)))
                 .collect::<Vec<_>>()
                 .join(",")
         ),
@@ -440,9 +498,12 @@ fn native_tool_result(name: &str, content: &str) -> String {
 }
 
 #[cfg(feature = "local-inference")]
-fn native_value_rule(schema: &serde_json::Value) -> &'static str {
+fn native_value_rule(schema: &serde_json::Value, protocol: NativeToolProtocol) -> &'static str {
     match schema.get("type").and_then(serde_json::Value::as_str) {
-        Some("string") => "escaped",
+        Some("string") => match protocol {
+            NativeToolProtocol::Legacy => "escaped",
+            NativeToolProtocol::Lfm => "string",
+        },
         Some("object") => "object",
         Some("array") => "array",
         Some("number") | Some("integer") => "number",
@@ -451,83 +512,169 @@ fn native_value_rule(schema: &serde_json::Value) -> &'static str {
     }
 }
 
-#[cfg(feature = "local-inference")]
+#[cfg(all(test, feature = "local-inference"))]
 fn native_tool_call_grammar(tools: &[ToolDefinition]) -> String {
-    let call_rules = tools
-        .iter()
-        .enumerate()
-        .map(|(index, _)| format!("call{}", grammar_label(index)))
+    native_tool_call_grammar_for(tools, NativeToolProtocol::Legacy)
+}
+
+#[cfg(feature = "local-inference")]
+fn native_tool_call_grammar_for(tools: &[ToolDefinition], protocol: NativeToolProtocol) -> String {
+    match protocol {
+        NativeToolProtocol::Legacy => legacy_tool_call_grammar(tools),
+        NativeToolProtocol::Lfm => lfm_tool_call_grammar(tools),
+    }
+}
+
+#[cfg(feature = "local-inference")]
+fn legacy_tool_call_grammar(tools: &[ToolDefinition]) -> String {
+    let call_rules = (0..tools.len())
+        .map(|index| format!("call{index}"))
         .collect::<Vec<_>>()
         .join(" | ");
-    let mut grammar = format!(
-        concat!(
-            "root ::= {}\n",
-            "value ::= escaped | object | array | number | boolean | \"null\"\n",
-            "boolean ::= \"true\" | \"false\"\n",
-            "escaped ::= \"<escape>\" [^<}},]+ \"<escape>\"\n",
-            "object ::= \"{{\" ws members ws \"}}\"\n",
-            "array ::=\n",
-            "  \"[\" ws (\n",
-            "    value\n",
-            "    (ws \",\" ws value)*\n",
-            "  )? \"]\"\n",
-            "members ::= pair (ws \",\" ws pair)* | \"\"\n",
-            "pair ::= key ws \":\" ws value\n",
-            "key ::= [a-zA-Z_] [a-zA-Z0-9_-]*\n",
-            "number ::= [+-]? [0-9]+ (\".\" [0-9]+)? ([eE] [+-]? [0-9]+)?\n",
-            "ws ::= [ \\t\\n]*\n"
-        ),
-        call_rules
+    let mut grammar = format!("root ::= {call_rules} | final\n");
+    grammar.push_str(
+        r#"final ::= [^<]*
+value ::= escaped | object | array | number | boolean | "null"
+boolean ::= "true" | "false"
+escaped ::= "<escape>" escapedchar* "<escape>"
+escapedchar ::= [^<\\] | "\\" (["\\/bfnrt] | "u" hex hex hex hex)
+hex ::= [0-9a-fA-F]
+object ::= "{" ws members ws "}"
+array ::= "[" ws (value (ws "," ws value)*)? ws "]"
+members ::= pair (ws "," ws pair)* | ""
+pair ::= key ws ":" ws value
+key ::= [a-zA-Z_] [a-zA-Z0-9_-]*
+number ::= [+-]? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
+ws ::= [ \t\n]*
+"#,
     );
     for (index, tool) in tools.iter().enumerate() {
-        let label = grammar_label(index);
-        let required = tool
-            .function
-            .parameters
-            .get("required")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<Vec<_>>();
-        grammar.push_str(&format!(
-            "call{label} ::= \"<start_function_call>\" \"call:\" \"{}\" \"{{\" ws args{label} ws \"}}<end_function_call>\"\n",
-            grammar_literal(&tool.function.name)
-        ));
-        let sequence = required
-            .iter()
-            .enumerate()
-            .map(|(required_index, _)| format!("arg{}{}", label, grammar_label(required_index)))
-            .collect::<Vec<_>>()
-            .join(" ws \",\" ws ");
-        if required.is_empty() {
-            grammar.push_str(&format!(
-                "args{label} ::= pair (ws \",\" ws pair)* | \"\"\n"
-            ));
-        } else {
-            grammar.push_str(&format!("args{label} ::= {sequence} (ws \",\" ws pair)*\n"));
-            for (required_index, name) in required.iter().enumerate() {
-                let value_rule = tool
-                    .function
-                    .parameters
-                    .pointer(&format!("/properties/{name}"))
-                    .map(native_value_rule)
-                    .unwrap_or("value");
-                grammar.push_str(&format!(
-                    "arg{}{} ::= \"{}\" ws \":\" ws {value_rule}\n",
-                    label,
-                    grammar_label(required_index),
-                    grammar_literal(name)
-                ));
-            }
-        }
+        append_tool_rule(
+            &mut grammar,
+            tool,
+            index,
+            NativeToolProtocol::Legacy,
+            "<start_function_call>call:",
+            "{",
+            "}",
+            ":",
+            "<end_function_call>",
+        );
     }
     grammar
 }
 
 #[cfg(feature = "local-inference")]
-fn grammar_label(index: usize) -> char {
-    char::from_u32(u32::from(b'a') + u32::try_from(index).unwrap_or(25).min(25)).unwrap_or('z')
+fn lfm_tool_call_grammar(tools: &[ToolDefinition]) -> String {
+    let call_rules = (0..tools.len())
+        .map(|index| format!("call{index}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut grammar = format!("root ::= {call_rules} | final\n");
+    grammar.push_str(
+        r#"final ::= [^<]*
+value ::= string | object | array | number | boolean | "null"
+string ::= jsonstring | singlestring
+jsonstring ::= "\"" jsonchar* "\""
+jsonchar ::= [^"\\] | "\\" (["\\/bfnrt] | "u" hex hex hex hex)
+singlestring ::= "'" singlechar* "'"
+singlechar ::= [^'\\] | "\\" (["'\\/bfnrt] | "u" hex hex hex hex)
+hex ::= [0-9a-fA-F]
+boolean ::= "true" | "false"
+object ::= "{" ws members ws "}"
+array ::= "[" ws (value (ws "," ws value)*)? ws "]"
+members ::= pair (ws "," ws pair)* | ""
+pair ::= (key | jsonstring) ws ":" ws value
+lfmpair ::= key ws "=" ws value
+key ::= [a-zA-Z_] [a-zA-Z0-9_-]*
+number ::= [+-]? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
+ws ::= [ \t\n]*
+"#,
+    );
+    for (index, tool) in tools.iter().enumerate() {
+        append_tool_rule(
+            &mut grammar,
+            tool,
+            index,
+            NativeToolProtocol::Lfm,
+            "<|tool_call_start|>[",
+            "(",
+            ")",
+            "=",
+            "]<|tool_call_end|>",
+        );
+    }
+    grammar
+}
+
+#[cfg(feature = "local-inference")]
+#[allow(clippy::too_many_arguments)]
+fn append_tool_rule(
+    grammar: &mut String,
+    tool: &ToolDefinition,
+    index: usize,
+    protocol: NativeToolProtocol,
+    call_prefix: &str,
+    argument_open: &str,
+    argument_close: &str,
+    assignment: &str,
+    call_suffix: &str,
+) {
+    let label = index.to_string();
+    let required = tool
+        .function
+        .parameters
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    grammar.push_str(&format!(
+        "call{label} ::= \"{}\" \"{}\" \"{}\" args{label} \"{}{}\"\n",
+        grammar_literal(call_prefix),
+        grammar_literal(&tool.function.name),
+        grammar_literal(argument_open),
+        grammar_literal(argument_close),
+        grammar_literal(call_suffix),
+    ));
+    let separator = match protocol {
+        NativeToolProtocol::Legacy | NativeToolProtocol::Lfm => " ws \",\" ws ",
+    };
+    let sequence = required
+        .iter()
+        .enumerate()
+        .map(|(required_index, _)| format!("arg{label}x{required_index}"))
+        .collect::<Vec<_>>()
+        .join(separator);
+    let generic_pair = match protocol {
+        NativeToolProtocol::Legacy => "pair",
+        NativeToolProtocol::Lfm => "lfmpair",
+    };
+    if required.is_empty() {
+        grammar.push_str(&format!(
+            "args{label} ::= {generic_pair} ({separator}{generic_pair})* | \"\"\n"
+        ));
+    } else {
+        grammar.push_str(&format!(
+            "args{label} ::= {sequence} ({separator}{generic_pair})*\n"
+        ));
+        for (required_index, name) in required.iter().enumerate() {
+            let value_rule = tool
+                .function
+                .parameters
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|properties| properties.get(*name))
+                .map(|schema| native_value_rule(schema, protocol))
+                .unwrap_or("value");
+            grammar.push_str(&format!(
+                "arg{label}x{required_index} ::= \"{}\" ws \"{}\" ws {value_rule}\n",
+                grammar_literal(name),
+                grammar_literal(assignment),
+            ));
+        }
+    }
 }
 
 #[cfg(feature = "local-inference")]
@@ -539,28 +686,17 @@ fn grammar_literal(value: &str) -> String {
 fn render_messages(
     messages: &[ChatMessage],
     tools: &[ToolDefinition],
-    native_tools: bool,
+    native_protocol: Option<NativeToolProtocol>,
 ) -> Result<Vec<llama_cpp_2::model::LlamaChatMessage>> {
     use llama_cpp_2::model::LlamaChatMessage;
 
-    let has_tool_result = messages.iter().any(|message| message.role == "tool");
     let instructions = if tools.is_empty() {
         None
-    } else if native_tools {
+    } else if let Some(protocol) = native_protocol {
         Some(format!(
-            "{}\n{}",
-            if has_tool_result {
-                "A function result is already supplied. Do not call any function; return only the final natural-language answer."
-            } else {
-                "Use the declared functions when needed. Fill arguments from the user's exact request; never use placeholder values. Return a final natural-language answer after a function result."
-            },
-            native_tool_declarations(tools)
+            "Use a declared function whenever it is needed. After every tool result, either call another declared function or return a final natural-language answer. Never use placeholder arguments.\n\n{}",
+            native_tool_declarations(tools, protocol)
         ))
-    } else if has_tool_result {
-        Some(
-            "A tool result is already in this conversation. Return only the final natural-language answer; do not call a function or repeat the tool protocol."
-                .to_string(),
-        )
     } else {
         let tool_json = serde_json::to_string_pretty(tools)?;
         Some(format!(
@@ -568,7 +704,7 @@ fn render_messages(
                 "Tool protocol for this turn. Return exactly one JSON object and no Markdown, commentary, or code fence.\n\n",
                 "If the user request needs a function, return {{\"kind\":\"tool_call\",\"name\":\"EXACT_FUNCTION_NAME\",\"arguments\":{{...}}}}. The name must be one of the listed functions and arguments must follow its schema.\n",
                 "If no function is needed, return {{\"kind\":\"final\",\"content\":\"answer\"}}. Never invent a tool result.\n\n",
-                "Available functions:\n{}\n\nCall a function when it is needed to answer the user."
+                "Available functions:\n{}\n\nAfter every tool result, call another function when needed to answer the user."
             ),
             tool_json
         ))
@@ -597,18 +733,14 @@ fn render_messages(
         let mut content = message.content.clone().unwrap_or_default();
 
         if let Some(tool_calls) = &message.tool_calls {
-            let native_history = native_tools && !has_tool_result;
-            let mut calls = if native_history {
-                native_tool_call_text(tool_calls)?
-            } else if has_tool_result {
-                String::new()
-            } else {
-                format!(
+            let mut calls = match native_protocol {
+                Some(protocol) => native_tool_call_text(tool_calls, protocol)?,
+                None => format!(
                     "Previous function call completed: {}",
                     serde_json::to_string(tool_calls)?
-                )
+                ),
             };
-            if native_history {
+            if native_protocol == Some(NativeToolProtocol::Legacy) {
                 for call in tool_calls {
                     if let Some(result) = results_by_id.get(call.id.as_str()) {
                         calls.push_str(&native_tool_result(&call.function.name, result));
@@ -622,14 +754,15 @@ fn render_messages(
         }
         if message.role == "tool" {
             let id = message.tool_call_id.as_deref().unwrap_or("local_tool");
-            if native_tools && !has_tool_result {
-                if !names_by_id.contains_key(id) {
+            let name = names_by_id.get(id).copied().unwrap_or("unknown_tool");
+            if native_protocol == Some(NativeToolProtocol::Legacy) {
+                if name == "unknown_tool" {
                     bail!("local GGUF tool result {id:?} has no matching prior tool call");
                 }
                 continue;
             }
             role = "user".to_string();
-            content = format!("Tool result for {id}:\n{content}");
+            content = format!("Tool result from {name} ({id}):\n{content}");
         }
 
         if !injected
@@ -656,10 +789,7 @@ fn render_messages(
 }
 
 #[cfg(feature = "local-inference")]
-fn local_tool_response_schema(
-    tools: &[ToolDefinition],
-    has_tool_result: bool,
-) -> serde_json::Value {
+fn local_tool_response_schema(tools: &[ToolDefinition]) -> serde_json::Value {
     let final_response = serde_json::json!({
         "type": "object",
         "properties": {
@@ -669,10 +799,6 @@ fn local_tool_response_schema(
         "required": ["kind", "content"],
         "additionalProperties": false
     });
-    if has_tool_result {
-        return final_response;
-    }
-
     let mut alternatives = Vec::with_capacity(tools.len() + 1);
     for tool in tools {
         alternatives.push(serde_json::json!({
@@ -722,14 +848,12 @@ fn generate(
     let template_source = template
         .to_string()
         .map_err(|error| anyhow::anyhow!("local GGUF model {model_spec:?} has invalid chat template metadata: {error}. No remote endpoint was tried."))?;
-    let has_tool_result = messages.iter().any(|message| message.role == "tool");
-    let native_tools = !tools.is_empty()
-        && !has_tool_result
-        && template_source.contains("<start_function_declaration>")
-        && template_source.contains("<start_function_call>");
-    let chat = render_messages(messages, tools, native_tools)?;
-    let tool_grammar = if native_tools && !has_tool_result {
-        let grammar = native_tool_call_grammar(tools);
+    let native_protocol = (!tools.is_empty())
+        .then(|| native_tool_protocol(&template_source))
+        .flatten();
+    let chat = render_messages(messages, tools, native_protocol)?;
+    let tool_grammar = if let Some(protocol) = native_protocol {
+        let grammar = native_tool_call_grammar_for(tools, protocol);
         Some(
             LlamaSampler::grammar(&model, &grammar, "root").map_err(|error| {
                 anyhow::anyhow!(
@@ -737,8 +861,8 @@ fn generate(
                 )
             })?,
         )
-    } else if !native_tools && !tools.is_empty() && !has_tool_result {
-        let schema = local_tool_response_schema(tools, false);
+    } else if !tools.is_empty() {
+        let schema = local_tool_response_schema(tools);
         let schema_json = serde_json::to_string(&schema)?;
         let grammar = llama_cpp_2::json_schema_to_grammar(&schema_json).map_err(|error| {
             anyhow::anyhow!(
@@ -923,5 +1047,121 @@ mod tests {
             .to_string();
         assert!(error.contains("expected_format"));
         assert!(error.contains(".gguf"));
+    }
+
+    #[cfg(feature = "local-inference")]
+    fn test_tool(name: impl Into<String>) -> ToolDefinition {
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: crate::FunctionDef {
+                name: name.into(),
+                description: "test tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }
+    }
+
+    /// Regression H1: every declared function needs its own GBNF rule, even
+    /// when a request carries a catalog-sized tool surface.
+    #[cfg(feature = "local-inference")]
+    #[test]
+    fn native_grammar_uses_distinct_rule_names_for_one_hundred_tools() {
+        let tools = (0..100)
+            .map(|index| test_tool(format!("tool_{index}")))
+            .collect::<Vec<_>>();
+        for protocol in [NativeToolProtocol::Legacy, NativeToolProtocol::Lfm] {
+            let grammar = native_tool_call_grammar_for(&tools, protocol);
+            let call_rules = grammar
+                .lines()
+                .filter_map(|line| line.split_once(" ::= "))
+                .map(|(name, _)| name)
+                .filter(|name| name.starts_with("call"))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(call_rules.len(), tools.len(), "{protocol:?}: {grammar}");
+        }
+    }
+
+    /// Regression H2: a real text argument must retain delimiters and angle
+    /// brackets rather than being token-masked into a different value.
+    #[cfg(feature = "local-inference")]
+    #[test]
+    fn native_string_with_comma_brace_and_angle_bracket_round_trips() {
+        let (name, arguments) = crate::parse_native_tool_call(
+            "<start_function_call>call:recall{query:<escape>alpha, {beta} \\u003Cgamma\\u003E<escape>}<end_function_call>",
+        )
+        .unwrap();
+        assert_eq!(name, "recall");
+        assert_eq!(arguments["query"], "alpha, {beta} <gamma>");
+
+        let grammar = native_tool_call_grammar(&[test_tool("recall")]);
+        assert!(
+            grammar.contains("escapedchar ::= [^<\\\\]"),
+            "string grammar still bans delimiters: {grammar}"
+        );
+    }
+
+    /// Regression H3: each later turn retains declarations, the prior native
+    /// call, and its paired result, while the grammar still permits a call or
+    /// ordinary final answer.
+    #[cfg(feature = "local-inference")]
+    #[test]
+    fn lfm_multiturn_render_keeps_tools_calls_results_and_final_alternative() {
+        let tools = vec![test_tool("find_tools"), test_tool("recall")];
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some("system prompt".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some("Find a material tool, then recall its result.".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![crate::ToolCallResponse {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: crate::FunctionCall {
+                        name: "find_tools".to_string(),
+                        arguments: r#"{"query":"materials"}"#.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some("materials_search is available".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+            },
+        ];
+        let rendered = render_messages(&messages, &tools, Some(NativeToolProtocol::Lfm)).unwrap();
+        let prompt = rendered
+            .iter()
+            .map(|message| format!("{message:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt.contains("List of tools:"), "{prompt}");
+        assert!(
+            prompt.contains(
+                "<|tool_call_start|>[find_tools(query=\\\"materials\\\")]<|tool_call_end|>"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Tool result from find_tools (call_1):"),
+            "{prompt}"
+        );
+
+        let grammar = native_tool_call_grammar_for(&tools, NativeToolProtocol::Lfm);
+        assert!(
+            grammar.contains("root ::= call0 | call1 | final"),
+            "{grammar}"
+        );
     }
 }

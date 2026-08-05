@@ -436,7 +436,7 @@ impl LlmClient {
         }
 
         let text = generation.text.trim();
-        if text.starts_with("<start_function_call>") {
+        if text.starts_with("<start_function_call>") || text.starts_with("<|tool_call_start|>") {
             let (name, arguments) = parse_native_tool_call(text).map_err(|error| {
                 anyhow::anyhow!(
                     "local GGUF model {model:?} produced an invalid embedded-template tool call {text:?}: {error}; the call was rejected and no remote endpoint was tried."
@@ -950,9 +950,11 @@ impl LlmClient {
                             return;
                         }
                         pending.push_str(delta);
-                        let is_protocol = ["{", "<start_function_call>"].iter().any(|marker| {
-                            marker.starts_with(&pending) || pending.starts_with(marker)
-                        });
+                        let is_protocol = ["{", "<start_function_call>", "<|tool_call_start|>"]
+                            .iter()
+                            .any(|marker| {
+                                marker.starts_with(&pending) || pending.starts_with(marker)
+                            });
                         if !visible_started && is_protocol {
                             return;
                         }
@@ -1716,6 +1718,10 @@ fn find_bare_json_tool_call(text: &str) -> Option<(usize, String, String)> {
 }
 
 fn parse_native_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
+    if text.starts_with("<|tool_call_start|>") {
+        return parse_lfm_tool_call(text);
+    }
+
     let prefix = "<start_function_call>call:";
     let suffix = "<end_function_call>";
     let body = text
@@ -1725,9 +1731,7 @@ fn parse_native_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
         .context("missing native function-call terminator")?;
     let open = body.find('{').context("missing native argument object")?;
     let name = body[..open].trim();
-    if name.is_empty() || name.chars().any(char::is_whitespace) {
-        bail!("native function name is empty or contains whitespace");
-    }
+    validate_native_tool_name(name)?;
     let mut parser = NativeValueParser::new(&body[open..]);
     let arguments = parser.object()?;
     parser.skip_whitespace();
@@ -1735,6 +1739,217 @@ fn parse_native_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
         bail!("native argument object has trailing characters");
     }
     Ok((name.to_string(), arguments))
+}
+
+fn parse_lfm_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
+    let body = text
+        .strip_prefix("<|tool_call_start|>")
+        .context("missing LFM function-call prefix")?
+        .strip_suffix("<|tool_call_end|>")
+        .context("missing LFM function-call terminator")?
+        .strip_prefix('[')
+        .and_then(|body| body.strip_suffix(']'))
+        .context("LFM function call must contain exactly one bracketed call")?;
+    let open = body.find('(').context("missing LFM argument list")?;
+    let name = body[..open].trim();
+    validate_native_tool_name(name)?;
+    let arguments = body[open + 1..]
+        .strip_suffix(')')
+        .context("unterminated LFM argument list")?;
+    let mut parser = LfmArgumentParser::new(arguments);
+    let arguments = parser.object()?;
+    parser.skip_whitespace();
+    if parser.position != parser.input.len() {
+        bail!("LFM argument list has trailing characters");
+    }
+    Ok((name.to_string(), arguments))
+}
+
+fn validate_native_tool_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        bail!("native function name is empty or contains whitespace");
+    }
+    Ok(())
+}
+
+struct LfmArgumentParser<'a> {
+    input: &'a str,
+    position: usize,
+}
+
+impl<'a> LfmArgumentParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, position: 0 }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .input
+            .as_bytes()
+            .get(self.position)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.position += 1;
+        }
+    }
+
+    fn object(&mut self) -> Result<serde_json::Value> {
+        let mut result = serde_json::Map::new();
+        self.skip_whitespace();
+        if self.position == self.input.len() {
+            return Ok(serde_json::Value::Object(result));
+        }
+        loop {
+            self.skip_whitespace();
+            let start = self.position;
+            while let Some(byte) = self.input.as_bytes().get(self.position) {
+                if *byte == b'=' || byte.is_ascii_whitespace() {
+                    break;
+                }
+                self.position += 1;
+            }
+            let key = self.input[start..self.position].trim();
+            if key.is_empty() || result.contains_key(key) {
+                bail!("LFM tool call has an empty or duplicate argument key");
+            }
+            self.skip_whitespace();
+            if self.input.as_bytes().get(self.position) != Some(&b'=') {
+                bail!("LFM tool call expected '=' after argument key {key:?}");
+            }
+            self.position += 1;
+            let value = self.value()?;
+            result.insert(key.to_string(), value);
+            self.skip_whitespace();
+            match self.input.as_bytes().get(self.position) {
+                Some(b',') => self.position += 1,
+                None => break,
+                _ => bail!("LFM tool call expected ',' after an argument"),
+            }
+        }
+        Ok(serde_json::Value::Object(result))
+    }
+
+    fn value(&mut self) -> Result<serde_json::Value> {
+        self.skip_whitespace();
+        match self.input.as_bytes().get(self.position) {
+            Some(b'\'') | Some(b'"') => Ok(serde_json::Value::String(self.quoted_string()?)),
+            Some(b'{') | Some(b'[') => self.json_container(),
+            Some(_) => {
+                let start = self.position;
+                while let Some(byte) = self.input.as_bytes().get(self.position) {
+                    if *byte == b',' || byte.is_ascii_whitespace() {
+                        break;
+                    }
+                    self.position += 1;
+                }
+                let raw = self.input[start..self.position].trim();
+                if raw.is_empty() {
+                    bail!("LFM tool call has an empty argument value");
+                }
+                serde_json::from_str(raw)
+                    .map_err(|error| anyhow::anyhow!("LFM argument is not valid JSON: {error}"))
+            }
+            None => bail!("LFM tool call ended before an argument value"),
+        }
+    }
+
+    fn quoted_string(&mut self) -> Result<String> {
+        let quote = *self
+            .input
+            .as_bytes()
+            .get(self.position)
+            .context("LFM string is missing its opening quote")?;
+        self.position += 1;
+        let mut result = String::new();
+        while let Some(byte) = self.input.as_bytes().get(self.position).copied() {
+            self.position += 1;
+            if byte == quote {
+                return Ok(result);
+            }
+            if byte != b'\\' {
+                let start = self.position - 1;
+                let character = self.input[start..]
+                    .chars()
+                    .next()
+                    .context("LFM string contains invalid UTF-8")?;
+                self.position = start + character.len_utf8();
+                result.push(character);
+                continue;
+            }
+            let escaped = *self
+                .input
+                .as_bytes()
+                .get(self.position)
+                .context("LFM string ends in an escape")?;
+            self.position += 1;
+            match escaped {
+                b'"' => result.push('"'),
+                b'\'' => result.push('\''),
+                b'\\' => result.push('\\'),
+                b'/' => result.push('/'),
+                b'b' => result.push('\u{0008}'),
+                b'f' => result.push('\u{000C}'),
+                b'n' => result.push('\n'),
+                b'r' => result.push('\r'),
+                b't' => result.push('\t'),
+                b'u' => {
+                    let hex_end = self.position + 4;
+                    let hex = self
+                        .input
+                        .get(self.position..hex_end)
+                        .context("LFM unicode escape is incomplete")?;
+                    let codepoint = u32::from_str_radix(hex, 16)
+                        .context("LFM unicode escape is not hexadecimal")?;
+                    let character = char::from_u32(codepoint)
+                        .context("LFM unicode escape is not a scalar value")?;
+                    result.push(character);
+                    self.position = hex_end;
+                }
+                _ => bail!("LFM string has an invalid escape"),
+            }
+        }
+        bail!("LFM string is unterminated")
+    }
+
+    fn json_container(&mut self) -> Result<serde_json::Value> {
+        let start = self.position;
+        let mut nesting = Vec::new();
+        let mut in_string = false;
+        let mut escaped = false;
+        while let Some(byte) = self.input.as_bytes().get(self.position).copied() {
+            self.position += 1;
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'{' | b'[' => nesting.push(byte),
+                b'}' => {
+                    if nesting.pop() != Some(b'{') {
+                        bail!("LFM JSON argument has mismatched delimiters");
+                    }
+                }
+                b']' => {
+                    if nesting.pop() != Some(b'[') {
+                        bail!("LFM JSON argument has mismatched delimiters");
+                    }
+                }
+                _ => {}
+            }
+            if nesting.is_empty() {
+                return serde_json::from_str(&self.input[start..self.position])
+                    .map_err(|error| anyhow::anyhow!("LFM argument is not valid JSON: {error}"));
+            }
+        }
+        bail!("LFM JSON argument is unterminated")
+    }
 }
 
 struct NativeValueParser<'a> {
@@ -1839,7 +2054,9 @@ impl<'a> NativeValueParser<'a> {
                 .find("<escape>")
                 .map(|offset| self.position + offset)
                 .context("unterminated native escaped string")?;
-            let value = self.input[self.position..end].to_string();
+            let encoded = &self.input[self.position..end];
+            let value = serde_json::from_str(&format!("\"{encoded}\""))
+                .context("native escaped string is not valid JSON")?;
             self.position = end + "<escape>".len();
             return Ok(serde_json::Value::String(value));
         }
@@ -1927,6 +2144,8 @@ fn validate_json_schema(
         }
     }
 
+    validate_json_constraints(value, schema, path)?;
+
     if let Some(properties) = schema.get("properties") {
         let properties = properties
             .as_object()
@@ -1982,6 +2201,121 @@ fn validate_json_schema(
             .context(format!("{path} must be an array"))?;
         for (index, child) in array.iter().enumerate() {
             validate_json_schema(child, items, &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_constraints(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+) -> Result<()> {
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema_number(schema, "minimum")? {
+            let exclusive = schema
+                .get("exclusiveMinimum")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if (exclusive && number <= minimum) || (!exclusive && number < minimum) {
+                bail!("{path} violates the schema minimum {minimum}");
+            }
+        }
+        if let Some(minimum) = schema_number(schema, "exclusiveMinimum")?
+            && number <= minimum
+        {
+            bail!("{path} violates the schema exclusiveMinimum {minimum}");
+        }
+        if let Some(maximum) = schema_number(schema, "maximum")? {
+            let exclusive = schema
+                .get("exclusiveMaximum")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if (exclusive && number >= maximum) || (!exclusive && number > maximum) {
+                bail!("{path} violates the schema maximum {maximum}");
+            }
+        }
+        if let Some(maximum) = schema_number(schema, "exclusiveMaximum")?
+            && number >= maximum
+        {
+            bail!("{path} violates the schema exclusiveMaximum {maximum}");
+        }
+        if let Some(multiple) = schema_number(schema, "multipleOf")? {
+            if multiple <= 0.0 {
+                bail!("tool schema multipleOf at {path} must be positive");
+            }
+            let quotient = number / multiple;
+            if (quotient - quotient.round()).abs() > f64::EPSILON * quotient.abs().max(1.0) {
+                bail!("{path} violates the schema multipleOf {multiple}");
+            }
+        }
+    }
+
+    if let Some(string) = value.as_str() {
+        validate_count_constraint(string.chars().count(), schema, "minLength", path)?;
+        validate_max_count_constraint(string.chars().count(), schema, "maxLength", path)?;
+    }
+    if let Some(array) = value.as_array() {
+        validate_count_constraint(array.len(), schema, "minItems", path)?;
+        validate_max_count_constraint(array.len(), schema, "maxItems", path)?;
+        if schema
+            .get("uniqueItems")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && array
+                .iter()
+                .enumerate()
+                .any(|(index, item)| array[..index].contains(item))
+        {
+            bail!("{path} violates the schema uniqueItems constraint");
+        }
+    }
+    if let Some(object) = value.as_object() {
+        validate_count_constraint(object.len(), schema, "minProperties", path)?;
+        validate_max_count_constraint(object.len(), schema, "maxProperties", path)?;
+    }
+    Ok(())
+}
+
+fn schema_number(schema: &serde_json::Value, name: &str) -> Result<Option<f64>> {
+    match schema.get(name) {
+        None | Some(serde_json::Value::Bool(_)) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .map(Some)
+            .context(format!("tool schema {name} must be a number")),
+    }
+}
+
+fn validate_count_constraint(
+    actual: usize,
+    schema: &serde_json::Value,
+    name: &str,
+    path: &str,
+) -> Result<()> {
+    if let Some(minimum) = schema.get(name) {
+        let minimum = minimum
+            .as_u64()
+            .context(format!("tool schema {name} must be a non-negative integer"))?;
+        if actual < minimum as usize {
+            bail!("{path} violates the schema {name} {minimum}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_max_count_constraint(
+    actual: usize,
+    schema: &serde_json::Value,
+    name: &str,
+    path: &str,
+) -> Result<()> {
+    if let Some(maximum) = schema.get(name) {
+        let maximum = maximum
+            .as_u64()
+            .context(format!("tool schema {name} must be a non-negative integer"))?;
+        if actual > maximum as usize {
+            bail!("{path} violates the schema {name} {maximum}");
         }
     }
     Ok(())
@@ -2289,6 +2623,43 @@ mod tests {
         assert!(error.contains("no remote endpoint was tried"));
     }
 
+    /// Regression H2: schema bounds are a rejection boundary, never a hint to
+    /// clamp a model-controlled tool argument after parsing.
+    #[test]
+    fn local_tool_response_rejects_out_of_range_limit_instead_of_clamping() {
+        let tool = ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "find_tools".to_string(),
+                description: "discover tools".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 25}
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            },
+        };
+        let error = LlmClient::local_chat_response(
+            local::LocalGeneration {
+                text: r#"{"kind":"tool_call","name":"find_tools","arguments":{"query":"materials","limit":26}}"#.to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            },
+            &[tool],
+            "test-model",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("maximum"), "{error}");
+        assert!(error.contains("rejected"), "{error}");
+        assert!(!error.contains("clamp"), "{error}");
+    }
+
     #[test]
     fn native_tool_call_parser_is_strict_and_preserves_json_types() {
         let (name, arguments) = parse_native_tool_call(
@@ -2302,6 +2673,17 @@ mod tests {
             "<start_function_call>call:lookup{query:<escape>titanium<escape>}<end_function_call>trailing"
         )
         .is_err());
+    }
+
+    #[test]
+    fn lfm_native_tool_call_parser_preserves_json_escaped_text() {
+        let (name, arguments) = parse_native_tool_call(
+            "<|tool_call_start|>[find_tools(query=\"alpha, {beta} <gamma>\", limit=2)]<|tool_call_end|>",
+        )
+        .unwrap();
+        assert_eq!(name, "find_tools");
+        assert_eq!(arguments["query"], "alpha, {beta} <gamma>");
+        assert_eq!(arguments["limit"], 2);
     }
 
     #[test]
