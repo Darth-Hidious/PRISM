@@ -210,6 +210,13 @@ const SCIENCE_EXTRAS: &[&str] = &[
     "lpbf",
     "simulation",
     "ml",
+    // The polymer extra (rdkit) was declared in pyproject.toml, all three maps
+    // in app/tools/_extras.py, and the marketplace catalog, but not here — so
+    // `prism provision extra polymer` was refused and the app rendered it as an
+    // unavailable capability. Declaring an extra everywhere except the gate that
+    // installs it is the same defect class as a tool that is registered but
+    // cannot run.
+    "polymer",
 ];
 
 /// Windows installers put `python.exe` on PATH, not `python3.X`. `python3`
