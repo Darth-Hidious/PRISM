@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -50,7 +51,6 @@ pub struct SweepState {
     /// "source|cursor" items fully completed.
     pub completed: BTreeSet<String>,
     pub papers_seen: usize,
-    pub duplicates_merged: usize,
 }
 
 impl SweepState {
@@ -121,7 +121,10 @@ impl RetrievalEngine {
         let ctx = self.fetch_ctx_for(plan.per_page_limit);
         let mut papers: Vec<Paper> = Vec::new();
         let mut seen: HashMap<String, usize> = HashMap::new();
-        let mut duplicates_merged = state.duplicates_merged;
+        // Counted fresh each run: on a resume every completed page is
+        // replayed, so its merges are re-observed. Seeding from the
+        // checkpoint would count every duplicate twice (once per run).
+        let mut duplicates_merged = 0usize;
         let mut pages_fetched = 0usize;
         let mut pages_from_cache = 0usize;
         let mut finished = true;
@@ -133,6 +136,7 @@ impl RetrievalEngine {
             let mut pages_this_source = 0usize;
             let mut count_this_source = 0usize;
             let mut error_this_source: Option<String> = None;
+            let mut exhausted = false;
 
             loop {
                 if pages_this_source >= plan.max_pages_per_source {
@@ -144,9 +148,18 @@ impl RetrievalEngine {
                     // a resume must not silently drop completed work — and
                     // the page still counts against the cap, so re-running
                     // a finished sweep is idempotent.
+                    let network_before = ctx.network_fetches.load(Ordering::SeqCst);
                     match sources::fetch_page(*id, &ctx, &plan.query, &cursor).await {
                         Ok((replayed, next)) => {
-                            pages_from_cache += 1;
+                            // pages_from_cache measures "no network happened",
+                            // not "was marked done": a completed page whose
+                            // cache entry is gone was refetched over the
+                            // network and must count as fetched.
+                            if ctx.network_fetches.load(Ordering::SeqCst) == network_before {
+                                pages_from_cache += 1;
+                            } else {
+                                pages_fetched += 1;
+                            }
                             pages_this_source += 1;
                             count_this_source += replayed.len();
                             for paper in replayed {
@@ -164,7 +177,10 @@ impl RetrievalEngine {
                             }
                             match next {
                                 Some(n) => cursor = n,
-                                None => break,
+                                None => {
+                                    exhausted = true;
+                                    break;
+                                }
                             }
                         }
                         Err(e) => {
@@ -180,15 +196,28 @@ impl RetrievalEngine {
                             state
                                 .completed
                                 .retain(|k| !k.starts_with(&format!("{}|", id.as_str())));
+                            // Reset the page budget: the source restarts from
+                            // page one, and the pages consumed before the
+                            // restart must not starve the re-fetched chain —
+                            // that is how resumes silently lost tail papers.
+                            pages_this_source = 0;
+                            count_this_source = 0;
                         }
                     }
                     continue;
                 }
 
+                let network_before = ctx.network_fetches.load(Ordering::SeqCst);
                 let page_result = sources::fetch_page(*id, &ctx, &plan.query, &cursor).await;
                 match page_result {
                     Ok((found, next)) => {
-                        pages_fetched += 1;
+                        // Same honesty as the replay path: count by real
+                        // network traffic, not by bookkeeping.
+                        if ctx.network_fetches.load(Ordering::SeqCst) == network_before {
+                            pages_from_cache += 1;
+                        } else {
+                            pages_fetched += 1;
+                        }
                         pages_this_source += 1;
                         count_this_source += found.len();
                         for paper in found {
@@ -206,11 +235,13 @@ impl RetrievalEngine {
                         }
                         state.mark_done(*id, &cursor);
                         state.papers_seen = papers.len() + duplicates_merged;
-                        state.duplicates_merged = duplicates_merged;
                         save_state(state_path, &state)?;
                         match next {
                             Some(n) => cursor = n,
-                            None => break,
+                            None => {
+                                exhausted = true;
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
@@ -219,6 +250,14 @@ impl RetrievalEngine {
                         break;
                     }
                 }
+            }
+
+            // A source that stopped at its page cap without exhausting the
+            // cursor chain left pages unfetched: the sweep is not finished,
+            // and reporting finished would claim completeness it does not
+            // have. A short sweep that says so is fine.
+            if !exhausted && error_this_source.is_none() {
+                finished = false;
             }
 
             let latency_ms = source_start.elapsed().as_secs_f64() * 1000.0;

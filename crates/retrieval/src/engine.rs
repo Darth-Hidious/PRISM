@@ -101,6 +101,8 @@ impl RetrievalEngine {
             cache,
             max_attempts: self.cfg.max_attempts,
             cache_hits: std::sync::Mutex::new(std::collections::HashMap::new()),
+            network_fetches: std::sync::atomic::AtomicUsize::new(0),
+            cache_fetches: std::sync::atomic::AtomicUsize::new(0),
             fulltext_limiter: Arc::new(RateLimiter::new(Duration::from_millis(1000))),
         }
     }

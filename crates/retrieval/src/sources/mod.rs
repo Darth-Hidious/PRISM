@@ -104,6 +104,10 @@ pub struct FetchCtx {
     pub max_attempts: u32,
     /// Which sources were served entirely from cache this round.
     pub cache_hits: std::sync::Mutex<HashMap<SourceId, bool>>,
+    /// Requests actually issued to the network this round.
+    pub network_fetches: std::sync::atomic::AtomicUsize,
+    /// Responses served from the disk cache this round.
+    pub cache_fetches: std::sync::atomic::AtomicUsize,
     /// Shared politeness limiter for full-text downloads across all hosts.
     pub fulltext_limiter: Arc<RateLimiter>,
 }
@@ -133,12 +137,16 @@ impl FetchCtx {
             // round came from cache (PubMed makes two).
             let mut hits = self.cache_hits.lock().expect("cache_hits poisoned");
             hits.entry(id).or_insert(true);
+            self.cache_fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok((body, true));
         }
         {
             let mut hits = self.cache_hits.lock().expect("cache_hits poisoned");
             hits.insert(id, false);
         }
+        self.network_fetches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let limiter = self.limiter(id);
         let body = get_with_retry(
             &self.client,
