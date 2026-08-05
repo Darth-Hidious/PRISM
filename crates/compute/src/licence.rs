@@ -48,9 +48,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use chrono::{DateTime, NaiveDate, Utc};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Default location of the licence declarations file.
 pub const LICENCES_FILE: &str = "licences.toml";
@@ -373,6 +376,220 @@ fn parse_time_part(part: &str, spec: &str) -> Result<u64> {
         .with_context(|| format!("invalid component {part:?} in SLURM walltime {spec:?}"))
 }
 
+// ── Signed leases ──────────────────────────────────────────────────────
+
+/// File names for the lease signing keypair under the compute data dir.
+const LEASE_KEY_FILE: &str = "lease-signing.key";
+const LEASE_PUB_FILE: &str = "lease-signing.pub";
+
+/// Ed25519 keypair used to mint and verify leases.
+///
+/// The signing half never leaves the submitting machine. The verifying
+/// half travels inside each lease so a compute node with no egress can
+/// check the assertion offline. It is *not* the licence secret: a licence
+/// secret (serial, key, server credential) grants the licence against the
+/// vendor; this keypair only proves PRISM minted the lease.
+pub struct LeaseKeys {
+    signing: SigningKey,
+}
+
+impl LeaseKeys {
+    /// Fresh ephemeral keypair (in-memory managers, tests).
+    pub fn generate() -> Self {
+        Self {
+            signing: SigningKey::generate(&mut rand::rngs::OsRng),
+        }
+    }
+
+    /// Load the keypair from `dir`, creating it on first use. The private
+    /// key file is written mode 0600.
+    pub fn load_or_create(dir: &Path) -> Result<Self> {
+        let key_path = dir.join(LEASE_KEY_FILE);
+        if let Some(keys) = Self::read(&key_path)
+            .with_context(|| format!("failed to read lease signing key {}", key_path.display()))?
+        {
+            return Ok(keys);
+        }
+        let keys = Self::generate();
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&key_path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(hex::encode(keys.signing.to_bytes()).as_bytes())
+                    .with_context(|| format!("failed to write {}", key_path.display()))?;
+            }
+            // Another process created the file between our check and open:
+            // read theirs instead of fighting.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(existing) = Self::read(&key_path)? {
+                    return Ok(existing);
+                }
+                return Err(e).with_context(|| format!("failed to open {}", key_path.display()));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to open {}", key_path.display()))
+            }
+        }
+        // The public half is not secret; publish it beside for pinning on
+        // compute nodes.
+        std::fs::write(dir.join(LEASE_PUB_FILE), keys.verifying_key_hex())
+            .context("failed to write lease verifying key")?;
+        Ok(keys)
+    }
+
+    fn read(key_path: &Path) -> Result<Option<Self>> {
+        if !key_path.exists() {
+            return Ok(None);
+        }
+        let hexed = std::fs::read_to_string(key_path)?;
+        let bytes = hex::decode(hexed.trim()).context("lease signing key is not hex")?;
+        let secret: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("lease signing key must be 32 bytes"))?;
+        Ok(Some(Self {
+            signing: SigningKey::from_bytes(&secret),
+        }))
+    }
+
+    pub fn verifying_key_hex(&self) -> String {
+        hex::encode(self.signing.verifying_key().to_bytes())
+    }
+
+    /// Sign raw bytes (internal minting helper).
+    fn sign(&self, message: &[u8]) -> String {
+        hex::encode(self.signing.sign(message).to_bytes())
+    }
+}
+
+/// A lease: the only licence artefact that ever travels to a compute node.
+///
+/// An opaque, signed, expiring assertion naming the licence id, seat
+/// count, job id and expiry. Verifiable offline via [`Lease::verify`]
+/// without the licence secret. `#[serde(deny_unknown_fields)]` keeps the
+/// wire form honest: a blob with extra fields is a forgery attempt, not a
+/// version skew.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lease {
+    pub licence_id: String,
+    pub seats: u32,
+    pub job_id: Uuid,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    /// Hex Ed25519 verifying key of the issuing PRISM deployment.
+    pub verifying_key: String,
+    /// Hex Ed25519 signature over [`Lease::payload`].
+    pub signature: String,
+}
+
+impl Lease {
+    /// Canonical bytes covered by the signature. Deliberately a plain
+    /// deterministic encoding, not JSON: identical on every platform and
+    /// Rust version, since the compute node may verify with a different
+    /// build than the submitter.
+    pub fn payload(&self) -> Vec<u8> {
+        format!(
+            "licence_id={};seats={};job_id={};issued_at={};expires_at={}",
+            self.licence_id,
+            self.seats,
+            self.job_id,
+            self.issued_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            self.expires_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        )
+        .into_bytes()
+    }
+
+    /// Offline verification: signature check only. Expiry is a separate
+    /// question ([`Lease::is_expired`]) so a node can tell a forgery from
+    /// an honest-but-late lease.
+    pub fn verify(&self) -> Result<()> {
+        let key_bytes = hex::decode(&self.verifying_key)
+            .context("lease verifying key is not hex")?;
+        let key_bytes: [u8; 32] = key_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("lease verifying key must be 32 bytes"))?;
+        let verifying = VerifyingKey::from_bytes(&key_bytes)
+            .context("lease verifying key is not a valid Ed25519 key")?;
+        let sig_bytes = hex::decode(&self.signature)
+            .context("lease signature is not hex")?;
+        let signature = Signature::from_slice(&sig_bytes)
+            .context("lease signature is malformed")?;
+        verifying
+            .verify_strict(&self.payload(), &signature)
+            .map_err(|e| anyhow::anyhow!("lease signature does not verify: {e}"))
+    }
+
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        now >= self.expires_at
+    }
+
+    /// Opaque single-token form for job scripts and environments:
+    /// base64 of the signed JSON. Contains no licence secret.
+    pub fn to_wire(&self) -> Result<String> {
+        let json = serde_json::to_vec(self)?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(json))
+    }
+
+    pub fn from_wire(wire: &str) -> Result<Self> {
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(wire.trim())
+            .context("lease blob is not valid base64")?;
+        serde_json::from_slice(&json).context("lease blob is not a valid lease")
+    }
+}
+
+/// Mint a signed lease. Caller decides the expiry; see
+/// [`bound_lease_expiry`] for the bounding rule.
+pub fn sign_lease(
+    keys: &LeaseKeys,
+    licence_id: &str,
+    seats: u32,
+    job_id: Uuid,
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Lease {
+    let mut lease = Lease {
+        licence_id: licence_id.to_string(),
+        seats,
+        job_id,
+        issued_at,
+        expires_at,
+        verifying_key: keys.verifying_key_hex(),
+        signature: String::new(),
+    };
+    lease.signature = keys.sign(&lease.payload());
+    lease
+}
+
+/// A lease expiry must never exceed the licence expiry, and must never
+/// exceed the job's walltime when one is known — a lease must not outlive
+/// the job that holds it.
+pub fn bound_lease_expiry(
+    licence_expires: DateTime<Utc>,
+    now: DateTime<Utc>,
+    walltime: Option<Duration>,
+) -> DateTime<Utc> {
+    let mut expiry = licence_expires;
+    if let Some(walltime) = walltime
+        && let Ok(walltime) = chrono::Duration::from_std(walltime)
+    {
+        let wall_limit = now + walltime;
+        if wall_limit < expiry {
+            expiry = wall_limit;
+        }
+    }
+    expiry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +816,131 @@ expires = "next tuesday"
     fn licence_request_defaults_to_one_seat() {
         let parsed: LicenceRequest = serde_json::from_str(r#"{"id": "vasp-6"}"#).unwrap();
         assert_eq!(parsed.seats, 1);
+    }
+
+    // ── Signed leases ──────────────────────────────────────────────────
+
+    fn test_lease(keys: &LeaseKeys, expires_at: DateTime<Utc>) -> Lease {
+        sign_lease(
+            keys,
+            "vasp-6",
+            4,
+            Uuid::new_v4(),
+            Utc::now(),
+            expires_at,
+        )
+    }
+
+    #[test]
+    fn lease_verifies_offline_without_the_secret() {
+        // The licence secret plays no part in minting or verifying a
+        // lease; the Ed25519 keypair is independent of it.
+        let keys = LeaseKeys::generate();
+        let lease = test_lease(&keys, Utc::now() + chrono::Duration::hours(2));
+        lease.verify().unwrap();
+        assert!(!lease.is_expired(Utc::now()));
+    }
+
+    #[test]
+    fn tampered_lease_fails_verification() {
+        let keys = LeaseKeys::generate();
+        let lease = test_lease(&keys, Utc::now() + chrono::Duration::hours(2));
+
+        let mut forged = lease.clone();
+        forged.seats = 4096;
+        assert!(forged.verify().is_err(), "seat count forgery must fail");
+
+        let mut forged = lease.clone();
+        forged.expires_at += chrono::Duration::days(365);
+        assert!(forged.verify().is_err(), "expiry extension must fail");
+
+        let mut forged = lease.clone();
+        forged.job_id = Uuid::new_v4();
+        assert!(forged.verify().is_err(), "job id swap must fail");
+
+        let mut forged = lease;
+        forged.licence_id = "gaussian-16".into();
+        assert!(forged.verify().is_err(), "licence id swap must fail");
+    }
+
+    #[test]
+    fn lease_signed_by_one_key_does_not_verify_with_another() {
+        let keys = LeaseKeys::generate();
+        let mut lease = test_lease(&keys, Utc::now() + chrono::Duration::hours(1));
+        let attacker = LeaseKeys::generate();
+        lease.verifying_key = attacker.verifying_key_hex();
+        assert!(lease.verify().is_err());
+    }
+
+    #[test]
+    fn lease_survives_wire_roundtrip_and_still_verifies() {
+        let keys = LeaseKeys::generate();
+        let lease = test_lease(&keys, Utc::now() + chrono::Duration::hours(1));
+        let wire = lease.to_wire().unwrap();
+        let back = Lease::from_wire(&wire).unwrap();
+        assert_eq!(back, lease);
+        back.verify().unwrap();
+
+        assert!(Lease::from_wire("not base64 !!!").is_err());
+    }
+
+    #[test]
+    fn lease_wire_form_carries_neither_secret_nor_signing_key() {
+        let keys = LeaseKeys::generate();
+        let lease = test_lease(&keys, Utc::now() + chrono::Duration::hours(1));
+        let wire = lease.to_wire().unwrap();
+        assert!(
+            !wire.contains("serial-9f2a-SECRET"),
+            "licence secret in wire form"
+        );
+        assert!(
+            !wire.contains(&hex::encode(keys.signing.to_bytes())),
+            "private signing key in wire form"
+        );
+    }
+
+    #[test]
+    fn lease_expiry_is_bounded_by_licence_expiry() {
+        let licence_expires = Utc::now() + chrono::Duration::days(30);
+        // Walltime far beyond the licence expiry: the licence wins.
+        let expiry = bound_lease_expiry(licence_expires, Utc::now(), Some(Duration::from_secs(100 * 86_400)));
+        assert_eq!(expiry, licence_expires);
+    }
+
+    #[test]
+    fn lease_expiry_is_bounded_by_job_walltime() {
+        let now = Utc::now();
+        let licence_expires = now + chrono::Duration::days(365);
+        let walltime = Duration::from_secs(2 * 3600);
+        let expiry = bound_lease_expiry(licence_expires, now, Some(walltime));
+        assert!(expiry <= now + chrono::Duration::hours(2), "{expiry}");
+        assert!(expiry > now, "{expiry}");
+        // No walltime known: bounded by the licence expiry alone.
+        let expiry = bound_lease_expiry(licence_expires, now, None);
+        assert_eq!(expiry, licence_expires);
+    }
+
+    #[test]
+    fn lease_keys_persist_and_reload() {
+        let dir = std::env::temp_dir().join(format!("prism-lease-keys-{}", Uuid::new_v4()));
+        let keys = LeaseKeys::load_or_create(&dir).unwrap();
+        let verifying = keys.verifying_key_hex();
+        let lease = test_lease(&keys, Utc::now() + chrono::Duration::hours(1));
+
+        // A fresh process loads the same keypair; old leases still verify.
+        let reloaded = LeaseKeys::load_or_create(&dir).unwrap();
+        assert_eq!(reloaded.verifying_key_hex(), verifying);
+        let new_lease = test_lease(&reloaded, Utc::now() + chrono::Duration::hours(1));
+        lease.verify().unwrap();
+        new_lease.verify().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(LEASE_KEY_FILE)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "private lease key must be 0600");
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
