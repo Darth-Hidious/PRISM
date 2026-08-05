@@ -175,7 +175,13 @@ fn normalize_for_containment(s: &str) -> String {
 }
 
 /// Does `quote` occur (modulo whitespace and case) in the cited block?
-fn quote_in_block(quote: &str, block_text: &str) -> bool {
+///
+/// Shared containment comparison: the papers pipeline uses it against the
+/// cited block, and the local-file ingest pipeline (`prism-ingest`) uses it
+/// against the source document text before anything reaches the provenance
+/// store. Both callers rely on this one implementation — behaviour must not
+/// diverge between them.
+pub fn quote_in_block(quote: &str, block_text: &str) -> bool {
     let needle = normalize_for_containment(quote);
     !needle.is_empty() && normalize_for_containment(block_text).contains(&needle)
 }
