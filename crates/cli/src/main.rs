@@ -367,6 +367,14 @@ enum Commands {
         /// Run only after this SLURM job id completes successfully.
         #[arg(long)]
         slurm_dependency_afterok: Option<u64>,
+        /// Id of a declared licence (~/.prism/licences.toml) to hold a
+        /// seat of before dispatch. Jobs for codes without a licence
+        /// need no flag and acquire nothing.
+        #[arg(long)]
+        licence: Option<String>,
+        /// Seats to hold for this job (default 1).
+        #[arg(long, default_value_t = 1)]
+        licence_seats: u32,
         /// Emit machine-readable JSON instead of human-readable status lines.
         #[arg(long)]
         json: bool,
@@ -3596,6 +3604,8 @@ async fn main() -> Result<()> {
             slurm_ntasks,
             slurm_array,
             slurm_dependency_afterok,
+            licence,
+            licence_seats,
             json,
         } => {
             handle_run(
@@ -3622,6 +3632,8 @@ async fn main() -> Result<()> {
                 slurm_ntasks,
                 slurm_array.as_deref(),
                 slurm_dependency_afterok,
+                licence.as_deref(),
+                licence_seats,
                 json,
             )
             .await?;
@@ -11109,11 +11121,14 @@ async fn handle_run(
     slurm_ntasks: Option<u32>,
     slurm_array: Option<&str>,
     slurm_dependency_afterok: Option<u64>,
+    licence: Option<&str>,
+    licence_seats: u32,
     json: bool,
 ) -> Result<()> {
     use prism_compute::ExperimentPlan;
     use prism_compute::backend::ComputeRouter;
     use prism_compute::byoc::{ByocTarget, SlurmJobConfig};
+    use prism_compute::licence::LicenceRequest;
 
     validate_run_backend_target(backend, ssh, k8s_context, slurm)?;
 
@@ -11130,6 +11145,10 @@ async fn handle_run(
         name: name.to_string(),
         image: image.to_string(),
         inputs: inputs_json.clone(),
+        licence: licence.map(|id| LicenceRequest {
+            id: id.to_string(),
+            seats: licence_seats,
+        }),
     };
 
     let (router, resolved_backend, target) = if let Some(ssh_target) = ssh {
@@ -12720,6 +12739,47 @@ mod tests {
                 assert_eq!(slurm_ntasks, Some(4));
                 assert_eq!(slurm_array.as_deref(), Some("0-15%4"));
                 assert_eq!(slurm_dependency_afterok, Some(98765));
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_run_licence_options() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "run",
+            "--licence",
+            "vasp-6",
+            "--licence-seats",
+            "4",
+            "--slurm",
+            "researcher@login.hpc",
+            "/shared/prism-worker.sif",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Run {
+                licence,
+                licence_seats,
+                ..
+            } => {
+                assert_eq!(licence.as_deref(), Some("vasp-6"));
+                assert_eq!(licence_seats, 4);
+            }
+            _ => panic!("expected Run command"),
+        }
+
+        // No licence flags -> no request (zero-config stays unlicensed).
+        let cli = Cli::try_parse_from(["prism", "run", "alpine:latest"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Run {
+                licence,
+                licence_seats,
+                ..
+            } => {
+                assert!(licence.is_none());
+                assert_eq!(licence_seats, 1);
             }
             _ => panic!("expected Run command"),
         }

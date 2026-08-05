@@ -126,10 +126,20 @@ fn map_status(resp: JobResponse) -> JobStatus {
 
 #[async_trait]
 impl ComputeBackend for Marc27Backend {
-    async fn submit(&self, plan: &ExperimentPlan) -> Result<Uuid> {
+    async fn submit(
+        &self,
+        _job_id: Uuid,
+        plan: &ExperimentPlan,
+        _lease: Option<&crate::licence::Lease>,
+    ) -> Result<Uuid> {
         // The broker's SubmitRequest accepts `image` + `inputs` (plus optional
         // gpu_type/timeout/budget); `ExperimentPlan` only carries image + inputs,
         // so that is exactly what we send. No invented `name` field.
+        //
+        // The caller's job id and lease are not sent: the platform assigns
+        // its own job id, and there is no offline compute node to verify a
+        // lease on. Seat accounting still applies — the router binds the
+        // lease to the returned platform id.
         let body = serde_json::json!({
             "image": plan.image,
             "inputs": plan.inputs,

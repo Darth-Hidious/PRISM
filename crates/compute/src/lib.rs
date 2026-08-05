@@ -13,6 +13,7 @@
 pub mod backend;
 pub mod byoc;
 pub mod job;
+pub mod licence;
 pub mod local;
 pub mod marc27;
 
@@ -31,7 +32,20 @@ pub use marc27::Marc27Backend;
 /// Trait for compute dispatch backends.
 #[async_trait]
 pub trait ComputeBackend: Send + Sync {
-    async fn submit(&self, plan: &ExperimentPlan) -> Result<Uuid>;
+    /// Submit a job.
+    ///
+    /// `job_id` is the caller's tracking id; backends that dispatch
+    /// locally use it as the job id. Backends whose platform assigns its
+    /// own id (MARC27) ignore it and return the platform's. `lease` is
+    /// the signed licence lease when the job needed one; backends that
+    /// generate job scripts embed it, and it is the only licence
+    /// artefact that ever reaches the execution side.
+    async fn submit(
+        &self,
+        job_id: Uuid,
+        plan: &ExperimentPlan,
+        lease: Option<&licence::Lease>,
+    ) -> Result<Uuid>;
     async fn status(&self, job_id: Uuid) -> Result<JobStatus>;
     async fn results(&self, job_id: Uuid) -> Result<serde_json::Value>;
     async fn cancel(&self, job_id: Uuid) -> Result<()>;
@@ -42,6 +56,11 @@ pub struct ExperimentPlan {
     pub name: String,
     pub image: String,
     pub inputs: serde_json::Value,
+    /// Optional licence the job needs. When present, a seat must be
+    /// acquired before dispatch; absent plans are unlicensed and acquire
+    /// nothing (the zero-config path is untouched).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licence: Option<licence::LicenceRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +92,7 @@ mod tests {
             name: "test".into(),
             image: "python:3.11".into(),
             inputs: serde_json::json!({"key": "value"}),
+            licence: None,
         };
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: ExperimentPlan = serde_json::from_str(&json).unwrap();
@@ -100,6 +120,7 @@ mod tests {
                     "nested": { "deep": { "value": null } }
                 }
             }),
+            licence: None,
         };
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: ExperimentPlan = serde_json::from_str(&json).unwrap();
@@ -118,6 +139,7 @@ mod tests {
             name: "empty-inputs".into(),
             image: "busybox:latest".into(),
             inputs: serde_json::Value::Null,
+            licence: None,
         };
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: ExperimentPlan = serde_json::from_str(&json).unwrap();
@@ -129,6 +151,7 @@ mod tests {
             name: "empty-obj".into(),
             image: "busybox:latest".into(),
             inputs: serde_json::json!({}),
+            licence: None,
         };
         let json2 = serde_json::to_string(&plan_obj).unwrap();
         let parsed2: ExperimentPlan = serde_json::from_str(&json2).unwrap();

@@ -162,6 +162,11 @@ impl ByocBackend {
         self.slurm_job_ids.read().await.get(&job_id).copied()
     }
 
+    /// The configured target (used for lease walltime extraction).
+    pub fn target(&self) -> &ByocTarget {
+        &self.target
+    }
+
     /// Build an SSH command prefix for the target host.
     fn ssh_cmd(host: &str, user: &str, key_path: &str, port: u16) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("ssh");
@@ -193,7 +198,12 @@ impl ByocBackend {
 
 #[async_trait]
 impl ComputeBackend for ByocBackend {
-    async fn submit(&self, plan: &ExperimentPlan) -> Result<Uuid> {
+    async fn submit(
+        &self,
+        job_id: Uuid,
+        plan: &ExperimentPlan,
+        lease: Option<&crate::licence::Lease>,
+    ) -> Result<Uuid> {
         match &self.target {
             ByocTarget::Ssh {
                 host,
@@ -201,7 +211,6 @@ impl ComputeBackend for ByocBackend {
                 key_path,
                 port,
             } => {
-                let job_id = Uuid::new_v4();
                 let inputs_json = serde_json::to_string(&plan.inputs)?;
 
                 // Validate image as a Docker reference — alphanumeric +
@@ -256,7 +265,6 @@ impl ComputeBackend for ByocBackend {
                 Ok(job_id)
             }
             ByocTarget::Kubernetes { context, namespace } => {
-                let job_id = Uuid::new_v4();
                 let inputs_json = serde_json::to_string(&plan.inputs)?;
 
                 // kubectl run as a Job
@@ -296,10 +304,9 @@ impl ComputeBackend for ByocBackend {
                 partition,
                 config,
             } => {
-                let job_id = Uuid::new_v4();
                 let inputs_json = serde_json::to_string(&plan.inputs)?;
 
-                let script = sbatch_script(&job_id, partition, config, &inputs_json)?;
+                let script = sbatch_script(&job_id, partition, config, &inputs_json, lease)?;
                 let ssh_command = format!("echo '{}' | sbatch", script.replace('\'', "'\\''"));
 
                 tracing::info!(
@@ -842,11 +849,18 @@ fn sbatch_directives(job_id: &Uuid, partition: &str, cfg: &SlurmJobConfig) -> Re
 
 /// Build the full sbatch script. It only executes a pre-staged,
 /// compute-node-visible `.sif`; it never performs a registry pull.
+///
+/// When the job needed a licensed code, `lease` is embedded as an opaque
+/// base64 token (`PRISM_LEASE`). The lease is signed and expiring and
+/// verifiable on the node with no network — and it is the only licence
+/// artefact that may appear here. A licence secret must never reach this
+/// script: sbatch scripts are world-readable on most clusters.
 fn sbatch_script(
     job_id: &Uuid,
     partition: &str,
     cfg: &SlurmJobConfig,
     inputs_json: &str,
+    lease: Option<&crate::licence::Lease>,
 ) -> Result<String> {
     let mut directives = sbatch_directives(job_id, partition, cfg)?;
     // Relative output paths resolve under sbatch's shared submission
@@ -867,6 +881,12 @@ fn sbatch_script(
         body.push('\n');
     }
     body.push_str(&format!("export PRISM_JOB_ID={job_id}\n"));
+    if let Some(lease) = lease {
+        // Opaque signed assertion (licence id, seats, job id, expiry,
+        // signature). No secret travels: see the module contract above.
+        let wire = lease.to_wire()?;
+        body.push_str(&format!("export PRISM_LEASE={}\n", sh_single_quote(&wire)));
+    }
     body.push_str("export PRISM_TASK_ID=\"${PRISM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}\"\n");
     body.push_str(&format!(
         "export PRISM_INPUTS={}\n",
@@ -1199,7 +1219,7 @@ mod tests {
         let job_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
         let mut config = slurm_config("/shared/prism.sif");
         config.array = Some("3,9".into());
-        let script = sbatch_script(&job_id, "gpu", &config, "{}").unwrap();
+        let script = sbatch_script(&job_id, "gpu", &config, "{}", None).unwrap();
 
         let task_3 = task_identity_from_script(&script, Some("3"));
         let task_9 = task_identity_from_script(&script, Some("9"));
@@ -1213,7 +1233,7 @@ mod tests {
     fn slurm_script_yields_valid_non_array_task_identity() {
         let job_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
         let config = slurm_config("/shared/prism.sif");
-        let script = sbatch_script(&job_id, "gpu", &config, "{}").unwrap();
+        let script = sbatch_script(&job_id, "gpu", &config, "{}", None).unwrap();
 
         let task_id = task_identity_from_script(&script, None);
 
@@ -1282,7 +1302,8 @@ mod tests {
             sif_path: "/shared/images/prism-worker.sif".into(),
         };
 
-        let script = sbatch_script(&job_id, "gpu", &config, r#"{"temperature":1200}"#).unwrap();
+        let script =
+            sbatch_script(&job_id, "gpu", &config, r#"{"temperature":1200}"#, None).unwrap();
 
         for directive in [
             "#SBATCH --partition=gpu",
@@ -1313,7 +1334,7 @@ mod tests {
     #[test]
     fn slurm_script_omits_absent_resources_and_empty_flags() {
         let config = slurm_config("/shared/prism.sif");
-        let script = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap();
+        let script = sbatch_script(&Uuid::nil(), "gpu", &config, "{}", None).unwrap();
 
         for flag in [
             "--account",
@@ -1338,12 +1359,12 @@ mod tests {
     fn slurm_script_supports_memory_per_cpu_and_rejects_both_memory_modes() {
         let mut config = slurm_config("/shared/prism.sif");
         config.mem_per_cpu = Some("8G".into());
-        let script = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap();
+        let script = sbatch_script(&Uuid::nil(), "gpu", &config, "{}", None).unwrap();
         assert!(script.contains("#SBATCH --mem-per-cpu=8G"));
         assert!(!script.contains("#SBATCH --mem="));
 
         config.mem = Some("64G".into());
-        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap_err();
+        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}", None).unwrap_err();
         assert!(error.to_string().contains("mutually exclusive"));
     }
 
@@ -1351,7 +1372,7 @@ mod tests {
     fn slurm_script_rejects_empty_configured_values() {
         let mut config = slurm_config("/shared/prism.sif");
         config.account = Some(String::new());
-        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap_err();
+        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}", None).unwrap_err();
         assert!(error.to_string().contains("invalid SLURM account"));
     }
 
@@ -1359,7 +1380,7 @@ mod tests {
     fn slurm_script_rejects_zero_resource_counts() {
         let mut config = slurm_config("/shared/prism.sif");
         config.nodes = Some(0);
-        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap_err();
+        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}", None).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1370,8 +1391,106 @@ mod tests {
     #[test]
     fn slurm_script_requires_a_prestaged_sif_path() {
         let config = slurm_config("registry.example/prism:latest");
-        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}").unwrap_err();
+        let error = sbatch_script(&Uuid::nil(), "gpu", &config, "{}", None).unwrap_err();
         assert!(error.to_string().contains("pre-staged .sif path"));
+    }
+
+    /// THE secret-hygiene test: for a licensed job, neither the full
+    /// sbatch script nor the full provenance record may contain the
+    /// licence secret. sbatch scripts are world-readable on most
+    /// clusters and provenance is permanent — a secret written into
+    /// either is disclosed for good.
+    #[test]
+    fn licence_secret_never_reaches_sbatch_script_or_provenance() {
+        use crate::licence::{LeaseKeys, LicenceRegistry, lease_provenance_record, sign_lease};
+
+        const SECRET: &str = "S3CR3T-serial-4242-flexlm-credential";
+        let decl = format!(
+            r#"
+[[licence]]
+id = "vasp-6"
+name = "VASP 6 (ESA pool)"
+seats = 32
+expires = "2126-12-31"
+secret = "{SECRET}"
+
+[licence.server]
+host = "flexlm.example.org"
+port = 27000
+"#
+        );
+        let registry = LicenceRegistry::from_toml(&decl).unwrap();
+        let licence = registry.get("vasp-6").unwrap();
+        assert_eq!(licence.secret.as_deref(), Some(SECRET));
+
+        let keys = LeaseKeys::generate();
+        let job_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let lease = sign_lease(
+            &keys,
+            "vasp-6",
+            4,
+            job_id,
+            chrono::Utc::now(),
+            chrono::Utc::now() + chrono::Duration::hours(2),
+        );
+
+        // ── Full sbatch script for the licensed job ────────────────
+        let config = SlurmJobConfig {
+            account: Some("esa-materials".into()),
+            time: Some("02:00:00".into()),
+            checkpoint: SlurmCheckpoint::default(),
+            sif_path: "/shared/prism-worker.sif".into(),
+            ..SlurmJobConfig::default()
+        };
+        let script = sbatch_script(
+            &job_id,
+            "gpu",
+            &config,
+            r#"{"composition":{"Fe":0.7}}"#,
+            Some(&lease),
+        )
+        .unwrap();
+
+        // The lease travels…
+        assert!(script.contains("export PRISM_LEASE="), "{script}");
+        // …and is recoverable and valid on the node.
+        let wire = script
+            .lines()
+            .find(|line| line.starts_with("export PRISM_LEASE="))
+            .unwrap()
+            .trim_start_matches("export PRISM_LEASE=")
+            .trim_matches('\'');
+        let embedded = crate::licence::Lease::from_wire(wire).unwrap();
+        embedded.verify().unwrap();
+        assert_eq!(embedded.job_id, job_id);
+        assert_eq!(embedded.licence_id, "vasp-6");
+        assert_eq!(embedded.seats, 4);
+
+        // …but the secret does not — not raw, not inside the lease blob.
+        assert!(
+            !script.contains(SECRET),
+            "licence secret leaked into sbatch script:\n{script}"
+        );
+        assert!(
+            !script.contains("flexlm.example.org"),
+            "server address has no business in an offline sbatch script:\n{script}"
+        );
+
+        // ── Full provenance record for the licensed job ────────────
+        let record = lease_provenance_record("session-esa-1", &lease);
+        let record_text = serde_json::to_string(&record).unwrap();
+        assert!(record_text.contains("licence_checkout"));
+        assert!(record_text.contains("vasp-6"));
+        assert!(record_text.contains(&job_id.to_string()));
+        assert!(record_text.contains("\"signature_valid\":true"));
+        assert!(
+            !record_text.contains(SECRET),
+            "licence secret leaked into provenance: {record_text}"
+        );
+        assert!(
+            !record_text.contains("flexlm.example.org"),
+            "server address leaked into provenance: {record_text}"
+        );
     }
 
     #[test]

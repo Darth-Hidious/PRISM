@@ -4971,12 +4971,18 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
+ "ed25519-dalek",
+ "hex",
  "prism-client",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]
