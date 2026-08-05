@@ -128,6 +128,111 @@ pub enum RefutedEntry {
     },
 }
 
+impl DoneEntry {
+    /// One line a person or an agent can read without destructuring.
+    ///
+    /// Evidence class is always shown for an established candidate: "done"
+    /// without its class invites treating an indeterminate result as settled.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::EstablishedCandidate {
+                candidate,
+                reward,
+                evidence_class,
+                iteration,
+                ..
+            } => format!(
+                "{candidate}  reward {reward:.3}  [{evidence_class}]  (iteration {iteration})"
+            ),
+            Self::CompletedJob {
+                job_id,
+                name,
+                backend,
+                completed_at,
+                ..
+            } => format!("job {job_id} '{name}' on {backend} completed {completed_at}"),
+        }
+    }
+}
+
+impl PendingEntry {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::JobQueued {
+                job_id,
+                name,
+                backend,
+                submitted_at,
+                ..
+            } => format!("job {job_id} '{name}' queued on {backend} since {submitted_at}"),
+            Self::JobRunning {
+                job_id,
+                name,
+                backend,
+                progress,
+                ..
+            } => format!(
+                "job {job_id} '{name}' running on {backend} ({:.0}%)",
+                progress * 100.0
+            ),
+            Self::PlannedIterations {
+                remaining,
+                of,
+                status,
+            } => format!("{remaining} of {of} iterations remaining ({status})"),
+        }
+    }
+}
+
+impl RefutedEntry {
+    /// The reason is never omitted — a refutation without its reason cannot
+    /// stop the campaign proposing the same thing again, which is the whole
+    /// point of keeping it.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::RejectedCandidate {
+                candidate,
+                reasons,
+                iteration,
+                evaluated,
+                ..
+            } => format!(
+                "{candidate} rejected at iteration {iteration}{}: {}",
+                if *evaluated { "" } else { " (unevaluated)" },
+                if reasons.is_empty() {
+                    "no reason recorded".to_string()
+                } else {
+                    reasons.join("; ")
+                }
+            ),
+            Self::FailedJob {
+                job_id,
+                name,
+                backend,
+                error,
+                ..
+            } => format!("job {job_id} '{name}' failed on {backend}: {error}"),
+            Self::FailedAction {
+                record_id,
+                tool_name,
+                error,
+                exit_code,
+                ..
+            } => format!(
+                "action {record_id} ({}) failed: {}{}",
+                tool_name.as_deref().unwrap_or("unknown tool"),
+                error.as_deref().unwrap_or("no error recorded"),
+                exit_code
+                    .map(|c| format!(" [exit {c}]"))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+}
+
 /// The one-call answer: done / pending / refuted for a campaign, plus the
 /// gaps where a store could not answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
