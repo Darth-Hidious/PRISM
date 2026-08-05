@@ -78,6 +78,10 @@ use domain::builtin_domain as domain_for;
 /// up without a human. See [`schedule`] for the design rationale.
 pub mod schedule;
 
+/// The campaign ledger — one read model over the checkpoint, the compute job
+/// registry, and the provenance store: done / pending / refuted in one call.
+pub mod ledger;
+
 /// The USD a tool result says it cost, or 0.0 when it says nothing. Accepts
 /// the two names tools in this workspace actually emit. Never estimates: an
 /// invented price would turn the budget ceiling into a fiction, and

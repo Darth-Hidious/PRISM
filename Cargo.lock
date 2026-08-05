@@ -4888,6 +4888,7 @@ dependencies = [
  "cron",
  "libc",
  "prism-client",
+ "prism-compute",
  "prism-llm",
  "prism-provenance",
  "prism-runtime",
