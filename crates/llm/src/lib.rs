@@ -293,6 +293,12 @@ enum LlmBackend {
 pub struct LlmClient {
     backend: LlmBackend,
     config: LlmConfig,
+    /// Monotonic source of unique ids for local GGUF tool calls. A constant
+    /// id (`local_call_0` for every call) corrupted multi-step sessions: with
+    /// two pending results sharing one id, the prompt renderer could not tell
+    /// which result belonged to which call, so earlier results were
+    /// misattributed or dropped when the next turn was rendered.
+    local_call_counter: std::sync::atomic::AtomicU64,
 }
 
 /// The chat-completions endpoint for an OpenAI-compatible base URL.
@@ -342,7 +348,20 @@ impl LlmClient {
                 LlmBackend::LocalGguf(local)
             }
         };
-        Self { backend, config }
+        Self {
+            backend,
+            config,
+            local_call_counter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The next unique tool-call id for this client's local session
+    /// (`local_call_1`, `local_call_2`, …).
+    fn next_local_call_id(counter: &std::sync::atomic::AtomicU64) -> String {
+        format!(
+            "local_call_{}",
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+        )
     }
 
     fn local_backend(&self) -> Option<&local::LocalGguf> {
@@ -379,6 +398,7 @@ impl LlmClient {
         tools: &[ToolDefinition],
         model: &str,
         usage: UsageInfo,
+        call_id: String,
     ) -> Result<ChatResponse> {
         let tool = tools.iter().find(|tool| tool.function.name == name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -402,7 +422,7 @@ impl LlmClient {
                 role: "assistant".to_string(),
                 content: None,
                 tool_calls: Some(vec![ToolCallResponse {
-                    id: "local_call_0".to_string(),
+                    id: call_id,
                     call_type: "function".to_string(),
                     function: FunctionCall {
                         name: name.to_string(),
@@ -420,6 +440,7 @@ impl LlmClient {
         tools: &[ToolDefinition],
         model: &str,
         has_tool_result: bool,
+        counter: &std::sync::atomic::AtomicU64,
     ) -> Result<ChatResponse> {
         let usage = UsageInfo {
             prompt_tokens: generation.prompt_tokens,
@@ -445,7 +466,14 @@ impl LlmClient {
                     "local GGUF model {model:?} produced an invalid embedded-template tool call {text:?}: {error}; the call was rejected and no remote endpoint was tried."
                 )
             })?;
-            return Self::local_tool_call_response(&name, &arguments, tools, model, usage);
+            return Self::local_tool_call_response(
+                &name,
+                &arguments,
+                tools,
+                model,
+                usage,
+                Self::next_local_call_id(counter),
+            );
         }
         if has_tool_result && !text.starts_with('{') {
             return Ok(ChatResponse {
@@ -517,7 +545,14 @@ impl LlmClient {
                         "local GGUF model {model:?} omitted arguments for tool {name:?}; the call was rejected and no remote endpoint was tried."
                     )
                 })?;
-                Self::local_tool_call_response(name, arguments, tools, model, usage)
+                Self::local_tool_call_response(
+                    name,
+                    arguments,
+                    tools,
+                    model,
+                    usage,
+                    Self::next_local_call_id(counter),
+                )
             }
             _ => bail!(
                 "local GGUF model {model:?} produced an invalid tool-response kind; no tool call was guessed and no remote endpoint was tried."
@@ -678,6 +713,7 @@ impl LlmClient {
                 tools,
                 &self.config.model,
                 messages.iter().any(|message| message.role == "tool"),
+                &self.local_call_counter,
             );
         }
         // MARC27 platform proxy: use /stream, collect text. This branch DROPS
@@ -934,7 +970,13 @@ impl LlmClient {
                         |delta| on_delta(delta, false),
                     )
                     .await?;
-                return Self::local_chat_response(generation, tools, &self.config.model, false);
+                return Self::local_chat_response(
+                    generation,
+                    tools,
+                    &self.config.model,
+                    false,
+                    &self.local_call_counter,
+                );
             }
 
             // Tool-call syntax is buffered so control markers never leak into
@@ -967,8 +1009,13 @@ impl LlmClient {
                     },
                 )
                 .await?;
-            let response =
-                Self::local_chat_response(generation, tools, &self.config.model, has_tool_result)?;
+            let response = Self::local_chat_response(
+                generation,
+                tools,
+                &self.config.model,
+                has_tool_result,
+                &self.local_call_counter,
+            )?;
             if !visible_started && let Some(content) = response.message.content.as_deref() {
                 on_delta(content, false);
             }
@@ -2645,6 +2692,7 @@ mod tests {
             std::slice::from_ref(&tool),
             "test-model",
             false,
+            &std::sync::atomic::AtomicU64::new(0),
         )
         .unwrap();
         let call = &response.message.tool_calls.unwrap()[0];
@@ -2660,6 +2708,7 @@ mod tests {
             std::slice::from_ref(&tool),
             "test-model",
             false,
+            &std::sync::atomic::AtomicU64::new(0),
         )
         .unwrap_err()
         .to_string();
@@ -2696,6 +2745,7 @@ mod tests {
             &[tool],
             "test-model",
             false,
+            &std::sync::atomic::AtomicU64::new(0),
         )
         .unwrap_err()
         .to_string();
@@ -2748,10 +2798,45 @@ mod tests {
             }],
             "test-model",
             true,
+            &std::sync::atomic::AtomicU64::new(0),
         )
         .unwrap();
         assert_eq!(response.message.content.as_deref(), Some("done"));
         assert!(response.message.tool_calls.is_none());
+    }
+
+    /// Regression C1: every local tool call in a session needs its own id, so
+    /// pending results can be attributed to their own call when the next turn
+    /// renders. A constant `local_call_0` collided and corrupted history.
+    #[test]
+    fn local_tool_calls_get_distinct_ids_within_one_session() {
+        let tool = ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "lookup".to_string(),
+                description: "Look something up".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        };
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let ids = (0..3)
+            .map(|_| {
+                let response = LlmClient::local_chat_response(
+                    local::LocalGeneration {
+                        text: r#"{"kind":"tool_call","name":"lookup","arguments":{}}"#.to_string(),
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                    },
+                    std::slice::from_ref(&tool),
+                    "test-model",
+                    false,
+                    &counter,
+                )
+                .unwrap();
+                response.message.tool_calls.unwrap()[0].id.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["local_call_1", "local_call_2", "local_call_3"]);
     }
 
     /// The base URL is data, not a hint. Whatever path a vendor mounts its

@@ -136,6 +136,10 @@ async fn embedded_gguf_streams_real_token_pieces() {
 /// Live regression H3: tool call -> tool result -> second tool call -> final
 /// answer using exactly the seven production meta-tools. This makes no network
 /// request: both tool results are deterministic local fixtures.
+///
+/// Regression C1: each hop's result is pushed under the id of its own call,
+/// and the two call ids must differ — a constant `local_call_0` made the
+/// results collide and corrupt the rendered history.
 #[tokio::test]
 #[ignore = "requires PRISM_TEST_GGUF to name a real local generation model"]
 async fn embedded_gguf_multistep_turn_uses_all_production_meta_tools() {
@@ -191,6 +195,11 @@ async fn embedded_gguf_multistep_turn_uses_all_production_meta_tools() {
         .expect("the local model did not produce the first tool call");
     assert_eq!(first_call.len(), 1);
     assert_eq!(first_call[0].function.name, "find_tools");
+    assert!(
+        first_call[0].id.starts_with("local_call_"),
+        "unexpected local call id shape: {}",
+        first_call[0].id
+    );
 
     let mut follow_up = messages;
     follow_up.push(first.message);
@@ -221,6 +230,14 @@ async fn embedded_gguf_multistep_turn_uses_all_production_meta_tools() {
         .expect("the local model did not produce the second tool call");
     assert_eq!(second_call.len(), 1);
     assert_eq!(second_call[0].function.name, "recall");
+    assert_ne!(
+        first_call[0].id, second_call[0].id,
+        "two tool calls share one id; their results would collide in history"
+    );
+    println!(
+        "call_attribution find_tools_call={} find_tools_result_for={} recall_call={} recall_result_for={}",
+        first_call[0].id, first_call[0].id, second_call[0].id, second_call[0].id
+    );
     assert!(
         second_streamed.is_empty(),
         "native tool protocol leaked into streamed text: {second_streamed:?}"
