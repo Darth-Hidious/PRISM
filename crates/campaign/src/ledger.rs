@@ -301,10 +301,7 @@ pub async fn build_campaign_ledger(
     }
 
     // ── Pending: planned iterations while the goal is not terminal ────────
-    if !matches!(
-        state.status,
-        GoalStatus::Completed | GoalStatus::Failed
-    ) {
+    if !matches!(state.status, GoalStatus::Completed | GoalStatus::Failed) {
         let remaining = state
             .config
             .max_iterations
@@ -329,22 +326,19 @@ pub async fn build_campaign_ledger(
         {
             Ok(failures) => {
                 for record in failures {
-                    let error = record
-                        .output_json
-                        .as_ref()
-                        .and_then(|out| {
-                            out.get("error")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string)
-                                .or_else(|| {
-                                    out.get("stderr")
-                                        .and_then(serde_json::Value::as_str)
-                                        .and_then(|stderr| {
-                                            stderr.lines().find(|line| !line.trim().is_empty())
-                                        })
-                                        .map(str::to_string)
-                                })
-                        });
+                    let error = record.output_json.as_ref().and_then(|out| {
+                        out.get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .or_else(|| {
+                                out.get("stderr")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(|stderr| {
+                                        stderr.lines().find(|line| !line.trim().is_empty())
+                                    })
+                                    .map(str::to_string)
+                            })
+                    });
                     ledger.refuted.push(RefutedEntry::FailedAction {
                         record_id: record.id.clone(),
                         tool_name: record.tool_name.clone(),
@@ -419,8 +413,7 @@ mod tests {
     /// the whole read model exists for: state must outlive the process.
     #[tokio::test]
     async fn ledger_survives_a_process_restart() {
-        let base =
-            std::env::temp_dir().join(format!("prism-ledger-restart-{}", Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("prism-ledger-restart-{}", Uuid::new_v4()));
         let campaigns_dir = base.join("campaigns");
         let jobs_dir = base.join("jobs");
         let prov_db = base.join("provenance.db");
@@ -437,6 +430,14 @@ mod tests {
             // refuted candidate with its reason, mid-flight status.
             let mut state = CampaignState::new(CAMPAIGN_ID.to_string(), goal(), config());
             let mut candidate = accepted_candidate("W25Mo25Ta25Nb25", 0.82, 3);
+            // Seed the class the way a real evaluator does — on the candidate's
+            // own property record. `Campaign::from_checkpoint` deliberately
+            // RE-DERIVES the class from these properties rather than trusting
+            // the stored field, so a class with no evidence behind it does not
+            // survive a restart. Setting the struct field alone (as this test
+            // first did) is exactly an ungrounded class, and it correctly came
+            // back `indeterminate`.
+            candidate.properties = serde_json::json!({ "evidence_class": "screening" });
             candidate.evidence_class = crate::EvidenceClass::Screening;
             state.candidates.push(candidate);
             state.rejected_candidates.push(ConstraintRejection {
@@ -539,8 +540,7 @@ mod tests {
 
         // ── Hour six: a fresh process re-opens from disk ──────────────────
         let campaign =
-            Campaign::from_checkpoint(&campaigns_dir.join(format!("{CAMPAIGN_ID}.json")))
-                .unwrap();
+            Campaign::from_checkpoint(&campaigns_dir.join(format!("{CAMPAIGN_ID}.json"))).unwrap();
         let store = ProvenanceStore::open(&prov_db).await.unwrap();
         let tracker = JobTracker::persistent(&jobs_dir).unwrap();
 
@@ -552,10 +552,7 @@ mod tests {
         let candidate = ledger
             .done
             .iter()
-            .find_map(|entry| match entry {
-                DoneEntry::EstablishedCandidate { .. } => Some(entry),
-                _ => None,
-            })
+            .find(|entry| matches!(entry, DoneEntry::EstablishedCandidate { .. }))
             .expect("established candidate present");
         match candidate {
             DoneEntry::EstablishedCandidate {
@@ -580,11 +577,10 @@ mod tests {
             "completed job is done"
         );
         assert!(
-            !ledger
-                .done
-                .iter()
-                .any(|entry| matches!(entry, DoneEntry::CompletedJob { job_id, .. }
-                    if *job_id == running_job_id.to_string())),
+            !ledger.done.iter().any(
+                |entry| matches!(entry, DoneEntry::CompletedJob { job_id, .. }
+                    if *job_id == running_job_id.to_string())
+            ),
             "a running job must never be reported done"
         );
 
@@ -612,10 +608,7 @@ mod tests {
         let rejection = ledger
             .refuted
             .iter()
-            .find_map(|entry| match entry {
-                RefutedEntry::RejectedCandidate { .. } => Some(entry),
-                _ => None,
-            })
+            .find(|entry| matches!(entry, RefutedEntry::RejectedCandidate { .. }))
             .expect("rejected candidate present");
         match rejection {
             RefutedEntry::RejectedCandidate {
@@ -626,9 +619,7 @@ mod tests {
             } => {
                 assert_eq!(candidate, "W80Mo10Ta5Nb5");
                 assert!(
-                    reasons
-                        .iter()
-                        .any(|reason| reason.contains("density")),
+                    reasons.iter().any(|reason| reason.contains("density")),
                     "the reason survives the restart: {reasons:?}"
                 );
                 assert!(evaluated);
@@ -700,15 +691,19 @@ mod tests {
             "no job is done: {:#?}",
             ledger.done
         );
-        let queued = ledger.pending.iter().filter(|entry| matches!(
-            entry,
-            PendingEntry::JobQueued { job_id, .. } if *job_id == queued_id.to_string()
-        ));
+        let queued = ledger.pending.iter().filter(|entry| {
+            matches!(
+                entry,
+                PendingEntry::JobQueued { job_id, .. } if *job_id == queued_id.to_string()
+            )
+        });
         assert_eq!(queued.count(), 1, "queued job is pending");
-        let running = ledger.pending.iter().filter(|entry| matches!(
-            entry,
-            PendingEntry::JobRunning { job_id, .. } if *job_id == running_id.to_string()
-        ));
+        let running = ledger.pending.iter().filter(|entry| {
+            matches!(
+                entry,
+                PendingEntry::JobRunning { job_id, .. } if *job_id == running_id.to_string()
+            )
+        });
         assert_eq!(running.count(), 1, "running job is pending");
     }
 
@@ -796,7 +791,13 @@ mod tests {
         let tracker = JobTracker::new();
         let orphan_id = Uuid::new_v4();
         tracker
-            .register(orphan_id, "someone else's sim", "img", "local", JobTarget::Local)
+            .register(
+                orphan_id,
+                "someone else's sim",
+                "img",
+                "local",
+                JobTarget::Local,
+            )
             .await
             .unwrap();
         let ledger = build_campaign_ledger(&state, None, Some(&tracker)).await;
@@ -808,10 +809,39 @@ mod tests {
             "an unattributable job is never claimed by this campaign"
         );
         assert!(
-            ledger.gaps.iter().any(|gap| gap
-                .contains("1 active job(s) that cannot be attributed")),
+            ledger
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("1 active job(s) that cannot be attributed")),
             "attribution failure is stated: {:?}",
             ledger.gaps
+        );
+    }
+
+    /// The other half of the restart guarantee, and the more important one:
+    /// an evidence class with NO property backing it must NOT survive.
+    ///
+    /// `from_checkpoint` re-derives the class from the candidate's own
+    /// property record, so a class asserted on the struct alone degrades to
+    /// `indeterminate` on reload. That is the fail-closed rule doing its job —
+    /// hour six must not inherit a confidence hour one never earned.
+    #[tokio::test]
+    async fn an_ungrounded_evidence_class_does_not_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ungrounded.json");
+
+        let mut state = CampaignState::new("ungrounded".to_string(), goal(), config());
+        let mut candidate = accepted_candidate("W25Mo25Ta25Nb25", 0.82, 3);
+        // Class set on the struct, but NOTHING in properties to ground it.
+        candidate.evidence_class = crate::EvidenceClass::Screening;
+        state.candidates.push(candidate);
+        std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+
+        let reloaded = Campaign::from_checkpoint(&path).unwrap();
+        assert_eq!(
+            reloaded.state().candidates[0].evidence_class,
+            crate::EvidenceClass::Indeterminate,
+            "an evidence class with no provenance must not survive a restart"
         );
     }
 
@@ -870,8 +900,7 @@ mod tests {
     async fn checkpoint_round_trip_keeps_ledger_readable() {
         // `Campaign::from_checkpoint` is the reader every caller (CLI, tool)
         // uses; prove a ledger can be built straight off its output.
-        let dir =
-            std::env::temp_dir().join(format!("prism-ledger-roundtrip-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("prism-ledger-roundtrip-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut state = CampaignState::new(CAMPAIGN_ID.to_string(), goal(), config());
         state.candidates.push(accepted_candidate("NbMoTaW", 0.5, 0));
