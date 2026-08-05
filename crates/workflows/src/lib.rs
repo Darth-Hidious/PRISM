@@ -94,6 +94,25 @@ pub struct WorkflowRunResult {
     pub steps: Vec<WorkflowStepResult>,
 }
 
+/// Credential policy for workflow LLM steps.
+///
+/// A workflow value such as `llm_base_url` is caller-controlled data. It may
+/// select an endpoint, but it must not make the node's environment credential
+/// follow that endpoint. Launchers that resolved an endpoint from trusted node
+/// configuration provide it separately here. The default is deliberately
+/// credential-free.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowExecutionOptions {
+    /// Endpoint resolved from trusted node/chat configuration.
+    pub trusted_llm_base_url: Option<String>,
+    /// Credential resolved alongside the trusted endpoint. It is never used
+    /// when the caller supplied an endpoint.
+    pub trusted_llm_api_key: Option<String>,
+    /// Whether the caller supplied `llm_base_url` in the values map. This
+    /// remains true even when it happens to equal the trusted endpoint.
+    pub caller_supplied_llm_base_url: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkflowCommandRequest {
     pub name: String,
@@ -340,9 +359,33 @@ pub async fn execute_workflow_with_policy(
     spec: &WorkflowSpec,
     values: &BTreeMap<String, String>,
     execute: bool,
+    policy: Option<&mut prism_policy::PolicyEngine>,
+    principal: Option<&str>,
+    role: Option<&str>,
+) -> Result<WorkflowRunResult> {
+    execute_workflow_with_policy_and_options(
+        spec,
+        values,
+        execute,
+        policy,
+        principal,
+        role,
+        &WorkflowExecutionOptions::default(),
+    )
+    .await
+}
+
+/// Execute a workflow with policy enforcement and an explicit LLM credential
+/// boundary. The boundary is separate from caller-provided workflow values so
+/// a caller cannot turn an arbitrary endpoint into a credential destination.
+pub async fn execute_workflow_with_policy_and_options(
+    spec: &WorkflowSpec,
+    values: &BTreeMap<String, String>,
+    execute: bool,
     mut policy: Option<&mut prism_policy::PolicyEngine>,
     principal: Option<&str>,
     role: Option<&str>,
+    options: &WorkflowExecutionOptions,
 ) -> Result<WorkflowRunResult> {
     let principal = principal.unwrap_or("agent");
     let role = role.unwrap_or(LEAST_PRIVILEGED_ROLE);
@@ -486,7 +529,7 @@ pub async fn execute_workflow_with_policy(
                 "message" => run_message_step(step, &mut context, !execute),
                 "http" => run_http_step(step, &mut context, !execute, &client).await,
                 "tool" => run_tool_step(step, &mut context, !execute, &client).await,
-                "llm" => run_llm_step(step, &mut context, !execute).await,
+                "llm" => run_llm_step(step, &mut context, !execute, options).await,
                 "provenance" => run_provenance_step(step, &mut context, !execute).await,
                 "if" => {
                     run_if_step(
@@ -507,6 +550,7 @@ pub async fn execute_workflow_with_policy(
                         &client,
                         policy.as_deref_mut(),
                         principal,
+                        options,
                     )
                     .await
                 }
@@ -519,6 +563,7 @@ pub async fn execute_workflow_with_policy(
                         policy.as_deref_mut(),
                         principal,
                         role,
+                        options,
                     )
                     .await
                 }
@@ -1058,6 +1103,7 @@ async fn run_llm_step(
     step: &WorkflowStep,
     context: &mut BTreeMap<String, serde_json::Value>,
     dry_run: bool,
+    options: &WorkflowExecutionOptions,
 ) -> Result<WorkflowStepResult> {
     let prompt = render_value(
         config_first(&step.config, &["prompt", "text", "input"])
@@ -1166,28 +1212,54 @@ async fn run_llm_step(
         });
     }
 
-    // Build the LLM client from step config / context / env (first hit
-    // wins). The env vars are the same ones `prism backend` uses so a
-    // workflow running on a PRISM node hits the same LLM endpoint the
-    // agent uses; the config/context overrides let a workflow (or its
-    // caller) target a specific endpoint.
-    let base_url = step
+    // Resolve the endpoint and credential as one unit. Step config and
+    // caller/context values may select a destination, but they never permit
+    // a node-held credential to follow that destination. Only the
+    // launcher-supplied trusted endpoint, or the process's own configured env endpoint
+    // when no caller endpoint is present, may use an environment key.
+    let step_base_url = step
         .config
         .get("base_url")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            context
-                .get("llm_base_url")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
+        .map(str::to_string);
+    let context_base_url = context
+        .get("llm_base_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let (base_url, trusted_destination, trusted_config_selected) =
+        if let Some(base_url) = step_base_url {
+            (base_url, false, false)
+        } else if let Some(base_url) = options
+            .trusted_llm_base_url
+            .as_ref()
+            .filter(|_| !options.caller_supplied_llm_base_url)
+        {
+            (base_url.clone(), true, true)
+        } else if let Some(base_url) = context_base_url {
+            (base_url, false, false)
+        } else if let Some(base_url) = env::var("LLM_BASE_URL")
+            .ok()
+            .or_else(|| env::var("LLM_API_BASE").ok())
+        {
+            // No caller endpoint exists, so the process-level endpoint and its
+            // configured credential remain an inseparable trusted pair.
+            (base_url, true, false)
+        } else {
+            ("http://127.0.0.1:8081/v1".to_string(), false, false)
+        };
+    let api_key = if !trusted_destination {
+        None
+    } else if trusted_config_selected {
+        options.trusted_llm_api_key.clone().or_else(|| {
+            env::var("LLM_API_KEY")
+                .or_else(|_| env::var("MARC27_TOKEN"))
+                .ok()
         })
-        .or_else(|| env::var("LLM_BASE_URL").ok())
-        .or_else(|| env::var("LLM_API_BASE").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:8081/v1".to_string());
-    let api_key = env::var("LLM_API_KEY")
-        .or_else(|_| env::var("MARC27_TOKEN"))
-        .ok();
+    } else {
+        env::var("LLM_API_KEY")
+            .or_else(|_| env::var("MARC27_TOKEN"))
+            .ok()
+    };
     // Model resolves with the same precedence as base_url: step config →
     // context (`llm_model`, injected by the agent/CLI from the resolved chat
     // config) → env → built-in default.
@@ -1445,6 +1517,7 @@ async fn run_loop_step(
     client: &reqwest::Client,
     mut policy: Option<&mut prism_policy::PolicyEngine>,
     principal: &str,
+    options: &WorkflowExecutionOptions,
 ) -> Result<WorkflowStepResult> {
     let max_iterations = step
         .config
@@ -1500,7 +1573,7 @@ async fn run_loop_step(
                 "message" => run_message_step(body_step, context, dry_run),
                 "http" => run_http_step(body_step, context, dry_run, client).await,
                 "tool" => run_tool_step(body_step, context, dry_run, client).await,
-                "llm" => run_llm_step(body_step, context, dry_run).await,
+                "llm" => run_llm_step(body_step, context, dry_run, options).await,
                 "if" => {
                     run_if_step(
                         body_step,
@@ -1682,6 +1755,7 @@ async fn run_workflow_step(
     policy: Option<&mut prism_policy::PolicyEngine>,
     principal: &str,
     role: &str,
+    options: &WorkflowExecutionOptions,
 ) -> Result<WorkflowStepResult> {
     // Aliases: `name` (canonical) | `workflow`
     let workflow_name = config_first(&step.config, &["name", "workflow"])
@@ -1731,13 +1805,14 @@ async fn run_workflow_step(
     let child_spec = find_workflow(&specs, workflow_name)
         .ok_or_else(|| anyhow!("sub-workflow '{}' not found", workflow_name))?;
 
-    let child_result = Box::pin(execute_workflow_with_policy(
+    let child_result = Box::pin(execute_workflow_with_policy_and_options(
         child_spec,
         &values,
         true,
         policy,
         Some(principal),
         Some(role),
+        options,
     ))
     .await?;
 

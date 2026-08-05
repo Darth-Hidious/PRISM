@@ -46,7 +46,7 @@ fn platform_verification_failed() -> HandlerError {
 /// and matches the identity carried by the node's stored platform credential.
 /// Anonymous-local callers retain local node capabilities but can never become
 /// the node owner merely by reaching loopback or choosing a token/user_id.
-async fn authorized_platform_client<'a>(
+pub(crate) async fn authorized_platform_client<'a>(
     state: &'a NodeState,
     caller: &AuthenticatedUser,
 ) -> Result<&'a prism_client::PlatformClient, HandlerError> {

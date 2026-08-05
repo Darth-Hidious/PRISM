@@ -390,7 +390,7 @@ async fn http_chat_service_and_backend_share_loop_and_catalog() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn anonymous_sessions_cannot_be_listed_read_or_resumed() {
+async fn anonymous_caller_can_resume_own_session_but_not_anothers() {
     let Some(python) = find_python() else {
         eprintln!("SKIP: python3 not on PATH");
         return;
@@ -407,6 +407,9 @@ async fn anonymous_sessions_cannot_be_listed_read_or_resumed() {
     .await
     .expect("spawn chat service");
 
+    let caller_a = prism_agent::service::anonymous_caller_id("transport-a");
+    let caller_b = prism_agent::service::anonymous_caller_id("transport-b");
+
     let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
     let first = service
         .chat(
@@ -415,7 +418,7 @@ async fn anonymous_sessions_cannot_be_listed_read_or_resumed() {
                 session_id: None,
                 approve: vec![],
             },
-            "anonymous-local",
+            &caller_a,
             tx1,
         )
         .await
@@ -428,40 +431,62 @@ async fn anonymous_sessions_cannot_be_listed_read_or_resumed() {
                 session_id: None,
                 approve: vec![],
             },
-            "anonymous-local",
+            &caller_b,
             tx2,
         )
         .await
         .expect("second anonymous session");
     assert_ne!(first.session_id, second.session_id);
-    assert!(service.list_sessions("anonymous-local").is_empty());
-    assert!(
-        service
-            .read_session(&first.session_id, "anonymous-local")
-            .is_err()
-    );
-    assert!(
-        service
-            .read_session(&second.session_id, "anonymous-local")
-            .is_err()
-    );
+    assert_eq!(service.list_sessions(&caller_a).len(), 1);
+    assert_eq!(service.list_sessions(&caller_b).len(), 1);
+    assert!(service.read_session(&first.session_id, &caller_a).is_ok());
+    assert!(service.read_session(&second.session_id, &caller_a).is_err());
 
     let (tx3, _rx3) = tokio::sync::mpsc::unbounded_channel();
-    let resume = service
+    let own_resume = service
         .chat(
             ChatRequest {
-                message: "try to resume".into(),
-                session_id: Some(second.session_id),
+                message: "resume my session".into(),
+                session_id: Some(first.session_id.clone()),
                 approve: vec![],
             },
-            "anonymous-local",
+            &caller_a,
             tx3,
+        )
+        .await
+        .expect("anonymous caller can resume its own session");
+    assert_eq!(own_resume.session_id, first.session_id);
+
+    let (tx4, _rx4) = tokio::sync::mpsc::unbounded_channel();
+    let other_resume = service
+        .chat(
+            ChatRequest {
+                message: "try to resume another caller's session".into(),
+                session_id: Some(second.session_id.clone()),
+                approve: vec![],
+            },
+            &caller_a,
+            tx4,
         )
         .await;
     assert!(matches!(
-        resume,
+        other_resume,
         Err(prism_agent::service::ChatError::SessionNotFound(_))
     ));
+
+    let (tx5, _rx5) = tokio::sync::mpsc::unbounded_channel();
+    service
+        .chat(
+            ChatRequest {
+                message: "my own second session".into(),
+                session_id: Some(second.session_id),
+                approve: vec![],
+            },
+            &caller_b,
+            tx5,
+        )
+        .await
+        .expect("the other anonymous caller retains its own access");
 }
 
 #[tokio::test(flavor = "multi_thread")]

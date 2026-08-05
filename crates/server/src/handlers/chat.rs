@@ -29,8 +29,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::NodeState;
 use crate::handlers::deployments::command_tool_platform_access;
-use crate::middleware::AuthenticatedUser;
-use prism_agent::service::{ChatError, ChatEvent, ChatRequest, ChatService};
+use crate::middleware::{AuthenticatedUser, SessionToken};
+use prism_agent::service::{ChatError, ChatEvent, ChatRequest, ChatService, anonymous_caller_id};
 
 #[derive(Deserialize)]
 pub struct ChatBody {
@@ -76,10 +76,19 @@ fn chat_service(state: &NodeState) -> Option<Arc<ChatService>> {
     state.chat.get().cloned()
 }
 
+fn chat_owner(user: &AuthenticatedUser, token: &SessionToken) -> String {
+    if user.is_anonymous_local() {
+        anonymous_caller_id(&token.0)
+    } else {
+        user.user_id.clone()
+    }
+}
+
 /// `POST /api/chat` — run one agent turn.
 pub async fn chat(
     State(state): State<Arc<NodeState>>,
     Extension(user): Extension<AuthenticatedUser>,
+    Extension(token): Extension<SessionToken>,
     Query(params): Query<ChatParams>,
     Json(body): Json<ChatBody>,
 ) -> Response {
@@ -105,10 +114,10 @@ pub async fn chat(
     if params.stream {
         // The service always terminates the stream with a `done` or
         // `error` event, so clients never hang on failures.
-        let user_id = user.user_id.clone();
+        let owner = chat_owner(&user, &token);
         tokio::spawn(async move {
             let _ = service
-                .chat_with_platform_access(request, &user_id, platform_access, tx)
+                .chat_with_platform_access(request, &owner, platform_access, tx)
                 .await;
         });
         let stream = UnboundedReceiverStream::new(rx).map(|event| {
@@ -129,8 +138,9 @@ pub async fn chat(
     } else {
         // Non-streaming: drain events into the void, return the outcome.
         drop(rx);
+        let owner = chat_owner(&user, &token);
         match service
-            .chat_with_platform_access(request, &user.user_id, platform_access, tx)
+            .chat_with_platform_access(request, &owner, platform_access, tx)
             .await
         {
             Ok(outcome) => Json(serde_json::json!({
@@ -157,23 +167,27 @@ pub async fn chat(
 pub async fn list_sessions(
     State(state): State<Arc<NodeState>>,
     Extension(user): Extension<AuthenticatedUser>,
+    Extension(token): Extension<SessionToken>,
 ) -> Response {
     let Some(service) = chat_service(&state) else {
         return service_unavailable();
     };
-    Json(serde_json::json!({ "sessions": service.list_sessions(&user.user_id) })).into_response()
+    let owner = chat_owner(&user, &token);
+    Json(serde_json::json!({ "sessions": service.list_sessions(&owner) })).into_response()
 }
 
 /// `GET /api/chat/sessions/{id}` — read one owned session's messages.
 pub async fn get_session(
     State(state): State<Arc<NodeState>>,
     Extension(user): Extension<AuthenticatedUser>,
+    Extension(token): Extension<SessionToken>,
     Path(id): Path<String>,
 ) -> Response {
     let Some(service) = chat_service(&state) else {
         return service_unavailable();
     };
-    match service.read_session(&id, &user.user_id) {
+    let owner = chat_owner(&user, &token);
+    match service.read_session(&id, &owner) {
         Ok(messages) => Json(serde_json::json!({
             "session_id": id,
             "messages": messages,

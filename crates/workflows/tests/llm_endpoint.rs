@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::Json;
 use axum::routing::post;
 use serde_json::{Value, json};
@@ -23,9 +24,19 @@ use serde_json::{Value, json};
 #[derive(Clone, Default)]
 struct Seen {
     requests: Arc<Mutex<Vec<Value>>>,
+    auth_headers: Arc<Mutex<Vec<Option<String>>>>,
 }
 
-async fn fake_chat_completions(State(seen): State<Seen>, Json(body): Json<Value>) -> Json<Value> {
+async fn fake_chat_completions(
+    State(seen): State<Seen>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let auth = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    seen.auth_headers.lock().unwrap().push(auth);
     seen.requests.lock().unwrap().push(body);
     Json(json!({
         "choices": [{ "message": { "content": "ack" } }]
@@ -91,6 +102,66 @@ async fn llm_step_uses_injected_endpoint_and_model() {
         requests[0].get("model").and_then(Value::as_str),
         Some("claude-sonnet-5"),
         "the step must send the injected model, not the built-in default"
+    );
+}
+
+/// Regression for the workflow credential-exfiltration door: a caller may
+/// choose an LLM endpoint, but that endpoint must not receive the node's
+/// MARC27 credential.
+#[tokio::test(flavor = "multi_thread")]
+async fn caller_supplied_llm_endpoint_never_receives_node_credential() {
+    let seen = Seen::default();
+    let llm_port = spawn_llm(seen.clone()).await;
+    let spec = single_llm_workflow();
+
+    let mut values = BTreeMap::new();
+    values.insert(
+        "llm_base_url".to_string(),
+        format!("http://127.0.0.1:{llm_port}/v1"),
+    );
+    let options = prism_workflows::WorkflowExecutionOptions {
+        trusted_llm_base_url: Some(format!("http://127.0.0.1:{llm_port}/v1")),
+        trusted_llm_api_key: Some("node-secret-token".to_string()),
+        caller_supplied_llm_base_url: true,
+    };
+    let result = prism_workflows::execute_workflow_with_policy_and_options(
+        &spec, &values, true, None, None, None, &options,
+    )
+    .await;
+
+    result.expect("caller-selected endpoint should still be usable");
+    assert_eq!(
+        seen.auth_headers.lock().unwrap().as_slice(),
+        &[None],
+        "caller-selected endpoint must receive no node credential"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trusted_llm_endpoint_keeps_its_paired_credential() {
+    let seen = Seen::default();
+    let llm_port = spawn_llm(seen.clone()).await;
+    let spec = single_llm_workflow();
+    let options = prism_workflows::WorkflowExecutionOptions {
+        trusted_llm_base_url: Some(format!("http://127.0.0.1:{llm_port}/v1")),
+        trusted_llm_api_key: Some("trusted-node-key".to_string()),
+        caller_supplied_llm_base_url: false,
+    };
+
+    prism_workflows::execute_workflow_with_policy_and_options(
+        &spec,
+        &BTreeMap::new(),
+        true,
+        None,
+        None,
+        None,
+        &options,
+    )
+    .await
+    .expect("trusted endpoint should remain usable");
+    assert_eq!(
+        seen.auth_headers.lock().unwrap().as_slice(),
+        &[Some("Bearer trusted-node-key".to_string())]
     );
 }
 

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use prism_core::rbac::LocalRole;
 
 use crate::NodeState;
+use crate::handlers::deployments::authorized_platform_client;
 use crate::middleware::{AuthenticatedUser, UserRole};
 
 /// Map an authenticated RBAC role to the policy engine's role vocabulary
@@ -97,6 +98,23 @@ pub async fn run_workflow(
     body: Option<Json<RunWorkflowRequest>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
+
+    // A linked node may execute workflows only for its verified owner. This
+    // check is intentionally separate from local RBAC: anonymous-local keeps
+    // standalone node capabilities, but it is never the platform owner.
+    if state.platform_client.is_some() {
+        let Some(Extension(user)) = user_ext.as_ref() else {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "error": "workflow execution requires a verified node-owner session" }),
+                ),
+            ));
+        };
+        authorized_platform_client(&state, user).await?;
+    }
+
+    let caller_supplied_llm_base_url = req.values.contains_key("llm_base_url");
     let specs = discover().map_err(internal)?;
     let Some(spec) = prism_workflows::find_workflow(&specs, &name) else {
         return Err((
@@ -146,14 +164,21 @@ pub async fn run_workflow(
         node_token,
         &llm_config,
     );
+    let options = prism_workflows::WorkflowExecutionOptions {
+        trusted_llm_base_url: (!llm_config.base_url.is_empty())
+            .then_some(llm_config.base_url.clone()),
+        trusted_llm_api_key: llm_config.api_key.clone(),
+        caller_supplied_llm_base_url,
+    };
 
-    let result = prism_workflows::execute_workflow_with_policy(
+    let result = prism_workflows::execute_workflow_with_policy_and_options(
         spec,
         &values,
         req.execute,
         Some(&mut policy),
         Some(principal.as_str()),
         Some(role),
+        &options,
     )
     .await
     .map_err(internal_display)?;
@@ -169,4 +194,30 @@ fn internal(e: String) -> (StatusCode, Json<Value>) {
 
 fn internal_display(e: anyhow::Error) -> (StatusCode, Json<Value>) {
     internal(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::middleware::AuthenticatedUser;
+
+    #[tokio::test]
+    async fn linked_node_workflow_run_rejects_anonymous_caller() {
+        let mut node = NodeState::new("test-node".to_string());
+        node.platform_client = Some(prism_client::PlatformClient::new("http://127.0.0.1:1"));
+        let state = Arc::new(node);
+
+        let result = run_workflow(
+            State(state),
+            Path("not-a-real-workflow".to_string()),
+            None,
+            Some(Extension(AuthenticatedUser::anonymous_local())),
+            None,
+        )
+        .await;
+
+        let (status, Json(body)) = result.expect_err("anonymous workflow run must be refused");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["error"].as_str().unwrap().contains("anonymous-local"));
+    }
 }

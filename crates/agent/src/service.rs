@@ -46,10 +46,16 @@ use crate::tool_catalog::ToolCatalog;
 use crate::transcript::TranscriptStore;
 use crate::types::{AgentConfig, AgentEvent};
 
-/// Stable principal used by the standalone HTTP seam when no account session
-/// exists. Anonymous sessions deliberately cannot be listed, read, or resumed
-/// because this principal is shared by all such requests.
+/// Stable principal prefix used by the standalone HTTP seam when no account
+/// session exists. HTTP handlers append the validated transport session token
+/// so anonymous callers can resume their own session without sharing access.
 pub const ANONYMOUS_LOCAL_USER_ID: &str = "anonymous-local";
+
+/// Bind an anonymous HTTP caller to its validated transport token. The token
+/// is a bearer capability issued/validated by the server, not request JSON.
+pub fn anonymous_caller_id(transport_token: &str) -> String {
+    format!("{ANONYMOUS_LOCAL_USER_ID}:{transport_token}")
+}
 
 // ── Wire types ───────────────────────────────────────────────────────
 
@@ -545,12 +551,10 @@ impl ChatService {
 
         let session_id = match &request.session_id {
             Some(sid) => {
-                // All anonymous HTTP requests share one transport principal.
-                // Refuse every anonymous resume rather than allowing one
-                // connection to resume another connection's history.
-                if user_id == ANONYMOUS_LOCAL_USER_ID || !self.user_owns(sid, user_id) {
-                    // Unknown AND not-owned collapse to the same error so
-                    // the API doesn't leak which session ids exist.
+                // Anonymous HTTP callers are scoped by the server to their
+                // validated transport token. Unknown AND not-owned collapse
+                // to the same error so the API doesn't leak session ids.
+                if !self.user_owns(sid, user_id) {
                     return Err(ChatError::SessionNotFound(sid.clone()));
                 }
                 let (sid, messages) = inner

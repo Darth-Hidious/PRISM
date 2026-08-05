@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use prism_ingest::llm::ToolDefinition;
 use prism_workflows::{
-    WorkflowRunResult, WorkflowSpec, discover_workflows, execute_workflow_with_policy,
-    find_workflow, parse_workflow_command_args,
+    WorkflowExecutionOptions, WorkflowRunResult, WorkflowSpec, discover_workflows, find_workflow,
+    parse_workflow_command_args,
 };
 use serde_json::{Value, json};
 use tokio::process::Command as TokioCommand;
@@ -63,6 +63,9 @@ pub struct CommandToolRuntime {
     pub llm_base_url: Option<String>,
     /// Resolved model id, injected into workflow context as `llm_model`.
     pub llm_model: Option<String>,
+    /// Credential paired with the resolved trusted endpoint. It is never
+    /// forwarded when a workflow caller overrides `llm_base_url`.
+    pub llm_api_key: Option<String>,
 }
 
 /// Which of a subcommand's OWN flags a free-form-argv tool may hand to clap.
@@ -3897,36 +3900,25 @@ fn platform_access_refusal() -> anyhow::Error {
 }
 
 fn strip_platform_credentials(cmd: &mut TokioCommand) {
-    // The child must not be able to recover the node credential from either
-    // environment inheritance or the normal PRISM credential/config paths.
-    // This is deliberately a credential boundary, not a list of platform
-    // tools: newly added CLI commands get the same safe default.
+    // LocalOnly is a credential boundary, not a filesystem boundary. Keep the
+    // real HOME so local-only commands can read the user's provenance graph
+    // and write campaign checkpoints where the rest of PRISM expects them.
+    // Empty values also stop the CLI's dotenv bootstrap from repopulating a
+    // removed credential from a project .env file.
     for key in [
         "MARC27_API_KEY",
         "MARC27_TOKEN",
         "MARC27_API_TOKEN",
         "PRISM_LOGIN_TOKEN",
+        "MARC27_API_URL",
+        "MARC27_PROJECT_ID",
     ] {
-        cmd.env_remove(key);
+        cmd.env(key, "");
     }
+    // The CLI and platform client honor this before any platform request or
+    // credential refresh. Stored local data remains available under HOME, but
+    // platform access is disabled for the child.
     cmd.env("PRISM_OFFLINE", "1");
-
-    // `prism` resolves stored credentials through platform-specific config
-    // directories and the SDK mirror under HOME. Point all of those lookups at
-    // an intentionally absent location rather than the node owner's home.
-    for key in [
-        "HOME",
-        "USERPROFILE",
-        "APPDATA",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "XDG_CACHE_HOME",
-    ] {
-        cmd.env(key, "/__prism_no_platform_credentials__");
-    }
-    cmd.env("HOMEDRIVE", "/");
-    cmd.env("HOMEPATH", "/__prism_no_platform_credentials__");
 }
 
 fn offline_platform_failure(value: &Value) -> bool {
@@ -4096,6 +4088,7 @@ async fn execute_workflow_command(
             // Authenticate the workflow's `tool` steps to the local node.
             // Execute mode only — dry runs plan without calling tools.
             let mut values = values.clone();
+            let caller_supplied_llm_base_url = values.contains_key("llm_base_url");
             // `or_insert`: an explicit workflow `_node_token` value wins over
             // the minted one (consistent with the slash/CLI paths).
             if *execute && let Some(token) = mint_agent_node_token().await {
@@ -4114,8 +4107,13 @@ async fn execute_workflow_command(
                     .entry("llm_model".to_string())
                     .or_insert_with(|| model.clone());
             }
+            let options = WorkflowExecutionOptions {
+                trusted_llm_base_url: runtime.llm_base_url.clone(),
+                trusted_llm_api_key: runtime.llm_api_key.clone(),
+                caller_supplied_llm_base_url,
+            };
             match find_workflow(&specs, name) {
-                Some(spec) => match execute_workflow_with_policy(
+                Some(spec) => match prism_workflows::execute_workflow_with_policy_and_options(
                     spec,
                     &values,
                     *execute,
@@ -4124,6 +4122,7 @@ async fn execute_workflow_command(
                     // Autonomous agent runs under the "agent" role — never a
                     // role smuggled through `values`.
                     Some("agent"),
+                    &options,
                 )
                 .await
                 {
@@ -4626,11 +4625,11 @@ if [ "$PRISM_OFFLINE" != "1" ]; then
   echo "missing offline boundary" >&2
   exit 1
 fi
-if [ "$HOME" != "/__prism_no_platform_credentials__" ]; then
-  echo "real home inherited" >&2
+if [ -z "$HOME" ] || [ "$HOME" = "/__prism_no_platform_credentials__" ]; then
+  echo "real home was not preserved" >&2
   exit 1
 fi
-if [ -n "$MARC27_API_KEY" ] || [ -n "$MARC27_TOKEN" ] || [ -n "$MARC27_API_TOKEN" ] || [ -n "$PRISM_LOGIN_TOKEN" ]; then
+if [ -n "$MARC27_API_KEY" ] || [ -n "$MARC27_TOKEN" ] || [ -n "$MARC27_API_TOKEN" ] || [ -n "$PRISM_LOGIN_TOKEN" ] || [ -n "$MARC27_API_URL" ] || [ -n "$MARC27_PROJECT_ID" ]; then
   echo "platform credential inherited" >&2
   exit 1
 fi
@@ -4661,6 +4660,83 @@ printf 'local command succeeded\n'
         .expect("local-only command should run");
         assert_eq!(result["success"], true);
         assert_eq!(result["stdout"], "local command succeeded");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_only_query_local_and_campaign_worker_preserve_real_home_data() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp home");
+        let prism_dir = home.path().join(".prism");
+        std::fs::create_dir_all(&prism_dir).expect("create prism data dir");
+        std::fs::write(prism_dir.join("provenance.db"), "local graph fixture")
+            .expect("write local graph fixture");
+
+        let executable = home.path().join("local-data-probe");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+if [ "$PRISM_OFFLINE" != "1" ] || [ -n "$MARC27_TOKEN" ]; then
+  echo "platform credential boundary missing" >&2
+  exit 1
+fi
+case "$1" in
+  query_local)
+    if [ ! -f "$HOME/.prism/provenance.db" ]; then
+      echo "local provenance graph missing" >&2
+      exit 1
+    fi
+    printf 'real local graph data\n'
+    ;;
+  campaign_worker)
+    mkdir -p "$HOME/.prism/campaigns"
+    printf '{"status":"checkpointed"}\n' > "$HOME/.prism/campaigns/camp_test.json"
+    ;;
+  *)
+    echo "unexpected local probe command: $1" >&2
+    exit 1
+    ;;
+esac
+"#,
+        )
+        .expect("write local data probe");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("stat local data probe")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions)
+            .expect("make local data probe executable");
+
+        let mut query = TokioCommand::new(&executable);
+        query
+            .arg("query_local")
+            .env("HOME", home.path())
+            .env("MARC27_TOKEN", "node-secret")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        strip_platform_credentials(&mut query);
+        let query_output = query.output().await.expect("run query-local probe");
+        assert!(query_output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&query_output.stdout).trim(),
+            "real local graph data"
+        );
+
+        let mut campaign = TokioCommand::new(&executable);
+        campaign
+            .arg("campaign_worker")
+            .env("HOME", home.path())
+            .env("MARC27_TOKEN", "node-secret")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        strip_platform_credentials(&mut campaign);
+        let campaign_output = campaign.output().await.expect("run campaign probe");
+        assert!(campaign_output.status.success());
+        assert!(
+            prism_dir.join("campaigns").join("camp_test.json").is_file(),
+            "campaign worker must write under the user's real HOME"
+        );
     }
 
     #[tokio::test]

@@ -21,8 +21,8 @@ use prism_python_bridge::tool_server::{ToolServer, ToolServerHandle};
 use prism_runtime::auth::{self, AUTH_REQUIRED_RPC_CODE};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
-    WorkflowRunResult, WorkflowSpec, discover_workflows, execute_workflow_with_policy,
-    find_workflow, parse_workflow_command_args,
+    WorkflowExecutionOptions, WorkflowRunResult, WorkflowSpec, discover_workflows, find_workflow,
+    parse_workflow_command_args,
 };
 use serde_json::{Value, json};
 use tokio::process::Command as TokioCommand;
@@ -4728,20 +4728,27 @@ async fn handle_workflow_slash_command(
             // thread the loopback session token the same way the CLI and
             // agent-tool paths do (dry runs plan only, so no token). Also point
             // `llm_*` steps at the resolved chat endpoint.
+            let caller_supplied_llm_base_url = values.contains_key("llm_base_url");
             let node_token = if execute {
                 command_tools::mint_agent_node_token().await
             } else {
                 None
             };
             let values = assemble_workflow_run_values(values, execute, node_token, llm_config);
+            let options = WorkflowExecutionOptions {
+                trusted_llm_base_url: Some(llm_config.base_url.clone()).filter(|s| !s.is_empty()),
+                trusted_llm_api_key: llm_config.api_key.clone(),
+                caller_supplied_llm_base_url,
+            };
 
-            let result = execute_workflow_with_policy(
+            let result = prism_workflows::execute_workflow_with_policy_and_options(
                 spec,
                 &values,
                 execute,
                 policy_engine.as_mut(),
                 Some(interactive_principal.as_str()),
                 Some(interactive_role.as_str()),
+                &options,
             )
             .await?;
             emit_workflow_result_view(spec, &result);
@@ -4755,6 +4762,7 @@ async fn handle_workflow_slash_command(
             let spec = find_workflow(&specs, &request.name)
                 .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", request.name))?;
             // Same node-token + llm-endpoint threading as the `run` arm above.
+            let caller_supplied_llm_base_url = request.values.contains_key("llm_base_url");
             let node_token = if request.execute {
                 command_tools::mint_agent_node_token().await
             } else {
@@ -4766,13 +4774,19 @@ async fn handle_workflow_slash_command(
                 node_token,
                 llm_config,
             );
-            let result = execute_workflow_with_policy(
+            let options = WorkflowExecutionOptions {
+                trusted_llm_base_url: Some(llm_config.base_url.clone()).filter(|s| !s.is_empty()),
+                trusted_llm_api_key: llm_config.api_key.clone(),
+                caller_supplied_llm_base_url,
+            };
+            let result = prism_workflows::execute_workflow_with_policy_and_options(
                 spec,
                 &values,
                 request.execute,
                 policy_engine.as_mut(),
                 Some(interactive_principal.as_str()),
                 Some(interactive_role.as_str()),
+                &options,
             )
             .await?;
             emit_workflow_result_view(spec, &result);
@@ -7413,6 +7427,7 @@ pub async fn build_agent_seed(
         // default. Empty base_url (unresolved) ⇒ None ⇒ env fallback.
         llm_base_url: Some(llm_config.base_url.clone()).filter(|s| !s.is_empty()),
         llm_model: Some(llm_config.model.clone()).filter(|s| !s.is_empty()),
+        llm_api_key: llm_config.api_key.clone(),
     };
     let hooks = Arc::new(build_default_hooks());
     let permissions = build_effective_permission_context(
