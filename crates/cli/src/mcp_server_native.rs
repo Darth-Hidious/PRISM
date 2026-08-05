@@ -43,6 +43,13 @@ pub async fn run(project_root: PathBuf, python_bin: PathBuf) -> Result<()> {
         python_bin,
         llm_base_url,
         llm_model,
+        // No node-held LLM credential is handed to tools spawned by the native
+        // MCP server. `resolve_workflow_llm_pair` yields only (base_url, model)
+        // — there is no key to pass — and an MCP client is an arbitrary external
+        // process, so `None` is also the safe default: a tool that accepts a
+        // caller-supplied `--llm-url` must never be able to send a node
+        // credential to it.
+        llm_api_key: None,
     };
 
     let stdin = tokio::io::stdin();
