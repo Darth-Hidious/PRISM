@@ -25,6 +25,10 @@ uuid = { workspace = true }
 
 prism-workflows = { path = "../workflows" }
 prism-provenance = { path = "../provenance" }
+# The campaign ledger read model joins the persistent compute-job tracker
+# (what was submitted) with the checkpoint (what was proposed) and the
+# provenance store (what was established).
+prism-compute = { path = "../compute" }
 prism-llm = { path = "../llm" }
 prism-runtime = { path = "../runtime" }
 prism-client = { path = "../client" }

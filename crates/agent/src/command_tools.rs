@@ -179,6 +179,7 @@ enum CommandToolKind {
     Predict,
     GoalStart,
     GoalStatus,
+    GoalLedger,
     GoalList,
     GoalResume,
     ScheduleCreate,
@@ -799,6 +800,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &["campaign_status"],
         kind: CommandToolKind::GoalStatus,
         description: "Show a long-running goal's progress from its checkpoint: iteration, candidates evaluated, best-so-far, spend. Use goal_list to find ids.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "goal_ledger",
+        root: "campaign",
+        aliases: &["campaign_ledger", "what_is_done"],
+        kind: CommandToolKind::GoalLedger,
+        description: "What is DONE, what is PENDING, and what was REFUTED for a long-running goal — in one answer, read from the campaign checkpoint, the provenance store and the job tracker. Call this FIRST when joining or resuming a campaign instead of replaying its history: it tells you what has already been established (with evidence class), what is still running (a submitted job is pending, never done), and what was already tried and rejected AND WHY — so you do not re-propose it. Read-only.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -2265,6 +2275,9 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::GoalStatus => {
             goal_id_schema("Goal (campaign) id from goal_list or goal_start output.")
         }
+        CommandToolKind::GoalLedger => {
+            goal_id_schema("Goal (campaign) id whose done/pending/refuted ledger you want.")
+        }
         CommandToolKind::GoalList => empty_schema(),
         CommandToolKind::GoalResume => {
             goal_id_schema("Goal (campaign) id to resume from its checkpoint.")
@@ -3638,6 +3651,17 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
         CommandToolKind::GoalStatus => Ok(CommandExecution::Cli {
             root: spec.root,
             args: vec!["status".to_string(), required_string(input, "id")?],
+        }),
+        // Reuses the existing, already-gated `Cli` execution, so the
+        // exhaustive access matrix in `gate_command_execution` is untouched —
+        // a read-only view needs no new privilege surface.
+        CommandToolKind::GoalLedger => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec![
+                "ledger".to_string(),
+                required_string(input, "id")?,
+                "--json".to_string(),
+            ],
         }),
         CommandToolKind::GoalList => Ok(CommandExecution::Cli {
             root: spec.root,

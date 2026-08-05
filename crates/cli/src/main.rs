@@ -729,6 +729,19 @@ fn format_classified_reward(reward: f64, evidence_class: prism_campaign::Evidenc
 
 #[derive(Debug, Subcommand)]
 enum CampaignCommands {
+    /// What is done, what is pending, and what was refuted — in one answer.
+    ///
+    /// Reads the three stores that already hold campaign state (checkpoint,
+    /// provenance, job tracker) so an agent joining a long-running campaign
+    /// can catch up without replaying it. `refuted` is the half nobody
+    /// collects: without it a campaign re-proposes what it already rejected.
+    Ledger {
+        /// Campaign id from `campaign list`.
+        id: String,
+        /// Emit JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Start a new discovery campaign from a goal description.
     Start {
         /// Natural-language description of what to discover.
@@ -2108,6 +2121,49 @@ async fn main() -> Result<()> {
                         // The BYOC sbatch wrapper interprets 140 as "the
                         // checkpoint is durable; requeue this allocation".
                         std::process::exit(140);
+                    }
+                }
+                CampaignCommands::Ledger { id, json } => {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let root = PathBuf::from(&home).join(".prism");
+                    let path = root.join("campaigns").join(format!("{id}.json"));
+                    let campaign = Campaign::from_checkpoint(&path)?;
+                    let store =
+                        prism_provenance::ProvenanceStore::open(&root.join("provenance.db"))
+                            .await
+                            .ok();
+                    let tracker = prism_compute::JobTracker::persistent(&root).ok();
+                    let ledger = prism_campaign::ledger::build_campaign_ledger(
+                        campaign.state(),
+                        store.as_ref(),
+                        tracker.as_ref(),
+                    )
+                    .await;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&ledger)?);
+                    } else {
+                        println!("Campaign: {id}");
+                        println!("\nDONE ({})", ledger.done.len());
+                        for entry in &ledger.done {
+                            println!("  {}", entry.summary());
+                        }
+                        println!("\nPENDING ({})", ledger.pending.len());
+                        for entry in &ledger.pending {
+                            println!("  {}", entry.summary());
+                        }
+                        println!("\nREFUTED ({})", ledger.refuted.len());
+                        for entry in &ledger.refuted {
+                            println!("  {}", entry.summary());
+                        }
+                        if !ledger.gaps.is_empty() {
+                            // A store that cannot answer is stated, never
+                            // silently omitted — a partial ledger the next
+                            // agent trusts is worse than a stated gap.
+                            println!("\nGAPS ({})", ledger.gaps.len());
+                            for gap in &ledger.gaps {
+                                println!("  {gap}");
+                            }
+                        }
                     }
                 }
                 CampaignCommands::Status { id } => {
