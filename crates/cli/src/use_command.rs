@@ -273,8 +273,8 @@ fn tools_state_line(marc27_logged_in: bool) -> String {
     if marc27_logged_in {
         format!("{platform} (logged in)")
     } else {
-        "\x1b[33mplatform tools unavailable\x1b[0m — run `prism login` for knowledge \
-         graph, discourse, marketplace. Local tools and chat work without it."
+        "\x1b[33mplatform tools unavailable\x1b[0m — not authenticated. Knowledge \
+         graph, discourse and marketplace need it; local tools and chat do not."
             .to_string()
     }
 }
@@ -670,13 +670,14 @@ mod tests {
         let logged_in = apply(UseAction::Show, None, true).await.unwrap();
         assert!(logged_in.message.contains("logged in"));
         let logged_out = apply(UseAction::Show, None, false).await.unwrap();
-        assert!(logged_out.message.contains("prism login"));
+        // Must state the fact, never instruct the reader to go and run a
+        // command — no surface may tell a human to leave and type something.
+        assert!(logged_out.message.contains("not authenticated"));
+        assert!(!logged_out.message.contains("prism login"));
         // Logged out must not read as "PRISM is broken": it says what is
         // unavailable AND what still works.
         assert!(
-            logged_out
-                .message
-                .contains("Local tools and chat work without it"),
+            logged_out.message.contains("local tools and chat do not"),
             "logged-out message should name what still works, got: {}",
             logged_out.message
         );

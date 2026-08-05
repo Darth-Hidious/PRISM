@@ -121,7 +121,7 @@ pub async fn run(project_root: &Path, python_bin: &Path, fix: bool) -> Result<()
     checks.push(check_file(
         "PRISM credentials",
         &creds_path,
-        "run `prism login`",
+        "not authenticated",
     ));
 
     // 6. (removed) "forge MCP config" checked `~/.forge/.mcp.json` and, when
@@ -192,7 +192,7 @@ pub async fn run(project_root: &Path, python_bin: &Path, fix: bool) -> Result<()
     println!("something PRISM fills in on demand or something you need to do.");
     if !creds_path.exists() {
         println!();
-        println!("Next step:  prism login");
+        println!("Next step:  authenticate this node");
     }
     println!();
     println!("To repair what can be repaired automatically:");
@@ -361,7 +361,7 @@ fn manual_only(creds_present: bool, platform: &[BootCheck]) -> Vec<BootCheck> {
     if !creds_present {
         rows.push(BootCheck {
             name: "PRISM credentials".to_string(),
-            result: "not repairable here — run: prism login".to_string(),
+            result: "not repairable here — requires authentication".to_string(),
             ok: false,
             dots: 4,
             delay_ms: 0,

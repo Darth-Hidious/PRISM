@@ -2950,12 +2950,14 @@ async fn main() -> Result<()> {
                                         anyhow!("token expired without stored session; run `prism login --token <PAT>` or set MARC27_API_KEY")
                                     })?;
                                 let refreshed = refresh_access_token(
-                                        &paths, &endpoints, effective_creds,
-                                    )
-                                    .await
-                                    .context(
-                                        "token expired and refresh failed — run `prism login` to re-authenticate",
-                                    )?;
+                                    &paths,
+                                    &endpoints,
+                                    effective_creds,
+                                )
+                                .await
+                                .context(
+                                    "token expired and refresh failed — re-authentication required",
+                                )?;
                                 // Reassign the OUTER client so the daemon
                                 // state (stored below) carries the live token.
                                 platform = PlatformClient::new(resolved_api_base)
@@ -3227,7 +3229,7 @@ async fn main() -> Result<()> {
                     .set(prism_mesh::federated_query::FederatedQuery::default());
 
                 if !mesh_has_auth {
-                    println!("  \u{26A0} Mesh: disabled (no auth — run `prism login` to enable)");
+                    println!("  \u{26A0} Mesh: disabled (not authenticated)");
                 } else if broadcast {
                     println!("  \u{2713} Mesh: broadcasting (mDNS + platform discovery)");
                 } else {
@@ -3910,7 +3912,7 @@ async fn main() -> Result<()> {
                         );
                     } else {
                         if token.is_none() {
-                            anyhow::bail!("publishing needs a login — run `prism login` first");
+                            anyhow::bail!("publishing requires authentication");
                         }
                         for entry in &selected {
                             marketplace.publish_entry(entry).await?;
