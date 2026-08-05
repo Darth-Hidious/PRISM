@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use polars::prelude::*;
-use prism_provenance::{EvidenceClass, LocalProvenance, ProvenanceStore};
+use prism_provenance::{EvidenceClass, LocalFact, LocalProvenance, ProvenanceStore};
 use serde::{Deserialize, Serialize};
 use tracing;
 
@@ -44,6 +44,12 @@ pub struct IngestResult {
     /// "Done." with exit 0 while storing nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+    /// Facts refused by the tabular containment gate — their numeric value
+    /// is not in any cell of the source the extractor saw. NON-EMPTY means
+    /// facts were dropped before the store; callers must surface them. A
+    /// silent drop is nearly as bad as a silent fabrication.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts_dropped: Vec<DroppedTabularFact>,
 }
 
 /// Configuration for a full ingest pipeline run.
@@ -156,9 +162,15 @@ impl IngestPipeline {
 
         // Step 3: LLM entity extraction (if configured)
         let mut errors: Vec<String> = Vec::new();
+        // Facts refused by the tabular containment gate are collected here so
+        // the run surfaces them (see `gate_tabular_facts`).
+        let mut facts_dropped: Vec<DroppedTabularFact> = Vec::new();
+        // The same bounded window the extractor sees — the gate checks
+        // containment against exactly these cells (a value from beyond this
+        // window cannot have been read by this run).
+        let sample_rows = extract_sample_rows(&df, self.config.max_sample_rows);
         let entities = if let Some(ref llm_config) = self.config.llm {
             let constructor = LlmOntologyConstructor::new(llm_config.clone());
-            let sample_rows = extract_sample_rows(&df, self.config.max_sample_rows);
 
             tracing::info!(
                 model = %llm_config.model,
@@ -214,8 +226,13 @@ impl IngestPipeline {
         // upsert (Neo4j retirement, step 1) — the store is bundled, so no
         // backend config gates the write.
         let graph = if graph_validation_passed && let Some(entity_set) = &entities {
-            match self.write_local_graph(entity_set, &source).await {
-                Ok(update) => {
+            match self
+                .write_local_graph(entity_set, &source, &sample_rows, &schema.columns)
+                .await
+            {
+                Ok((update, dropped)) => {
+                    // Refused facts are surfaced, never silent.
+                    facts_dropped.extend(dropped);
                     tracing::info!(
                         nodes = update.nodes_created,
                         edges = update.edges_created,
@@ -247,6 +264,7 @@ impl IngestPipeline {
             graph,
             embeddings: None,
             errors,
+            facts_dropped,
         })
     }
 
@@ -256,7 +274,9 @@ impl IngestPipeline {
         &self,
         entity_set: &EntitySet,
         source: &DataSource,
-    ) -> Result<GraphUpdate> {
+        sample_rows: &[Vec<String>],
+        columns: &[String],
+    ) -> Result<(GraphUpdate, Vec<DroppedTabularFact>)> {
         let db_path = match &self.config.provenance_db {
             Some(p) => p.clone(),
             None => dirs::home_dir()
@@ -286,8 +306,17 @@ impl IngestPipeline {
         };
         store.record_activity(&prov).await?;
 
-        let facts = to_local_facts(entity_set);
-        for fact in &facts {
+        // Containment gate: a tabular fact is honest only if its number is
+        // actually in a cell of the source the extractor saw. Facts whose
+        // value is not in any cell are dropped here (never written, never
+        // corrected) and returned so the run surfaces the refusals.
+        let outcome = gate_tabular_facts(
+            to_local_facts(entity_set),
+            sample_rows,
+            columns,
+            &source.path,
+        );
+        for fact in &outcome.kept {
             store
                 .write_fact_with_evidence(fact, &prov, EvidenceClass::Research)
                 .await?;
@@ -295,11 +324,16 @@ impl IngestPipeline {
         // Best-effort: vectorize the freshly written entity names into the
         // same Turso store so `prism query --semantic` works without Qdrant.
         // Failures are logged inside and never fail the ingest.
-        store.embed_entities_best_effort(&facts, &prov.tenant).await;
-        Ok(GraphUpdate {
-            nodes_created: entity_set.entities.len(),
-            edges_created: facts.len(),
-        })
+        store
+            .embed_entities_best_effort(&outcome.kept, &prov.tenant)
+            .await;
+        Ok((
+            GraphUpdate {
+                nodes_created: entity_set.entities.len(),
+                edges_created: outcome.kept.len(),
+            },
+            outcome.dropped,
+        ))
     }
 }
 
@@ -352,6 +386,170 @@ fn extract_sample_rows(df: &DataFrame, max_rows: usize) -> Vec<Vec<String>> {
                 .collect()
         })
         .collect()
+}
+
+// ─── Tabular containment gate ────────────────────────────────────────────
+// The CSV/Parquet path has no prose, so it has no verbatim-quote concept.
+// The honest analogue of a quote is a CELL REFERENCE — which file, which
+// row, which column a number was read from, such that a reader can open the
+// source and look at it. The gate verifies a fact's value against the cells
+// the extractor actually saw: a fact whose number is not in any cell is
+// REFUSED (dropped, never corrected) — the tabular equivalent of a quote
+// that is not in the document. Refusals are reported, never silent.
+//
+// This mirrors the papers and local-text routes, which gate on a verbatim
+// quote through the one shared `retrieval::claims::quote_in_block`. Tabular
+// data has no sentence to quote, so the gate verifies the NUMBER instead.
+
+/// The exact `(file, row, column)` a number was read from — the tabular
+/// analogue of a verbatim quote. Resolved by the containment gate when it
+/// verifies a fact's value against the source cells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellReference {
+    pub file: String,
+    /// 0-based row index within the sample rows the extractor saw.
+    pub row: usize,
+    pub column: String,
+}
+
+/// Why a tabular fact was refused before the provenance store. A refused
+/// fact is dropped — never downgraded, never silently repaired.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroppedTabularFact {
+    pub subject: String,
+    pub object: String,
+    /// The numeric value that could not be matched to a source cell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    pub reason: TabularDropReason,
+}
+
+/// The cause of a tabular refusal. An enum (not a free string) so every
+/// refusal names a machine-stable cause; `as_label` is the wire form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabularDropReason {
+    /// The fact's numeric value does not occur in any cell of the source the
+    /// extractor saw. A number not in the file cannot be attributed to the
+    /// file — the tabular equivalent of a quote not in the document.
+    ValueNotInSource,
+}
+
+impl TabularDropReason {
+    /// Stable machine-readable label used in drop reports.
+    #[must_use]
+    pub fn as_label(self) -> &'static str {
+        match self {
+            TabularDropReason::ValueNotInSource => "value_not_in_source",
+        }
+    }
+}
+
+/// One gate run's outcome: the facts that passed (kept, each traceable to a
+/// cell) and the facts refused (which callers MUST surface — a silent drop
+/// is nearly as bad as a silent fabrication).
+#[derive(Debug, Default)]
+pub struct TabularFactOutcome {
+    pub kept: Vec<LocalFact>,
+    pub dropped: Vec<DroppedTabularFact>,
+}
+
+/// Resolve `value` to its source cell among the rows the extractor saw,
+/// returning the first `(file, row, column)` whose stringified value
+/// matches. `None` when no cell contains the value — the fact's number is
+/// not in the source.
+fn find_cell(
+    value: f64,
+    sample_rows: &[Vec<String>],
+    columns: &[String],
+    file: &str,
+) -> Option<CellReference> {
+    for (row_idx, row) in sample_rows.iter().enumerate() {
+        for (col_idx, cell) in row.iter().enumerate() {
+            if cell_matches_value(cell, value) {
+                let column = columns
+                    .get(col_idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("col{col_idx}"));
+                return Some(CellReference {
+                    file: file.to_string(),
+                    row: row_idx,
+                    column,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Does a stringified cell equal `value`? Parses the cell as a number and
+/// compares with tolerance, so `"7.8"` matches `7.8` and `"2"` matches
+/// `2.0`. Non-numeric cells (`"Steel"`, `""`, headers) never match.
+fn cell_matches_value(cell: &str, value: f64) -> bool {
+    let Ok(cell_value) = cell.trim().parse::<f64>() else {
+        return false;
+    };
+    if cell_value.is_nan() || cell_value.is_infinite() || value.is_nan() || value.is_infinite() {
+        return false;
+    }
+    (cell_value - value).abs() <= 1e-9_f64.max(value.abs() * 1e-9)
+}
+
+/// The tabular containment gate. Every fact with a numeric `value` must be
+/// traceable to a source cell: the value must occur in one of the cells the
+/// extractor actually saw (`sample_rows`, the same bounded window the LLM
+/// received). A value not found is dropped — never corrected, never stored.
+/// Facts without a numeric value carry no number to verify and pass through
+/// (they cannot introduce a number that is not in the source).
+///
+/// Containment is checked against the SAME window the extractor saw, not the
+/// full table: a value from beyond `max_sample_rows` cannot have been read
+/// by this run.
+#[must_use]
+pub fn gate_tabular_facts(
+    facts: Vec<LocalFact>,
+    sample_rows: &[Vec<String>],
+    columns: &[String],
+    file: &str,
+) -> TabularFactOutcome {
+    let mut outcome = TabularFactOutcome::default();
+    for fact in facts {
+        let Some(value) = fact.value else {
+            outcome.kept.push(fact);
+            continue;
+        };
+        match find_cell(value, sample_rows, columns, file) {
+            Some(cell) => {
+                tracing::info!(
+                    subject = %fact.subject,
+                    object = %fact.object,
+                    value,
+                    column = %cell.column,
+                    row = cell.row,
+                    "tabular fact grounded in a source cell"
+                );
+                outcome.kept.push(fact);
+            }
+            None => {
+                let LocalFact {
+                    subject, object, ..
+                } = fact;
+                tracing::warn!(
+                    subject = %subject,
+                    object = %object,
+                    value,
+                    "tabular fact dropped before the store: its value is not in any cell the extractor saw"
+                );
+                outcome.dropped.push(DroppedTabularFact {
+                    subject,
+                    object,
+                    value: Some(value),
+                    reason: TabularDropReason::ValueNotInSource,
+                });
+            }
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -493,13 +691,30 @@ mod tests {
             path: "/tmp/alloys.csv".into(),
             format: "csv".into(),
         };
+        // The extractor saw one row whose cells hold both numeric values the
+        // facts cite (density 7.8, Fe fraction 0.98), so both facts are
+        // grounded in source cells and kept by the gate.
+        let columns = vec![
+            "name".to_string(),
+            "density".to_string(),
+            "fe_fraction".to_string(),
+        ];
+        let sample_rows = vec![vec![
+            "Steel".to_string(),
+            "7.8".to_string(),
+            "0.98".to_string(),
+        ]];
 
-        let update = pipeline
-            .write_local_graph(&entity_set, &source)
+        let (update, dropped) = pipeline
+            .write_local_graph(&entity_set, &source, &sample_rows, &columns)
             .await
             .unwrap();
         assert_eq!(update.nodes_created, 3);
         assert_eq!(update.edges_created, 2);
+        assert!(
+            dropped.is_empty(),
+            "facts whose values are in the source must not be dropped"
+        );
 
         // Reopen the store and verify the facts actually landed, in the
         // shapes the read API serves.
@@ -560,6 +775,7 @@ mod tests {
             graph: None,
             embeddings: None,
             errors: Vec::new(),
+            facts_dropped: Vec::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
         // None fields should not appear in JSON.
@@ -567,16 +783,140 @@ mod tests {
         assert!(!json.contains("graph_validation"));
         assert!(!json.contains("graph"));
         assert!(!json.contains("embeddings"));
+        assert!(!json.contains("facts_dropped"));
         // No errors ⇒ no errors key either (clean success stays clean)…
         assert!(!json.contains("errors"));
         // …but step failures MUST be visible in the JSON (the old shape hid
         // failed steps entirely — audit critical #2).
         let failed = IngestResult {
             errors: vec!["local graph write failed: disk full".into()],
+            facts_dropped: Vec::new(),
             ..result
         };
         let json = serde_json::to_string(&failed).unwrap();
         assert!(json.contains("errors"));
         assert!(json.contains("disk full"));
+    }
+
+    /// The gate's core job: a tabular fact whose numeric value is NOT in any
+    /// cell the extractor saw is refused — dropped, never corrected, never
+    /// stored. The tabular equivalent of a quote not in the document.
+    #[test]
+    fn tabular_fact_whose_value_is_not_in_source_is_refused() {
+        let columns = vec!["name".to_string(), "density".to_string()];
+        let sample_rows = vec![
+            vec!["Steel".to_string(), "7.8".to_string()],
+            vec!["Copper".to_string(), "8.96".to_string()],
+        ];
+        // A number that appears nowhere in the source: fabrication.
+        let fact = LocalFact {
+            subject: "ghost alloy".into(),
+            predicate: "HAS_PROPERTY".into(),
+            object: "density".into(),
+            value: Some(99.0),
+            unit: Some("g/cm3".into()),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+        };
+
+        let outcome = gate_tabular_facts(vec![fact], &sample_rows, &columns, "/data/alloys.csv");
+        assert!(
+            outcome.kept.is_empty(),
+            "a fabricated value must not be kept"
+        );
+        assert_eq!(outcome.dropped.len(), 1);
+        let drop = &outcome.dropped[0];
+        assert_eq!(drop.subject, "ghost alloy");
+        assert_eq!(drop.object, "density");
+        assert_eq!(drop.value, Some(99.0));
+        assert_eq!(drop.reason, TabularDropReason::ValueNotInSource);
+        assert_eq!(drop.reason.as_label(), "value_not_in_source");
+    }
+
+    /// The legitimate case must not regress: a fact whose value genuinely is
+    /// in a source cell is kept (fields intact) and not reported as dropped.
+    #[test]
+    fn genuine_tabular_fact_whose_value_is_in_source_is_kept() {
+        let columns = vec!["name".to_string(), "density".to_string()];
+        let sample_rows = vec![vec!["Steel".to_string(), "7.8".to_string()]];
+
+        let fact = LocalFact {
+            subject: "Steel".into(),
+            predicate: "HAS_PROPERTY".into(),
+            object: "density".into(),
+            value: Some(7.8),
+            unit: Some("g/cm3".into()),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+        };
+
+        let outcome = gate_tabular_facts(vec![fact], &sample_rows, &columns, "/data/alloys.csv");
+        assert!(outcome.dropped.is_empty());
+        assert_eq!(outcome.kept.len(), 1);
+        assert_eq!(outcome.kept[0].subject, "Steel");
+        assert_eq!(outcome.kept[0].value, Some(7.8));
+    }
+
+    /// A drop is never silent: the ingest result carries the refused facts
+    /// (subject/object/value/reason) so a consumer — and the user via the
+    /// summary — sees them. Mirrors the papers and local-text routes.
+    #[test]
+    fn refused_tabular_facts_are_surfaced_not_silent() {
+        let columns = vec!["name".to_string(), "density".to_string()];
+        let sample_rows = vec![vec!["Steel".to_string(), "7.8".to_string()]];
+        let facts = vec![
+            LocalFact {
+                subject: "ghost".into(),
+                predicate: "HAS_PROPERTY".into(),
+                object: "density".into(),
+                value: Some(99.0),
+                unit: None,
+                confidence: Some(0.9),
+                kind: Some("measurement".into()),
+            },
+            LocalFact {
+                subject: "phantom".into(),
+                predicate: "HAS_PROPERTY".into(),
+                object: "density".into(),
+                value: Some(404.0),
+                unit: None,
+                confidence: Some(0.9),
+                kind: Some("measurement".into()),
+            },
+        ];
+
+        let outcome = gate_tabular_facts(facts, &sample_rows, &columns, "/data/alloys.csv");
+        assert_eq!(outcome.dropped.len(), 2);
+
+        let result = IngestResult {
+            source: DataSource {
+                path: "/data/alloys.csv".into(),
+                format: "csv".into(),
+            },
+            schema: SchemaAnalysis {
+                columns: columns.clone(),
+                detected_types: vec![],
+            },
+            validation: crate::validation::ValidationReport {
+                issues: vec![],
+                passed: true,
+            },
+            row_count: 1,
+            column_count: 2,
+            entities: None,
+            graph_validation: None,
+            graph: None,
+            embeddings: None,
+            errors: Vec::new(),
+            facts_dropped: outcome.dropped.clone(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        // Refusals must be visible in the serialized result, by name.
+        assert!(json.contains("facts_dropped"));
+        assert!(json.contains("ghost"));
+        assert!(json.contains("phantom"));
+        assert!(json.contains("value_not_in_source"));
+        assert!(json.contains("99"));
+        assert!(json.contains("404"));
     }
 }
