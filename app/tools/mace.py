@@ -320,8 +320,16 @@ def _mace_get_cached_structure(**kwargs: Any) -> dict[str, Any]:
 
 
 # ===========================================================================
-# Shared schema fragments — pulled directly from the pydantic models so the
-# JSON Schema fed to the LLM matches the validation surface exactly.
+# Shared schema fragments — the JSON Schema fed to the LLM must never permit
+# what the runtime rejects. The source of truth is the enforcement itself:
+# the pydantic models in app/tools/simulation/mace/schemas.py (the
+# synchronous validation gate) and the supercell builders in
+# app/tools/simulation/mace/core/builders.py (the job-execution gate:
+# bcc/fcc/hcp build a FIXED 100-atom cell). Declared bounds are therefore
+# the enforced bounds narrowed to what actually succeeds; where a declared
+# value is stricter than enforcement (e.g. fmax minimum 0.001 vs gt=0),
+# the strict direction is safe. tests/test_mace_tool_schemas.py re-derives
+# the enforced truth and fails on any drift.
 # ===========================================================================
 
 _COMPOSITION_SCHEMA = {
@@ -345,47 +353,29 @@ _COMPOSITION_SCHEMA = {
     "required": ["atoms"],
 }
 
-_STRUCTURE_REF_SCHEMA = {
-    "type": "object",
-    "description": (
-        "Either a fresh composition+phase OR a cache_ref pointing at a previously "
-        "computed CIF. Exactly one of (composition+phase) OR cache_ref must be set."
-    ),
-    "properties": {
-        "composition": _COMPOSITION_SCHEMA,
-        "phase": {
-            "type": "string",
-            "enum": ["bcc", "fcc", "hcp", "b2", "l12", "sigma", "amorphous"],
-            "description": "Crystallographic phase to build.",
-        },
-        "n_atoms": {
-            "type": "integer",
-            "minimum": 2,
-            "maximum": 1000,
-            "description": "Total atoms in the supercell.",
-        },
-        "cache_ref": {
-            "type": "string",
-            "description": "cache:// URI from a previous tool call.",
-        },
-    },
-}
-
 # Shared property fragments — the same phase/n_atoms appear in 5 primitives;
-# define once so every copy carries a description for the model.
+# define once so every copy carries the SAME contract for the model.
 _PHASE_SCHEMA = {
     "type": "string",
-    "enum": ["bcc", "fcc", "hcp", "b2", "l12", "sigma"],
-    "description": "Crystallographic phase of the supercell to build.",
+    "enum": ["bcc", "fcc", "hcp", "c14_laves"],
+    "description": (
+        "Crystallographic phase of the supercell to build. bcc/fcc/hcp build "
+        "a fixed 100-atom random-substitution cell; c14_laves builds a fixed "
+        "96-atom MgZn2-prototype cell whose big/small sublattices are taken "
+        "from the two most abundant elements of the composition."
+    ),
 }
 
 _N_ATOMS_SCHEMA = {
     "type": "integer",
-    "minimum": 8,
-    "maximum": 432,
+    "minimum": 100,
+    "maximum": 100,
     "description": (
-        "Total atoms in the generated supercell (must equal the sum of the "
-        "composition's atom counts)."
+        "Total atoms in the generated supercell; must equal the sum of the "
+        "composition's atom counts. Always pass 100: the supercell builder "
+        "constructs a fixed 100-atom cell for bcc/fcc/hcp (the WAMS "
+        "phase-competition protocol), so any other value passes validation "
+        "but fails at build time."
     ),
 }
 
@@ -441,17 +431,18 @@ _PRIMITIVE_OPTIONS_SCHEMA = {
         },
         "head": {
             "type": "string",
+            "enum": ["omat_pbe", "matpes_r2scan", "oc20_usemppbe", "omol", "spice_wB97M", "rgd1_b3lyp"],
             "default": "omat_pbe",
             "description": (
-                "MACE-MH-1 head selector. Options: omat_pbe (default — inorganic "
-                "crystals), omol (molecules), oc20 (surfaces), spice (small molecules), "
-                "rgd1 (reactive small-molecule chemistry), mptrj (Materials Project "
-                "baseline), matpes (R²SCAN-level inorganic)."
+                "MACE-MH-1 head selector. omat_pbe (default — inorganic crystals), "
+                "omol (molecules), oc20_usemppbe (surfaces), spice_wB97M (small "
+                "molecules), rgd1_b3lyp (reactive small-molecule chemistry), "
+                "matpes_r2scan (R²SCAN-level inorganic)."
             ),
         },
         "dtype": {"type": "string", "enum": ["float32", "float64"], "default": "float64"},
         "seed": {"type": "integer", "default": 20260506},
-        "timeout_seconds": {"type": "integer", "minimum": 1, "default": 3600},
+        "timeout_seconds": {"type": "integer", "minimum": 60, "maximum": 14400, "default": 3600},
         "progress_token": {"type": "string", "description": "Optional MCP-style progress token."},
     },
 }
@@ -491,10 +482,10 @@ def create_mace_tools(registry: ToolRegistry) -> None:
                 "composition": _COMPOSITION_SCHEMA,
                 "phase": _PHASE_SCHEMA,
                 "n_atoms": _N_ATOMS_SCHEMA,
-                "fmax_eV_per_A": {"type": "number", "minimum": 0.001, "maximum": 1.0, "default": 0.05,
-                                  "description": "Force-convergence threshold in eV/Å."},
-                "max_steps": {"type": "integer", "minimum": 1, "default": 500,
-                              "description": "Maximum optimizer steps before giving up."},
+                "fmax_eV_per_A": {"type": "number", "minimum": 0.001, "maximum": 0.5, "default": 0.05,
+                                  "description": "Force-convergence threshold in eV/Å (enforced: > 0 and ≤ 0.5)."},
+                "max_steps": {"type": "integer", "minimum": 10, "maximum": 2000, "default": 200,
+                              "description": "Maximum optimizer steps before giving up (enforced: 10–2000)."},
                 "options": _PRIMITIVE_OPTIONS_SCHEMA,
             },
             "required": ["composition", "phase", "n_atoms"],
@@ -561,8 +552,10 @@ def create_mace_tools(registry: ToolRegistry) -> None:
                 "temperatures_K": {
                     "type": "array",
                     "items": {"type": "number"},
+                    "minItems": 1,
+                    "maxItems": 64,
                     "default": [0.0, 300.0, 1000.0, 1500.0],
-                    "description": "Temperatures at which to evaluate F_vib.",
+                    "description": "Temperatures at which to evaluate F_vib (enforced: 1–64 values).",
                 },
                 "q_mesh": {
                     "type": "array",
