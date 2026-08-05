@@ -16,7 +16,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Crates whose string literals reach a human directly.
-const HUMAN_FACING_CRATES: &[&str] = &["server", "cli", "tui", "mesh"];
+///
+/// `agent` is here because the access-refusal constants a person sees over
+/// `/api/chat` live in `agent/src/command_tools.rs`, not in `server` — an
+/// adversarial reviewer found the guard was scanning everywhere except where
+/// those strings actually are.
+const HUMAN_FACING_CRATES: &[&str] = &["server", "cli", "tui", "mesh", "agent", "workflows"];
 
 /// The imperative form we ban. A bare mention ("obtained via the device flow")
 /// is fine; telling the reader to go and type something is not.
@@ -35,6 +40,19 @@ fn is_comment(line: &str) -> bool {
 /// A line asserting *against* the pattern is the guard, not a violation.
 fn is_guard_assertion(line: &str) -> bool {
     line.contains("!body.contains") || line.contains("assert") || line.contains("is_instruction")
+}
+
+/// A tool's `description` is read by the MODEL, not shown to a person. Telling
+/// the agent "Run `prism status ...` through PRISM's Rust CLI" is the no-exit
+/// design working — the agent runs it so nobody has to leave. The ban is on
+/// telling a *human* to go and type something.
+///
+/// Deliberately narrow: only a line assigning the `description` field itself.
+/// A refusal message, an error, or any other literal is still scanned, so this
+/// cannot be used to smuggle user-facing text past the guard.
+fn is_agent_facing_tool_description(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("description:") || t.starts_with(".description(")
 }
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -71,7 +89,10 @@ fn no_user_facing_string_tells_a_human_to_run_a_cli_command() {
                 continue;
             };
             for (idx, line) in text.lines().enumerate() {
-                if is_comment(line) || is_guard_assertion(line) {
+                if is_comment(line)
+                    || is_guard_assertion(line)
+                    || is_agent_facing_tool_description(line)
+                {
                     continue;
                 }
                 // Only string literals reach a user.
