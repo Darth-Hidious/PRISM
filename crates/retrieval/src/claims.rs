@@ -510,4 +510,105 @@ mod tests {
         // Object absent from the block: no support.
         assert!(supporting_quote("Ti-6Al-4V", "omega phase", None, block).is_none());
     }
+
+    // ── Salience hardening: reviewer bypasses A1–A7 ─────────────────────
+    //
+    // Two independent reviewers stamped all seven blocks below as
+    // Ti-6Al-4V / UTS / 1140 MPa at confidence 0.9, evidence_class
+    // `research`, against the real library. Each must be refused.
+
+    const SALIENCE_SUBJECT: &str = "Ti-6Al-4V";
+    const SALIENCE_OBJECT: &str = "UTS";
+    const SALIENCE_VALUE: f64 = 1140.0;
+
+    fn no_support(block: &str) {
+        assert!(
+            supporting_quote(SALIENCE_SUBJECT, SALIENCE_OBJECT, Some(SALIENCE_VALUE), block)
+                .is_none(),
+            "block must NOT support Ti-6Al-4V / UTS / 1140 MPa: {block:?}"
+        );
+    }
+
+    fn support(block: &str) -> String {
+        supporting_quote(SALIENCE_SUBJECT, SALIENCE_OBJECT, Some(SALIENCE_VALUE), block)
+            .unwrap_or_else(|| panic!("block MUST support Ti-6Al-4V / UTS / 1140 MPa: {block:?}"))
+    }
+
+    /// A1: `[1140]` is a citation marker, not a measurement.
+    #[test]
+    fn a1_citation_marker_digits_are_not_evidence() {
+        no_support("Ti-6Al-4V is widely used in aerospace applications [1140].");
+    }
+
+    /// A2: 1140 is a batch id; the actual UTS in the sentence is 950.
+    #[test]
+    fn a2_batch_id_equal_to_the_claim_value_is_not_evidence() {
+        no_support("For Ti-6Al-4V, batch 1140 showed a UTS of 950 MPa.");
+    }
+
+    /// A3: 1140 belongs to the diameter, not the UTS.
+    #[test]
+    fn a3_number_bound_to_another_property_is_not_evidence() {
+        no_support("The Ti-6Al-4V rods (diameter 1140 um) exhibited a UTS of 950 MPa.");
+    }
+
+    /// A4: a table row is not one undifferentiated span; the number sits in
+    /// the elongation column, not the UTS column.
+    #[test]
+    fn a4_table_row_columns_do_not_cross_support() {
+        no_support("Ti-6Al-4V | annealed | UTS 950 MPa | elongation 1140");
+    }
+
+    /// A5: the subject Ti-6Al-4V appears nowhere in the block.
+    #[test]
+    fn a5_subject_absent_from_the_block_is_refused() {
+        no_support("The UTS of the forged billet was 1140 MPa.");
+    }
+
+    /// A6: `1140` must not match as a substring of `11140`.
+    #[test]
+    fn a6_digit_boundary_blocks_substring_match_inside_11140() {
+        no_support("The Ti-6Al-4V ingot id was 11140 and its UTS was 950 MPa.");
+    }
+
+    /// A7: `1,140` must not match inside `11,140`.
+    #[test]
+    fn a7_digit_boundary_blocks_substring_match_inside_11_140() {
+        no_support("In total, 11,140 Ti-6Al-4V components were inspected.");
+    }
+
+    // ── Legitimate cases that must STILL stamp ──────────────────────────
+
+    /// The property appears under its full name, not the `UTS` acronym:
+    /// the number must still bind to it.
+    #[test]
+    fn legit_full_property_name_stamps_via_acronym_binding() {
+        let quote = support("The ultimate tensile strength of Ti-6Al-4V was 1140 MPa.");
+        assert!(quote.contains("1140"));
+    }
+
+    /// Comma-grouped rendering of the same value.
+    #[test]
+    fn legit_comma_grouped_value_stamps() {
+        let quote = support("The Ti-6Al-4V billet showed a UTS of 1,140 MPa.");
+        assert!(quote.contains("1,140"));
+    }
+
+    /// Anaphora: the subject names the alloy in the previous sentence, and
+    /// the measurement sentence says "the alloy". The subject is required in
+    /// the BLOCK, not the same span — that is the chosen rule, and this is
+    /// the case it exists for.
+    #[test]
+    fn legit_anaphora_subject_in_block_not_in_span_stamps() {
+        let quote =
+            support("Ti-6Al-4V samples were prepared. The alloy showed a UTS of 1140 MPa.");
+        assert_eq!(quote, "The alloy showed a UTS of 1140 MPa.");
+    }
+
+    /// Non-numeric fact whose subject and object genuinely co-occur.
+    #[test]
+    fn legit_non_numeric_cooccurrence_stamps() {
+        let block = "The Ti-6Al-4V microstructure contained an alpha-beta phase.";
+        assert!(supporting_quote("Ti-6Al-4V", "alpha-beta", None, block).is_some());
+    }
 }
