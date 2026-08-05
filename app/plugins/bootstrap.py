@@ -132,6 +132,21 @@ def build_full_registry(
     except Exception:
         pass
 
+    # HuggingFace PULL tool — anonymous discovery/details/download of models
+    # and datasets. PRISM can already publish OUT to the Hub (`prism publish
+    # --target huggingface`); this is the missing IN direction. Anonymous public
+    # API only (never authenticates, never fetches gated repos). A thin Hub
+    # keyword passthrough is near-useless for materials (searching 'mace'
+    # returns Macedonian-language NLP models), so search blends a hand-curated
+    # materials index (app/tools/hf_index.py) with raw API results. See
+    # app/tools/hf.py.
+    try:
+        from app.tools.hf import create_hf_tools
+
+        create_hf_tools(registry)
+    except Exception:
+        logger.debug("hf tools not registered", exc_info=True)
+
     # Knowledge plane is SPINE and lives in Rust: `query_platform` (graph +
     # semantic search), `knowledge_entity`/`knowledge_paths`/`knowledge_corpora`
     # (graph/catalog reads) and `knowledge_ingest` (background extraction job)
