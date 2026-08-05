@@ -637,7 +637,7 @@ mod tests {
         // The row must state what is wrong, not instruct the reader to quit and
         // run something — the remedy belongs in the surface they are already in.
         // Guarded repo-wide by crates/server/tests/no_exit_to_cli.rs.
-        assert!(rows[0].result.contains("not authenticated"));
+        assert!(rows[0].result.contains("requires authentication"));
         assert!(!rows[0].result.contains("prism login"));
         assert!(rows[1].result.contains("unreachable"));
     }
