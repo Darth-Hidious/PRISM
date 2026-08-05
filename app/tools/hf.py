@@ -1,4 +1,3 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
 """HuggingFace PULL tool — anonymous discovery, details and download.
 
 PRISM can already publish *out* to the Hub (``prism publish --target

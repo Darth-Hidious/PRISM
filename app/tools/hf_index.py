@@ -1,4 +1,3 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
 """Curated HuggingFace materials index + licence classifier.
 
 WHY THIS EXISTS
