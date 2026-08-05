@@ -206,6 +206,35 @@ fn quote_in_block(quote: &str, block_text: &str) -> bool {
 /// previous version of this function, which required only that the number and
 /// (subject *or* object) co-occur anywhere in the span. Each rule above kills
 /// at least one of them; the tests name them A1–A7.
+/// Accepted surface spellings of the claim's declared QUDT unit.
+///
+/// Without this the rule cannot tell the property's own unit from any other
+/// short token, so `"Ti-6Al-4V was tested at 1140 K, its UTS was 950 MPa"`
+/// bound a *temperature* to a strength in MPa. Adjacency of tokens is not
+/// binding of quantities — the unit is what ties a number to its property.
+fn unit_symbols(unit: Option<&str>) -> Vec<String> {
+    let Some(raw) = unit else {
+        return Vec::new();
+    };
+    let tail = raw.rsplit(':').next().unwrap_or(raw).to_ascii_lowercase();
+    let mut out = vec![tail.clone()];
+    let alias: &[&str] = match tail.as_str() {
+        "megapa" => &["mpa"],
+        "gigapa" => &["gpa"],
+        "kilopa" => &["kpa"],
+        "pa" => &["pa"],
+        "percent" => &["pct", "%"],
+        "k" => &["k"],
+        "degc" | "deg-c" | "celsius" => &["c", "°c"],
+        "w-per-m-k" => &["w"],
+        "gm-per-cm3" => &["g"],
+        _ => &[],
+    };
+    out.extend(alias.iter().map(|s| (*s).to_string()));
+    out
+}
+
+/// Strict form: no declared unit, so no unit token may bridge the gap.
 #[must_use]
 pub fn supporting_quote(
     subject: &str,
@@ -213,8 +242,20 @@ pub fn supporting_quote(
     value: Option<f64>,
     block_text: &str,
 ) -> Option<String> {
+    supporting_quote_with_unit(subject, object, value, None, block_text)
+}
+
+#[must_use]
+pub fn supporting_quote_with_unit(
+    subject: &str,
+    object: &str,
+    value: Option<f64>,
+    unit: Option<&str>,
+    block_text: &str,
+) -> Option<String> {
     let subject_n = normalize_for_containment(subject);
     let object_n = normalize_for_containment(object);
+    let units = unit_symbols(unit);
 
     // A numeric fact whose subject is nowhere in the document cannot be
     // supported by it, however well the number matches.
@@ -235,7 +276,7 @@ pub fn supporting_quote(
                         find_at_digit_boundary(&masked, n).map(|pos| (pos, pos + n.len()))
                     })
                     .any(|(start, end)| {
-                        property_binds_number(&object_n, &subject_n, &masked, start, end)
+                        property_binds_number(&object_n, &subject_n, &units, &masked, start, end)
                     })
             }
             None => {
@@ -353,6 +394,7 @@ const BINDING_CONNECTIVES: &[&str] = &[
 fn property_binds_number(
     object_n: &str,
     subject_n: &str,
+    units: &[String],
     hay: &str,
     num_start: usize,
     num_end: usize,
@@ -381,9 +423,9 @@ fn property_binds_number(
                 return false;
             }
             if value_first {
-                gap_is_only_unit(gap)
+                gap_is_only_unit(gap, units)
             } else {
-                gap_is_only_connective(gap, subject_n)
+                gap_is_only_connective(gap, subject_n, units)
             }
         })
 }
@@ -459,16 +501,20 @@ fn property_mentions(object_n: &str, hay: &str) -> Vec<(usize, usize, bool)> {
 /// The value-first gap: only a unit may separate a number from the property it
 /// belongs to (`14`**%** `elongation`, `1140` **MPa** `UTS`). A connective verb
 /// there means a new clause began and the number belongs to something else.
-fn gap_is_only_unit(gap: &str) -> bool {
+fn gap_is_only_unit(gap: &str, units: &[String]) -> bool {
     if gap.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // A comma is a clause boundary: "lot 1140, UTS 950 MPa" names two things.
+    if gap.contains(',') {
         return false;
     }
     gap.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| !t.is_empty())
-        .all(|token| token.len() <= 4 && !BINDING_CONNECTIVES.contains(&token))
+        .all(|token| units.iter().any(|u| u == token))
 }
 
-fn gap_is_only_connective(gap: &str, subject_n: &str) -> bool {
+fn gap_is_only_connective(gap: &str, subject_n: &str, units: &[String]) -> bool {
     gap.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
         .filter(|t| !t.is_empty())
         .all(|token| {
@@ -484,8 +530,10 @@ fn gap_is_only_connective(gap: &str, subject_n: &str) -> bool {
             if token.chars().any(|c| c.is_ascii_digit()) {
                 return false;
             }
-            // Connectives, or unit-ish short tokens such as mpa, gpa, hv, nm.
-            BINDING_CONNECTIVES.contains(&token) || token.len() <= 4
+            // Connectives, or the claim's OWN unit. A blanket "any short
+            // token" admitted foreign quantities -- "with mass 1140 kg" and
+            // "load 1140 N" both bound to a UTS in MPa.
+            BINDING_CONNECTIVES.contains(&token) || units.iter().any(|u| u == token)
         })
 }
 
@@ -790,13 +838,18 @@ mod tests {
     const SALIENCE_SUBJECT: &str = "Ti-6Al-4V";
     const SALIENCE_OBJECT: &str = "UTS";
     const SALIENCE_VALUE: f64 = 1140.0;
+    /// The claim's declared unit. Without it these helpers ran in strict mode,
+    /// where every alphabetic token is refused -- so B9 would have "passed"
+    /// without exercising the unit rule at all.
+    const SALIENCE_UNIT: &str = "QUDT:MegaPA";
 
     fn no_support(block: &str) {
         assert!(
-            supporting_quote(
+            supporting_quote_with_unit(
                 SALIENCE_SUBJECT,
                 SALIENCE_OBJECT,
                 Some(SALIENCE_VALUE),
+                Some(SALIENCE_UNIT),
                 block
             )
             .is_none(),
@@ -805,10 +858,11 @@ mod tests {
     }
 
     fn support(block: &str) -> String {
-        supporting_quote(
+        supporting_quote_with_unit(
             SALIENCE_SUBJECT,
             SALIENCE_OBJECT,
             Some(SALIENCE_VALUE),
+            Some(SALIENCE_UNIT),
             block,
         )
         .unwrap_or_else(|| panic!("block MUST support Ti-6Al-4V / UTS / 1140 MPa: {block:?}"))
@@ -908,6 +962,28 @@ mod tests {
     /// Value, unit, then property — also common in tables and captions.
     #[test]
     fn legit_value_unit_property_order_stamps() {
+        support("Ti-6Al-4V: 1140 MPa UTS.");
+    }
+
+    /// B9: a value-first number bound to the property through ANY short
+    /// token, so a temperature, wavelength, lot id, mass or load became a
+    /// tensile strength in MPa. Adjacency of tokens is not binding of
+    /// quantities -- the declared unit is what ties a number to its property.
+    #[test]
+    fn b9_a_foreign_quantity_does_not_bind_through_its_own_unit() {
+        no_support("Ti-6Al-4V was tested at 1140 K, its UTS was 950 MPa.");
+        no_support("Ti-6Al-4V (1140 C, UTS 950 MPa, elongation 14%).");
+        no_support("Ti-6Al-4V probed at 1140 nm, UTS 950 MPa.");
+        no_support("Ti-6Al-4V lot 1140, UTS 950 MPa.");
+        no_support("Ti-6Al-4V: 1140 K UTS 950 MPa.");
+        // property-first side of the same root cause
+        no_support("Ti-6Al-4V had a UTS, with mass 1140 kg.");
+        no_support("Ti-6Al-4V: UTS and load 1140 N recorded.");
+    }
+
+    /// The claim's OWN unit must still bridge a value-first gap.
+    #[test]
+    fn legit_value_first_binds_through_the_claims_own_unit() {
         support("Ti-6Al-4V: 1140 MPa UTS.");
     }
 
