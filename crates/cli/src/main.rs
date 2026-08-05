@@ -43,8 +43,9 @@ use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 // machine" means.
 use crate::local_llm::is_loopback_url;
 use prism_workflows::{
-    WorkflowRunResult, WorkflowSpec, discover_workflows, execute_workflow, find_workflow,
-    load_workflow_from_str, parse_workflow_command_args,
+    WorkflowExecutionOptions, WorkflowRunResult, WorkflowSpec, discover_workflows,
+    execute_workflow_with_policy_and_options, find_workflow, load_workflow_from_str,
+    parse_workflow_command_args,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -4821,15 +4822,30 @@ async fn handle_workflow_command(
                     .ok_or_else(|| anyhow!("Workflow not found: {name}"))?,
             };
             let mut values = parse_set_pairs(&pairs)?;
+            let caller_supplied_llm_base_url = values.contains_key("llm_base_url");
             // Only execute-mode runs actually call tools (dry runs plan only).
-            // `or_insert`: an explicit `--set _node_token=…` wins over the
-            // minted one (consistent with the slash/agent paths).
-            if execute && let Some(token) = mint_workflow_node_token(paths).await {
-                values.entry("_node_token".to_string()).or_insert(token);
+            // The launcher-issued token replaces any caller-supplied reserved
+            // value; the workflow engine separately binds it to port 7327.
+            let node_token = if execute {
+                mint_workflow_node_token(paths).await
+            } else {
+                None
+            };
+            if let Some(token) = &node_token {
+                values.insert("_node_token".to_string(), token.clone());
             }
             // Point `llm_*` steps at the resolved chat endpoint.
             inject_workflow_llm_endpoint(&mut values, project_root, paths);
-            let result = execute_workflow(spec, &values, execute).await?;
+            let options = resolve_workflow_llm_options(
+                project_root,
+                paths,
+                caller_supplied_llm_base_url,
+                node_token,
+            );
+            let result = execute_workflow_with_policy_and_options(
+                spec, &values, execute, None, None, None, &options,
+            )
+            .await?;
             render_workflow_result(spec, &result);
         }
     }
@@ -4850,16 +4866,34 @@ async fn try_run_workflow_alias(
         return Ok(false);
     };
     let mut values = request.values;
+    let caller_supplied_llm_base_url = values.contains_key("llm_base_url");
     // Only execute-mode runs actually call tools (dry runs plan only).
-    // `or_insert`: an explicit `--set _node_token=…` wins over the minted one.
-    if request.execute
-        && let Some(token) = mint_workflow_node_token(paths).await
-    {
-        values.entry("_node_token".to_string()).or_insert(token);
+    let node_token = if request.execute {
+        mint_workflow_node_token(paths).await
+    } else {
+        None
+    };
+    if let Some(token) = &node_token {
+        values.insert("_node_token".to_string(), token.clone());
     }
     // Point `llm_*` steps at the resolved chat endpoint.
     inject_workflow_llm_endpoint(&mut values, project_root, paths);
-    let result = execute_workflow(spec, &values, request.execute).await?;
+    let options = resolve_workflow_llm_options(
+        project_root,
+        paths,
+        caller_supplied_llm_base_url,
+        node_token,
+    );
+    let result = execute_workflow_with_policy_and_options(
+        spec,
+        &values,
+        request.execute,
+        None,
+        None,
+        None,
+        &options,
+    )
+    .await?;
     render_workflow_result(spec, &result);
     Ok(true)
 }
@@ -5460,6 +5494,7 @@ fn build_llm_config(
 ) -> Result<prism_ingest::LlmConfig> {
     let node_config = prism_core::config::NodeConfig::load(Some(project_root));
     let llm = &node_config.llm;
+    let api_key_override = api_key_override.filter(|key| !key.trim().is_empty());
 
     // Also load ~/.prism/config.toml [chat] — the user-visible chat target
     // set by `prism use local/provider/marc27`. When set to Local or Provider,
@@ -5483,7 +5518,7 @@ fn build_llm_config(
             api_key_override
                 .map(str::to_string)
                 .or_else(|| local_key.clone())
-                .or_else(|| llm.resolve_api_key()),
+                .or_else(|| llm.resolve_api_key().filter(|key| !key.trim().is_empty())),
         ),
         crate::chat_config::ChatTarget::Provider {
             provider,
@@ -5503,8 +5538,12 @@ fn build_llm_config(
                     .unwrap_or_else(|| prov_model.clone()),
                 api_key_override
                     .map(str::to_string)
-                    .or_else(|| std::env::var(&env_name).ok())
-                    .or_else(|| llm.resolve_api_key()),
+                    .or_else(|| {
+                        std::env::var(&env_name)
+                            .ok()
+                            .filter(|key| !key.trim().is_empty())
+                    })
+                    .or_else(|| llm.resolve_api_key().filter(|key| !key.trim().is_empty())),
             )
         }
         // Marc27 cloud: use prism.toml [llm] as before.
@@ -5518,7 +5557,7 @@ fn build_llm_config(
             };
             let api_key = api_key_override
                 .map(str::to_string)
-                .or_else(|| llm.resolve_api_key());
+                .or_else(|| llm.resolve_api_key().filter(|key| !key.trim().is_empty()));
             (base_url, model, api_key)
         }
     };
@@ -5602,6 +5641,72 @@ fn resolve_workflow_llm_pair(project_root: &Path, paths: &PrismPaths) -> Option<
         std::env::var("LLM_MODEL").ok(),
         marc27_base_url,
     )
+}
+
+/// Resolve the trusted LLM endpoint and its paired credential for a CLI
+/// workflow launch. The endpoint is kept in `values` for workflow rendering,
+/// while the key travels only through `WorkflowExecutionOptions`.
+fn resolve_workflow_llm_options(
+    project_root: &Path,
+    paths: &PrismPaths,
+    caller_supplied_llm_base_url: bool,
+    node_token: Option<String>,
+) -> WorkflowExecutionOptions {
+    let resolved = resolve_workflow_llm_pair(project_root, paths);
+    let trusted_llm_api_key = resolved
+        .as_ref()
+        .and_then(|_| resolve_workflow_llm_api_key(project_root, paths));
+    WorkflowExecutionOptions {
+        trusted_llm_base_url: resolved.as_ref().map(|(base_url, _)| base_url.clone()),
+        trusted_llm_api_key,
+        caller_supplied_llm_base_url,
+        trusted_node_port: node_token.as_ref().map(|_| 7327),
+        trusted_node_token: node_token,
+    }
+}
+
+fn resolve_workflow_llm_api_key(project_root: &Path, paths: &PrismPaths) -> Option<String> {
+    let node_config = prism_core::config::NodeConfig::load(Some(project_root));
+    let chat_target = crate::chat_config::load().unwrap_or_default().chat;
+    let platform_token = paths
+        .load_cli_state()
+        .ok()
+        .and_then(|state| state.credentials)
+        .map(|credentials| credentials.access_token);
+    resolve_workflow_llm_api_key_for_target(&chat_target, &node_config.llm, platform_token)
+}
+
+fn resolve_workflow_llm_api_key_for_target(
+    chat_target: &crate::chat_config::ChatTarget,
+    cfg_llm: &prism_core::config::LlmSection,
+    platform_token: Option<String>,
+) -> Option<String> {
+    let non_empty = |key: Option<String>| key.filter(|value| !value.trim().is_empty());
+
+    match chat_target {
+        crate::chat_config::ChatTarget::Local { api_key, .. } => {
+            non_empty(api_key.clone()).or_else(|| non_empty(cfg_llm.resolve_api_key()))
+        }
+        crate::chat_config::ChatTarget::Provider {
+            provider,
+            api_key_env,
+            ..
+        } => {
+            let registry = crate::providers::Registry::load();
+            let env_name = api_key_env
+                .clone()
+                .unwrap_or_else(|| crate::providers::default_api_key_env(&registry, provider));
+            non_empty(std::env::var(env_name).ok()).or_else(|| non_empty(cfg_llm.resolve_api_key()))
+        }
+        crate::chat_config::ChatTarget::Marc27 { .. } => non_empty(
+            std::env::var("LLM_API_KEY")
+                .ok()
+                .or_else(|| std::env::var("MARC27_API_KEY").ok())
+                .or_else(|| std::env::var("MARC27_TOKEN").ok())
+                .or_else(|| cfg_llm.resolve_api_key())
+                .or(platform_token),
+        ),
+    }
 }
 
 /// Inject the resolved chat LLM endpoint into a workflow's `values`. A `--set`
@@ -9333,7 +9438,13 @@ async fn create_dashboard_session(
         rbac_engine.assign_role(user_id, prism_core::rbac::LocalRole::NodeAdmin)?;
     }
 
-    create_dashboard_session_for_user(dashboard_url, user_id, creds.display_name.as_deref()).await
+    create_dashboard_session_for_user_with_platform_token(
+        dashboard_url,
+        user_id,
+        creds.display_name.as_deref(),
+        Some(creds.access_token.as_str()),
+    )
+    .await
 }
 
 async fn create_dashboard_session_for_user(
@@ -9341,12 +9452,28 @@ async fn create_dashboard_session_for_user(
     user_id: &str,
     display_name: Option<&str>,
 ) -> Result<String> {
+    create_dashboard_session_for_user_with_platform_token(
+        dashboard_url,
+        user_id,
+        display_name,
+        None,
+    )
+    .await
+}
+
+async fn create_dashboard_session_for_user_with_platform_token(
+    dashboard_url: &str,
+    user_id: &str,
+    display_name: Option<&str>,
+    platform_token: Option<&str>,
+) -> Result<String> {
     let url = format!("{dashboard_url}/api/sessions");
     let resp = reqwest::Client::new()
         .post(&url)
         .json(&serde_json::json!({
             "user_id": user_id,
             "display_name": display_name,
+            "platform_token": platform_token,
         }))
         .send()
         .await
@@ -9875,8 +10002,17 @@ async fn mint_workflow_node_token(paths: &prism_runtime::PrismPaths) -> Option<S
     match create_dashboard_session("http://127.0.0.1:7327", paths).await {
         Ok(token) => Some(token),
         Err(e) => {
-            tracing::debug!(error = %e, "workflow: no local node session (running tokenless)");
-            None
+            // Standalone/offline nodes have no account to verify. Their
+            // anonymous local session is still useful for the local tool
+            // boundary; linked nodes continue to reject it as non-owner.
+            tracing::debug!(error = %e, "workflow: trying anonymous local node session");
+            prism_client::node_session::mint_local_session(
+                "http://127.0.0.1:7327",
+                "anonymous-local",
+                None,
+            )
+            .await
+            .ok()
         }
     }
 }
@@ -11871,6 +12007,21 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn cli_workflow_run_preserves_config_resolved_llm_key_for_auth_endpoint() {
+        let target = crate::chat_config::ChatTarget::Local {
+            url: "http://127.0.0.1:9000/v1".to_string(),
+            model: "auth-model".to_string(),
+            api_key: Some("config-resolved-key".to_string()),
+        };
+        let key = resolve_workflow_llm_api_key_for_target(
+            &target,
+            &prism_core::config::LlmSection::default(),
+            None,
+        );
+        assert_eq!(key.as_deref(), Some("config-resolved-key"));
     }
 
     #[test]

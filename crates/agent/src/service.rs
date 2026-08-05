@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use prism_ingest::LlmConfig;
 use prism_ingest::llm::{ChatMessage, LlmClient};
 use prism_python_bridge::{ToolServer, ToolServerHandle};
@@ -189,6 +189,10 @@ impl std::error::Error for ChatError {}
 
 struct ChatInner {
     tool_server: ToolServerHandle,
+    /// Separate worker for LocalOnly callers. It runs offline with all
+    /// inherited platform/provider credentials blanked, so allowing a local
+    /// Python tool does not also allow an owner credentialed platform call.
+    local_only_tool_server: ToolServerHandle,
     command_tool_runtime: CommandToolRuntime,
     config: Arc<AgentConfig>,
     hooks: Arc<HookRegistry>,
@@ -231,6 +235,10 @@ impl ChatService {
             hooks,
             permissions,
         } = build_agent_seed(&tool_server_config, &llm_config).await?;
+        let local_only_tool_server = local_only_tool_server_config(&tool_server_config)
+            .spawn()
+            .await
+            .context("failed to spawn LocalOnly Python tool server")?;
 
         // Same policy bootstrap as run_server: built-in + discovered
         // OPA/Rego policies; absence is a warning, not an error.
@@ -256,6 +264,7 @@ impl ChatService {
         Ok(Self {
             inner: tokio::sync::Mutex::new(ChatInner {
                 tool_server,
+                local_only_tool_server,
                 command_tool_runtime,
                 config,
                 hooks,
@@ -405,6 +414,7 @@ impl ChatService {
             let mut inner = self.inner.lock().await;
             let ChatInner {
                 tool_server,
+                local_only_tool_server,
                 command_tool_runtime,
                 policy,
                 ..
@@ -420,7 +430,12 @@ impl ChatService {
                 )
                 .await
             } else {
-                tool_server
+                let worker = match platform_access {
+                    CommandToolPlatformAccess::VerifiedNodeOwner => tool_server,
+                    CommandToolPlatformAccess::LocalOnly
+                    | CommandToolPlatformAccess::UnverifiedHttp => local_only_tool_server,
+                };
+                worker
                     .call_tool(name, args.clone())
                     .await
                     .map_err(Into::into)
@@ -777,6 +792,39 @@ fn approval_decision(approved: &BTreeSet<String>, tool_name: &str) -> ApprovalRe
         ApprovalResponse::Allow
     } else {
         ApprovalResponse::Deny
+    }
+}
+
+fn local_only_tool_server_config(config: &ToolServer) -> ToolServer {
+    let mut env = config.env.clone();
+    for key in [
+        "MARC27_API_KEY",
+        "MARC27_TOKEN",
+        "MARC27_API_TOKEN",
+        "PRISM_LOGIN_TOKEN",
+        "MARC27_API_URL",
+        "MARC27_PROJECT_ID",
+        "LLM_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+        "ZAI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GROQ_API_KEY",
+        "MP_API_KEY",
+        "LENS_API_TOKEN",
+        "FIRECRAWL_API_KEY",
+    ] {
+        env.insert(key.to_string(), String::new());
+    }
+    // Python platform clients check this before resolving credentials or
+    // making a network request. HOME remains intact for local data/tools.
+    env.insert("PRISM_OFFLINE".to_string(), "1".to_string());
+    ToolServer {
+        python_bin: config.python_bin.clone(),
+        project_root: config.project_root.clone(),
+        env,
     }
 }
 

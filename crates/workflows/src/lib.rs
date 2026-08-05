@@ -111,6 +111,13 @@ pub struct WorkflowExecutionOptions {
     /// Whether the caller supplied `llm_base_url` in the values map. This
     /// remains true even when it happens to equal the trusted endpoint.
     pub caller_supplied_llm_base_url: bool,
+    /// Loopback port paired with `trusted_node_token`. A workflow-supplied
+    /// `node_port` may select a destination, but the token is attached only
+    /// when that destination matches this launcher-supplied marker.
+    pub trusted_node_port: Option<u16>,
+    /// Session credential resolved by a trusted launcher for the local node.
+    /// It is deliberately kept out of the caller-controlled values map.
+    pub trusted_node_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -528,7 +535,7 @@ pub async fn execute_workflow_with_policy_and_options(
                 "set" => run_set_step(step, &mut context, !execute),
                 "message" => run_message_step(step, &mut context, !execute),
                 "http" => run_http_step(step, &mut context, !execute, &client).await,
-                "tool" => run_tool_step(step, &mut context, !execute, &client).await,
+                "tool" => run_tool_step(step, &mut context, !execute, &client, options).await,
                 "llm" => run_llm_step(step, &mut context, !execute, options).await,
                 "provenance" => run_provenance_step(step, &mut context, !execute).await,
                 "if" => {
@@ -539,6 +546,7 @@ pub async fn execute_workflow_with_policy_and_options(
                         &client,
                         policy.as_deref_mut(),
                         principal,
+                        options,
                     )
                     .await
                 }
@@ -554,7 +562,9 @@ pub async fn execute_workflow_with_policy_and_options(
                     )
                     .await
                 }
-                "parallel" => run_parallel_step(step, &mut context, !execute, &client).await,
+                "parallel" => {
+                    run_parallel_step(step, &mut context, !execute, &client, options).await
+                }
                 "workflow" => {
                     run_workflow_step(
                         step,
@@ -650,6 +660,15 @@ fn config_first<'a>(
     keys.iter().find_map(|k| config.get(*k))
 }
 
+fn render_http_value(
+    value: serde_json::Value,
+    context: &BTreeMap<String, serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let mut safe_context = context.clone();
+    safe_context.remove("_node_token");
+    render_value(value, &safe_context)
+}
+
 fn run_set_step(
     step: &WorkflowStep,
     context: &mut BTreeMap<String, serde_json::Value>,
@@ -716,21 +735,25 @@ async fn run_http_step(
         .and_then(|v| v.as_str())
         .unwrap_or("GET")
         .to_uppercase();
-    let url = render_value(
+    // Loopback credentials are never available to arbitrary HTTP steps. A
+    // workflow can call the local tool boundary through `action: tool`, but
+    // an HTTP step must not be able to render `_node_token` into a URL,
+    // header, or body and send it off-box.
+    let url = render_http_value(
         step.config
             .get("url")
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String(String::new())),
         context,
     )?;
-    let headers = render_value(
+    let headers = render_http_value(
         step.config
             .get("headers")
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
         context,
     )?;
-    let body = render_value(
+    let body = render_http_value(
         step.config
             .get("body")
             .cloned()
@@ -854,6 +877,7 @@ async fn run_tool_step(
     context: &mut BTreeMap<String, serde_json::Value>,
     dry_run: bool,
     client: &reqwest::Client,
+    options: &WorkflowExecutionOptions,
 ) -> Result<WorkflowStepResult> {
     // Aliases: `name` (canonical) | `tool`
     let tool_name = config_first(&step.config, &["name", "tool"])
@@ -915,9 +939,10 @@ async fn run_tool_step(
         .get("node_port")
         .and_then(|v| {
             v.as_u64()
+                .and_then(|port| u16::try_from(port).ok())
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
-        .unwrap_or(7327);
+        .unwrap_or(7327_u16);
 
     let url = format!("http://127.0.0.1:{port}/api/tools/{tool_name}/run");
     let body = serde_json::json!({
@@ -926,19 +951,19 @@ async fn run_tool_step(
         "approve": approve,
     });
 
-    // Authenticate to the local node. When the node is online it gates
-    // `/api/tools/{name}/run` behind a session token (+ ExecuteTools), so a
-    // tokenless call 401s. The caller (CLI `workflow run`, or the agent)
-    // injects a loopback-minted session token into the context under the
-    // reserved `_node_token` key; we forward it as a Bearer credential. The
-    // key is stripped from the returned context so it never leaks into
-    // rendered output or the agent's tool result. Absent token ⇒ no header
-    // (works in offline mode, and fails honestly with 401 when online).
+    // Authenticate to the local node. A token is attached only when the
+    // launcher supplied both the credential and the trusted destination
+    // marker. Caller-controlled `_node_token` values are never accepted as
+    // credentials, and a caller-controlled `node_port` gets no token.
     let mut req = client.post(&url).json(&body);
-    if let Some(token) = context
-        .get("_node_token")
-        .and_then(|v| v.as_str())
-        .filter(|t| !t.is_empty())
+    let destination_is_trusted = options
+        .trusted_node_port
+        .is_some_and(|trusted_port| trusted_port == port);
+    if destination_is_trusted
+        && let Some(token) = options
+            .trusted_node_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
     {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
@@ -1010,6 +1035,7 @@ async fn run_if_step(
     client: &reqwest::Client,
     _policy: Option<&mut prism_policy::PolicyEngine>,
     _principal: &str,
+    options: &WorkflowExecutionOptions,
 ) -> Result<WorkflowStepResult> {
     // Aliases: `condition` (canonical) | `cond` | `when` | `if`
     let condition_raw = render_value(
@@ -1041,7 +1067,7 @@ async fn run_if_step(
             "set" => run_set_step(sub_step, context, dry_run)?,
             "message" => run_message_step(sub_step, context, dry_run)?,
             "http" => run_http_step(sub_step, context, dry_run, client).await?,
-            "tool" => run_tool_step(sub_step, context, dry_run, client).await?,
+            "tool" => run_tool_step(sub_step, context, dry_run, client, options).await?,
             other => bail!("unsupported step action in if branch: {other}"),
         };
         sub_results.push(sub_result);
@@ -1250,15 +1276,14 @@ async fn run_llm_step(
     let api_key = if !trusted_destination {
         None
     } else if trusted_config_selected {
-        options.trusted_llm_api_key.clone().or_else(|| {
-            env::var("LLM_API_KEY")
-                .or_else(|_| env::var("MARC27_TOKEN"))
-                .ok()
-        })
+        // The launcher must resolve the endpoint and credential as a pair.
+        // In particular, never reattach MARC27_TOKEN merely because a
+        // trusted endpoint was supplied without its paired key.
+        options.trusted_llm_api_key.clone()
     } else {
-        env::var("LLM_API_KEY")
-            .or_else(|_| env::var("MARC27_TOKEN"))
-            .ok()
+        // Process-level LLM_BASE_URL and LLM_API_KEY are the only implicit
+        // pair. Platform credentials are never an LLM env fallback.
+        env::var("LLM_API_KEY").ok().filter(|key| !key.is_empty())
     };
     // Model resolves with the same precedence as base_url: step config →
     // context (`llm_model`, injected by the agent/CLI from the resolved chat
@@ -1572,7 +1597,7 @@ async fn run_loop_step(
                 "set" => run_set_step(body_step, context, dry_run),
                 "message" => run_message_step(body_step, context, dry_run),
                 "http" => run_http_step(body_step, context, dry_run, client).await,
-                "tool" => run_tool_step(body_step, context, dry_run, client).await,
+                "tool" => run_tool_step(body_step, context, dry_run, client, options).await,
                 "llm" => run_llm_step(body_step, context, dry_run, options).await,
                 "if" => {
                     run_if_step(
@@ -1582,6 +1607,7 @@ async fn run_loop_step(
                         client,
                         policy.as_deref_mut(),
                         principal,
+                        options,
                     )
                     .await
                 }
@@ -1665,6 +1691,7 @@ async fn run_parallel_step(
     context: &mut BTreeMap<String, serde_json::Value>,
     dry_run: bool,
     client: &reqwest::Client,
+    options: &WorkflowExecutionOptions,
 ) -> Result<WorkflowStepResult> {
     // Aliases: `steps` (canonical) | `tasks` | `branches`
     let sub_steps: Vec<WorkflowStep> = config_first(&step.config, &["steps", "tasks", "branches"])
@@ -1695,12 +1722,15 @@ async fn run_parallel_step(
         let sub_step = sub_step.clone();
         let mut sub_context = context.clone();
         let client = client.clone();
+        let options = options.clone();
         handles.push(tokio::spawn(async move {
             let result = match sub_step.action.as_str() {
                 "set" => run_set_step(&sub_step, &mut sub_context, false),
                 "message" => run_message_step(&sub_step, &mut sub_context, false),
                 "http" => run_http_step(&sub_step, &mut sub_context, false, &client).await,
-                "tool" => run_tool_step(&sub_step, &mut sub_context, false, &client).await,
+                "tool" => {
+                    run_tool_step(&sub_step, &mut sub_context, false, &client, &options).await
+                }
                 other => Err(anyhow!("unsupported step action in parallel: {other}")),
             };
             (sub_step.id.clone(), result, sub_context)
@@ -3481,6 +3511,23 @@ steps:
             !result.context.contains_key("_node_token"),
             "injected _node_token leaked into returned context: {:?}",
             result.context.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn http_step_cannot_render_node_token_into_outbound_headers() {
+        let mut context = BTreeMap::new();
+        context.insert(
+            "_node_token".to_string(),
+            serde_json::Value::String("node-secret".to_string()),
+        );
+        let result = render_http_value(
+            serde_json::json!({"Authorization": "Bearer {{ _node_token }}"}),
+            &context,
+        );
+        assert!(
+            result.is_err(),
+            "HTTP rendering must reject the reserved node token rather than forward it"
         );
     }
 

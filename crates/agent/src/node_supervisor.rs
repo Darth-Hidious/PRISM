@@ -74,7 +74,11 @@ fn lock() -> std::sync::MutexGuard<'static, Option<SupervisedNode>> {
 /// registration is confirmed, dashboard URL, log path). The report never
 /// overclaims: if registration failed or wasn't confirmed inside the startup
 /// window, it says so.
-pub async fn node_up(runtime: &CommandToolRuntime, extra_args: &[String]) -> Result<String> {
+pub async fn node_up(
+    runtime: &CommandToolRuntime,
+    extra_args: &[String],
+    platform_access: crate::command_tools::CommandToolPlatformAccess,
+) -> Result<String> {
     if extra_args.iter().any(|arg| arg == "--background") {
         bail!(
             "--background is not needed here: the node already runs as a supervised \
@@ -123,6 +127,12 @@ pub async fn node_up(runtime: &CommandToolRuntime, extra_args: &[String]) -> Res
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file.try_clone()?))
         .stderr(Stdio::from(log_file));
+    if matches!(
+        platform_access,
+        crate::command_tools::CommandToolPlatformAccess::LocalOnly
+    ) {
+        crate::command_tools::strip_platform_credentials(&mut cmd);
+    }
     // No kill_on_drop: the node must outlive the chat session (see module
     // docs); the pid file keeps it stoppable from any later session.
     let mut child = cmd.spawn().context("failed to spawn the node daemon")?;

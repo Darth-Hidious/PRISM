@@ -18,7 +18,7 @@ use std::sync::Arc;
 use prism_core::rbac::LocalRole;
 
 use crate::NodeState;
-use crate::handlers::deployments::authorized_platform_client;
+use crate::handlers::deployments::command_tool_platform_access;
 use crate::middleware::{AuthenticatedUser, UserRole};
 
 /// Map an authenticated RBAC role to the policy engine's role vocabulary
@@ -99,19 +99,29 @@ pub async fn run_workflow(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
 
-    // A linked node may execute workflows only for its verified owner. This
-    // check is intentionally separate from local RBAC: anonymous-local keeps
-    // standalone node capabilities, but it is never the platform owner.
-    if state.platform_client.is_some() {
-        let Some(Extension(user)) = user_ext.as_ref() else {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(
-                    json!({ "error": "workflow execution requires a verified node-owner session" }),
-                ),
-            ));
+    // Resolve the same execution boundary used by chat and one-shot tool
+    // calls. Anonymous callers on linked nodes are refused for real workflow
+    // execution; authenticated non-owners remain LocalOnly and may execute
+    // workflows that do not require platform authority.
+    let platform_access = match user_ext.as_ref() {
+        Some(Extension(user)) => command_tool_platform_access(&state, user).await,
+        None => prism_agent::command_tools::CommandToolPlatformAccess::UnverifiedHttp,
+    };
+    if req.execute
+        && matches!(
+            platform_access,
+            prism_agent::command_tools::CommandToolPlatformAccess::UnverifiedHttp
+        )
+    {
+        let message = if user_ext
+            .as_ref()
+            .is_some_and(|Extension(user)| user.is_anonymous_local())
+        {
+            "Platform access denied: this is an anonymous-local caller; workflow execution requires a verified node-owner session."
+        } else {
+            "workflow execution requires a verified node-owner session"
         };
-        authorized_platform_client(&state, user).await?;
+        return Err((StatusCode::FORBIDDEN, Json(json!({ "error": message }))));
     }
 
     let caller_supplied_llm_base_url = req.values.contains_key("llm_base_url");
@@ -149,11 +159,32 @@ pub async fn run_workflow(
     //   * `llm_base_url` / `llm_model` — the node's resolved LLM endpoint so
     //     `llm_*` steps reach the real model, not the engine's localhost
     //     default.
-    let node_token = match (req.execute, authed_user.as_deref()) {
-        (true, Some(user_id)) => {
-            prism_client::node_session::mint_local_session("http://127.0.0.1:7327", user_id, None)
-                .await
-                .ok()
+    let node_token = match (req.execute, authed_user.as_deref(), platform_access) {
+        (
+            true,
+            Some(user_id),
+            prism_agent::command_tools::CommandToolPlatformAccess::VerifiedNodeOwner
+            | prism_agent::command_tools::CommandToolPlatformAccess::LocalOnly,
+        ) => {
+            let platform_token = matches!(
+                platform_access,
+                prism_agent::command_tools::CommandToolPlatformAccess::VerifiedNodeOwner
+            )
+            .then(|| {
+                state
+                    .platform_client
+                    .as_ref()
+                    .and_then(|client| client.access_token())
+            })
+            .flatten();
+            prism_client::node_session::mint_local_session_with_platform_token(
+                "http://127.0.0.1:7327",
+                user_id,
+                None,
+                platform_token,
+            )
+            .await
+            .ok()
         }
         _ => None,
     };
@@ -161,14 +192,21 @@ pub async fn run_workflow(
     let values = prism_agent::protocol::assemble_workflow_run_values(
         req.values,
         req.execute,
-        node_token,
+        node_token.clone(),
         &llm_config,
     );
     let options = prism_workflows::WorkflowExecutionOptions {
         trusted_llm_base_url: (!llm_config.base_url.is_empty())
             .then_some(llm_config.base_url.clone()),
-        trusted_llm_api_key: llm_config.api_key.clone(),
+        trusted_llm_api_key: matches!(
+            platform_access,
+            prism_agent::command_tools::CommandToolPlatformAccess::VerifiedNodeOwner
+        )
+        .then(|| llm_config.api_key.clone())
+        .flatten(),
         caller_supplied_llm_base_url,
+        trusted_node_port: node_token.as_ref().map(|_| 7327),
+        trusted_node_token: node_token,
     };
 
     let result = prism_workflows::execute_workflow_with_policy_and_options(

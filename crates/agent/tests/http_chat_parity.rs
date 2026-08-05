@@ -490,6 +490,52 @@ async fn anonymous_caller_can_resume_own_session_but_not_anothers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn authenticated_non_owner_can_run_a_local_python_tool_and_chat() {
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let base_url = start_stub_llm(StubMode::GatedTool).await;
+    let sessions = tempfile::tempdir().expect("sessions dir");
+    let calls_log = project.path().join("calls.log");
+    let service = ChatService::spawn(
+        llm_config(base_url),
+        tool_server_config(project.path(), &python),
+        Some(sessions.path().to_path_buf()),
+    )
+    .await
+    .expect("spawn chat service");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = service
+        .chat_with_platform_access(
+            ChatRequest {
+                message: "use the local tool and answer".into(),
+                session_id: None,
+                approve: vec!["stub_gated".into()],
+            },
+            "authenticated-non-owner",
+            prism_agent::command_tools::CommandToolPlatformAccess::LocalOnly,
+            tx,
+        )
+        .await
+        .expect("LocalOnly must not refuse an authenticated non-owner chat");
+
+    assert_eq!(outcome.answer, "GATED_DONE");
+    assert!(
+        drain(&mut rx).iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolResult { tool_name, is_error: false, .. }
+                if tool_name == "stub_gated"
+        )),
+        "the local Python tool must run under LocalOnly"
+    );
+    assert!(calls_log.exists(), "the local Python tool must be called");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn gated_tool_is_skipped_then_runs_when_approved() {
     let Some(python) = find_python() else {
         eprintln!("SKIP: python3 not on PATH");

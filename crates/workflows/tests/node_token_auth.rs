@@ -140,9 +140,18 @@ async fn tool_step_succeeds_with_node_token() {
     values.insert("node_port".to_string(), node_port.to_string());
     values.insert("_node_token".to_string(), EXPECTED_BEARER.to_string());
 
-    let result = prism_workflows::execute_workflow(&spec, &values, true)
-        .await
-        .expect("tool step must succeed with a valid node token");
+    let options = prism_workflows::WorkflowExecutionOptions {
+        trusted_llm_base_url: None,
+        trusted_llm_api_key: None,
+        caller_supplied_llm_base_url: false,
+        trusted_node_port: Some(node_port),
+        trusted_node_token: Some(EXPECTED_BEARER.to_string()),
+    };
+    let result = prism_workflows::execute_workflow_with_policy_and_options(
+        &spec, &values, true, None, None, None, &options,
+    )
+    .await
+    .expect("tool step must succeed with a valid node token");
 
     assert_eq!(result.steps.len(), 1);
     assert_eq!(result.steps[0].status, "completed");
@@ -155,5 +164,36 @@ async fn tool_step_succeeds_with_node_token() {
     assert!(
         !result.context.contains_key("_node_token"),
         "the injected _node_token must not leak into the returned context"
+    );
+}
+
+/// A workflow caller may choose `node_port`, but that must not redirect a
+/// launcher-issued node credential to the chosen port.
+#[tokio::test(flavor = "multi_thread")]
+async fn caller_selected_node_port_never_receives_node_token() {
+    let seen = Seen::default();
+    let caller_port = spawn_gated_node(seen.clone()).await;
+    let spec = single_tool_workflow();
+    let mut values = BTreeMap::new();
+    values.insert("node_port".to_string(), caller_port.to_string());
+    values.insert("_node_token".to_string(), "caller-forged-token".to_string());
+    let options = prism_workflows::WorkflowExecutionOptions {
+        trusted_llm_base_url: None,
+        trusted_llm_api_key: None,
+        caller_supplied_llm_base_url: false,
+        trusted_node_port: Some(7327),
+        trusted_node_token: Some(EXPECTED_BEARER.to_string()),
+    };
+
+    let error = prism_workflows::execute_workflow_with_policy_and_options(
+        &spec, &values, true, None, None, None, &options,
+    )
+    .await
+    .expect_err("caller-selected node port must not authenticate");
+    assert!(format!("{error:#}").contains("401"));
+    assert_eq!(
+        seen.auth_headers.lock().unwrap().as_slice(),
+        &[None],
+        "caller-selected node port must receive no node token"
     );
 }

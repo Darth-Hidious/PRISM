@@ -123,6 +123,8 @@ async fn caller_supplied_llm_endpoint_never_receives_node_credential() {
         trusted_llm_base_url: Some(format!("http://127.0.0.1:{llm_port}/v1")),
         trusted_llm_api_key: Some("node-secret-token".to_string()),
         caller_supplied_llm_base_url: true,
+        trusted_node_port: None,
+        trusted_node_token: None,
     };
     let result = prism_workflows::execute_workflow_with_policy_and_options(
         &spec, &values, true, None, None, None, &options,
@@ -138,6 +140,37 @@ async fn caller_supplied_llm_endpoint_never_receives_node_credential() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn trusted_endpoint_without_launcher_key_never_uses_marc27_token() {
+    let seen = Seen::default();
+    let llm_port = spawn_llm(seen.clone()).await;
+    let spec = single_llm_workflow();
+    let options = prism_workflows::WorkflowExecutionOptions {
+        trusted_llm_base_url: Some(format!("http://127.0.0.1:{llm_port}/v1")),
+        trusted_llm_api_key: None,
+        caller_supplied_llm_base_url: false,
+        trusted_node_port: None,
+        trusted_node_token: None,
+    };
+
+    prism_workflows::execute_workflow_with_policy_and_options(
+        &spec,
+        &BTreeMap::new(),
+        true,
+        None,
+        None,
+        None,
+        &options,
+    )
+    .await
+    .expect("trusted endpoint without a launcher key remains callable");
+    assert_eq!(
+        seen.auth_headers.lock().unwrap().as_slice(),
+        &[None],
+        "MARC27_TOKEN must not be attached without a paired launcher key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn trusted_llm_endpoint_keeps_its_paired_credential() {
     let seen = Seen::default();
     let llm_port = spawn_llm(seen.clone()).await;
@@ -146,6 +179,8 @@ async fn trusted_llm_endpoint_keeps_its_paired_credential() {
         trusted_llm_base_url: Some(format!("http://127.0.0.1:{llm_port}/v1")),
         trusted_llm_api_key: Some("trusted-node-key".to_string()),
         caller_supplied_llm_base_url: false,
+        trusted_node_port: None,
+        trusted_node_token: None,
     };
 
     prism_workflows::execute_workflow_with_policy_and_options(

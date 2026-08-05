@@ -93,7 +93,16 @@ pub(crate) async fn command_tool_platform_access(
     }
     if authorized_platform_client(state, caller).await.is_ok() {
         CommandToolPlatformAccess::VerifiedNodeOwner
+    } else if caller.is_authenticated() {
+        // A verified account that is not this node's owner can still use
+        // LocalOnly capabilities. The boundary strips node/platform
+        // credentials; it must not turn lack of owner authority into a total
+        // loss of local work.
+        CommandToolPlatformAccess::LocalOnly
     } else {
+        // Anonymous-local on a linked node has not proved any account
+        // identity. Keep the fail-closed state distinct from LocalOnly so it
+        // cannot reach a command or workflow that may expose owner authority.
         CommandToolPlatformAccess::UnverifiedHttp
     }
 }
@@ -201,5 +210,19 @@ mod tests {
             }
             Ok(_) => panic!("non-owner caller reached the deployment path"),
         }
+    }
+
+    #[tokio::test]
+    async fn authenticated_non_owner_gets_local_only_execution_access() {
+        let mut node = NodeState::new("test-node".into());
+        node.platform_client = Some(prism_client::PlatformClient::new("http://127.0.0.1:1"));
+        node.platform_owner_id.set("owner-123".into()).unwrap();
+        let caller =
+            AuthenticatedUser::from_session_user_id(format!("{VERIFIED_SESSION_PREFIX}other-user"));
+
+        assert_eq!(
+            command_tool_platform_access(&node, &caller).await,
+            CommandToolPlatformAccess::LocalOnly
+        );
     }
 }

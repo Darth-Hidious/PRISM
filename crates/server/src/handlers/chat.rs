@@ -76,9 +76,22 @@ fn chat_service(state: &NodeState) -> Option<Arc<ChatService>> {
     state.chat.get().cloned()
 }
 
-fn chat_owner(user: &AuthenticatedUser, token: &SessionToken) -> String {
+fn chat_owner(user: &AuthenticatedUser, token: &SessionToken, persistent_sessions: bool) -> String {
     if user.is_anonymous_local() {
-        anonymous_caller_id(&token.0)
+        if persistent_sessions {
+            // The session database validated this bearer token, so it is a
+            // real transport capability and can safely scope anonymous chat.
+            anonymous_caller_id(&token.0)
+        } else {
+            // Offline auth accepts any non-empty bearer string. It therefore
+            // cannot establish caller identity. Use a fresh, non-resumable
+            // owner key instead of persisting a caller-chosen bearer token.
+            format!(
+                "{}:offline:{}",
+                prism_agent::service::ANONYMOUS_LOCAL_USER_ID,
+                uuid::Uuid::new_v4()
+            )
+        }
     } else {
         user.user_id.clone()
     }
@@ -114,7 +127,7 @@ pub async fn chat(
     if params.stream {
         // The service always terminates the stream with a `done` or
         // `error` event, so clients never hang on failures.
-        let owner = chat_owner(&user, &token);
+        let owner = chat_owner(&user, &token, state.session_db_path.is_some());
         tokio::spawn(async move {
             let _ = service
                 .chat_with_platform_access(request, &owner, platform_access, tx)
@@ -138,7 +151,7 @@ pub async fn chat(
     } else {
         // Non-streaming: drain events into the void, return the outcome.
         drop(rx);
-        let owner = chat_owner(&user, &token);
+        let owner = chat_owner(&user, &token, state.session_db_path.is_some());
         match service
             .chat_with_platform_access(request, &owner, platform_access, tx)
             .await
@@ -172,7 +185,7 @@ pub async fn list_sessions(
     let Some(service) = chat_service(&state) else {
         return service_unavailable();
     };
-    let owner = chat_owner(&user, &token);
+    let owner = chat_owner(&user, &token, state.session_db_path.is_some());
     Json(serde_json::json!({ "sessions": service.list_sessions(&owner) })).into_response()
 }
 
@@ -186,7 +199,7 @@ pub async fn get_session(
     let Some(service) = chat_service(&state) else {
         return service_unavailable();
     };
-    let owner = chat_owner(&user, &token);
+    let owner = chat_owner(&user, &token, state.session_db_path.is_some());
     match service.read_session(&id, &owner) {
         Ok(messages) => Json(serde_json::json!({
             "session_id": id,
@@ -198,5 +211,24 @@ pub async fn get_session(
             "session_not_found",
             format!("no such chat session: {id}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{anonymous_caller_id, chat_owner};
+    use crate::middleware::{AuthenticatedUser, SessionToken};
+
+    #[test]
+    fn offline_chat_owner_is_not_derived_from_a_caller_chosen_bearer() {
+        let user = AuthenticatedUser::anonymous_local();
+        let owner_a = chat_owner(&user, &SessionToken("caller-a".into()), false);
+        let owner_b = chat_owner(&user, &SessionToken("caller-b".into()), false);
+
+        assert_ne!(owner_a, owner_b);
+        assert!(!owner_a.contains("caller-a"));
+        assert!(!owner_b.contains("caller-b"));
+        assert_ne!(owner_a, anonymous_caller_id("caller-a"));
+        assert_ne!(owner_b, anonymous_caller_id("caller-b"));
     }
 }

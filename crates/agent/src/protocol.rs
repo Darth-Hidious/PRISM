@@ -3852,7 +3852,13 @@ async fn handle_node_slash_command(
                 // Node lifecycle only — never launches a workflow.
                 ..Default::default()
             };
-            let report = match crate::node_supervisor::node_up(&runtime, &args[2..]).await {
+            let report = match crate::node_supervisor::node_up(
+                &runtime,
+                &args[2..],
+                command_tools::CommandToolPlatformAccess::LocalOnly,
+            )
+            .await
+            {
                 Ok(report) => report,
                 Err(error) => format!("Node start failed: {error:#}"),
             };
@@ -4628,7 +4634,9 @@ pub fn assemble_workflow_run_values(
     llm_config: &LlmConfig,
 ) -> BTreeMap<String, String> {
     if execute && let Some(token) = node_token {
-        values.entry("_node_token".to_string()).or_insert(token);
+        // The launcher-issued token is trusted metadata, not a caller value;
+        // never let `--set _node_token=...` replace it.
+        values.insert("_node_token".to_string(), token);
     }
     if !llm_config.base_url.is_empty() {
         values
@@ -4734,11 +4742,14 @@ async fn handle_workflow_slash_command(
             } else {
                 None
             };
-            let values = assemble_workflow_run_values(values, execute, node_token, llm_config);
+            let values =
+                assemble_workflow_run_values(values, execute, node_token.clone(), llm_config);
             let options = WorkflowExecutionOptions {
                 trusted_llm_base_url: Some(llm_config.base_url.clone()).filter(|s| !s.is_empty()),
                 trusted_llm_api_key: llm_config.api_key.clone(),
                 caller_supplied_llm_base_url,
+                trusted_node_port: node_token.as_ref().map(|_| 7327),
+                trusted_node_token: node_token,
             };
 
             let result = prism_workflows::execute_workflow_with_policy_and_options(
@@ -4771,13 +4782,15 @@ async fn handle_workflow_slash_command(
             let values = assemble_workflow_run_values(
                 request.values,
                 request.execute,
-                node_token,
+                node_token.clone(),
                 llm_config,
             );
             let options = WorkflowExecutionOptions {
                 trusted_llm_base_url: Some(llm_config.base_url.clone()).filter(|s| !s.is_empty()),
                 trusted_llm_api_key: llm_config.api_key.clone(),
                 caller_supplied_llm_base_url,
+                trusted_node_port: node_token.as_ref().map(|_| 7327),
+                trusted_node_token: node_token,
             };
             let result = prism_workflows::execute_workflow_with_policy_and_options(
                 spec,
@@ -8175,13 +8188,13 @@ mod tests {
     }
 
     #[test]
-    fn assemble_values_does_not_clobber_user_node_token() {
-        // A caller-supplied `_node_token` via `--set` wins over the minted one.
+    fn assemble_values_does_not_allow_a_caller_to_replace_node_token() {
+        // A caller-supplied `_node_token` via `--set` is not a trusted source.
         let mut values = BTreeMap::new();
         values.insert("_node_token".to_string(), "user-set".to_string());
         let out =
             assemble_workflow_run_values(values, true, Some("minted".to_string()), &resolved_llm());
-        assert_eq!(out.get("_node_token").map(String::as_str), Some("user-set"));
+        assert_eq!(out.get("_node_token").map(String::as_str), Some("minted"));
     }
 
     #[test]

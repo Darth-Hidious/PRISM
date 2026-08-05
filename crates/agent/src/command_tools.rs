@@ -3899,7 +3899,7 @@ fn platform_access_refusal() -> anyhow::Error {
     anyhow::anyhow!(PLATFORM_ACCESS_REFUSAL)
 }
 
-fn strip_platform_credentials(cmd: &mut TokioCommand) {
+pub(crate) fn strip_platform_credentials(cmd: &mut TokioCommand) {
     // LocalOnly is a credential boundary, not a filesystem boundary. Keep the
     // real HOME so local-only commands can read the user's provenance graph
     // and write campaign checkpoints where the rest of PRISM expects them.
@@ -3912,6 +3912,17 @@ fn strip_platform_credentials(cmd: &mut TokioCommand) {
         "PRISM_LOGIN_TOKEN",
         "MARC27_API_URL",
         "MARC27_PROJECT_ID",
+        // LLM/provider credentials are node-held credentials too. A
+        // LocalOnly child may receive a caller-selected endpoint, so none of
+        // these process credentials may cross that boundary.
+        "LLM_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+        "ZAI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GROQ_API_KEY",
     ] {
         cmd.env(key, "");
     }
@@ -4014,10 +4025,16 @@ async fn execute_cli_command(
 pub(crate) async fn mint_agent_node_token() -> Option<String> {
     let paths = prism_runtime::PrismPaths::discover().ok()?;
     let state = paths.load_cli_state().ok()?;
-    let user_id = state.credentials.as_ref()?.user_id.clone()?;
-    prism_client::node_session::mint_local_session("http://127.0.0.1:7327", &user_id, None)
-        .await
-        .ok()
+    let credentials = state.credentials.as_ref()?;
+    let user_id = credentials.user_id.as_deref()?;
+    prism_client::node_session::mint_local_session_with_platform_token(
+        "http://127.0.0.1:7327",
+        user_id,
+        None,
+        Some(credentials.access_token.as_str()),
+    )
+    .await
+    .ok()
 }
 
 async fn execute_workflow_command(
@@ -4025,6 +4042,7 @@ async fn execute_workflow_command(
     execution: &CommandExecution,
     invocation: &str,
     policy: Option<&mut prism_policy::PolicyEngine>,
+    platform_access: CommandToolPlatformAccess,
 ) -> Result<Value> {
     let result = match execution {
         CommandExecution::WorkflowList => {
@@ -4084,19 +4102,34 @@ async fn execute_workflow_command(
             values,
             execute,
         } => {
+            if *execute && matches!(platform_access, CommandToolPlatformAccess::UnverifiedHttp) {
+                // A linked node's anonymous caller cannot use workflow_run as
+                // a command-tool bypass for the route-level owner check.
+                return Err(platform_access_refusal());
+            }
             let specs = discover_workflows(Some(&runtime.project_root))?;
             // Authenticate the workflow's `tool` steps to the local node.
             // Execute mode only — dry runs plan without calling tools.
             let mut values = values.clone();
             let caller_supplied_llm_base_url = values.contains_key("llm_base_url");
-            // `or_insert`: an explicit workflow `_node_token` value wins over
-            // the minted one (consistent with the slash/CLI paths).
-            if *execute && let Some(token) = mint_agent_node_token().await {
-                values.entry("_node_token".to_string()).or_insert(token);
+            // Only a launcher-issued session may authorize local tool steps;
+            // caller-supplied `_node_token` values are never trusted.
+            let node_token = if *execute
+                && matches!(
+                    platform_access,
+                    CommandToolPlatformAccess::VerifiedNodeOwner
+                ) {
+                mint_agent_node_token().await
+            } else {
+                None
+            };
+            if let Some(token) = &node_token {
+                values.insert("_node_token".to_string(), token.clone());
             }
             // Point `llm_*` steps at the resolved chat endpoint (the SAME
-            // config the agent's chat path uses). `or_insert` lets an explicit
-            // workflow value win. Both modes: dry runs render the endpoint too.
+            // config the agent's chat path uses). An explicit workflow value
+            // remains caller-controlled and therefore cannot receive the
+            // trusted credential. Both modes render the endpoint.
             if let Some(base_url) = &runtime.llm_base_url {
                 values
                     .entry("llm_base_url".to_string())
@@ -4109,8 +4142,15 @@ async fn execute_workflow_command(
             }
             let options = WorkflowExecutionOptions {
                 trusted_llm_base_url: runtime.llm_base_url.clone(),
-                trusted_llm_api_key: runtime.llm_api_key.clone(),
+                trusted_llm_api_key: matches!(
+                    platform_access,
+                    CommandToolPlatformAccess::VerifiedNodeOwner
+                )
+                .then(|| runtime.llm_api_key.clone())
+                .flatten(),
                 caller_supplied_llm_base_url,
+                trusted_node_port: node_token.as_ref().map(|_| 7327),
+                trusted_node_token: node_token,
             };
             match find_workflow(&specs, name) {
                 Some(spec) => match prism_workflows::execute_workflow_with_policy_and_options(
@@ -4308,13 +4348,10 @@ pub async fn execute_command_tool_with_platform_access(
         CommandExecution::Cli { root, args }
             if *root == "node" && is_node_lifecycle_subcommand(args) =>
         {
-            if !matches!(
-                platform_access,
-                CommandToolPlatformAccess::VerifiedNodeOwner
-            ) {
+            if !node_lifecycle_allowed(platform_access) {
                 Err(platform_access_refusal())
             } else {
-                execute_node_lifecycle(runtime, args, &invocation).await
+                execute_node_lifecycle(runtime, args, &invocation, platform_access).await
             }
         }
         CommandExecution::Cli { root, args } => {
@@ -4323,7 +4360,8 @@ pub async fn execute_command_tool_with_platform_access(
         CommandExecution::WorkflowList
         | CommandExecution::WorkflowShow { .. }
         | CommandExecution::WorkflowRun { .. } => {
-            execute_workflow_command(runtime, &execution, &invocation, policy).await
+            execute_workflow_command(runtime, &execution, &invocation, policy, platform_access)
+                .await
         }
         CommandExecution::NotebookExec {
             code,
@@ -4572,13 +4610,18 @@ fn is_node_lifecycle_subcommand(args: &[String]) -> bool {
     )
 }
 
+fn node_lifecycle_allowed(platform_access: CommandToolPlatformAccess) -> bool {
+    !matches!(platform_access, CommandToolPlatformAccess::UnverifiedHttp)
+}
+
 async fn execute_node_lifecycle(
     runtime: &CommandToolRuntime,
     args: &[String],
     invocation: &str,
+    platform_access: CommandToolPlatformAccess,
 ) -> Result<Value> {
     let result = match args[0].as_str() {
-        "up" => crate::node_supervisor::node_up(runtime, &args[1..]).await,
+        "up" => crate::node_supervisor::node_up(runtime, &args[1..], platform_access).await,
         // "down" (the CLI verb) and "stop" (the palette verb) are synonyms.
         _ => crate::node_supervisor::node_stop().await,
     };
@@ -4610,6 +4653,50 @@ pub fn to_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn anonymous_chat_workflow_run_is_refused_at_execution_boundary() {
+        let error = execute_command_tool_with_platform_access(
+            &CommandToolRuntime::default(),
+            "workflow_run",
+            &json!({"name": "forge", "execute": true}),
+            None,
+            CommandToolPlatformAccess::UnverifiedHttp,
+        )
+        .await
+        .expect_err("anonymous linked workflow execution must fail closed");
+
+        assert!(
+            error.to_string().contains("verified node-owner session"),
+            "refusal must identify the missing owner verification: {error:#}"
+        );
+    }
+
+    #[test]
+    fn standalone_node_up_does_not_require_platform_access() {
+        assert!(node_lifecycle_allowed(CommandToolPlatformAccess::LocalOnly));
+        assert!(!node_lifecycle_allowed(
+            CommandToolPlatformAccess::UnverifiedHttp
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn papers_caller_controlled_llm_url_gets_no_node_credential() {
+        let mut command = TokioCommand::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '%s|%s|%s' \"$LLM_API_KEY\" \"$MARC27_TOKEN\" \"$OPENAI_API_KEY\"")
+            .env("LLM_API_KEY", "node-llm-secret")
+            .env("MARC27_TOKEN", "node-platform-secret")
+            .env("OPENAI_API_KEY", "node-provider-secret");
+        // This is the same LocalOnly child boundary used for the papers
+        // command when its --llm-url comes from the caller.
+        strip_platform_credentials(&mut command);
+        let output = command.output().await.expect("credential probe child");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "||");
+    }
 
     #[cfg(unix)]
     #[tokio::test]

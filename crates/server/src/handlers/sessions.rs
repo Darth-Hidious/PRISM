@@ -142,12 +142,15 @@ pub async fn create_session(
     }
 
     let Some(ref db_path) = state.session_db_path else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "Session management not configured.".into(),
-            }),
-        ));
+        // Offline auth is a local capability gate, not an identity system.
+        // Return a fresh, unpersisted bearer for same-process follow-up calls;
+        // chat ownership does not use this value, so one caller cannot choose
+        // another caller's persisted session owner key.
+        return Ok(Json(SessionResponse {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            user_id: ANONYMOUS_LOCAL_USER_ID.to_string(),
+            expires_at: (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+        }));
     };
 
     let mgr = prism_core::session::SessionManager::new(db_path, chrono::Duration::hours(24))
@@ -294,6 +297,41 @@ mod tests {
             session_gate(false, Some("m27_realtoken")),
             SessionGate::VerifyPlatformToken
         );
+    }
+
+    #[tokio::test]
+    async fn offline_loopback_mints_a_fresh_anonymous_capability() {
+        use axum::extract::{ConnectInfo, State};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let state = std::sync::Arc::new(NodeState::new("offline-node".into()));
+        let request = || {
+            create_session(
+                State(state.clone()),
+                ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234)),
+                Json(CreateSessionRequest {
+                    user_id: Some("caller-selected-user".into()),
+                    display_name: None,
+                    platform_role: Some("admin".into()),
+                    platform_token: None,
+                }),
+            )
+        };
+        let first = match request().await {
+            Ok(Json(response)) => response,
+            Err((status, Json(error))) => {
+                panic!("offline session mint failed ({status}): {}", error.error)
+            }
+        };
+        let second = match request().await {
+            Ok(Json(response)) => response,
+            Err((status, Json(error))) => {
+                panic!("offline session mint failed ({status}): {}", error.error)
+            }
+        };
+        assert_ne!(first.session_id, second.session_id);
+        assert_eq!(first.user_id, ANONYMOUS_LOCAL_USER_ID);
+        assert_eq!(second.user_id, ANONYMOUS_LOCAL_USER_ID);
     }
 
     #[tokio::test]

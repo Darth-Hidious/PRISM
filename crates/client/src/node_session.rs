@@ -24,12 +24,28 @@ pub async fn mint_local_session(
     user_id: &str,
     display_name: Option<&str>,
 ) -> anyhow::Result<String> {
+    mint_local_session_with_platform_token(base_url, user_id, display_name, None).await
+}
+
+/// Mint a loopback session while proving the launching platform identity.
+///
+/// The node deliberately ignores `user_id` unless this token verifies against
+/// the linked platform. This is the path workflow launchers use on linked
+/// nodes; a bare `mint_local_session` remains anonymous-local for legacy local
+/// callers.
+pub async fn mint_local_session_with_platform_token(
+    base_url: &str,
+    user_id: &str,
+    display_name: Option<&str>,
+    platform_token: Option<&str>,
+) -> anyhow::Result<String> {
     let url = format!("{}/api/sessions", base_url.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .post(&url)
         .json(&serde_json::json!({
             "user_id": user_id,
             "display_name": display_name,
+            "platform_token": platform_token,
         }))
         .send()
         .await?;
@@ -41,4 +57,38 @@ pub async fn mint_local_session(
     }
 
     Ok(resp.json::<SessionResponse>().await?.session_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mint_local_session_with_platform_token;
+    use mockito::Matcher;
+
+    #[tokio::test]
+    async fn workflow_session_mint_carries_launching_platform_identity() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/sessions")
+            .match_body(Matcher::Json(serde_json::json!({
+                "user_id": "owner-123",
+                "display_name": null,
+                "platform_token": "owner-platform-token",
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"session_id":"verified-node-session"}"#)
+            .create_async()
+            .await;
+
+        let token = mint_local_session_with_platform_token(
+            &server.url(),
+            "owner-123",
+            None,
+            Some("owner-platform-token"),
+        )
+        .await
+        .expect("session mint");
+        assert_eq!(token, "verified-node-session");
+        mock.assert_async().await;
+    }
 }
