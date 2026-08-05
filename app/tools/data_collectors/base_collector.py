@@ -80,11 +80,6 @@ def get_default_collector_registry() -> CollectorRegistry:
     except Exception:
         pass
     try:
-        from app.tools.data_collectors.literature_collector import LiteratureCollector
-        reg.register(LiteratureCollector())
-    except Exception:
-        pass
-    try:
         from app.tools.data_collectors.patent_collector import PatentCollector
         reg.register(PatentCollector())
     except Exception:

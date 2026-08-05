@@ -407,6 +407,31 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         requires_approval: true,
     },
     CommandToolSpec {
+        name: "papers",
+        root: "papers",
+        aliases: &["prism_papers", "papers_search"],
+        kind: CommandToolKind::RootSubcommand {
+            subcommands: &["search", "sweep", "full-text", "claims"],
+            flags: FlagPolicy::Only(&[
+                "--query",
+                "--limit",
+                "--sources",
+                "--mailto",
+                "--no-cache",
+                "--max-pages",
+                "--state",
+                "--pmc",
+                "--url",
+                "--format",
+                "--model",
+                "--llm-url",
+            ]),
+        },
+        description: "Fast literature retrieval over machine-readable APIs (arXiv, OpenAlex, Crossref, PubMed, Semantic Scholar, Europe PMC preprints, ChemRxiv, DOAJ). `subcommand=search --args [--query Q, --limit N]` for one concurrent federated search; `sweep` for resumable paginated harvesting; `full-text --args [--pmc PMC123 | --url U]` for JATS/PDF extraction with section/table locators; `claims` for EMMO-typed claim extraction (needs a configured LLM, returns zero claims honestly when none is set). Output is JSON with per-source status; every extracted claim carries evidence_class capped at 'research'.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
         name: "mesh",
         root: "mesh",
         aliases: &["prism_mesh"],
@@ -5876,7 +5901,7 @@ ValueError: boom\n";
         // definitions in crates/cli/src/main.rs. `status`, `tools`, `agent`
         // are unit variants (no flags); `job-status` takes one positional;
         // `doctor`'s only flag is the repair; `query` and `models` declare
-        // their read-path flags.
+        // their read-path flags; `papers` declares its retrieval flags.
         assert_eq!(
             checked,
             vec![
@@ -5885,6 +5910,7 @@ ValueError: boom\n";
                 "doctor",
                 "query",
                 "job-status",
+                "papers",
                 "agent",
                 "models"
             ]

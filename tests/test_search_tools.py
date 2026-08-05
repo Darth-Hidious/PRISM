@@ -5,7 +5,8 @@ removed. Both functionalities live behind prior_art_search(source=…). The
 private _literature_search / _patent_search helpers are preserved for
 direct testing because prior_art_search dispatches into them.
 """
-from unittest.mock import patch
+import json
+from unittest.mock import MagicMock, patch
 from app.tools.base import ToolRegistry
 from app.tools.search import create_search_tools, _literature_search, _patent_search
 
@@ -32,23 +33,39 @@ class TestCreateSearchTools:
 
 
 class TestLiteratureSearchFunc:
-    """`_literature_search` goes through `collect_with_status`, not `collect`
-    — stubbing `collect` left these tests hitting arXiv and Semantic Scholar
-    for real, which is both slow and non-deterministic."""
+    """`_literature_search` delegates to the Rust retrieval engine
+    (`prism papers search`) — these stub the engine process, never the
+    network."""
 
-    @patch(
-        "app.tools.data_collectors.literature_collector"
-        ".LiteratureCollector.collect_with_status"
-    )
-    def test_returns_results(self, mock_collect):
-        mock_collect.return_value = {
-            "results": [
-                {"source": "arxiv", "title": "Paper 1"},
-                {"source": "semantic_scholar", "title": "Paper 2"},
-            ],
-            "source_status": {"arxiv": "ok (1 results)",
-                              "semantic_scholar": "ok (1 results)"},
-        }
+    ENGINE_OUTCOME = json.dumps({
+        "papers": [
+            {"source": "arxiv", "source_id": "1", "title": "Paper 1",
+             "abstract_text": "A1", "url": "u1"},
+            {"source": "semantic_scholar", "source_id": "2",
+             "title": "Paper 2", "abstract_text": "A2", "url": "u2"},
+        ],
+        "duplicates_merged": 0,
+        "source_status": [
+            {"source": "arxiv", "status": "ok", "count": 1,
+             "cache_hit": False, "error": None},
+            {"source": "semantic_scholar", "status": "ok", "count": 1,
+             "cache_hit": False, "error": None},
+        ],
+        "elapsed_ms": 10.0,
+    })
+
+    def _engine_proc(self):
+        proc = MagicMock()
+        proc.stdout = self.ENGINE_OUTCOME
+        proc.stderr = ""
+        proc.returncode = 0
+        return proc
+
+    @patch("app.tools.search.spawn.run")
+    @patch("app.tools.search._resolve_prism_binary",
+           return_value="/usr/local/bin/prism")
+    def test_returns_results(self, _binary, mock_run):
+        mock_run.return_value = self._engine_proc()
         result = _literature_search(query="tungsten alloy")
         assert result["count"] == 2
         assert result["source"] == "literature"
@@ -56,13 +73,19 @@ class TestLiteratureSearchFunc:
         # Per-source outcomes must reach the caller — a thin result set with
         # a failed source is a different fact from a genuinely empty one.
         assert result["source_status"]["arxiv"] == "ok (1 results)"
+        # Every record carries the literature evidence ceiling.
+        assert all(r["evidence_class"] == "research" for r in result["results"])
 
-    @patch(
-        "app.tools.data_collectors.literature_collector"
-        ".LiteratureCollector.collect_with_status"
-    )
-    def test_empty_results(self, mock_collect):
-        mock_collect.return_value = {"results": [], "source_status": {}}
+    @patch("app.tools.search.spawn.run")
+    @patch("app.tools.search._resolve_prism_binary",
+           return_value="/usr/local/bin/prism")
+    def test_empty_results(self, _binary, mock_run):
+        proc = MagicMock()
+        proc.stdout = json.dumps({"papers": [], "duplicates_merged": 0,
+                                  "source_status": [], "elapsed_ms": 1.0})
+        proc.stderr = ""
+        proc.returncode = 0
+        mock_run.return_value = proc
         result = _literature_search(query="")
         assert result["count"] == 0
         assert result["results"] == []

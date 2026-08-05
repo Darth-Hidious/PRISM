@@ -14,6 +14,7 @@ mod local_llm;
 mod mcp_server_native;
 mod notebook;
 mod onboarding;
+mod papers;
 use prism_core::providers;
 mod pyiron_cmd;
 mod tool_sync;
@@ -210,6 +211,13 @@ enum Commands {
     Node {
         #[command(subcommand)]
         command: NodeCommands,
+    },
+    /// Fast literature retrieval engine (arXiv, OpenAlex, Crossref, PubMed,
+    /// Semantic Scholar, Europe PMC preprints, ChemRxiv, DOAJ). Concurrent,
+    /// polite, resumable; output is JSON aimed at EMMO-typed ingestion.
+    Papers {
+        #[command(subcommand)]
+        command: crate::papers::PapersCommands,
     },
     /// Ingest a data file into the knowledge graph.
     Ingest {
@@ -3421,6 +3429,9 @@ async fn main() -> Result<()> {
                 }
             },
         },
+        Commands::Papers { command } => {
+            crate::papers::handle(command, &cli.project_root).await?;
+        }
         Commands::Ingest {
             path,
             corpus,

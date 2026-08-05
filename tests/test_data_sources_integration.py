@@ -18,7 +18,9 @@ class TestGetDefaultCollectorRegistry:
         reg = get_default_collector_registry()
         names = [c.name for c in reg.list_collectors()]
         assert "omat24" in names
-        assert "literature" in names
+        # Literature retrieval moved to the Rust engine (`prism papers`);
+        # it is deliberately NOT a Python collector anymore.
+        assert "literature" not in names
         assert "patents" in names
 
     def test_at_least_five_collectors(self):
@@ -59,42 +61,6 @@ class TestOMAT24Integration:
             results = c.collect(elements=["W"], max_results=10)
             assert len(results) == 1
             assert results[0]["formula"] == "WRh"
-
-
-class TestLiteratureIntegration:
-    @patch("app.tools.data_collectors.literature_collector.requests")
-    def test_combined_results(self, mock_requests):
-        arxiv_resp = MagicMock()
-        arxiv_resp.text = """<?xml version="1.0"?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-  <entry>
-    <id>http://arxiv.org/abs/2401.00001</id>
-    <title>Test Paper</title>
-    <summary>Abstract text.</summary>
-    <published>2024-01-01T00:00:00Z</published>
-    <author><name>Author A</name></author>
-  </entry>
-</feed>"""
-        arxiv_resp.raise_for_status = MagicMock()
-
-        s2_resp = MagicMock()
-        s2_resp.json.return_value = {
-            "data": [
-                {"paperId": "s2-1", "title": "S2 Paper", "authors": [{"name": "B"}],
-                 "abstract": "S2 abstract", "year": 2024, "url": "http://s2.org",
-                 "citationCount": 5}
-            ]
-        }
-        s2_resp.raise_for_status = MagicMock()
-
-        mock_requests.get.side_effect = [arxiv_resp, s2_resp]
-
-        from app.tools.data_collectors.literature_collector import LiteratureCollector
-        c = LiteratureCollector()
-        results = c.collect(query="tungsten alloy", max_results=20)
-        assert len(results) == 2
-        sources = {r["source"] for r in results}
-        assert sources == {"arxiv", "semantic_scholar"}
 
 
 class TestPatentIntegration:
@@ -172,11 +138,6 @@ class TestSupportedParams:
         from app.tools.data_collectors.omat24_collector import OMAT24Collector
         c = OMAT24Collector()
         assert "elements" in c.supported_params()
-
-    def test_literature_supported_params(self):
-        from app.tools.data_collectors.literature_collector import LiteratureCollector
-        c = LiteratureCollector()
-        assert "query" in c.supported_params()
 
     def test_patents_supported_params(self):
         from app.tools.data_collectors.patent_collector import PatentCollector

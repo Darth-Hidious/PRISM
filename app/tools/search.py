@@ -19,7 +19,14 @@ compatibility — anything that calls `literature_search` directly
 keeps working. The agent's catalog, however, sees the unified one
 first because it has a richer description.
 """
+import json
+import os
+import shutil
+from pathlib import Path
+
+from app.tools import spawn
 from app.tools.base import Tool, ToolRegistry
+from app.tools.evidence import EvidenceSource, stamp_evidence
 
 
 def _compact_abstract(text, limit: int = 400) -> str:
@@ -30,25 +37,126 @@ def _compact_abstract(text, limit: int = 400) -> str:
     return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
 
 
+def _resolve_prism_binary() -> str | None:
+    """Find the `prism` executable that hosts the Rust retrieval engine.
+
+    Resolution order: PRISM_BINARY env (same convention as _provision.py),
+    PATH, then an in-tree build. Returns None when nothing exists — the
+    caller turns that into an honest error, never a fallback implementation.
+    """
+    env = os.environ.get("PRISM_BINARY")
+    if env:
+        return env
+    found = shutil.which("prism")
+    if found:
+        return found
+    repo_root = Path(__file__).resolve().parents[2]
+    for candidate in ("target/release/prism", "target/debug/prism"):
+        path = repo_root / candidate
+        if path.exists():
+            return str(path)
+    return None
+
+
 def _literature_search_impl(**kwargs) -> dict:
-    """Run the LiteratureCollector. Internal helper for both the unified
-    `prior_art_search` and the legacy `literature_search` alias."""
-    from app.tools.data_collectors.literature_collector import LiteratureCollector
-    collector = LiteratureCollector()
-    out = collector.collect_with_status(
-        query=kwargs.get("query", ""),
-        max_results=kwargs.get("max_results", 20),
-        sources=kwargs.get("sources"),
-    )
-    results = out["results"]
-    for r in results:
-        r["abstract"] = _compact_abstract(r.get("abstract"))
-    return {
+    """Delegate to the Rust retrieval engine (`prism papers search`).
+
+    The old Python arXiv/Semantic Scholar fetcher was deleted when the Rust
+    engine replaced it: there is exactly one literature retrieval engine, and
+    this adapter keeps the agent-visible contract stable. Every record comes
+    back stamped with the literature evidence class (research/orange) — a
+    retrieval record is never stronger than that.
+    """
+    query = kwargs.get("query", "")
+    max_results = int(kwargs.get("max_results", 20))
+    sources = kwargs.get("sources")
+    if not query:
+        return {"results": [], "count": 0, "source": "literature",
+                "source_status": {}}
+
+    binary = _resolve_prism_binary()
+    if not binary:
+        return {
+            "results": [],
+            "count": 0,
+            "source": "literature",
+            "source_status": {},
+            "error": (
+                "prism binary not found — the papers backend is the Rust "
+                "retrieval engine (`prism papers search`); no Python fallback "
+                "exists by design. Set PRISM_BINARY or install prism."
+            ),
+        }
+
+    argv = [binary, "papers", "search", "--query", query,
+            "--limit", str(max_results)]
+    if sources:
+        argv += ["--sources", ",".join(sources)]
+    try:
+        proc = spawn.run(
+            argv, capture_output=True, text=True, timeout=180, check=False,
+        )
+    except Exception as exc:
+        return {
+            "results": [], "count": 0, "source": "literature",
+            "source_status": {},
+            "error": f"papers engine failed to run: {type(exc).__name__}: {exc}",
+        }
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()[:400]
+        return {
+            "results": [], "count": 0, "source": "literature",
+            "source_status": {},
+            "error": f"papers engine exited {proc.returncode}: {stderr}",
+        }
+    try:
+        outcome = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {
+            "results": [], "count": 0, "source": "literature",
+            "source_status": {},
+            "error": "papers engine produced unparseable output",
+        }
+
+    results = []
+    for paper in outcome.get("papers", []):
+        record = dict(paper)
+        # Backward-compatible field aliases for the pre-engine contract.
+        record["abstract"] = _compact_abstract(record.pop("abstract_text", None))
+        record["type"] = "paper"
+        stamp_evidence(record, EvidenceSource.LITERATURE_EXTRACTION)
+        results.append(record)
+
+    # Engine status list -> legacy per-source dict.
+    source_status = {}
+    for status in outcome.get("source_status", []):
+        name = status.get("source", "unknown")
+        state = status.get("status", "error")
+        if state == "ok":
+            note = "cache" if status.get("cache_hit") else "ok"
+            source_status[name] = f"{note} ({status.get('count', 0)} results)"
+        elif state == "timeout":
+            source_status[name] = f"timeout: {status.get('error') or 'deadline'}"
+        else:
+            source_status[name] = f"error: {status.get('error') or 'unknown'}"
+
+    out = {
         "results": results,
         "count": len(results),
         "source": "literature",
-        "source_status": out["source_status"],
+        "source_status": source_status,
+        "duplicates_merged": outcome.get("duplicates_merged", 0),
+        "engine_elapsed_ms": outcome.get("elapsed_ms"),
     }
+    # Nothing was retrieved AND every source failed: that is a fault, not an
+    # empty result. Surface it; keep the results list honest (empty).
+    if not results and source_status and all(
+        not v.startswith("ok") for v in source_status.values()
+    ):
+        out["error"] = (
+            "no papers retrieved because every source failed; see source_status"
+        )
+    return out
 
 
 def _eastern_search_impl(**kwargs) -> dict:
@@ -140,6 +248,10 @@ def _prior_art_search(**kwargs) -> dict:
             out["papers"] = lit.get("results", [])
             out["counts"]["papers"] = lit.get("count", 0)
             out["source_status"] = lit.get("source_status", {})
+            # A retrieval fault (engine missing, every source down) is not an
+            # empty result — keep it visible to the agent.
+            if lit.get("error"):
+                out["papers_error"] = lit["error"]
         except Exception as exc:
             out["papers_error"] = str(exc)
 
