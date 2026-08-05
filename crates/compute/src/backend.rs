@@ -147,6 +147,31 @@ impl ComputeRouter {
         self
     }
 
+    /// Replace the licence declarations with a load *result*, so a caller can
+    /// install the broken-file state a real user gets from a typo'd
+    /// `licences.toml`. Free work must survive it.
+    pub fn with_licence_manager_from(self, registry: Result<LicenceRegistry>) -> Self {
+        let Self {
+            local,
+            marc27,
+            byoc,
+            tracker,
+            default_backend,
+            licence_keys_dir,
+            ..
+        } = self;
+        let licences = LicenceManager::new(registry, tracker.clone(), licence_keys_dir.clone());
+        Self {
+            local,
+            marc27,
+            byoc,
+            tracker,
+            default_backend,
+            licences,
+            licence_keys_dir,
+        }
+    }
+
     /// Replace the licence declarations (tests, embedded callers). The
     /// job tracker and key directory are preserved.
     pub fn with_licence_registry(self, registry: LicenceRegistry) -> Self {
@@ -610,6 +635,40 @@ expires = "2126-12-31"
         );
         assert!(licence_error.to_string().contains("ansys"));
         assert!(router.tracker().list(false).await.is_empty());
+    }
+
+    /// A BROKEN licences.toml must not break free work.
+    ///
+    /// `LicenceManager::new` takes the load `Result` rather than `?`-ing it,
+    /// so a file that exists but does not parse is held and surfaces only at
+    /// the first licensed request. That is the whole zero-config contract:
+    /// someone who has never configured a licence — or who typo'd the file —
+    /// still runs Quantum ESPRESSO and MACE untouched. Getting this wrong
+    /// turns a working free workload into a refusal, which is worse than any
+    /// leak this module could have.
+    #[tokio::test]
+    async fn a_malformed_declarations_file_does_not_break_unlicensed_work() {
+        let broken = LicenceRegistry::from_toml("this is not valid toml {{{");
+        assert!(broken.is_err(), "fixture must actually fail to parse");
+
+        let router = ComputeRouter::local_only()
+            .with_byoc(slurm_target(None, ""))
+            .with_licence_manager_from(broken);
+        let plan = ExperimentPlan {
+            name: "free-experiment".into(),
+            image: "quantum-espresso.sif".into(),
+            inputs: serde_json::json!({}),
+            licence: None,
+        };
+        let error = router.submit(&plan).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<LicenceError>().is_none(),
+            "a broken licence file must not gate an unlicensed plan: {error}"
+        );
+        assert!(
+            error.to_string().contains("pre-staged .sif"),
+            "plan should have reached the backend: {error}"
+        );
     }
 
     #[tokio::test]

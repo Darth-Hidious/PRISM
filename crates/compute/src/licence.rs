@@ -95,7 +95,7 @@ pub struct LicenceServer {
 /// serialization of a registry — logs, provenance, wire formats — drops
 /// it. Its real protection is that nothing that travels is ever built
 /// from a [`Licence`], only from a [`Lease`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Licence {
     pub id: String,
     pub name: String,
@@ -108,6 +108,25 @@ pub struct Licence {
     /// Optional address of a real licence server.
     #[serde(default)]
     pub server: Option<LicenceServer>,
+}
+
+/// Hand-written so the secret can never reach a log.
+///
+/// `skip_serializing` protects serde, but `Debug` is not serde: a derived
+/// `{:?}` prints every field verbatim, and one `tracing::debug!("{licence:?}")`
+/// added later would put a vendor key in a log file forever. Nothing formats a
+/// `Licence` today — this exists so nothing can.
+impl std::fmt::Debug for Licence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Licence")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("seats", &self.seats)
+            .field("expires", &self.expires)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("server", &self.server)
+            .finish()
+    }
 }
 
 /// Raw form straight out of TOML, before validation.
@@ -947,6 +966,33 @@ expires = "2026-08-09T12:00:00Z"
         assert!(registry.is_empty());
         assert_eq!(registry.get("vasp-6"), None);
         assert!(registry.ids().is_empty());
+    }
+
+    /// `skip_serializing` guards serde; `Debug` is a separate surface. A
+    /// derived `{:?}` would print the vendor key verbatim into any log that
+    /// ever formats a licence.
+    #[test]
+    fn debug_never_prints_the_licence_secret() {
+        let registry = LicenceRegistry::from_toml(
+            "[[licence]]\nid = \"vasp-6\"\nname = \"VASP 6\"\nseats = 4\n\
+             expires = \"2027-01-01\"\nsecret = \"SUPER-SECRET-SERIAL-9999\"\n",
+        )
+        .expect("fixture parses");
+        let licence = registry.get("vasp-6").expect("declared");
+        assert_eq!(licence.secret.as_deref(), Some("SUPER-SECRET-SERIAL-9999"));
+
+        let rendered = format!("{licence:?}");
+        assert!(
+            !rendered.contains("SUPER-SECRET-SERIAL-9999"),
+            "Debug leaked the licence secret: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // The registry Debug-formats its licences, so it must be clean too.
+        let whole = format!("{registry:?}");
+        assert!(
+            !whole.contains("SUPER-SECRET-SERIAL-9999"),
+            "registry Debug leaked the secret: {whole}"
+        );
     }
 
     #[test]
