@@ -231,8 +231,12 @@ pub fn supporting_quote(
                 let masked = mask_bracketed(&hay);
                 number_needles(v)
                     .iter()
-                    .filter_map(|n| find_at_digit_boundary(&masked, n))
-                    .any(|pos| property_mentioned_before(&object_n, &masked, pos))
+                    .filter_map(|n| {
+                        find_at_digit_boundary(&masked, n).map(|pos| (pos, pos + n.len()))
+                    })
+                    .any(|(start, end)| {
+                        property_binds_number(&object_n, &subject_n, &masked, start, end)
+                    })
             }
             None => {
                 !subject_n.is_empty()
@@ -300,34 +304,189 @@ fn find_at_digit_boundary(hay: &str, needle: &str) -> Option<usize> {
     None
 }
 
-/// Is the claim's property named before byte offset `pos`?
+/// Words that may sit between a property and its value without breaking the
+/// binding: "a UTS **of** 1140 MPa", "elongation **was** 14".
+const BINDING_CONNECTIVES: &[&str] = &[
+    "of",
+    "was",
+    "were",
+    "is",
+    "are",
+    "at",
+    "to",
+    "a",
+    "an",
+    "the",
+    "about",
+    "approximately",
+    "reached",
+    "measured",
+    "showed",
+    "exhibited",
+    "had",
+    "with",
+    "up",
+];
+
+/// Does the claim's property bind to the number at `num`?
 ///
-/// Accepts the literal form (`uts`) or the acronym of consecutive words
-/// (`ultimate tensile strength` → `uts`), so a paper spelling the property out
-/// in full still supports its own measurement.
-fn property_mentioned_before(object_n: &str, hay: &str, pos: usize) -> bool {
+/// **Binding, not ordering.** The previous rule only asked whether the property
+/// appeared *before* the number, which a reviewer defeated three ways:
+///
+/// * `head.contains("uts")` matched inside `outputs`, `struts`, `nuts` — a raw
+///   substring test, so a part count became a tensile strength;
+/// * reordering beat it outright — "A UTS of 950 MPa was measured for
+///   Ti-6Al-4V batch 1140" stamps 1140 as the UTS because UTS merely came
+///   first, while the real value 950 sits in between;
+/// * any three words whose initials spell the acronym bound it — "**U**nder
+///   **t**hermal **s**tress, ... 1140 C".
+///
+/// It was also lossy in the other direction: "14% elongation" is the standard
+/// way to report elongation, and a property-must-come-first rule can never
+/// support it.
+///
+/// So: the property mention and the number must be **adjacent in either
+/// order**, separated only by connectives, the subject, or short unit-like
+/// tokens — and never by another number. A digit in the gap means some other
+/// quantity sits between them, which is exactly the batch-id/sample-count
+/// family.
+fn property_binds_number(
+    object_n: &str,
+    subject_n: &str,
+    hay: &str,
+    num_start: usize,
+    num_end: usize,
+) -> bool {
     if object_n.is_empty() {
         return false;
     }
-    let head = &hay[..pos];
-    if head.contains(object_n) {
-        return true;
+    property_mentions(object_n, hay)
+        .into_iter()
+        .any(|(start, end, from_acronym)| {
+            // Property first ("a UTS of 1140 MPa") tolerates connectives and
+            // the subject. Value first ("14% elongation", "1140 MPa UTS") does
+            // NOT: a verb between the number and the property means they are
+            // separate facts -- "batch 1140 showed a UTS of 950 MPa" names the
+            // real value 950, and 1140 is the batch. Only a unit may sit there.
+            let (gap, value_first) = if end <= num_start {
+                (&hay[end..num_start], false)
+            } else if num_end <= start {
+                (&hay[num_end..start], true)
+            } else {
+                return false; // overlapping — not a separate mention
+            };
+            // An acronym expansion binds only within its own clause: a comma
+            // between the words and the number means they are not one phrase.
+            if from_acronym && gap.contains(',') {
+                return false;
+            }
+            if value_first {
+                gap_is_only_unit(gap)
+            } else {
+                gap_is_only_connective(gap, subject_n)
+            }
+        })
+}
+
+/// Every place the property is named: literal at word boundaries, plus
+/// acronym expansions over consecutive words. Returns `(start, end,
+/// from_acronym)` byte ranges into `hay`.
+fn property_mentions(object_n: &str, hay: &str) -> Vec<(usize, usize, bool)> {
+    let mut out = Vec::new();
+    let is_word_char = |c: char| c.is_ascii_alphanumeric();
+
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(object_n) {
+        let start = from + rel;
+        let end = start + object_n.len();
+        // Word boundaries: "uts" must not be found inside "outputs".
+        let before_ok = hay[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c));
+        let after_ok = hay[end..].chars().next().is_none_or(|c| !is_word_char(c));
+        if before_ok && after_ok {
+            out.push((start, end, false));
+        }
+        from = start + 1;
     }
+
     // Acronym expansion only makes sense for a single alphabetic token.
     if object_n.contains(' ') || !object_n.chars().all(|c| c.is_ascii_alphabetic()) {
-        return false;
+        return out;
     }
-    let words: Vec<&str> = head.split_whitespace().collect();
     let n = object_n.chars().count();
-    if n < 2 || words.len() < n {
+    if n < 2 {
+        return out;
+    }
+    let mut words: Vec<(usize, &str)> = Vec::new();
+    let mut word_start: Option<usize> = None;
+    for (i, ch) in hay.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(s) = word_start.take() {
+                words.push((s, &hay[s..i]));
+            }
+        } else if word_start.is_none() {
+            word_start = Some(i);
+        }
+    }
+    if let Some(s) = word_start {
+        words.push((s, &hay[s..]));
+    }
+    for w in words.windows(n) {
+        let initials: String = w
+            .iter()
+            .filter_map(|(_, word)| word.chars().find(|c| c.is_ascii_alphanumeric()))
+            .collect();
+        if initials == object_n {
+            let (start, _) = w[0];
+            let (last_start, last_word) = w[n - 1];
+            // End at the last alphanumeric character, so trailing punctuation
+            // stays in the gap. Otherwise "stress," swallows its own comma and
+            // the clause-boundary check below never sees it.
+            let trimmed = last_word.trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+            out.push((start, last_start + trimmed.len(), true));
+        }
+    }
+    out
+}
+
+/// May this text sit between a property and its value?
+///
+/// Connectives, the subject, and short unit-like tokens (`mpa`, `%`, `nm`) are
+/// fine. **Any digit is not** — another number between them means the property
+/// already has a different value, and this one belongs to something else.
+/// The value-first gap: only a unit may separate a number from the property it
+/// belongs to (`14`**%** `elongation`, `1140` **MPa** `UTS`). A connective verb
+/// there means a new clause began and the number belongs to something else.
+fn gap_is_only_unit(gap: &str) -> bool {
+    if gap.chars().any(|c| c.is_ascii_digit()) {
         return false;
     }
-    words.windows(n).any(|w| {
-        w.iter()
-            .filter_map(|word| word.chars().find(|c| c.is_ascii_alphanumeric()))
-            .collect::<String>()
-            == object_n
-    })
+    gap.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .all(|token| token.len() <= 4 && !BINDING_CONNECTIVES.contains(&token))
+}
+
+fn gap_is_only_connective(gap: &str, subject_n: &str) -> bool {
+    gap.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .filter(|t| !t.is_empty())
+        .all(|token| {
+            // The subject is allowed even though material names carry digits
+            // (Ti-6Al-4V). Checking digits over the whole gap instead of per
+            // token rejected every sentence that named its own material.
+            if !subject_n.is_empty() && subject_n.contains(token) {
+                return true;
+            }
+            // Any OTHER number between the property and this value means the
+            // property already has a different value, and this one belongs to
+            // something else -- the batch-id / sample-count family.
+            if token.chars().any(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            // Connectives, or unit-ish short tokens such as mpa, gpa, hv, nm.
+            BINDING_CONNECTIVES.contains(&token) || token.len() <= 4
+        })
 }
 
 /// Split `block_text` into candidate supporting spans: sentences and table
@@ -696,6 +855,60 @@ mod tests {
     #[test]
     fn a7_digit_boundary_blocks_substring_match_inside_11_140() {
         no_support("In total, 11,140 Ti-6Al-4V components were inspected.");
+    }
+
+    // ── Round 2: bypasses B1-B3, found by review of the A1-A7 fix ───────
+    //
+    // The A1-A7 fix required the property to appear BEFORE the number. A
+    // reviewer defeated that three ways, all stamping at confidence 0.9.
+    // Ordering is not binding.
+
+    /// B1: `uts` hid inside `outputs` — the property test was a raw substring.
+    #[test]
+    fn b1_property_substring_inside_another_word_is_not_a_mention() {
+        no_support("The outputs of Ti-6Al-4V machining were 1140 parts.");
+        no_support("Ti-6Al-4V statute limits outputs to 1140 units.");
+    }
+
+    /// B2: put the property first and the fabricated number later, and the
+    /// ordering rule waves it through — while the REAL value sits between.
+    #[test]
+    fn b2_property_first_does_not_bind_a_later_unrelated_number() {
+        no_support("A UTS of 950 MPa was measured for Ti-6Al-4V batch 1140.");
+        no_support("Ti-6Al-4V had a UTS of 950 MPa across 1140 samples.");
+        no_support("UTS data for Ti-6Al-4V were collected at wavelength 1140 nm.");
+        no_support("Ti-6Al-4V UTS reached 950 MPa (lot 1140, certified).");
+        no_support("Ti-6Al-4V UTS was 950 MPa over 1,140 test bars.");
+    }
+
+    /// B3: any three words whose initials spell the acronym bound it.
+    #[test]
+    fn b3_acronym_collision_across_a_clause_boundary_is_refused() {
+        no_support("Under thermal stress, Ti-6Al-4V reached 1140 C.");
+        no_support("Until tested soundly, Ti-6Al-4V lot 1140 was held.");
+    }
+
+    // ── Lossiness the same review caught: real claims the rule dropped ──
+
+    /// "N% elongation" is the standard English form. A property-must-come-
+    /// first rule can never support it, which made the rule systematically
+    /// lossy for the most common way elongation is reported.
+    #[test]
+    fn legit_value_before_property_stamps() {
+        let quote = supporting_quote(
+            "Ti-6Al-4V",
+            "elongation",
+            Some(14.0),
+            "Ti-6Al-4V exhibited 14% elongation at fracture.",
+        )
+        .expect("value-first phrasing is standard and must be supported");
+        assert!(quote.contains("14%"));
+    }
+
+    /// Value, unit, then property — also common in tables and captions.
+    #[test]
+    fn legit_value_unit_property_order_stamps() {
+        support("Ti-6Al-4V: 1140 MPa UTS.");
     }
 
     // ── Legitimate cases that must STILL stamp ──────────────────────────
