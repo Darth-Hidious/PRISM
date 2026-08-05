@@ -39,7 +39,7 @@ use crate::permissions::{
 use crate::prompt_profile::{PromptProfile, profile_for_model};
 use crate::prompts::{append_runtime_tool_guidance, build_system_prompt, render_system_prompt};
 use crate::scratchpad::Scratchpad;
-use crate::session::{RuntimeSessionState, SessionStore};
+use crate::session::{RuntimeSessionState, SessionStore, deterministic_title, title_refresh_due};
 use crate::tool_catalog::ToolCatalog;
 use crate::transcript::{
     TranscriptEntry, TranscriptStore, TurnBudget, extract_key_files, extract_pending_work,
@@ -5732,6 +5732,9 @@ fn spawn_agent_turn(
                     &runtime.llm_config,
                     &slash_ctx,
                 );
+                // Session titles are a display concern: when the policy says
+                // one is due, kick it off detached so it never blocks a turn.
+                maybe_spawn_title_generation(&mut runtime);
             }
             Err(error) => {
                 tracing::error!(error = %error, "agent turn failed");
@@ -5747,6 +5750,219 @@ fn spawn_agent_turn(
     });
 
     result_rx
+}
+
+// ── Session title generation ────────────────────────────────────────
+
+/// Auxiliary model used for title generation: the cheapest Anthropic model in
+/// the seeded registry, so a platform-connected session labels itself for
+/// fractions of a cent per label.
+const TITLE_AUX_MODEL: &str = "claude-haiku-4-5";
+/// Hard budget for a title-generation LLM call; the detached task is
+/// additionally wrapped in a timeout guard, so it cannot hang.
+const TITLE_LLM_TIMEOUT_SECS: u64 = 20;
+/// A label the model returns may not exceed these; longer output is trimmed.
+const TITLE_MAX_TITLE_CHARS: usize = 120;
+const TITLE_MAX_SUMMARY_CHARS: usize = 300;
+
+/// Whether `config` targets the MARC27 platform LLM proxy — mirrors
+/// `LlmClient::is_marc27` (crates/llm/src/lib.rs), which is private. Only
+/// when this is true may title generation call a model; otherwise PRISM is
+/// running standalone and the deterministic fallback applies. Pure string
+/// check — never touches the network.
+fn platform_llm_connected(config: &LlmConfig) -> bool {
+    config.base_url.contains("marc27.com") || config.base_url.contains("/llm")
+}
+
+/// Kick off session title/summary generation when [`title_refresh_due`] says
+/// so. Spawns a DETACHED task and returns immediately: the user's work never
+/// waits for a label. Platform-connected sessions ask the cheap auxiliary
+/// model (bounded by [`TITLE_LLM_TIMEOUT_SECS`]); standalone sessions get the
+/// deterministic fallback. Either way a label is persisted — a missing
+/// platform means a plainer title, never a missing session, error, or hang.
+fn maybe_spawn_title_generation(runtime: &mut ServerRuntime) {
+    let Some(meta) = runtime.session_store.meta() else {
+        return;
+    };
+    if !title_refresh_due(meta) {
+        return;
+    }
+    let turn_count = meta.turn_count;
+    let Some(session_id) = runtime.session_store.current_id().map(str::to_string) else {
+        return;
+    };
+
+    // Excerpt for the labeler: first user message + last few exchanges.
+    let mut exchange: Vec<(String, String)> = runtime
+        .history
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .filter_map(|m| {
+            let content = m.content.as_deref()?.trim().to_string();
+            if content.is_empty() {
+                return None;
+            }
+            Some((m.role.clone(), content.chars().take(400).collect()))
+        })
+        .collect();
+    let Some(first_user) = exchange
+        .iter()
+        .find(|(role, _)| role == "user")
+        .map(|(_, content)| content.clone())
+    else {
+        return; // Nothing user-authored to label yet.
+    };
+    if exchange.len() > 8 {
+        exchange = exchange.split_off(exchange.len() - 8);
+    }
+
+    // Mark the attempt NOW, in memory, so later turns do not re-spawn while
+    // the detached task runs (or if it fails to persist). A failed attempt is
+    // retried on the same sparse schedule — see `title_refresh_due`.
+    if let Some(meta) = runtime.session_store.meta_mut() {
+        meta.title_turn = turn_count;
+    }
+
+    let sessions_dir = runtime.session_store.dir().to_path_buf();
+    let platform = platform_llm_connected(&runtime.llm_config);
+    let llm_config = runtime.llm_config.clone();
+
+    tokio::spawn(async move {
+        let (title, summary, source) = if platform {
+            match llm_title(&llm_config, &exchange).await {
+                Some((t, s)) => (t, s, "model"),
+                // Platform flaked: fall back, keep the rail useful.
+                None => (deterministic_title(&first_user), None, "heuristic"),
+            }
+        } else {
+            (deterministic_title(&first_user), None, "heuristic")
+        };
+
+        // A fresh store aimed at the same directory; `update_session_meta`
+        // merges with whatever the runtime has persisted meanwhile.
+        SessionStore::new(Some(sessions_dir)).update_session_meta(&session_id, |meta| {
+            meta.title = Some(title.clone());
+            meta.summary = summary.clone();
+            meta.title_source = Some(source.to_string());
+            meta.title_turn = turn_count;
+        });
+        // Let any live UI refresh its history rail without a re-list.
+        emit_notification(
+            "ui.session.title",
+            serde_json::json!({
+                "session_id": session_id,
+                "title": title,
+                "summary": summary,
+                "title_source": source,
+            }),
+        );
+    });
+}
+
+/// Ask the cheap auxiliary model for a title + one-line summary. Bounded by a
+/// short timeout and returns `None` on ANY failure so the caller falls back
+/// to the deterministic label. Never panics; cannot hang past the guard.
+async fn llm_title(
+    base_config: &LlmConfig,
+    exchange: &[(String, String)],
+) -> Option<(String, Option<String>)> {
+    let config = LlmConfig {
+        model: TITLE_AUX_MODEL.to_string(),
+        timeout_secs: TITLE_LLM_TIMEOUT_SECS,
+        // Those limits belong to the session model, not the auxiliary one.
+        context_window: None,
+        max_output_tokens: None,
+        ..base_config.clone()
+    };
+    let client = LlmClient::new(config);
+    let transcript = exchange
+        .iter()
+        .map(|(role, content)| format!("{role}: {content}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        "Conversation transcript (first user message, then recent turns):\n{transcript}\n\n\
+         Reply with a single JSON object and nothing else, shaped exactly like:\n\
+         {{\"title\": \"...\", \"summary\": \"...\"}}\n\
+         title: at most 8 words, concrete, specific to this work, no quotation marks.\n\
+         summary: one sentence of at most 25 words."
+    );
+    let request = client.chat(
+        "You label materials-research chat sessions so users can find them later.",
+        &prompt,
+    );
+    // Belt and braces: even with a misconfigured transport timeout, this task
+    // has a hard lifetime bound.
+    let raw = match timeout(Duration::from_secs(TITLE_LLM_TIMEOUT_SECS + 5), request).await {
+        Ok(Ok(text)) => text,
+        _ => return None,
+    };
+    parse_title_json(&raw)
+}
+
+/// Parse the auxiliary model's reply into `(title, optional summary)`.
+/// Tolerates code fences and surrounding junk; `None` when no usable title is
+/// present (the caller then falls back to the deterministic label).
+fn parse_title_json(raw: &str) -> Option<(String, Option<String>)> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&raw[start..=end]).ok()?;
+    let title = sanitize_label(value.get("title")?.as_str()?, TITLE_MAX_TITLE_CHARS);
+    if title.is_empty() {
+        return None;
+    }
+    let summary = value
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(|s| sanitize_label(s, TITLE_MAX_SUMMARY_CHARS))
+        .filter(|s| !s.is_empty());
+    Some((title, summary))
+}
+
+/// Clean model output for use as a label: control characters out, whitespace
+/// collapsed, hard-capped at `max_chars`.
+fn sanitize_label(s: &str, max_chars: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let joined = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= max_chars {
+        return joined;
+    }
+    let cut = joined
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(joined.len());
+    let mut out = joined[..cut].trim_end().to_string();
+    out.push('…');
+    out
+}
+
+/// One-sentence warning when `/model` switches to a profile with a strictly
+/// smaller tool surface, else `None`. The transcript may contain tool calls
+/// the new model can no longer make, so the user is told — the switch itself
+/// is never blocked.
+fn tool_surface_downgrade_note(
+    old_model: &str,
+    new_model: &str,
+    catalog_len: usize,
+) -> Option<String> {
+    use crate::prompt_profile::{CORE_TOOL_SET, ToolSurface};
+    let from = profile_for_model(old_model).tool_surface;
+    let to = profile_for_model(new_model).tool_surface;
+    if from == ToolSurface::All && to == ToolSurface::CoreSetPlusFind {
+        Some(format!(
+            "Tool surface shrank from the full catalog ({catalog_len} tools) to the curated core set ({} tools, including find_tools): tools already used in this transcript may no longer be callable by {new_model}.",
+            CORE_TOOL_SET.len()
+        ))
+    } else {
+        None
+    }
 }
 
 // ── Command handlers ──────────────────────────────────────────────
@@ -6659,6 +6875,10 @@ async fn handle_command(
                 // Keep the provenance ledger attributing rows to the model
                 // actually serving the session.
                 crate::hooks::set_provenance_ctx("", &llm_config.model);
+                // Persist the switch in session meta so the history rail shows
+                // what actually served the conversation, and keep the set of
+                // all models this thread has run on.
+                session_store.note_model_used(new_model);
                 // Push ui.status so the TUI header reflects the new model immediately.
                 emit_notification(
                     "ui.status",
@@ -6674,6 +6894,11 @@ async fn handle_command(
                     &format!("Model switched: {} → {}", old, new_model),
                     "info",
                 );
+                // A smaller tool surface means the transcript may hold tool
+                // calls the new model cannot make — inform, never block.
+                if let Some(note) = tool_surface_downgrade_note(&old, new_model, tools.len()) {
+                    emit_view("model", "Tool surface reduced", &note, "warning");
+                }
             }
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
@@ -7831,10 +8056,10 @@ mod tests {
         humanize_tool_verb, inline_list, load_plan_snapshot, notification_value,
         parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
         parse_edit_slash_action, parse_notebook_run_args, parse_python_slash_action,
-        parse_read_slash_path, parse_skill_create_args, parse_slash_command,
+        parse_read_slash_path, parse_skill_create_args, parse_slash_command, parse_title_json,
         parse_write_slash_action, persist_plan_snapshot, pick_organization, pick_project,
-        plan_snapshot_path, project_api_history, shell_command_join, summarize_api_view,
-        system_prompt_for_mode, truncate_for_ui,
+        plan_snapshot_path, platform_llm_connected, project_api_history, shell_command_join,
+        summarize_api_view, system_prompt_for_mode, tool_surface_downgrade_note, truncate_for_ui,
     };
     use prism_ingest::LlmConfig;
     use prism_runtime::auth;
@@ -8807,5 +9032,69 @@ mod tests {
         let body = format_skill_run("hello_skill", &ran);
         assert!(body.contains("exited cleanly"), "got: {body}");
         assert!(body.contains("hi-from-tui"), "got: {body}");
+    }
+
+    // ── /model: tool-surface downgrade warning ─────────────────────
+
+    #[test]
+    fn tool_surface_downgrade_warning_fires_on_shrink() {
+        // Full-catalog model → unknown/local model on the compact profile.
+        let note = tool_surface_downgrade_note("claude-sonnet-5", "some-random-local-7b", 120)
+            .expect("full catalog → core set is a downgrade");
+        assert!(note.contains("full catalog (120 tools)"), "got: {note}");
+        assert!(note.contains("core set"), "got: {note}");
+        assert!(note.contains("some-random-local-7b"), "got: {note}");
+    }
+
+    #[test]
+    fn tool_surface_downgrade_silent_on_widen_or_lateral() {
+        // Widen: core-set model → full-catalog model.
+        assert!(
+            tool_surface_downgrade_note("some-random-local-7b", "claude-sonnet-5", 120).is_none()
+        );
+        // Lateral: full catalog → full catalog.
+        assert!(tool_surface_downgrade_note("claude-sonnet-5", "gpt-5", 120).is_none());
+    }
+
+    // ── Title generation: platform gate + reply parsing ────────────
+
+    #[test]
+    fn platform_gate_decides_llm_vs_fallback_titles() {
+        // Platform proxy → the auxiliary model may be asked.
+        let platform = LlmConfig {
+            base_url: "https://api.marc27.com/llm/p/proj123".to_string(),
+            ..Default::default()
+        };
+        assert!(platform_llm_connected(&platform));
+        // Standalone endpoints → deterministic fallback, no network ever.
+        for base_url in ["http://localhost:8080/v1", "http://localhost:11434/v1"] {
+            let local = LlmConfig {
+                base_url: base_url.to_string(),
+                ..Default::default()
+            };
+            assert!(!platform_llm_connected(&local), "misclassified: {base_url}");
+        }
+    }
+
+    #[test]
+    fn parse_title_json_tolerates_fences_and_junk() {
+        let (title, summary) = parse_title_json(
+            "```json\n{\"title\":\"HEA screening\",\"summary\":\"Screening refractory HEAs.\"}\n```",
+        )
+        .expect("fenced JSON parses");
+        assert_eq!(title, "HEA screening");
+        assert_eq!(summary.as_deref(), Some("Screening refractory HEAs."));
+
+        // Surrounding junk tolerated; summary optional; whitespace cleaned.
+        let (title, summary) =
+            parse_title_json("Sure! {\"title\":\"  Polymer  fit \"} hope that helps")
+                .expect("object inside prose parses");
+        assert_eq!(title, "Polymer fit");
+        assert!(summary.is_none());
+
+        // No usable title → caller falls back to the deterministic label.
+        assert!(parse_title_json("no json here at all").is_none());
+        assert!(parse_title_json("{\"title\":\"\"}").is_none());
+        assert!(parse_title_json("{\"summary\":\"only a summary\"}").is_none());
     }
 }

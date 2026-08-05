@@ -22,6 +22,25 @@ const MAX_FILE_SIZE: u64 = 256 * 1024; // 256KB
 const MAX_ROTATIONS: usize = 3;
 const LATEST_FILE: &str = ".latest";
 
+/// Every this-many turns, `append_message` flushes a fresh `meta` line so the
+/// file alone carries near-current counters (rotation moves old lines into
+/// backups; the in-memory meta is the only full-history counter source).
+const META_FLUSH_EVERY_TURNS: usize = 5;
+
+/// Generate the initial title once the first real exchange has completed
+/// (one user message + one assistant reply).
+pub const TITLE_FIRST_EXCHANGE_TURNS: usize = 2;
+/// Refresh a title only after at least this many new turns...
+pub const TITLE_REFRESH_MIN_GAP: usize = 16;
+/// Hard cap for deterministic (non-LLM) titles, in characters.
+pub const TITLE_MAX_CHARS: usize = 60;
+
+/// Process-wide serialization of session-meta read-modify-write cycles. The
+/// title generator runs in a detached task with its own [`SessionStore`]
+/// concurrently with the runtime's store; both append `meta` lines to the
+/// same file, so their read-modify-write must not interleave.
+static META_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn default_sessions_dir() -> PathBuf {
     UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
@@ -32,7 +51,9 @@ fn default_sessions_dir() -> PathBuf {
 
 // ── Data types ───────────────────────────────────────────────────────
 
-/// Session metadata — written as the first JSONL line.
+/// Session metadata — written as the first JSONL line, and re-appended as a
+/// fresh `meta` line whenever it changes (model switch, title, periodic
+/// counter flush). Readers take the LAST `meta` line as current.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub session_id: String,
@@ -43,6 +64,26 @@ pub struct SessionMeta {
     pub compaction_count: usize,
     pub parent_session_id: Option<String>,
     pub branch_name: Option<String>,
+    /// Short label for the history rail. `None` until generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// One-line description for the history rail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// How `title` came to be: `"model"` (auxiliary LLM) or `"heuristic"`
+    /// (deterministic fallback). Recorded so nothing downstream mistakes a
+    /// generated label for user-authored text. Never an evidence class — a
+    /// title labels the session, it does not claim anything about the world.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_source: Option<String>,
+    /// `turn_count` at the last title generation; drives the refresh policy.
+    #[serde(default)]
+    pub title_turn: usize,
+    /// Every model that has served this session, deduped, first-use order.
+    /// The last entry is the current one; `model` above is kept in sync.
+    /// Empty only in legacy files written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// A single entry (one JSONL line).
@@ -70,9 +111,21 @@ pub struct SessionInfo {
     pub session_id: String,
     pub created_at: f64,
     pub turn_count: usize,
+    /// The model currently serving the session (tracks `/model` switches).
     pub model: String,
     pub size_kb: f64,
     pub is_latest: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// `"model"` or `"heuristic"` — see [`SessionMeta::title_source`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_source: Option<String>,
+    /// All models that served the session, first-use order. Never empty when
+    /// `model` is set (falls back to `[model]` for legacy sessions).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// Non-transcript runtime state that should survive resume/fork flows.
@@ -135,6 +188,11 @@ impl SessionStore {
             compaction_count: 0,
             parent_session_id: None,
             branch_name: None,
+            title: None,
+            summary: None,
+            title_source: None,
+            title_turn: 0,
+            models: vec![model.to_string()],
         });
 
         let meta_entry = SessionEntry {
@@ -265,6 +323,104 @@ impl SessionStore {
                 meta.turn_count += 1;
             }
         }
+
+        // Keep the persisted meta close to the live counters so a fresh store
+        // (history rail, resume) sees near-current state from the file alone.
+        let flush_due = matches!(role, "user" | "assistant")
+            && self
+                .meta
+                .as_ref()
+                .is_some_and(|m| m.turn_count > 0 && m.turn_count % META_FLUSH_EVERY_TURNS == 0);
+        if flush_due && let Some(sid) = self.current_id().map(str::to_string) {
+            self.update_session_meta(&sid, |_meta| {});
+        }
+    }
+
+    /// Record `model` as the session's current model and add it to the set of
+    /// models used. Call after a successful `/model` switch so persisted meta
+    /// (and the [`SessionInfo`] built from it) reflects what actually served
+    /// the conversation. Never errors: a failed write leaves the in-memory
+    /// state correct for this process.
+    pub fn note_model_used(&mut self, model: &str) {
+        let Some(sid) = self.current_id().map(str::to_string) else {
+            return;
+        };
+        let model = model.to_string();
+        self.update_session_meta(&sid, move |meta| {
+            // Legacy sessions (files predating `models`) start with an empty
+            // set — backfill the outgoing model so history is not lost.
+            if meta.models.is_empty() && !meta.model.is_empty() {
+                meta.models.push(meta.model.clone());
+            }
+            meta.model = model.clone();
+            if !meta.models.contains(&model) {
+                meta.models.push(model);
+            }
+        });
+    }
+
+    /// Read-modify-write the persisted metadata for `session_id`.
+    ///
+    /// Meta is append-only: the updated state is written as a new `meta` line
+    /// and readers take the last one. The base is the in-memory meta when this
+    /// store owns the session (authoritative for counters and model) or the
+    /// last persisted meta otherwise. Title fields are owned by the detached
+    /// title-generation task, so persisted values are adopted before `mutate`
+    /// runs and can never be clobbered by a counter flush or model switch.
+    ///
+    /// Errors are swallowed by design: a label or bookkeeping update must
+    /// never take a session down.
+    pub fn update_session_meta<F: FnOnce(&mut SessionMeta)>(
+        &mut self,
+        session_id: &str,
+        mutate: F,
+    ) {
+        let path = self.sessions_dir.join(format!("{session_id}.jsonl"));
+        let _guard = META_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let disk_meta = last_meta_in_file(&path);
+        let is_current = self.current_id == Some(session_id.to_string());
+        let mut merged = if is_current {
+            self.meta.clone()
+        } else {
+            disk_meta.clone()
+        };
+        let Some(meta) = merged.as_mut() else {
+            return;
+        };
+
+        if let Some(disk) = &disk_meta {
+            if meta.title.is_none() {
+                meta.title = disk.title.clone();
+            }
+            if meta.summary.is_none() {
+                meta.summary = disk.summary.clone();
+            }
+            if meta.title_source.is_none() {
+                meta.title_source = disk.title_source.clone();
+            }
+            meta.title_turn = meta.title_turn.max(disk.title_turn);
+        }
+
+        mutate(meta);
+        meta.updated_at = unix_now();
+
+        let entry = SessionEntry {
+            entry_type: "meta".to_string(),
+            role: String::new(),
+            content: String::new(),
+            tool_name: String::new(),
+            call_id: String::new(),
+            timestamp: meta.updated_at,
+            data: serde_json::to_value(&*meta).ok(),
+        };
+        Self::append_entry(&path, &entry);
+
+        if is_current {
+            self.meta = merged;
+        }
     }
 
     /// Record a compaction event.
@@ -304,18 +460,34 @@ impl SessionStore {
 
         let mut sessions = Vec::new();
         for path in paths.into_iter().take(limit) {
-            let first_line = match fs::read_to_string(&path) {
-                Ok(text) => text.lines().next().unwrap_or("").to_string(),
-                Err(_) => continue,
-            };
-            if first_line.is_empty() {
+            // Meta is append-only: the first `meta` line was written at
+            // creation, later ones (model switches, titles, counter flushes)
+            // are appended. Last one wins for current state; the first still
+            // owns `created_at`.
+            let Ok(text) = fs::read_to_string(&path) else {
                 continue;
-            }
-            let entry: serde_json::Value = match serde_json::from_str(&first_line) {
-                Ok(v) => v,
-                Err(_) => continue,
             };
-            let meta_data = entry.get("data").cloned().unwrap_or_default();
+            let mut first_meta: Option<SessionMeta> = None;
+            let mut last_meta: Option<SessionMeta> = None;
+            for line in text.lines() {
+                let line = line.trim();
+                if !line.starts_with("{\"type\":\"meta\"") {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<SessionEntry>(line) else {
+                    continue;
+                };
+                let Some(data) = entry.data else { continue };
+                let Ok(meta) = serde_json::from_value::<SessionMeta>(data) else {
+                    continue;
+                };
+                if first_meta.is_none() {
+                    first_meta = Some(meta.clone());
+                }
+                last_meta = Some(meta);
+            }
+            let Some(meta) = last_meta else { continue };
+
             let stem = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -325,24 +497,26 @@ impl SessionStore {
                 .metadata()
                 .map(|m| m.len() as f64 / 1024.0)
                 .unwrap_or(0.0);
+            let models = if meta.models.is_empty() && !meta.model.is_empty() {
+                vec![meta.model.clone()]
+            } else {
+                meta.models.clone()
+            };
 
             sessions.push(SessionInfo {
                 session_id: stem.clone(),
-                created_at: meta_data
-                    .get("created_at")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0),
-                turn_count: meta_data
-                    .get("turn_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize,
-                model: meta_data
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                created_at: first_meta
+                    .as_ref()
+                    .map(|m| m.created_at)
+                    .unwrap_or(meta.created_at),
+                turn_count: meta.turn_count,
+                model: meta.model.clone(),
                 size_kb,
                 is_latest: latest_id.as_deref() == Some(stem.as_str()),
+                title: meta.title.clone(),
+                summary: meta.summary.clone(),
+                title_source: meta.title_source.clone(),
+                models,
             });
         }
         sessions
@@ -358,6 +532,11 @@ impl SessionStore {
     /// Current session metadata, if any.
     pub fn meta(&self) -> Option<&SessionMeta> {
         self.meta.as_ref()
+    }
+
+    /// Mutable current session metadata, if any.
+    pub fn meta_mut(&mut self) -> Option<&mut SessionMeta> {
+        self.meta.as_mut()
     }
 
     /// Persist non-transcript session state to a sidecar JSON file.
@@ -382,14 +561,19 @@ impl SessionStore {
 
     fn write_entry(&self, entry: &SessionEntry) {
         if let Some(path) = &self.current_path {
-            self.maybe_rotate(path);
-            if let Ok(line) = serde_json::to_string(entry) {
-                let _ = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .and_then(|mut f| writeln!(f, "{line}"));
-            }
+            Self::append_entry(path, entry);
+        }
+    }
+
+    /// Rotate if needed, then append one serialized entry to `path`.
+    fn append_entry(path: &Path, entry: &SessionEntry) {
+        Self::maybe_rotate(path);
+        if let Ok(line) = serde_json::to_string(entry) {
+            let _ = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut f| writeln!(f, "{line}"));
         }
     }
 
@@ -403,7 +587,7 @@ impl SessionStore {
         }
     }
 
-    fn maybe_rotate(&self, path: &Path) {
+    fn maybe_rotate(path: &Path) {
         let size = path.metadata().map(|m| m.len()).unwrap_or(0);
         if size < MAX_FILE_SIZE {
             return;
@@ -447,7 +631,93 @@ impl SessionStore {
     }
 }
 
+// ── Title policy ─────────────────────────────────────────────────────
+
+/// Whether a title (re)generation is due for a session.
+///
+/// Policy — generate once the first real exchange has completed, then refresh
+/// sparingly: only after at least [`TITLE_REFRESH_MIN_GAP`] new turns AND at
+/// least a doubling of the turn count since the last generation attempt
+/// (`title_turn` marks attempts, not just successes, so a failed generation
+/// is retried on the same sparse schedule instead of every turn). A 100-turn
+/// session thus costs at most ~5 label generations, and a session that stops
+/// growing keeps the label it has.
+#[must_use]
+pub fn title_refresh_due(meta: &SessionMeta) -> bool {
+    if meta.turn_count < TITLE_FIRST_EXCHANGE_TURNS {
+        return false;
+    }
+    // `title_turn == 0` means no attempt ever; otherwise gate retries and
+    // refreshes alike on substantial growth since the last attempt.
+    meta.title_turn == 0
+        || (meta.turn_count.saturating_sub(meta.title_turn) >= TITLE_REFRESH_MIN_GAP
+            && meta.turn_count >= meta.title_turn.saturating_mul(2))
+}
+
+/// Deterministic fallback title: the first user message, cleaned and
+/// truncated at a word boundary. Needs no model, no network, no I/O — this is
+/// the label PRISM shows when running standalone. Never fails; empty input
+/// yields `"Untitled session"`.
+#[must_use]
+pub fn deterministic_title(first_user_message: &str) -> String {
+    let cleaned: String = first_user_message
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut words = cleaned.split_whitespace();
+    let Some(first) = words.next() else {
+        return "Untitled session".to_string();
+    };
+
+    let mut title = first.to_string();
+    let mut truncated = false;
+    if title.chars().count() > TITLE_MAX_CHARS {
+        // One giant word: hard-cut, leaving room for the ellipsis.
+        let cut = title
+            .char_indices()
+            .nth(TITLE_MAX_CHARS - 1)
+            .map(|(i, _)| i)
+            .unwrap_or(title.len());
+        title.truncate(cut);
+        truncated = true;
+    } else {
+        for word in words {
+            // +1 for the joining space.
+            if title.chars().count() + 1 + word.chars().count() > TITLE_MAX_CHARS {
+                truncated = true;
+                break;
+            }
+            title.push(' ');
+            title.push_str(word);
+        }
+    }
+    if truncated {
+        title.push('…');
+    }
+    title
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// The last `meta` entry persisted in a session file, if any. Meta updates
+/// are appended, so the last line is current.
+fn last_meta_in_file(path: &Path) -> Option<SessionMeta> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut last = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("{\"type\":\"meta\"") {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<SessionEntry>(line)
+            && let Some(data) = entry.data
+            && let Ok(meta) = serde_json::from_value::<SessionMeta>(data)
+        {
+            last = Some(meta);
+        }
+    }
+    last
+}
 
 /// Parse a session JSONL file into (messages, meta). Shared by
 /// [`SessionStore::resume_session`] (which also switches the current
@@ -637,6 +907,224 @@ mod tests {
             .load_runtime_state(&sid)
             .expect("runtime state should load");
         assert_eq!(loaded, state);
+    }
+
+    /// Build a `SessionMeta` for policy tests without going through the store.
+    fn meta_with(turn_count: usize, title: Option<&str>, title_turn: usize) -> SessionMeta {
+        SessionMeta {
+            session_id: "s".to_string(),
+            created_at: 0.0,
+            updated_at: 0.0,
+            model: "m".to_string(),
+            turn_count,
+            compaction_count: 0,
+            parent_session_id: None,
+            branch_name: None,
+            title: title.map(str::to_string),
+            summary: None,
+            title_source: None,
+            title_turn,
+            models: vec!["m".to_string()],
+        }
+    }
+
+    #[test]
+    fn title_and_summary_persist_across_reload() {
+        let (mut store, tmp) = make_store();
+        let sid = store.new_session("m1");
+        store.append_message("user", "screen perovskites", "", "", None);
+        store.append_message("assistant", "Starting the screen...", "", "", None);
+        store.update_session_meta(&sid.clone(), |meta| {
+            meta.title = Some("Perovskite screen".to_string());
+            meta.summary = Some("Screening perovskite candidates for stability.".to_string());
+            meta.title_source = Some("model".to_string());
+            meta.title_turn = 2;
+        });
+
+        // Fresh eyes — no shared memory, disk only.
+        let store2 = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let info = store2
+            .list_sessions(10)
+            .into_iter()
+            .find(|s| s.session_id == sid)
+            .expect("session listed");
+        assert_eq!(info.title.as_deref(), Some("Perovskite screen"));
+        assert_eq!(
+            info.summary.as_deref(),
+            Some("Screening perovskite candidates for stability.")
+        );
+        assert_eq!(info.title_source.as_deref(), Some("model"));
+
+        // Resume also picks the persisted meta up.
+        let mut store3 = SessionStore::new(Some(tmp.path().to_path_buf()));
+        store3.resume_session(&sid);
+        assert_eq!(
+            store3.meta().and_then(|m| m.title.as_deref()),
+            Some("Perovskite screen")
+        );
+    }
+
+    #[test]
+    fn meta_update_from_another_store_does_not_clobber_runtime_fields() {
+        // The title task writes through its own store while the runtime owns
+        // the live counters: neither may erase the other's fields.
+        let (mut store, tmp) = make_store();
+        let sid = store.new_session("m1");
+        for i in 0..10 {
+            store.append_message("user", &format!("msg {i}"), "", "", None);
+        }
+
+        // Detached-task side: sets a title from an outside store.
+        let mut task_store = SessionStore::new(Some(tmp.path().to_path_buf()));
+        task_store.update_session_meta(&sid.clone(), |meta| {
+            meta.title = Some("From the task".to_string());
+            meta.title_source = Some("heuristic".to_string());
+        });
+
+        // Runtime side: later counter flushes must keep the task's title, and
+        // the next flush adopts it into memory.
+        for i in 0..5 {
+            store.append_message("assistant", &format!("reply {i}"), "", "", None);
+        }
+        let meta = store.meta().unwrap();
+        assert_eq!(meta.title.as_deref(), Some("From the task"));
+        assert_eq!(meta.turn_count, 15);
+
+        // And the disk agrees with both writers.
+        let disk = last_meta_in_file(&tmp.path().join(format!("{sid}.jsonl"))).unwrap();
+        assert_eq!(disk.title.as_deref(), Some("From the task"));
+        assert_eq!(disk.turn_count, 15);
+    }
+
+    #[test]
+    fn model_switch_updates_session_info_and_keeps_model_set() {
+        let (mut store, tmp) = make_store();
+        let sid = store.new_session("m1");
+        store.append_message("user", "hello", "", "", None);
+
+        store.note_model_used("m2");
+        store.note_model_used("m3");
+        store.note_model_used("m2"); // revisits do not duplicate
+
+        let meta = store.meta().unwrap();
+        assert_eq!(meta.model, "m2");
+        let want: Vec<String> = ["m1", "m2", "m3"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(meta.models, want);
+
+        // SessionInfo — what the history rail renders — must agree.
+        let store2 = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let info = store2
+            .list_sessions(10)
+            .into_iter()
+            .find(|s| s.session_id == sid)
+            .expect("session listed");
+        assert_eq!(info.model, "m2");
+        assert_eq!(info.models, want);
+    }
+
+    #[test]
+    fn turn_counters_survive_reload_via_periodic_meta_flush() {
+        let (mut store, tmp) = make_store();
+        let sid = store.new_session("m1");
+        for i in 0..10 {
+            store.append_message("user", &format!("msg {i}"), "", "", None);
+            store.append_message("assistant", "ok", "", "", None);
+        }
+
+        // File alone must carry the counters — no shared memory.
+        let store2 = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let info = store2
+            .list_sessions(10)
+            .into_iter()
+            .find(|s| s.session_id == sid)
+            .expect("session listed");
+        assert_eq!(info.turn_count, 20);
+    }
+
+    #[test]
+    fn legacy_session_file_without_new_fields_loads() {
+        // The 130 pre-existing transcripts predate title/models fields; they
+        // must list cleanly with sane fallbacks.
+        let (store, tmp) = make_store();
+        let sid = "20260101_000000_deadbeef";
+        // Hand-written in the exact on-disk shape (struct field order — the
+        // `{\"type\":\"meta\"` prefix filter depends on it).
+        let meta_line = concat!(
+            "{\"type\":\"meta\",\"role\":\"\",\"content\":\"\",",
+            "\"tool_name\":\"\",\"call_id\":\"\",\"timestamp\":0.0,",
+            "\"data\":{\"session_id\":\"20260101_000000_deadbeef\",",
+            "\"created_at\":1000.0,\"updated_at\":1000.0,\"model\":\"old-model\",",
+            "\"turn_count\":4,\"compaction_count\":0,",
+            "\"parent_session_id\":null,\"branch_name\":null}}"
+        );
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            format!("{meta_line}\n"),
+        )
+        .unwrap();
+
+        let sessions = store.list_sessions(10);
+        assert_eq!(sessions.len(), 1);
+        let info = &sessions[0];
+        assert_eq!(info.model, "old-model");
+        assert_eq!(info.turn_count, 4);
+        assert_eq!(info.created_at, 1000.0);
+        assert!(info.title.is_none());
+        assert!(info.summary.is_none());
+        assert!(info.title_source.is_none());
+        assert_eq!(info.models, vec!["old-model".to_string()]);
+    }
+
+    #[test]
+    fn title_refresh_policy_first_exchange_then_substantial_growth() {
+        // Untitled, never attempted: due once the first real exchange lands.
+        assert!(!title_refresh_due(&meta_with(1, None, 0)));
+        assert!(title_refresh_due(&meta_with(2, None, 0)));
+
+        // Titled (or attempted) at turn 2: no churn mid-session; due again
+        // only after >= 16 new turns AND a doubling of the turn count.
+        assert!(!title_refresh_due(&meta_with(10, Some("T"), 2)));
+        assert!(!title_refresh_due(&meta_with(17, Some("T"), 2)));
+        assert!(title_refresh_due(&meta_with(18, Some("T"), 2)));
+
+        // The doubling gate bites on later refreshes: 16 new turns but not 2x.
+        assert!(!title_refresh_due(&meta_with(36, Some("T"), 20)));
+        assert!(title_refresh_due(&meta_with(40, Some("T"), 20)));
+
+        // A failed attempt (title_turn set, title still absent) retries on the
+        // same sparse schedule — never every turn.
+        assert!(!title_refresh_due(&meta_with(3, None, 2)));
+        assert!(title_refresh_due(&meta_with(18, None, 2)));
+    }
+
+    #[test]
+    fn deterministic_title_cleans_truncates_and_needs_no_model() {
+        // Short messages pass through untouched (after a trim).
+        assert_eq!(
+            deterministic_title("Screen perovskites for thermal stability"),
+            "Screen perovskites for thermal stability"
+        );
+        // Control chars and whitespace runs are cleaned.
+        assert_eq!(
+            deterministic_title("  compare\n\tBaTiO3  films "),
+            "compare BaTiO3 films"
+        );
+        // Empty input is still a session.
+        assert_eq!(deterministic_title(""), "Untitled session");
+        assert_eq!(deterministic_title("   \n  "), "Untitled session");
+
+        // Long messages truncate at a word boundary, marked with an ellipsis.
+        let long = (0..20)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let title = deterministic_title(&long);
+        assert!(title.chars().count() <= TITLE_MAX_CHARS, "got: {title}");
+        assert!(title.ends_with('\u{2026}'), "got: {title}");
+
+        // One giant word is hard-cut, still within the cap.
+        let huge = deterministic_title(&"x".repeat(500));
+        assert_eq!(huge.chars().count(), TITLE_MAX_CHARS);
     }
 
     #[test]
