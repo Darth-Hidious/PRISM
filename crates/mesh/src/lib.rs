@@ -195,7 +195,11 @@ pub fn start_mesh(
         // carries org_id, project_id, and roles — checked by every
         // peer before accepting requests from this node.
         if opts.auth_token.is_none() {
-            eprintln!("\x1b[33m  ⚠ Mesh disabled: no auth token — run `prism login` first.\x1b[0m");
+            // States the fact, not a command to go and type. Every surface that
+            // renders this (app, TUI, CLI) must offer authentication in place;
+            // telling a human to quit and run something is the defect this
+            // product keeps being called out for.
+            eprintln!("\x1b[33m  ⚠ Mesh disabled: not authenticated.\x1b[0m");
             eprintln!(
                 "\x1b[33m    The mesh requires platform authentication for RBAC enforcement.\x1b[0m"
             );
@@ -255,7 +259,7 @@ pub fn start_mesh(
                                         peer_name = %peer.name,
                                         peer_id = %peer.node_id,
                                         "discovered peer is NOT authenticated — refusing to add to mesh. \
-                                         Peer must run `prism login` before joining."
+                                         The peer must authenticate before joining."
                                     );
                                     continue;
                                 }
