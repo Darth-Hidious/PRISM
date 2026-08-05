@@ -6461,8 +6461,9 @@ fn print_ingest_summary(summary: &serde_json::Value) {
             if let Some(dropped) = result
                 .get("facts_dropped")
                 .and_then(|value| value.as_array())
+                && !dropped.is_empty()
             {
-                if !dropped.is_empty() {
+                {
                     println!(
                         "  Dropped: {} fact(s) refused before the store — their value is not in any source cell",
                         dropped.len()
