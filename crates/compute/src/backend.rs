@@ -73,11 +73,7 @@ impl ComputeRouter {
     }
 
     fn local_with_tracker(tracker: JobTracker) -> Self {
-        let licences = LicenceManager::new(
-            LicenceRegistry::load_default(),
-            tracker.clone(),
-            None,
-        );
+        let licences = LicenceManager::new(LicenceRegistry::load_default(), tracker.clone(), None);
         Self {
             local: LocalBackend::new(),
             marc27: None,
@@ -140,11 +136,7 @@ impl ComputeRouter {
     }
 
     fn marc27_with_tracker(api_base: &str, auth: Marc27Auth, tracker: JobTracker) -> Self {
-        let licences = LicenceManager::new(
-            LicenceRegistry::load_default(),
-            tracker.clone(),
-            None,
-        );
+        let licences = LicenceManager::new(LicenceRegistry::load_default(), tracker.clone(), None);
         Self::marc27_with_parts(api_base, auth, tracker, licences, None)
     }
 
@@ -167,11 +159,7 @@ impl ComputeRouter {
             licence_keys_dir,
             ..
         } = self;
-        let licences = LicenceManager::new(
-            Ok(registry),
-            tracker.clone(),
-            licence_keys_dir.clone(),
-        );
+        let licences = LicenceManager::new(Ok(registry), tracker.clone(), licence_keys_dir.clone());
         Self {
             local,
             marc27,
@@ -668,10 +656,7 @@ expires = "2126-12-31"
 
         // Seat is back: held count is zero and the single seat can be
         // checked out again.
-        assert_eq!(
-            router.licences().held_summary("vasp-6").await.seats_held,
-            0
-        );
+        assert_eq!(router.licences().held_summary("vasp-6").await.seats_held, 0);
         let hold = router
             .licences()
             .checkout(
@@ -703,8 +688,7 @@ expires = "2126-12-31"
             .with_licence_registry(LicenceRegistry::default());
         assert_eq!(no_time.lease_walltime(&plan).unwrap(), None);
 
-        let local =
-            ComputeRouter::local_only().with_licence_registry(LicenceRegistry::default());
+        let local = ComputeRouter::local_only().with_licence_registry(LicenceRegistry::default());
         assert_eq!(local.lease_walltime(&plan).unwrap(), None);
 
         let garbage = ComputeRouter::local_only()
@@ -755,19 +739,14 @@ expires = "2126-12-31"
         router.licences().drop_hold(hold.lease_id).await;
 
         // Exactly one seat held, by exactly the bound lease.
-        assert_eq!(
-            router.licences().held_summary("vasp-6").await.seats_held,
-            1
-        );
+        assert_eq!(router.licences().held_summary("vasp-6").await.seats_held, 1);
         let record = router.tracker().get(job_id).await.unwrap();
         assert_eq!(record.licence.as_ref(), Some(&lease));
         // The bound lease is bounded by the walltime (1h), not the
         // 2126 licence expiry.
         assert!(
             lease.expires_at
-                <= chrono::Utc::now()
-                    + chrono::Duration::hours(1)
-                    + chrono::Duration::seconds(5)
+                <= chrono::Utc::now() + chrono::Duration::hours(1) + chrono::Duration::seconds(5)
         );
 
         // Terminal state frees the seat — the release path.
@@ -775,15 +754,10 @@ expires = "2126-12-31"
             .tracker()
             .update_status(
                 job_id,
-                crate::job::TrackedStatus::Completed {
-                    duration_secs: 42,
-                },
+                crate::job::TrackedStatus::Completed { duration_secs: 42 },
             )
             .await
             .unwrap();
-        assert_eq!(
-            router.licences().held_summary("vasp-6").await.seats_held,
-            0
-        );
+        assert_eq!(router.licences().held_summary("vasp-6").await.seats_held, 0);
     }
 }

@@ -885,10 +885,7 @@ fn sbatch_script(
         // Opaque signed assertion (licence id, seats, job id, expiry,
         // signature). No secret travels: see the module contract above.
         let wire = lease.to_wire()?;
-        body.push_str(&format!(
-            "export PRISM_LEASE={}\n",
-            sh_single_quote(&wire)
-        ));
+        body.push_str(&format!("export PRISM_LEASE={}\n", sh_single_quote(&wire)));
     }
     body.push_str("export PRISM_TASK_ID=\"${PRISM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}\"\n");
     body.push_str(&format!(
@@ -1305,7 +1302,8 @@ mod tests {
             sif_path: "/shared/images/prism-worker.sif".into(),
         };
 
-        let script = sbatch_script(&job_id, "gpu", &config, r#"{"temperature":1200}"#, None).unwrap();
+        let script =
+            sbatch_script(&job_id, "gpu", &config, r#"{"temperature":1200}"#, None).unwrap();
 
         for directive in [
             "#SBATCH --partition=gpu",
@@ -1404,9 +1402,7 @@ mod tests {
     /// either is disclosed for good.
     #[test]
     fn licence_secret_never_reaches_sbatch_script_or_provenance() {
-        use crate::licence::{
-            LeaseKeys, LicenceRegistry, lease_provenance_record, sign_lease,
-        };
+        use crate::licence::{LeaseKeys, LicenceRegistry, lease_provenance_record, sign_lease};
 
         const SECRET: &str = "S3CR3T-serial-4242-flexlm-credential";
         let decl = format!(

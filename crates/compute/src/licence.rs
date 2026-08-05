@@ -137,10 +137,17 @@ impl Licence {
             bail!("licence entry with an empty id");
         }
         if raw.seats == 0 {
-            bail!("licence '{}' declares zero seats; seat count must be at least 1", raw.id);
+            bail!(
+                "licence '{}' declares zero seats; seat count must be at least 1",
+                raw.id
+            );
         }
-        let expires = parse_expiry(&raw.expires)
-            .with_context(|| format!("licence '{}' has an invalid expiry {:?}", raw.id, raw.expires))?;
+        let expires = parse_expiry(&raw.expires).with_context(|| {
+            format!(
+                "licence '{}' has an invalid expiry {:?}",
+                raw.id, raw.expires
+            )
+        })?;
         Ok(Self {
             id: raw.id,
             name: raw.name,
@@ -160,7 +167,10 @@ impl Licence {
 fn parse_expiry(text: &str) -> Result<DateTime<Utc>> {
     if let Ok(date) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
         // Valid through the end of the named day.
-        return Ok(date.and_hms_opt(23, 59, 59).expect("23:59:59 is valid").and_utc());
+        return Ok(date
+            .and_hms_opt(23, 59, 59)
+            .expect("23:59:59 is valid")
+            .and_utc());
     }
     let dt = DateTime::parse_from_rfc3339(text)?;
     Ok(dt.with_timezone(&Utc))
@@ -446,7 +456,7 @@ impl LeaseKeys {
                 return Err(e).with_context(|| format!("failed to open {}", key_path.display()));
             }
             Err(e) => {
-                return Err(e).with_context(|| format!("failed to open {}", key_path.display()))
+                return Err(e).with_context(|| format!("failed to open {}", key_path.display()));
             }
         }
         // The public half is not secret; publish it beside for pinning on
@@ -512,8 +522,10 @@ impl Lease {
             self.licence_id,
             self.seats,
             self.job_id,
-            self.issued_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            self.expires_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            self.issued_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            self.expires_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         )
         .into_bytes()
     }
@@ -522,17 +534,16 @@ impl Lease {
     /// question ([`Lease::is_expired`]) so a node can tell a forgery from
     /// an honest-but-late lease.
     pub fn verify(&self) -> Result<()> {
-        let key_bytes = hex::decode(&self.verifying_key)
-            .context("lease verifying key is not hex")?;
+        let key_bytes =
+            hex::decode(&self.verifying_key).context("lease verifying key is not hex")?;
         let key_bytes: [u8; 32] = key_bytes
             .try_into()
             .map_err(|_| anyhow::anyhow!("lease verifying key must be 32 bytes"))?;
         let verifying = VerifyingKey::from_bytes(&key_bytes)
             .context("lease verifying key is not a valid Ed25519 key")?;
-        let sig_bytes = hex::decode(&self.signature)
-            .context("lease signature is not hex")?;
-        let signature = Signature::from_slice(&sig_bytes)
-            .context("lease signature is malformed")?;
+        let sig_bytes = hex::decode(&self.signature).context("lease signature is not hex")?;
+        let signature =
+            Signature::from_slice(&sig_bytes).context("lease signature is malformed")?;
         verifying
             .verify_strict(&self.payload(), &signature)
             .map_err(|e| anyhow::anyhow!("lease signature does not verify: {e}"))
@@ -747,8 +758,9 @@ impl LicenceManager {
         let mut pending = self.pending.write().await;
         let summary = self.held_summary_locked(&request.id, now, &pending).await;
         if summary.seats_held.saturating_add(request.seats) > licence.seats {
-            return Err(LicenceError::no_seats(licence, summary.seats_held, summary.earliest_free)
-                .into());
+            return Err(
+                LicenceError::no_seats(licence, summary.seats_held, summary.earliest_free).into(),
+            );
         }
         let hold = SeatHold {
             lease_id: Uuid::new_v4(),
@@ -775,7 +787,10 @@ impl LicenceManager {
                 bail!("licence hold {} was already released", hold.lease_id);
             };
             if *live != *hold {
-                bail!("licence hold {} does not match its reservation", hold.lease_id);
+                bail!(
+                    "licence hold {} does not match its reservation",
+                    hold.lease_id
+                );
             }
         }
         let keys = self.keys().await?;
@@ -1061,7 +1076,10 @@ expires = "next tuesday"
 
     #[test]
     fn slurm_walltime_parses_all_slurm_forms() {
-        assert_eq!(parse_slurm_walltime("30").unwrap(), Duration::from_secs(30 * 60));
+        assert_eq!(
+            parse_slurm_walltime("30").unwrap(),
+            Duration::from_secs(30 * 60)
+        );
         assert_eq!(
             parse_slurm_walltime("10:30").unwrap(),
             Duration::from_secs(10 * 60 + 30)
@@ -1090,8 +1108,13 @@ expires = "next tuesday"
 
     #[test]
     fn slurm_walltime_rejects_garbage_and_zero() {
-        for bad in ["", "abc", "10:", ":10", "0", "00:00:00", "1-2-3", "10:70", "10:00:99"] {
-            assert!(parse_slurm_walltime(bad).is_err(), "{bad:?} should not parse");
+        for bad in [
+            "", "abc", "10:", ":10", "0", "00:00:00", "1-2-3", "10:70", "10:00:99",
+        ] {
+            assert!(
+                parse_slurm_walltime(bad).is_err(),
+                "{bad:?} should not parse"
+            );
         }
     }
 
@@ -1136,7 +1159,13 @@ secret = "serial-9f2a-SECRET"
         let lease = manager.mint(&hold, job_id).await.unwrap();
         manager
             .tracker()
-            .register(job_id, "licensed-job", "vasp6.sif", "byoc", crate::job::JobTarget::Local)
+            .register(
+                job_id,
+                "licensed-job",
+                "vasp6.sif",
+                "byoc",
+                crate::job::JobTarget::Local,
+            )
             .await
             .unwrap();
         manager
@@ -1155,9 +1184,7 @@ secret = "serial-9f2a-SECRET"
         // 16 racers for 2 seats.
         for _ in 0..16 {
             let manager = Arc::clone(&manager);
-            set.spawn(async move {
-                manager.checkout(&request("vasp-6", 1), None).await
-            });
+            set.spawn(async move { manager.checkout(&request("vasp-6", 1), None).await });
         }
         let mut granted = 0;
         let mut refused = 0;
@@ -1232,7 +1259,10 @@ expires = "{expiry_date}"
 
         // Walltime longer than the licence lifetime: licence expiry wins.
         let hold = manager
-            .checkout(&request("vasp-6", 1), Some(Duration::from_secs(500 * 86_400)))
+            .checkout(
+                &request("vasp-6", 1),
+                Some(Duration::from_secs(500 * 86_400)),
+            )
             .await
             .unwrap();
         let lease = manager.mint(&hold, Uuid::new_v4()).await.unwrap();
@@ -1249,7 +1279,8 @@ expires = "{expiry_date}"
         let lease = manager.mint(&hold, Uuid::new_v4()).await.unwrap();
         assert!(
             lease.expires_at <= before + chrono::Duration::seconds(600 + 5),
-            "{}", lease.expires_at
+            "{}",
+            lease.expires_at
         );
         assert!(lease.expires_at > before);
         lease.verify().unwrap();
@@ -1268,7 +1299,12 @@ expires = "{expiry_date}"
         // records the terminal state.
         manager
             .tracker()
-            .update_status(job_id, crate::job::TrackedStatus::Failed { error: "NODE_FAIL".into() })
+            .update_status(
+                job_id,
+                crate::job::TrackedStatus::Failed {
+                    error: "NODE_FAIL".into(),
+                },
+            )
             .await
             .unwrap();
 
@@ -1283,7 +1319,12 @@ expires = "{expiry_date}"
         let manager = manager_with(ONE_LICENCE);
         // Lease bounded by a 50ms walltime: the job vanishes without ever
         // releasing, and no status update ever arrives.
-        let (job_id, lease) = bind_lease(&manager, &request("vasp-6", 2), Some(Duration::from_millis(50))).await;
+        let (job_id, lease) = bind_lease(
+            &manager,
+            &request("vasp-6", 2),
+            Some(Duration::from_millis(50)),
+        )
+        .await;
         assert_eq!(manager.held_summary("vasp-6").await.seats_held, 2);
         assert!(!lease.is_expired(Utc::now()));
 
@@ -1293,7 +1334,15 @@ expires = "{expiry_date}"
         assert_eq!(manager.held_summary("vasp-6").await.seats_held, 0);
         // …and reclaim clears the stale record so the store stays honest.
         assert_eq!(manager.reclaim_expired().await.unwrap(), 1);
-        assert!(manager.tracker().get(job_id).await.unwrap().licence.is_none());
+        assert!(
+            manager
+                .tracker()
+                .get(job_id)
+                .await
+                .unwrap()
+                .licence
+                .is_none()
+        );
 
         // Seat count is back to full: both seats can be taken again.
         let hold = manager.checkout(&request("vasp-6", 2), None).await.unwrap();
@@ -1310,7 +1359,15 @@ expires = "{expiry_date}"
             .await
             .unwrap();
         assert_eq!(manager.reclaim_expired().await.unwrap(), 1);
-        assert!(manager.tracker().get(job_id).await.unwrap().licence.is_none());
+        assert!(
+            manager
+                .tracker()
+                .get(job_id)
+                .await
+                .unwrap()
+                .licence
+                .is_none()
+        );
         // Second sweep finds nothing left to reclaim.
         assert_eq!(manager.reclaim_expired().await.unwrap(), 0);
     }
@@ -1318,7 +1375,10 @@ expires = "{expiry_date}"
     #[tokio::test]
     async fn zero_licences_licensed_request_refuses_naming_what_is_missing() {
         let manager = manager_with("");
-        let error = manager.checkout(&request("vasp-6", 1), None).await.unwrap_err();
+        let error = manager
+            .checkout(&request("vasp-6", 1), None)
+            .await
+            .unwrap_err();
         let licence_error = error.downcast_ref::<LicenceError>().unwrap();
         let message = licence_error.to_string();
         assert!(
@@ -1333,7 +1393,10 @@ expires = "{expiry_date}"
     #[tokio::test]
     async fn unknown_licence_id_names_what_is_declared() {
         let manager = manager_with(ONE_LICENCE);
-        let error = manager.checkout(&request("ansys", 1), None).await.unwrap_err();
+        let error = manager
+            .checkout(&request("ansys", 1), None)
+            .await
+            .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("ansys"), "{message}");
         assert!(message.contains("vasp-6"), "{message}");
@@ -1346,7 +1409,10 @@ expires = "{expiry_date}"
             JobTracker::new(),
             None,
         );
-        let error = manager.checkout(&request("vasp-6", 1), None).await.unwrap_err();
+        let error = manager
+            .checkout(&request("vasp-6", 1), None)
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 error.downcast_ref::<LicenceError>(),
@@ -1375,12 +1441,15 @@ expires = "{expiry_date}"
     async fn no_seats_refusal_reports_held_count_and_next_free_time() {
         let manager = manager_with(ONE_LICENCE);
         let (_job_id, lease) = bind_lease(&manager, &request("vasp-6", 2), None).await;
-        let error = manager.checkout(&request("vasp-6", 1), None).await.unwrap_err();
+        let error = manager
+            .checkout(&request("vasp-6", 1), None)
+            .await
+            .unwrap_err();
         let licence_error = error.downcast_ref::<LicenceError>().unwrap();
         let (message, earliest_free) = match licence_error {
-            LicenceError::NoSeats {
-                earliest_free, ..
-            } => (licence_error.to_string(), *earliest_free),
+            LicenceError::NoSeats { earliest_free, .. } => {
+                (licence_error.to_string(), *earliest_free)
+            }
             other => panic!("expected NoSeats, got {other}"),
         };
         assert!(message.contains("2 seat(s) exist"), "{message}");
@@ -1408,11 +1477,7 @@ expires = "{expiry_date}"
 
         // A fresh process instance sees the bound lease and counts the seat.
         let tracker = JobTracker::persistent(&data_dir).unwrap();
-        let manager = LicenceManager::new(
-            LicenceRegistry::from_str(ONE_LICENCE),
-            tracker,
-            None,
-        );
+        let manager = LicenceManager::new(LicenceRegistry::from_str(ONE_LICENCE), tracker, None);
         let summary = manager.held_summary("vasp-6").await;
         assert_eq!(summary.seats_held, 1, "seat lost across process restart");
         let record = manager.tracker().get(job_id).await.unwrap();
@@ -1426,14 +1491,7 @@ expires = "{expiry_date}"
     // ── Signed leases ──────────────────────────────────────────────────
 
     fn test_lease(keys: &LeaseKeys, expires_at: DateTime<Utc>) -> Lease {
-        sign_lease(
-            keys,
-            "vasp-6",
-            4,
-            Uuid::new_v4(),
-            Utc::now(),
-            expires_at,
-        )
+        sign_lease(keys, "vasp-6", 4, Uuid::new_v4(), Utc::now(), expires_at)
     }
 
     #[test]
@@ -1508,7 +1566,11 @@ expires = "{expiry_date}"
     fn lease_expiry_is_bounded_by_licence_expiry() {
         let licence_expires = Utc::now() + chrono::Duration::days(30);
         // Walltime far beyond the licence expiry: the licence wins.
-        let expiry = bound_lease_expiry(licence_expires, Utc::now(), Some(Duration::from_secs(100 * 86_400)));
+        let expiry = bound_lease_expiry(
+            licence_expires,
+            Utc::now(),
+            Some(Duration::from_secs(100 * 86_400)),
+        );
         assert_eq!(expiry, licence_expires);
     }
 
@@ -1542,7 +1604,11 @@ expires = "{expiry_date}"
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join(LEASE_KEY_FILE)).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(dir.join(LEASE_KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600, "private lease key must be 0600");
         }
 
