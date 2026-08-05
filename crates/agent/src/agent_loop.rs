@@ -1654,90 +1654,103 @@ pub async fn run_turn(
             // and a call that never ran is not evidence of anything.
             tools_used_this_turn.push(tool_name.clone());
             let start = Instant::now();
-            let mut result: Result<Value> = if tool_name == crate::subagent::SPAWN_SUBAGENT_TOOL {
-                // spawn_subagent is a meta-tool by name, but unlike
-                // recall/find_tools it needs the LIVE turn machinery (LLM
-                // client, tool server, approval channel, policy engine) that
-                // execute_meta_tool cannot carry — so it is intercepted here,
-                // before the generic meta-tool dispatch. It runs one nested
-                // run_turn under the parent's permission/approval gating.
-                let sub_result = crate::subagent::execute_spawn_subagent(
-                    llm,
-                    tool_server,
-                    command_tool_runtime,
-                    tool_catalog,
-                    config,
-                    &args,
-                    hooks,
-                    permissions,
-                    live_permission_overrides.clone(),
-                    emit,
-                    approval_rx.clone(),
-                    policy.as_deref_mut(),
-                )
-                .await;
-                // The subagent's spend counts against the PARENT's cumulative
-                // budget too — delegation must not be a budget escape hatch.
-                if let Ok(value) = &sub_result {
-                    let (sub_in, sub_out) = crate::subagent::usage_from_result(value);
-                    transcript.record_cost("subagent", sub_in, sub_out);
-                }
-                sub_result.map(|value| serde_json::json!({ "result": value }))
-            } else if crate::meta_tools::is_meta_tool(tool_name) {
-                // Native meta-tools (recall / find_tools) operate on the agent's
-                // own state — durable memory + the tool catalog — so intercept
-                // them before command-tool / Python dispatch. Open the same
-                // Turso store the provenance hook writes to.
-                let db_path = dirs::home_dir()
-                    .map(|h| h.join(".prism/provenance.db"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
-                let store = prism_provenance::ProvenanceStore::open(&db_path).await.ok();
-                // Real session id so `recall` scopes to THIS session
-                // instead of the pre-fix literal "session" bucket.
-                let session_id = crate::hooks::provenance_session_id();
-                crate::meta_tools::execute_meta_tool(
-                    tool_name,
-                    &args,
-                    store.as_ref(),
-                    &session_id,
-                    tool_catalog,
-                )
-                .await
-                .map(|value| serde_json::json!({ "result": value }))
-            } else if command_tools::is_command_tool(tool_name) {
-                command_tools::execute_command_tool(
-                    command_tool_runtime,
-                    tool_name,
-                    &args,
-                    policy.as_deref_mut(),
-                )
-                .await
-                .map(|value| serde_json::json!({ "result": value }))
-            } else if tool_catalog
-                .find(tool_name)
-                .is_some_and(|tool| tool.source.as_deref() == Some("mcp"))
-            {
-                // External MCP tool (namespaced `mcp__<server>__<tool>`,
-                // admitted via extend_untrusted): route to the connected MCP
-                // server session instead of the Python tool server. The
-                // approval gate above already ran — MCP tools are untrusted,
-                // always requires_approval, never in the auto-approve set.
-                crate::mcp::call_global_tool(tool_name, &args).await
-            } else {
-                // Purpose-built Python tools remain available to LocalOnly
-                // callers, but arbitrary execute_python/execute_bash dispatch
-                // must prove node ownership before signaling the worker.
-                match command_tools::gate_external_tool_execution(
-                    tool_name,
-                    command_tools::current_platform_access(),
-                ) {
-                    Ok(_) => tool_server
-                        .call_tool(tool_name, args.clone())
+            let mut result: Result<Value> =
+                if let Some(meta_tool) = crate::meta_tools::MetaTool::from_name(tool_name) {
+                    // Native meta-tools, classified by EFFECT (`MetaTool::effect` —
+                    // an exhaustive, wildcard-free match). Read-only state access
+                    // (recall / find_tools / list_skills / list_failures) operates
+                    // on the agent's own state — durable memory + the tool catalog
+                    // — and is intercepted here before command-tool / Python
+                    // dispatch. The EXECUTING members (write_skill / run_skill run
+                    // un-sandboxed shell/Python as the node OS user; spawn_subagent
+                    // drives a nested turn over the same tool surface) pass the
+                    // same platform-access gate as every other execution surface —
+                    // resolved inside their executors so no dispatch path can skip
+                    // it. The old blanket `is_meta_tool` interception carried them
+                    // ahead of every gate call site.
+                    if meta_tool == crate::meta_tools::MetaTool::SpawnSubagent {
+                        // spawn_subagent needs the LIVE turn machinery (LLM
+                        // client, tool server, approval channel, policy engine)
+                        // that execute_meta_tool cannot carry — dispatched here,
+                        // access-gated inside execute_spawn_subagent. It runs one
+                        // nested run_turn under the parent's permission/approval
+                        // gating, inheriting (never widening) the caller's
+                        // platform access.
+                        let sub_result = crate::subagent::execute_spawn_subagent(
+                            llm,
+                            tool_server,
+                            command_tool_runtime,
+                            tool_catalog,
+                            config,
+                            &args,
+                            hooks,
+                            permissions,
+                            live_permission_overrides.clone(),
+                            emit,
+                            approval_rx.clone(),
+                            policy.as_deref_mut(),
+                        )
+                        .await;
+                        // The subagent's spend counts against the PARENT's cumulative
+                        // budget too — delegation must not be a budget escape hatch.
+                        if let Ok(value) = &sub_result {
+                            let (sub_in, sub_out) = crate::subagent::usage_from_result(value);
+                            transcript.record_cost("subagent", sub_in, sub_out);
+                        }
+                        sub_result.map(|value| serde_json::json!({ "result": value }))
+                    } else {
+                        // Open the same Turso store the provenance hook writes to.
+                        let db_path = dirs::home_dir()
+                            .map(|h| h.join(".prism/provenance.db"))
+                            .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+                        let store = prism_provenance::ProvenanceStore::open(&db_path).await.ok();
+                        // Real session id so `recall` scopes to THIS session
+                        // instead of the pre-fix literal "session" bucket.
+                        let session_id = crate::hooks::provenance_session_id();
+                        crate::meta_tools::execute_meta_tool(
+                            tool_name,
+                            &args,
+                            store.as_ref(),
+                            &session_id,
+                            tool_catalog,
+                        )
                         .await
-                        .map_err(Into::into),
-                    Err(error) => Err(error),
-                }
-            };
+                        .map(|value| serde_json::json!({ "result": value }))
+                    }
+                } else if command_tools::is_command_tool(tool_name) {
+                    command_tools::execute_command_tool(
+                        command_tool_runtime,
+                        tool_name,
+                        &args,
+                        policy.as_deref_mut(),
+                    )
+                    .await
+                    .map(|value| serde_json::json!({ "result": value }))
+                } else if tool_catalog
+                    .find(tool_name)
+                    .is_some_and(|tool| tool.source.as_deref() == Some("mcp"))
+                {
+                    // External MCP tool (namespaced `mcp__<server>__<tool>`,
+                    // admitted via extend_untrusted): route to the connected MCP
+                    // server session instead of the Python tool server. The
+                    // approval gate above already ran — MCP tools are untrusted,
+                    // always requires_approval, never in the auto-approve set.
+                    crate::mcp::call_global_tool(tool_name, &args).await
+                } else {
+                    // Purpose-built Python tools remain available to LocalOnly
+                    // callers, but arbitrary execute_python/execute_bash dispatch
+                    // must prove node ownership before signaling the worker.
+                    match command_tools::gate_external_tool_execution(
+                        tool_name,
+                        command_tools::current_platform_access(),
+                    ) {
+                        Ok(_) => tool_server
+                            .call_tool(tool_name, args.clone())
+                            .await
+                            .map_err(Into::into),
+                        Err(error) => Err(error),
+                    }
+                };
 
             // Auto-pin tools surfaced by find_tools so their full definitions
             // become callable next iteration (the "now available" hint used to

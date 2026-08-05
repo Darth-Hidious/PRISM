@@ -24,7 +24,17 @@
 //!   OPA policy engine, and approval channel. Approval requests raised inside
 //!   the subagent are forwarded to the parent's event sink, so the SAME
 //!   human/headless approver answers them; `auto_approve` is inherited
-//!   verbatim, never widened.
+//!   verbatim, never widened. Platform access is inherited too:
+//!   `current_platform_access` is a task-local scoped by the transport around
+//!   the whole parent turn (`command_tools::with_platform_access`), and the
+//!   nested `run_turn` is awaited within the same task and scope — so the
+//!   subagent sees exactly the caller's access, and every gate (command
+//!   tools, Python/MCP dispatch, meta-tools) re-runs inside the nested turn.
+//! - **The spawn itself is access-gated** (effect-classified `ExecutesCode`):
+//!   delegation drives a nested turn over the same code-running tool surface,
+//!   so it requires node-owner access like the tools it can drive — a
+//!   LocalOnly caller gets an honest refusal at the spawn instead of a nested
+//!   turn that spends frontier-model tokens before failing at the inner gates.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -43,7 +53,8 @@ use crate::tool_catalog::{LoadedTool, ToolCatalog};
 use crate::transcript::{TranscriptStore, TurnBudget};
 use crate::types::{AgentConfig, AgentEvent, UsageInfo};
 
-/// The meta-tool name (also listed in `meta_tools::META_TOOLS`).
+/// The meta-tool name (the [`crate::meta_tools::MetaTool::SpawnSubagent`]
+/// variant of the closed meta-tool registry).
 pub const SPAWN_SUBAGENT_TOOL: &str = "spawn_subagent";
 
 /// Default model for delegated tasks — the frontier tier. Registered in
@@ -234,6 +245,18 @@ async fn execute_spawn_subagent_inner(
     approval_rx: Option<SharedApprovalReceiver>,
     policy: Option<&mut prism_policy::PolicyEngine>,
 ) -> Result<Value> {
+    // SAFETY: access gate FIRST. spawn_subagent is effect-classified
+    // ExecutesCode (it drives a nested turn over the same code-running tool
+    // surface), so it resolves node-owner access through the same gate every
+    // other execution surface uses — before a nested turn, a model call, or
+    // any token is spent. The nested turn inherits THIS access via the
+    // task-local scope and re-runs every gate inside; delegation can never
+    // widen it (see module docs).
+    crate::command_tools::gate_meta_tool_execution(
+        crate::meta_tools::MetaTool::SpawnSubagent,
+        crate::command_tools::current_platform_access(),
+    )?;
+
     // SAFETY: recursion cap — enforced before anything is spent.
     if let Some(err) = depth_cap_error(parent_config) {
         return Ok(err);

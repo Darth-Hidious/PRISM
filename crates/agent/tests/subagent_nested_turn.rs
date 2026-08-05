@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use prism_agent::agent_loop;
+use prism_agent::command_tools::CommandToolPlatformAccess;
 
 /// Serialize the tests in this binary. They all drive `run_turn`, whose entry
 /// resets the PROCESS-GLOBAL repair-chain memory (`hooks::LAST_CODE_RUN`); the
@@ -168,12 +169,16 @@ fn llm_config(base_url: String) -> LlmConfig {
 }
 
 /// Drive one backend turn (the TUI dispatch path) and collect every emitted
-/// event plus the final answer.
+/// event plus the final answer. `access` is the platform-credential boundary
+/// the transport establishes around the turn: the real TUI dispatch scopes
+/// `VerifiedNodeOwner` (protocol::spawn_agent_turn); tests for non-owner
+/// callers pass `LocalOnly` (the unscoped default).
 async fn run_parent_turn(
     project: &Path,
     python: &Path,
     base_url: String,
     subagent_depth: usize,
+    access: CommandToolPlatformAccess,
 ) -> (String, Vec<AgentEvent>) {
     let seed = build_agent_seed(
         &tool_server_config(project, python),
@@ -198,32 +203,35 @@ async fn run_parent_turn(
     let mut scratchpad = prism_agent::scratchpad::Scratchpad::new();
     let mut answer = String::new();
     let mut events: Vec<AgentEvent> = Vec::new();
-    agent_loop::run_turn(
-        &llm,
-        &mut tool_server,
-        &command_tool_runtime,
-        &mut history,
-        tools.as_ref(),
-        &config,
-        "delegate the echo task",
-        None, // chat path — no task context
-        &mut transcript,
-        hooks.as_ref(),
-        &permissions,
-        None,
-        &mut scratchpad,
-        &mut |event| {
-            if let AgentEvent::TurnComplete {
-                text: Some(text), ..
-            } = &event
-                && !text.is_empty()
-            {
-                answer = text.clone();
-            }
-            events.push(event);
-        },
-        None,
-        None,
+    prism_agent::command_tools::with_platform_access(
+        access,
+        agent_loop::run_turn(
+            &llm,
+            &mut tool_server,
+            &command_tool_runtime,
+            &mut history,
+            tools.as_ref(),
+            &config,
+            "delegate the echo task",
+            None, // chat path — no task context
+            &mut transcript,
+            hooks.as_ref(),
+            &permissions,
+            None,
+            &mut scratchpad,
+            &mut |event| {
+                if let AgentEvent::TurnComplete {
+                    text: Some(text), ..
+                } = &event
+                    && !text.is_empty()
+                {
+                    answer = text.clone();
+                }
+                events.push(event);
+            },
+            None,
+            None,
+        ),
     )
     .await
     .expect("parent turn");
@@ -253,7 +261,14 @@ async fn spawn_subagent_runs_a_nested_turn_that_calls_tools() {
     let base_url = start_stub_llm().await;
     let calls_log = project.path().join("calls.log");
 
-    let (answer, events) = run_parent_turn(project.path(), &python, base_url, 0).await;
+    let (answer, events) = run_parent_turn(
+        project.path(),
+        &python,
+        base_url,
+        0,
+        CommandToolPlatformAccess::VerifiedNodeOwner,
+    )
+    .await;
 
     // Parent finished ON TOP of the subagent's result.
     assert_eq!(answer, "PARENT_DONE");
@@ -303,6 +318,7 @@ async fn spawn_subagent_refuses_beyond_max_depth() {
         &python,
         base_url,
         prism_agent::subagent::MAX_SUBAGENT_DEPTH,
+        CommandToolPlatformAccess::VerifiedNodeOwner,
     )
     .await;
 
@@ -319,6 +335,51 @@ async fn spawn_subagent_refuses_beyond_max_depth() {
     assert!(
         !calls_log.exists(),
         "no nested tool may run past the depth cap"
+    );
+}
+
+/// Round 7: spawn_subagent is effect-classified ExecutesCode — it drives a
+/// nested turn over the same code-running tool surface — so a LocalOnly
+/// (non-owner) caller is refused at the spawn itself. The turn still
+/// completes honestly; no nested LLM call or tool execution may happen.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_only_caller_cannot_spawn_a_subagent() {
+    let _serial = SERIAL_TEST_LOCK.lock().await;
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let base_url = start_stub_llm().await;
+    let calls_log = project.path().join("calls.log");
+
+    let (answer, events) = run_parent_turn(
+        project.path(),
+        &python,
+        base_url,
+        0,
+        CommandToolPlatformAccess::LocalOnly,
+    )
+    .await;
+
+    assert_eq!(
+        answer, "PARENT_DONE",
+        "the refusal still completes the turn"
+    );
+    let sub_result =
+        tool_result_content(&events, "spawn_subagent").expect("spawn_subagent result event");
+    assert!(
+        sub_result.contains("owner-only"),
+        "refusal must say why approval is insufficient: {sub_result}"
+    );
+    assert!(
+        sub_result.contains("verified node-owner session"),
+        "{sub_result}"
+    );
+    assert!(
+        !calls_log.exists(),
+        "no nested tool may run for a refused spawn"
     );
 }
 
@@ -422,7 +483,14 @@ async fn spawn_subagent_preserves_parent_repair_chain() {
     // Clean the process-global chain so we assert only on THIS turn's records.
     prism_agent::hooks::reset_code_run_chain();
 
-    let (answer, events) = run_parent_turn(project.path(), &python, base_url, 0).await;
+    let (answer, events) = run_parent_turn(
+        project.path(),
+        &python,
+        base_url,
+        0,
+        CommandToolPlatformAccess::VerifiedNodeOwner,
+    )
+    .await;
 
     // The parent finished ON TOP of the subagent (the real wiring ran).
     assert_eq!(answer, "PARENT_DONE");

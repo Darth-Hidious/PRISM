@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
+use crate::meta_tools::{MetaTool, MetaToolEffect};
 use crate::permissions::PermissionMode;
 use crate::tool_catalog::LoadedTool;
 
@@ -23,6 +24,10 @@ const CODE_EXECUTION_ACCESS_REFUSAL: &str = "Un-sandboxed code execution is owne
      non-owner. This request requires a verified node-owner session.";
 const MCP_ACCESS_REFUSAL: &str = "External MCP execution is owner-only: globally installed MCP servers may inherit node \
      credentials. This request requires a verified node-owner session.";
+const META_EXECUTION_ACCESS_REFUSAL: &str = "Un-sandboxed meta-tool execution is owner-only: write_skill and run_skill execute authored \
+     shell/Python as the node OS user, and spawn_subagent drives a nested agent turn over the \
+     same code-running tools, so caller approval cannot authorize a non-owner. This request \
+     requires a verified node-owner session.";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CommandToolPlatformAccess {
@@ -42,7 +47,15 @@ tokio::task_local! {
     static PLATFORM_ACCESS: CommandToolPlatformAccess;
 }
 
-pub(crate) async fn with_platform_access<F, T>(access: CommandToolPlatformAccess, future: F) -> T
+/// Establish the transport's platform-credential boundary for the scope of one
+/// future. Every access gate (`gate_command_execution`,
+/// `gate_external_tool_execution`, `gate_meta_tool_execution`) reads this
+/// task-local; a transport sets it once at its entry point (the TUI backend
+/// scopes its turns as `VerifiedNodeOwner`; the HTTP chat service scopes each
+/// turn with the access it resolved for the caller). Futures AWAITED inside
+/// the scope — including nested subagent turns — inherit the same value, so
+/// delegation can never widen access.
+pub async fn with_platform_access<F, T>(access: CommandToolPlatformAccess, future: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
@@ -1202,6 +1215,35 @@ pub(crate) fn gate_external_tool_execution(
         }
         (CommandToolPlatformAccess::LocalOnly, Some(message)) => bail!(message),
         (CommandToolPlatformAccess::UnverifiedHttp, _) => Err(platform_access_refusal()),
+    }
+}
+
+/// Gate the native meta-tools by their EFFECT classification, not their
+/// membership: `recall`/`find_tools`/`list_skills`/`list_failures` read agent
+/// state and pass for LocalOnly callers, while `write_skill`/`run_skill`
+/// (un-sandboxed shell/Python as the node OS user) and `spawn_subagent`
+/// (drives a nested turn over the same tool surface) require a verified
+/// node-owner session — same as `execute_python`/`execute_bash`.
+///
+/// Exhaustive by design, like [`gate_command_execution`]: the requirement is
+/// derived from [`MetaTool::effect`], a wildcard-free match over the closed
+/// [`MetaTool`] registry, so a meta-tool added later cannot compile until
+/// someone declares whether it executes.
+pub(crate) fn gate_meta_tool_execution(
+    meta_tool: MetaTool,
+    platform_access: CommandToolPlatformAccess,
+) -> Result<()> {
+    match (platform_access, meta_tool.effect()) {
+        (CommandToolPlatformAccess::VerifiedNodeOwner, MetaToolEffect::ReadOnly)
+        | (CommandToolPlatformAccess::VerifiedNodeOwner, MetaToolEffect::ExecutesCode)
+        | (CommandToolPlatformAccess::LocalOnly, MetaToolEffect::ReadOnly) => Ok(()),
+        (CommandToolPlatformAccess::LocalOnly, MetaToolEffect::ExecutesCode) => {
+            bail!(META_EXECUTION_ACCESS_REFUSAL)
+        }
+        (CommandToolPlatformAccess::UnverifiedHttp, MetaToolEffect::ReadOnly)
+        | (CommandToolPlatformAccess::UnverifiedHttp, MetaToolEffect::ExecutesCode) => {
+            Err(platform_access_refusal())
+        }
     }
 }
 
@@ -4915,6 +4957,59 @@ mod tests {
             gate_command_execution(&executions[6], CommandToolPlatformAccess::LocalOnly).is_err(),
             "shared notebook reset is owner-only"
         );
+    }
+
+    /// Round 7: the meta-tool gate keys on the EFFECT classification. LocalOnly
+    /// callers keep the read-only state tools but cannot reach the executing
+    /// ones; the owner keeps all of them; UnverifiedHttp fails closed for all.
+    #[test]
+    fn meta_tool_gate_allows_read_only_for_local_only_and_owner_only_execution() {
+        let read_only = [
+            MetaTool::Recall,
+            MetaTool::FindTools,
+            MetaTool::ListSkills,
+            MetaTool::ListFailures,
+        ];
+        let executing = [
+            MetaTool::WriteSkill,
+            MetaTool::RunSkill,
+            MetaTool::SpawnSubagent,
+        ];
+
+        for tool in read_only {
+            assert!(
+                gate_meta_tool_execution(tool, CommandToolPlatformAccess::LocalOnly).is_ok(),
+                "read-only meta-tools must stay available to LocalOnly callers: {}",
+                tool.name()
+            );
+            assert!(
+                gate_meta_tool_execution(tool, CommandToolPlatformAccess::VerifiedNodeOwner)
+                    .is_ok(),
+                "{}",
+                tool.name()
+            );
+        }
+        for tool in executing {
+            let error = gate_meta_tool_execution(tool, CommandToolPlatformAccess::LocalOnly)
+                .expect_err("executing meta-tools are owner-only");
+            assert!(
+                error.to_string().contains("owner-only"),
+                "refusal must say why approval is insufficient: {error:#}"
+            );
+            assert!(
+                gate_meta_tool_execution(tool, CommandToolPlatformAccess::VerifiedNodeOwner)
+                    .is_ok(),
+                "the verified owner keeps {}: {error:#}",
+                tool.name()
+            );
+        }
+        for tool in MetaTool::ALL {
+            assert!(
+                gate_meta_tool_execution(tool, CommandToolPlatformAccess::UnverifiedHttp).is_err(),
+                "every meta-tool must fail closed for unverified HTTP: {}",
+                tool.name()
+            );
+        }
     }
 
     #[cfg(unix)]

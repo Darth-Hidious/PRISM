@@ -20,16 +20,107 @@ use prism_provenance::ProvenanceStore;
 use crate::permissions::PermissionMode;
 use crate::tool_catalog::{LoadedTool, ToolCatalog};
 
-/// Tool names handled natively by the meta-tool layer.
-const META_TOOLS: &[&str] = &[
-    "recall",
-    "find_tools",
-    "write_skill",
-    "run_skill",
-    "list_skills",
-    "spawn_subagent",
-    "list_failures",
-];
+/// What a meta-tool DOES — the classification the access gate keys on. The
+/// layer is NOT homogeneous: most members read agent state, but `write_skill`
+/// and `run_skill` execute un-sandboxed shell/Python as the node OS user, and
+/// `spawn_subagent` drives a nested agent turn over the same tool surface.
+/// Classifying by membership alone ("it is a meta-tool") is what once carried
+/// the executing members ahead of every gate call site — so classification is
+/// by effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaToolEffect {
+    /// Pure read of agent state (durable memory, tool catalog, skill
+    /// inventory, failure list). Keeps the early interception in the agent
+    /// loop; no platform-access gate.
+    ReadOnly,
+    /// Executes code, or drives a nested agent turn that can. Must pass the
+    /// same platform-access gate as every other execution surface (see
+    /// `command_tools::gate_meta_tool_execution`).
+    ExecutesCode,
+}
+
+/// The closed registry of native meta-tools. Adding a tool means adding a
+/// variant, and [`MetaTool::name`] and [`MetaTool::effect`] are wildcard-free
+/// matches over it — a new meta-tool CANNOT COMPILE until someone declares its
+/// wire name AND whether it executes. That exhaustiveness is the property that
+/// closed the command-dispatch series (`gate_command_execution`), reused here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaTool {
+    Recall,
+    FindTools,
+    WriteSkill,
+    RunSkill,
+    ListSkills,
+    SpawnSubagent,
+    ListFailures,
+}
+
+impl MetaTool {
+    /// Every meta-tool. A variant missing from this array still cannot skip
+    /// classification (the wildcard-free matches force it), but it would skip
+    /// the registry-parity test — the array makes that a compile-time count.
+    pub const ALL: [MetaTool; 7] = [
+        MetaTool::Recall,
+        MetaTool::FindTools,
+        MetaTool::WriteSkill,
+        MetaTool::RunSkill,
+        MetaTool::ListSkills,
+        MetaTool::SpawnSubagent,
+        MetaTool::ListFailures,
+    ];
+
+    /// Parse the wire name. Strings are an open set so the `_` arm is
+    /// unavoidable — but this is REGISTRATION, not classification: every
+    /// variant that can be constructed is forced through the exhaustive
+    /// [`MetaTool::effect`] before any gate decision.
+    #[must_use]
+    pub fn from_name(tool_name: &str) -> Option<MetaTool> {
+        match tool_name {
+            "recall" => Some(MetaTool::Recall),
+            "find_tools" => Some(MetaTool::FindTools),
+            "write_skill" => Some(MetaTool::WriteSkill),
+            "run_skill" => Some(MetaTool::RunSkill),
+            "list_skills" => Some(MetaTool::ListSkills),
+            "spawn_subagent" => Some(MetaTool::SpawnSubagent),
+            "list_failures" => Some(MetaTool::ListFailures),
+            _ => None,
+        }
+    }
+
+    /// The wire name — wildcard-free, so a new variant cannot compile until
+    /// it is named.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            MetaTool::Recall => "recall",
+            MetaTool::FindTools => "find_tools",
+            MetaTool::WriteSkill => "write_skill",
+            MetaTool::RunSkill => "run_skill",
+            MetaTool::ListSkills => "list_skills",
+            MetaTool::SpawnSubagent => "spawn_subagent",
+            MetaTool::ListFailures => "list_failures",
+        }
+    }
+
+    /// Effect classification — wildcard-free, so a new variant cannot compile
+    /// until someone declares whether it executes.
+    #[must_use]
+    pub fn effect(self) -> MetaToolEffect {
+        match self {
+            MetaTool::Recall
+            | MetaTool::FindTools
+            | MetaTool::ListSkills
+            | MetaTool::ListFailures => MetaToolEffect::ReadOnly,
+            // write_skill verifies by RUNNING the code once; run_skill
+            // re-executes stored code; spawn_subagent drives a nested turn
+            // over the same code-running tool surface. All three are
+            // node-owner only.
+            MetaTool::WriteSkill | MetaTool::RunSkill | MetaTool::SpawnSubagent => {
+                MetaToolEffect::ExecutesCode
+            }
+        }
+    }
+}
 
 /// How many matches `recall(query)` returns by default.
 const DEFAULT_RECALL_LIMIT: usize = 5;
@@ -61,7 +152,7 @@ const FIND_TOOLS_DESC_CHARS: usize = 400;
 /// True if `tool_name` is handled by the native meta-tool layer.
 #[must_use]
 pub fn is_meta_tool(tool_name: &str) -> bool {
-    META_TOOLS.contains(&tool_name)
+    MetaTool::from_name(tool_name).is_some()
 }
 
 /// True if `tool_name` is a reserved, trusted built-in — a native meta-tool or
@@ -245,6 +336,13 @@ pub fn definitions() -> Vec<LoadedTool> {
 
 /// Execute a meta-tool. Returns the tool's result value; the caller wraps it
 /// as `{ "result": ... }` to match the command-tool convention.
+///
+/// Access is resolved HERE, not at any one dispatch site: executing meta-tools
+/// (`write_skill` / `run_skill`) run un-sandboxed code as the node OS user, so
+/// they must prove node-owner access exactly like every other execution
+/// surface — no matter who calls (agent-loop dispatch, the `/skills` slash
+/// command, or anything added later). Read-only state access stays open to
+/// LocalOnly callers. Mirrors `execute_command_tool`, which gates internally.
 pub async fn execute_meta_tool(
     tool_name: &str,
     args: &Value,
@@ -252,22 +350,31 @@ pub async fn execute_meta_tool(
     session_id: &str,
     catalog: &ToolCatalog,
 ) -> Result<Value> {
-    match tool_name {
-        "recall" => recall(args, store, session_id).await,
-        "find_tools" => Ok(find_tools(args, catalog)),
-        "write_skill" => write_skill(args).await,
-        "run_skill" => run_skill(args).await,
-        "list_skills" => Ok(list_skills()),
-        "list_failures" => list_failures(args, store, session_id).await,
+    let meta_tool = MetaTool::from_name(tool_name)
+        .ok_or_else(|| anyhow::anyhow!("unknown meta-tool '{tool_name}'"))?;
+    crate::command_tools::gate_meta_tool_execution(
+        meta_tool,
+        crate::command_tools::current_platform_access(),
+    )?;
+
+    // Wildcard-free over the closed registry: a new meta-tool cannot compile
+    // until it is wired here.
+    match meta_tool {
+        MetaTool::Recall => recall(args, store, session_id).await,
+        MetaTool::FindTools => Ok(find_tools(args, catalog)),
+        MetaTool::WriteSkill => write_skill(args).await,
+        MetaTool::RunSkill => run_skill(args).await,
+        MetaTool::ListSkills => Ok(list_skills()),
+        MetaTool::ListFailures => list_failures(args, store, session_id).await,
         // Needs the live turn machinery (LLM client, tool server, approval
         // channel), which this signature cannot carry — the agent loop
         // intercepts it BEFORE this dispatcher (see agent_loop.rs). Reaching
         // this arm means a caller (e.g. the single-tool executor) tried to
-        // run it out of context.
-        "spawn_subagent" => anyhow::bail!(
+        // run it out of context. The access gate above already ran, so this
+        // refusal is about context, not privilege.
+        MetaTool::SpawnSubagent => anyhow::bail!(
             "spawn_subagent runs a nested agent turn and is dispatched inside the agent loop only"
         ),
-        other => anyhow::bail!("unknown meta-tool '{other}'"),
     }
 }
 
@@ -763,6 +870,74 @@ mod tests {
         assert!(!is_meta_tool("peek_result"));
     }
 
+    /// The exhaustive-classification invariant (round 7): a meta-tool added
+    /// later cannot skip declaring what it does. The compile-time half is the
+    /// wildcard-free matches in [`MetaTool::name`] and [`MetaTool::effect`] —
+    /// a new variant fails to build until both are extended. This test is the
+    /// runtime half: the closed registry round-trips name->enum->name, matches
+    /// the definitions offered to the model exactly, and the effect split the
+    /// access gate keys on is the deliberate one (moving a tool across the
+    /// line must update this test).
+    #[test]
+    fn new_meta_tool_cannot_skip_name_or_effect_classification() {
+        // Every registered variant round-trips and is recognized.
+        for tool in MetaTool::ALL {
+            assert_eq!(MetaTool::from_name(tool.name()), Some(tool));
+            assert!(is_meta_tool(tool.name()), "{}", tool.name());
+        }
+        // Read-only state access: may keep the early interception.
+        for tool in [
+            MetaTool::Recall,
+            MetaTool::FindTools,
+            MetaTool::ListSkills,
+            MetaTool::ListFailures,
+        ] {
+            assert_eq!(tool.effect(), MetaToolEffect::ReadOnly, "{}", tool.name());
+        }
+        // Code execution (or a nested turn that drives it): owner-gated.
+        for tool in [
+            MetaTool::WriteSkill,
+            MetaTool::RunSkill,
+            MetaTool::SpawnSubagent,
+        ] {
+            assert_eq!(
+                tool.effect(),
+                MetaToolEffect::ExecutesCode,
+                "{}",
+                tool.name()
+            );
+        }
+        // Registry parity with the definitions offered to the model: neither
+        // side may grow without the other.
+        let mut def_names: Vec<String> = definitions().iter().map(|t| t.name.clone()).collect();
+        let mut all_names: Vec<String> =
+            MetaTool::ALL.iter().map(|t| t.name().to_string()).collect();
+        def_names.sort();
+        all_names.sort();
+        assert_eq!(def_names, all_names);
+    }
+
+    /// The gate is INSIDE the executor (mirrors `execute_command_tool`), so
+    /// every dispatch path — agent loop, `/skills` slash command, anything
+    /// later — resolves access here. Default platform access is LocalOnly
+    /// (non-owner): executing meta-tools must refuse, read-only state access
+    /// must not.
+    #[tokio::test]
+    async fn execute_meta_tool_refuses_non_owner_execution_and_allows_read_only() {
+        let catalog = ToolCatalog::from_tool_server_json(&json!({ "tools": [] }));
+        for tool in ["write_skill", "run_skill"] {
+            let err = execute_meta_tool(tool, &json!({ "name": "x" }), None, "", &catalog)
+                .await
+                .expect_err("{tool} must be refused for a LocalOnly caller");
+            assert!(err.to_string().contains("owner-only"), "{tool}: {err:#}");
+        }
+        // Read-only members pass the same default access.
+        let out = execute_meta_tool("list_skills", &json!({}), None, "", &catalog)
+            .await
+            .expect("read-only meta-tools must not be gated");
+        assert!(out["skills"].is_array(), "{out}");
+    }
+
     #[test]
     fn reserved_names_cover_meta_and_command_tools_but_not_arbitrary() {
         // Anti-spoofing: both trusted layers are reserved against authored/user tools.
@@ -1205,10 +1380,19 @@ mod tests {
     /// green "completed" card. We store a failing body directly (the same
     /// `skills::store` path write_skill uses after verification) to reach the
     /// "stored-then-broke" state deterministically.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_skill_failure_emits_success_error_contract() {
         let (_g, _dir) = crate::skills::test_env_guard("meta-runskill-fail");
+        // run_skill is execution-class: the gate requires node-owner access,
+        // which this test simulates (TUI dispatch scopes turns the same way).
+        crate::command_tools::with_platform_access(
+            crate::command_tools::CommandToolPlatformAccess::VerifiedNodeOwner,
+            run_skill_failure_emits_success_error_contract_owner(),
+        )
+        .await;
+    }
+
+    async fn run_skill_failure_emits_success_error_contract_owner() {
         let catalog = ToolCatalog::from_tool_server_json(&json!({ "tools": [] }));
 
         let drifted = crate::skills::AuthoredSkill::new(
@@ -1257,6 +1441,17 @@ mod tests {
     #[tokio::test]
     async fn write_skill_verifies_stores_lists_and_runs() {
         let (_g, _dir) = crate::skills::test_env_guard("meta-writeskill");
+        // write_skill/run_skill are execution-class: the gate requires
+        // node-owner access, which this test simulates (TUI dispatch scopes
+        // turns the same way; see protocol::spawn_agent_turn).
+        crate::command_tools::with_platform_access(
+            crate::command_tools::CommandToolPlatformAccess::VerifiedNodeOwner,
+            write_skill_verifies_stores_lists_and_runs_owner(),
+        )
+        .await;
+    }
+
+    async fn write_skill_verifies_stores_lists_and_runs_owner() {
         let catalog = ToolCatalog::from_tool_server_json(&json!({ "tools": [] }));
 
         // 1. A valid shell skill: verified by running once, then stored.

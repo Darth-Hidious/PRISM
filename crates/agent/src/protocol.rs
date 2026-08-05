@@ -9039,6 +9039,17 @@ mod tests {
     #[tokio::test]
     async fn skills_create_verify_then_store_list_and_run() {
         let (_g, _dir) = crate::skills::test_env_guard("protocol-skills");
+        // write_skill/run_skill are execution-class meta-tools: the gate
+        // requires node-owner access, which the `/skills` slash path has (the
+        // command arm scopes it as VerifiedNodeOwner). Simulate that scope.
+        crate::command_tools::with_platform_access(
+            crate::command_tools::CommandToolPlatformAccess::VerifiedNodeOwner,
+            skills_create_verify_then_store_list_and_run_owner(),
+        )
+        .await;
+    }
+
+    async fn skills_create_verify_then_store_list_and_run_owner() {
         let catalog = ToolCatalog::from_tool_server_json(&serde_json::json!({ "tools": [] }));
 
         // A valid shell skill: verified by running once, then stored.
