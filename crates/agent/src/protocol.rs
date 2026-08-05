@@ -7505,8 +7505,10 @@ async fn run_server_core(
     tool_server_config: ToolServer,
     input: Box<dyn Iterator<Item = String>>,
 ) -> Result<()> {
-    // LlmClient is rebuilt per-turn so /model switches take effect.
-    let _verify_config = LlmClient::new(llm_config.clone());
+    // Persist the same effective limits each per-turn client will use. For an
+    // embedded GGUF this replaces any registry guess with the active context
+    // derived from model metadata before transcript/tool budgeting begins.
+    let llm_config = LlmClient::new(llm_config).config().clone();
 
     let AgentSeed {
         tool_server,
@@ -7717,8 +7719,7 @@ async fn run_server_core(
                     // that does not fit stays discoverable via find_tools.
                     "model_tool_selection": {
                         "token_budget": crate::tool_catalog::tool_token_budget(
-                            crate::models::get_model_config(&runtime.llm_config.model)
-                                .context_window,
+                            crate::models::request_context_window(&runtime.llm_config),
                         ),
                         "meta_tools": ["recall", "find_tools", "list_failures"],
                     },

@@ -791,6 +791,18 @@ pub fn get_model_config(model_id: &str) -> ModelConfig {
     UNKNOWN_MODEL_CONFIG
 }
 
+/// Context available to an actual request. A resolved client config wins over
+/// registry metadata because embedded GGUF construction replaces catalog
+/// guesses with the runtime context read from the model itself.
+#[must_use]
+pub fn request_context_window(config: &prism_llm::LlmConfig) -> usize {
+    config
+        .context_window
+        .and_then(|window| usize::try_from(window).ok())
+        .filter(|window| *window > 0)
+        .unwrap_or_else(|| get_model_config(&config.model).context_window)
+}
+
 /// Preference when a fuzzy query is ambiguous across providers — lower =
 /// more canonical. A direct vendor beats a router/cloud reseller, so bare
 /// `o3` resolves to `openai/o3`, not `azure/o3`.
@@ -1619,6 +1631,20 @@ context_window = 0
         // S4: reload() clears the warned set so a re-orphaned id warns again.
         reload();
         assert!(warn_unknown_once("some-never-seen-model"));
+    }
+
+    #[test]
+    fn local_backend_budgets_tools_against_resolved_context_not_unknown_128k() {
+        let _iso = isolate();
+        let config = prism_llm::LlmConfig {
+            model: "unregistered-local.gguf".to_string(),
+            context_window: Some(8_192),
+            ..prism_llm::LlmConfig::default()
+        };
+
+        let budget = crate::tool_catalog::tool_token_budget(request_context_window(&config));
+        assert_eq!(budget, crate::tool_catalog::MIN_TOOL_TOKENS);
+        assert_ne!(budget, crate::tool_catalog::MAX_TOOL_TOKENS);
     }
 
     #[test]

@@ -102,9 +102,15 @@ pub fn feature_disabled_error() -> anyhow::Error {
     )
 }
 
+/// Conservative fallback only for unreadable/legacy GGUF metadata. Normal
+/// local operation derives the active context directly from the model.
+#[cfg(feature = "local-inference")]
+const FALLBACK_CONTEXT_SIZE: u32 = 4096;
+
 /// Local adapter state. The model is loaded once and shared; every request gets
 /// a fresh context/KV cache so conversation state remains explicit in messages.
 pub(crate) struct LocalGguf {
+    #[cfg(feature = "local-inference")]
     model_spec: String,
     #[cfg(feature = "local-inference")]
     context_size: u32,
@@ -115,12 +121,11 @@ pub(crate) struct LocalGguf {
 impl LocalGguf {
     pub(crate) fn new(model_spec: String) -> Self {
         #[cfg(feature = "local-inference")]
-        let context_size = std::env::var("PRISM_LOCAL_CONTEXT_SIZE")
-            .ok()
-            .and_then(|raw| raw.parse::<u32>().ok())
-            .filter(|size| *size >= 512)
-            .unwrap_or(4096);
+        let context_size = active_context_size(&model_spec);
+        #[cfg(not(feature = "local-inference"))]
+        let _ = model_spec;
         Self {
+            #[cfg(feature = "local-inference")]
             model_spec,
             #[cfg(feature = "local-inference")]
             context_size,
@@ -129,9 +134,17 @@ impl LocalGguf {
         }
     }
 
-    pub(crate) fn trained_context_window(&self) -> Option<u64> {
-        let path = resolve_model_path(&self.model_spec).ok()?;
-        trained_context_window(&path)
+    /// Context the runtime will actually allocate. GGUF metadata is the
+    /// default authority; an explicit smaller override remains a valid cap.
+    pub(crate) fn context_window(&self) -> Option<u64> {
+        #[cfg(feature = "local-inference")]
+        {
+            Some(u64::from(self.context_size))
+        }
+        #[cfg(not(feature = "local-inference"))]
+        {
+            None
+        }
     }
 
     #[cfg(feature = "local-inference")]
@@ -208,29 +221,42 @@ impl LocalGguf {
     }
 }
 
-fn trained_context_window(path: &Path) -> Option<u64> {
-    #[cfg(feature = "local-inference")]
-    {
-        let metadata = llama_cpp_2::gguf::GgufContext::from_file(path)?;
-        let architecture_index = metadata.find_key("general.architecture");
-        if architecture_index < 0 {
-            return None;
-        }
-        let architecture = metadata.val_str(architecture_index)?;
-        let context_index = metadata.find_key(&format!("{architecture}.context_length"));
-        if context_index < 0 {
-            return None;
-        }
-        match metadata.kv_type(context_index) {
-            llama_cpp_sys_2::GGUF_TYPE_UINT32 => Some(u64::from(metadata.val_u32(context_index))),
-            llama_cpp_sys_2::GGUF_TYPE_UINT64 => Some(metadata.val_u64(context_index)),
-            _ => None,
-        }
+#[cfg(feature = "local-inference")]
+fn active_context_size(model_spec: &str) -> u32 {
+    let trained = resolve_model_path(model_spec)
+        .ok()
+        .and_then(|path| trained_context_window(&path))
+        .and_then(|size| u32::try_from(size).ok())
+        .filter(|size| *size >= 512);
+    let requested = std::env::var("PRISM_LOCAL_CONTEXT_SIZE")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|size| *size >= 512);
+
+    match (requested, trained) {
+        (Some(requested), Some(trained)) => requested.min(trained),
+        (Some(requested), None) => requested,
+        (None, Some(trained)) => trained,
+        (None, None) => FALLBACK_CONTEXT_SIZE,
     }
-    #[cfg(not(feature = "local-inference"))]
-    {
-        let _ = path;
-        None
+}
+
+#[cfg(feature = "local-inference")]
+fn trained_context_window(path: &Path) -> Option<u64> {
+    let metadata = llama_cpp_2::gguf::GgufContext::from_file(path)?;
+    let architecture_index = metadata.find_key("general.architecture");
+    if architecture_index < 0 {
+        return None;
+    }
+    let architecture = metadata.val_str(architecture_index)?;
+    let context_index = metadata.find_key(&format!("{architecture}.context_length"));
+    if context_index < 0 {
+        return None;
+    }
+    match metadata.kv_type(context_index) {
+        llama_cpp_sys_2::GGUF_TYPE_UINT32 => Some(u64::from(metadata.val_u32(context_index))),
+        llama_cpp_sys_2::GGUF_TYPE_UINT64 => Some(metadata.val_u64(context_index)),
+        _ => None,
     }
 }
 

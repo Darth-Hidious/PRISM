@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::command_tools::{self, CommandToolRuntime};
 use crate::hooks::HookRegistry;
-use crate::models::{estimate_cost, get_model_config};
+use crate::models::{estimate_cost, get_model_config, request_context_window};
 use crate::permissions::{SharedPermissionOverrides, ToolPermissionContext};
 use crate::scratchpad::Scratchpad;
 use crate::tool_catalog::ToolCatalog;
@@ -1038,7 +1038,7 @@ pub async fn run_turn(
     // Tool-definition token budget for THIS model's real context window,
     // resolved once per turn (the catalog and the model do not change mid-turn).
     let tool_token_budget =
-        crate::tool_catalog::tool_token_budget(get_model_config(&config.model).context_window);
+        crate::tool_catalog::tool_token_budget(request_context_window(llm.config()));
     // Capability-gap re-retrieval: fires at most once per turn (see 2g).
     let mut capability_gap_retried = false;
 

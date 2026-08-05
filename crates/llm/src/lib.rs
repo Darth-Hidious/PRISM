@@ -38,9 +38,9 @@ pub struct LlmConfig {
     /// Request timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// The model's context window in tokens, from the platform catalog.
-    /// `None` = unknown (e.g. local llama.cpp) — consumers must fall back
-    /// to conservative behavior, never assume a size.
+    /// The model's context window in tokens. Hosted values come from the
+    /// platform catalog; an embedded GGUF client replaces them with the
+    /// active context derived from model metadata. `None` means unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     /// The model's max output tokens, from the platform catalog. Used to
@@ -333,8 +333,11 @@ impl LlmClient {
             ),
             BackendChoice::LocalGguf => {
                 let local = local::LocalGguf::new(config.model.clone());
-                if config.context_window.is_none() {
-                    config.context_window = local.trained_context_window();
+                if let Some(context_window) = local.context_window() {
+                    // A registry fallback describes a model id, not the local
+                    // runtime. GGUF metadata (plus an explicit smaller runtime
+                    // cap) is authoritative for what this client can accept.
+                    config.context_window = Some(context_window);
                 }
                 LlmBackend::LocalGguf(local)
             }
@@ -754,10 +757,10 @@ impl LlmClient {
         let model_max = self.config.max_output_tokens.unwrap_or(4096);
         // Clamp the requested output so it can never collide with the input:
         // context_window − estimated prompt − margin. When the context window is
-        // unknown (local models), only the configured max applies. Unknown/local
-        // models also have no catalog max_output_tokens, so they naturally floor
-        // at 4096 — the same ceiling the compact profile's Capped(4096) would set,
-        // which is why no per-profile cap needs plumbing across the crate boundary.
+        // unknown, only the configured max applies. Embedded local models now
+        // carry their GGUF-derived context but still have no catalog
+        // max_output_tokens, so their output ceiling naturally remains 4096 — the
+        // same cap the compact profile would select.
         let by_context = match self.config.context_window {
             Some(cw) => cw
                 .saturating_sub(est_prompt_tokens)
@@ -2508,6 +2511,47 @@ mod tests {
             choose_backend("https://api.openai.com/v1"),
             BackendChoice::Http
         );
+    }
+
+    #[cfg(feature = "local-inference")]
+    fn write_context_only_gguf(path: &std::path::Path, context_window: u32) {
+        use std::io::Write as _;
+
+        fn write_string(file: &mut std::fs::File, value: &str) {
+            file.write_all(&(value.len() as u64).to_le_bytes()).unwrap();
+            file.write_all(value.as_bytes()).unwrap();
+        }
+
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(b"GGUF").unwrap();
+        file.write_all(&3_u32.to_le_bytes()).unwrap();
+        file.write_all(&0_u64.to_le_bytes()).unwrap(); // tensor count
+        file.write_all(&2_u64.to_le_bytes()).unwrap(); // metadata count
+        write_string(&mut file, "general.architecture");
+        file.write_all(&8_u32.to_le_bytes()).unwrap(); // GGUF_TYPE_STRING
+        write_string(&mut file, "prismtest");
+        write_string(&mut file, "prismtest.context_length");
+        file.write_all(&4_u32.to_le_bytes()).unwrap(); // GGUF_TYPE_UINT32
+        file.write_all(&context_window.to_le_bytes()).unwrap();
+    }
+
+    /// The local client's effective context is the value every upstream tool
+    /// budget must consume; a catalog fallback must never override GGUF truth.
+    #[cfg(feature = "local-inference")]
+    #[test]
+    fn local_backend_budgets_tools_against_gguf_context_not_unknown_128k() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("context-only.gguf");
+        write_context_only_gguf(&model, 8_192);
+
+        let client = LlmClient::new(LlmConfig {
+            base_url: LOCAL_GGUF_URL.to_string(),
+            model: model.display().to_string(),
+            context_window: Some(128_000),
+            ..LlmConfig::default()
+        });
+
+        assert_eq!(client.config().context_window, Some(8_192));
     }
 
     #[cfg(not(feature = "local-inference"))]
