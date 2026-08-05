@@ -339,7 +339,7 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
             Event::GeneralRef(e) => Some(crate::sources::resolve_reference(
                 &e.decode().unwrap_or_default(),
             )),
-            Event::Start(e) | Event::Empty(e) => {
+            Event::Start(e) => {
                 match e.local_name().as_ref() {
                     b"front" => depth_front += 1,
                     b"body" => depth_body += 1,
@@ -387,6 +387,11 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                 }
                 None
             }
+            // A self-closing tag carries no content and never gets an End
+            // event: it must not open a sink or a depth, or the parser
+            // wedges on it and silently drops the rest of the document
+            // (e.g. a bare <table-wrap/>).
+            Event::Empty(_) => None,
             Event::End(e) => {
                 match e.local_name().as_ref() {
                     b"front" => depth_front -= 1,
@@ -620,6 +625,42 @@ mod tests {
         }
         // Back-matter (references) is excluded.
         assert!(!ft.plain_text.contains("Old citation text"));
+    }
+
+    /// A self-closing <table-wrap/> must not wedge the sink: the parser
+    /// used to open the wrap state on it and never receive the End event,
+    /// silently truncating every block after it.
+    #[test]
+    fn self_closing_table_wrap_does_not_wedge_the_sink() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Wedge probe</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <p>Before the wedge.</p>
+      <table-wrap/>
+      <fig/>
+      <p>After the wedge.</p>
+    </sec>
+  </body>
+</article>"#;
+        let ft = parse_jats(body.as_bytes()).unwrap();
+        assert!(
+            ft.blocks.iter().any(|b| b.text == "Before the wedge."),
+            "blocks: {:?}",
+            ft.blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+        assert!(
+            ft.blocks.iter().any(|b| b.text == "After the wedge."),
+            "a self-closing wrap wedged the sink; blocks: {:?}",
+            ft.blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
     }
 
     #[test]
